@@ -53,7 +53,9 @@ def create_app(db_path: str) -> FastAPI:
         try:
             q().submit_result(task_id, result)
         except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            msg = str(e)
+            status_code = 404 if "not found" in msg.lower() else 400
+            raise HTTPException(status_code=status_code, detail=msg)
         return {"status": "ok"}
 
     @app.delete("/tasks/{task_id}", status_code=200)

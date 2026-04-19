@@ -21,7 +21,8 @@ def task_queue(tmp_db):
 @pytest.fixture
 def test_client(tmp_db):
     app = create_app(tmp_db)
-    return TestClient(app)
+    with TestClient(app) as client:
+        yield client
 
 
 @pytest.fixture
