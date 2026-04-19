@@ -56,6 +56,5 @@ def check_health(agent: dict, session: str) -> bool:
 
 def refresh_pane(agent: dict, session: str) -> None:
     target = f"{session}:{agent['pane']}"
-    subprocess.run(
-        ["tmux", "send-keys", "-t", target, agent["cmd"], "Enter"],
-    )
+    subprocess.run(["tmux", "send-keys", "-t", target, "", "Enter"])
+    subprocess.run(["tmux", "send-keys", "-t", target, agent["cmd"], "Enter"])

@@ -121,7 +121,7 @@ def test_u_s09_health_check_dead():
     assert result is False
 
 
-# U-S10: Refresh uses cmd from sessions.json — correct tmux send-keys command called
+# U-S10: Refresh sends blank Enter first, then cmd — two subprocess.run calls
 def test_u_s10_refresh_pane_uses_cmd():
     agent = make_agent(pane=2)
     agent["cmd"] = "claude --dangerously-skip-permissions --continue"
@@ -129,11 +129,15 @@ def test_u_s10_refresh_pane_uses_cmd():
     with patch("agent_crew.session.subprocess.run") as mock_run:
         refresh_pane(agent, session="crew")
 
-    mock_run.assert_called_once()
-    args = mock_run.call_args[0][0]
-    assert "tmux" in args
-    assert "send-keys" in args
-    assert agent["cmd"] in args
+    assert mock_run.call_count == 2
+    first_args = mock_run.call_args_list[0][0][0]
+    second_args = mock_run.call_args_list[1][0][0]
+    # first call: blank Enter
+    assert "send-keys" in first_args
+    assert "" in first_args
+    # second call: actual cmd
+    assert "send-keys" in second_args
+    assert agent["cmd"] in second_args
 
 
 # U-S03b: started_at as ISO-8601 string also supported
