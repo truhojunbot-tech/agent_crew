@@ -72,7 +72,7 @@ def test_i_di01_single_round(tmp_db):
         assert agent in synthesis
 
 
-# I-DI02: multi_round(rounds=2) — round 2 tasks context에 round 1 synthesis 포함
+# I-DI02: multi_round(rounds=2) — round 2 tasks context에 round 1 synthesis 내용 포함
 def test_i_di02_multi_round_context(tmp_db):
     agents = ["claude", "codex"]
     topic = "Architecture decision"
@@ -81,14 +81,16 @@ def test_i_di02_multi_round_context(tmp_db):
         queue = _HTTPQueueAdapter(client)
         multi_round(queue, agents, topic, rounds=2)
 
-        # round=2인 task 중 prior_synthesis context 확인
         resp = client.get("/tasks", params={"status": "pending"})
         all_tasks = resp.json()
 
     round2_tasks = [t for t in all_tasks if t["context"].get("round") == 2]
     assert len(round2_tasks) > 0
     for task in round2_tasks:
-        assert "prior_synthesis" in task["context"]
+        prior = task["context"].get("prior_synthesis", "")
+        assert prior, "prior_synthesis must be non-empty"
+        # round 1 synthesis는 topic과 agent 이름을 포함해야 함
+        assert topic in prior or "## Panel Opinions" in prior or "claude" in prior
 
 
 # I-DI03: 2 agents로 discussion — 3명 미만에서도 동작
@@ -114,7 +116,7 @@ def test_i_di03_two_agents(tmp_db):
     assert "## Panel Opinions" in synthesis
 
 
-# I-DI04: agent 1명 실패 — 실패 기록, synthesis에 누락 의견 표시
+# I-DI04: agent 1명 실패 — 서버 confirmed status로 synthesis entry 도출, 실패 표시 검증
 def test_i_di04_agent_failure(tmp_db):
     agents = ["claude", "codex", "gemini"]
     topic = "Database choice"
@@ -122,16 +124,21 @@ def test_i_di04_agent_failure(tmp_db):
     with TestClient(create_app(tmp_db)) as client:
         queue = _HTTPQueueAdapter(client)
         task_ids = enqueue_panel_tasks(queue, agents, topic, context={})
-
         perspectives = assign_perspectives(agents)
-        results = []
 
-        # claude, codex: 성공
+        # claude, codex: 성공 결과 제출
+        success_summaries = {}
         for task_id, agent in zip(task_ids[:2], agents[:2]):
-            r = _submit_result(client, task_id, agent, perspectives[agent], f"{agent} opinion")
-            results.append(r)
+            summary = f"{agent} opinion on {topic}"
+            client.post(f"/tasks/{task_id}/result", json={
+                "task_id": task_id,
+                "status": "completed",
+                "summary": summary,
+                "findings": [],
+            })
+            success_summaries[task_id] = summary
 
-        # gemini: 실패
+        # gemini: 실패 결과 제출 (실제 HTTP POST)
         failed_task_id = task_ids[2]
         client.post(f"/tasks/{failed_task_id}/result", json={
             "task_id": failed_task_id,
@@ -139,15 +146,25 @@ def test_i_di04_agent_failure(tmp_db):
             "summary": "Agent timed out",
             "findings": [],
         })
-        results.append({
-            "agent": "gemini",
-            "perspective": perspectives["gemini"],
-            "summary": "[FAILED] Agent timed out — opinion missing",
-        })
+
+        # 서버에서 실제 task status 쿼리 — failed task_id 집합 확인
+        failed_resp = client.get("/tasks", params={"status": "failed"})
+        failed_ids = {t["task_id"] for t in failed_resp.json()}
+        assert failed_task_id in failed_ids, "failed task must be recorded on server"
+
+        # 서버 확인 status 기반으로 synthesis results 구성
+        results = []
+        for task_id, agent in zip(task_ids, agents):
+            perspective = perspectives[agent]
+            if task_id in failed_ids:
+                summary = f"[FAILED] {agent} did not respond — opinion missing"
+            else:
+                summary = success_summaries[task_id]
+            results.append({"agent": agent, "perspective": perspective, "summary": summary})
 
         synthesis = build_synthesis(results, topic=topic)
 
     assert "claude" in synthesis
     assert "codex" in synthesis
     assert "gemini" in synthesis
-    assert "FAILED" in synthesis or "missing" in synthesis
+    assert "FAILED" in synthesis
