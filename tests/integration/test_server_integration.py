@@ -1,6 +1,9 @@
 import threading
 
 import pytest
+from fastapi.testclient import TestClient
+
+from agent_crew.server import create_app
 
 
 pytestmark = pytest.mark.integration
@@ -56,25 +59,30 @@ def test_i_sv02_full_lifecycle(test_client):
     assert resp.json()["status"] == "ok"
 
 
-# I-SV03: GET /tasks/next concurrent (2 clients) — 중복 할당 없음
-def test_i_sv03_concurrent_dequeue(test_client):
-    for i in range(2):
-        test_client.post("/tasks", json={
-            "task_id": f"sv03-task-{i}",
-            "task_type": "implement",
-            "description": f"Task {i}",
-            "branch": "main",
-            "priority": 3,
-            "context": {},
-        })
+# I-SV03: GET /tasks/next concurrent (2 independent clients) — 중복 할당 없음
+def test_i_sv03_concurrent_dequeue(tmp_db):
+    app = create_app(tmp_db)
+    with TestClient(app) as setup_client:
+        for i in range(2):
+            setup_client.post("/tasks", json={
+                "task_id": f"sv03-task-{i}",
+                "task_type": "implement",
+                "description": f"Task {i}",
+                "branch": "main",
+                "priority": 3,
+                "context": {},
+            })
 
     results = []
     errors = []
+    barrier = threading.Barrier(2)
 
     def dequeue():
         try:
-            resp = test_client.get("/tasks/next", params={"role": "coder"})
-            results.append(resp.json())
+            with TestClient(app) as client:
+                barrier.wait()
+                resp = client.get("/tasks/next", params={"role": "coder"})
+                results.append(resp.json())
         except Exception as e:
             errors.append(e)
 
@@ -164,3 +172,21 @@ def test_i_sv07_resolve_gate(test_client, resolve_approved):
     assert resp.status_code == 200
     gate = resp.json()
     assert gate["status"] == "approved"
+
+
+# I-SV07b: POST /gates/{id}/resolve {"status": "rejected"} → status=rejected
+def test_i_sv07b_resolve_gate_rejected(test_client, resolve_rejected):
+    test_client.post("/gates", json={
+        "id": "gate-sv07b",
+        "type": "approval",
+        "message": "Reject deploy",
+        "status": "pending",
+        "created_at": 0.0,
+    })
+
+    resp = test_client.post("/gates/gate-sv07b/resolve", json=resolve_rejected)
+    assert resp.status_code == 200
+
+    resp = test_client.get("/gates/gate-sv07b")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "rejected"
