@@ -66,7 +66,7 @@ def handle_review_result(
     if iteration >= max_iter and result.verdict != "approve":
         return "escalate"
     if result.verdict == "approve":
-        return "approved_skip_test" if no_tester else "approved"
+        return "approved"
     return "request_changes"
 
 
@@ -83,6 +83,8 @@ def build_feedback(result: TaskResult) -> str:
     for finding in result.findings:
         if isinstance(finding, dict):
             layer = finding.get("layer", "unknown")
+            if layer not in _KNOWN_LAYERS:
+                layer = "unknown"
             issue = finding.get("issue", str(finding))
         else:
             parts = str(finding).split(":", 1)

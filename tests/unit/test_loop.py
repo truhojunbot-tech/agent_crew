@@ -50,7 +50,7 @@ def test_u_l03_handle_review_result_approve():
     assert handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER) == "approved"
 
 
-# U-L04: handle_review_result + no_tester=True → "approved_skip_test" (tester 스킵 표시)
+# U-L04: handle_review_result + no_tester=True → "approved" (허용 어휘: approved/request_changes/escalate)
 def test_u_l04_handle_review_result_no_tester():
     result = TaskResult(
         task_id="r-001",
@@ -58,11 +58,8 @@ def test_u_l04_handle_review_result_no_tester():
         summary="Looks good",
         verdict="approve",
     )
-    outcome = handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=True)
-    assert outcome == "approved_skip_test"
-    # no_tester=False일 때는 일반 "approved" 반환 (test 단계 진행)
-    outcome_with_tester = handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=False)
-    assert outcome_with_tester == "approved"
+    assert handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=True) == "approved"
+    assert handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=False) == "approved"
 
 
 # U-L05: handle_review_result verdict=request_changes → "request_changes"
@@ -149,3 +146,22 @@ def test_u_l10b_handle_test_result_needs_human():
         summary="Requires human review",
     )
     assert handle_test_result(result) == "needs_human"
+
+
+# U-L10c: build_feedback — dict finding의 알 수 없는 layer → [unknown] 정규화
+def test_u_l10c_build_feedback_dict_unknown_layer():
+    result = TaskResult(
+        task_id="r-002",
+        status="completed",
+        summary="Issues found",
+        findings=[
+            {"layer": "typo", "issue": "misnamed variable"},
+            {"layer": "test_quality", "issue": "missing branch coverage"},
+        ],
+    )
+    feedback = build_feedback(result)
+
+    assert "[unknown]" in feedback
+    assert "misnamed variable" in feedback
+    assert "[test_quality]" in feedback
+    assert "missing branch coverage" in feedback
