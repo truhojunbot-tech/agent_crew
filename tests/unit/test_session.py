@@ -2,8 +2,6 @@ import json
 import time
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 from agent_crew.session import (
     SESSION_MAX_FAILURES,
     SESSION_MAX_HOURS,
