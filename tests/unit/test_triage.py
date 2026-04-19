@@ -2,7 +2,7 @@ from agent_crew.triage import build_prompt, filter_processed, parse_issues, pars
 
 
 def make_issue(number=1, title="Fix bug", labels=None):
-    label_objs = [{"name": l} for l in (labels or [])]
+    label_objs = [{"name": label} for label in (labels or [])]
     return {"number": number, "title": title, "labels": label_objs, "body": "details"}
 
 
