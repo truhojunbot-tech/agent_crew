@@ -54,7 +54,11 @@ def check_health(agent: dict, session: str) -> bool:
     return result.returncode == 0
 
 
-def refresh_pane(agent: dict, session: str) -> None:
+def refresh_pane(agent: dict, session: str, sessions_path: str = "") -> None:
     target = f"{session}:{agent['pane']}"
     subprocess.run(["tmux", "send-keys", "-t", target, "", "Enter"])
     subprocess.run(["tmux", "send-keys", "-t", target, agent["cmd"], "Enter"])
+    if sessions_path:
+        agents = load_sessions(sessions_path)
+        updated = [reset_session(a) if a["name"] == agent["name"] else a for a in agents]
+        save_sessions(sessions_path, updated)
