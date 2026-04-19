@@ -72,10 +72,19 @@ def test_i_di01_single_round(tmp_db):
         assert agent in synthesis
 
 
-# I-DI02: multi_round(rounds=2) — round 2 tasks context에 round 1 synthesis 내용 포함
+# I-DI02: multi_round(rounds=2) — round 2 tasks context에 round 1 synthesis 전체 포함
 def test_i_di02_multi_round_context(tmp_db):
     agents = ["claude", "codex"]
     topic = "Architecture decision"
+
+    # multi_round()가 round 1에서 생성하는 synthesis를 동일 로직으로 재현
+    expected_round1 = build_synthesis(
+        [
+            {"agent": a, "perspective": p, "summary": f"Round 1 input from {a}."}
+            for a, p in zip(agents, [assign_perspectives(agents)[a] for a in agents])
+        ],
+        topic=topic,
+    )
 
     with TestClient(create_app(tmp_db)) as client:
         queue = _HTTPQueueAdapter(client)
@@ -89,8 +98,9 @@ def test_i_di02_multi_round_context(tmp_db):
     for task in round2_tasks:
         prior = task["context"].get("prior_synthesis", "")
         assert prior, "prior_synthesis must be non-empty"
-        # round 1 synthesis는 topic과 agent 이름을 포함해야 함
-        assert topic in prior or "## Panel Opinions" in prior or "claude" in prior
+        assert "## Topic" in prior
+        assert "## Panel Opinions" in prior
+        assert expected_round1 in prior or prior == expected_round1
 
 
 # I-DI03: 2 agents로 discussion — 3명 미만에서도 동작
