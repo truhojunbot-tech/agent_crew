@@ -1,6 +1,6 @@
 import uuid
 
-from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 
 DEFAULT_MAX_ITER: int = 5
 
@@ -62,12 +62,31 @@ def handle_review_result(
     iteration: int,
     max_iter: int,
     no_tester: bool = False,
+    queue=None,
+    task_desc: str = "",
+    branch: str = "",
 ) -> str:
     if iteration >= max_iter and result.verdict != "approve":
+        if queue is not None:
+            gate = GateRequest(
+                id=f"gate-escalation-{uuid.uuid4().hex[:8]}",
+                type="escalation",
+                message=f"Review loop exceeded {max_iter} iterations",
+            )
+            queue.create_gate(gate)
         return "escalate"
     if result.verdict == "approve":
+        if queue is not None and not no_tester and task_desc and branch:
+            enqueue_test(queue, task_desc, branch)
         return "approved"
     return "request_changes"
+
+
+def enqueue_implement_with_feedback(
+    queue, task_desc: str, branch: str, review_result: TaskResult
+) -> str:
+    feedback = build_feedback(review_result)
+    return enqueue_implement(queue, task_desc, branch, context={"feedback": feedback})
 
 
 def handle_test_result(result: TaskResult) -> str:
