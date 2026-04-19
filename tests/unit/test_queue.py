@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
 
@@ -165,3 +165,79 @@ def test_u_q10_list_tasks_by_status(q):
     assert pending[0].task_id == "b"
     all_tasks = q.list_tasks()
     assert len(all_tasks) == 2
+
+
+# ---------------------------------------------------------------------------
+# Gate tests (U-Q11 ~ U-Q17)
+# ---------------------------------------------------------------------------
+
+def make_gate(gate_id="g-001", gate_type="approval", message="Please approve"):
+    return GateRequest(id=gate_id, type=gate_type, message=message)
+
+
+# U-Q11: Persistence — TaskQueue 재연결 후 task와 gate 모두 살아있는지
+def test_u_q11_persistence(tmp_path):
+    db = str(tmp_path / "persist.db")
+    q1 = TaskQueue(db)
+    q1.enqueue(make_task("t-persist"))
+    q1.create_gate(make_gate("g-persist"))
+    q2 = TaskQueue(db)
+    tasks = q2.list_tasks()
+    assert len(tasks) == 1
+    assert tasks[0].task_id == "t-persist"
+    gates = q2.list_gates()
+    assert len(gates) == 1
+    assert gates[0].id == "g-persist"
+    assert gates[0].status == "pending"
+
+
+# U-Q12: Gate create → status=pending
+def test_u_q12_gate_create(q):
+    gate_id = q.create_gate(make_gate())
+    assert gate_id == "g-001"
+    gates = q.list_gates(status="pending")
+    assert len(gates) == 1
+    assert gates[0].id == "g-001"
+    assert gates[0].status == "pending"
+
+
+# U-Q13: Gate resolve approved → status=approved
+def test_u_q13_gate_resolve_approved(q):
+    q.create_gate(make_gate())
+    q.resolve_gate("g-001", approved=True)
+    gates = q.list_gates(status="approved")
+    assert len(gates) == 1
+    assert gates[0].status == "approved"
+
+
+# U-Q14: Gate resolve rejected → status=rejected
+def test_u_q14_gate_resolve_rejected(q):
+    q.create_gate(make_gate())
+    q.resolve_gate("g-001", approved=False)
+    gates = q.list_gates(status="rejected")
+    assert len(gates) == 1
+    assert gates[0].status == "rejected"
+
+
+# U-Q15: Gate list pending — pending 게이트만 반환
+def test_u_q15_gate_list_pending(q):
+    q.create_gate(make_gate("g-001"))
+    q.create_gate(make_gate("g-002"))
+    q.resolve_gate("g-001", approved=True)
+    pending = q.list_gates(status="pending")
+    assert len(pending) == 1
+    assert pending[0].id == "g-002"
+
+
+# U-Q16: Gate resolve nonexistent → ValueError
+def test_u_q16_gate_resolve_nonexistent(q):
+    with pytest.raises(ValueError):
+        q.resolve_gate("ghost", approved=True)
+
+
+# U-Q17: Gate resolve already resolved → ValueError (idempotency)
+def test_u_q17_gate_resolve_already_resolved(q):
+    q.create_gate(make_gate())
+    q.resolve_gate("g-001", approved=True)
+    with pytest.raises(ValueError):
+        q.resolve_gate("g-001", approved=True)
