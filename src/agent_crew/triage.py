@@ -1,4 +1,10 @@
+import json
 import re
+import subprocess
+import time
+import uuid
+
+from agent_crew.protocol import GateRequest, TaskRequest
 
 
 def parse_issues(data: list[dict]) -> list[dict]:
@@ -43,3 +49,69 @@ def parse_response(text: str) -> dict | None:
         "issue": int(issue_match.group(1)),
         "description": desc_match.group(1).strip(),
     }
+
+
+def fetch_issues_from_gh(repo: str) -> list[dict]:
+    result = subprocess.run(
+        ["gh", "issue", "list", "--repo", repo, "--json", "number,title,labels"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(result.stdout)
+
+
+def run(
+    queue,
+    repo: str,
+    agent_fn,
+    branch: str = "main",
+    merge_history: str = "none",
+) -> dict | None:
+    """Full triage pipeline: fetch issues → filter → prompt → agent → gate.
+
+    Returns {"gate_id": str, "parsed": dict, "branch": str} or None if no issues.
+    agent_fn(prompt: str) -> str: callable that returns the triage agent's response text.
+    """
+    raw = fetch_issues_from_gh(repo)
+    issues = parse_issues(raw)
+    filtered = filter_processed(issues)
+    prompt = build_prompt(filtered, merge_history)
+    if prompt is None:
+        return None
+    response_text = agent_fn(prompt)
+    parsed = parse_response(response_text)
+    if parsed is None:
+        return None
+    gate = GateRequest(
+        id=f"gate-triage-{uuid.uuid4().hex[:8]}",
+        type="approval",
+        message=f"Triage selected issue #{parsed['issue']}: {parsed['description']}",
+    )
+    gate_id = queue.create_gate(gate)
+    return {"gate_id": gate_id, "parsed": parsed, "branch": branch}
+
+
+def enqueue_task(queue, triage_result: dict) -> str:
+    """Enqueue an implement task from an approved triage result."""
+    parsed = triage_result["parsed"]
+    branch = triage_result.get("branch", "main")
+    req = TaskRequest(
+        task_id=f"impl-triage-{uuid.uuid4().hex[:8]}",
+        task_type="implement",
+        description=parsed["description"],
+        branch=branch,
+        context={"issue": parsed["issue"]},
+    )
+    return queue.enqueue(req)
+
+
+def check_gate_timeout(queue, timeout_seconds: float) -> list[str]:
+    """Auto-reject pending gates older than timeout_seconds. Returns rejected IDs."""
+    now = time.time()
+    rejected = []
+    for gate in queue.list_gates(status="pending"):
+        if now - gate.created_at >= timeout_seconds:
+            queue.resolve_gate(gate.id, approved=False)
+            rejected.append(gate.id)
+    return rejected
