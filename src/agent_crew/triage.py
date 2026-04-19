@@ -16,9 +16,9 @@ def filter_processed(issues: list[dict]) -> list[dict]:
     return [i for i in issues if "agent_crew:done" not in i.get("labels", [])]
 
 
-def build_prompt(issues: list[dict], merge_history: str) -> str:
+def build_prompt(issues: list[dict], merge_history: str) -> str | None:
     if not issues:
-        return ""
+        return None
     lines = ["## Open Issues\n"]
     for issue in issues:
         labels = ", ".join(issue.get("labels", [])) or "none"
@@ -35,8 +35,8 @@ def build_prompt(issues: list[dict], merge_history: str) -> str:
 
 
 def parse_response(text: str) -> dict | None:
-    issue_match = re.search(r"ISSUE:\s*(\d+)", text)
-    desc_match = re.search(r"DESCRIPTION:\s*(.+)", text)
+    issue_match = re.search(r"^ISSUE:\s*(\d+)\s*$", text, re.MULTILINE)
+    desc_match = re.search(r"^DESCRIPTION:\s*(.+)\s*$", text, re.MULTILINE)
     if not issue_match or not desc_match:
         return None
     return {

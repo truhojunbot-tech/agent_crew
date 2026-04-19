@@ -56,6 +56,20 @@ def test_u_t04_parse_response():
     assert "session" in result["description"].lower()
 
 
-# U-T05: No open issues → build_prompt returns empty string
+# U-T05: No open issues → build_prompt returns None
 def test_u_t05_empty_issues():
-    assert build_prompt([], "some history") == ""
+    assert build_prompt([], "some history") is None
+
+
+# U-T04b: parse_response ignores ISSUE:/DESCRIPTION: embedded in prose
+def test_u_t04b_parse_response_anchored():
+    # inline prose — should NOT match because not at line start
+    prose = "We might tackle ISSUE: 99 later. The DESCRIPTION: unclear."
+    result = parse_response(prose)
+    assert result is None
+
+
+# U-T04c: parse_response handles malformed response → None
+def test_u_t04c_parse_response_missing_fields():
+    assert parse_response("just some text with no markers") is None
+    assert parse_response("ISSUE: 5\n(no description line)") is None
