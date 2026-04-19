@@ -54,6 +54,9 @@ def enqueue_test(queue, task_desc: str, branch: str, context: dict = {}) -> str:
     return queue.enqueue(req)
 
 
+_KNOWN_LAYERS = {"test_quality", "code_quality", "business_gap"}
+
+
 def handle_review_result(
     result: TaskResult,
     iteration: int,
@@ -63,18 +66,27 @@ def handle_review_result(
     if iteration >= max_iter and result.verdict != "approve":
         return "escalate"
     if result.verdict == "approve":
-        return "approved"
+        return "approved_skip_test" if no_tester else "approved"
     return "request_changes"
 
 
 def handle_test_result(result: TaskResult) -> str:
     if result.status == "completed":
         return "passed"
+    if result.status == "needs_human":
+        return "needs_human"
     return "failed"
 
 
 def build_feedback(result: TaskResult) -> str:
     lines = [f"Review feedback (task {result.task_id}):"]
     for finding in result.findings:
-        lines.append(f"- {finding}")
+        if isinstance(finding, dict):
+            layer = finding.get("layer", "unknown")
+            issue = finding.get("issue", str(finding))
+        else:
+            parts = str(finding).split(":", 1)
+            layer = parts[0].strip() if len(parts) == 2 and parts[0].strip() in _KNOWN_LAYERS else "unknown"
+            issue = parts[1].strip() if layer != "unknown" else str(finding)
+        lines.append(f"- [{layer}] {issue}")
     return "\n".join(lines)

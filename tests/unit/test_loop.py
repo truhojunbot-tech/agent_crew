@@ -50,7 +50,7 @@ def test_u_l03_handle_review_result_approve():
     assert handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER) == "approved"
 
 
-# U-L04: handle_review_result + no_tester=True → "approved" (tester 스킵)
+# U-L04: handle_review_result + no_tester=True → "approved_skip_test" (tester 스킵 표시)
 def test_u_l04_handle_review_result_no_tester():
     result = TaskResult(
         task_id="r-001",
@@ -58,7 +58,11 @@ def test_u_l04_handle_review_result_no_tester():
         summary="Looks good",
         verdict="approve",
     )
-    assert handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=True) == "approved"
+    outcome = handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=True)
+    assert outcome == "approved_skip_test"
+    # no_tester=False일 때는 일반 "approved" 반환 (test 단계 진행)
+    outcome_with_tester = handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=False)
+    assert outcome_with_tester == "approved"
 
 
 # U-L05: handle_review_result verdict=request_changes → "request_changes"
@@ -115,17 +119,33 @@ def test_u_l09_enqueue_review_rejects_happy_path():
     assert "happy_path" in ctx_str or "happy path" in ctx_str or "reviewer_rejects" in ctx_str
 
 
-# U-L10: build_feedback — findings에 layer 레이블 포함됨
+# U-L10: build_feedback — findings에 layer 레이블 prefix 포함, unknown 정규화
 def test_u_l10_build_feedback():
     result = TaskResult(
         task_id="r-001",
         status="completed",
         summary="Issues found",
-        findings=["test_quality: missing edge cases", "code_quality: no error handling", "business_gap: no logging"],
+        findings=[
+            "test_quality: missing edge cases",
+            "code_quality: no error handling",
+            "business_gap: no logging",
+            "no label here",
+        ],
     )
     feedback = build_feedback(result)
 
-    assert "test_quality" in feedback
-    assert "code_quality" in feedback
-    assert "business_gap" in feedback
+    assert "[test_quality]" in feedback
+    assert "[code_quality]" in feedback
+    assert "[business_gap]" in feedback
     assert "missing edge cases" in feedback
+    assert "[unknown]" in feedback
+
+
+# U-L10b: handle_test_result status=needs_human → "needs_human"
+def test_u_l10b_handle_test_result_needs_human():
+    result = TaskResult(
+        task_id="t-003",
+        status="needs_human",
+        summary="Requires human review",
+    )
+    assert handle_test_result(result) == "needs_human"
