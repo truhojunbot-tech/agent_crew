@@ -93,9 +93,10 @@ Supports multiple rounds: each round uses the previous synthesis as new context.
 The discussion loop is the recommended way to decompose an architecture document into concrete implementation tasks before coding begins.
 
 ```bash
-crew discuss "Break this architecture into vertical slice implementation tasks. \
-  Each slice must be independently testable and deliver working functionality." \
-  --context docs/architecture.md \
+crew discuss "$(cat docs/architecture.md)
+
+Break the above architecture into vertical slice implementation tasks.
+Each slice must be independently testable and deliver working functionality." \
   --perspectives "claude:analyst,codex:critic,gemini:risk" \
   --then-run
 ```
