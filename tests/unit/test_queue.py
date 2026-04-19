@@ -97,6 +97,7 @@ def test_u_q06_atomic_dequeue(db_path):
     assert len(task_ids) == 2
 
 
+<<<<<<< HEAD
 # U-Q07: Submit result — completed/failed/needs_human 모두 DB에 올바르게 저장되는지 검증
 @pytest.mark.parametrize("result_status,verdict", [
     ("completed", "approve"),
@@ -104,6 +105,10 @@ def test_u_q06_atomic_dequeue(db_path):
     ("needs_human", None),
 ])
 def test_u_q07_submit_result(q, result_status, verdict):
+=======
+# U-Q07: Submit result → status=completed, DB에서 실제로 읽어서 검증
+def test_u_q07_submit_result(q, tmp_path):
+>>>>>>> ee2e7ec (fix: apply review feedback on queue.py)
     q.enqueue(make_task())
     q.dequeue()
     res = TaskResult(
@@ -122,9 +127,15 @@ def test_u_q07_submit_result(q, result_status, verdict):
     row = conn.execute("SELECT * FROM tasks WHERE task_id = 't-001'").fetchone()
     conn.close()
 
+<<<<<<< HEAD
     assert row["status"] == result_status
     assert row["summary"] == "Done"
     assert row["verdict"] == verdict
+=======
+    assert row["status"] == "completed"
+    assert row["summary"] == "Done"
+    assert row["verdict"] == "approve"
+>>>>>>> ee2e7ec (fix: apply review feedback on queue.py)
     assert json.loads(row["findings"]) == ["f1"]
     assert row["pr_number"] == 7
 
