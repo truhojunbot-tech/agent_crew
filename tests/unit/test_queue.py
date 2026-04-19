@@ -4,7 +4,7 @@ import threading
 
 import pytest
 
-from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
 
@@ -170,9 +170,6 @@ def test_u_q10_list_tasks_by_status(q):
 # ---------------------------------------------------------------------------
 # Gate tests (U-Q11 ~ U-Q17)
 # ---------------------------------------------------------------------------
-
-from agent_crew.protocol import GateRequest
-
 
 def make_gate(gate_id="g-001", gate_type="approval", message="Please approve"):
     return GateRequest(id=gate_id, type=gate_type, message=message)
