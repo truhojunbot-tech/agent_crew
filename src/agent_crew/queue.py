@@ -125,6 +125,8 @@ class TaskQueue:
     def submit_result(self, task_id: str, result: TaskResult) -> None:
         conn = self._connect()
         try:
+            if result.task_id != task_id:
+                raise ValueError(f"task_id mismatch: argument {task_id!r} != result.task_id {result.task_id!r}")
             row = conn.execute("SELECT task_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
