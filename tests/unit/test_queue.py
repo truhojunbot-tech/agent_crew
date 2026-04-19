@@ -1,3 +1,5 @@
+import json
+import sqlite3
 import threading
 
 import pytest
@@ -95,8 +97,8 @@ def test_u_q06_atomic_dequeue(db_path):
     assert len(task_ids) == 2
 
 
-# U-Q07: Submit result → status=completed, 결과 저장됨
-def test_u_q07_submit_result(q):
+# U-Q07: Submit result → status=completed, DB에서 실제로 읽어서 검증
+def test_u_q07_submit_result(q, tmp_path):
     q.enqueue(make_task())
     q.dequeue()
     res = TaskResult(
@@ -108,8 +110,18 @@ def test_u_q07_submit_result(q):
         pr_number=7,
     )
     q.submit_result("t-001", res)
-    completed = q.list_tasks(status="completed")
-    assert len(completed) == 1
+
+    # DB에서 직접 읽어서 모든 필드 검증
+    conn = sqlite3.connect(q._db_path)
+    conn.row_factory = sqlite3.Row
+    row = conn.execute("SELECT * FROM tasks WHERE task_id = 't-001'").fetchone()
+    conn.close()
+
+    assert row["status"] == "completed"
+    assert row["summary"] == "Done"
+    assert row["verdict"] == "approve"
+    assert json.loads(row["findings"]) == ["f1"]
+    assert row["pr_number"] == 7
 
 
 # U-Q08: Submit result for nonexistent task_id → ValueError

@@ -71,8 +71,11 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            task_type_filter = _ROLE_TO_TYPE.get(role) if role else None
-            if task_type_filter:
+            if role:
+                task_type_filter = _ROLE_TO_TYPE.get(role)
+                if task_type_filter is None:
+                    conn.execute("ROLLBACK")
+                    raise ValueError(f"Unknown role: {role!r}. Must be one of {list(_ROLE_TO_TYPE)}")
                 row = conn.execute(
                     """
                     SELECT * FROM tasks
@@ -128,10 +131,11 @@ class TaskQueue:
             conn.execute(
                 """
                 UPDATE tasks
-                SET status = 'completed', summary = ?, verdict = ?, findings = ?, pr_number = ?
+                SET status = ?, summary = ?, verdict = ?, findings = ?, pr_number = ?
                 WHERE task_id = ?
                 """,
                 (
+                    result.status,
                     result.summary,
                     result.verdict,
                     json.dumps(result.findings),
