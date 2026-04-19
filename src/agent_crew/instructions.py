@@ -40,17 +40,19 @@ _ROLE_SECTIONS: dict = {
 }
 
 
-def generate(role: str, project: str, port_file: str) -> str:
+def generate(role: str, project: str, port: int) -> str:
     section = _ROLE_SECTIONS.get(role, f"## Role: {role}\n")
-    content = (_COMMON + section).replace("<project>", project).replace("<port>", port_file)
+    content = (_COMMON + section).replace("<project>", project).replace("<port>", str(port))
     return content
 
 
 def write(role: str, worktree_path: str, project: str, port_file: str) -> str:
     if role not in ROLE_FILES:
         raise ValueError(f"Unknown role: {role!r}. Must be one of {list(ROLE_FILES)}")
+    with open(port_file) as f:
+        port = int(f.read().strip())
     filename = ROLE_FILES[role]
-    content = generate(role, project, port_file)
+    content = generate(role, project, port)
     path = os.path.join(worktree_path, filename)
     with open(path, "w") as f:
         f.write(content)

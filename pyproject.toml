@@ -6,9 +6,20 @@ build-backend = "setuptools.build_meta"
 name = "agent_crew"
 version = "0.1.0"
 requires-python = ">=3.11"
+dependencies = [
+  "fastapi",
+  "uvicorn",
+  "httpx",
+  "click",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "unit: unit tests",
+  "integration: integration tests",
+  "e2e: end-to-end tests",
+]
