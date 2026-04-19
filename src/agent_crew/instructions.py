@@ -8,11 +8,12 @@ ROLE_FILES: dict = {
 
 _COMMON = """\
 # Agent Crew — <project>
-Port file: <port>
+
+## Task Queue (HTTP)
+- Receive next task: GET http://localhost:<port>/tasks/next
+- Submit result:     POST http://localhost:<port>/tasks/{id}/result
 
 ## Common Instructions
-- Read task from /tmp/multi-agent/<project>/task.md
-- Write result to /tmp/multi-agent/<project>/result.md
 - Follow TDD: write tests first, then implement
 - Commit and push when done
 """
