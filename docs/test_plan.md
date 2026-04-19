@@ -108,14 +108,16 @@
 
 | # | Test | Verify |
 |---|------|--------|
-| U-L01 | Enqueue implement task | task_type=implement, assigned to coder |
-| U-L02 | On coder completion → enqueue review task | task_type=review, assigned to reviewer |
+| U-L01 | Enqueue implement task | task_type=implement, TDD instructions in context |
+| U-L02 | On coder completion → enqueue review task | task_type=review, 3-layer checklist in context |
 | U-L03 | Review approved → enqueue test task (if tester) | task_type=test |
 | U-L04 | Review approved + --no-tester → done | Loop exits successfully |
-| U-L05 | Review request_changes → re-enqueue implement | Feedback included in context |
+| U-L05 | Review request_changes → re-enqueue implement | Review layer feedback (which of 3 layers failed) in context |
 | U-L06 | Max iterations reached → escalation gate | Gate type=escalation created |
 | U-L07 | Test passed → loop complete | Final status = success |
 | U-L08 | Test failed → re-enqueue implement | Test feedback in context |
+| U-L09 | Review verdict: tests-pass-only not sufficient | request_changes when only happy path tested |
+| U-L10 | Review feedback carries layer label | findings tagged with "test_quality" / "code_quality" / "business_gap" |
 
 ### 2.8 setup.py — `test_setup.py`
 
@@ -206,6 +208,9 @@ Uses real server (TestClient) + mock agent responses.
 | I-LO03 | Max iterations → escalation gate | 5 review cycles → gate created |
 | I-LO04 | --no-tester skips test step | implement → review(approve) → done (no test) |
 | I-LO05 | Test failure triggers re-implement | implement → review(approve) → test(fail) → implement |
+| I-LO06 | Reviewer rejects happy-path-only tests | Mock reviewer returns request_changes with finding tagged "test_quality" |
+| I-LO07 | Reviewer approves after edge cases added | Second implement adds edge case tests → reviewer approves |
+| I-LO08 | Business gap finding survives into re-implement | reviewer finding tagged "business_gap" present in next implement task context |
 
 ### 3.6 Triage + Gate — `test_triage_integration.py`
 
@@ -246,10 +251,12 @@ curl -s -X POST "http://localhost:$PORT/tasks/$TASK_ID/result" -d '{"status":"co
 
 ### 4.3 Code-Review Loop E2E — `test_e2e_loop.py`
 
+Stub coder: writes tests first, then implementation. Stub reviewer: checks 3 layers.
+
 | # | Test | Verify |
 |---|------|--------|
-| E-LO01 | `crew run "add hello.py"` → stub coder → stub reviewer approves | Task completes, PR simulated |
-| E-LO02 | `crew run` with reviewer requesting changes once | 2 implement cycles, then approved |
+| E-LO01 | `crew run "add hello.py"` → stub coder (TDD) → stub reviewer approves all 3 layers | Task completes, PR simulated |
+| E-LO02 | Stub reviewer rejects for test_quality → stub coder adds edge cases → approved | 2 implement cycles, rejection carries layer label |
 | E-LO03 | `crew run --max-iter 2` with perpetual rejection | Escalation gate created after 2 iterations |
 | E-LO04 | `crew run --no-tester` | No test task enqueued |
 

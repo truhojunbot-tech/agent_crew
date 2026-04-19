@@ -210,20 +210,31 @@ if --then-run: synthesis becomes input to code-review loop
 
 ### 2.5 Code-Review Loop
 
+TDD is the default. The coder writes failing tests first, then implements. The reviewer evaluates test quality and business logic — not just test passage.
+
 ```
 crew run "<task>"
   ↓
 Coordinator: POST /tasks (task_type=implement, assigned to coder)
   ↓
-Coder: GET /tasks/next → implement → commit → create PR → POST /tasks/{id}/result
+Coder: GET /tasks/next
+  → write failing tests (RED)
+  → implement until tests pass (GREEN)
+  → refactor
+  → commit → create PR
+  → POST /tasks/{id}/result
   ↓
 Coordinator: POST /tasks (task_type=review, assigned to reviewer)
   ↓
-Reviewer: GET /tasks/next → review PR → POST /tasks/{id}/result {verdict}
+Reviewer: GET /tasks/next → 3-layer review:
+  1. Test quality  — do tests verify requirements? edge cases? error paths?
+  2. Code quality  — architecture, readability, coupling
+  3. Business gaps — side effects, security, perf, missing requirements
+  → POST /tasks/{id}/result {verdict}
   ↓
 if approved:
   [optional] Coordinator: POST /tasks (task_type=test, assigned to tester)
-  Tester: GET /tasks/next → run tests → POST /tasks/{id}/result
+  Tester: GET /tasks/next → run full suite in clean env → POST /tasks/{id}/result
   if passed: done ✅
 if request_changes (and iter < max_iter):
   Coordinator: re-enqueue implement task with review feedback → loop

@@ -90,9 +90,23 @@ Supports multiple rounds: each round uses the previous synthesis as new context.
 
 ### 5.2 Code-Review Loop
 
-One agent implements, another reviews, optionally a third runs integration tests. Repeats until approved or max iterations reached.
+TDD is the default philosophy: the coder writes failing tests first, then implements until all tests pass. The reviewer's job is not just to verify test passage but to evaluate whether the tests themselves are meaningful.
 
-Default role assignment: `claude` (implement) → `codex` (review) → `gemini` (test). All configurable.
+**Implementation step (TDD)**:
+1. Write failing tests that capture the requirements
+2. Implement until tests pass
+3. Refactor, commit, open PR
+
+**Review step (3-layer)**:
+1. **Test coverage** — do the tests actually verify the requirements, not just pass? Are edge cases, error paths, and boundary conditions covered?
+2. **Code quality** — architecture, readability, naming, coupling
+3. **Business logic** — what the tests don't capture: side effects, security, performance, missing requirements
+
+A PR where tests pass but the tests only cover the happy path is a `request_changes`. The reviewer must explicitly check all three layers.
+
+**Tester step**: independent runner executes the full test suite in isolation to catch environment-specific failures.
+
+Repeats until approved or max iterations reached. Default role assignment: `claude` (implement) → `codex` (review) → `gemini` (test). All configurable.
 
 ---
 
@@ -319,10 +333,22 @@ POST /tasks/{id}/result with JSON body:
 ```
 
 **Agent-specific section** (appended per role):
-- **Implementer**: "You are the coder. Create a branch, implement the task, commit, and open a PR."
-- **Reviewer**: "You are the reviewer. Check out the PR branch, review the code, and submit your verdict."
-- **Tester**: "You are the tester. Run the test suite against the PR branch and report pass/fail."
-- **Panel** (discussion): "You are a panel member. Analyze the topic from your assigned perspective and submit your opinion."
+
+- **Implementer**:
+  > You are the coder. Follow TDD: write failing tests first that capture the requirements, then implement until all tests pass, then refactor. Create a branch, commit with tests and implementation together, and open a PR.
+
+- **Reviewer**:
+  > You are the reviewer. Your job is not to check if tests pass — that is the tester's job. You review three things in order:
+  > 1. **Test quality**: do the tests actually verify the requirements? Check edge cases, error paths, and boundary conditions. If the tests only cover the happy path, that is a request_changes.
+  > 2. **Code quality**: architecture, readability, naming, unnecessary coupling.
+  > 3. **Business logic gaps**: what the tests don't capture — side effects, security, performance, missing requirements.
+  > Submit verdict: "approve" only if all three layers pass.
+
+- **Tester**:
+  > You are the tester. Check out the PR branch and run the full test suite in a clean environment. Report pass/fail and any environment-specific failures not caught in the coder's local run.
+
+- **Panel** (discussion):
+  > You are a panel member. Analyze the topic from your assigned perspective and submit your opinion.
 
 ---
 
