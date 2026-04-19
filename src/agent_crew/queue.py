@@ -3,7 +3,7 @@ import sqlite3
 import time
 from typing import List, Optional
 
-from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 
 _ROLE_TO_TYPE = {
     "coder": "implement",
@@ -11,6 +11,16 @@ _ROLE_TO_TYPE = {
     "tester": "test",
     "panel": "discuss",
 }
+
+_DDL_GATES = """
+CREATE TABLE IF NOT EXISTS gates (
+    id         TEXT PRIMARY KEY,
+    type       TEXT NOT NULL,
+    message    TEXT NOT NULL,
+    status     TEXT NOT NULL DEFAULT 'pending',
+    created_at REAL NOT NULL
+)
+"""
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -35,6 +45,7 @@ class TaskQueue:
         self._db_path = db_path
         conn = self._connect()
         conn.execute(_DDL)
+        conn.execute(_DDL_GATES)
         conn.commit()
         conn.close()
 
@@ -177,6 +188,64 @@ class TaskQueue:
                     branch=r["branch"],
                     priority=r["priority"],
                     context=json.loads(r["context"]),
+                )
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def create_gate(self, gate: GateRequest) -> str:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "INSERT INTO gates (id, type, message, status, created_at) VALUES (?, ?, ?, ?, ?)",
+                (gate.id, gate.type, gate.message, "pending", gate.created_at),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return gate.id
+
+    def resolve_gate(self, gate_id: str, approved: bool) -> None:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status FROM gates WHERE id = ?", (gate_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                raise ValueError(f"Gate not found: {gate_id!r}")
+            if row["status"] in ("approved", "rejected"):
+                conn.execute("ROLLBACK")
+                raise ValueError(f"Gate {gate_id!r} is already resolved (status={row['status']!r})")
+            new_status = "approved" if approved else "rejected"
+            conn.execute("UPDATE gates SET status = ? WHERE id = ?", (new_status, gate_id))
+            conn.execute("COMMIT")
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def list_gates(self, status: str = "") -> List[GateRequest]:
+        conn = self._connect()
+        try:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM gates WHERE status = ? ORDER BY created_at ASC",
+                    (status,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM gates ORDER BY created_at ASC").fetchall()
+            return [
+                GateRequest(
+                    id=r["id"],
+                    type=r["type"],
+                    message=r["message"],
+                    status=r["status"],
+                    created_at=r["created_at"],
                 )
                 for r in rows
             ]
