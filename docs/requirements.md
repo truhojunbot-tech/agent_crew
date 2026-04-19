@@ -88,6 +88,35 @@ Each agent is assigned a **perspective**: `analyst | critic | advocate | risk` (
 
 Supports multiple rounds: each round uses the previous synthesis as new context.
 
+#### Example: Architecture → Implementation Task Breakdown
+
+The discussion loop is the recommended way to decompose an architecture document into concrete implementation tasks before coding begins.
+
+```bash
+crew discuss "Break this architecture into vertical slice implementation tasks. \
+  Each slice must be independently testable and deliver working functionality." \
+  --context docs/architecture.md \
+  --perspectives "claude:analyst,codex:critic,gemini:risk" \
+  --then-run
+```
+
+Flow:
+```
+Each agent reads architecture.md from their assigned perspective
+  → analyst: identifies natural dependency boundaries and slice order
+  → critic:  challenges slice definitions — too large? missing dependencies?
+  → risk:    flags slices where design is unclear or assumptions are wrong
+  ↓
+Coordinator synthesizes into ordered slice list with completion criteria
+  ↓
+synthesis.md contains:
+  - Slice N: "<what it delivers>" — completion criterion: "<how to verify it works>"
+  ↓
+--then-run: first slice becomes the crew run task automatically
+```
+
+This replaces ad-hoc planning conversations: the panel surfaces disagreements before a single line of code is written, and the synthesis is a concrete, verifiable task list rather than vague notes.
+
 ### 5.2 Code-Review Loop
 
 TDD is the default philosophy: the coder writes failing tests first, then implements until all tests pass. The reviewer's job is not just to verify test passage but to evaluate whether the tests themselves are meaningful.
