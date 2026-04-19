@@ -10,7 +10,7 @@ from agent_crew.discussion import (
 )
 
 
-# U-D01: enqueue_panel_tasks — agents 수만큼 task_type=discuss 태스크 등록됨
+# U-D01: enqueue_panel_tasks — agents 수만큼 task_type=discuss 태스크 등록됨, task_id 유일성 보장
 def test_u_d01_enqueue_panel_tasks():
     queue = MagicMock()
     queue.enqueue.side_effect = lambda req: req.task_id
@@ -23,11 +23,28 @@ def test_u_d01_enqueue_panel_tasks():
 
     assert len(task_ids) == 3
     assert queue.enqueue.call_count == 3
+    assert len(set(task_ids)) == 3, "task_id must be unique across agents"
 
     for c in queue.enqueue.call_args_list:
         req = c[0][0]
         assert req.task_type == "discuss"
         assert topic in req.description
+
+
+# U-D01b: enqueue_panel_tasks — multi-round 호출 시 task_id 충돌 없음
+def test_u_d01b_enqueue_panel_tasks_multi_round_unique():
+    queue = MagicMock()
+    all_ids = []
+    queue.enqueue.side_effect = lambda req: (all_ids.append(req.task_id) or req.task_id)
+
+    agents = ["claude", "codex"]
+    topic = "topic"
+    context = {}
+
+    enqueue_panel_tasks(queue, agents, topic, context)
+    enqueue_panel_tasks(queue, agents, topic, context)
+
+    assert len(set(all_ids)) == len(all_ids), "task_ids must be globally unique across rounds"
 
 
 # U-D02: assign_perspectives (default) — DEFAULT_PERSPECTIVES 라운드로빈 할당
@@ -50,20 +67,32 @@ def test_u_d03_assign_perspectives_custom():
     assert result["b"] == "business"
 
 
-# U-D04: build_synthesis — 모든 패널 의견 포함된 synthesis.md 문자열 생성
+# U-D04: build_synthesis — synthesis.md 계약 섹션 헤더 포함 검증
 def test_u_d04_build_synthesis():
     results = [
         {"agent": "claude", "perspective": "analyst", "summary": "We need more data."},
         {"agent": "codex", "perspective": "critic", "summary": "This approach has risks."},
     ]
-    synthesis = build_synthesis(results)
+    synthesis = build_synthesis(
+        results,
+        topic="Adopt microservices?",
+        synthesis="Balance risk and speed.",
+        decision="Proceed with pilot.",
+    )
 
+    assert "## Topic" in synthesis
+    assert "Adopt microservices?" in synthesis
+    assert "## Panel Opinions" in synthesis
     assert "claude" in synthesis
     assert "codex" in synthesis
     assert "analyst" in synthesis
     assert "critic" in synthesis
     assert "We need more data." in synthesis
     assert "This approach has risks." in synthesis
+    assert "## Synthesis" in synthesis
+    assert "Balance risk and speed." in synthesis
+    assert "## Decision" in synthesis
+    assert "Proceed with pilot." in synthesis
 
 
 # U-D05: multi_round — round 2 context에 round 1 synthesis 포함됨
