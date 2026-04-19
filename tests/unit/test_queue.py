@@ -136,6 +136,15 @@ def test_u_q08_submit_result_nonexistent(q):
         q.submit_result("ghost", res)
 
 
+# U-Q08b: Submit result where result.task_id != task_id argument → ValueError
+def test_u_q08b_submit_result_task_id_mismatch(q):
+    q.enqueue(make_task("t-001"))
+    q.dequeue()
+    res = TaskResult(task_id="other-id", status="completed", summary="mismatch")
+    with pytest.raises(ValueError, match="task_id mismatch"):
+        q.submit_result("t-001", res)
+
+
 # U-Q09: Cancel task → status=cancelled, dequeue 시 반환 안 됨
 def test_u_q09_cancel_task(q):
     q.enqueue(make_task())
