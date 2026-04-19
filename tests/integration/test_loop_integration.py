@@ -12,12 +12,13 @@ from agent_crew.loop import (
     DEFAULT_MAX_ITER,
     build_feedback,
     enqueue_implement,
+    enqueue_implement_with_feedback,
     enqueue_review,
     enqueue_test,
     handle_review_result,
     handle_test_result,
 )
-from agent_crew.protocol import GateRequest, TaskResult
+from agent_crew.protocol import TaskResult
 
 
 pytestmark = pytest.mark.integration
@@ -112,6 +113,7 @@ def test_i_lo03_max_iterations_escalate(task_queue, test_client):
         outcome = handle_review_result(
             _make_result(review_id, verdict="request_changes"),
             iteration=i, max_iter=DEFAULT_MAX_ITER,
+            queue=task_queue,
         )
         if i < DEFAULT_MAX_ITER:
             assert outcome == "request_changes"
@@ -119,13 +121,10 @@ def test_i_lo03_max_iterations_escalate(task_queue, test_client):
             _submit(test_client, prev_id, summary=f"Attempt {i + 1}")
         else:
             assert outcome == "escalate"
-            # escalation gate 생성
-            gate = GateRequest(id="gate-lo03", type="escalation",
-                               message=f"Review loop exceeded {DEFAULT_MAX_ITER} iterations")
-            gate_id = task_queue.create_gate(gate)
+            # gate auto-created by handle_review_result — verify via HTTP
             resp = test_client.get("/gates/pending")
-            pending_ids = {g["id"] for g in resp.json()}
-            assert gate_id in pending_ids
+            pending = resp.json()
+            assert any("escalation" in g.get("type", "") for g in pending)
 
 
 # I-LO04: --no-tester → implement → review(approve) → done, no test enqueued
@@ -136,13 +135,15 @@ def test_i_lo04_no_tester(task_queue, test_client):
     review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
     _submit(test_client, review_id, summary="LGTM", verdict="approve")
 
+    # pass queue so auto-enqueue logic runs; no_tester=True must suppress it
     outcome = handle_review_result(
         _make_result(review_id, verdict="approve"),
         iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=True,
+        queue=task_queue, task_desc=DESC, branch=BRANCH,
     )
     assert outcome == "approved"
 
-    # test task가 enqueue되지 않았음을 확인
+    # queue에 test task가 없음을 확인 (no_tester=True가 enqueue 억제)
     resp = test_client.get("/tasks", params={"status": "pending"})
     pending = resp.json()
     assert not any(t["task_type"] == "test" for t in pending)
@@ -230,11 +231,13 @@ def test_i_lo08_business_gap_in_context(task_queue, test_client):
     _submit(test_client, review_id, verdict="request_changes", findings=gap_findings)
 
     result = _make_result(review_id, verdict="request_changes", findings=gap_findings)
+
+    # build_feedback가 [business_gap] prefix를 생성하는지 확인
     feedback = build_feedback(result)
     assert "[business_gap]" in feedback
 
-    # feedback은 다음 implement의 context에 포함됨
-    impl_id2 = enqueue_implement(task_queue, DESC, BRANCH, context={"feedback": feedback})
+    # enqueue_implement_with_feedback가 feedback을 context에 자동 carryover
+    impl_id2 = enqueue_implement_with_feedback(task_queue, DESC, BRANCH, result)
 
     resp = test_client.get(f"/tasks/{impl_id2}")
     assert resp.status_code == 200
