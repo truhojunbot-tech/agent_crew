@@ -1,3 +1,4 @@
+import os
 from contextlib import asynccontextmanager
 from typing import Literal
 
@@ -90,3 +91,6 @@ def create_app(db_path: str) -> FastAPI:
         return {"status": "resolved"}
 
     return app
+
+
+app = create_app(os.getenv("AGENT_CREW_DB", "/tmp/agent_crew_default.db"))
