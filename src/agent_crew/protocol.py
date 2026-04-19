@@ -19,6 +19,8 @@ class TaskRequest:
     def __post_init__(self):
         if self.task_type not in _VALID_TASK_TYPES:
             raise ValueError(f"Invalid task_type: {self.task_type!r}. Must be one of {_VALID_TASK_TYPES}")
+        if not (1 <= self.priority <= 5):
+            raise ValueError(f"Invalid priority: {self.priority!r}. Must be between 1 and 5")
 
 
 @dataclass

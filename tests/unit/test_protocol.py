@@ -71,3 +71,20 @@ def test_u_p05_gate_request_valid_construction():
 def test_u_p06_gate_request_rejects_invalid_type():
     with pytest.raises(ValueError):
         GateRequest(id="g-002", type="invalid", message="bad")
+
+
+def test_u_p07_task_request_rejects_priority_zero():
+    with pytest.raises(ValueError):
+        TaskRequest(task_id="t-007", task_type="implement", description="bad", priority=0)
+
+
+def test_u_p08_task_request_rejects_priority_six():
+    with pytest.raises(ValueError):
+        TaskRequest(task_id="t-008", task_type="implement", description="bad", priority=6)
+
+
+def test_u_p09_task_request_accepts_boundary_priorities():
+    req_low = TaskRequest(task_id="t-009a", task_type="implement", description="low", priority=1)
+    assert req_low.priority == 1
+    req_high = TaskRequest(task_id="t-009b", task_type="implement", description="high", priority=5)
+    assert req_high.priority == 5
