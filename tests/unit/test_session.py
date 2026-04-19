@@ -1,6 +1,6 @@
 import json
-from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock, call, patch
+import time
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -18,7 +18,7 @@ from agent_crew.session import (
 
 
 def make_agent(name="claude", pane=1, hours_ago=0, failures=0):
-    started = (datetime.now(timezone.utc) - timedelta(hours=hours_ago)).isoformat()
+    started = time.time() - hours_ago * 3600
     return {
         "name": name,
         "pane": pane,
@@ -52,10 +52,11 @@ def test_u_s02_save_sessions(tmp_path):
     assert "agents" in data
     assert len(data["agents"]) == 1
     assert data["agents"][0]["name"] == "claude"
+    assert isinstance(data["agents"][0]["started_at"], float)
 
 
 # U-S03: Refresh needed — age > SESSION_MAX_HOURS → True
-def test_u_s03_refresh_needed_age(tmp_path):
+def test_u_s03_refresh_needed_age():
     agent = make_agent(hours_ago=SESSION_MAX_HOURS + 1)
     assert refresh_needed(agent) is True
 
@@ -77,24 +78,21 @@ def test_u_s06_increment_failure():
     agent = make_agent(failures=1)
     updated = increment_failure(agent)
     assert updated["failures"] == 2
-    assert agent["failures"] == 1  # original unchanged
+    assert agent["failures"] == 1
     assert updated is not agent
 
 
-# U-S07: Reset after refresh — started_at=now, failures=0
+# U-S07: Reset after refresh — started_at=now (epoch float), failures=0
 def test_u_s07_reset_session():
     agent = make_agent(hours_ago=10, failures=3)
-    before = datetime.now(timezone.utc)
+    before = time.time()
     updated = reset_session(agent)
-    after = datetime.now(timezone.utc)
+    after = time.time()
 
     assert updated["failures"] == 0
     assert updated is not agent
-    started = datetime.fromisoformat(updated["started_at"])
-    # normalize to UTC if naive
-    if started.tzinfo is None:
-        started = started.replace(tzinfo=timezone.utc)
-    assert before <= started <= after
+    assert isinstance(updated["started_at"], float)
+    assert before <= updated["started_at"] <= after
 
 
 # U-S08: Health check — pane alive (mock tmux) → True
@@ -125,7 +123,7 @@ def test_u_s09_health_check_dead():
     assert result is False
 
 
-# U-S10: Refresh uses cmd from sessions.json — correct tmux send-keys called
+# U-S10: Refresh uses cmd from sessions.json — correct tmux send-keys command called
 def test_u_s10_refresh_pane_uses_cmd():
     agent = make_agent(pane=2)
     agent["cmd"] = "claude --dangerously-skip-permissions --continue"
@@ -138,3 +136,14 @@ def test_u_s10_refresh_pane_uses_cmd():
     assert "tmux" in args
     assert "send-keys" in args
     assert agent["cmd"] in args
+
+
+# U-S03b: started_at as ISO-8601 string also supported
+def test_u_s03b_refresh_needed_iso_string():
+    from datetime import datetime, timedelta, timezone
+    old_iso = (datetime.now(timezone.utc) - timedelta(hours=SESSION_MAX_HOURS + 1)).isoformat()
+    agent = {
+        "name": "claude", "pane": 1,
+        "cmd": "cmd", "started_at": old_iso, "failures": 0,
+    }
+    assert refresh_needed(agent) is True
