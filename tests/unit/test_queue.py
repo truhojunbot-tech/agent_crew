@@ -178,15 +178,20 @@ def make_gate(gate_id="g-001", gate_type="approval", message="Please approve"):
     return GateRequest(id=gate_id, type=gate_type, message=message)
 
 
-# U-Q11: Persistence — TaskQueue 재연결 후 기존 task 살아있는지
+# U-Q11: Persistence — TaskQueue 재연결 후 task와 gate 모두 살아있는지
 def test_u_q11_persistence(tmp_path):
     db = str(tmp_path / "persist.db")
     q1 = TaskQueue(db)
     q1.enqueue(make_task("t-persist"))
+    q1.create_gate(make_gate("g-persist"))
     q2 = TaskQueue(db)
     tasks = q2.list_tasks()
     assert len(tasks) == 1
     assert tasks[0].task_id == "t-persist"
+    gates = q2.list_gates()
+    assert len(gates) == 1
+    assert gates[0].id == "g-persist"
+    assert gates[0].status == "pending"
 
 
 # U-Q12: Gate create → status=pending
