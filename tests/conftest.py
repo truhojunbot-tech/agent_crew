@@ -35,6 +35,18 @@ def tmux_session():
 
 
 @pytest.fixture
+def resolve_approved():
+    """Valid resolve body approving a gate — {"status": "approved"}."""
+    return {"status": "approved"}
+
+
+@pytest.fixture
+def resolve_rejected():
+    """Valid resolve body rejecting a gate — {"status": "rejected"}."""
+    return {"status": "rejected"}
+
+
+@pytest.fixture
 def stub_agents(tmp_path):
     scripts = {}
     for agent in ["claude", "codex"]:

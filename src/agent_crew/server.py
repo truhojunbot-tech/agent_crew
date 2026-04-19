@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -8,7 +9,7 @@ from agent_crew.queue import TaskQueue
 
 
 class ResolveBody(BaseModel):
-    approved: bool
+    status: Literal["approved", "rejected"]
 
 
 def create_app(db_path: str) -> FastAPI:
@@ -83,7 +84,7 @@ def create_app(db_path: str) -> FastAPI:
     @app.post("/gates/{gate_id}/resolve", status_code=200)
     def resolve_gate(gate_id: str, body: ResolveBody):
         try:
-            q().resolve_gate(gate_id, body.approved)
+            q().resolve_gate(gate_id, approved=body.status == "approved")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"status": "resolved"}
