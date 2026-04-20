@@ -2,7 +2,13 @@ from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
-from agent_crew.cli import _capture_pane, _pane_looks_idle, crew
+from agent_crew.cli import (
+    _capture_pane,
+    _check_window_width_fits,
+    _pane_looks_idle,
+    _required_window_width,
+    crew,
+)
 
 
 # U-C01: crew --help → exit 0, 서브커맨드 목록 포함
@@ -88,3 +94,31 @@ def test_u_c10_capture_pane_failure():
     with patch("agent_crew.cli.subprocess.run", return_value=mock_result):
         output = _capture_pane("%42")
     assert output is None
+
+
+# U-C11: _required_window_width — coordinator + N agents each need MIN_PANE_WIDTH
+def test_u_c11_required_window_width():
+    # 1 agent => coordinator + 1 = 2 * 60 = 120
+    assert _required_window_width(1) == 120
+    # 3 agents => 4 * 60 = 240
+    assert _required_window_width(3) == 240
+
+
+# U-C12: _check_window_width_fits — window too narrow (Bug #1 repro)
+def test_u_c12_check_window_width_fits_rejects_narrow():
+    msg = _check_window_width_fits(window_width=80, num_agents=3)
+    assert msg  # non-empty error
+    assert "80" in msg
+    assert "240" in msg
+    assert "Maximize" in msg or "wider" in msg
+
+
+# U-C13: _check_window_width_fits — window wide enough → empty string
+def test_u_c13_check_window_width_fits_allows_wide():
+    assert _check_window_width_fits(window_width=240, num_agents=3) == ""
+    assert _check_window_width_fits(window_width=500, num_agents=3) == ""
+
+
+# U-C14: unknown width (tmux probe failed) → empty string (don't block setup)
+def test_u_c14_check_window_width_fits_unknown_ok():
+    assert _check_window_width_fits(window_width=0, num_agents=3) == ""

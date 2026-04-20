@@ -101,6 +101,28 @@ _STATUS_ALIASES = (
     ("done", "completed"),
 )
 
+_MIN_PANE_WIDTH = 60
+
+
+def _required_window_width(num_agents: int) -> int:
+    """Coordinator + each agent pane must be at least _MIN_PANE_WIDTH cols."""
+    return _MIN_PANE_WIDTH * (num_agents + 1)
+
+
+def _check_window_width_fits(window_width: int, num_agents: int) -> str:
+    """Return an error message if the window can't host the requested crew,
+    or an empty string if it fits (or width is unknown / 0)."""
+    if not window_width:
+        return ""
+    required = _required_window_width(num_agents)
+    if window_width >= required:
+        return ""
+    return (
+        f"tmux window is {window_width} cols wide but {num_agents} agents need "
+        f"at least {required} cols (>={_MIN_PANE_WIDTH}/pane incl. coordinator). "
+        f"Maximize the terminal, close other panes, or run setup in a wider window."
+    )
+
 
 def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
     import urllib.request
@@ -133,6 +155,26 @@ def setup(project: str, agents: str, base: str):
     proj_dir = _proj_dir(base, project)
     os.makedirs(proj_dir, exist_ok=True)
     _crew_log(proj_dir, f"setup START agents={agent_list}")
+
+    # Pre-flight: tmux window must be wide enough for coordinator + N agent panes.
+    # main-vertical layout allocates ~half the window to the coordinator and
+    # splits the rest across agents. In an 80-col window with 3 agents, each
+    # agent pane ends up ~1 char wide — the agent CLI typing gets wrapped
+    # per-character and nothing ever boots. Refuse early, before worktrees.
+    _tmux_pane_env = os.environ.get("TMUX_PANE", "")
+    _dm_target = ["-t", _tmux_pane_env] if _tmux_pane_env else []
+    _ww = subprocess.run(
+        ["tmux", "display-message", "-p"] + _dm_target + ["#{window_width}"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    try:
+        _window_width = int(_ww)
+    except ValueError:
+        _window_width = 0
+    _crew_log(proj_dir, f"preflight window_width={_window_width} required={_required_window_width(len(agent_list))}")
+    _err = _check_window_width_fits(_window_width, len(agent_list))
+    if _err:
+        raise click.ClickException(_err)
 
     # Worktrees
     worktrees = setup_module.create_worktrees(project, base, agent_list)
@@ -185,6 +227,36 @@ def setup(project: str, agents: str, base: str):
         capture_output=True, text=True,
     )
     _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
+
+    # Post-layout width check — if any agent pane landed below MIN_PANE_WIDTH
+    # (e.g. the coordinator hogged width because of other neighbors we didn't
+    # see), kill the splits and fail cleanly rather than leaving a broken setup.
+    narrow_panes: list[tuple[str, int]] = []
+    for pid in pane_ids:
+        pw = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pid, "#{pane_width}"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        try:
+            width = int(pw)
+        except ValueError:
+            width = 0
+        if width and width < _MIN_PANE_WIDTH:
+            narrow_panes.append((pid, width))
+    if narrow_panes:
+        for pid in pane_ids:
+            subprocess.run(["tmux", "kill-pane", "-t", pid], capture_output=True)
+        for wt_path in worktrees.values():
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", wt_path],
+                capture_output=True,
+            )
+        details = ", ".join(f"{pid}={w}" for pid, w in narrow_panes)
+        raise click.ClickException(
+            f"tmux produced panes narrower than {_MIN_PANE_WIDTH} cols after layout ({details}). "
+            f"Agent CLIs will not boot at this width. Split-panes and worktrees were cleaned up. "
+            f"Widen the terminal or run setup in a fresh window."
+        )
 
     # Write pane_map.json — server reads this at startup for push routing.
     # Two key flavors share one dict:
