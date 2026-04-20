@@ -286,13 +286,21 @@ def status(project: str, base: str):
             tasks = task_groups[display_status]
             click.echo(f"\n{display_status.upper()} ({len(tasks)}):")
             for t in tasks:
-                if isinstance(t, dict):
-                    click.echo(f"  [{t.get('task_id', '?')}] {t.get('description', '')[:60]}")
-                else:
-                    tid = getattr(t, "task_id", "?")
-                    desc = getattr(t, "description", "")
-                    click.echo(f"  [{tid}] {str(desc)[:60]}")
+                def _get(key, default=None):
+                    if isinstance(t, dict):
+                        return t.get(key, default)
+                    return getattr(t, key, default)
+                tid = _get("task_id") or "?"
+                ttype = _get("task_type") or "?"
+                prio = _get("priority")
+                desc = str(_get("description") or "")[:50]
+                ctx = _get("context") or {}
+                agent = ""
+                if isinstance(ctx, dict) and ctx.get("agent"):
+                    agent = f" @{ctx['agent']}"
+                click.echo(f"  [{tid}] p{prio} {ttype}{agent} — {desc}")
 
+    click.echo("\nPanes:")
     pane_targets = state.get("pane_ids") or [
         f"{session_name}:0.{i}" for i in range(len(agent_list))
     ]
@@ -302,7 +310,7 @@ def status(project: str, base: str):
             capture_output=True,
         )
         alive = result.returncode == 0
-        click.echo(f"  {agent}: {'alive' if alive else 'dead'}")
+        click.echo(f"  {agent} ({target}): {'alive' if alive else 'dead'}")
 
 
 @crew.command()
