@@ -48,6 +48,31 @@ def _port_listening(port: int, timeout: float = 5.0) -> bool:
     return False
 
 
+_PANE_IDLE_PATTERNS = [
+    "$",            # shell prompt (agent CLI exited)
+    "❯",            # zsh prompt
+    ">>>",          # python repl
+    "Completed",    # common completion signal
+]
+
+
+def _capture_pane(session_name: str, pane_index: int) -> str | None:
+    """Capture last 5 lines of a tmux pane. Returns None if tmux fails."""
+    result = subprocess.run(
+        ["tmux", "capture-pane", "-t", f"{session_name}:{pane_index}", "-p", "-l", "5"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _pane_looks_idle(pane_output: str) -> bool:
+    """Heuristic: does the pane output suggest the agent is idle/done?"""
+    last_line = pane_output.rstrip().rsplit("\n", 1)[-1] if pane_output.strip() else ""
+    return any(pat in last_line for pat in _PANE_IDLE_PATTERNS)
+
+
 @click.group()
 def crew():
     """agent_crew — multi-agent development crew CLI."""
@@ -316,13 +341,40 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     wait_timeout = float(timeout)
 
+    # Resolve session info for pane capture fallback
+    session_name = ""
+    if project:
+        st = _read_state(base, project)
+        if st:
+            session_name = st.get("session", "")
+
     def _wait(task_id: str):
         deadline = time.time() + wait_timeout
+        fallback_start = time.time() + 30  # grace period before pane checks
+        pane_idle_count = 0
         while time.time() < deadline:
             result = queue.get_result(task_id)
             if result is not None:
                 return result
-            time.sleep(0.5)
+            # Pane capture fallback: after 30s, check every 10s
+            if session_name and time.time() > fallback_start:
+                pane_out = _capture_pane(session_name, 0)
+                if pane_out and _pane_looks_idle(pane_out):
+                    pane_idle_count += 1
+                    if pane_idle_count >= 3:
+                        click.echo(
+                            f"Warning: agent pane looks idle but task {task_id!r} "
+                            f"has no API result. Agent may have missed POST."
+                        )
+                        raise click.ClickException(
+                            f"task {task_id!r}: agent appears idle without submitting result. "
+                            f"Check pane manually or re-run."
+                        )
+                else:
+                    pane_idle_count = 0
+                time.sleep(10)
+            else:
+                time.sleep(0.5)
         raise click.ClickException(f"task {task_id!r} timed out after {wait_timeout}s")
 
     impl_id = enqueue_implement(queue, task, branch)
