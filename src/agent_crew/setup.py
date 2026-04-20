@@ -69,10 +69,16 @@ def start_agents_in_panes(
         polling_prompt = (
             f"You are agent '{agent}' (role: {role}). "
             f"Run this background polling loop using bash tool: "
-            f"while true; do RESP=$(curl -sf 'http://127.0.0.1:{port}/tasks/next?role={role}'); "
-            f"if [ -n \"$RESP\" ]; then echo \"NEW_TASK: $RESP\"; fi; sleep 30; done & "
-            f"When you see NEW_TASK output, process it and POST the result to "
-            f"http://127.0.0.1:{port}/tasks/{{id}}/result . Start the loop now."
+            f"while true; do "
+            f"RESP=$(curl -sf 'http://127.0.0.1:{port}/tasks/next?role={role}'); "
+            f"if [ -n \"$RESP\" ] && [ \"$RESP\" != \"null\" ]; then "
+            f"TASK_ID=$(echo \"$RESP\" | python3 -c \"import sys,json;d=json.load(sys.stdin);print(d.get('task_id',''))\"); "
+            f"DESC=$(echo \"$RESP\" | python3 -c \"import sys,json;d=json.load(sys.stdin);print(d.get('description',''))\"); "
+            f"echo \"=== TASK_ASSIGNED task_id=$TASK_ID ===\"; "
+            f"echo \"description: $DESC\"; "
+            f"echo \"POST when done: curl -X POST http://127.0.0.1:{port}/tasks/$TASK_ID/result -H 'Content-Type: application/json' -d '{{\\\"task_id\\\":\\\"'$TASK_ID'\\\",\\\"status\\\":\\\"completed\\\",\\\"summary\\\":\\\"<summary>\\\"}}'\"; "
+            f"fi; sleep 30; done & "
+            f"When you see TASK_ASSIGNED output, immediately process the task and run the POST curl shown. Start the loop now."
         )
         _send_literal_text(target, polling_prompt)
         time.sleep(1)

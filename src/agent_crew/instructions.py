@@ -18,13 +18,17 @@ Start this background loop immediately when the session starts. Keep it running 
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=<role>')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK received"
-    # Process the task here
+  if [ -n "$RESP" ] && [ "$RESP" != "null" ]; then
+    TASK_ID=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('task_id',''))")
+    DESC=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('description',''))")
+    echo "=== TASK_ASSIGNED task_id=$TASK_ID ==="
+    echo "description: $DESC"
+    echo "POST when done: curl -X POST http://localhost:<port>/tasks/$TASK_ID/result -H 'Content-Type: application/json' -d '{\"task_id\":\"'$TASK_ID'\",\"status\":\"completed\",\"summary\":\"<summary>\"}'"
   fi
   sleep 30
 done &
 ```
+When you see TASK_ASSIGNED output, immediately process the task and run the POST curl shown.
 
 ## Result Submission (MANDATORY)
 After completing any task, you MUST call the API POST request below before doing anything else:
@@ -70,9 +74,12 @@ _ROLE_SECTIONS: dict = {
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=implementer')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK: $RESP"
-    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  if [ -n "$RESP" ] && [ "$RESP" != "null" ]; then
+    TASK_ID=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('task_id',''))")
+    DESC=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('description',''))")
+    echo "=== TASK_ASSIGNED task_id=$TASK_ID ==="
+    echo "description: $DESC"
+    echo "POST when done: curl -X POST http://localhost:<port>/tasks/$TASK_ID/result -H 'Content-Type: application/json' -d '{\"task_id\":\"'$TASK_ID'\",\"status\":\"completed\",\"summary\":\"<summary>\"}'"
   fi
   sleep 30
 done &
@@ -88,9 +95,12 @@ done &
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=reviewer')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK: $RESP"
-    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  if [ -n "$RESP" ] && [ "$RESP" != "null" ]; then
+    TASK_ID=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('task_id',''))")
+    DESC=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('description',''))")
+    echo "=== TASK_ASSIGNED task_id=$TASK_ID ==="
+    echo "description: $DESC"
+    echo "POST when done: curl -X POST http://localhost:<port>/tasks/$TASK_ID/result -H 'Content-Type: application/json' -d '{\"task_id\":\"'$TASK_ID'\",\"status\":\"completed\",\"summary\":\"<summary>\"}'"
   fi
   sleep 30
 done &
@@ -106,9 +116,12 @@ done &
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=tester')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK: $RESP"
-    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  if [ -n "$RESP" ] && [ "$RESP" != "null" ]; then
+    TASK_ID=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('task_id',''))")
+    DESC=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('description',''))")
+    echo "=== TASK_ASSIGNED task_id=$TASK_ID ==="
+    echo "description: $DESC"
+    echo "POST when done: curl -X POST http://localhost:<port>/tasks/$TASK_ID/result -H 'Content-Type: application/json' -d '{\"task_id\":\"'$TASK_ID'\",\"status\":\"completed\",\"summary\":\"<summary>\"}'"
   fi
   sleep 30
 done &

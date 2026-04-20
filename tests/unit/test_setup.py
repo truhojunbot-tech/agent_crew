@@ -130,3 +130,21 @@ def test_u_se11_codex_trust_prompt_auto_answered():
         if "-l" in call[0][0]
     ]
     assert "1" in all_texts
+
+
+# U-SE12: polling prompt parses task_id and null-checks response
+def test_u_se12_polling_prompt_parses_task_id_and_null_checks():
+    mock_result = MagicMock(returncode=0)
+    with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
+         patch("agent_crew.setup.time.sleep"):
+        start_agents_in_panes("crew", ["claude"], 8100)
+
+    all_literal_texts = [
+        call[0][0][-1]
+        for call in mock_run.call_args_list
+        if "-l" in call[0][0]
+    ]
+    combined = " ".join(all_literal_texts)
+    assert "task_id" in combined
+    assert "null" in combined
+    assert "/result" in combined

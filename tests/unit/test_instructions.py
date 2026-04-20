@@ -15,3 +15,11 @@ def test_u_i01_generate_includes_polling_and_result_submission():
     assert "completed" in content
     assert "failed" in content
     assert "needs_human" in content
+
+
+# U-I12: polling routine parses task_id and null-checks before processing
+def test_u_i12_generate_polling_parses_task_id_and_null_checks():
+    content = generate("implementer", "myproject", 8123)
+    assert "task_id" in content
+    assert "null" in content
+    assert "/result" in content
