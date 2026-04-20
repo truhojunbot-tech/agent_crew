@@ -74,16 +74,17 @@ def test_u_c08_pane_looks_idle_active():
 def test_u_c09_capture_pane_success():
     mock_result = MagicMock(returncode=0, stdout="line1\nline2\n$ ")
     with patch("agent_crew.cli.subprocess.run", return_value=mock_result) as mock_run:
-        output = _capture_pane("crew_test", 0)
+        output = _capture_pane("%42")
     assert output == "line1\nline2\n$ "
     args = mock_run.call_args[0][0]
     assert "tmux" in args
     assert "capture-pane" in args
+    assert "%42" in args
 
 
 # U-C10: _capture_pane — tmux not available
 def test_u_c10_capture_pane_failure():
     mock_result = MagicMock(returncode=1, stdout="")
     with patch("agent_crew.cli.subprocess.run", return_value=mock_result):
-        output = _capture_pane("crew_test", 0)
+        output = _capture_pane("%42")
     assert output is None

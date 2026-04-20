@@ -32,22 +32,25 @@ After completing any task, you MUST call the API POST request below before doing
 curl -X POST http://localhost:<port>/tasks/{id}/result \\
   -H "Content-Type: application/json" \\
   -d '{
-    "status": "done",
-    "branch": "<branch>",
-    "commit": "<commit_hash>",
-    "notes": "<any issues or observations>"
+    "task_id": "<id>",
+    "status": "completed",
+    "summary": "<short summary of what was done>"
   }'
 ```
-Status values: done | blocked | needs_clarification
+Required fields: `task_id`, `status`, `summary`.
+Status values (accepted by the API): `completed` | `failed` | `needs_human`.
+Review tasks may additionally include `verdict` (`approve` | `request_changes`) and `findings` (list of strings).
 
 ### Result Note Template
 Use this structure for the handoff note you write before the API POST:
 ```text
-status: done | blocked | needs_clarification
+status: completed | failed | needs_human
+summary: <short description of outcome>
 branch: <branch-name>
 commit: <commit-hash>
-notes: <short summary of what changed or why blocked>
+notes: <context or follow-up details>
 ```
+`branch`, `commit`, and `notes` are for your own log — the API accepts them via `summary` text.
 Never skip the POST request just because the note is complete.
 
 ## Common Instructions

@@ -10,4 +10,8 @@ def test_u_i01_generate_includes_polling_and_result_submission():
     assert "Result Note Template" in content
     assert "branch: <branch-name>" in content
     assert "commit: <commit-hash>" in content
-    assert "notes: <short summary of what changed or why blocked>" in content
+    assert "notes: <context or follow-up details>" in content
+    # API-aligned status values must be present
+    assert "completed" in content
+    assert "failed" in content
+    assert "needs_human" in content

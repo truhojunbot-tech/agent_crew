@@ -56,10 +56,11 @@ _PANE_IDLE_PATTERNS = [
 ]
 
 
-def _capture_pane(session_name: str, pane_index: int) -> str | None:
-    """Capture last 5 lines of a tmux pane. Returns None if tmux fails."""
+def _capture_pane(target: str) -> str | None:
+    """Capture last 5 lines of a tmux pane. target is a pane_id (e.g. '%42')
+    or a session:window.pane spec. Returns None if tmux fails."""
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", f"{session_name}:0.{pane_index}", "-p", "-l", "5"],
+        ["tmux", "capture-pane", "-t", target, "-p", "-S", "-5"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -186,6 +187,8 @@ def setup(project: str, agents: str, base: str):
         "port": port,
         "port_file": port_file,
         "session": session_name,
+        "window": window_index,
+        "pane_ids": pane_ids,
         "agents": agent_list,
         "worktrees": worktrees,
         "db": db_file,
@@ -231,9 +234,12 @@ def status(project: str, base: str):
                     desc = getattr(t, "description", "")
                     click.echo(f"  [{tid}] {str(desc)[:60]}")
 
-    for i, agent in enumerate(agent_list):
+    pane_targets = state.get("pane_ids") or [
+        f"{session_name}:0.{i}" for i in range(len(agent_list))
+    ]
+    for agent, target in zip(agent_list, pane_targets):
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", f"{session_name}:0.{i}", "-p"],
+            ["tmux", "capture-pane", "-t", target, "-p"],
             capture_output=True,
         )
         alive = result.returncode == 0
@@ -287,12 +293,18 @@ def recover(project: str, base: str):
     ).returncode == 0
 
     if not has_session:
-        # Re-split panes in current window (no new session)
-        window_index = subprocess.run(
-            ["tmux", "display-message", "-p", "#I"],
+        # Original session is gone — fall back to current tmux session/window.
+        current = subprocess.run(
+            ["tmux", "display-message", "-p", "#S:#I"],
             capture_output=True, text=True,
-        ).stdout.strip() or "0"
-        window_target = f"{session_name}:{window_index}"
+        )
+        if current.returncode != 0 or not current.stdout.strip():
+            raise click.ClickException(
+                f"tmux session {session_name!r} missing and not running inside tmux. "
+                f"Start a tmux session and re-run recover."
+            )
+        cur_session, _, cur_window = current.stdout.strip().partition(":")
+        window_target = f"{cur_session}:{cur_window or '0'}"
         pane_ids: list[str] = []
         for _, wt_path in worktrees.items():
             result = subprocess.run(
@@ -309,11 +321,15 @@ def recover(project: str, base: str):
         )
         if pane_ids:
             setup_module.start_agents_in_panes(
-                session_name,
+                cur_session,
                 state.get("agents", []),
                 port,
                 pane_targets=pane_ids,
             )
+            state["session"] = cur_session
+            state["window"] = cur_window or "0"
+            state["pane_ids"] = pane_ids
+            _write_state(base, project, state)
         recovered.append("tmux")
 
     if recovered:
@@ -420,12 +436,17 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     wait_timeout = float(timeout)
 
-    # Resolve session info for pane capture fallback
-    session_name = ""
+    # Resolve pane info for pane capture fallback
+    first_pane_target = ""
     if project:
         st = _read_state(base, project)
         if st:
-            session_name = st.get("session", "")
+            pane_ids = st.get("pane_ids") or []
+            session_name_st = st.get("session", "")
+            if pane_ids:
+                first_pane_target = pane_ids[0]
+            elif session_name_st:
+                first_pane_target = f"{session_name_st}:0.0"
 
     def _wait(task_id: str):
         deadline = time.time() + wait_timeout
@@ -436,8 +457,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
             if result is not None:
                 return result
             # Pane capture fallback: after 30s, check every 10s
-            if session_name and time.time() > fallback_start:
-                pane_out = _capture_pane(session_name, 0)
+            if first_pane_target and time.time() > fallback_start:
+                pane_out = _capture_pane(first_pane_target)
                 if pane_out and _pane_looks_idle(pane_out):
                     pane_idle_count += 1
                     if pane_idle_count >= 3:
