@@ -51,11 +51,22 @@ def start_agents_in_panes(
         role = _AGENT_TO_ROLE.get(agent, "implementer")
         polling_prompt = (
             f"You are agent '{agent}' (role: {role}). "
-            f"Run this background polling loop using bash tool: "
-            f"while true; do RESP=$(curl -sf 'http://127.0.0.1:{port}/tasks/next?role={role}'); "
-            f"if [ -n \"$RESP\" ]; then echo \"NEW_TASK: $RESP\"; fi; sleep 30; done & "
-            f"When you see NEW_TASK output, process it and POST the result to "
-            f"http://127.0.0.1:{port}/tasks/{{id}}/result . Start the loop now."
+            f"Start a background polling loop with bash tool now — copy this exactly: "
+            f"while true; do "
+            f"RESP=$(curl -sf 'http://127.0.0.1:{port}/tasks/next?role={role}'); "
+            f"if [ -n \"$RESP\" ] && [ \"$RESP\" != \"null\" ]; then "
+            f"TF=$(mktemp /tmp/agent_task_XXXXXX.json); "
+            f"echo \"$RESP\" > \"$TF\"; "
+            f"echo \"=== AGENT_TASK_FILE: $TF ===\"; "
+            f"fi; sleep 30; done & "
+            f"When you see '=== AGENT_TASK_FILE: /tmp/... ===', immediately use bash tool to: "
+            f"cat that file, parse the JSON (task_id, task_type, description, context), "
+            f"do the work described, then POST result: "
+            f"curl -s -X POST http://127.0.0.1:{port}/tasks/TASK_ID/result "
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{\"task_id\":\"TASK_ID\",\"status\":\"completed\",\"summary\":\"...\",\"findings\":[]}}' . "
+            f"IMPORTANT: read the task from the file — do NOT call GET /tasks/next again, the task is already in the file. "
+            f"Start the loop now."
         )
         _send_literal_text(target, polling_prompt)
         time.sleep(1)

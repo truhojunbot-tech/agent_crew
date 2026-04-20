@@ -100,3 +100,5 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
     prompt_text = third_args[-1]
     assert "/tasks/next?role=implementer" in prompt_text
     assert "curl" in prompt_text
+    assert "AGENT_TASK_FILE" in prompt_text
+    assert "mktemp" in prompt_text

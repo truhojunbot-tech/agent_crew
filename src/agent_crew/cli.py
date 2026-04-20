@@ -394,29 +394,15 @@ def teardown(project: str, base: str):
     _crew_log(proj_dir, f"teardown START session={session_name} agents={agent_list} server_pid={server_pid}")
     _crew_log(proj_dir, f"tmux before teardown: {_tmux_snapshot(session_name)}")
 
-    # Kill only the agent panes (match by worktree path) — never kill the session,
-    # because setup runs in a shared session (coordinator pane lives there too).
-    worktree_paths = {os.path.realpath(p) for p in worktrees.values()}
-    if worktree_paths:
-        result = subprocess.run(
-            ["tmux", "list-panes", "-s", "-t", session_name,
-             "-F", "#{pane_id} #{pane_current_path}"],
+    # Kill only the saved agent pane_ids — never kill the session.
+    # Using saved IDs is reliable even if agents cd'd away from their worktree paths.
+    pane_ids = state.get("pane_ids", [])
+    for pane_id in pane_ids:
+        r = subprocess.run(
+            ["tmux", "kill-pane", "-t", pane_id],
             capture_output=True, text=True,
         )
-        if result.returncode == 0:
-            for line in result.stdout.strip().splitlines():
-                parts = line.split(" ", 1)
-                if len(parts) != 2:
-                    continue
-                pane_id, pane_path = parts
-                if os.path.realpath(pane_path) in worktree_paths:
-                    _crew_log(proj_dir, f"kill-pane {pane_id} path={pane_path}")
-                    subprocess.run(
-                        ["tmux", "kill-pane", "-t", pane_id],
-                        capture_output=True,
-                    )
-        else:
-            _crew_log(proj_dir, f"list-panes failed rc={result.returncode}: {result.stderr.strip()}")
+        _crew_log(proj_dir, f"kill-pane {pane_id} rc={r.returncode} {r.stderr.strip()}")
 
     _crew_log(proj_dir, f"tmux after kill-panes: {_tmux_snapshot(session_name)}")
 
