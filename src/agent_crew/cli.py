@@ -207,11 +207,94 @@ def teardown(project: str, base: str):
 
 @crew.command("run")
 @click.argument("task")
-def run_cmd(task: str):
-    """Run TASK. TASK must not be empty."""
+@click.option("--db", default="", help="SQLite DB path (standalone)")
+@click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--max-iter", default=0, type=int, help="Max review iterations (0 = default)")
+@click.option("--no-tester", is_flag=True, help="Skip test phase after approval")
+@click.option("--branch", default="main", show_default=True)
+def run_cmd(task: str, db: str, project: str, base: str,
+            max_iter: int, no_tester: bool, branch: str):
+    """Run TASK through the code-review loop."""
     if not task.strip():
         raise click.UsageError("task must not be empty")
-    click.echo(f"Running task: {task}")
+
+    if not db:
+        if not project:
+            raise click.ClickException("--db or --project is required")
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+
+    from agent_crew.loop import (
+        DEFAULT_MAX_ITER,
+        build_feedback,
+        enqueue_implement,
+        enqueue_review,
+        enqueue_test,
+        handle_review_result,
+        handle_test_result,
+    )
+    from agent_crew.queue import TaskQueue
+    import time
+
+    if max_iter <= 0:
+        max_iter = DEFAULT_MAX_ITER
+
+    queue = TaskQueue(db)
+
+    def _wait(task_id: str, timeout: float = 60.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            result = queue.get_result(task_id)
+            if result is not None:
+                return result
+            time.sleep(0.1)
+        raise click.ClickException(f"task {task_id!r} timed out after {timeout}s")
+
+    impl_id = enqueue_implement(queue, task, branch)
+
+    for iteration in range(1, max_iter + 1):
+        _wait(impl_id)
+
+        review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id)
+        review_result = _wait(review_id)
+
+        # pass no_tester=True here — test enqueue is handled manually below
+        outcome = handle_review_result(
+            review_result,
+            iteration=iteration,
+            max_iter=max_iter,
+            no_tester=True,
+            queue=queue,
+        )
+
+        if outcome == "escalate":
+            click.echo(f"Escalated after {max_iter} iterations.")
+            return
+
+        if outcome == "approved":
+            if not no_tester:
+                test_id = enqueue_test(queue, task, branch)
+                test_result = _wait(test_id)
+                test_outcome = handle_test_result(test_result)
+                if test_outcome == "passed":
+                    click.echo("Loop complete: approved and tested.")
+                else:
+                    click.echo(f"Tests {test_outcome}. Re-implementing.")
+                    impl_id = enqueue_implement(queue, task, branch,
+                                               context={"retry": True})
+                    continue
+            else:
+                click.echo("Loop complete: approved (no tester).")
+            return
+
+        # request_changes: re-implement with feedback
+        feedback = build_feedback(review_result)
+        impl_id = enqueue_implement(queue, task, branch, context={"feedback": feedback})
+
+    click.echo(f"Max iterations ({max_iter}) reached without approval.")
 
 
 @crew.command()

@@ -251,3 +251,23 @@ class TaskQueue:
             ]
         finally:
             conn.close()
+
+    def get_result(self, task_id: str) -> Optional[TaskResult]:
+        """Return TaskResult if the task is done, else None."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT task_id, status, summary, verdict, findings FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["status"] not in ("completed", "failed", "needs_human"):
+                return None
+            return TaskResult(
+                task_id=row["task_id"],
+                status=row["status"],
+                summary=row["summary"] or "",
+                verdict=row["verdict"],
+                findings=json.loads(row["findings"]) if row["findings"] else [],
+            )
+        finally:
+            conn.close()
