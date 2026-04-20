@@ -5,6 +5,7 @@ import signal
 import socket
 import subprocess
 import sys
+import time
 
 import click
 
@@ -16,6 +17,26 @@ _DEFAULT_AGENTS = "claude,codex,gemini"
 
 def _proj_dir(base: str, project: str) -> str:
     return os.path.join(base, project)
+
+
+def _crew_log(proj_dir: str, msg: str) -> None:
+    ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+    line = f"[{ts}] {msg}\n"
+    try:
+        with open(os.path.join(proj_dir, "crew.log"), "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _tmux_snapshot(session: str) -> str:
+    """Return a one-line summary of all panes in the session."""
+    r = subprocess.run(
+        ["tmux", "list-panes", "-s", "-t", session,
+         "-F", "#{pane_id}:#{pane_current_path}"],
+        capture_output=True, text=True,
+    )
+    return r.stdout.strip().replace("\n", " | ") if r.returncode == 0 else "(session gone)"
 
 
 def _state_path(base: str, project: str) -> str:
@@ -111,9 +132,11 @@ def setup(project: str, agents: str, base: str):
     agent_list = [a.strip() for a in agents.split(",") if a.strip()]
     proj_dir = _proj_dir(base, project)
     os.makedirs(proj_dir, exist_ok=True)
+    _crew_log(proj_dir, f"setup START agents={agent_list}")
 
     # Worktrees
     worktrees = setup_module.create_worktrees(project, base, agent_list)
+    _crew_log(proj_dir, f"worktrees created: {list(worktrees.values())}")
 
     # Port + port file
     port = setup_module.find_free_port()
@@ -140,11 +163,13 @@ def setup(project: str, agents: str, base: str):
         stdout=log_file,
         stderr=log_file,
     )
+    _crew_log(proj_dir, f"server started pid={server_proc.pid} port={port}")
 
     # Wait until server is ready (up to 15 s) before returning
     if not _port_listening(port, timeout=15.0):
         server_proc.terminate()
         log_file.close()
+        _crew_log(proj_dir, f"server failed to start on port {port}")
         raise click.ClickException(
             f"server failed to start on port {port}. "
             f"Check {os.path.join(proj_dir, 'server.log')}"
@@ -160,27 +185,34 @@ def setup(project: str, agents: str, base: str):
         capture_output=True, text=True,
     ).stdout.strip() or "0"
     window_target = f"{session_name}:{window_index}"
+    _crew_log(proj_dir, f"tmux session={session_name} window={window_index} before-split: {_tmux_snapshot(session_name)}")
+
     pane_ids: list[str] = []
-    for _, wt_path in worktrees.items():
+    for agent, wt_path in worktrees.items():
         result = subprocess.run(
             ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
              "-P", "-F", "#{pane_id}"],
             capture_output=True, text=True,
         )
         pane_id = result.stdout.strip()
+        rc = result.returncode
+        _crew_log(proj_dir, f"split-window agent={agent} rc={rc} pane_id={pane_id!r} stderr={result.stderr.strip()!r}")
         if pane_id:
             pane_ids.append(pane_id)
+
     # Coordinator on left, agents stacked vertically on right
-    subprocess.run(
+    layout_result = subprocess.run(
         ["tmux", "select-layout", "-t", window_target, "main-vertical"],
-        capture_output=True,
+        capture_output=True, text=True,
     )
+    _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
 
     # Start agent CLIs and send polling prompt — target panes by captured id,
     # not by hardcoded index, since the shared session has coordinator on pane 0.
     setup_module.start_agents_in_panes(
         session_name, agent_list, port, pane_targets=pane_ids or None
     )
+    _crew_log(proj_dir, f"agents started pane_ids={pane_ids}")
 
     _write_state(base, project, {
         "project": project,
@@ -353,6 +385,9 @@ def teardown(project: str, base: str):
     server_pid = state.get("server_pid")
     proj_dir = _proj_dir(base, project)
 
+    _crew_log(proj_dir, f"teardown START session={session_name} agents={agent_list} server_pid={server_pid}")
+    _crew_log(proj_dir, f"tmux before teardown: {_tmux_snapshot(session_name)}")
+
     # Kill only the agent panes (match by worktree path) — never kill the session,
     # because setup runs in a shared session (coordinator pane lives there too).
     worktree_paths = {os.path.realpath(p) for p in worktrees.values()}
@@ -369,25 +404,33 @@ def teardown(project: str, base: str):
                     continue
                 pane_id, pane_path = parts
                 if os.path.realpath(pane_path) in worktree_paths:
+                    _crew_log(proj_dir, f"kill-pane {pane_id} path={pane_path}")
                     subprocess.run(
                         ["tmux", "kill-pane", "-t", pane_id],
                         capture_output=True,
                     )
+        else:
+            _crew_log(proj_dir, f"list-panes failed rc={result.returncode}: {result.stderr.strip()}")
+
+    _crew_log(proj_dir, f"tmux after kill-panes: {_tmux_snapshot(session_name)}")
 
     # Kill server
     if server_pid:
         try:
             os.kill(server_pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
+            _crew_log(proj_dir, f"server SIGTERM pid={server_pid}")
+        except (ProcessLookupError, OSError) as e:
+            _crew_log(proj_dir, f"server kill skipped pid={server_pid}: {e}")
 
     # Remove worktrees
     for agent in agent_list:
         wt_path = worktrees.get(agent, "")
         if wt_path:
-            subprocess.run(["git", "worktree", "remove", "--force", wt_path],
-                           capture_output=True)
+            r = subprocess.run(["git", "worktree", "remove", "--force", wt_path],
+                               capture_output=True, text=True)
+            _crew_log(proj_dir, f"worktree remove {agent} rc={r.returncode}")
 
+    _crew_log(proj_dir, f"teardown DONE — removing state dir {proj_dir}")
     # Remove state dir
     shutil.rmtree(proj_dir, ignore_errors=True)
 
