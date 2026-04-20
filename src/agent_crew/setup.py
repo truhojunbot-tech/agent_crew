@@ -16,7 +16,7 @@ _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> None:
     """Start agent CLIs in tmux panes and send initial polling prompt."""
     for i, agent in enumerate(agents):
-        target = f"{session_name}:{i}"
+        target = f"{session_name}:0.{i}"
         cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
         # Start agent CLI
         subprocess.run(["tmux", "send-keys", "-t", target, cmd, "Enter"],
@@ -24,7 +24,7 @@ def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> No
     # Wait for agent CLIs to initialize
     time.sleep(3)
     for i, agent in enumerate(agents):
-        target = f"{session_name}:{i}"
+        target = f"{session_name}:0.{i}"
         role = _AGENT_TO_ROLE.get(agent, "implementer")
         polling_prompt = (
             f"You are agent '{agent}' (role: {role}). "

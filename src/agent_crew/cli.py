@@ -59,7 +59,7 @@ _PANE_IDLE_PATTERNS = [
 def _capture_pane(session_name: str, pane_index: int) -> str | None:
     """Capture last 5 lines of a tmux pane. Returns None if tmux fails."""
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", f"{session_name}:{pane_index}", "-p", "-l", "5"],
+        ["tmux", "capture-pane", "-t", f"{session_name}:0.{pane_index}", "-p", "-l", "5"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -133,15 +133,16 @@ def setup(project: str, agents: str, base: str):
             f"Check {os.path.join(proj_dir, 'server.log')}"
         )
 
-    # tmux session + panes
-    session_name = f"crew_{project}"
-    first_wt = next(iter(worktrees.values()))
-    subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-c", first_wt],
-                   capture_output=True)
-    for i, (_, wt_path) in enumerate(worktrees.items()):
-        if i > 0:
-            subprocess.run(["tmux", "new-window", "-t", session_name, "-c", wt_path],
-                           capture_output=True)
+    # tmux panes — split current window, no new session
+    session_name = subprocess.run(
+        ["tmux", "display-message", "-p", "#S"],
+        capture_output=True, text=True,
+    ).stdout.strip() or f"crew_{project}"
+    for _, wt_path in worktrees.items():
+        subprocess.run(
+            ["tmux", "split-window", "-h", "-c", wt_path],
+            capture_output=True,
+        )
 
     # Start agent CLIs and send polling prompt
     setup_module.start_agents_in_panes(session_name, agent_list, port)
@@ -198,7 +199,7 @@ def status(project: str, base: str):
 
     for i, agent in enumerate(agent_list):
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", f"{session_name}:{i}", "-p"],
+            ["tmux", "capture-pane", "-t", f"{session_name}:0.{i}", "-p"],
             capture_output=True,
         )
         alive = result.returncode == 0
@@ -252,17 +253,12 @@ def recover(project: str, base: str):
     ).returncode == 0
 
     if not has_session:
-        start_dir = next(iter(worktrees.values())) if worktrees else proj_dir
-        subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session_name, "-c", start_dir],
-            capture_output=True,
-        )
-        for i, (_, wt_path) in enumerate(worktrees.items()):
-            if i > 0:
-                subprocess.run(
-                    ["tmux", "new-window", "-t", session_name, "-c", wt_path],
-                    capture_output=True,
-                )
+        # Re-split panes in current window (no new session)
+        for _, wt_path in worktrees.items():
+            subprocess.run(
+                ["tmux", "split-window", "-h", "-c", wt_path],
+                capture_output=True,
+            )
         recovered.append("tmux")
 
     if recovered:
