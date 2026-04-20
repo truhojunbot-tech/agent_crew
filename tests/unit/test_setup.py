@@ -23,7 +23,8 @@ def test_u_se01_validate_git_repo_true():
 
 # U-SE02: create_worktrees — 올바른 경로 dict 반환
 def test_u_se02_create_worktrees():
-    with patch("agent_crew.setup.subprocess.run"):
+    mock_result = MagicMock(returncode=0)
+    with patch("agent_crew.setup.subprocess.run", return_value=mock_result):
         result = create_worktrees("myproject", "/base", ["claude", "codex"])
     assert set(result.keys()) == {"claude", "codex"}
     assert result["claude"] == "/base/myproject/claude"
@@ -75,7 +76,8 @@ def test_u_se06_write_port_file(tmp_path):
 # U-SE07: create_worktrees with custom agents — --agents 플래그 반영
 def test_u_se07_create_worktrees_custom_agents():
     agents = ["alpha", "beta", "gamma"]
-    with patch("agent_crew.setup.subprocess.run"):
+    mock_result = MagicMock(returncode=0)
+    with patch("agent_crew.setup.subprocess.run", return_value=mock_result):
         result = create_worktrees("proj", "/base", agents)
     assert set(result.keys()) == {"alpha", "beta", "gamma"}
     for agent in agents:

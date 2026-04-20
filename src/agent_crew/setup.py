@@ -25,7 +25,15 @@ def create_worktrees(project: str, base: str, agents: list[str]) -> dict[str, st
     worktrees = {}
     for agent in agents:
         wt_path = os.path.join(base, project, agent)
-        subprocess.run(["git", "worktree", "add", "-B", f"agent/{agent}", wt_path], capture_output=True)
+        branch = f"agent/{project}/{agent}"
+        result = subprocess.run(
+            ["git", "worktree", "add", "-B", branch, wt_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 and not os.path.isdir(wt_path):
+            raise RuntimeError(
+                f"Failed to create worktree for {agent}: {result.stderr.strip()}"
+            )
         worktrees[agent] = wt_path
     return worktrees
 
