@@ -56,10 +56,11 @@ _PANE_IDLE_PATTERNS = [
 ]
 
 
-def _capture_pane(session_name: str, pane_index: int) -> str | None:
-    """Capture last 5 lines of a tmux pane. Returns None if tmux fails."""
+def _capture_pane(target: str) -> str | None:
+    """Capture last 5 lines of a tmux pane. target is a pane_id (e.g. '%42')
+    or a session:window.pane spec. Returns None if tmux fails."""
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", f"{session_name}:{pane_index}", "-p", "-l", "5"],
+        ["tmux", "capture-pane", "-t", target, "-p", "-S", "-5"],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -71,6 +72,22 @@ def _pane_looks_idle(pane_output: str) -> bool:
     """Heuristic: does the pane output suggest the agent is idle/done?"""
     last_line = pane_output.rstrip().rsplit("\n", 1)[-1] if pane_output.strip() else ""
     return any(pat in last_line for pat in _PANE_IDLE_PATTERNS)
+
+
+_STATUS_ALIASES = (
+    ("queued", "pending"),
+    ("running", "in_progress"),
+    ("done", "completed"),
+)
+
+
+def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
+    import urllib.request
+
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/tasks?status={status}", timeout=2
+    ) as resp:
+        return json.loads(resp.read())
 
 
 @click.group()
@@ -133,24 +150,45 @@ def setup(project: str, agents: str, base: str):
             f"Check {os.path.join(proj_dir, 'server.log')}"
         )
 
-    # tmux session + panes
-    session_name = f"crew_{project}"
-    first_wt = next(iter(worktrees.values()))
-    subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-c", first_wt],
-                   capture_output=True)
-    for i, (_, wt_path) in enumerate(worktrees.items()):
-        if i > 0:
-            subprocess.run(["tmux", "new-window", "-t", session_name, "-c", wt_path],
-                           capture_output=True)
+    # tmux panes — split current window, no new session
+    session_name = subprocess.run(
+        ["tmux", "display-message", "-p", "#S"],
+        capture_output=True, text=True,
+    ).stdout.strip() or f"crew_{project}"
+    window_index = subprocess.run(
+        ["tmux", "display-message", "-p", "#I"],
+        capture_output=True, text=True,
+    ).stdout.strip() or "0"
+    window_target = f"{session_name}:{window_index}"
+    pane_ids: list[str] = []
+    for _, wt_path in worktrees.items():
+        result = subprocess.run(
+            ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
+             "-P", "-F", "#{pane_id}"],
+            capture_output=True, text=True,
+        )
+        pane_id = result.stdout.strip()
+        if pane_id:
+            pane_ids.append(pane_id)
+    # Coordinator on left, agents stacked vertically on right
+    subprocess.run(
+        ["tmux", "select-layout", "-t", window_target, "main-vertical"],
+        capture_output=True,
+    )
 
-    # Start agent CLIs and send polling prompt
-    setup_module.start_agents_in_panes(session_name, agent_list, port)
+    # Start agent CLIs and send polling prompt — target panes by captured id,
+    # not by hardcoded index, since the shared session has coordinator on pane 0.
+    setup_module.start_agents_in_panes(
+        session_name, agent_list, port, pane_targets=pane_ids or None
+    )
 
     _write_state(base, project, {
         "project": project,
         "port": port,
         "port_file": port_file,
         "session": session_name,
+        "window": window_index,
+        "pane_ids": pane_ids,
         "agents": agent_list,
         "worktrees": worktrees,
         "db": db_file,
@@ -173,22 +211,35 @@ def status(project: str, base: str):
     session_name = state["session"]
     port = state["port"]
     agent_list = state["agents"]
-
     click.echo(f"Project: {project}")
     click.echo(f"Port: {port}")
-
-    task_count = 0
     try:
-        import urllib.request
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/tasks", timeout=2) as resp:
-            task_count = len(json.loads(resp.read()))
+        task_groups = {
+            display_status: _fetch_tasks_by_status(port, api_status)
+            for display_status, api_status in _STATUS_ALIASES
+        }
     except Exception:
-        pass
-    click.echo(f"Tasks: {task_count}")
+        click.echo("\nTASKS: (server unreachable)")
+    else:
+        total = sum(len(tasks) for tasks in task_groups.values())
+        click.echo(f"\nTasks: {total}")
+        for display_status, _ in _STATUS_ALIASES:
+            tasks = task_groups[display_status]
+            click.echo(f"\n{display_status.upper()} ({len(tasks)}):")
+            for t in tasks:
+                if isinstance(t, dict):
+                    click.echo(f"  [{t.get('task_id', '?')}] {t.get('description', '')[:60]}")
+                else:
+                    tid = getattr(t, "task_id", "?")
+                    desc = getattr(t, "description", "")
+                    click.echo(f"  [{tid}] {str(desc)[:60]}")
 
-    for i, agent in enumerate(agent_list):
+    pane_targets = state.get("pane_ids") or [
+        f"{session_name}:0.{i}" for i in range(len(agent_list))
+    ]
+    for agent, target in zip(agent_list, pane_targets):
         result = subprocess.run(
-            ["tmux", "capture-pane", "-t", f"{session_name}:{i}", "-p"],
+            ["tmux", "capture-pane", "-t", target, "-p"],
             capture_output=True,
         )
         alive = result.returncode == 0
@@ -242,17 +293,43 @@ def recover(project: str, base: str):
     ).returncode == 0
 
     if not has_session:
-        start_dir = next(iter(worktrees.values())) if worktrees else proj_dir
+        # Original session is gone — fall back to current tmux session/window.
+        current = subprocess.run(
+            ["tmux", "display-message", "-p", "#S:#I"],
+            capture_output=True, text=True,
+        )
+        if current.returncode != 0 or not current.stdout.strip():
+            raise click.ClickException(
+                f"tmux session {session_name!r} missing and not running inside tmux. "
+                f"Start a tmux session and re-run recover."
+            )
+        cur_session, _, cur_window = current.stdout.strip().partition(":")
+        window_target = f"{cur_session}:{cur_window or '0'}"
+        pane_ids: list[str] = []
+        for _, wt_path in worktrees.items():
+            result = subprocess.run(
+                ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
+                 "-P", "-F", "#{pane_id}"],
+                capture_output=True, text=True,
+            )
+            pane_id = result.stdout.strip()
+            if pane_id:
+                pane_ids.append(pane_id)
         subprocess.run(
-            ["tmux", "new-session", "-d", "-s", session_name, "-c", start_dir],
+            ["tmux", "select-layout", "-t", window_target, "main-vertical"],
             capture_output=True,
         )
-        for i, (_, wt_path) in enumerate(worktrees.items()):
-            if i > 0:
-                subprocess.run(
-                    ["tmux", "new-window", "-t", session_name, "-c", wt_path],
-                    capture_output=True,
-                )
+        if pane_ids:
+            setup_module.start_agents_in_panes(
+                cur_session,
+                state.get("agents", []),
+                port,
+                pane_targets=pane_ids,
+            )
+            state["session"] = cur_session
+            state["window"] = cur_window or "0"
+            state["pane_ids"] = pane_ids
+            _write_state(base, project, state)
         recovered.append("tmux")
 
     if recovered:
@@ -276,8 +353,26 @@ def teardown(project: str, base: str):
     server_pid = state.get("server_pid")
     proj_dir = _proj_dir(base, project)
 
-    # Kill tmux session
-    subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+    # Kill only the agent panes (match by worktree path) — never kill the session,
+    # because setup runs in a shared session (coordinator pane lives there too).
+    worktree_paths = {os.path.realpath(p) for p in worktrees.values()}
+    if worktree_paths:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-s", "-t", session_name,
+             "-F", "#{pane_id} #{pane_current_path}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                pane_id, pane_path = parts
+                if os.path.realpath(pane_path) in worktree_paths:
+                    subprocess.run(
+                        ["tmux", "kill-pane", "-t", pane_id],
+                        capture_output=True,
+                    )
 
     # Kill server
     if server_pid:
@@ -341,12 +436,17 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     wait_timeout = float(timeout)
 
-    # Resolve session info for pane capture fallback
-    session_name = ""
+    # Resolve pane info for pane capture fallback
+    first_pane_target = ""
     if project:
         st = _read_state(base, project)
         if st:
-            session_name = st.get("session", "")
+            pane_ids = st.get("pane_ids") or []
+            session_name_st = st.get("session", "")
+            if pane_ids:
+                first_pane_target = pane_ids[0]
+            elif session_name_st:
+                first_pane_target = f"{session_name_st}:0.0"
 
     def _wait(task_id: str):
         deadline = time.time() + wait_timeout
@@ -357,8 +457,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
             if result is not None:
                 return result
             # Pane capture fallback: after 30s, check every 10s
-            if session_name and time.time() > fallback_start:
-                pane_out = _capture_pane(session_name, 0)
+            if first_pane_target and time.time() > fallback_start:
+                pane_out = _capture_pane(first_pane_target)
                 if pane_out and _pane_looks_idle(pane_out):
                     pane_idle_count += 1
                     if pane_idle_count >= 3:
@@ -376,6 +476,54 @@ def run_cmd(task: str, db: str, project: str, base: str,
             else:
                 time.sleep(0.5)
         raise click.ClickException(f"task {task_id!r} timed out after {wait_timeout}s")
+
+    import urllib.request as _urllib_req
+
+    def _auto_resolve_gates(port: int) -> int:
+        """Resolve any pending gates via HTTP. Returns count of resolved gates."""
+        resolved = 0
+        try:
+            with _urllib_req.urlopen(
+                f"http://127.0.0.1:{port}/gates/pending", timeout=2
+            ) as resp:
+                gates = json.loads(resp.read())
+            for gate in gates:
+                gate_id = gate.get("id") or gate.get("gate_id")
+                if not gate_id:
+                    continue
+                payload = json.dumps({"status": "approved"}).encode()
+                req = _urllib_req.Request(
+                    f"http://127.0.0.1:{port}/gates/{gate_id}/resolve",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with _urllib_req.urlopen(req, timeout=2):
+                        pass
+                    click.echo(f"  Gate {gate_id} auto-approved.")
+                    resolved += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return resolved
+
+    def _drain_resolvable_gates(port: int) -> int:
+        """Resolve gates until the pending set is empty."""
+        total = 0
+        while True:
+            resolved = _auto_resolve_gates(port)
+            if resolved == 0:
+                return total
+            total += resolved
+
+    # Determine port for gate resolution (available when --project is set)
+    _run_port = 0
+    if project:
+        _pstate = _read_state(base, project)
+        if _pstate:
+            _run_port = _pstate.get("port", 0)
 
     impl_id = enqueue_implement(queue, task, branch)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
@@ -403,12 +551,17 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] Review approved.")
+            # Auto-resolve any pending gates before proceeding
+            if _run_port:
+                _drain_resolvable_gates(_run_port)
             if not no_tester:
                 test_id = enqueue_test(queue, task, branch)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_result = _wait(test_id)
                 test_outcome = handle_test_result(test_result)
                 if test_outcome == "passed":
+                    if _run_port:
+                        _drain_resolvable_gates(_run_port)
                     click.echo(f"[{iteration}/{max_iter}] Tests passed. Loop complete.")
                     return
                 else:
@@ -417,6 +570,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
                                                context={"retry": True})
                     continue
             else:
+                if _run_port:
+                    _drain_resolvable_gates(_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Loop complete (no tester).")
             return
 
@@ -438,7 +593,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--output", default="synthesis.md", show_default=True, help="Path to write synthesis")
 @click.option("--branch", default="main", show_default=True)
-@click.option("--timeout", default=600, type=int, show_default=True, help="Task wait timeout in seconds")
+@click.option("--timeout", default=300, type=int, show_default=True, help="Task wait timeout in seconds")
 def discuss(topic: str, agents: str, rounds: int, then_run: bool,
             db: str, project: str, base: str, output: str, branch: str, timeout: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""

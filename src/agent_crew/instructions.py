@@ -10,12 +10,53 @@ _COMMON = """\
 # Agent Crew — <project>
 
 ## Task Queue (HTTP)
-- Receive next task: GET http://localhost:<port>/tasks/next
+- Receive next task: GET http://localhost:<port>/tasks/next?role=<role>
 - Submit result:     POST http://localhost:<port>/tasks/{id}/result
+
+## Polling Routine (MANDATORY)
+Start this background loop immediately when the session starts. Keep it running in the background for the entire session:
+```bash
+while true; do
+  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=<role>')
+  if [ -n "$RESP" ]; then
+    echo "NEW_TASK received"
+    # Process the task here
+  fi
+  sleep 30
+done &
+```
+
+## Result Submission (MANDATORY)
+After completing any task, you MUST call the API POST request below before doing anything else:
+```bash
+curl -X POST http://localhost:<port>/tasks/{id}/result \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "task_id": "<id>",
+    "status": "completed",
+    "summary": "<short summary of what was done>"
+  }'
+```
+Required fields: `task_id`, `status`, `summary`.
+Status values (accepted by the API): `completed` | `failed` | `needs_human`.
+Review tasks may additionally include `verdict` (`approve` | `request_changes`) and `findings` (list of strings).
+
+### Result Note Template
+Use this structure for the handoff note you write before the API POST:
+```text
+status: completed | failed | needs_human
+summary: <short description of outcome>
+branch: <branch-name>
+commit: <commit-hash>
+notes: <context or follow-up details>
+```
+`branch`, `commit`, and `notes` are for your own log — the API accepts them via `summary` text.
+Never skip the POST request just because the note is complete.
 
 ## Common Instructions
 - Follow TDD: write tests first, then implement
 - Commit and push when done
+- NEVER skip result submission — coordinator depends on it
 """
 
 _ROLE_SECTIONS: dict = {
@@ -24,18 +65,54 @@ _ROLE_SECTIONS: dict = {
 - Write production code in src/
 - Run pytest and fix failures before committing
 - Branch: agent/claude
+
+## Implementer Polling
+```bash
+while true; do
+  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=implementer')
+  if [ -n "$RESP" ]; then
+    echo "NEW_TASK: $RESP"
+    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  fi
+  sleep 30
+done &
+```
 """,
     "reviewer": """\
 ## Role: reviewer
 - Review diffs and open GitHub PRs
 - Leave structured feedback in result.md
 - Do not merge without approval gate
+
+## Reviewer Polling
+```bash
+while true; do
+  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=reviewer')
+  if [ -n "$RESP" ]; then
+    echo "NEW_TASK: $RESP"
+    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  fi
+  sleep 30
+done &
+```
 """,
     "tester": """\
 ## Role: tester
 - Write and maintain tests in tests/
 - Ensure full coverage of new code paths
 - Report flaky tests immediately
+
+## Tester Polling
+```bash
+while true; do
+  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=tester')
+  if [ -n "$RESP" ]; then
+    echo "NEW_TASK: $RESP"
+    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  fi
+  sleep 30
+done &
+```
 """,
 }
 
