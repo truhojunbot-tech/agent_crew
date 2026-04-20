@@ -13,8 +13,18 @@ _AGENT_CMDS = {
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 
 
-def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> None:
-    """Start agent CLIs in tmux panes and send initial polling prompt."""
+def start_agents_in_panes(
+    session_name: str,
+    agents: list[str],
+    port: int,
+    pane_targets: list[str] | None = None,
+) -> None:
+    """Start agent CLIs in tmux panes and send initial polling prompt.
+
+    pane_targets (optional): explicit tmux targets per agent (e.g. pane_ids
+    like ``%42``). When omitted, falls back to ``<session>:0.<i>`` which
+    assumes a fresh session where pane 0 is the first agent.
+    """
     def _send_literal_text(target: str, text: str) -> None:
         subprocess.run(
             ["tmux", "send-keys", "-l", "-t", target, text],
@@ -24,16 +34,20 @@ def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> No
     def _send_enter(target: str) -> None:
         subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
 
-    for i, agent in enumerate(agents):
-        target = f"{session_name}:0.{i}"
+    if pane_targets is None:
+        pane_targets = [f"{session_name}:0.{i}" for i in range(len(agents))]
+    if len(pane_targets) != len(agents):
+        raise ValueError(
+            f"pane_targets length {len(pane_targets)} != agents length {len(agents)}"
+        )
+
+    for agent, target in zip(agents, pane_targets):
         cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
-        # Start agent CLI
         _send_literal_text(target, cmd)
         _send_enter(target)
     # Wait for agent CLIs to initialize
     time.sleep(3)
-    for i, agent in enumerate(agents):
-        target = f"{session_name}:0.{i}"
+    for agent, target in zip(agents, pane_targets):
         role = _AGENT_TO_ROLE.get(agent, "implementer")
         polling_prompt = (
             f"You are agent '{agent}' (role: {role}). "
