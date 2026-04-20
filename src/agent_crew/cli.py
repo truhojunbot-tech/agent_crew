@@ -175,13 +175,17 @@ def setup(project: str, agents: str, base: str):
             f"Check {os.path.join(proj_dir, 'server.log')}"
         )
 
-    # tmux panes — split current window, no new session
+    # tmux panes — split current window, no new session.
+    # Use $TMUX_PANE so display-message targets the CALLING pane's session,
+    # not whatever the tmux client happens to be focused on.
+    tmux_pane_env = os.environ.get("TMUX_PANE", "")
+    dm_target = ["-t", tmux_pane_env] if tmux_pane_env else []
     session_name = subprocess.run(
-        ["tmux", "display-message", "-p", "#S"],
+        ["tmux", "display-message", "-p"] + dm_target + ["#S"],
         capture_output=True, text=True,
     ).stdout.strip() or f"crew_{project}"
     window_index = subprocess.run(
-        ["tmux", "display-message", "-p", "#I"],
+        ["tmux", "display-message", "-p"] + dm_target + ["#I"],
         capture_output=True, text=True,
     ).stdout.strip() or "0"
     window_target = f"{session_name}:{window_index}"
@@ -326,8 +330,10 @@ def recover(project: str, base: str):
 
     if not has_session:
         # Original session is gone — fall back to current tmux session/window.
+        tmux_pane_env = os.environ.get("TMUX_PANE", "")
+        dm_target = ["-t", tmux_pane_env] if tmux_pane_env else []
         current = subprocess.run(
-            ["tmux", "display-message", "-p", "#S:#I"],
+            ["tmux", "display-message", "-p"] + dm_target + ["#S:#I"],
             capture_output=True, text=True,
         )
         if current.returncode != 0 or not current.stdout.strip():
