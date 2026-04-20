@@ -166,10 +166,16 @@ def test_e_di02_two_rounds(live_server, tmp_path):
 
     assert len(rows) == 4  # 2 agents × 2 rounds
     round2_contexts = [json.loads(rows[i]["context"]) for i in (2, 3)]
-    assert all("prior_synthesis" in ctx for ctx in round2_contexts)
+    for ctx in round2_contexts:
+        assert "prior_synthesis" in ctx
+        ps = ctx["prior_synthesis"]
+        # Must contain round 1 synthesis text — not empty or a placeholder
+        assert "## Topic" in ps
+        assert "Build vs buy?" in ps
+        assert "Round 1 synthesis." in ps
 
 
-# E-DI03: --then-run triggers code-review loop (implement task enqueued after synthesis)
+# E-DI03: --then-run triggers full code-review loop (discuss → implement → review chain)
 def test_e_di03_then_run(live_server, tmp_path):
     port, db_path, _ = live_server
     output = str(tmp_path / "synthesis.md")
@@ -182,22 +188,26 @@ def test_e_di03_then_run(live_server, tmp_path):
         "--then-run",
     ])
 
-    # One panel agent responds
+    # Discussion phase: one panel agent responds
     assert _stub(port, "panel").returncode == 0
+    # Code-review loop chain: coder implements, reviewer approves
+    assert _stub(port, "coder").returncode == 0
+    assert _stub(port, "reviewer", verdict="approve").returncode == 0
 
-    cli_t.join(timeout=30.0)
+    cli_t.join(timeout=60.0)
     assert not cli_t.is_alive(), "CLI thread timed out"
 
     r = holder[0]
     assert r.exit_code == 0, r.output
     assert "code-review loop started" in r.output.lower()
+    assert "approved" in r.output.lower()
 
     # synthesis.md written
     assert pathlib.Path(output).exists()
 
-    # implement task enqueued in DB
+    # Both discuss and implement+review tasks exist in DB
     queue = TaskQueue(db_path)
     all_tasks = queue.list_tasks()
-    impl_tasks = [t for t in all_tasks if t.task_type == "implement"]
-    assert len(impl_tasks) == 1
-    assert "adopt event sourcing" in impl_tasks[0].description.lower()
+    assert any(t.task_type == "discuss" for t in all_tasks)
+    assert any(t.task_type == "implement" for t in all_tasks)
+    assert any(t.task_type == "review" for t in all_tasks)

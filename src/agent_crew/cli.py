@@ -378,5 +378,51 @@ def discuss(topic: str, agents: str, rounds: int, then_run: bool,
     click.echo(f"Discussion complete. Synthesis written to {output}")
 
     if then_run:
+        from agent_crew.loop import (
+            DEFAULT_MAX_ITER,
+            build_feedback,
+            enqueue_review,
+            handle_review_result,
+        )
+
+        max_iter = DEFAULT_MAX_ITER
         impl_id = enqueue_implement(queue, topic, branch)
         click.echo(f"Code-review loop started: {impl_id}")
+
+        for iteration in range(1, max_iter + 1):
+            _wait_result = None
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                _wait_result = queue.get_result(impl_id)
+                if _wait_result is not None:
+                    break
+                time.sleep(0.1)
+            if _wait_result is None:
+                raise click.ClickException(f"task {impl_id!r} timed out")
+
+            review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id)
+            review_result = None
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                review_result = queue.get_result(review_id)
+                if review_result is not None:
+                    break
+                time.sleep(0.1)
+            if review_result is None:
+                raise click.ClickException(f"task {review_id!r} timed out")
+
+            outcome = handle_review_result(
+                review_result, iteration=iteration, max_iter=max_iter,
+                no_tester=True, queue=queue,
+            )
+            if outcome == "escalate":
+                click.echo(f"Escalated after {max_iter} iterations.")
+                return
+            if outcome == "approved":
+                click.echo("Loop complete: approved.")
+                return
+
+            feedback = build_feedback(review_result)
+            impl_id = enqueue_implement(queue, topic, branch, context={"feedback": feedback})
+
+        click.echo(f"Max iterations ({max_iter}) reached without approval.")
