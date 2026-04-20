@@ -28,10 +28,11 @@ def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> No
         role = _AGENT_TO_ROLE.get(agent, "implementer")
         polling_prompt = (
             f"You are agent '{agent}' (role: {role}). "
-            f"Poll GET http://127.0.0.1:{port}/tasks/next?role={role} every 10 seconds. "
-            f"When you receive a task, execute it and POST result to "
-            f"http://127.0.0.1:{port}/tasks/{{id}}/result. "
-            f"Start polling now."
+            f"Run this background polling loop using bash tool: "
+            f"while true; do RESP=$(curl -sf 'http://127.0.0.1:{port}/tasks/next?role={role}'); "
+            f"if [ -n \"$RESP\" ]; then echo \"NEW_TASK: $RESP\"; fi; sleep 30; done & "
+            f"When you see NEW_TASK output, process it and POST the result to "
+            f"http://127.0.0.1:{port}/tasks/{{id}}/result . Start the loop now."
         )
         subprocess.run(["tmux", "send-keys", "-t", target, polling_prompt, ""],
                        capture_output=True)

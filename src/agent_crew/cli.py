@@ -174,17 +174,27 @@ def status(project: str, base: str):
     port = state["port"]
     agent_list = state["agents"]
 
+    import urllib.request
+
     click.echo(f"Project: {project}")
     click.echo(f"Port: {port}")
 
-    task_count = 0
-    try:
-        import urllib.request
-        with urllib.request.urlopen(f"http://127.0.0.1:{port}/tasks", timeout=2) as resp:
-            task_count = len(json.loads(resp.read()))
-    except Exception:
-        pass
-    click.echo(f"Tasks: {task_count}")
+    for task_status in ["queued", "running", "done"]:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{port}/tasks?status={task_status}", timeout=2
+            ) as resp:
+                tasks = json.loads(resp.read())
+                click.echo(f"\n{task_status.upper()} ({len(tasks)}):")
+                for t in tasks:
+                    if isinstance(t, dict):
+                        click.echo(f"  [{t.get('task_id', '?')}] {t.get('description', '')[:60]}")
+                    else:
+                        tid = getattr(t, "task_id", "?")
+                        desc = getattr(t, "description", "")
+                        click.echo(f"  [{tid}] {str(desc)[:60]}")
+        except Exception:
+            click.echo(f"\n{task_status.upper()}: (server unreachable)")
 
     for i, agent in enumerate(agent_list):
         result = subprocess.run(
@@ -377,6 +387,45 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 time.sleep(0.5)
         raise click.ClickException(f"task {task_id!r} timed out after {wait_timeout}s")
 
+    import urllib.request as _urllib_req
+
+    def _auto_resolve_gates(port: int) -> int:
+        """Resolve any pending gates via HTTP. Returns count of resolved gates."""
+        resolved = 0
+        try:
+            with _urllib_req.urlopen(
+                f"http://127.0.0.1:{port}/gates/pending", timeout=2
+            ) as resp:
+                gates = json.loads(resp.read())
+            for gate in gates:
+                gate_id = gate.get("id") or gate.get("gate_id")
+                if not gate_id:
+                    continue
+                payload = json.dumps({"status": "approved"}).encode()
+                req = _urllib_req.Request(
+                    f"http://127.0.0.1:{port}/gates/{gate_id}/resolve",
+                    data=payload,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with _urllib_req.urlopen(req, timeout=2):
+                        pass
+                    click.echo(f"  Gate {gate_id} auto-approved.")
+                    resolved += 1
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        return resolved
+
+    # Determine port for gate resolution (available when --project is set)
+    _run_port = 0
+    if project:
+        _pstate = _read_state(base, project)
+        if _pstate:
+            _run_port = _pstate.get("port", 0)
+
     impl_id = enqueue_implement(queue, task, branch)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
 
@@ -403,6 +452,9 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] Review approved.")
+            # Auto-resolve any pending gates before proceeding
+            if _run_port:
+                _auto_resolve_gates(_run_port)
             if not no_tester:
                 test_id = enqueue_test(queue, task, branch)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
