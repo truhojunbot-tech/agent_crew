@@ -4,6 +4,7 @@ E2E tests for crew triage / poll CLI — scheduled issue selection.
 E-TR01: crew triage --repo mock/repo — stub gh CLI, issue selected, gate created
 E-TR02: crew triage --no-confirm — skips gate, enqueues implement task immediately
 E-TR03: crew poll --interval 1s --cycles 2 — two triage cycles observed
+E-TR04: poll --interval parsing — 10s / 2m / 1h parsed to correct seconds
 """
 
 import json
@@ -108,3 +109,35 @@ def test_e_tr03_poll_two_cycles(monkeypatch, db_path):
     queue = TaskQueue(db_path)
     gates = queue.list_gates()
     assert len(gates) == 2
+
+
+# E-TR04: interval string parsing — 10s / 2m / 1h → correct sleep seconds
+@pytest.mark.parametrize("interval,expected_secs", [
+    ("10s", 10),
+    ("2m", 120),
+    ("1h", 3600),
+])
+def test_e_tr04_poll_interval_parsing(monkeypatch, db_path, interval, expected_secs):
+    monkeypatch.setattr(subprocess, "run", _gh_mock())
+
+    slept: list[float] = []
+
+    import time as _time_mod
+
+    def _fake_sleep(secs: float):
+        slept.append(secs)
+
+    monkeypatch.setattr(_time_mod, "sleep", _fake_sleep)
+
+    runner = CliRunner()
+    # --cycles 2 so sleep is called once between cycle 1 and 2
+    result = runner.invoke(
+        crew,
+        ["poll", "--repo", "mock/repo", "--db", db_path, "--interval", interval, "--cycles", "2"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "[cycle 1]" in result.output
+    assert "[cycle 2]" in result.output
+    # sleep must have been called exactly once with the correctly parsed seconds
+    assert slept == [expected_secs]

@@ -453,12 +453,13 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
     queue = TaskQueue(db)
 
     def _agent_fn(prompt: str) -> str:
-        issues = triage_module.parse_issues(triage_module.fetch_issues_from_gh(repo))
-        filtered = triage_module.filter_processed(issues)
-        if not filtered:
+        import re
+        # Pick the first issue listed in the prompt without re-fetching from GitHub.
+        # build_prompt produces lines like: "- #42: Add OAuth login (labels: enhancement)"
+        m = re.search(r"- #(\d+): (.+?) \(labels:", prompt)
+        if not m:
             return ""
-        top = filtered[0]
-        return f"ISSUE: {top['number']}\nDESCRIPTION: {top['title']}"
+        return f"ISSUE: {m.group(1)}\nDESCRIPTION: {m.group(2).strip()}"
 
     if no_confirm:
         # Skip gate: fetch → filter → pick → enqueue directly
@@ -522,12 +523,11 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
     queue = TaskQueue(db)
 
     def _agent_fn(prompt: str) -> str:
-        issues = triage_module.parse_issues(triage_module.fetch_issues_from_gh(repo))
-        filtered = triage_module.filter_processed(issues)
-        if not filtered:
+        import re
+        m = re.search(r"- #(\d+): (.+?) \(labels:", prompt)
+        if not m:
             return ""
-        top = filtered[0]
-        return f"ISSUE: {top['number']}\nDESCRIPTION: {top['title']}"
+        return f"ISSUE: {m.group(1)}\nDESCRIPTION: {m.group(2).strip()}"
 
     cycle = 0
     while True:
