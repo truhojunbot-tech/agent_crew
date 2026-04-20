@@ -37,35 +37,96 @@ your result.
 1. Receive the task block.
 2. Do the work in this worktree (write code, run tests, review diff — whatever
    the role requires). Commit and push if appropriate.
-3. POST the result to `http://127.0.0.1:<port>/tasks/<task_id>/result` with:
+3. **MANDATORY**: POST the result to `http://127.0.0.1:<port>/tasks/<task_id>/result`
+   before considering the task finished. No result = the role stays busy and
+   the queue stalls.
+4. Wait. The server will push the next task when one becomes available.
+
+## Result Submission — MANDATORY, NOT OPTIONAL
+
+The server's contract: a role stays marked `in_progress` until it receives a
+POST to `/tasks/<task_id>/result`. If you skip this step, **no further task
+will be pushed to your pane** and the whole crew stalls. This happens every
+time a result is skipped — there is no fallback.
+
+### Required fields
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `task_id` | string | yes | Echo the task_id from the received block exactly. |
+| `status` | enum | yes | `completed` \\| `failed` \\| `needs_human` |
+| `summary` | string | yes | 1–3 sentences. Include branch + commit hash for code tasks. |
+| `verdict` | enum\\|null | reviewers only | `approve` \\| `request_changes` \\| `null` |
+| `findings` | string[] | reviewers only | Actionable issues. Empty array for non-reviewers. |
+| `pr_number` | int\\|null | if opened | GitHub PR number, otherwise `null`. |
+
+### Canonical POST template
 
 ```bash
-curl -s -X POST http://127.0.0.1:<port>/tasks/<task_id>/result \\
+curl -sS -X POST http://127.0.0.1:<port>/tasks/<task_id>/result \\
   -H "Content-Type: application/json" \\
   -d '{
     "task_id": "<task_id>",
     "status": "completed",
-    "summary": "<short description of what you did>",
+    "summary": "<what was done — include branch + commit hash for code tasks>",
     "verdict": null,
     "findings": [],
     "pr_number": null
   }'
 ```
 
-Status values: `completed | failed | needs_human`.
-Reviewers may set `verdict` to `approve | request_changes` and add `findings`.
-Include `pr_number` if you opened one.
+Expected HTTP response: `200 OK` with `{"status":"ok"}`. If you receive a
+non-2xx status or a network error, retry immediately — do not leave the task
+unresolved.
 
-4. Wait. The server will push the next task when one becomes available.
+### Summary field — include these whenever they apply
+
+- `branch: <branch-name>` — the branch the work lives on
+- `commit: <short-hash>` — the commit you produced (after `git commit`)
+- `pr: #<number>` — include in both `summary` text and the `pr_number` field
+- `notes: <anything unusual>` — blockers, assumptions, deviations
+
+### Worked example (implementer)
+
+```bash
+curl -sS -X POST http://127.0.0.1:<port>/tasks/t-042/result \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "task_id": "t-042",
+    "status": "completed",
+    "summary": "Fixed login timeout. branch: agent/fix-login-timeout commit: a1b2c3d. Added regression test in test_auth.py::test_login_timeout_retries.",
+    "verdict": null,
+    "findings": [],
+    "pr_number": 42
+  }'
+```
+
+### Failure / escalation example
+
+```bash
+curl -sS -X POST http://127.0.0.1:<port>/tasks/t-042/result \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "task_id": "t-042",
+    "status": "needs_human",
+    "summary": "Spec ambiguous: description says \\"cache 5m\\" but existing TTL is 10m. Need direction before implementing.",
+    "verdict": null,
+    "findings": [],
+    "pr_number": null
+  }'
+```
 
 ## Rules
 
-- **Never skip the POST.** The coordinator tracks task state via these results.
-  Without a POST, the role stays marked busy and the next task will not be pushed.
+- **Never skip the POST.** This is rule #1. If in doubt, POST `status: failed`
+  or `status: needs_human` with an honest summary — silence is worse than
+  failure.
 - **Do not call `GET /tasks/next` in a polling loop.** Tasks arrive via pane push only.
-- **Commit and push your work before POSTing the result** when the task involves code changes.
-- If the task is malformed or impossible, POST with `status: "failed"` or `status: "needs_human"`
-  and a summary explaining why.
+- **Commit and push your work before POSTing the result** when the task involves
+  code changes, and include the commit hash in the summary.
+- Echo `task_id` exactly as received — no prefixes, no changes.
+- If the task is malformed or impossible, POST with `status: "failed"` or
+  `status: "needs_human"` and a summary explaining why.
 """
 
 _ROLE_SECTIONS: dict = {
@@ -78,8 +139,16 @@ You write production code following TDD where practical:
 3. Refactor, commit (with tests + impl together), and open a PR if the task
    requests one.
 
-Include in your result `summary`: what was done, commit hash, and branch name.
-Set `pr_number` if you opened a PR.
+### Result checklist (implementer)
+
+Before you POST the result, verify:
+- [ ] Tests pass locally
+- [ ] `git commit` done — you have a real commit hash
+- [ ] `git push` done if the branch needs to be reviewed
+- [ ] `summary` includes `branch: <name>` and `commit: <hash>`
+- [ ] `pr_number` set if you opened a PR; otherwise `null`
+- [ ] `status` is `completed` (or `failed`/`needs_human` with honest reason)
+- [ ] `verdict: null`, `findings: []` (implementers don't fill these)
 """,
     "reviewer": """\
 ## Role: reviewer
@@ -94,6 +163,15 @@ you set `verdict: "approve"`:
 
 Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
 `findings`.
+
+### Result checklist (reviewer)
+
+Before you POST the result, verify:
+- [ ] `status: completed` (the review itself completed, regardless of verdict)
+- [ ] `verdict` is `approve` or `request_changes` — never `null`
+- [ ] `findings` lists concrete, actionable items when verdict is
+  `request_changes`; may be empty on `approve`
+- [ ] `summary` names the PR reviewed and the headline judgement
 """,
     "tester": """\
 ## Role: tester
@@ -101,12 +179,26 @@ Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
 You check out the PR branch and run the full test suite (lint + pytest) in a
 clean environment. Independently review the diff for requirement coverage —
 do not rubber-stamp the reviewer. Report in your `summary` and `findings`.
+
+### Result checklist (tester)
+
+Before you POST the result, verify:
+- [ ] `status: completed` if the suite ran to completion (pass or fail), otherwise `failed`
+- [ ] `summary` includes pass/fail counts and lint outcome
+- [ ] `findings` lists failing tests and any independent diff-review concerns
+- [ ] `verdict: null` (only reviewers set verdict)
 """,
     "panel": """\
 ## Role: panel (discussion)
 
 You analyze the topic from your assigned perspective (see `context.perspective`)
 and submit your opinion in the result `summary`.
+
+### Result checklist (panel)
+
+- [ ] `status: completed`
+- [ ] `summary` contains your perspective-grounded opinion (not a rehash of the topic)
+- [ ] `verdict: null`, `findings: []`, `pr_number: null`
 """,
 }
 
