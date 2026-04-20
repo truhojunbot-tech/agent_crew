@@ -7,6 +7,7 @@ from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 
 _ROLE_TO_TYPE = {
     "coder": "implement",
+    "implementer": "implement",
     "reviewer": "review",
     "tester": "test",
     "panel": "discuss",

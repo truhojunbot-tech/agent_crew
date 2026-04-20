@@ -63,6 +63,14 @@ def test_u_q04_dequeue_role_filter(q):
     assert result.task_type == "review"
 
 
+# U-Q04b: role=implementer alias → picks up implement tasks (regression for queue.py mismatch)
+def test_u_q04b_dequeue_implementer_alias(q):
+    q.enqueue(make_task("impl", task_type="implement"))
+    result = q.dequeue(role="implementer")
+    assert result is not None
+    assert result.task_type == "implement"
+
+
 # U-Q05: Dequeue empty queue → None
 def test_u_q05_dequeue_empty_returns_none(q):
     result = q.dequeue()
