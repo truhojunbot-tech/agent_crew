@@ -86,16 +86,27 @@ def setup(project: str, agents: str, base: str):
     agent_dicts = [{"name": a, "pane": i} for i, a in enumerate(agent_list)]
     setup_module.write_sessions_json(sessions_file, agent_dicts)
 
-    # Start server
+    # Start server — include sys.path in PYTHONPATH so subprocess can import agent_crew
     db_file = os.path.join(proj_dir, "tasks.db")
-    server_env = {**os.environ, "AGENT_CREW_DB": db_file}
+    pythonpath = os.pathsep.join(p for p in sys.path if p)
+    server_env = {**os.environ, "AGENT_CREW_DB": db_file, "PYTHONPATH": pythonpath}
+    log_file = open(os.path.join(proj_dir, "server.log"), "w")
     server_proc = subprocess.Popen(
         [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
-         "--host", "127.0.0.1", "--port", str(port), "--log-level", "error"],
+         "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
         env=server_env,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=log_file,
     )
+
+    # Wait until server is ready (up to 15 s) before returning
+    if not _port_listening(port, timeout=15.0):
+        server_proc.terminate()
+        log_file.close()
+        raise click.ClickException(
+            f"server failed to start on port {port}. "
+            f"Check {os.path.join(proj_dir, 'server.log')}"
+        )
 
     # tmux session + panes
     session_name = f"crew_{project}"

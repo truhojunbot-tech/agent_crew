@@ -117,8 +117,8 @@ def test_e_st01_setup_creates_artifacts(monkeypatch, git_repo, base_dir):
     # tmux pane exists
     assert _tmux_pane_exists("crew_testproj", 0)
 
-    # server listening on the port
-    assert _port_listening(port, timeout=8.0), f"server not listening on {port}"
+    # server already confirmed listening by setup command itself
+    assert _port_listening(port, timeout=2.0), f"server not listening on {port}"
 
     _kill_server(state)
 
@@ -132,7 +132,6 @@ def test_e_st02_status_after_setup(monkeypatch, git_repo, base_dir):
     runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
     state = _read_state(base_dir, "testproj")
     port = state["port"]
-    _port_listening(port, timeout=8.0)
 
     result = runner.invoke(crew, ["status", "testproj", "--base", base_dir])
 
