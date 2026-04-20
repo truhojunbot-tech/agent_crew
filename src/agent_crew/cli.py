@@ -426,3 +426,118 @@ def discuss(topic: str, agents: str, rounds: int, then_run: bool,
             impl_id = enqueue_implement(queue, topic, branch, context={"feedback": feedback})
 
         click.echo(f"Max iterations ({max_iter}) reached without approval.")
+
+
+@crew.command()
+@click.option("--repo", required=True, help="GitHub repo (owner/name)")
+@click.option("--db", default="", help="SQLite DB path (standalone)")
+@click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--branch", default="main", show_default=True)
+@click.option("--no-confirm", is_flag=True, help="Skip approval gate, enqueue task immediately")
+@click.option("--merge-history", default="none", show_default=True, help="Recent merge history text")
+def triage(repo: str, db: str, project: str, base: str, branch: str,
+           no_confirm: bool, merge_history: str):
+    """Triage GitHub issues and select the next task."""
+    if not db:
+        if not project:
+            raise click.ClickException("--db or --project is required")
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+
+    from agent_crew import triage as triage_module
+    from agent_crew.queue import TaskQueue
+
+    queue = TaskQueue(db)
+
+    def _agent_fn(prompt: str) -> str:
+        issues = triage_module.parse_issues(triage_module.fetch_issues_from_gh(repo))
+        filtered = triage_module.filter_processed(issues)
+        if not filtered:
+            return ""
+        top = filtered[0]
+        return f"ISSUE: {top['number']}\nDESCRIPTION: {top['title']}"
+
+    if no_confirm:
+        # Skip gate: fetch → filter → pick → enqueue directly
+        raw = triage_module.fetch_issues_from_gh(repo)
+        issues = triage_module.parse_issues(raw)
+        filtered = triage_module.filter_processed(issues)
+        prompt = triage_module.build_prompt(filtered, merge_history)
+        if prompt is None:
+            click.echo("No issues to triage.")
+            return
+        response_text = _agent_fn(prompt)
+        parsed = triage_module.parse_response(response_text)
+        if parsed is None:
+            click.echo("No issues to triage.")
+            return
+        pseudo_result = {"parsed": parsed, "branch": branch}
+        task_id = triage_module.enqueue_task(queue, pseudo_result)
+        click.echo(f"Task enqueued: {task_id}")
+    else:
+        result = triage_module.run(queue, repo, _agent_fn, branch=branch, merge_history=merge_history)
+        if result is None:
+            click.echo("No issues to triage.")
+            return
+        click.echo(f"Gate created: {result['gate_id']}")
+        click.echo(f"Issue #{result['parsed']['issue']}: {result['parsed']['description']}")
+
+
+@crew.command()
+@click.option("--repo", required=True, help="GitHub repo (owner/name)")
+@click.option("--db", default="", help="SQLite DB path (standalone)")
+@click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--branch", default="main", show_default=True)
+@click.option("--interval", default="60s", show_default=True, help="Poll interval (e.g. 10s, 1m)")
+@click.option("--cycles", default=0, type=int, help="Max cycles (0 = run forever)")
+@click.option("--merge-history", default="none", show_default=True)
+def poll(repo: str, db: str, project: str, base: str, branch: str,
+         interval: str, cycles: int, merge_history: str):
+    """Continuously triage issues on a schedule."""
+    if not db:
+        if not project:
+            raise click.ClickException("--db or --project is required")
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+
+    import re
+    import time as _time
+
+    m = re.fullmatch(r"(\d+)(s|m|h)?", interval.strip())
+    if not m:
+        raise click.ClickException(f"Invalid interval: {interval!r}. Use e.g. '30s', '2m'.")
+    value = int(m.group(1))
+    unit = m.group(2) or "s"
+    seconds = value * {"s": 1, "m": 60, "h": 3600}[unit]
+
+    from agent_crew import triage as triage_module
+    from agent_crew.queue import TaskQueue
+
+    queue = TaskQueue(db)
+
+    def _agent_fn(prompt: str) -> str:
+        issues = triage_module.parse_issues(triage_module.fetch_issues_from_gh(repo))
+        filtered = triage_module.filter_processed(issues)
+        if not filtered:
+            return ""
+        top = filtered[0]
+        return f"ISSUE: {top['number']}\nDESCRIPTION: {top['title']}"
+
+    cycle = 0
+    while True:
+        cycle += 1
+        result = triage_module.run(queue, repo, _agent_fn, branch=branch, merge_history=merge_history)
+        if result is None:
+            click.echo(f"[cycle {cycle}] No issues to triage.")
+        else:
+            click.echo(f"[cycle {cycle}] Gate created: {result['gate_id']}")
+
+        if cycles and cycle >= cycles:
+            break
+        _time.sleep(seconds)
