@@ -39,8 +39,13 @@
 - **Runtime**: FastAPI + uvicorn, runs as a background process
 - **Port**: auto-selected starting from 8100; written to `/tmp/agent_crew/<project>/port`
 - **Persistence**: SQLite at `/tmp/agent_crew/<project>/agent_crew.db`
-- **Atomicity**: `GET /tasks/next` wraps dequeue in a DB transaction (no double-assignment)
-- **Crash recovery**: SQLite persists all state; on restart, pending/in_progress tasks are preserved. `crew recover` or coordinator auto-restart relaunches the server. Agents retry on connection refused (3 attempts, exponential backoff).
+- **Atomicity**: dequeue (inside `/tasks/next` and inside push) wraps in a DB transaction — no double-assignment
+- **Crash recovery**: SQLite persists all state; on restart, pending/in_progress tasks are preserved. `crew recover` relaunches the server.
+- **Push model**: the server loads `pane_map.json` (`{role: pane_id}`) at startup and, on `POST /tasks`, delivers each task to the target role's pane via `tmux send-keys`. Agents do NOT poll — they receive tasks via pane input and POST results back. On `POST /tasks/{id}/result`, the server checks for more pending tasks of that role and pushes the next one automatically. Agents still may call `GET /tasks/next` for observability or recovery, but it is not the primary delivery path.
+
+#### Why push, not pull
+
+Conversational-agent CLIs (Claude, Codex, Gemini) don't reliably maintain a `while true; curl; sleep` background loop across turns. The design therefore pushes tasks synchronously at enqueue time, using tmux as the agent-side transport. The HTTP server still owns atomicity, persistence, external API access, and gate state — the push is layered on top.
 
 #### HTTP API — Tasks
 
@@ -253,11 +258,12 @@ if max_iter reached: create escalation gate → surface to user ⚠️
    - `CLAUDE.md` in the claude worktree
    - `AGENTS.md` in the codex worktree
    - `GEMINI.md` in the gemini worktree
-   - Content: common section (Task Queue API protocol, workflow steps, result format) + agent-specific section (role instructions). See requirements.md §15 for template.
-4. Split tmux panes in current window (coordinator stays in pane 0)
-5. Launch agent CLI in each pane from its worktree
-6. Start Task Queue + Gate server in background, write port file
-7. Write `sessions.json` (including per-agent restart command)
+   - Content: common section (task arrival format, result submission) + agent-specific section (role instructions). See requirements.md §15 for template.
+4. Split tmux panes in current window (coordinator stays in pane 0). Capture each new pane's `pane_id` via `split-window -P -F '#{pane_id}'`.
+5. Write `pane_map.json` (`{role: pane_id}`) in the project dir.
+6. Start Task Queue + Gate server in background, passing `AGENT_CREW_PANE_MAP` and `AGENT_CREW_PORT` via env so the server can push tasks to the right pane.
+7. Launch agent CLI in each pane from its worktree, send short kickoff prompt telling the agent to wait for `=== AGENT_CREW TASK ===` pushes.
+8. Write `sessions.json` (including per-agent restart command).
 
 ---
 

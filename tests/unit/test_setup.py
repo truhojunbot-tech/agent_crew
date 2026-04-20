@@ -85,7 +85,9 @@ def test_u_se07_create_worktrees_custom_agents():
         assert result[agent] == f"/base/proj/{agent}"
 
 
-# U-SE08: start_agents_in_panes uses literal tmux input for cmd/prompt and sends Enter separately
+# U-SE08: start_agents_in_panes uses literal tmux input for cmd/kickoff and sends Enter separately.
+# Push model: kickoff prompt tells agent to wait for "=== AGENT_CREW TASK ===" pushes;
+# no polling loop is sent.
 def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
     mock_result = MagicMock(returncode=0)
     with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
@@ -98,7 +100,9 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
     assert "-l" in first_args
     assert "-l" in third_args
     prompt_text = third_args[-1]
-    assert "/tasks/next?role=implementer" in prompt_text
-    assert "curl" in prompt_text
-    assert "AGENT_TASK_FILE" in prompt_text
-    assert "mktemp" in prompt_text
+    # Push-model kickoff should reference the task block format and the server URL
+    assert "AGENT_CREW TASK" in prompt_text
+    assert "http://127.0.0.1:8100" in prompt_text
+    # Must NOT contain polling loop artifacts
+    assert "while true" not in prompt_text
+    assert "mktemp" not in prompt_text

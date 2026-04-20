@@ -151,33 +151,8 @@ def setup(project: str, agents: str, base: str):
     agent_dicts = [{"name": a, "pane": i} for i, a in enumerate(agent_list)]
     setup_module.write_sessions_json(sessions_file, agent_dicts)
 
-    # Start server — include sys.path in PYTHONPATH so subprocess can import agent_crew
-    db_file = os.path.join(proj_dir, "tasks.db")
-    pythonpath = os.pathsep.join(p for p in sys.path if p)
-    server_env = {**os.environ, "AGENT_CREW_DB": db_file, "PYTHONPATH": pythonpath}
-    log_file = open(os.path.join(proj_dir, "server.log"), "w")
-    server_proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
-         "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
-        env=server_env,
-        stdout=log_file,
-        stderr=log_file,
-    )
-    _crew_log(proj_dir, f"server started pid={server_proc.pid} port={port}")
-
-    # Wait until server is ready (up to 15 s) before returning
-    if not _port_listening(port, timeout=15.0):
-        server_proc.terminate()
-        log_file.close()
-        _crew_log(proj_dir, f"server failed to start on port {port}")
-        raise click.ClickException(
-            f"server failed to start on port {port}. "
-            f"Check {os.path.join(proj_dir, 'server.log')}"
-        )
-
-    # tmux panes — split current window, no new session.
-    # Use $TMUX_PANE so display-message targets the CALLING pane's session,
-    # not whatever the tmux client happens to be focused on.
+    # tmux panes must exist before the server starts, so the server can load
+    # pane_map.json at startup and push tasks to the right pane.
     tmux_pane_env = os.environ.get("TMUX_PANE", "")
     dm_target = ["-t", tmux_pane_env] if tmux_pane_env else []
     session_name = subprocess.run(
@@ -211,8 +186,50 @@ def setup(project: str, agents: str, base: str):
     )
     _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
 
-    # Start agent CLIs and send polling prompt — target panes by captured id,
-    # not by hardcoded index, since the shared session has coordinator on pane 0.
+    # Write pane_map.json: {role: pane_id} — server reads this at startup for push.
+    pane_map = {
+        setup_module._AGENT_TO_ROLE.get(a, "implementer"): pid
+        for a, pid in zip(agent_list, pane_ids)
+    }
+    pane_map_file = os.path.join(proj_dir, "pane_map.json")
+    with open(pane_map_file, "w") as f:
+        json.dump(pane_map, f)
+    _crew_log(proj_dir, f"pane_map written: {pane_map}")
+
+    # Start server — include sys.path in PYTHONPATH so subprocess can import agent_crew.
+    # AGENT_CREW_PANE_MAP tells the server where to push tasks; AGENT_CREW_PORT is
+    # embedded in push messages so agents know where to POST results.
+    db_file = os.path.join(proj_dir, "tasks.db")
+    pythonpath = os.pathsep.join(p for p in sys.path if p)
+    server_env = {
+        **os.environ,
+        "AGENT_CREW_DB": db_file,
+        "AGENT_CREW_PANE_MAP": pane_map_file,
+        "AGENT_CREW_PORT": str(port),
+        "PYTHONPATH": pythonpath,
+    }
+    log_file = open(os.path.join(proj_dir, "server.log"), "w")
+    server_proc = subprocess.Popen(
+        [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
+         "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
+        env=server_env,
+        stdout=log_file,
+        stderr=log_file,
+    )
+    _crew_log(proj_dir, f"server started pid={server_proc.pid} port={port}")
+
+    # Wait until server is ready (up to 15 s) before returning
+    if not _port_listening(port, timeout=15.0):
+        server_proc.terminate()
+        log_file.close()
+        _crew_log(proj_dir, f"server failed to start on port {port}")
+        raise click.ClickException(
+            f"server failed to start on port {port}. "
+            f"Check {os.path.join(proj_dir, 'server.log')}"
+        )
+
+    # Start agent CLIs and send kickoff prompt. Agents wait for pane pushes;
+    # no polling loop is started.
     setup_module.start_agents_in_panes(
         session_name, agent_list, port, pane_targets=pane_ids or None
     )
@@ -225,6 +242,7 @@ def setup(project: str, agents: str, base: str):
         "session": session_name,
         "window": window_index,
         "pane_ids": pane_ids,
+        "pane_map": pane_map,
         "agents": agent_list,
         "worktrees": worktrees,
         "db": db_file,

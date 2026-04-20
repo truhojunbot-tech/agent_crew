@@ -340,18 +340,26 @@ The Task Queue server is a background process managed by the coordinator.
 ```markdown
 # Agent Crew Protocol
 
-## Task Queue API
-- Server: http://localhost:<port> (read port from /tmp/agent_crew/<project>/port)
-- Poll for tasks: GET /tasks/next?agent=<your_name>&role=<your_role>
-- Submit result: POST /tasks/{id}/result
+## Task Delivery — Push Model
+The server at http://127.0.0.1:<port> pushes tasks into your tmux pane. Do NOT poll.
+Tasks arrive as a block:
+
+  === AGENT_CREW TASK ===
+  task_id: <id>
+  task_type: implement | review | test | discuss
+  branch: <branch>
+  priority: <1-5>
+  context: {...}
+  description: <prompt>
+  === END TASK ===
+
+Below the block the server includes the exact curl command to submit your result.
 
 ## Workflow
-1. Read the port file to discover the server address
-2. Poll GET /tasks/next with your agent name and role
-3. If no task available, wait 10s and retry
-4. Execute the task in your worktree
-5. Submit result via POST /tasks/{id}/result
-6. Return to step 2
+1. Wait for an AGENT_CREW TASK block to appear in your pane.
+2. Execute the task in your worktree. Commit and push if code changes.
+3. POST the result to /tasks/<task_id>/result.
+4. Wait for the next push. (Never start a background polling loop.)
 
 ## Result format
 POST /tasks/{id}/result with JSON body:

@@ -9,110 +9,104 @@ ROLE_FILES: dict = {
 _COMMON = """\
 # Agent Crew — <project>
 
-## Task Queue (HTTP)
-- Receive next task: GET http://localhost:<port>/tasks/next?role=<role>
-- Submit result:     POST http://localhost:<port>/tasks/{id}/result
+You are part of the `agent_crew` multi-agent workflow. The server at
+`http://127.0.0.1:<port>` will **push** tasks to this pane whenever work is
+available. You do NOT poll — you wait for each task to arrive in your pane.
 
-## Polling Routine (MANDATORY)
-Start this background loop immediately when the session starts. Keep it running in the background for the entire session:
-```bash
-while true; do
-  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=<role>')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK received"
-    # Process the task here
-  fi
-  sleep 30
-done &
+## Task Arrival Format
+
+When the server pushes a task, you will see a block like this appear in your
+terminal input:
+
+```
+=== AGENT_CREW TASK ===
+task_id: <id>
+task_type: implement | review | test | discuss
+branch: <branch-name>
+priority: <1-5>
+context: {"key": "value", ...}
+description: <natural language task description>
+=== END TASK ===
 ```
 
-## Result Submission (MANDATORY)
-After completing any task, you MUST call the API POST request below before doing anything else:
+Below the task block the server will include the exact `curl` command to post
+your result.
+
+## Your Loop (per task)
+
+1. Receive the task block.
+2. Do the work in this worktree (write code, run tests, review diff — whatever
+   the role requires). Commit and push if appropriate.
+3. POST the result to `http://127.0.0.1:<port>/tasks/<task_id>/result` with:
+
 ```bash
-curl -X POST http://localhost:<port>/tasks/{id}/result \\
+curl -s -X POST http://127.0.0.1:<port>/tasks/<task_id>/result \\
   -H "Content-Type: application/json" \\
   -d '{
-    "task_id": "<id>",
+    "task_id": "<task_id>",
     "status": "completed",
-    "summary": "<short summary of what was done>"
+    "summary": "<short description of what you did>",
+    "verdict": null,
+    "findings": [],
+    "pr_number": null
   }'
 ```
-Required fields: `task_id`, `status`, `summary`.
-Status values (accepted by the API): `completed` | `failed` | `needs_human`.
-Review tasks may additionally include `verdict` (`approve` | `request_changes`) and `findings` (list of strings).
 
-### Result Note Template
-Use this structure for the handoff note you write before the API POST:
-```text
-status: completed | failed | needs_human
-summary: <short description of outcome>
-branch: <branch-name>
-commit: <commit-hash>
-notes: <context or follow-up details>
-```
-`branch`, `commit`, and `notes` are for your own log — the API accepts them via `summary` text.
-Never skip the POST request just because the note is complete.
+Status values: `completed | failed | needs_human`.
+Reviewers may set `verdict` to `approve | request_changes` and add `findings`.
+Include `pr_number` if you opened one.
 
-## Common Instructions
-- Follow TDD: write tests first, then implement
-- Commit and push when done
-- NEVER skip result submission — coordinator depends on it
+4. Wait. The server will push the next task when one becomes available.
+
+## Rules
+
+- **Never skip the POST.** The coordinator tracks task state via these results.
+  Without a POST, the role stays marked busy and the next task will not be pushed.
+- **Do not call `GET /tasks/next` in a polling loop.** Tasks arrive via pane push only.
+- **Commit and push your work before POSTing the result** when the task involves code changes.
+- If the task is malformed or impossible, POST with `status: "failed"` or `status: "needs_human"`
+  and a summary explaining why.
 """
 
 _ROLE_SECTIONS: dict = {
     "implementer": """\
 ## Role: implementer
-- Write production code in src/
-- Run pytest and fix failures before committing
-- Branch: agent/claude
 
-## Implementer Polling
-```bash
-while true; do
-  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=implementer')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK: $RESP"
-    # Process the task, then POST /tasks/{id}/result immediately when finished.
-  fi
-  sleep 30
-done &
-```
+You write production code following TDD where practical:
+1. Write failing tests that capture the requirements.
+2. Implement until tests pass.
+3. Refactor, commit (with tests + impl together), and open a PR if the task
+   requests one.
+
+Include in your result `summary`: what was done, commit hash, and branch name.
+Set `pr_number` if you opened a PR.
 """,
     "reviewer": """\
 ## Role: reviewer
-- Review diffs and open GitHub PRs
-- Leave structured feedback in result.md
-- Do not merge without approval gate
 
-## Reviewer Polling
-```bash
-while true; do
-  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=reviewer')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK: $RESP"
-    # Process the task, then POST /tasks/{id}/result immediately when finished.
-  fi
-  sleep 30
-done &
-```
+You review the coder's PR across three layers — all three must pass before
+you set `verdict: "approve"`:
+
+1. **Test quality** — do the tests verify the actual requirements? Edge cases?
+   Error paths? Happy-path-only tests are a `request_changes`.
+2. **Code quality** — architecture, readability, naming, coupling.
+3. **Business logic gaps** — side effects, security, performance, missing requirements.
+
+Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
+`findings`.
 """,
     "tester": """\
 ## Role: tester
-- Write and maintain tests in tests/
-- Ensure full coverage of new code paths
-- Report flaky tests immediately
 
-## Tester Polling
-```bash
-while true; do
-  RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=tester')
-  if [ -n "$RESP" ]; then
-    echo "NEW_TASK: $RESP"
-    # Process the task, then POST /tasks/{id}/result immediately when finished.
-  fi
-  sleep 30
-done &
-```
+You check out the PR branch and run the full test suite (lint + pytest) in a
+clean environment. Independently review the diff for requirement coverage —
+do not rubber-stamp the reviewer. Report in your `summary` and `findings`.
+""",
+    "panel": """\
+## Role: panel (discussion)
+
+You analyze the topic from your assigned perspective (see `context.perspective`)
+and submit your opinion in the result `summary`.
 """,
 }
 

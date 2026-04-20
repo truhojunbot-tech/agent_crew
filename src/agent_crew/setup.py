@@ -19,7 +19,12 @@ def start_agents_in_panes(
     port: int,
     pane_targets: list[str] | None = None,
 ) -> None:
-    """Start agent CLIs in tmux panes and send initial polling prompt.
+    """Start agent CLIs in tmux panes.
+
+    Push model: server delivers tasks to the pane via tmux send-keys when new
+    tasks arrive. Agents do NOT poll — they wait for pane messages, parse the
+    task, do the work, and POST results back. The kickoff prompt just tells
+    the agent how to recognize the incoming AGENT_CREW TASK format.
 
     pane_targets (optional): explicit tmux targets per agent (e.g. pane_ids
     like ``%42``). When omitted, falls back to ``<session>:0.<i>`` which
@@ -49,26 +54,15 @@ def start_agents_in_panes(
     time.sleep(3)
     for agent, target in zip(agents, pane_targets):
         role = _AGENT_TO_ROLE.get(agent, "implementer")
-        polling_prompt = (
+        kickoff_prompt = (
             f"You are agent '{agent}' (role: {role}). "
-            f"Start a background polling loop with bash tool now — copy this exactly: "
-            f"while true; do "
-            f"RESP=$(curl -sf 'http://127.0.0.1:{port}/tasks/next?role={role}'); "
-            f"if [ -n \"$RESP\" ] && [ \"$RESP\" != \"null\" ]; then "
-            f"TF=$(mktemp /tmp/agent_task_XXXXXX.json); "
-            f"echo \"$RESP\" > \"$TF\"; "
-            f"echo \"=== AGENT_TASK_FILE: $TF ===\"; "
-            f"fi; sleep 30; done & "
-            f"When you see '=== AGENT_TASK_FILE: /tmp/... ===', immediately use bash tool to: "
-            f"cat that file, parse the JSON (task_id, task_type, description, context), "
-            f"do the work described, then POST result: "
-            f"curl -s -X POST http://127.0.0.1:{port}/tasks/TASK_ID/result "
-            f"-H 'Content-Type: application/json' "
-            f"-d '{{\"task_id\":\"TASK_ID\",\"status\":\"completed\",\"summary\":\"...\",\"findings\":[]}}' . "
-            f"IMPORTANT: read the task from the file — do NOT call GET /tasks/next again, the task is already in the file. "
-            f"Start the loop now."
+            f"The agent_crew server at http://127.0.0.1:{port} will push tasks to this pane. "
+            f"When you see a block starting with '=== AGENT_CREW TASK ===', parse the fields "
+            f"(task_id, task_type, branch, priority, context, description), do the work, "
+            f"then POST result to /tasks/<task_id>/result. Do not poll — just wait for the next task. "
+            f"Read your agent instruction file (CLAUDE.md / AGENTS.md / GEMINI.md) in this directory for full protocol."
         )
-        _send_literal_text(target, polling_prompt)
+        _send_literal_text(target, kickoff_prompt)
         time.sleep(1)
         _send_enter(target)
 

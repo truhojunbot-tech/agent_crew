@@ -13,6 +13,15 @@ _ROLE_TO_TYPE = {
     "panel": "discuss",
 }
 
+# Reverse map (canonical role name per task_type). Used by the server to
+# pick which pane to push a new task to.
+_TYPE_TO_ROLE = {
+    "implement": "implementer",
+    "review": "reviewer",
+    "test": "tester",
+    "discuss": "panel",
+}
+
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
     id         TEXT PRIMARY KEY,
@@ -134,14 +143,17 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def submit_result(self, task_id: str, result: TaskResult) -> None:
+    def submit_result(self, task_id: str, result: TaskResult) -> str:
+        """Submit a task result. Returns the task_type of the completed task
+        (so push-model callers can decide what to push next)."""
         conn = self._connect()
         try:
             if result.task_id != task_id:
                 raise ValueError(f"task_id mismatch: argument {task_id!r} != result.task_id {result.task_id!r}")
-            row = conn.execute("SELECT task_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            row = conn.execute("SELECT task_type FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
+            task_type = row["task_type"]
             conn.execute(
                 """
                 UPDATE tasks
@@ -158,6 +170,7 @@ class TaskQueue:
                 ),
             )
             conn.commit()
+            return task_type
         finally:
             conn.close()
 
@@ -166,6 +179,19 @@ class TaskQueue:
         try:
             conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))
             conn.commit()
+        finally:
+            conn.close()
+
+    def has_in_progress(self, task_type: str) -> bool:
+        """Return True if any task of the given type is in_progress.
+        Used by push-model server to decide if a role is busy."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE status = 'in_progress' AND task_type = ? LIMIT 1",
+                (task_type,),
+            ).fetchone()
+            return row is not None
         finally:
             conn.close()
 
