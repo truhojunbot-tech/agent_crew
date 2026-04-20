@@ -435,6 +435,7 @@ def teardown(project: str, base: str):
             r = subprocess.run(["git", "worktree", "remove", "--force", wt_path],
                                capture_output=True, text=True)
             _crew_log(proj_dir, f"worktree remove {agent} rc={r.returncode}")
+    subprocess.run(["git", "worktree", "prune"], capture_output=True, text=True)
 
     _crew_log(proj_dir, f"teardown DONE — removing state dir {proj_dir}")
     # Remove state dir
