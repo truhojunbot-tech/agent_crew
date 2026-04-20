@@ -80,12 +80,33 @@ def create_app(
             return  # nothing pending
         push_fn(pane_id, _format_task_message(task, port))
 
+    def _try_push_discuss(agent: Optional[str]) -> None:
+        """Discuss tasks fan out per agent, not per role. pane_map is expected
+        to hold agent-name keys (e.g. 'claude', 'codex', 'gemini') alongside
+        the role keys. Busy-check and dequeue are both scoped to the agent so
+        concurrent panelists don't block each other."""
+        if not pane_map or not agent:
+            return
+        pane_id = pane_map.get(agent)
+        if not pane_id:
+            return
+        if q().has_discuss_in_progress_for_agent(agent):
+            return
+        task = q().dequeue_discuss_for_agent(agent)
+        if task is None:
+            return
+        push_fn(pane_id, _format_task_message(task, port))
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
         task_id = q().enqueue(task)
-        role = _TYPE_TO_ROLE.get(task.task_type)
-        if role:
-            _try_push_next(role)
+        if task.task_type == "discuss":
+            agent = task.context.get("agent") if isinstance(task.context, dict) else None
+            _try_push_discuss(agent)
+        else:
+            role = _TYPE_TO_ROLE.get(task.task_type)
+            if role:
+                _try_push_next(role)
         return {"task_id": task_id}
 
     @app.get("/tasks/next")
@@ -109,16 +130,22 @@ def create_app(
 
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
+        # Capture context before marking done — we need the agent name for
+        # discuss-task follow-up pushes.
+        ctx = q().get_task_context(task_id)
         try:
             task_type = q().submit_result(task_id, result)
         except ValueError as e:
             msg = str(e)
             status_code = 404 if "not found" in msg.lower() else 400
             raise HTTPException(status_code=status_code, detail=msg)
-        # Task done → that role is now idle → push the next pending task of the same role.
-        role = _TYPE_TO_ROLE.get(task_type)
-        if role:
-            _try_push_next(role)
+        if task_type == "discuss":
+            _try_push_discuss(ctx.get("agent") if isinstance(ctx, dict) else None)
+        else:
+            # Task done → that role is now idle → push the next pending task of the same role.
+            role = _TYPE_TO_ROLE.get(task_type)
+            if role:
+                _try_push_next(role)
         return {"status": "ok"}
 
     @app.delete("/tasks/{task_id}", status_code=200)

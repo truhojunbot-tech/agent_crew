@@ -186,11 +186,16 @@ def setup(project: str, agents: str, base: str):
     )
     _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
 
-    # Write pane_map.json: {role: pane_id} — server reads this at startup for push.
-    pane_map = {
-        setup_module._AGENT_TO_ROLE.get(a, "implementer"): pid
-        for a, pid in zip(agent_list, pane_ids)
-    }
+    # Write pane_map.json — server reads this at startup for push routing.
+    # Two key flavors share one dict:
+    #   role key (implementer/reviewer/tester) — routes implement/review/test tasks
+    #   agent-name key (claude/codex/gemini)    — routes discuss tasks (panelists
+    #                                              fan out per agent)
+    pane_map: dict[str, str] = {}
+    for a, pid in zip(agent_list, pane_ids):
+        role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+        pane_map[role] = pid
+        pane_map[a] = pid
     pane_map_file = os.path.join(proj_dir, "pane_map.json")
     with open(pane_map_file, "w") as f:
         json.dump(pane_map, f)

@@ -149,3 +149,137 @@ def test_u_sp06_different_roles_push_independently(tmp_db):
     assert len(push.calls) == 2
     pane_ids = {c[0] for c in push.calls}
     assert pane_ids == {"%100", "%200"}
+
+
+def _discuss_payload(task_id, agent, topic="some topic", priority=3):
+    return {
+        "task_id": task_id,
+        "task_type": "discuss",
+        "description": f"Discuss: {topic}",
+        "branch": "main",
+        "priority": priority,
+        "context": {"agent": agent, "round": 1},
+    }
+
+
+# U-SP07: discuss task routes to the pane keyed by context.agent (Bug #2 fix)
+def test_u_sp07_discuss_pushes_to_agent_specific_pane(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={
+            "implementer": "%100", "reviewer": "%200", "tester": "%300",
+            "claude": "%100", "codex": "%200", "gemini": "%300",
+        },
+        port=9000,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_discuss_payload("d-claude", "claude"))
+
+    assert len(push.calls) == 1
+    pane_id, text = push.calls[0]
+    assert pane_id == "%100"
+    assert "d-claude" in text
+    assert "discuss" in text
+
+
+# U-SP08: three concurrent discuss tasks fan out to three panes simultaneously
+def test_u_sp08_discuss_fans_out_across_panels(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={
+            "claude": "%100", "codex": "%200", "gemini": "%300",
+        },
+        port=9000,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_discuss_payload("d-claude", "claude"))
+        client.post("/tasks", json=_discuss_payload("d-codex", "codex"))
+        client.post("/tasks", json=_discuss_payload("d-gemini", "gemini"))
+
+    assert len(push.calls) == 3
+    routed = {c[0]: c[1] for c in push.calls}
+    assert "d-claude" in routed["%100"]
+    assert "d-codex" in routed["%200"]
+    assert "d-gemini" in routed["%300"]
+
+
+# U-SP09: two discuss tasks for the SAME agent → first pushes, second waits
+def test_u_sp09_same_agent_discuss_serializes(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"claude": "%100", "codex": "%200"},
+        port=9000,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_discuss_payload("d-claude-1", "claude"))
+        client.post("/tasks", json=_discuss_payload("d-claude-2", "claude", priority=1))
+
+    assert len(push.calls) == 1
+    assert "d-claude-1" in push.calls[0][1]
+
+
+# U-SP10: result submission for a discuss task triggers the next discuss for the same agent
+def test_u_sp10_discuss_result_triggers_next_for_same_agent(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"claude": "%100"},
+        port=9000,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_discuss_payload("d-claude-1", "claude"))
+        client.post("/tasks", json=_discuss_payload("d-claude-2", "claude"))
+        assert len(push.calls) == 1  # only first pushed
+
+        resp = client.post(
+            "/tasks/d-claude-1/result",
+            json=_result_payload("d-claude-1"),
+        )
+        assert resp.status_code == 200
+
+    assert len(push.calls) == 2
+    assert "d-claude-2" in push.calls[1][1]
+    assert push.calls[1][0] == "%100"
+
+
+# U-SP11: discuss task for an agent not in pane_map → no push (graceful skip)
+def test_u_sp11_discuss_unknown_agent_no_push(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"claude": "%100"},
+        port=9000,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        resp = client.post(
+            "/tasks", json=_discuss_payload("d-unknown", "rando-agent"),
+        )
+        assert resp.status_code == 201
+
+    assert push.calls == []
+
+
+# U-SP12: discuss task without context.agent → no push (malformed, graceful)
+def test_u_sp12_discuss_missing_agent_no_push(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"claude": "%100"},
+        port=9000,
+        push_fn=push,
+    )
+    payload = _discuss_payload("d-noagent", "claude")
+    payload["context"] = {}  # no agent key
+    with TestClient(app) as client:
+        resp = client.post("/tasks", json=payload)
+        assert resp.status_code == 201
+
+    assert push.calls == []

@@ -195,6 +195,91 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def has_discuss_in_progress_for_agent(self, agent: str) -> bool:
+        """Per-agent busy check for discuss tasks. Needed because discuss tasks
+        fan out to different panes (one per agent) and the coarse `has_in_progress`
+        would falsely mark a pane busy when a sibling panelist is mid-reply."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT context FROM tasks WHERE status = 'in_progress' AND task_type = 'discuss'"
+            ).fetchall()
+            for r in rows:
+                try:
+                    ctx = json.loads(r["context"]) if r["context"] else {}
+                except Exception:
+                    continue
+                if ctx.get("agent") == agent:
+                    return True
+            return False
+        finally:
+            conn.close()
+
+    def dequeue_discuss_for_agent(self, agent: str) -> Optional[TaskRequest]:
+        """Atomic pending→in_progress for the oldest pending discuss task whose
+        context.agent matches `agent`. Context is stored as JSON, so filtering
+        happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE status = 'pending' AND task_type = 'discuss'
+                ORDER BY priority ASC, created_at ASC
+                """
+            ).fetchall()
+            chosen = None
+            for row in rows:
+                try:
+                    ctx = json.loads(row["context"]) if row["context"] else {}
+                except Exception:
+                    continue
+                if ctx.get("agent") == agent:
+                    chosen = row
+                    break
+            if chosen is None:
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute(
+                "UPDATE tasks SET status = 'in_progress' WHERE task_id = ?",
+                (chosen["task_id"],),
+            )
+            conn.execute("COMMIT")
+            return TaskRequest(
+                task_id=chosen["task_id"],
+                task_type=chosen["task_type"],
+                description=chosen["description"],
+                branch=chosen["branch"],
+                priority=chosen["priority"],
+                context=json.loads(chosen["context"]),
+            )
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def get_task_context(self, task_id: str) -> dict:
+        """Return the stored context dict for a task, or {} if not found."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT context FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None or not row["context"]:
+                return {}
+            try:
+                return json.loads(row["context"])
+            except Exception:
+                return {}
+        finally:
+            conn.close()
+
     def list_tasks(self, status: str = "") -> List[TaskRequest]:
         conn = self._connect()
         try:
