@@ -154,11 +154,21 @@ def setup(project: str, agents: str, base: str):
         ["tmux", "display-message", "-p", "#S"],
         capture_output=True, text=True,
     ).stdout.strip() or f"crew_{project}"
+    window_index = subprocess.run(
+        ["tmux", "display-message", "-p", "#I"],
+        capture_output=True, text=True,
+    ).stdout.strip() or "0"
+    window_target = f"{session_name}:{window_index}"
     for _, wt_path in worktrees.items():
         subprocess.run(
-            ["tmux", "split-window", "-h", "-c", wt_path],
+            ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target],
             capture_output=True,
         )
+    # Coordinator on left, agents stacked vertically on right
+    subprocess.run(
+        ["tmux", "select-layout", "-t", window_target, "main-vertical"],
+        capture_output=True,
+    )
 
     # Start agent CLIs and send polling prompt
     setup_module.start_agents_in_panes(session_name, agent_list, port)
@@ -270,11 +280,20 @@ def recover(project: str, base: str):
 
     if not has_session:
         # Re-split panes in current window (no new session)
+        window_index = subprocess.run(
+            ["tmux", "display-message", "-p", "#I"],
+            capture_output=True, text=True,
+        ).stdout.strip() or "0"
+        window_target = f"{session_name}:{window_index}"
         for _, wt_path in worktrees.items():
             subprocess.run(
-                ["tmux", "split-window", "-h", "-c", wt_path],
+                ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target],
                 capture_output=True,
             )
+        subprocess.run(
+            ["tmux", "select-layout", "-t", window_target, "main-vertical"],
+            capture_output=True,
+        )
         recovered.append("tmux")
 
     if recovered:
