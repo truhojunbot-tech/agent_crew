@@ -317,8 +317,26 @@ def teardown(project: str, base: str):
     server_pid = state.get("server_pid")
     proj_dir = _proj_dir(base, project)
 
-    # Kill tmux session
-    subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
+    # Kill only the agent panes (match by worktree path) — never kill the session,
+    # because setup runs in a shared session (coordinator pane lives there too).
+    worktree_paths = {os.path.realpath(p) for p in worktrees.values()}
+    if worktree_paths:
+        result = subprocess.run(
+            ["tmux", "list-panes", "-s", "-t", session_name,
+             "-F", "#{pane_id} #{pane_current_path}"],
+            capture_output=True, text=True,
+        )
+        if result.returncode == 0:
+            for line in result.stdout.strip().splitlines():
+                parts = line.split(" ", 1)
+                if len(parts) != 2:
+                    continue
+                pane_id, pane_path = parts
+                if os.path.realpath(pane_path) in worktree_paths:
+                    subprocess.run(
+                        ["tmux", "kill-pane", "-t", pane_id],
+                        capture_output=True,
+                    )
 
     # Kill server
     if server_pid:
