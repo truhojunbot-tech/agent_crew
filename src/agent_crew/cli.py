@@ -299,8 +299,130 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
 @crew.command()
 @click.argument("topic")
-def discuss(topic: str):
+@click.option("--agents", default="analyst,critic,advocate,risk", help="Comma-separated panel agent names")
+@click.option("--rounds", default=1, type=int, show_default=True, help="Number of discussion rounds")
+@click.option("--then-run", is_flag=True, help="Trigger code-review loop after synthesis")
+@click.option("--db", default="", help="SQLite DB path (standalone)")
+@click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--output", default="synthesis.md", show_default=True, help="Path to write synthesis")
+@click.option("--branch", default="main", show_default=True)
+def discuss(topic: str, agents: str, rounds: int, then_run: bool,
+            db: str, project: str, base: str, output: str, branch: str):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
         raise click.UsageError("topic must not be empty")
-    click.echo(f"Starting discussion on: {topic}")
+
+    if not db:
+        if not project:
+            raise click.ClickException("--db or --project is required")
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+
+    from agent_crew.discussion import assign_perspectives, build_synthesis, enqueue_panel_tasks
+    from agent_crew.loop import enqueue_implement
+    from agent_crew.queue import TaskQueue
+    import time
+
+    agent_list = [a.strip() for a in agents.split(",") if a.strip()]
+    queue = TaskQueue(db)
+    perspectives = assign_perspectives(agent_list)
+
+    def _wait_all(task_ids: list[str], timeout: float = 60.0) -> dict:
+        deadline = time.time() + timeout
+        done: dict = {}
+        while time.time() < deadline:
+            for tid in task_ids:
+                if tid not in done:
+                    r = queue.get_result(tid)
+                    if r is not None:
+                        done[tid] = r
+            if len(done) == len(task_ids):
+                return done
+            time.sleep(0.1)
+        raise click.ClickException(f"Discussion timed out after {timeout}s")
+
+    prior_synthesis = ""
+    final_synthesis = ""
+
+    for round_num in range(1, rounds + 1):
+        context: dict = {"round": round_num}
+        if round_num > 1 and prior_synthesis:
+            context["prior_synthesis"] = prior_synthesis
+
+        task_ids = enqueue_panel_tasks(queue, agent_list, topic, context)
+        results_map = _wait_all(task_ids)
+
+        panel_results = []
+        for agent, tid in zip(agent_list, task_ids):
+            r = results_map[tid]
+            panel_results.append({
+                "agent": agent,
+                "perspective": perspectives[agent],
+                "summary": r.summary,
+            })
+
+        final_synthesis = build_synthesis(
+            panel_results,
+            topic=topic,
+            synthesis=f"Round {round_num} synthesis.",
+            decision="Proceed as discussed.",
+        )
+        prior_synthesis = final_synthesis
+
+    with open(output, "w") as f:
+        f.write(final_synthesis)
+
+    click.echo(f"Discussion complete. Synthesis written to {output}")
+
+    if then_run:
+        from agent_crew.loop import (
+            DEFAULT_MAX_ITER,
+            build_feedback,
+            enqueue_review,
+            handle_review_result,
+        )
+
+        max_iter = DEFAULT_MAX_ITER
+        impl_id = enqueue_implement(queue, topic, branch)
+        click.echo(f"Code-review loop started: {impl_id}")
+
+        for iteration in range(1, max_iter + 1):
+            _wait_result = None
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                _wait_result = queue.get_result(impl_id)
+                if _wait_result is not None:
+                    break
+                time.sleep(0.1)
+            if _wait_result is None:
+                raise click.ClickException(f"task {impl_id!r} timed out")
+
+            review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id)
+            review_result = None
+            deadline = time.time() + 60.0
+            while time.time() < deadline:
+                review_result = queue.get_result(review_id)
+                if review_result is not None:
+                    break
+                time.sleep(0.1)
+            if review_result is None:
+                raise click.ClickException(f"task {review_id!r} timed out")
+
+            outcome = handle_review_result(
+                review_result, iteration=iteration, max_iter=max_iter,
+                no_tester=True, queue=queue,
+            )
+            if outcome == "escalate":
+                click.echo(f"Escalated after {max_iter} iterations.")
+                return
+            if outcome == "approved":
+                click.echo("Loop complete: approved.")
+                return
+
+            feedback = build_feedback(review_result)
+            impl_id = enqueue_implement(queue, topic, branch, context={"feedback": feedback})
+
+        click.echo(f"Max iterations ({max_iter}) reached without approval.")
