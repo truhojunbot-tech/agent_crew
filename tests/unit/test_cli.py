@@ -22,11 +22,11 @@ def test_u_c02_crew_setup_no_project():
     assert result.exit_code != 0
 
 
-# U-C03: crew status (실행 중 프로젝트 없음) → 깔끔한 메시지, exit 0
+# U-C03: crew status <project> (존재하지 않는 프로젝트) → not found 에러, exit != 0
 def test_u_c03_crew_status_no_project():
     runner = CliRunner()
-    result = runner.invoke(crew, ["status"])
-    assert result.exit_code == 0
+    result = runner.invoke(crew, ["status", "nonexistent", "--base", "/tmp/_crew_no_such_base"])
+    assert result.exit_code != 0
     assert len(result.output.strip()) > 0
 
 
@@ -44,8 +44,9 @@ def test_u_c05_crew_discuss_empty_topic():
     assert result.exit_code != 0
 
 
-# U-C06: crew teardown → exit 0
+# U-C06: crew teardown <project> (존재하지 않는 프로젝트) → not found 에러, exit != 0
 def test_u_c06_crew_teardown():
     runner = CliRunner()
-    result = runner.invoke(crew, ["teardown"])
-    assert result.exit_code == 0
+    result = runner.invoke(crew, ["teardown", "nonexistent", "--base", "/tmp/_crew_no_such_base"])
+    assert result.exit_code != 0
+    assert len(result.output.strip()) > 0

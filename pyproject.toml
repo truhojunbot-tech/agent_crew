@@ -13,6 +13,9 @@ dependencies = [
   "click",
 ]
 
+[project.scripts]
+crew = "agent_crew.cli:crew"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

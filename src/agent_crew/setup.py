@@ -30,9 +30,13 @@ def create_worktrees(project: str, base: str, agents: list[str]) -> dict[str, st
     return worktrees
 
 
+_AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}
+
+
 def write_instruction_files(worktrees: dict, project: str, port_file: str) -> None:
     for agent, wt_path in worktrees.items():
-        instructions.write(agent, wt_path, project, port_file)
+        role = _AGENT_TO_ROLE.get(agent, "implementer")
+        instructions.write(role, wt_path, project, port_file)
 
 
 def write_sessions_json(path: str, agents: list[dict]) -> None:
