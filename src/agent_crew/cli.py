@@ -113,10 +113,13 @@ def setup(project: str, agents: str, base: str):
     first_wt = next(iter(worktrees.values()))
     subprocess.run(["tmux", "new-session", "-d", "-s", session_name, "-c", first_wt],
                    capture_output=True)
-    for i, (agent, wt_path) in enumerate(worktrees.items()):
+    for i, (_, wt_path) in enumerate(worktrees.items()):
         if i > 0:
             subprocess.run(["tmux", "new-window", "-t", session_name, "-c", wt_path],
                            capture_output=True)
+
+    # Start agent CLIs and send polling prompt
+    setup_module.start_agents_in_panes(session_name, agent_list, port)
 
     _write_state(base, project, {
         "project": project,
@@ -279,8 +282,9 @@ def teardown(project: str, base: str):
 @click.option("--max-iter", default=0, type=int, help="Max review iterations (0 = default)")
 @click.option("--no-tester", is_flag=True, help="Skip test phase after approval")
 @click.option("--branch", default="main", show_default=True)
+@click.option("--timeout", default=600, type=int, show_default=True, help="Task wait timeout in seconds")
 def run_cmd(task: str, db: str, project: str, base: str,
-            max_iter: int, no_tester: bool, branch: str):
+            max_iter: int, no_tester: bool, branch: str, timeout: int):
     """Run TASK through the code-review loop."""
     if not task.strip():
         raise click.UsageError("task must not be empty")
@@ -310,21 +314,26 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     queue = TaskQueue(db)
 
-    def _wait(task_id: str, timeout: float = 60.0):
-        deadline = time.time() + timeout
+    wait_timeout = float(timeout)
+
+    def _wait(task_id: str):
+        deadline = time.time() + wait_timeout
         while time.time() < deadline:
             result = queue.get_result(task_id)
             if result is not None:
                 return result
-            time.sleep(0.1)
-        raise click.ClickException(f"task {task_id!r} timed out after {timeout}s")
+            time.sleep(0.5)
+        raise click.ClickException(f"task {task_id!r} timed out after {wait_timeout}s")
 
     impl_id = enqueue_implement(queue, task, branch)
+    click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
 
     for iteration in range(1, max_iter + 1):
         _wait(impl_id)
+        click.echo(f"[{iteration}/{max_iter}] Implementation done.")
 
         review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id)
+        click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
         review_result = _wait(review_id)
 
         # pass no_tester=True here — test enqueue is handled manually below
@@ -337,26 +346,30 @@ def run_cmd(task: str, db: str, project: str, base: str,
         )
 
         if outcome == "escalate":
-            click.echo(f"Escalated after {max_iter} iterations.")
+            click.echo(f"[{iteration}/{max_iter}] Escalated after {max_iter} iterations.")
             return
 
         if outcome == "approved":
+            click.echo(f"[{iteration}/{max_iter}] Review approved.")
             if not no_tester:
                 test_id = enqueue_test(queue, task, branch)
+                click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_result = _wait(test_id)
                 test_outcome = handle_test_result(test_result)
                 if test_outcome == "passed":
-                    click.echo("Loop complete: approved and tested.")
+                    click.echo(f"[{iteration}/{max_iter}] Tests passed. Loop complete.")
+                    return
                 else:
-                    click.echo(f"Tests {test_outcome}. Re-implementing.")
+                    click.echo(f"[{iteration}/{max_iter}] Tests {test_outcome}. Re-implementing.")
                     impl_id = enqueue_implement(queue, task, branch,
                                                context={"retry": True})
                     continue
             else:
-                click.echo("Loop complete: approved (no tester).")
+                click.echo(f"[{iteration}/{max_iter}] Loop complete (no tester).")
             return
 
         # request_changes: re-implement with feedback
+        click.echo(f"[{iteration}/{max_iter}] Changes requested. Re-implementing.")
         feedback = build_feedback(review_result)
         impl_id = enqueue_implement(queue, task, branch, context={"feedback": feedback})
 
@@ -373,8 +386,9 @@ def run_cmd(task: str, db: str, project: str, base: str,
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--output", default="synthesis.md", show_default=True, help="Path to write synthesis")
 @click.option("--branch", default="main", show_default=True)
+@click.option("--timeout", default=600, type=int, show_default=True, help="Task wait timeout in seconds")
 def discuss(topic: str, agents: str, rounds: int, then_run: bool,
-            db: str, project: str, base: str, output: str, branch: str):
+            db: str, project: str, base: str, output: str, branch: str, timeout: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
         raise click.UsageError("topic must not be empty")
@@ -396,8 +410,11 @@ def discuss(topic: str, agents: str, rounds: int, then_run: bool,
     queue = TaskQueue(db)
     perspectives = assign_perspectives(agent_list)
 
-    def _wait_all(task_ids: list[str], timeout: float = 60.0) -> dict:
-        deadline = time.time() + timeout
+    wait_timeout = float(timeout)
+
+    def _wait_all(task_ids: list[str], timeout: float = 0.0) -> dict:
+        effective_timeout = timeout if timeout > 0 else wait_timeout
+        deadline = time.time() + effective_timeout
         done: dict = {}
         while time.time() < deadline:
             for tid in task_ids:
@@ -408,7 +425,7 @@ def discuss(topic: str, agents: str, rounds: int, then_run: bool,
             if len(done) == len(task_ids):
                 return done
             time.sleep(0.1)
-        raise click.ClickException(f"Discussion timed out after {timeout}s")
+        raise click.ClickException(f"Discussion timed out after {effective_timeout}s")
 
     prior_synthesis = ""
     final_synthesis = ""
@@ -457,25 +474,25 @@ def discuss(topic: str, agents: str, rounds: int, then_run: bool,
 
         for iteration in range(1, max_iter + 1):
             _wait_result = None
-            deadline = time.time() + 60.0
+            deadline = time.time() + wait_timeout
             while time.time() < deadline:
                 _wait_result = queue.get_result(impl_id)
                 if _wait_result is not None:
                     break
                 time.sleep(0.1)
             if _wait_result is None:
-                raise click.ClickException(f"task {impl_id!r} timed out")
+                raise click.ClickException(f"task {impl_id!r} timed out after {wait_timeout}s")
 
             review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id)
             review_result = None
-            deadline = time.time() + 60.0
+            deadline = time.time() + wait_timeout
             while time.time() < deadline:
                 review_result = queue.get_result(review_id)
                 if review_result is not None:
                     break
                 time.sleep(0.1)
             if review_result is None:
-                raise click.ClickException(f"task {review_id!r} timed out")
+                raise click.ClickException(f"task {review_id!r} timed out after {wait_timeout}s")
 
             outcome = handle_review_result(
                 review_result, iteration=iteration, max_iter=max_iter,

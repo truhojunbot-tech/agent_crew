@@ -7,10 +7,37 @@ from agent_crew import instructions, session
 
 _AGENT_CMDS = {
     "claude": "claude --dangerously-skip-permissions --continue",
-    "codex": "codex --resume",
-    "gemini": "gemini --resume",
+    "codex": "codex --dangerously-bypass-approvals-and-sandbox",
+    "gemini": "gemini --yolo",
 }
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
+
+
+def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> None:
+    """Start agent CLIs in tmux panes and send initial polling prompt."""
+    for i, agent in enumerate(agents):
+        target = f"{session_name}:{i}"
+        cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
+        # Start agent CLI
+        subprocess.run(["tmux", "send-keys", "-t", target, cmd, "Enter"],
+                       capture_output=True)
+    # Wait for agent CLIs to initialize
+    time.sleep(3)
+    for i, agent in enumerate(agents):
+        target = f"{session_name}:{i}"
+        role = _AGENT_TO_ROLE.get(agent, "implementer")
+        polling_prompt = (
+            f"You are agent '{agent}' (role: {role}). "
+            f"Poll GET http://127.0.0.1:{port}/tasks/next?role={role} every 10 seconds. "
+            f"When you receive a task, execute it and POST result to "
+            f"http://127.0.0.1:{port}/tasks/{{id}}/result. "
+            f"Start polling now."
+        )
+        subprocess.run(["tmux", "send-keys", "-t", target, polling_prompt, ""],
+                       capture_output=True)
+        time.sleep(1)
+        subprocess.run(["tmux", "send-keys", "-t", target, "", "Enter"],
+                       capture_output=True)
 
 
 def validate_git_repo(path: str) -> bool:
