@@ -8,6 +8,7 @@ from agent_crew.setup import (
     write_instruction_files,
     write_port_file,
     write_sessions_json,
+    _get_agent_cmd,
 )
 
 
@@ -100,3 +101,32 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
     prompt_text = third_args[-1]
     assert "/tasks/next?role=implementer" in prompt_text
     assert "curl" in prompt_text
+
+
+# U-SE09: _get_agent_cmd — claude omits --continue when .claude/projects/ absent
+def test_u_se09_get_agent_cmd_claude_omits_continue_when_no_projects(tmp_path):
+    cmd = _get_agent_cmd("claude", str(tmp_path))
+    assert "--continue" not in cmd
+    assert "--dangerously-skip-permissions" in cmd
+
+
+# U-SE10: _get_agent_cmd — claude keeps --continue when .claude/projects/ present
+def test_u_se10_get_agent_cmd_claude_keeps_continue_when_projects_exist(tmp_path):
+    (tmp_path / ".claude" / "projects").mkdir(parents=True)
+    cmd = _get_agent_cmd("claude", str(tmp_path))
+    assert "--continue" in cmd
+
+
+# U-SE11: start_agents_in_panes sends trust response "1" after codex startup
+def test_u_se11_codex_trust_prompt_auto_answered():
+    mock_result = MagicMock(returncode=0)
+    with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
+         patch("agent_crew.setup.time.sleep"):
+        start_agents_in_panes("crew", ["codex"], 8100)
+
+    all_texts = [
+        call[0][0][-1]
+        for call in mock_run.call_args_list
+        if "-l" in call[0][0]
+    ]
+    assert "1" in all_texts

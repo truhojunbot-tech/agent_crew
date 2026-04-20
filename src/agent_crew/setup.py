@@ -13,11 +13,23 @@ _AGENT_CMDS = {
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 
 
+def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
+    cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
+    if "--continue" in cmd:
+        has_history = worktree_path is not None and os.path.isdir(
+            os.path.join(worktree_path, ".claude", "projects")
+        )
+        if not has_history:
+            cmd = cmd.replace(" --continue", "")
+    return cmd
+
+
 def start_agents_in_panes(
     session_name: str,
     agents: list[str],
     port: int,
     pane_targets: list[str] | None = None,
+    worktrees: dict[str, str] | None = None,
 ) -> None:
     """Start agent CLIs in tmux panes and send initial polling prompt.
 
@@ -42,9 +54,14 @@ def start_agents_in_panes(
         )
 
     for agent, target in zip(agents, pane_targets):
-        cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
+        wt_path = worktrees.get(agent) if worktrees else None
+        cmd = _get_agent_cmd(agent, wt_path)
         _send_literal_text(target, cmd)
         _send_enter(target)
+        if agent == "codex":
+            time.sleep(1)
+            _send_literal_text(target, "1")
+            _send_enter(target)
     # Wait for agent CLIs to initialize
     time.sleep(3)
     for agent, target in zip(agents, pane_targets):
