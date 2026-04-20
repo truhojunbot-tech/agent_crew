@@ -170,6 +170,72 @@ def status(project: str, base: str):
 @crew.command()
 @click.argument("project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
+def recover(project: str, base: str):
+    """Recover a crashed PROJECT: restart server and recreate tmux panes."""
+    state = _read_state(base, project)
+    if state is None:
+        raise click.ClickException(f"project {project!r} not found. Run setup first.")
+
+    session_name = state["session"]
+    port = state["port"]
+    worktrees = state.get("worktrees", {})
+    db_file = state["db"]
+    proj_dir = _proj_dir(base, project)
+    recovered = []
+
+    # Restart server if not listening
+    if not _port_listening(port, timeout=1.0):
+        pythonpath = os.pathsep.join(p for p in sys.path if p)
+        server_env = {**os.environ, "AGENT_CREW_DB": db_file, "PYTHONPATH": pythonpath}
+        log_path = os.path.join(proj_dir, "server.log")
+        log_file = open(log_path, "a")
+        server_proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
+             "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
+            env=server_env,
+            stdout=log_file,
+            stderr=log_file,
+        )
+        if _port_listening(port, timeout=15.0):
+            state["server_pid"] = server_proc.pid
+            _write_state(base, project, state)
+            recovered.append("server")
+        else:
+            server_proc.terminate()
+            log_file.close()
+            raise click.ClickException(
+                f"Failed to restart server on port {port}. Check {log_path}"
+            )
+
+    # Recreate tmux session if gone
+    has_session = subprocess.run(
+        ["tmux", "has-session", "-t", session_name],
+        capture_output=True,
+    ).returncode == 0
+
+    if not has_session:
+        start_dir = next(iter(worktrees.values())) if worktrees else proj_dir
+        subprocess.run(
+            ["tmux", "new-session", "-d", "-s", session_name, "-c", start_dir],
+            capture_output=True,
+        )
+        for i, (_, wt_path) in enumerate(worktrees.items()):
+            if i > 0:
+                subprocess.run(
+                    ["tmux", "new-window", "-t", session_name, "-c", wt_path],
+                    capture_output=True,
+                )
+        recovered.append("tmux")
+
+    if recovered:
+        click.echo(f"Recovered: {', '.join(recovered)}")
+    else:
+        click.echo("Nothing to recover: server and tmux already running.")
+
+
+@crew.command()
+@click.argument("project")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
 def teardown(project: str, base: str):
     """Tear down PROJECT."""
     state = _read_state(base, project)
