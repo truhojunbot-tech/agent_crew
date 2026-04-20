@@ -14,7 +14,7 @@ _COMMON = """\
 - Submit result:     POST http://localhost:<port>/tasks/{id}/result
 
 ## Polling Routine (MANDATORY)
-Start this background loop immediately when you receive this instruction:
+Start this background loop immediately when the session starts. Keep it running in the background for the entire session:
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=<role>')
@@ -27,7 +27,7 @@ done &
 ```
 
 ## Result Submission (MANDATORY)
-After completing any task, you MUST call:
+After completing any task, you MUST call the API POST request below before doing anything else:
 ```bash
 curl -X POST http://localhost:<port>/tasks/{id}/result \\
   -H "Content-Type: application/json" \\
@@ -39,6 +39,16 @@ curl -X POST http://localhost:<port>/tasks/{id}/result \\
   }'
 ```
 Status values: done | blocked | needs_clarification
+
+### Result Note Template
+Use this structure for the handoff note you write before the API POST:
+```text
+status: done | blocked | needs_clarification
+branch: <branch-name>
+commit: <commit-hash>
+notes: <short summary of what changed or why blocked>
+```
+Never skip the POST request just because the note is complete.
 
 ## Common Instructions
 - Follow TDD: write tests first, then implement
@@ -57,7 +67,10 @@ _ROLE_SECTIONS: dict = {
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=implementer')
-  if [ -n "$RESP" ]; then echo "NEW_TASK: $RESP"; fi
+  if [ -n "$RESP" ]; then
+    echo "NEW_TASK: $RESP"
+    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  fi
   sleep 30
 done &
 ```
@@ -72,7 +85,10 @@ done &
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=reviewer')
-  if [ -n "$RESP" ]; then echo "NEW_TASK: $RESP"; fi
+  if [ -n "$RESP" ]; then
+    echo "NEW_TASK: $RESP"
+    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  fi
   sleep 30
 done &
 ```
@@ -87,7 +103,10 @@ done &
 ```bash
 while true; do
   RESP=$(curl -sf 'http://localhost:<port>/tasks/next?role=tester')
-  if [ -n "$RESP" ]; then echo "NEW_TASK: $RESP"; fi
+  if [ -n "$RESP" ]; then
+    echo "NEW_TASK: $RESP"
+    # Process the task, then POST /tasks/{id}/result immediately when finished.
+  fi
   sleep 30
 done &
 ```

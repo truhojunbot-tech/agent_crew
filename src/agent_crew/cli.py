@@ -73,6 +73,22 @@ def _pane_looks_idle(pane_output: str) -> bool:
     return any(pat in last_line for pat in _PANE_IDLE_PATTERNS)
 
 
+_STATUS_ALIASES = (
+    ("queued", "pending"),
+    ("running", "in_progress"),
+    ("done", "completed"),
+)
+
+
+def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
+    import urllib.request
+
+    with urllib.request.urlopen(
+        f"http://127.0.0.1:{port}/tasks?status={status}", timeout=2
+    ) as resp:
+        return json.loads(resp.read())
+
+
 @click.group()
 def crew():
     """agent_crew — multi-agent development crew CLI."""
@@ -174,28 +190,28 @@ def status(project: str, base: str):
     session_name = state["session"]
     port = state["port"]
     agent_list = state["agents"]
-
-    import urllib.request
-
     click.echo(f"Project: {project}")
     click.echo(f"Port: {port}")
-
-    for task_status in ["queued", "running", "done"]:
-        try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/tasks?status={task_status}", timeout=2
-            ) as resp:
-                tasks = json.loads(resp.read())
-                click.echo(f"\n{task_status.upper()} ({len(tasks)}):")
-                for t in tasks:
-                    if isinstance(t, dict):
-                        click.echo(f"  [{t.get('task_id', '?')}] {t.get('description', '')[:60]}")
-                    else:
-                        tid = getattr(t, "task_id", "?")
-                        desc = getattr(t, "description", "")
-                        click.echo(f"  [{tid}] {str(desc)[:60]}")
-        except Exception:
-            click.echo(f"\n{task_status.upper()}: (server unreachable)")
+    try:
+        task_groups = {
+            display_status: _fetch_tasks_by_status(port, api_status)
+            for display_status, api_status in _STATUS_ALIASES
+        }
+    except Exception:
+        click.echo("\nTASKS: (server unreachable)")
+    else:
+        total = sum(len(tasks) for tasks in task_groups.values())
+        click.echo(f"\nTasks: {total}")
+        for display_status, _ in _STATUS_ALIASES:
+            tasks = task_groups[display_status]
+            click.echo(f"\n{display_status.upper()} ({len(tasks)}):")
+            for t in tasks:
+                if isinstance(t, dict):
+                    click.echo(f"  [{t.get('task_id', '?')}] {t.get('description', '')[:60]}")
+                else:
+                    tid = getattr(t, "task_id", "?")
+                    desc = getattr(t, "description", "")
+                    click.echo(f"  [{tid}] {str(desc)[:60]}")
 
     for i, agent in enumerate(agent_list):
         result = subprocess.run(
@@ -415,6 +431,15 @@ def run_cmd(task: str, db: str, project: str, base: str,
             pass
         return resolved
 
+    def _drain_resolvable_gates(port: int) -> int:
+        """Resolve gates until the pending set is empty."""
+        total = 0
+        while True:
+            resolved = _auto_resolve_gates(port)
+            if resolved == 0:
+                return total
+            total += resolved
+
     # Determine port for gate resolution (available when --project is set)
     _run_port = 0
     if project:
@@ -450,13 +475,15 @@ def run_cmd(task: str, db: str, project: str, base: str,
             click.echo(f"[{iteration}/{max_iter}] Review approved.")
             # Auto-resolve any pending gates before proceeding
             if _run_port:
-                _auto_resolve_gates(_run_port)
+                _drain_resolvable_gates(_run_port)
             if not no_tester:
                 test_id = enqueue_test(queue, task, branch)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_result = _wait(test_id)
                 test_outcome = handle_test_result(test_result)
                 if test_outcome == "passed":
+                    if _run_port:
+                        _drain_resolvable_gates(_run_port)
                     click.echo(f"[{iteration}/{max_iter}] Tests passed. Loop complete.")
                     return
                 else:
@@ -465,6 +492,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
                                                context={"retry": True})
                     continue
             else:
+                if _run_port:
+                    _drain_resolvable_gates(_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Loop complete (no tester).")
             return
 
@@ -486,7 +515,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--output", default="synthesis.md", show_default=True, help="Path to write synthesis")
 @click.option("--branch", default="main", show_default=True)
-@click.option("--timeout", default=600, type=int, show_default=True, help="Task wait timeout in seconds")
+@click.option("--timeout", default=300, type=int, show_default=True, help="Task wait timeout in seconds")
 def discuss(topic: str, agents: str, rounds: int, then_run: bool,
             db: str, project: str, base: str, output: str, branch: str, timeout: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""

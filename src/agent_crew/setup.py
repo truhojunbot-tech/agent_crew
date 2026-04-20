@@ -15,12 +15,21 @@ _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 
 def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> None:
     """Start agent CLIs in tmux panes and send initial polling prompt."""
+    def _send_literal_text(target: str, text: str) -> None:
+        subprocess.run(
+            ["tmux", "send-keys", "-l", "-t", target, text],
+            capture_output=True,
+        )
+
+    def _send_enter(target: str) -> None:
+        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
+
     for i, agent in enumerate(agents):
         target = f"{session_name}:0.{i}"
         cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
         # Start agent CLI
-        subprocess.run(["tmux", "send-keys", "-t", target, cmd, "Enter"],
-                       capture_output=True)
+        _send_literal_text(target, cmd)
+        _send_enter(target)
     # Wait for agent CLIs to initialize
     time.sleep(3)
     for i, agent in enumerate(agents):
@@ -34,11 +43,9 @@ def start_agents_in_panes(session_name: str, agents: list[str], port: int) -> No
             f"When you see NEW_TASK output, process it and POST the result to "
             f"http://127.0.0.1:{port}/tasks/{{id}}/result . Start the loop now."
         )
-        subprocess.run(["tmux", "send-keys", "-t", target, polling_prompt, ""],
-                       capture_output=True)
+        _send_literal_text(target, polling_prompt)
         time.sleep(1)
-        subprocess.run(["tmux", "send-keys", "-t", target, "", "Enter"],
-                       capture_output=True)
+        _send_enter(target)
 
 
 def validate_git_repo(path: str) -> bool:

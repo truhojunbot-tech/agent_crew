@@ -4,6 +4,7 @@ from agent_crew.setup import (
     create_worktrees,
     find_free_port,
     validate_git_repo,
+    start_agents_in_panes,
     write_instruction_files,
     write_port_file,
     write_sessions_json,
@@ -82,3 +83,20 @@ def test_u_se07_create_worktrees_custom_agents():
     assert set(result.keys()) == {"alpha", "beta", "gamma"}
     for agent in agents:
         assert result[agent] == f"/base/proj/{agent}"
+
+
+# U-SE08: start_agents_in_panes uses literal tmux input for cmd/prompt and sends Enter separately
+def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
+    mock_result = MagicMock(returncode=0)
+    with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
+         patch("agent_crew.setup.time.sleep"):
+        start_agents_in_panes("crew_proj", ["claude"], 8100)
+
+    assert mock_run.call_count == 4
+    first_args = mock_run.call_args_list[0][0][0]
+    third_args = mock_run.call_args_list[2][0][0]
+    assert "-l" in first_args
+    assert "-l" in third_args
+    prompt_text = third_args[-1]
+    assert "/tasks/next?role=implementer" in prompt_text
+    assert "curl" in prompt_text
