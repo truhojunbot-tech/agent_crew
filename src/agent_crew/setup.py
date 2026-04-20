@@ -105,12 +105,15 @@ def write_sessions_json(path: str, agents: list[dict]) -> None:
 
 
 def find_free_port(start: int = 8100) -> int:
+    """Find a free port by actually binding to it (SO_REUSEADDR off) to avoid TOCTOU."""
     port = start
     while True:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            if sock.connect_ex(("localhost", port)) != 0:
+            try:
+                sock.bind(("127.0.0.1", port))
                 return port
-        port += 1
+            except OSError:
+                port += 1
 
 
 def write_port_file(path: str, port: int) -> None:

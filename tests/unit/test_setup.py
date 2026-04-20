@@ -55,12 +55,12 @@ def test_u_se04_write_sessions_json(tmp_path):
         assert "cmd" in agent
 
 
-# U-SE05: find_free_port — 8100부터 사용 가능한 포트 반환 (mock socket)
+# U-SE05: find_free_port — 8100 bind fails, returns 8101
 def test_u_se05_find_free_port():
     mock_sock = MagicMock()
     mock_sock.__enter__ = lambda s: s
     mock_sock.__exit__ = MagicMock(return_value=False)
-    mock_sock.connect_ex.side_effect = lambda addr: 0 if addr[1] == 8100 else 1
+    mock_sock.bind.side_effect = lambda addr: (_ for _ in ()).throw(OSError()) if addr[1] == 8100 else None
 
     with patch("agent_crew.setup.socket.socket", return_value=mock_sock):
         port = find_free_port(start=8100)
