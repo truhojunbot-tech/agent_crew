@@ -122,3 +122,32 @@ def test_u_c13_check_window_width_fits_allows_wide():
 # U-C14: unknown width (tmux probe failed) → empty string (don't block setup)
 def test_u_c14_check_window_width_fits_unknown_ok():
     assert _check_window_width_fits(window_width=0, num_agents=3) == ""
+
+
+# U-C15: teardown runs git worktree prune after removing worktrees
+def test_u_c15_teardown_runs_worktree_prune(tmp_path):
+    import json
+    proj_dir = tmp_path / "myproj"
+    proj_dir.mkdir()
+    state = {
+        "session": "crew_myproj",
+        "agents": ["claude"],
+        "worktrees": {"claude": str(tmp_path / "wt" / "claude")},
+        "server_pid": 0,
+        "port_file": str(tmp_path / "port"),
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    mock_ok = MagicMock(returncode=0, stdout="", stderr="")
+    runner = CliRunner()
+    with patch("agent_crew.cli.subprocess.run", return_value=mock_ok) as mock_run, \
+         patch("agent_crew.cli.shutil.rmtree"), \
+         patch("agent_crew.cli.os.kill"), \
+         patch("agent_crew.cli._tmux_snapshot", return_value=""):
+        runner.invoke(crew, ["teardown", "myproj", "--base", str(tmp_path)])
+
+    prune_calls = [
+        c for c in mock_run.call_args_list
+        if "worktree" in str(c) and "prune" in str(c)
+    ]
+    assert len(prune_calls) == 1, f"Expected 1 prune call, got {len(prune_calls)}"

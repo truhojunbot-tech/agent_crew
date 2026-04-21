@@ -13,10 +13,22 @@ _AGENT_CMDS = {
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 
 
+def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
+    cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
+    if "--continue" in cmd:
+        has_history = worktree_path is not None and os.path.isdir(
+            os.path.join(worktree_path, ".claude", "projects")
+        )
+        if not has_history:
+            cmd = cmd.replace(" --continue", "")
+    return cmd
+
+
 def start_agents_in_panes(
     session_name: str,
     agents: list[str],
     pane_targets: list[str] | None = None,
+    worktrees: dict[str, str] | None = None,
 ) -> None:
     """Start agent CLIs in tmux panes.
 
@@ -52,9 +64,16 @@ def start_agents_in_panes(
         )
 
     for agent, target in zip(agents, pane_targets):
-        cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
+        wt_path = worktrees.get(agent) if worktrees else None
+        cmd = _get_agent_cmd(agent, wt_path)
         _send_literal_text(target, cmd)
         _send_enter(target)
+        if agent == "codex":
+            # codex prints a trust prompt after launch; "1" accepts the current
+            # directory as trusted so the CLI reaches the ready state.
+            time.sleep(1)
+            _send_literal_text(target, "1")
+            _send_enter(target)
     # Give agent CLIs time to finish their own boot banners before the first
     # task push might arrive.
     time.sleep(3)

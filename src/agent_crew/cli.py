@@ -309,7 +309,7 @@ def setup(project: str, agents: str, base: str):
     # polling loop. Instructions live in each worktree's CLAUDE.md/AGENTS.md/GEMINI.md
     # which the CLIs auto-load.
     setup_module.start_agents_in_panes(
-        session_name, agent_list, pane_targets=pane_ids or None
+        session_name, agent_list, pane_targets=pane_ids or None, worktrees=worktrees
     )
     _crew_log(proj_dir, f"agents started pane_ids={pane_ids}")
 
@@ -466,6 +466,7 @@ def recover(project: str, base: str):
                 cur_session,
                 state.get("agents", []),
                 pane_targets=pane_ids,
+                worktrees=worktrees,
             )
             state["session"] = cur_session
             state["window"] = cur_window or "0"
@@ -524,6 +525,7 @@ def teardown(project: str, base: str):
             r = subprocess.run(["git", "worktree", "remove", "--force", wt_path],
                                capture_output=True, text=True)
             _crew_log(proj_dir, f"worktree remove {agent} rc={r.returncode}")
+    subprocess.run(["git", "worktree", "prune"], capture_output=True, text=True)
 
     _crew_log(proj_dir, f"teardown DONE — removing state dir {proj_dir}")
     # Remove state dir
