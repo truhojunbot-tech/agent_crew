@@ -305,10 +305,11 @@ def setup(project: str, agents: str, base: str):
             f"Check {os.path.join(proj_dir, 'server.log')}"
         )
 
-    # Start agent CLIs and send kickoff prompt. Agents wait for pane pushes;
-    # no polling loop is started.
+    # Start agent CLIs. Agents wait for pane pushes; no kickoff prompt, no
+    # polling loop. Instructions live in each worktree's CLAUDE.md/AGENTS.md/GEMINI.md
+    # which the CLIs auto-load.
     setup_module.start_agents_in_panes(
-        session_name, agent_list, port, pane_targets=pane_ids or None
+        session_name, agent_list, pane_targets=pane_ids or None
     )
     _crew_log(proj_dir, f"agents started pane_ids={pane_ids}")
 
@@ -464,7 +465,6 @@ def recover(project: str, base: str):
             setup_module.start_agents_in_panes(
                 cur_session,
                 state.get("agents", []),
-                port,
                 pane_targets=pane_ids,
             )
             state["session"] = cur_session

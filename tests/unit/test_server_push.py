@@ -283,3 +283,36 @@ def test_u_sp12_discuss_missing_agent_no_push(tmp_db):
         assert resp.status_code == 201
 
     assert push.calls == []
+
+
+# U-SP13: _default_push uses tmux load-buffer + paste-buffer -p so multi-line
+# task text is delivered as a single bracketed paste (one Enter to submit).
+# Before this fix, send-keys -l turned each \n in the task block into a
+# separate Enter keystroke, which codex would submit prematurely and then hit
+# its upstream rate limit.
+def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
+    from unittest.mock import MagicMock
+    from agent_crew.server import _default_push
+
+    mock_run = MagicMock(return_value=MagicMock(returncode=0))
+    monkeypatch.setattr("agent_crew.server.subprocess.run", mock_run)
+
+    text = "line1\nline2\nline3"
+    _default_push("%42", text)
+
+    # 3 subprocess calls: load-buffer (stdin), paste-buffer -p -d, send-keys Enter
+    assert mock_run.call_count == 3
+    load_args = mock_run.call_args_list[0][0][0]
+    paste_args = mock_run.call_args_list[1][0][0]
+    enter_args = mock_run.call_args_list[2][0][0]
+
+    assert load_args[:3] == ["tmux", "load-buffer", "-"]
+    load_kwargs = mock_run.call_args_list[0][1]
+    assert load_kwargs.get("input") == text
+
+    assert "paste-buffer" in paste_args
+    assert "-p" in paste_args  # bracketed paste mode
+    assert "-d" in paste_args  # delete buffer after paste
+    assert "%42" in paste_args
+
+    assert enter_args == ["tmux", "send-keys", "-t", "%42", "Enter"]

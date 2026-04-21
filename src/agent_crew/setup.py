@@ -16,15 +16,20 @@ _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 def start_agents_in_panes(
     session_name: str,
     agents: list[str],
-    port: int,
     pane_targets: list[str] | None = None,
 ) -> None:
     """Start agent CLIs in tmux panes.
 
     Push model: server delivers tasks to the pane via tmux send-keys when new
     tasks arrive. Agents do NOT poll — they wait for pane messages, parse the
-    task, do the work, and POST results back. The kickoff prompt just tells
-    the agent how to recognize the incoming AGENT_CREW TASK format.
+    task, do the work, and POST results back.
+
+    No kickoff prompt is sent. Each worktree already contains the role-specific
+    instruction file (CLAUDE.md / AGENTS.md / GEMINI.md) which the agent CLI
+    auto-loads, and that file explicitly documents the ``=== AGENT_CREW TASK ===``
+    protocol. Sending an extra kickoff prompt wastes per-agent API quota (and
+    for rate-limited backends like codex, it cascades: the kickoff gets throttled,
+    leaving the subsequent task push in a dead composer state).
 
     pane_targets (optional): explicit tmux targets per agent (e.g. pane_ids
     like ``%42``). When omitted, falls back to ``<session>:0.<i>`` which
@@ -50,21 +55,9 @@ def start_agents_in_panes(
         cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
         _send_literal_text(target, cmd)
         _send_enter(target)
-    # Wait for agent CLIs to initialize
+    # Give agent CLIs time to finish their own boot banners before the first
+    # task push might arrive.
     time.sleep(3)
-    for agent, target in zip(agents, pane_targets):
-        role = _AGENT_TO_ROLE.get(agent, "implementer")
-        kickoff_prompt = (
-            f"You are agent '{agent}' (role: {role}). "
-            f"The agent_crew server at http://127.0.0.1:{port} will push tasks to this pane. "
-            f"When you see a block starting with '=== AGENT_CREW TASK ===', parse the fields "
-            f"(task_id, task_type, branch, priority, context, description), do the work, "
-            f"then POST result to /tasks/<task_id>/result. Do not poll — just wait for the next task. "
-            f"Read your agent instruction file (CLAUDE.md / AGENTS.md / GEMINI.md) in this directory for full protocol."
-        )
-        _send_literal_text(target, kickoff_prompt)
-        time.sleep(1)
-        _send_enter(target)
 
 
 def validate_git_repo(path: str) -> bool:

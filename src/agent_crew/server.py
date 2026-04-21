@@ -16,8 +16,25 @@ class ResolveBody(BaseModel):
 
 
 def _default_push(pane_id: str, text: str) -> None:
-    """Default push implementation — sends literal text then Enter to tmux pane."""
-    subprocess.run(["tmux", "send-keys", "-l", "-t", pane_id, text], capture_output=True)
+    """Default push implementation — sends text via tmux bracketed paste then Enter.
+
+    Using ``send-keys -l`` for multi-line text turns each embedded ``\\n`` into
+    a literal Enter keystroke inside the TUI composer, which some agent CLIs
+    (notably codex) interpret as a premature submit for the first line.
+    ``load-buffer`` + ``paste-buffer -p`` wraps the whole blob in bracketed-paste
+    escape sequences so the composer treats it as a single atomic paste, and we
+    issue exactly one Enter at the end to submit.
+    """
+    subprocess.run(
+        ["tmux", "load-buffer", "-"],
+        input=text,
+        text=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["tmux", "paste-buffer", "-p", "-d", "-t", pane_id],
+        capture_output=True,
+    )
     subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
 
 
