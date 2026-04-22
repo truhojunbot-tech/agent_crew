@@ -1,4 +1,4 @@
-from agent_crew.instructions import generate
+from agent_crew.instructions import ROLE_FILES, generate
 
 
 def test_u_i01_generate_describes_push_model_and_result_submission():
@@ -61,3 +61,22 @@ def test_u_i05_failure_path_documented():
     assert "failed" in content
     # Failure/escalation worked example present
     assert "needs direction" in content.lower() or "needs_human" in content
+
+
+def test_u_i06_role_files_use_dotclaude_subdir():
+    """Instructions must be written to .claude/ so they don't conflict with the
+    project's root CLAUDE.md (which is tracked in git and reverts on checkout)."""
+    for role, path in ROLE_FILES.items():
+        assert path.startswith(".claude/"), (
+            f"Role {role!r} uses {path!r} — must use .claude/ prefix to avoid git conflicts"
+        )
+
+
+def test_u_i07_common_instructs_ignore_alfred_global():
+    """Agents must be told to ignore the global Alfred ~/.claude/CLAUDE.md
+    so they don't invoke skills, use Telegram MCP, or create tmux panes."""
+    content = generate("implementer", "myproject", 8123)
+    lower = content.lower()
+    assert "alfred" in lower
+    assert "telegram" in lower  # explicitly prohibited
+    assert "skill" in lower     # skill invocation prohibited

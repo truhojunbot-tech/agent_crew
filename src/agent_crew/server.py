@@ -1,6 +1,7 @@
 import json
 import os
 import subprocess
+import time
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
@@ -15,15 +16,26 @@ class ResolveBody(BaseModel):
     status: Literal["approved", "rejected"]
 
 
-def _default_push(pane_id: str, text: str) -> None:
-    """Default push implementation — sends text via tmux bracketed paste then Enter.
+def _pane_has_task(pane_id: str) -> bool:
+    """Return True if the pane's visible text still contains the task marker.
 
-    Using ``send-keys -l`` for multi-line text turns each embedded ``\\n`` into
-    a literal Enter keystroke inside the TUI composer, which some agent CLIs
-    (notably codex) interpret as a premature submit for the first line.
-    ``load-buffer`` + ``paste-buffer -p`` wraps the whole blob in bracketed-paste
-    escape sequences so the composer treats it as a single atomic paste, and we
-    issue exactly one Enter at the end to submit.
+    When the task is sitting unsubmitted in the composer, the marker is visible.
+    Once Enter is processed the composer clears and the marker disappears.
+    """
+    r = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-t", pane_id],
+        capture_output=True, text=True,
+    )
+    return "=== AGENT_CREW TASK ===" in r.stdout
+
+
+def _default_push(pane_id: str, text: str) -> None:
+    """Send task via tmux bracketed paste, then retry Enter until task is submitted.
+
+    Bracketed-paste mode delivers the entire blob atomically. After paste we
+    wait for the TUI to finish consuming it, then send Enter. If the pane still
+    shows the task marker (Enter was dropped or arrived too early), we wait and
+    retry once.
     """
     subprocess.run(
         ["tmux", "load-buffer", "-"],
@@ -35,7 +47,14 @@ def _default_push(pane_id: str, text: str) -> None:
         ["tmux", "paste-buffer", "-p", "-d", "-t", pane_id],
         capture_output=True,
     )
+    # Give the TUI time to process the bracketed-paste sequence.
+    time.sleep(0.5)
     subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
+    # Verify delivery: if task marker still visible the Enter was dropped — retry once.
+    time.sleep(0.3)
+    if _pane_has_task(pane_id):
+        time.sleep(0.2)
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
 
 
 def _format_task_message(task: TaskRequest, port: int) -> str:

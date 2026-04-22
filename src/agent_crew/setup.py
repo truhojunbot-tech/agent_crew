@@ -1,3 +1,5 @@
+import fcntl
+import json
 import os
 import socket
 import subprocess
@@ -77,6 +79,38 @@ def start_agents_in_panes(
     # Give agent CLIs time to finish their own boot banners before the first
     # task push might arrive.
     time.sleep(3)
+
+
+def pretrust_claude_worktree(worktrees: dict[str, str]) -> None:
+    """Pre-accept Claude's workspace-trust dialog for the claude worktree.
+
+    `--dangerously-skip-permissions` bypasses tool permissions but not the
+    workspace-trust dialog, so setup would otherwise stall on a "Trust this
+    folder?" prompt. Claude stores trust per-project in ~/.claude.json under
+    projects[<abs_path>].hasTrustDialogAccepted — we pre-seed it here so the
+    dialog is skipped on first launch. Other Claude sessions may write this
+    file concurrently, so we hold an exclusive flock across read-modify-write.
+    """
+    wt_path = worktrees.get("claude")
+    if not wt_path:
+        return
+    config = os.path.expanduser("~/.claude.json")
+    if not os.path.exists(config):
+        return
+    wt_abs = os.path.abspath(wt_path)
+    with open(config, "r+") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            data = json.load(f)
+            proj = data.setdefault("projects", {}).setdefault(wt_abs, {})
+            if proj.get("hasTrustDialogAccepted") is True:
+                return
+            proj["hasTrustDialogAccepted"] = True
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, indent=2)
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
 
 def validate_git_repo(path: str) -> bool:

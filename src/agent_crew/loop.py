@@ -1,8 +1,35 @@
+import json
+import urllib.request
 import uuid
 
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 
 DEFAULT_MAX_ITER: int = 5
+
+
+def _post_task_http(port: int, req: TaskRequest) -> str:
+    """POST a TaskRequest to the running server so its push_fn fires.
+
+    Direct queue.enqueue() inserts into SQLite without triggering the server's
+    tmux push path (see server.py::post_task). Any CLI caller that wants the
+    agent pane to actually receive the task must route through HTTP.
+    """
+    payload = json.dumps({
+        "task_id": req.task_id,
+        "task_type": req.task_type,
+        "description": req.description,
+        "branch": req.branch,
+        "priority": req.priority,
+        "context": req.context,
+    }).encode()
+    http_req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/tasks",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(http_req, timeout=5) as resp:
+        return json.loads(resp.read())["task_id"]
 
 _TDD_CONTEXT = {
     "tdd": True,
@@ -21,7 +48,7 @@ _REVIEW_CONTEXT = {
 }
 
 
-def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}) -> str:
+def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, port: int = 0) -> str:
     req = TaskRequest(
         task_id=f"impl-{uuid.uuid4().hex[:8]}",
         task_type="implement",
@@ -29,10 +56,12 @@ def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}) ->
         branch=branch,
         context={**_TDD_CONTEXT, **context},
     )
+    if port:
+        return _post_task_http(port, req)
     return queue.enqueue(req)
 
 
-def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {}) -> str:
+def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {}, port: int = 0) -> str:
     req = TaskRequest(
         task_id=f"review-{uuid.uuid4().hex[:8]}",
         task_type="review",
@@ -40,10 +69,12 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
         branch=branch,
         context={**_REVIEW_CONTEXT, "prev_task_id": prev_task_id, **context},
     )
+    if port:
+        return _post_task_http(port, req)
     return queue.enqueue(req)
 
 
-def enqueue_test(queue, task_desc: str, branch: str, context: dict = {}) -> str:
+def enqueue_test(queue, task_desc: str, branch: str, context: dict = {}, port: int = 0) -> str:
     req = TaskRequest(
         task_id=f"test-{uuid.uuid4().hex[:8]}",
         task_type="test",
@@ -51,6 +82,8 @@ def enqueue_test(queue, task_desc: str, branch: str, context: dict = {}) -> str:
         branch=branch,
         context=context,
     )
+    if port:
+        return _post_task_http(port, req)
     return queue.enqueue(req)
 
 
@@ -65,6 +98,7 @@ def handle_review_result(
     queue=None,
     task_desc: str = "",
     branch: str = "",
+    port: int = 0,
 ) -> str:
     if iteration >= max_iter and result.verdict != "approve":
         if queue is not None:
@@ -77,16 +111,16 @@ def handle_review_result(
         return "escalate"
     if result.verdict == "approve":
         if queue is not None and not no_tester and task_desc and branch:
-            enqueue_test(queue, task_desc, branch)
+            enqueue_test(queue, task_desc, branch, port=port)
         return "approved"
     return "request_changes"
 
 
 def enqueue_implement_with_feedback(
-    queue, task_desc: str, branch: str, review_result: TaskResult
+    queue, task_desc: str, branch: str, review_result: TaskResult, port: int = 0
 ) -> str:
     feedback = build_feedback(review_result)
-    return enqueue_implement(queue, task_desc, branch, context={"feedback": feedback})
+    return enqueue_implement(queue, task_desc, branch, context={"feedback": feedback}, port=port)
 
 
 def handle_test_result(result: TaskResult) -> str:

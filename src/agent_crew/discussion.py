@@ -1,20 +1,36 @@
 import uuid
 
+from agent_crew.loop import _post_task_http
 from agent_crew.protocol import TaskRequest
 
 DEFAULT_PERSPECTIVES: list[str] = ["analyst", "critic", "advocate", "risk"]
 
 
-def enqueue_panel_tasks(queue, agents: list[str], topic: str, context: dict) -> list[str]:
+def enqueue_panel_tasks(
+    queue, agents: list[str], topic: str, context: dict, port: int = 0,
+    perspectives: dict[str, str] | None = None,
+) -> list[str]:
+    """Enqueue one discuss task per agent.
+
+    Each task's context carries:
+      - `agent`: agent name (claude/codex/gemini) — the server uses this to
+        route the push to the right pane via pane_map.
+      - `perspective`: panel role (analyst/critic/...) — the agent CLI reads
+        this from context to frame its opinion (see instructions.py).
+    Callers should pass a pre-computed `perspectives` dict from
+    `assign_perspectives(agents)` so both sides of the equation agree.
+    """
+    perspective_map = perspectives or assign_perspectives(agents)
     task_ids = []
     for agent in agents:
+        ctx = {**context, "agent": agent, "perspective": perspective_map.get(agent, "")}
         req = TaskRequest(
             task_id=f"{agent}-{uuid.uuid4().hex[:8]}",
             task_type="discuss",
             description=f"Discuss: {topic}",
-            context={**context, "agent": agent},
+            context=ctx,
         )
-        task_id = queue.enqueue(req)
+        task_id = _post_task_http(port, req) if port else queue.enqueue(req)
         task_ids.append(task_id)
     return task_ids
 

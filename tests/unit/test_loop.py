@@ -1,10 +1,11 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from agent_crew.loop import (
     DEFAULT_MAX_ITER,
     build_feedback,
     enqueue_implement,
     enqueue_review,
+    enqueue_test,
     handle_review_result,
     handle_test_result,
 )
@@ -165,3 +166,52 @@ def test_u_l10c_build_feedback_dict_unknown_layer():
     assert "misnamed variable" in feedback
     assert "[test_quality]" in feedback
     assert "missing branch coverage" in feedback
+
+
+# U-L11: port > 0 → POSTs to /tasks HTTP endpoint (triggers server push).
+# Without this path, direct queue.enqueue() bypasses the server's push_fn and
+# tasks sit QUEUED without ever reaching the tmux pane.
+def test_u_l11_enqueue_implement_routes_through_http_when_port_given():
+    queue = MagicMock()
+    fake_resp = MagicMock()
+    fake_resp.read.return_value = b'{"task_id":"impl-http-1"}'
+    fake_resp.__enter__ = lambda s: s
+    fake_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("agent_crew.loop.urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+        task_id = enqueue_implement(queue, "t", "main", port=8101)
+
+    assert task_id == "impl-http-1"
+    queue.enqueue.assert_not_called()
+    req = mock_urlopen.call_args[0][0]
+    assert req.full_url == "http://127.0.0.1:8101/tasks"
+    assert req.get_method() == "POST"
+
+
+# U-L12: port == 0 → direct queue.enqueue (legacy path, no server).
+def test_u_l12_enqueue_implement_direct_db_when_no_port():
+    queue = MagicMock()
+    queue.enqueue.side_effect = lambda req: req.task_id
+
+    with patch("agent_crew.loop.urllib.request.urlopen") as mock_urlopen:
+        task_id = enqueue_implement(queue, "t", "main")
+
+    assert task_id.startswith("impl-")
+    queue.enqueue.assert_called_once()
+    mock_urlopen.assert_not_called()
+
+
+# U-L13: enqueue_review / enqueue_test also honor port.
+def test_u_l13_enqueue_review_and_test_honor_port():
+    queue = MagicMock()
+    fake_resp = MagicMock()
+    fake_resp.read.return_value = b'{"task_id":"x"}'
+    fake_resp.__enter__ = lambda s: s
+    fake_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("agent_crew.loop.urllib.request.urlopen", return_value=fake_resp) as mock_urlopen:
+        enqueue_review(queue, "t", "main", prev_task_id="impl-1", port=8101)
+        enqueue_test(queue, "t", "main", port=8101)
+
+    queue.enqueue.assert_not_called()
+    assert mock_urlopen.call_count == 2

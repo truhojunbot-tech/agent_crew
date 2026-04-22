@@ -294,17 +294,21 @@ def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
     from unittest.mock import MagicMock
     from agent_crew.server import _default_push
 
-    mock_run = MagicMock(return_value=MagicMock(returncode=0))
+    # capture-pane returns empty (task marker absent) → no retry Enter needed.
+    mock_run = MagicMock(return_value=MagicMock(returncode=0, stdout=""))
     monkeypatch.setattr("agent_crew.server.subprocess.run", mock_run)
+    monkeypatch.setattr("agent_crew.server.time.sleep", lambda _: None)
 
     text = "line1\nline2\nline3"
     _default_push("%42", text)
 
-    # 3 subprocess calls: load-buffer (stdin), paste-buffer -p -d, send-keys Enter
-    assert mock_run.call_count == 3
+    # 4 subprocess calls: load-buffer, paste-buffer -p -d, send-keys Enter,
+    # capture-pane (verify Enter was processed). No retry because marker absent.
+    assert mock_run.call_count == 4
     load_args = mock_run.call_args_list[0][0][0]
     paste_args = mock_run.call_args_list[1][0][0]
     enter_args = mock_run.call_args_list[2][0][0]
+    capture_args = mock_run.call_args_list[3][0][0]
 
     assert load_args[:3] == ["tmux", "load-buffer", "-"]
     load_kwargs = mock_run.call_args_list[0][1]
@@ -316,3 +320,4 @@ def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
     assert "%42" in paste_args
 
     assert enter_args == ["tmux", "send-keys", "-t", "%42", "Enter"]
+    assert "capture-pane" in capture_args

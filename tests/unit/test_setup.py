@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 from agent_crew.setup import (
     create_worktrees,
     find_free_port,
+    pretrust_claude_worktree,
     validate_git_repo,
     start_agents_in_panes,
     write_instruction_files,
@@ -141,3 +142,47 @@ def test_u_se11_codex_trust_prompt_auto_answered():
         if "-l" in call[0][0]
     ]
     assert "1" in all_texts
+
+
+# U-SE12: pretrust_claude_worktree writes hasTrustDialogAccepted for claude worktree
+# Claude's --dangerously-skip-permissions doesn't skip the workspace trust dialog,
+# so first launch in a new worktree would stall. We pre-seed the flag in
+# ~/.claude.json so the dialog is auto-accepted.
+def test_u_se12_pretrust_claude_worktree(tmp_path):
+    import json as _json
+    config = tmp_path / ".claude.json"
+    config.write_text(_json.dumps({"projects": {"/existing": {"hasTrustDialogAccepted": True}}}))
+
+    wt = tmp_path / "wt_claude"
+    wt.mkdir()
+    with patch("agent_crew.setup.os.path.expanduser", return_value=str(config)):
+        pretrust_claude_worktree({"claude": str(wt)})
+
+    data = _json.loads(config.read_text())
+    # Existing entries preserved.
+    assert data["projects"]["/existing"]["hasTrustDialogAccepted"] is True
+    # New worktree path registered as trusted.
+    assert data["projects"][str(wt)]["hasTrustDialogAccepted"] is True
+
+
+# U-SE13: pretrust_claude_worktree — no-op when ~/.claude.json missing
+# Fresh install: Claude will create the file on first launch; don't synthesize one.
+def test_u_se13_pretrust_noop_when_config_missing(tmp_path):
+    missing = tmp_path / "nope.json"
+    wt = tmp_path / "wt_claude"
+    wt.mkdir()
+    with patch("agent_crew.setup.os.path.expanduser", return_value=str(missing)):
+        pretrust_claude_worktree({"claude": str(wt)})
+    assert not missing.exists()
+
+
+# U-SE14: pretrust_claude_worktree — no-op when claude not in worktrees
+def test_u_se14_pretrust_noop_when_no_claude_worktree(tmp_path):
+    import json as _json
+    config = tmp_path / ".claude.json"
+    original = {"projects": {}}
+    config.write_text(_json.dumps(original))
+    with patch("agent_crew.setup.os.path.expanduser", return_value=str(config)):
+        pretrust_claude_worktree({"codex": str(tmp_path / "wt_codex")})
+    # File untouched.
+    assert _json.loads(config.read_text()) == original

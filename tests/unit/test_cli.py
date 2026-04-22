@@ -1,12 +1,11 @@
+import pathlib
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
 
 from agent_crew.cli import (
     _capture_pane,
-    _check_window_width_fits,
     _pane_looks_idle,
-    _required_window_width,
     crew,
 )
 
@@ -96,32 +95,141 @@ def test_u_c10_capture_pane_failure():
     assert output is None
 
 
-# U-C11: _required_window_width — coordinator + N agents each need MIN_PANE_WIDTH
-def test_u_c11_required_window_width():
-    # 1 agent => coordinator + 1 = 2 * 60 = 120
-    assert _required_window_width(1) == 120
-    # 3 agents => 4 * 60 = 240
-    assert _required_window_width(3) == 240
+# U-C16: discuss --nowait enqueues tasks and returns immediately (no polling)
+def test_u_c16_discuss_nowait_returns_immediately(tmp_path):
+    """--nowait must not block on task results — it enqueues and prints task_ids
+    so the caller can poll `crew status` at their own pace."""
+    db_path = str(tmp_path / "tasks.db")
+    runner = CliRunner()
+    result = runner.invoke(crew, [
+        "discuss", "Adopt Rust?",
+        "--db", db_path,
+        "--agents", "analyst,critic",
+        "--nowait",
+    ])
+    assert result.exit_code == 0, result.output
+    assert "queued" in result.output.lower()
+    # Both agent names must appear so caller can correlate tasks to panelists.
+    # Line format: "  <agent> (<perspective>): <task_id>"
+    assert "analyst " in result.output
+    assert "critic " in result.output
+    # Rows exist in DB with pending status (never got pushed — no tmux/server).
+    import sqlite3
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT task_type, status FROM tasks").fetchall()
+    conn.close()
+    assert len(rows) == 2
+    assert all(r["task_type"] == "discuss" for r in rows)
 
 
-# U-C12: _check_window_width_fits — window too narrow (Bug #1 repro)
-def test_u_c12_check_window_width_fits_rejects_narrow():
-    msg = _check_window_width_fits(window_width=80, num_agents=3)
-    assert msg  # non-empty error
-    assert "80" in msg
-    assert "240" in msg
-    assert "Maximize" in msg or "wider" in msg
+# U-C17: discuss times out → partial synthesis written, missing task_ids reported, exit 2
+def test_u_c17_discuss_timeout_preserves_partial_synthesis(tmp_path):
+    """When the timeout fires with only some agents done, the caller shouldn't
+    lose the completed work — we write a PARTIAL synthesis and emit the
+    missing task_ids so the user can re-run or wait-and-status."""
+    from agent_crew.queue import TaskQueue
+    from agent_crew.discussion import enqueue_panel_tasks
+    from agent_crew.protocol import TaskResult
+
+    db_path = str(tmp_path / "tasks.db")
+    output = str(tmp_path / "synthesis.md")
+    queue = TaskQueue(db_path)
+
+    # Pre-stage: one agent "already responded", the other never will.
+    task_ids = enqueue_panel_tasks(
+        queue, ["analyst", "critic"], "AI strategy", {"round": 1}, port=0
+    )
+    # Mark analyst's task as completed with a real summary.
+    queue.submit_result(task_ids[0], TaskResult(
+        task_id=task_ids[0], status="completed", summary="analyst summary content."
+    ))
+    # critic's task_ids[1] stays pending → will trigger the timeout branch.
+
+    # We need enqueue_panel_tasks to return our pre-staged IDs so _wait_all
+    # polls for them. Patch it to return the existing IDs and not re-enqueue.
+    runner = CliRunner()
+    with patch("agent_crew.discussion.enqueue_panel_tasks", return_value=task_ids):
+        result = runner.invoke(crew, [
+            "discuss", "AI strategy",
+            "--db", db_path,
+            "--agents", "analyst,critic",
+            "--output", output,
+            "--timeout", "1",  # fire quickly
+        ])
+
+    assert result.exit_code == 2, f"expected partial-success exit 2, got {result.exit_code}: {result.output}"
+    # Synthesis file must exist and carry PARTIAL marker + the completed summary.
+    content = pathlib.Path(output).read_text()
+    assert "PARTIAL" in content
+    assert "analyst summary content." in content
+    # Missing task_id must be surfaced so the user can chase it.
+    combined = result.output + (result.stderr if hasattr(result, "stderr_bytes") else "")
+    assert task_ids[1] in combined or task_ids[1] in content
 
 
-# U-C13: _check_window_width_fits — window wide enough → empty string
-def test_u_c13_check_window_width_fits_allows_wide():
-    assert _check_window_width_fits(window_width=240, num_agents=3) == ""
-    assert _check_window_width_fits(window_width=500, num_agents=3) == ""
+# U-C18: discuss in project mode refuses agents not in pane_map
+# Prevents the silent-push-skip bug where perspective names (analyst/critic)
+# were passed as agents and every task sat queued forever.
+def test_u_c18_discuss_rejects_unknown_agents_in_project_mode(tmp_path):
+    import json
+    proj_dir = tmp_path / "myproj"
+    proj_dir.mkdir()
+    db_file = str(proj_dir / "tasks.db")
+    state = {
+        "project": "myproj",
+        "port": 0,
+        "session": "crew_myproj",
+        "agents": ["claude", "codex"],
+        "db": db_file,
+        "pane_map": {
+            "implementer": "%1", "claude": "%1",
+            "reviewer": "%2", "codex": "%2",
+        },
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    result = runner.invoke(crew, [
+        "discuss", "Adopt microservices?",
+        "--project", "myproj",
+        "--base", str(tmp_path),
+        "--agents", "analyst,critic",
+    ])
+    assert result.exit_code != 0
+    out = result.output
+    assert "analyst" in out and "critic" in out
+    # Must hint that these are perspectives, not agents — that's the confusion
+    # we're trying to head off.
+    assert "perspective" in out.lower()
+    # Must list the real agents so the user can see what to pass.
+    assert "claude" in out
+    assert "codex" in out
 
 
-# U-C14: unknown width (tmux probe failed) → empty string (don't block setup)
-def test_u_c14_check_window_width_fits_unknown_ok():
-    assert _check_window_width_fits(window_width=0, num_agents=3) == ""
+# U-C19: discuss context carries both agent (pane routing) and perspective
+# (instruction framing). Previously only agent was in context, so the agent
+# CLI's perspective-aware prompt had nothing to read.
+def test_u_c19_discuss_context_includes_perspective():
+    from agent_crew.discussion import enqueue_panel_tasks
+
+    class _FakeQueue:
+        def __init__(self):
+            self.enqueued = []
+        def enqueue(self, req):
+            self.enqueued.append(req)
+            return req.task_id
+
+    q = _FakeQueue()
+    ids = enqueue_panel_tasks(
+        q, ["claude", "codex"], "Adopt Rust?", {"round": 1}, port=0,
+        perspectives={"claude": "analyst", "codex": "critic"},
+    )
+    assert len(ids) == 2
+    assert q.enqueued[0].context["agent"] == "claude"
+    assert q.enqueued[0].context["perspective"] == "analyst"
+    assert q.enqueued[1].context["agent"] == "codex"
+    assert q.enqueued[1].context["perspective"] == "critic"
 
 
 # U-C15: teardown runs git worktree prune after removing worktrees
