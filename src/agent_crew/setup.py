@@ -212,10 +212,52 @@ def write_sessions_json(path: str, agents: list[dict]) -> None:
     session.save_sessions(path, enriched)
 
 
+def _is_port_listening(port: int) -> bool:
+    """Return True if something is accepting connections on 127.0.0.1:<port>."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        try:
+            s.connect(("127.0.0.1", port))
+            return True
+        except (ConnectionRefusedError, socket.timeout, OSError):
+            return False
+
+
+def _collect_active_ports(base: str | None = None) -> set[int]:
+    """Return ports from ~/.agent_crew/*/port files whose servers are still listening."""
+    if base is None:
+        base = os.path.expanduser("~/.agent_crew")
+    active: set[int] = set()
+    if not os.path.isdir(base):
+        return active
+    for entry in os.scandir(base):
+        if not entry.is_dir():
+            continue
+        port_file = os.path.join(entry.path, "port")
+        if not os.path.isfile(port_file):
+            continue
+        try:
+            port = int(open(port_file).read().strip())
+        except (ValueError, OSError):
+            continue
+        if _is_port_listening(port):
+            active.add(port)
+    return active
+
+
 def find_free_port(start: int = 8100) -> int:
-    """Find a free port by actually binding to it (SO_REUSEADDR off) to avoid TOCTOU."""
+    """Find a free port, blacklisting ports held by alive agent_crew servers.
+
+    Scans ~/.agent_crew/*/port files and skips any port whose server is still
+    listening. Ports from dead (non-listening) projects remain eligible.
+    Binds the socket to verify (SO_REUSEADDR off) to avoid TOCTOU.
+    """
+    blacklisted = _collect_active_ports()
     port = start
     while True:
+        if port in blacklisted:
+            port += 1
+            continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
                 sock.bind(("127.0.0.1", port))
