@@ -687,6 +687,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         handle_test_result,
     )
     from agent_crew.queue import TaskQueue
+    from agent_crew import github
     import time
 
     if max_iter <= 0:
@@ -805,12 +806,52 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 return total
             total += resolved
 
+    def _create_and_report_pr(branch_name: str, repo_url: str, task_desc: str) -> None:
+        """Create a GitHub PR and report the result."""
+        if not github.check_gh_installed():
+            click.echo("Warning: gh CLI not installed, skipping PR creation")
+            return
+        resolved_repo = repo_url or github.get_repo()
+        if not resolved_repo:
+            click.echo("Warning: Could not determine repo, skipping PR creation")
+            return
+        pr_number = github.create_pr(
+            title=task_desc.split('\n')[0][:72],
+            body=task_desc,
+            branch=branch_name,
+            base="main",
+            repo=resolved_repo
+        )
+        if pr_number:
+            pr_url = github.get_pr_url(resolved_repo, pr_number)
+            click.echo(f"Created PR #{pr_number}: {pr_url}")
+        else:
+            click.echo("Warning: Failed to create GitHub PR")
+
     # Determine port for gate resolution (available when --project is set)
     _run_port = 0
     if project:
         _pstate = _read_state(base, project)
         if _pstate:
             _run_port = _pstate.get("port", 0)
+
+    # Create GitHub issue if requested
+    issue_number = None
+    if create_issue:
+        if not github.check_gh_installed():
+            raise click.ClickException("gh CLI is not installed. Install it to use --create-issue.")
+        repo_url = repo or github.get_repo()
+        if not repo_url:
+            raise click.ClickException("Could not determine repo. Use --repo to specify owner/repo.")
+        issue_number = github.create_issue(
+            title=task.split('\n')[0][:72],  # First line, max 72 chars
+            body=task,
+            repo=repo_url
+        )
+        if issue_number:
+            click.echo(f"Created GitHub issue #{issue_number}")
+        else:
+            raise click.ClickException("Failed to create GitHub issue")
 
     impl_id = enqueue_implement(queue, task, branch, port=_run_port)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
@@ -852,6 +893,9 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     if _run_port:
                         _drain_resolvable_gates(_run_port)
                     click.echo(f"[{iteration}/{max_iter}] Tests passed. Loop complete.")
+                    # Create PR if requested
+                    if create_pr:
+                        _create_and_report_pr(branch, repo, task)
                     return
                 else:
                     click.echo(f"[{iteration}/{max_iter}] Tests {test_outcome}. Re-implementing.")
@@ -862,6 +906,9 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 if _run_port:
                     _drain_resolvable_gates(_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Loop complete (no tester).")
+                # Create PR if requested
+                if create_pr:
+                    _create_and_report_pr(branch, repo, task)
             return
 
         # request_changes: re-implement with feedback
