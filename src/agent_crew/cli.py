@@ -531,18 +531,25 @@ def recover(project: str, base: str):
             )
 
         # Check each agent pane individually and recreate only the dead ones so alive
-        # panes keep their running agent CLIs.
+        # panes keep their running agent CLIs. Also handle missing panes.
         agent_list = state.get("agents", [])
         existing_pane_ids = state.get("pane_ids", [])
-        if agent_list and len(existing_pane_ids) == len(agent_list):
+        if agent_list:
             window_target = f"{session_name}:{window}"
             new_pane_ids: list[str] = []
             dead_agents: list[str] = []
             dead_targets: list[str] = []
-            for agent, pane_id in zip(agent_list, existing_pane_ids):
-                if _pane_alive(pane_id):
+
+            # Match existing panes with agents; create missing panes
+            for i, agent in enumerate(agent_list):
+                pane_id = existing_pane_ids[i] if i < len(existing_pane_ids) else None
+
+                # Check if pane exists and is alive
+                if pane_id and _pane_alive(pane_id):
                     new_pane_ids.append(pane_id)
                     continue
+
+                # Pane is dead or missing — recreate it
                 wt_path = worktrees.get(agent, "")
                 split_cmd = ["tmux", "split-window", "-h"]
                 if wt_path:
@@ -555,7 +562,8 @@ def recover(project: str, base: str):
                     dead_agents.append(agent)
                     dead_targets.append(new_id)
                 else:
-                    new_pane_ids.append(pane_id)
+                    # Fallback to existing if split failed
+                    new_pane_ids.append(pane_id or "unknown")
 
             if dead_agents:
                 subprocess.run(
