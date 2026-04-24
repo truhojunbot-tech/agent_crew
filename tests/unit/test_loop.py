@@ -215,3 +215,38 @@ def test_u_l13_enqueue_review_and_test_honor_port():
 
     queue.enqueue.assert_not_called()
     assert mock_urlopen.call_count == 2
+
+
+# U-L14: enqueue_review is idempotent — if review already exists for impl task, return its ID
+def test_u_l14_enqueue_review_idempotent():
+    from agent_crew.protocol import TaskRequest
+
+    queue = MagicMock()
+    existing_review = TaskRequest(
+        task_id="review-existing",
+        task_type="review",
+        description="some work",
+        branch="main",
+        context={"prev_task_id": "impl-1"},
+    )
+    queue.list_tasks.return_value = [existing_review]
+
+    task_id = enqueue_review(queue, "some work", "main", prev_task_id="impl-1")
+
+    assert task_id == "review-existing"
+    queue.enqueue.assert_not_called()  # No new task created
+
+
+# U-L15: enqueue_review creates new if no existing review for impl task
+def test_u_l15_enqueue_review_creates_new_if_none_exist():
+    queue = MagicMock()
+    queue.list_tasks.return_value = []  # No existing tasks
+    queue.enqueue.side_effect = lambda req: req.task_id
+
+    task_id = enqueue_review(queue, "some work", "main", prev_task_id="impl-1")
+
+    assert task_id.startswith("review-")
+    queue.enqueue.assert_called_once()
+    req = queue.enqueue.call_args[0][0]
+    assert req.task_type == "review"
+    assert req.context.get("prev_task_id") == "impl-1"

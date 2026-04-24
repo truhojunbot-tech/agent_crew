@@ -321,3 +321,93 @@ def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
 
     assert enter_args == ["tmux", "send-keys", "-t", "%42", "Enter"]
     assert "capture-pane" in capture_args
+
+
+# U-SP14: impl task completed → auto-enqueue review task
+def test_u_sp14_impl_completed_auto_enqueue_review(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"implementer": "%100", "reviewer": "%200"},
+        port=8100,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("impl-001", "implement", "Add feature X"))
+        assert len(push.calls) == 1
+        assert "impl-001" in push.calls[0][1]
+
+        resp = client.post("/tasks/impl-001/result", json=_result_payload("impl-001"))
+        assert resp.status_code == 200
+
+    assert len(push.calls) == 2
+    review_push = push.calls[1]
+    assert review_push[0] == "%200"  # review pane
+    assert "review" in review_push[1]
+    assert "impl-001" in review_push[1]  # prev_task_id in description or context
+
+
+# U-SP15: impl task failed → no auto review enqueue
+def test_u_sp15_impl_failed_no_auto_review(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"implementer": "%100", "reviewer": "%200"},
+        port=8100,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("impl-002", "implement"))
+        assert len(push.calls) == 1
+
+        resp = client.post(
+            "/tasks/impl-002/result",
+            json=_result_payload("impl-002", status="failed")
+        )
+        assert resp.status_code == 200
+
+    assert len(push.calls) == 1  # no review task pushed
+
+
+# U-SP16: impl task needs_human → no auto review enqueue
+def test_u_sp16_impl_needs_human_no_auto_review(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"implementer": "%100", "reviewer": "%200"},
+        port=8100,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("impl-003", "implement"))
+        assert len(push.calls) == 1
+
+        resp = client.post(
+            "/tasks/impl-003/result",
+            json=_result_payload("impl-003", status="needs_human")
+        )
+        assert resp.status_code == 200
+
+    assert len(push.calls) == 1  # no review task pushed
+
+
+# U-SP17: auto-enqueued review task can be queried via /tasks (it gets pushed, so check in_progress)
+def test_u_sp17_auto_review_task_queryable(tmp_db):
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"implementer": "%100", "reviewer": "%200"},
+        port=8100,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("impl-004", "implement", "Fix bug Y"))
+        client.post("/tasks/impl-004/result", json=_result_payload("impl-004"))
+
+        # Auto-enqueued review task gets pushed immediately, so it's in_progress
+        tasks = client.get("/tasks").json()
+        review_tasks = [t for t in tasks if t["task_type"] == "review"]
+        assert len(review_tasks) >= 1
+        review = review_tasks[0]
+        assert "impl-004" in str(review.get("context", {}))
+        assert "Fix bug Y" in review["description"]

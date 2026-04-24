@@ -2,6 +2,7 @@ import json
 import os
 import subprocess
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
@@ -133,6 +134,42 @@ def create_app(
             return
         push_fn(pane_id, _format_task_message(task, port))
 
+    def _auto_enqueue_review(impl_task_id: str) -> None:
+        """Auto-enqueue a review task when an impl task completes.
+        This ensures review is triggered independently of CLI timeout."""
+        try:
+            # Get the original impl task to extract description and branch
+            impl_tasks = [t for t in q().list_tasks() if t.task_id == impl_task_id]
+            if not impl_tasks:
+                return
+            impl_task = impl_tasks[0]
+
+            # Create review task with same description/branch, reference to impl task
+            review_context = {
+                "checklist_layers": ["test_quality", "code_quality", "business_gap"],
+                "reviewer_rejects_happy_path_only": True,
+                "instructions": (
+                    "3-layer review: "
+                    "1) test_quality — coverage, edge cases, mocks; "
+                    "2) code_quality — naming, error handling, SOLID; "
+                    "3) business_gap — requirements met, logging, observability."
+                ),
+                "prev_task_id": impl_task_id,
+            }
+            review_req = TaskRequest(
+                task_id=f"review-{uuid.uuid4().hex[:8]}",
+                task_type="review",
+                description=impl_task.description,
+                branch=impl_task.branch,
+                context=review_context,
+            )
+            q().enqueue(review_req)
+            # Try to push the newly enqueued review task to reviewer pane
+            _try_push_next("reviewer")
+        except Exception:
+            # Silently fail auto-enqueue — don't crash the result submission
+            pass
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
         task_id = q().enqueue(task)
@@ -178,6 +215,9 @@ def create_app(
         if task_type == "discuss":
             _try_push_discuss(ctx.get("agent") if isinstance(ctx, dict) else None)
         else:
+            # Auto-transition: impl task completed → auto-enqueue review task
+            if task_type == "implement" and result.status == "completed":
+                _auto_enqueue_review(task_id)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             if role:

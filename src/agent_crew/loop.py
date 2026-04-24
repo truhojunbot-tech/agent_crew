@@ -62,6 +62,18 @@ def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, po
 
 
 def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {}, port: int = 0) -> str:
+    # Check if a review task already exists for this impl task (auto-transition case).
+    # This makes enqueue_review idempotent when the server has auto-created a review.
+    try:
+        all_tasks = queue.list_tasks()
+        for task in all_tasks:
+            if task.task_type == "review":
+                task_ctx = task.context if isinstance(task.context, dict) else {}
+                if task_ctx.get("prev_task_id") == prev_task_id:
+                    return task.task_id
+    except Exception:
+        pass  # If we can't query, just create a new one
+
     req = TaskRequest(
         task_id=f"review-{uuid.uuid4().hex[:8]}",
         task_type="review",
