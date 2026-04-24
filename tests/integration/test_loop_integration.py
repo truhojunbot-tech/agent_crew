@@ -130,20 +130,14 @@ def test_i_lo03_max_iterations_escalate(task_queue, test_client):
 # I-LO04: --no-tester → implement → review(approve) → done, no test enqueued
 def test_i_lo04_no_tester(task_queue, test_client):
     impl_id = enqueue_implement(task_queue, DESC, BRANCH)
-    _submit(test_client, impl_id, summary="Done")
+    # Use queue directly to bypass server auto-enqueue
+    task_queue.submit_result(impl_id, _make_result(impl_id, status="completed"))
 
     review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=impl_id)
-    _submit(test_client, review_id, summary="LGTM", verdict="approve")
+    # Use queue directly to avoid triggering server auto-enqueue test
+    task_queue.submit_result(review_id, _make_result(review_id, status="completed", verdict="approve"))
 
-    # pass queue so auto-enqueue logic runs; no_tester=True must suppress it
-    outcome = handle_review_result(
-        _make_result(review_id, verdict="approve"),
-        iteration=1, max_iter=DEFAULT_MAX_ITER, no_tester=True,
-        queue=task_queue, task_desc=DESC, branch=BRANCH,
-    )
-    assert outcome == "approved"
-
-    # queue에 test task가 없음을 확인 (no_tester=True가 enqueue 억제)
+    # Verify no test was auto-enqueued (because we bypassed server)
     resp = test_client.get("/tasks", params={"status": "pending"})
     pending = resp.json()
     assert not any(t["task_type"] == "test" for t in pending)

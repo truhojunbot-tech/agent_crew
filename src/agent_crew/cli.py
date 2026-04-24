@@ -166,6 +166,13 @@ def setup(project: str, agents: str, base: str):
             return
         click.echo(f"Project {project!r} has stale state (panes dead or server down). Re-initializing...")
 
+        # Kill old panes to prevent duplicates when creating new ones
+        for pane_id in existing_pane_ids:
+            subprocess.run(
+                ["tmux", "kill-pane", "-t", pane_id],
+                capture_output=True, text=True,
+            )
+
     # Warn if other project panes exist in this window
     tmux_pane_env_pre = os.environ.get("TMUX_PANE", "")
     if tmux_pane_env_pre:
@@ -369,6 +376,7 @@ def status(project: str, base: str, preview: int):
         result_cache[task_id] = r
         return r
 
+    task_groups = None
     try:
         task_groups = {
             display_status: _fetch_tasks_by_status(port, api_status)
@@ -376,7 +384,8 @@ def status(project: str, base: str, preview: int):
         }
     except Exception:
         click.echo("\nTASKS: (server unreachable)")
-    else:
+
+    if task_groups:
         total = sum(len(tasks) for tasks in task_groups.values())
         click.echo(f"\nTasks: {total}")
         for display_status, _ in _STATUS_ALIASES:
@@ -411,17 +420,56 @@ def status(project: str, base: str, preview: int):
                                 snippet = snippet[:preview] + "…"
                             click.echo(f"      summary: {snippet}")
 
-    click.echo("\nPanes:")
+    click.echo("\nAgents:")
     pane_targets = state.get("pane_ids") or [
         f"{session_name}:0.{i}" for i in range(len(agent_list))
     ]
+
+    agent_status = {}
     for agent, target in zip(agent_list, pane_targets):
         result = subprocess.run(
             ["tmux", "capture-pane", "-t", target, "-p"],
             capture_output=True,
+            text=True,
         )
         alive = result.returncode == 0
-        click.echo(f"  {agent} ({target}): {'alive' if alive else 'dead'}")
+        status_str = "alive" if alive else "dead"
+
+        # Extract last line of pane output for current activity
+        current_task = ""
+        if alive and result.stdout:
+            lines = result.stdout.strip().split("\n")
+            # Find a line that looks like it shows task/activity
+            for line in lines[-5:]:
+                if "task" in line.lower() or "processing" in line.lower() or "review" in line.lower():
+                    current_task = f" — {line.strip()[:60]}"
+                    break
+
+        click.echo(f"  {agent} ({target}): {status_str}{current_task}")
+        agent_status[agent] = alive
+
+    # Performance metrics
+    if _queue_for_preview is not None and task_groups:
+        click.echo("\nMetrics:")
+        all_done = task_groups.get("done", [])
+        all_running = task_groups.get("running", [])
+
+        # Count tasks by type in done list
+        type_counts = {}
+        for t in all_done:
+            ttype = t.get("task_type") if isinstance(t, dict) else getattr(t, "task_type", "?")
+            type_counts[ttype] = type_counts.get(ttype, 0) + 1
+
+        for ttype, count in sorted(type_counts.items()):
+            click.echo(f"  {ttype}: {count} done")
+
+        # Running by role
+        if all_running:
+            role_running = {}
+            for t in all_running:
+                ttype = t.get("task_type") if isinstance(t, dict) else getattr(t, "task_type", "?")
+                role_running[ttype] = role_running.get(ttype, 0) + 1
+            click.echo(f"  In progress: {role_running}")
 
 
 @crew.command()
@@ -438,7 +486,11 @@ def recover(project: str, base: str):
     worktrees = state.get("worktrees", {})
     db_file = state["db"]
     proj_dir = _proj_dir(base, project)
+    port_file = os.path.join(proj_dir, "port")
     recovered = []
+
+    # Ensure instruction files exist in all worktrees before agents start
+    setup_module.write_instruction_files(worktrees, project, port_file)
 
     # Restart server if not listening
     if not _port_listening(port, timeout=1.0):
@@ -540,17 +592,18 @@ def recover(project: str, base: str):
             dead_agents: list[str] = []
             dead_targets: list[str] = []
 
-            # Match existing panes with agents; create missing panes
+            # Match existing panes with agents; recreate dead ones or those without worktree
             for i, agent in enumerate(agent_list):
                 pane_id = existing_pane_ids[i] if i < len(existing_pane_ids) else None
+                wt_path = worktrees.get(agent, "")
 
-                # Check if pane exists and is alive
-                if pane_id and _pane_alive(pane_id):
+                # Check if pane exists and is alive with valid worktree
+                if pane_id and _pane_alive(pane_id) and wt_path and os.path.isdir(wt_path):
+                    # Keep alive pane that has valid worktree context
                     new_pane_ids.append(pane_id)
                     continue
 
-                # Pane is dead or missing — recreate it
-                wt_path = worktrees.get(agent, "")
+                # Pane is dead, missing worktree, or invalid — recreate it
                 split_cmd = ["tmux", "split-window", "-h"]
                 if wt_path:
                     split_cmd += ["-c", wt_path]
@@ -998,20 +1051,27 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     perspectives_map = assign_perspectives(agent_list, perspectives=perspective_pool)
 
     _run_port = 0
+    _pane_map = {}
+    _session_name = ""
     if project:
         _pstate = _read_state(base, project)
         if _pstate:
             _run_port = _pstate.get("port", 0)
+            _pane_map = _pstate.get("pane_map", {})
+            _session_name = _pstate.get("session", "")
 
     wait_timeout = float(timeout)
 
-    def _wait_all(task_ids: list[str], timeout: float = 0.0) -> tuple[dict, list[str]]:
-        """Poll for all task results. On timeout, return (partial_done, missing_ids)
-        instead of raising — the caller decides whether partial results are
-        actionable (e.g. synthesize what we have) or fatal."""
+    def _wait_all(task_ids: list[str], timeout: float = 0.0) -> tuple[dict, list[str], dict]:
+        """Poll for all task results. On timeout, return (partial_done, missing_ids, idle_status)
+        where idle_status maps agent names to idle/active state.
+        The caller decides whether partial results are actionable or if idle agents
+        need escalation."""
         effective_timeout = timeout if timeout > 0 else wait_timeout
         deadline = time.time() + effective_timeout
         done: dict = {}
+        idle_status: dict[str, bool] = {}  # agent -> is_idle
+
         while time.time() < deadline:
             for tid in task_ids:
                 if tid not in done:
@@ -1019,10 +1079,20 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
                     if r is not None:
                         done[tid] = r
             if len(done) == len(task_ids):
-                return done, []
+                return done, [], idle_status
             time.sleep(0.1)
+
         missing = [tid for tid in task_ids if tid not in done]
-        return done, missing
+
+        # Check pane state for missing tasks to distinguish idle vs. still working
+        if missing and _pane_map and _session_name:
+            for agent in agent_list:
+                pane_id = _pane_map.get(agent)
+                if pane_id:
+                    pane_out = _capture_pane(pane_id)
+                    idle_status[agent] = bool(pane_out and _pane_looks_idle(pane_out))
+
+        return done, missing, idle_status
 
     if nowait:
         # Fire-and-forget: enqueue round 1 only, emit task_ids, exit.
@@ -1050,11 +1120,18 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
         )
-        results_map, missing = _wait_all(task_ids)
+        results_map, missing, idle_status = _wait_all(task_ids)
 
         if missing:
             partial_hit = True
             missing_by_round[round_num] = missing
+            # Report idle agents for debugging
+            idle_agents = [a for a in agent_list if idle_status.get(a, False)]
+            active_agents = [a for a in agent_list if not idle_status.get(a, False) and a in missing]
+            if idle_agents:
+                click.echo(f"  Idle agents (no pane activity): {', '.join(idle_agents)}", err=True)
+            if active_agents:
+                click.echo(f"  Still working: {', '.join(active_agents)}", err=True)
 
         # Build synthesis from whoever completed. If nobody completed, skip
         # this round's synthesis entirely rather than writing an empty file.
