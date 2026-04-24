@@ -512,12 +512,24 @@ def recover(project: str, base: str):
             _write_state(base, project, state)
         recovered.append("tmux")
     else:
-        # Session exists — check each agent pane individually and recreate
-        # only the dead ones so alive panes keep their running agent CLIs.
+        # Session exists — validate window before touching tmux to avoid killing wrong panes
+        window = state.get("window", "0")
+        window_check = subprocess.run(
+            ["tmux", "list-windows", "-t", f"{session_name}:{window}", "-F", "#{window_id}"],
+            capture_output=True, text=True,
+        )
+        if window_check.returncode != 0:
+            raise click.ClickException(
+                f"Window {session_name}:{window} not found. state.json may be stale. "
+                f"Run 'crew teardown' and 'crew setup' to rebuild."
+            )
+
+        # Check each agent pane individually and recreate only the dead ones so alive
+        # panes keep their running agent CLIs.
         agent_list = state.get("agents", [])
         existing_pane_ids = state.get("pane_ids", [])
         if agent_list and len(existing_pane_ids) == len(agent_list):
-            window_target = f"{session_name}:{state.get('window', '0')}"
+            window_target = f"{session_name}:{window}"
             new_pane_ids: list[str] = []
             dead_agents: list[str] = []
             dead_targets: list[str] = []

@@ -256,6 +256,9 @@ def test_u_c20_recover_all_panes_alive_noop(tmp_path):
     (proj_dir / "state.json").write_text(json.dumps(state))
 
     def _fake_run(args, **_kw):
+        # Window validation needs list-windows to succeed
+        if "list-windows" in args:
+            return MagicMock(returncode=0, stdout="0", stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
 
     runner = CliRunner()
@@ -300,6 +303,8 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
         return pane_id == "%1"
 
     def _fake_run(args, **_kw):
+        if "list-windows" in args:
+            return MagicMock(returncode=0, stdout="0", stderr="")
         if "split-window" in args:
             return MagicMock(returncode=0, stdout="%9\n", stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
@@ -355,6 +360,8 @@ def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
     fresh_ids = iter(["%7\n", "%8\n"])
 
     def _fake_run(args, **_kw):
+        if "list-windows" in args:
+            return MagicMock(returncode=0, stdout="0", stderr="")
         if "split-window" in args:
             return MagicMock(returncode=0, stdout=next(fresh_ids), stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
