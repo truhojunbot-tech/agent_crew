@@ -3,7 +3,10 @@ from dataclasses import dataclass, field
 from typing import Literal, Optional
 
 _VALID_TASK_TYPES = {"implement", "review", "test", "discuss"}
-_VALID_STATUSES = {"completed", "failed", "needs_human"}
+# Result statuses: final outcomes submitted by agents
+_VALID_RESULT_STATUSES = {"completed", "failed", "needs_human", "timed_out", "blocked"}
+# For backward compatibility, keep old name
+_VALID_STATUSES = _VALID_RESULT_STATUSES
 _VALID_GATE_TYPES = {"approval", "merge", "escalation"}
 
 
@@ -26,15 +29,18 @@ class TaskRequest:
 @dataclass
 class TaskResult:
     task_id: str
-    status: Literal["completed", "failed", "needs_human"]
+    status: Literal["completed", "failed", "needs_human", "timed_out", "blocked"]
     summary: str
     verdict: Optional[Literal["approve", "request_changes"]] = None
     findings: list[str] = field(default_factory=list)
     pr_number: Optional[int] = None
+    retry_count: int = 0  # Track number of retry attempts
 
     def __post_init__(self):
-        if self.status not in _VALID_STATUSES:
-            raise ValueError(f"Invalid status: {self.status!r}. Must be one of {_VALID_STATUSES}")
+        if self.status not in _VALID_RESULT_STATUSES:
+            raise ValueError(f"Invalid status: {self.status!r}. Must be one of {_VALID_RESULT_STATUSES}")
+        if self.retry_count < 0:
+            raise ValueError(f"Invalid retry_count: {self.retry_count!r}. Must be >= 0")
 
 
 @dataclass
