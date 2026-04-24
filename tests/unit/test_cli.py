@@ -876,3 +876,69 @@ def test_u_c47_health_endpoint_returns_ok():
         assert data.get("status") == "ok"
     finally:
         os.unlink(db_path)
+
+
+# U-C48: crew setup --help shows single-agent usage example
+def test_u_c48_setup_help_shows_single_agent_example():
+    """crew setup --help must include an example showing --agents for single-agent
+    mode so users know they can spawn only one agent."""
+    runner = CliRunner()
+    result = runner.invoke(crew, ["setup", "--help"])
+    assert result.exit_code == 0
+    # The help text must hint at single-agent usage with --agents
+    assert "--agents" in result.output
+    # Must show a concrete agent name as example (codex or claude)
+    assert "codex" in result.output or "claude" in result.output
+    # Must show the pattern "crew setup" or similar context
+    assert "single" in result.output.lower() or "example" in result.output.lower() or "e.g." in result.output.lower()
+
+
+# U-C49: crew setup prints a Tip line after completing successfully
+def test_u_c49_setup_prints_tip_after_completion(tmp_path):
+    """After a successful setup, cli.py must print a Tip line mentioning --agents
+    so users discover the single-agent mode."""
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        if cmd == "display-message":
+            # First call returns session:window, subsequent calls return numeric values
+            joined = " ".join(args)
+            if "#S:#I" in joined:
+                return MagicMock(returncode=0, stdout="crew:0\n", stderr="")
+            if "window_width" in joined:
+                return MagicMock(returncode=0, stdout="200\n", stderr="")
+            if "pane_width" in joined:
+                return MagicMock(returncode=0, stdout="100\n", stderr="")
+            return MagicMock(returncode=0, stdout="crew\n", stderr="")
+        if cmd == "split-window":
+            return MagicMock(returncode=0, stdout="%99\n", stderr="")
+        if cmd == "select-layout":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if cmd in ("list-panes", "list-windows"):
+            return MagicMock(returncode=0, stdout="0\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 12345
+
+    runner = CliRunner(env={"TMUX_PANE": "%0"})
+    with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
+         patch("agent_crew.cli._read_state", return_value=None), \
+         patch("agent_crew.cli.setup_module.find_free_port", return_value=19999), \
+         patch("agent_crew.cli.setup_module.write_port_file"), \
+         patch("agent_crew.cli.setup_module.create_worktrees", return_value={"claude": str(tmp_path / "wt")}), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_sessions_json"), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
+         patch("agent_crew.cli._write_state"), \
+         patch("os.getcwd", return_value=str(tmp_path)):
+        result = runner.invoke(crew, ["setup", "myproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    output = result.output.lower()
+    assert "tip" in output
+    assert "--agents" in result.output

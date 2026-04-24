@@ -244,10 +244,20 @@ def crew():
 
 @crew.command()
 @click.argument("project")
-@click.option("--agents", default=_DEFAULT_AGENTS, help="Comma-separated agent names")
+@click.option("--agents", default=_DEFAULT_AGENTS,
+              help="Comma-separated agent names. e.g. --agents codex  (single-agent mode)")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True, help="Base directory for state/worktrees")
 def setup(project: str, agents: str, base: str):
-    """Configure environment for PROJECT."""
+    """Configure environment for PROJECT.
+
+    Examples:
+
+      crew setup myproj                        # default: claude,codex,gemini
+
+      crew setup myproj --agents codex         # single-agent task
+
+      crew setup myproj --agents claude,codex  # two agents
+    """
     cwd = os.getcwd()
     if not setup_module.validate_git_repo(cwd):
         raise click.ClickException("not a git repository")
@@ -473,6 +483,7 @@ def setup(project: str, agents: str, base: str):
     })
 
     click.echo(f"Setup complete: {project} on port {port}")
+    click.echo("Tip: use --agents <name> to spawn only specific agents (e.g. --agents claude)")
 
 
 @crew.command()
