@@ -125,7 +125,7 @@ def resolve_project_path(project: str) -> str:
     """Auto-detect project path from project name.
 
     Searches common locations: ~/alfred/projects/<project>, ~/work/<project>, etc.
-    Raises RuntimeError if not found.
+    Falls back to current directory if it's a git repo. Raises RuntimeError if not found.
     """
     # Priority order for project discovery
     candidates = [
@@ -138,6 +138,11 @@ def resolve_project_path(project: str) -> str:
     for path in candidates:
         if os.path.isdir(path) and validate_git_repo(path):
             return path
+
+    # Fallback: check current directory
+    cwd = os.getcwd()
+    if validate_git_repo(cwd):
+        return cwd
 
     raise RuntimeError(
         f"Could not find project '{project}' in any standard location. "
