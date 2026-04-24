@@ -32,6 +32,9 @@ htmlcov/
 port
 sessions.json
 
+# Agent crew local state (per-worktree)
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db
