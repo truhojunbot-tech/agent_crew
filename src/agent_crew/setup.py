@@ -121,7 +121,61 @@ def validate_git_repo(path: str) -> bool:
     return result.returncode == 0
 
 
-def create_worktrees(project: str, base: str, agents: list[str]) -> dict[str, str]:
+def resolve_project_path(project: str) -> str:
+    """Auto-detect project path from project name.
+
+    Searches common locations: ~/alfred/projects/<project>, ~/work/<project>, etc.
+    Raises RuntimeError if not found.
+    """
+    # Priority order for project discovery
+    candidates = [
+        os.path.expanduser(f"~/alfred/projects/{project}"),
+        os.path.expanduser(f"~/projects/{project}"),
+        os.path.expanduser(f"~/work/{project}"),
+        os.path.expanduser(f"~/{project}"),
+    ]
+
+    for path in candidates:
+        if os.path.isdir(path) and validate_git_repo(path):
+            return path
+
+    raise RuntimeError(
+        f"Could not find project '{project}' in any standard location. "
+        f"Searched: {', '.join(candidates)}. "
+        f"Use 'crew setup --project-path <path>' to specify explicitly."
+    )
+
+
+def create_worktrees(project: str, base: str, agents: list[str], project_path: str | None = None) -> dict[str, str]:
+    """Create git worktrees for agents.
+
+    Args:
+        project: project name (e.g., 'agent_crew')
+        base: base directory for worktrees (e.g., ~/.agent_crew)
+        agents: list of agent names
+        project_path: explicit path to project git repo. If None, auto-detect.
+    """
+    if project_path is None:
+        project_path = resolve_project_path(project)
+
+    if not validate_git_repo(project_path):
+        raise RuntimeError(f"Project path {project_path!r} is not a git repository")
+
+    worktrees = {}
+    for agent in agents:
+        wt_path = os.path.join(base, project, agent)
+        branch = f"agent/{project}/{agent}"
+        # Run git worktree add FROM the project repo, not from cwd
+        result = subprocess.run(
+            ["git", "-C", project_path, "worktree", "add", "-B", branch, wt_path],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0 and not os.path.isdir(wt_path):
+            raise RuntimeError(
+                f"Failed to create worktree for {agent}: {result.stderr.strip()}"
+            )
+        worktrees[agent] = wt_path
+    return worktrees
     worktrees = {}
     for agent in agents:
         wt_path = os.path.join(base, project, agent)
