@@ -310,13 +310,19 @@ def create_app(
 
 def _load_pane_map() -> Optional[dict]:
     path = os.getenv("AGENT_CREW_PANE_MAP")
+    logger.info(f"_load_pane_map: AGENT_CREW_PANE_MAP={path}")
     if not path:
+        logger.warning("_load_pane_map: AGENT_CREW_PANE_MAP not set")
         return None
     path = os.path.expanduser(path)  # Handle ~ in env var
+    logger.info(f"_load_pane_map: expanded path={path}")
     try:
         with open(path) as f:
-            return json.load(f)
+            pane_map = json.load(f)
+            logger.info(f"_load_pane_map: loaded pane_map={pane_map}")
+            return pane_map
     except FileNotFoundError:
+        logger.error(f"_load_pane_map: file not found: {path}")
         return None
 
 

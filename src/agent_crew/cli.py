@@ -443,7 +443,13 @@ def recover(project: str, base: str):
     # Restart server if not listening
     if not _port_listening(port, timeout=1.0):
         pythonpath = os.pathsep.join(p for p in sys.path if p)
-        server_env = {**os.environ, "AGENT_CREW_DB": db_file, "PYTHONPATH": pythonpath}
+        pane_map_file = os.path.join(proj_dir, "pane_map.json")
+        server_env = {
+            **os.environ,
+            "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PANE_MAP": pane_map_file,
+            "PYTHONPATH": pythonpath,
+        }
         log_path = os.path.join(proj_dir, "server.log")
         log_file = open(log_path, "a")
         server_proc = subprocess.Popen(
