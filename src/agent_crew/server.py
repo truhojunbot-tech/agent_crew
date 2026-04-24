@@ -385,6 +385,61 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
         return {"status": "resolved"}
 
+    @app.post("/tasks/{task_id}/checkpoint", status_code=201)
+    def save_checkpoint(task_id: str, checkpoint: dict):
+        """Save a task checkpoint for fault recovery and time-travel debugging."""
+        checkpoint_num = checkpoint.get("checkpoint_num", 0)
+        state = checkpoint.get("state", {})
+        try:
+            checkpoint_id = q().save_checkpoint(task_id, checkpoint_num, state)
+            logger.info(f"POST /tasks/{task_id}/checkpoint: saved checkpoint {checkpoint_num}")
+            return {"checkpoint_id": checkpoint_id}
+        except Exception as e:
+            logger.error(f"POST /tasks/{task_id}/checkpoint: error: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/tasks/{task_id}/checkpoints")
+    def list_task_checkpoints(task_id: str):
+        """List all checkpoints for a task."""
+        try:
+            checkpoints = q().list_checkpoints(task_id)
+            logger.info(f"GET /tasks/{task_id}/checkpoints: found {len(checkpoints)} checkpoints")
+            return checkpoints
+        except Exception as e:
+            logger.error(f"GET /tasks/{task_id}/checkpoints: error: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/tasks/{task_id}/checkpoint/{checkpoint_num}")
+    def get_task_checkpoint(task_id: str, checkpoint_num: int):
+        """Retrieve a specific checkpoint for time-travel debugging."""
+        try:
+            state = q().get_checkpoint(task_id, checkpoint_num)
+            if state is None:
+                raise HTTPException(status_code=404, detail=f"Checkpoint {checkpoint_num} not found for task {task_id}")
+            logger.info(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: retrieved")
+            return {"checkpoint_num": checkpoint_num, "state": state}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: error: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/tasks/{task_id}/checkpoint/latest")
+    def get_latest_task_checkpoint(task_id: str):
+        """Retrieve the latest checkpoint for a task."""
+        try:
+            result = q().get_latest_checkpoint(task_id)
+            if result is None:
+                raise HTTPException(status_code=404, detail=f"No checkpoints found for task {task_id}")
+            checkpoint_num, state = result
+            logger.info(f"GET /tasks/{task_id}/checkpoint/latest: checkpoint {checkpoint_num}")
+            return {"checkpoint_num": checkpoint_num, "state": state}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"GET /tasks/{task_id}/checkpoint/latest: error: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+
     return app
 
 

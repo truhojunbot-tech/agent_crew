@@ -49,6 +49,19 @@ CREATE TABLE IF NOT EXISTS tasks (
 )
 """
 
+_DDL_CHECKPOINTS = """
+CREATE TABLE IF NOT EXISTS checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    task_id       TEXT NOT NULL,
+    checkpoint_num INTEGER NOT NULL,
+    timestamp     REAL NOT NULL,
+    state_snapshot TEXT NOT NULL,
+    created_at    REAL NOT NULL,
+    FOREIGN KEY (task_id) REFERENCES tasks(task_id) ON DELETE CASCADE,
+    UNIQUE(task_id, checkpoint_num)
+)
+"""
+
 
 class TaskQueue:
     def __init__(self, db_path: str):
@@ -56,6 +69,7 @@ class TaskQueue:
         conn = self._connect()
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
+        conn.execute(_DDL_CHECKPOINTS)
         conn.commit()
         conn.close()
 
@@ -381,5 +395,76 @@ class TaskQueue:
                 verdict=row["verdict"],
                 findings=json.loads(row["findings"]) if row["findings"] else [],
             )
+        finally:
+            conn.close()
+
+    def save_checkpoint(self, task_id: str, checkpoint_num: int, state_snapshot: dict) -> str:
+        """Save a checkpoint for a task. Returns checkpoint_id."""
+        checkpoint_id = f"ckpt-{task_id}-{checkpoint_num}"
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO checkpoints
+                (checkpoint_id, task_id, checkpoint_num, timestamp, state_snapshot, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    checkpoint_id,
+                    task_id,
+                    checkpoint_num,
+                    time.time(),
+                    json.dumps(state_snapshot),
+                    time.time(),
+                ),
+            )
+            conn.commit()
+            return checkpoint_id
+        finally:
+            conn.close()
+
+    def get_checkpoint(self, task_id: str, checkpoint_num: int) -> Optional[dict]:
+        """Retrieve a specific checkpoint for a task."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT state_snapshot FROM checkpoints WHERE task_id = ? AND checkpoint_num = ?",
+                (task_id, checkpoint_num),
+            ).fetchone()
+            if row is None:
+                return None
+            return json.loads(row["state_snapshot"])
+        finally:
+            conn.close()
+
+    def get_latest_checkpoint(self, task_id: str) -> Optional[tuple]:
+        """Retrieve the latest checkpoint for a task. Returns (checkpoint_num, state_snapshot)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT checkpoint_num, state_snapshot FROM checkpoints WHERE task_id = ? ORDER BY checkpoint_num DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return (row["checkpoint_num"], json.loads(row["state_snapshot"]))
+        finally:
+            conn.close()
+
+    def list_checkpoints(self, task_id: str) -> List[dict]:
+        """List all checkpoints for a task."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT checkpoint_num, timestamp FROM checkpoints WHERE task_id = ? ORDER BY checkpoint_num ASC",
+                (task_id,),
+            ).fetchall()
+            return [
+                {
+                    "checkpoint_num": r["checkpoint_num"],
+                    "timestamp": r["timestamp"],
+                }
+                for r in rows
+            ]
         finally:
             conn.close()
