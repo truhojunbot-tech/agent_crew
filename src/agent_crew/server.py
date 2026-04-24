@@ -118,12 +118,14 @@ def create_app(
     pane_map: Optional[dict] = None,
     port: int = 0,
     push_fn: Callable[[str, str], None] = _default_push,
+    project: Optional[str] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
     port: the HTTP port the server is listening on (embedded in task push messages so
     agents know where to POST results). Defaults to 0 (messages will say port 0).
     push_fn: injectable for testing.
+    project: optional project name used to guard against cross-project review routing.
     """
     state: dict = {}
 
@@ -226,7 +228,19 @@ def create_app(
                 return
             impl_task = impl_tasks[0]
 
-            # Create review task with same description/branch, reference to impl task
+            # Cross-project guard: if the impl task carries a project tag and the
+            # server was started for a different project, skip auto-review to
+            # prevent misrouting tasks across project queues.
+            impl_project = impl_task.context.get("project") if isinstance(impl_task.context, dict) else None
+            if impl_project and project and impl_project != project:
+                logger.warning(
+                    f"_auto_enqueue_review: skipping cross-project review — "
+                    f"impl project={impl_project!r}, server project={project!r}"
+                )
+                return
+
+            # Create review task with same description/branch, reference to impl task.
+            # Inherit project from impl task so downstream guards can detect misrouting.
             review_context = {
                 "checklist_layers": ["test_quality", "code_quality", "business_gap"],
                 "reviewer_rejects_happy_path_only": True,
@@ -238,6 +252,8 @@ def create_app(
                 ),
                 "prev_task_id": impl_task_id,
             }
+            if impl_project:
+                review_context["project"] = impl_project
             review_req = TaskRequest(
                 task_id=f"review-{uuid.uuid4().hex[:8]}",
                 task_type="review",

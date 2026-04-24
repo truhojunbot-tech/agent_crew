@@ -214,10 +214,43 @@ class TaskQueue:
             conn.close()
 
     def cancel(self, task_id: str) -> None:
+        """Cancel a task. Dependent tasks (prev_task_id points to task_id) are marked
+        'orphaned' rather than cancelled — operators can manually cancel them if desired."""
         conn = self._connect()
         try:
             conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))
+            # Mark pending dependents as orphaned (not cancelled) so the operator
+            # can see them and decide whether to cancel or reassign.
+            conn.execute(
+                """
+                UPDATE tasks SET status = 'orphaned'
+                WHERE status IN ('pending', 'in_progress')
+                AND json_extract(context, '$.prev_task_id') = ?
+                """,
+                (task_id,),
+            )
             conn.commit()
+        finally:
+            conn.close()
+
+    def list_orphaned(self) -> List[TaskRequest]:
+        """Return all tasks with status='orphaned'."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE status = 'orphaned' ORDER BY priority ASC, created_at ASC"
+            ).fetchall()
+            return [
+                TaskRequest(
+                    task_id=r["task_id"],
+                    task_type=r["task_type"],
+                    description=r["description"],
+                    branch=r["branch"],
+                    priority=r["priority"],
+                    context=json.loads(r["context"]),
+                )
+                for r in rows
+            ]
         finally:
             conn.close()
 

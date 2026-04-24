@@ -51,6 +51,45 @@ def parse_response(text: str) -> dict | None:
     }
 
 
+def get_project_git_origin(project_path: str) -> str | None:
+    """Return the 'origin' remote URL for the git repo at project_path, or None."""
+    result = subprocess.run(
+        ["git", "-C", project_path, "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def validate_repo_origin(repo: str, project_path: str) -> tuple[bool, str]:
+    """Check that --repo matches the git remote origin of project_path.
+
+    repo: owner/name form (e.g. 'org/myrepo')
+    Returns (True, "") on match, (False, error_message) on mismatch.
+    """
+    origin = get_project_git_origin(project_path)
+    if origin is None:
+        return True, ""  # no remote configured — can't validate, allow through
+    # Normalise: strip trailing .git, extract owner/name from URL
+    normalised = origin.rstrip("/")
+    if normalised.endswith(".git"):
+        normalised = normalised[:-4]
+    # Both "https://github.com/org/repo" and "git@github.com:org/repo" forms
+    # end with "/org/repo" or ":org/repo" — take the last two path components.
+    parts = normalised.replace(":", "/").rstrip("/").split("/")
+    if len(parts) >= 2:
+        origin_slug = f"{parts[-2]}/{parts[-1]}"
+    else:
+        origin_slug = normalised
+    if repo == origin_slug:
+        return True, ""
+    return False, (
+        f"repo mismatch: --repo {repo} but project origin is {origin_slug} ({origin})"
+    )
+
+
 def fetch_issues_from_gh(repo: str) -> list[dict]:
     result = subprocess.run(
         ["gh", "issue", "list", "--repo", repo, "--json", "number,title,labels"],

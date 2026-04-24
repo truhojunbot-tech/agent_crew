@@ -249,3 +249,98 @@ def test_u_q17_gate_resolve_already_resolved(q):
     q.resolve_gate("g-001", approved=True)
     with pytest.raises(ValueError):
         q.resolve_gate("g-001", approved=True)
+
+
+# U-Q18: cancel() marks dependent tasks (context.prev_task_id) as 'orphaned'
+def test_u_q18_cancel_orphans_dependents(q):
+    """When an impl task is cancelled, any pending tasks whose context.prev_task_id
+    references the cancelled task must become 'orphaned', not 'cancelled'.
+    This preserves the review chain visibly without silently dropping work."""
+    impl = TaskRequest(
+        task_id="impl-parent",
+        task_type="implement",
+        description="parent task",
+        context={},
+    )
+    review = TaskRequest(
+        task_id="review-child",
+        task_type="review",
+        description="review of parent",
+        context={"prev_task_id": "impl-parent"},
+    )
+    q.enqueue(impl)
+    q.enqueue(review)
+
+    q.cancel("impl-parent")
+
+    # Parent is cancelled
+    cancelled = q.list_tasks(status="cancelled")
+    assert any(t.task_id == "impl-parent" for t in cancelled)
+
+    # Dependent is orphaned, NOT cancelled
+    orphaned = q.list_tasks(status="orphaned")
+    assert any(t.task_id == "review-child" for t in orphaned)
+
+    # Dependent is NOT in cancelled list
+    assert not any(t.task_id == "review-child" for t in cancelled)
+
+
+# U-Q19: cancel() does NOT cascade 'cancelled' status to dependents
+def test_u_q19_cancel_does_not_cascade_cancelled_status(q):
+    """Cancelling a task must not set dependents to 'cancelled'.
+    Only the target task itself becomes 'cancelled'."""
+    impl = TaskRequest(
+        task_id="impl-x",
+        task_type="implement",
+        description="impl x",
+        context={},
+    )
+    review = TaskRequest(
+        task_id="review-x",
+        task_type="review",
+        description="review x",
+        context={"prev_task_id": "impl-x"},
+    )
+    test_task = TaskRequest(
+        task_id="test-x",
+        task_type="test",
+        description="test x",
+        context={"prev_task_id": "review-x"},
+    )
+    q.enqueue(impl)
+    q.enqueue(review)
+    q.enqueue(test_task)
+
+    q.cancel("impl-x")
+
+    cancelled = q.list_tasks(status="cancelled")
+    cancelled_ids = {t.task_id for t in cancelled}
+    # Only impl-x is cancelled
+    assert "impl-x" in cancelled_ids
+    assert "review-x" not in cancelled_ids
+    assert "test-x" not in cancelled_ids
+
+
+# U-Q20: list_orphaned() returns only orphaned tasks
+def test_u_q20_list_orphaned(q):
+    """list_orphaned() must return tasks with status='orphaned' only."""
+    impl = TaskRequest(
+        task_id="impl-orphan-test",
+        task_type="implement",
+        description="impl",
+        context={},
+    )
+    review = TaskRequest(
+        task_id="review-orphan-test",
+        task_type="review",
+        description="review",
+        context={"prev_task_id": "impl-orphan-test"},
+    )
+    q.enqueue(impl)
+    q.enqueue(review)
+
+    q.cancel("impl-orphan-test")
+
+    orphaned = q.list_orphaned()
+    assert len(orphaned) == 1
+    assert orphaned[0].task_id == "review-orphan-test"
