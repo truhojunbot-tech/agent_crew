@@ -967,15 +967,24 @@ def run_cmd(task: str, db: str, project: str, base: str,
             click.echo(f"  Auto-submit failed: {e}")
 
     def _wait(task_id: str):
-        deadline = time.time() + wait_timeout
-        fallback_start = time.time() + 30  # grace period before pane checks
+        start_time = time.time()
+        deadline = start_time + wait_timeout
+        fallback_start = start_time + 30  # grace period before pane checks
         pane_idle_count = 0
+        last_progress_print = start_time
         while time.time() < deadline:
             result = queue.get_result(task_id)
             if result is not None:
+                elapsed = int(time.time() - start_time)
                 return result
+            # Print progress every 10 seconds during the wait
+            now = time.time()
+            if now - last_progress_print >= 10:
+                elapsed = int(now - start_time)
+                click.echo(f"  Waiting... ({elapsed}s elapsed)")
+                last_progress_print = now
             # Pane capture fallback: after 30s, check every 10s
-            if first_pane_target and time.time() > fallback_start:
+            if first_pane_target and now > fallback_start:
                 pane_out = _capture_pane(first_pane_target)
                 if pane_out and _pane_looks_idle(pane_out):
                     pane_idle_count += 1
@@ -1093,15 +1102,19 @@ def run_cmd(task: str, db: str, project: str, base: str,
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
 
     for iteration in range(1, max_iter + 1):
+        impl_start = time.time()
         _wait(impl_id)
-        click.echo(f"[{iteration}/{max_iter}] Implementation done.")
+        impl_elapsed = int(time.time() - impl_start)
+        click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
         review_context = {}
         if reviewer:
             review_context["agent_override"] = reviewer
         review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, context=review_context, port=_run_port)
         click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
+        review_start = time.time()
         review_result = _wait(review_id)
+        review_elapsed = int(time.time() - review_start)
 
         # pass no_tester=True here — test enqueue is handled manually below
         outcome = handle_review_result(
@@ -1113,50 +1126,52 @@ def run_cmd(task: str, db: str, project: str, base: str,
         )
 
         if outcome == "escalate":
-            click.echo(f"[{iteration}/{max_iter}] Escalated after {max_iter} iterations.")
+            click.echo(f"[{iteration}/{max_iter}] ❌ Escalated after {max_iter} iterations.")
             return
 
         if outcome == "approved":
-            click.echo(f"[{iteration}/{max_iter}] Review approved.")
+            click.echo(f"[{iteration}/{max_iter}] ✅ Review approved ({review_elapsed}s)")
             # Auto-resolve any pending gates before proceeding
             if _run_port:
                 _drain_resolvable_gates(_run_port)
             if not no_tester:
                 test_id = enqueue_test(queue, task, branch, port=_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
+                test_start = time.time()
                 test_result = _wait(test_id)
+                test_elapsed = int(time.time() - test_start)
                 test_outcome = handle_test_result(test_result)
                 if test_outcome == "passed":
                     if _run_port:
                         _drain_resolvable_gates(_run_port)
-                    click.echo(f"[{iteration}/{max_iter}] Tests passed. Loop complete.")
+                    click.echo(f"[{iteration}/{max_iter}] ✅ Tests passed ({test_elapsed}s). Loop complete.")
                     # Create PR if requested
                     if create_pr:
                         _create_and_report_pr(branch, repo, task)
                     return
                 else:
-                    click.echo(f"[{iteration}/{max_iter}] Tests {test_outcome}. Re-implementing.")
+                    click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
                     impl_id = enqueue_implement(queue, task, branch,
                                                context={"retry": True}, port=_run_port)
                     continue
             else:
                 if _run_port:
                     _drain_resolvable_gates(_run_port)
-                click.echo(f"[{iteration}/{max_iter}] Loop complete (no tester).")
+                click.echo(f"[{iteration}/{max_iter}] ✅ Loop complete ({review_elapsed}s, no tester).")
                 # Create PR if requested
                 if create_pr:
                     _create_and_report_pr(branch, repo, task)
             return
 
         # request_changes: re-implement with feedback
-        click.echo(f"[{iteration}/{max_iter}] Changes requested. Re-implementing.")
+        click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
         feedback = build_feedback(review_result)
         retry_context = {"feedback": feedback}
         if implementer:
             retry_context["agent_override"] = implementer
         impl_id = enqueue_implement(queue, task, branch, context=retry_context, port=_run_port)
 
-    click.echo(f"Max iterations ({max_iter}) reached without approval.")
+    click.echo(f"❌ Max iterations ({max_iter}) reached without approval.")
 
 
 @crew.command()
