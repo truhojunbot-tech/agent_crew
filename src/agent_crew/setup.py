@@ -155,7 +155,8 @@ def create_worktrees(project: str, base: str, agents: list[str], project_path: s
         agents: list of agent names
         project_path: explicit path to project git repo. If None, auto-detect.
 
-    Worktrees are stored at: base/worktrees/project/agent/
+    Worktrees are stored at: base/worktrees/project/agent/ (new)
+    For backward compatibility, existing worktrees at base/project/agent/ are reused.
     State (state.json, tasks.db) at: base/project/
     """
     if project_path is None:
@@ -166,6 +167,14 @@ def create_worktrees(project: str, base: str, agents: list[str], project_path: s
 
     worktrees = {}
     for agent in agents:
+        # Check for existing worktree at old location (backward compatibility)
+        old_wt_path = os.path.join(base, project, agent)
+        if os.path.isdir(old_wt_path):
+            # Reuse existing worktree at old location
+            worktrees[agent] = old_wt_path
+            continue
+
+        # Create new worktree at architecture-compliant location
         wt_path = os.path.join(base, "worktrees", project, agent)
         branch = f"agent/{project}/{agent}"
         # Run git worktree add FROM the project repo, not from cwd
