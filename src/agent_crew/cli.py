@@ -659,8 +659,12 @@ def teardown(project: str, base: str):
 @click.option("--no-tester", is_flag=True, help="Skip test phase after approval")
 @click.option("--branch", default="main", show_default=True)
 @click.option("--timeout", default=600, type=int, show_default=True, help="Task wait timeout in seconds")
+@click.option("--create-issue", is_flag=True, help="Create GitHub issue for task")
+@click.option("--create-pr", is_flag=True, help="Create GitHub PR after implementation")
+@click.option("--repo", default="", help="GitHub repo (owner/repo format)")
 def run_cmd(task: str, db: str, project: str, base: str,
-            max_iter: int, no_tester: bool, branch: str, timeout: int):
+            max_iter: int, no_tester: bool, branch: str, timeout: int,
+            create_issue: bool, create_pr: bool, repo: str):
     """Run TASK through the code-review loop."""
     if not task.strip():
         raise click.UsageError("task must not be empty")
