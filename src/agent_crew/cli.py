@@ -715,9 +715,12 @@ def teardown(project: str, base: str):
 @click.option("--create-issue", is_flag=True, help="Create GitHub issue for task")
 @click.option("--create-pr", is_flag=True, help="Create GitHub PR after implementation")
 @click.option("--repo", default="", help="GitHub repo (owner/repo format)")
+@click.option("--implementer", default="", help="Agent for implementation (claude/codex/gemini)")
+@click.option("--reviewer", default="", help="Agent for review (claude/codex/gemini)")
 def run_cmd(task: str, db: str, project: str, base: str,
             max_iter: int, no_tester: bool, branch: str, timeout: int,
-            create_issue: bool, create_pr: bool, repo: str):
+            create_issue: bool, create_pr: bool, repo: str,
+            implementer: str, reviewer: str):
     """Run TASK through the code-review loop."""
     if not task.strip():
         raise click.UsageError("task must not be empty")
@@ -906,7 +909,11 @@ def run_cmd(task: str, db: str, project: str, base: str,
         else:
             raise click.ClickException("Failed to create GitHub issue")
 
-    impl_id = enqueue_implement(queue, task, branch, port=_run_port)
+    impl_context = {}
+    if implementer:
+        impl_context["agent_override"] = implementer
+
+    impl_id = enqueue_implement(queue, task, branch, context=impl_context, port=_run_port)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
     if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0):
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
@@ -915,7 +922,10 @@ def run_cmd(task: str, db: str, project: str, base: str,
         _wait(impl_id)
         click.echo(f"[{iteration}/{max_iter}] Implementation done.")
 
-        review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, port=_run_port)
+        review_context = {}
+        if reviewer:
+            review_context["agent_override"] = reviewer
+        review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, context=review_context, port=_run_port)
         click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
         review_result = _wait(review_id)
 
@@ -967,7 +977,10 @@ def run_cmd(task: str, db: str, project: str, base: str,
         # request_changes: re-implement with feedback
         click.echo(f"[{iteration}/{max_iter}] Changes requested. Re-implementing.")
         feedback = build_feedback(review_result)
-        impl_id = enqueue_implement(queue, task, branch, context={"feedback": feedback}, port=_run_port)
+        retry_context = {"feedback": feedback}
+        if implementer:
+            retry_context["agent_override"] = implementer
+        impl_id = enqueue_implement(queue, task, branch, context=retry_context, port=_run_port)
 
     click.echo(f"Max iterations ({max_iter}) reached without approval.")
 

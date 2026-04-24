@@ -145,6 +145,20 @@ def create_app(
         if task is None:
             logger.debug(f"_try_push_next: no pending task for role {role}")
             return  # nothing pending
+
+        # Check if task has an agent_override in context
+        task_context = task.context if isinstance(task.context, dict) else {}
+        logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
+        if "agent_override" in task_context:
+            agent_override = task_context["agent_override"]
+            override_pane_id = pane_map.get(agent_override)
+            if override_pane_id:
+                logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
+                pane_id = override_pane_id
+            else:
+                logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
+                return
+
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
         push_fn(pane_id, _format_task_message(task, port))
 
