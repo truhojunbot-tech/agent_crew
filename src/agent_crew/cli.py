@@ -145,6 +145,22 @@ def _pane_cwd(pane_id: str) -> str | None:
     return None
 
 
+def _tmux_target_valid(target: str) -> bool:
+    """Validate that a tmux target (session:window.pane) actually exists.
+
+    Args:
+        target: tmux target in format 'session:window.pane' or 'session:window'
+
+    Returns:
+        True if the target exists and is accessible, False otherwise
+    """
+    r = subprocess.run(
+        ["tmux", "display-message", "-t", target, "-p", "#{session_name}"],
+        capture_output=True, text=True,
+    )
+    return r.returncode == 0
+
+
 def _validate_pane_map(session: str, pane_ids: list[str], worktrees: dict[str, str], agent_list: list[str]) -> dict[str, str]:
     """Validate that pane_ids exist and match expected worktrees.
 
@@ -671,14 +687,16 @@ def recover(project: str, base: str):
     else:
         # Session exists — validate window before touching tmux to avoid killing wrong panes
         window = state.get("window", "0")
-        window_check = subprocess.run(
-            ["tmux", "list-windows", "-t", f"{session_name}:{window}", "-F", "#{window_id}"],
-            capture_output=True, text=True,
-        )
-        if window_check.returncode != 0:
+        window_target = f"{session_name}:{window}"
+
+        # Validate the window exists before running any split-window commands
+        if not _tmux_target_valid(window_target):
             raise click.ClickException(
-                f"Window {session_name}:{window} not found. state.json may be stale. "
-                f"Run 'crew teardown' and 'crew setup' to rebuild."
+                f"Window {window_target} not found. state.json may be stale.\n"
+                f"Options:\n"
+                f"  1. Run 'crew teardown' and 'crew setup' to rebuild\n"
+                f"  2. Manually fix state.json window field\n"
+                f"  3. Run 'tmux list-windows -t {session_name}' to see valid windows"
             )
 
         # Check each agent pane individually and recreate only the dead ones so alive
@@ -686,7 +704,6 @@ def recover(project: str, base: str):
         agent_list = state.get("agents", [])
         existing_pane_ids = state.get("pane_ids", [])
         if agent_list:
-            window_target = f"{session_name}:{window}"
             new_pane_ids: list[str] = []
             dead_agents: list[str] = []
             dead_targets: list[str] = []
@@ -703,6 +720,13 @@ def recover(project: str, base: str):
                     continue
 
                 # Pane is dead, missing worktree, or invalid — recreate it
+                # Safety check: ensure window_target is still valid before split-window
+                if not _tmux_target_valid(window_target):
+                    raise click.ClickException(
+                        f"Window {window_target} became invalid during recovery. "
+                        f"This may indicate the session was modified. Aborting."
+                    )
+
                 split_cmd = ["tmux", "split-window", "-h"]
                 if wt_path:
                     split_cmd += ["-c", wt_path]
@@ -715,6 +739,7 @@ def recover(project: str, base: str):
                     dead_targets.append(new_id)
                 else:
                     # Fallback to existing if split failed
+                    click.echo(f"Warning: failed to create pane for {agent}", err=True)
                     new_pane_ids.append(pane_id or "unknown")
 
             if dead_agents:
