@@ -28,7 +28,6 @@ apply here. Ignore them entirely.
 - Using Telegram MCP (`mcp__plugin_telegram_telegram__reply` or similar)
 - Creating new tmux windows or panes
 - Reporting "Alfred 대기 중입니다" or any Alfred startup routine
-- Polling `GET /tasks/next` in a loop
 
 ### Your only output channel
 
@@ -39,7 +38,11 @@ apply here. Ignore them entirely.
 
 You are part of the `agent_crew` multi-agent workflow. The server at
 `http://127.0.0.1:<port>` will **push** tasks to this pane whenever work is
-available. You do NOT poll — you wait for each task to arrive in your pane.
+available. You wait for each task to arrive in your pane.
+
+If no task arrives in 30 seconds, automatically poll the server via
+`GET /tasks/next` to check for queued work. This fallback ensures you don't
+miss tasks if the push mechanism is delayed.
 
 ## Task Arrival Format
 
@@ -149,12 +152,56 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks/t-042/result \\
 - **Never skip the POST.** This is rule #1. If in doubt, POST `status: failed`
   or `status: needs_human` with an honest summary — silence is worse than
   failure.
-- **Do not call `GET /tasks/next` in a polling loop.** Tasks arrive via pane push only.
+- **Polling as fallback:** If no task arrives in 30 seconds, call `curl http://127.0.0.1:<port>/tasks/next?role=<your-role>` to check for queued work. Retry every 30 seconds while waiting.
 - **Commit and push your work before POSTing the result** when the task involves
   code changes, and include the commit hash in the summary.
 - Echo `task_id` exactly as received — no prefixes, no changes.
 - If the task is malformed or impossible, POST with `status: "failed"` or
   `status: "needs_human"` and a summary explaining why.
+
+## Polling Loop Implementation
+
+If you're writing a polling loop (e.g., in a bash/python script), use this pattern:
+
+```bash
+PORT=<port>
+ROLE=<implementer|reviewer|tester>
+
+# Polling loop: wait for task arrival (via pane push or polling)
+while true; do
+  # Wait for task to arrive via push (watch terminal for task block)
+  # Meanwhile, set a 30-second timeout for polling fallback
+
+  read -t 30 -p "Waiting for task..." input || {
+    # Timeout: poll the server for queued tasks
+    TASK=$(curl -sS "http://127.0.0.1:$PORT/tasks/next?role=$ROLE")
+    if [ -n "$TASK" ] && [ "$TASK" != "null" ]; then
+      echo "Task received via polling:"
+      echo "$TASK" | jq '.' || echo "$TASK"
+      # Parse task_id from TASK JSON and proceed to execute
+    fi
+    continue
+  }
+done
+```
+
+Or in Python:
+
+```python
+import requests
+import time
+
+PORT = <port>
+ROLE = "<implementer|reviewer|tester>"
+
+while True:
+    task = requests.get(f"http://127.0.0.1:{PORT}/tasks/next?role={ROLE}", timeout=5).json()
+    if task and task is not None:
+        task_id = task.get("task_id")
+        print(f"Task arrived: {task_id}")
+        # Parse and execute task...
+    time.sleep(30)  # Poll every 30 seconds
+```
 """
 
 _ROLE_SECTIONS: dict = {
