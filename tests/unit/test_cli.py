@@ -635,3 +635,147 @@ def test_u_c41_run_proceeds_when_all_panes_alive(tmp_path):
     # Error must NOT be about dead panes — if it is, the pane check logic is wrong.
     output_lower = result.output.lower()
     assert "dead panes" not in output_lower
+
+
+# U-C42: crew status shows all terminal statuses (failed, needs_human, cancelled)
+def test_u_c42_status_shows_all_terminal_statuses(tmp_path):
+    """crew status must display failed, needs_human, and cancelled tasks, not just
+    queued/running/done. Regression: _STATUS_ALIASES omitted these statuses."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    tq = TaskQueue(db_file)
+
+    state = {
+        "project": "proj42",
+        "port": 9999,
+        "db": db_file,
+        "session": "crew_proj42",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj42").mkdir()
+    (tmp_path / "proj42" / "state.json").write_text(json.dumps(state))
+
+    from agent_crew.protocol import TaskRequest, TaskResult
+    import uuid
+
+    # Create tasks in terminal statuses
+    for status in ("failed", "needs_human", "cancelled"):
+        task = TaskRequest(
+            task_id=str(uuid.uuid4()),
+            task_type="implement",
+            description=f"task with status {status}",
+            branch="main",
+            priority=3,
+            context={},
+        )
+        tq.enqueue(task)
+        # Transition through in_progress to reach terminal status
+        dequeued = tq.dequeue()
+        assert dequeued is not None
+        if status != "cancelled":
+            result_obj = TaskResult(
+                task_id=dequeued.task_id,
+                status=status,
+                summary=f"finished with {status}",
+                verdict=None,
+                findings=[],
+            )
+            tq.submit_result(dequeued.task_id, result_obj)
+        else:
+            tq.cancel(dequeued.task_id)
+
+    runner = CliRunner()
+    # Server is "unreachable" — force DB fallback path
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=Exception("unreachable")), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, ["status", "proj42", "--base", str(tmp_path)])
+
+    output = result.output.lower()
+    assert "failed" in output
+    assert "needs_human" in output or "needs human" in output
+    assert "cancelled" in output
+
+
+# U-C43: crew status uses server as source of truth when reachable
+def test_u_c43_status_uses_server_when_reachable(tmp_path):
+    """When the server is reachable, crew status must query the server API,
+    not the local DB, and show all tasks returned by the server."""
+    import json
+
+    db_file = str(tmp_path / "tasks.db")
+    state = {
+        "project": "proj43",
+        "port": 9998,
+        "db": db_file,
+        "session": "crew_proj43",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj43").mkdir()
+    (tmp_path / "proj43" / "state.json").write_text(json.dumps(state))
+
+    # Server returns one task of each status
+    server_tasks = [
+        {"task_id": "t1", "task_type": "implement", "description": "server-task-pending",
+         "branch": "main", "priority": 3, "context": {}, "status": "pending"},
+        {"task_id": "t2", "task_type": "review", "description": "server-task-failed",
+         "branch": "main", "priority": 3, "context": {}, "status": "failed"},
+    ]
+
+    def mock_fetch(port, status):
+        return [t for t in server_tasks if t["status"] == status]
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=mock_fetch), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, ["status", "proj43", "--base", str(tmp_path)])
+
+    assert "server-task-pending" in result.output
+    assert "server-task-failed" in result.output
+
+
+# U-C44: crew status falls back to DB with warning when server is unreachable
+def test_u_c44_status_falls_back_to_db_with_warning(tmp_path):
+    """When the server is unreachable, crew status must fall back to the local DB
+    and print a warning so the operator knows the data may be stale."""
+    import json
+    from agent_crew.queue import TaskQueue
+    from agent_crew.protocol import TaskRequest
+
+    db_file = str(tmp_path / "tasks.db")
+    tq = TaskQueue(db_file)
+
+    pending_task = TaskRequest(
+        task_id="db-task-001",
+        task_type="implement",
+        description="db-only task description",
+        branch="main",
+        priority=2,
+        context={},
+    )
+    tq.enqueue(pending_task)
+
+    state = {
+        "project": "proj44",
+        "port": 9997,
+        "db": db_file,
+        "session": "crew_proj44",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj44").mkdir()
+    (tmp_path / "proj44" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=Exception("connection refused")), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, ["status", "proj44", "--base", str(tmp_path)])
+
+    output = result.output.lower()
+    # Must warn about server being unreachable / data being from DB
+    assert "unreachable" in output or "fallback" in output or "db" in output or "offline" in output
+    # Must still show DB tasks
+    assert "db-only task description" in result.output

@@ -319,6 +319,29 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def list_all_with_status(self) -> List[dict]:
+        """Return all tasks as raw dicts including the status field."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, task_type, description, branch, priority, context, status "
+                "FROM tasks ORDER BY priority ASC, created_at ASC"
+            ).fetchall()
+            return [
+                {
+                    "task_id": r["task_id"],
+                    "task_type": r["task_type"],
+                    "description": r["description"],
+                    "branch": r["branch"],
+                    "priority": r["priority"],
+                    "context": json.loads(r["context"]) if r["context"] else {},
+                    "status": r["status"],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
     def list_tasks(self, status: str = "") -> List[TaskRequest]:
         conn = self._connect()
         try:

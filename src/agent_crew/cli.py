@@ -221,7 +221,12 @@ _STATUS_ALIASES = (
     ("queued", "pending"),
     ("running", "in_progress"),
     ("done", "completed"),
+    ("failed", "failed"),
+    ("needs_human", "needs_human"),
+    ("cancelled", "cancelled"),
 )
+# Reverse map: DB status → display label (used in DB fallback)
+_DB_STATUS_TO_DISPLAY = {api: disp for disp, api in _STATUS_ALIASES}
 
 def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
     import urllib.request
@@ -518,13 +523,26 @@ def status(project: str, base: str, preview: int):
             for display_status, api_status in _STATUS_ALIASES
         }
     except Exception:
-        click.echo("\nTASKS: (server unreachable)")
+        click.echo("\nTASKS: (server unreachable — showing DB state, may be stale)")
+        if db_file and os.path.exists(db_file):
+            try:
+                from agent_crew.queue import TaskQueue as _TQ
+                _tq_all = _TQ(db_file)
+                _all_tasks = _tq_all.list_all_with_status()
+                task_groups = {}
+                for _t in _all_tasks:
+                    _st = _t.get("status", "unknown")
+                    _disp = _DB_STATUS_TO_DISPLAY.get(_st, _st)
+                    task_groups.setdefault(_disp, []).append(_t)
+            except Exception:
+                task_groups = None
 
     if task_groups:
         total = sum(len(tasks) for tasks in task_groups.values())
         click.echo(f"\nTasks: {total}")
-        for display_status, _ in _STATUS_ALIASES:
-            tasks = task_groups[display_status]
+        for display_status, tasks in task_groups.items():
+            if not tasks:
+                continue
             click.echo(f"\n{display_status.upper()} ({len(tasks)}):")
             for t in tasks:
                 def _get(key, default=None):
