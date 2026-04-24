@@ -327,7 +327,7 @@ def _load_pane_map() -> Optional[dict]:
 
 
 app = create_app(
-    db_path=os.getenv("AGENT_CREW_DB", "/tmp/agent_crew_default.db"),
+    db_path=os.path.expanduser(os.getenv("AGENT_CREW_DB", "/tmp/agent_crew_default.db")),
     pane_map=_load_pane_map(),
     port=int(os.getenv("AGENT_CREW_PORT", "0") or 0),
 )
