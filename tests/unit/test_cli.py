@@ -232,6 +232,157 @@ def test_u_c19_discuss_context_includes_perspective():
     assert q.enqueued[1].context["perspective"] == "critic"
 
 
+# U-C20: recover — session alive + all panes alive → no-op (nothing to recover)
+def test_u_c20_recover_all_panes_alive_noop(tmp_path):
+    """Issue #52: recover must skip work when every agent pane is already alive."""
+    import json
+    proj_dir = tmp_path / "rcproj"
+    proj_dir.mkdir()
+    state = {
+        "project": "rcproj",
+        "port": 8100,
+        "session": "crew_rcproj",
+        "window": "0",
+        "agents": ["claude", "codex"],
+        "pane_ids": ["%1", "%2"],
+        "pane_map": {
+            "claude": "%1", "codex": "%2",
+            "implementer": "%1", "reviewer": "%2",
+        },
+        "worktrees": {"claude": "/tmp/wt/claude", "codex": "/tmp/wt/codex"},
+        "db": str(proj_dir / "tasks.db"),
+        "server_pid": 123,
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    def _fake_run(args, **_kw):
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
+        result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert "nothing to recover" in result.output.lower()
+    mock_start.assert_not_called()
+    split_calls = [c for c in mock_run.call_args_list if "split-window" in str(c)]
+    assert len(split_calls) == 0
+
+
+# U-C21: recover — session alive + one pane dead → only dead pane recreated
+def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
+    """Issue #52: alive panes keep their pane_id; dead panes get fresh ones,
+    and only the dead agent gets (re-)started."""
+    import json
+    proj_dir = tmp_path / "rcproj"
+    proj_dir.mkdir()
+    state = {
+        "project": "rcproj",
+        "port": 8100,
+        "session": "crew_rcproj",
+        "window": "0",
+        "agents": ["claude", "codex"],
+        "pane_ids": ["%1", "%2"],
+        "pane_map": {
+            "claude": "%1", "codex": "%2",
+            "implementer": "%1", "reviewer": "%2",
+        },
+        "worktrees": {"claude": "/tmp/wt/claude", "codex": "/tmp/wt/codex"},
+        "db": str(proj_dir / "tasks.db"),
+        "server_pid": 123,
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    def _fake_pane_alive(pane_id):
+        return pane_id == "%1"
+
+    def _fake_run(args, **_kw):
+        if "split-window" in args:
+            return MagicMock(returncode=0, stdout="%9\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli._pane_alive", side_effect=_fake_pane_alive), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
+        result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+
+    split_calls = [c for c in mock_run.call_args_list if "split-window" in str(c)]
+    assert len(split_calls) == 1, f"expected 1 split-window call, got {len(split_calls)}"
+
+    mock_start.assert_called_once()
+    pos = mock_start.call_args[0]
+    kw = mock_start.call_args[1]
+    assert pos[1] == ["codex"]
+    assert kw.get("pane_targets") == ["%9"]
+
+    new_state = json.loads((proj_dir / "state.json").read_text())
+    assert new_state["pane_ids"] == ["%1", "%9"]
+    assert new_state["pane_map"]["codex"] == "%9"
+    assert new_state["pane_map"]["reviewer"] == "%9"
+    assert new_state["pane_map"]["claude"] == "%1"
+    assert "pane" in result.output.lower()
+
+
+# U-C22: recover — session alive + all panes dead → all recreated in place
+def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
+    import json
+    proj_dir = tmp_path / "rcproj"
+    proj_dir.mkdir()
+    state = {
+        "project": "rcproj",
+        "port": 8100,
+        "session": "crew_rcproj",
+        "window": "0",
+        "agents": ["claude", "codex"],
+        "pane_ids": ["%1", "%2"],
+        "pane_map": {
+            "claude": "%1", "codex": "%2",
+            "implementer": "%1", "reviewer": "%2",
+        },
+        "worktrees": {"claude": "/tmp/wt/claude", "codex": "/tmp/wt/codex"},
+        "db": str(proj_dir / "tasks.db"),
+        "server_pid": 123,
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    fresh_ids = iter(["%7\n", "%8\n"])
+
+    def _fake_run(args, **_kw):
+        if "split-window" in args:
+            return MagicMock(returncode=0, stdout=next(fresh_ids), stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli._pane_alive", return_value=False), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
+        result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+
+    split_calls = [c for c in mock_run.call_args_list if "split-window" in str(c)]
+    assert len(split_calls) == 2, f"expected 2 split-window calls, got {len(split_calls)}"
+
+    mock_start.assert_called_once()
+    pos = mock_start.call_args[0]
+    kw = mock_start.call_args[1]
+    assert pos[1] == ["claude", "codex"]
+    assert kw.get("pane_targets") == ["%7", "%8"]
+
+    new_state = json.loads((proj_dir / "state.json").read_text())
+    assert new_state["pane_ids"] == ["%7", "%8"]
+    assert new_state["pane_map"]["claude"] == "%7"
+    assert new_state["pane_map"]["codex"] == "%8"
+
+
 # U-C15: teardown runs git worktree prune after removing worktrees
 def test_u_c15_teardown_runs_worktree_prune(tmp_path):
     import json

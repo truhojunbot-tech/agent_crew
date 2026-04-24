@@ -511,6 +511,58 @@ def recover(project: str, base: str):
             state["pane_ids"] = pane_ids
             _write_state(base, project, state)
         recovered.append("tmux")
+    else:
+        # Session exists — check each agent pane individually and recreate
+        # only the dead ones so alive panes keep their running agent CLIs.
+        agent_list = state.get("agents", [])
+        existing_pane_ids = state.get("pane_ids", [])
+        if agent_list and len(existing_pane_ids) == len(agent_list):
+            window_target = f"{session_name}:{state.get('window', '0')}"
+            new_pane_ids: list[str] = []
+            dead_agents: list[str] = []
+            dead_targets: list[str] = []
+            for agent, pane_id in zip(agent_list, existing_pane_ids):
+                if _pane_alive(pane_id):
+                    new_pane_ids.append(pane_id)
+                    continue
+                wt_path = worktrees.get(agent, "")
+                split_cmd = ["tmux", "split-window", "-h"]
+                if wt_path:
+                    split_cmd += ["-c", wt_path]
+                split_cmd += ["-t", window_target, "-P", "-F", "#{pane_id}"]
+                r = subprocess.run(split_cmd, capture_output=True, text=True)
+                new_id = r.stdout.strip()
+                if new_id:
+                    new_pane_ids.append(new_id)
+                    dead_agents.append(agent)
+                    dead_targets.append(new_id)
+                else:
+                    new_pane_ids.append(pane_id)
+
+            if dead_agents:
+                subprocess.run(
+                    ["tmux", "select-layout", "-t", window_target, "main-vertical"],
+                    capture_output=True,
+                )
+                setup_module.start_agents_in_panes(
+                    session_name, dead_agents,
+                    pane_targets=dead_targets, worktrees=worktrees,
+                )
+                pane_map = state.get("pane_map", {})
+                for a, pid in zip(agent_list, new_pane_ids):
+                    role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+                    pane_map[role] = pid
+                    pane_map[a] = pid
+                state["pane_ids"] = new_pane_ids
+                state["pane_map"] = pane_map
+                _write_state(base, project, state)
+                pane_map_file = os.path.join(proj_dir, "pane_map.json")
+                try:
+                    with open(pane_map_file, "w") as f:
+                        json.dump(pane_map, f)
+                except OSError:
+                    pass
+                recovered.append(f"panes({len(dead_agents)})")
 
     if recovered:
         click.echo(f"Recovered: {', '.join(recovered)}")
