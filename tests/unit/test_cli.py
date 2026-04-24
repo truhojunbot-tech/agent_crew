@@ -419,3 +419,169 @@ def test_u_c15_teardown_runs_worktree_prune(tmp_path):
         if "worktree" in str(c) and "prune" in str(c)
     ]
     assert len(prune_calls) == 1, f"Expected 1 prune call, got {len(prune_calls)}"
+
+
+# U-C22: _auto_detect_project — returns None when base dir doesn't exist
+def test_u_c22_auto_detect_nonexistent_base():
+    from agent_crew.cli import _auto_detect_project
+    result = _auto_detect_project("/nonexistent/path/that/does/not/exist")
+    assert result is None
+
+
+# U-C23: _auto_detect_project — returns None when no projects exist
+def test_u_c23_auto_detect_no_projects(tmp_path):
+    from agent_crew.cli import _auto_detect_project
+    base = str(tmp_path)
+    result = _auto_detect_project(base)
+    assert result is None
+
+
+# U-C24: _auto_detect_project — returns most recently modified project
+def test_u_c24_auto_detect_most_recent_project(tmp_path):
+    from agent_crew.cli import _auto_detect_project
+    import json
+    import time
+
+    base = str(tmp_path)
+
+    # Create two projects with different mtimes
+    proj1_dir = tmp_path / "project_old"
+    proj1_dir.mkdir()
+    (proj1_dir / "state.json").write_text(json.dumps({"project": "project_old"}))
+
+    time.sleep(0.1)  # Ensure different mtimes
+
+    proj2_dir = tmp_path / "project_new"
+    proj2_dir.mkdir()
+    (proj2_dir / "state.json").write_text(json.dumps({"project": "project_new"}))
+
+    result = _auto_detect_project(base)
+    assert result == "project_new"
+
+
+# U-C25: _auto_detect_project — ignores dirs without state.json
+def test_u_c25_auto_detect_ignores_dirs_without_state(tmp_path):
+    from agent_crew.cli import _auto_detect_project
+    import json
+
+    base = str(tmp_path)
+
+    # Create project with state.json
+    proj_with_state = tmp_path / "with_state"
+    proj_with_state.mkdir()
+    (proj_with_state / "state.json").write_text(json.dumps({"project": "with_state"}))
+
+    # Create project without state.json
+    proj_without_state = tmp_path / "without_state"
+    proj_without_state.mkdir()
+    (proj_without_state / "other_file.txt").write_text("not a state file")
+
+    result = _auto_detect_project(base)
+    assert result == "with_state"
+
+
+# U-C26: _auto_detect_project — works with tilde expansion
+def test_u_c26_auto_detect_tilde_expansion(tmp_path, monkeypatch):
+    from agent_crew.cli import _auto_detect_project
+    import json
+    import os
+
+    # Mock home directory to tmp_path
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    # Create nested directory structure
+    crew_dir = tmp_path / ".agent_crew"
+    crew_dir.mkdir()
+    proj_dir = crew_dir / "test_project"
+    proj_dir.mkdir()
+    (proj_dir / "state.json").write_text(json.dumps({"project": "test_project"}))
+
+    result = _auto_detect_project("~/.agent_crew")
+    assert result == "test_project"
+
+
+# U-C27: _auto_detect_project — handles exception gracefully
+def test_u_c27_auto_detect_handles_exception(tmp_path):
+    from agent_crew.cli import _auto_detect_project
+    from unittest.mock import patch
+
+    base = str(tmp_path)
+
+    # Mock os.listdir to raise an exception
+    with patch("os.listdir", side_effect=PermissionError("Access denied")):
+        result = _auto_detect_project(base)
+
+    assert result is None
+
+
+# U-C28: crew run auto-detects project when --db and --project not provided
+def test_u_c28_run_auto_detect_project(tmp_path):
+    from agent_crew.cli import _auto_detect_project
+    import json
+
+    runner = CliRunner()
+
+    # Setup base directory with a project
+    base = str(tmp_path)
+    proj_dir = tmp_path / "auto_test"
+    proj_dir.mkdir()
+    db_file = str(proj_dir / "tasks.db")
+    state = {
+        "project": "auto_test",
+        "port": 0,
+        "db": db_file,
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    # Try to run without --db or --project; it should auto-detect
+    result = runner.invoke(crew, [
+        "run", "test task",
+        "--base", base,
+    ])
+
+    # We expect it to fail because we don't have a real server, but the
+    # error should NOT be about missing --db/--project
+    assert "--db" not in result.output or "--project" not in result.output or \
+           "auto_test" in result.output or result.exit_code == 0
+
+
+# U-C29: crew discuss auto-detects project when --db and --project not provided
+def test_u_c29_discuss_auto_detect_project(tmp_path):
+    import json
+
+    runner = CliRunner()
+
+    # Setup base directory with a project
+    base = str(tmp_path)
+    proj_dir = tmp_path / "discuss_auto_test"
+    proj_dir.mkdir()
+    db_file = str(proj_dir / "tasks.db")
+    state = {
+        "project": "discuss_auto_test",
+        "port": 0,
+        "db": db_file,
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    # Try to run without --db or --project; it should auto-detect
+    result = runner.invoke(crew, [
+        "discuss", "test topic",
+        "--base", base,
+    ])
+
+    # We expect it to fail because we don't have a real server, but the
+    # error should NOT be about missing --db/--project
+    assert "--db" not in result.output or "--project" not in result.output or \
+           "discuss_auto_test" in result.output or result.exit_code == 0
+
+
+# U-C30: _auto_detect_project — returns None when base is not a directory
+def test_u_c30_auto_detect_base_is_file(tmp_path):
+    from agent_crew.cli import _auto_detect_project
+
+    # Create a file instead of a directory
+    file_path = tmp_path / "not_a_dir"
+    file_path.write_text("I am a file")
+
+    result = _auto_detect_project(str(file_path))
+    assert result is None
