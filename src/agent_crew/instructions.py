@@ -202,6 +202,36 @@ while True:
         # Parse and execute task...
     time.sleep(30)  # Poll every 30 seconds
 ```
+
+## Checkpointing for Fault Recovery
+
+For long-running tasks, save checkpoints at strategic points to enable resumption on failure:
+
+```bash
+# Save checkpoint after completing a major step
+curl -sS -X POST http://127.0.0.1:<port>/tasks/<task_id>/checkpoint \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "checkpoint_num": 1,
+    "state": {
+      "step": "completed_code_analysis",
+      "files_analyzed": 42,
+      "findings": ["..."]
+    }
+  }'
+
+# Retrieve latest checkpoint if resuming from failure
+curl -sS http://127.0.0.1:<port>/tasks/<task_id>/checkpoint/latest | jq '.state'
+
+# List all checkpoints for time-travel debugging
+curl -sS http://127.0.0.1:<port>/tasks/<task_id>/checkpoints | jq '.'
+```
+
+Benefits:
+- **Fault recovery**: Resume from last checkpoint instead of restarting
+- **Cost savings**: Don't re-run expensive operations (API calls, analysis)
+- **Time-travel debugging**: View agent state at any checkpoint
+- **Alternative exploration**: Branch from saved state to try different approaches
 """
 
 _ROLE_SECTIONS: dict = {
