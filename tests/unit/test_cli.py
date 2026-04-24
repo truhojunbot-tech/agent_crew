@@ -572,3 +572,373 @@ def test_u_c39_auto_detect_base_is_file(tmp_path):
 
     result = _auto_detect_project(str(file_path))
     assert result is None
+
+
+# U-C40: crew run exits early with 'Dead panes detected' when a required pane is dead
+def test_u_c40_run_exits_on_dead_pane(tmp_path):
+    """crew run must check pane liveness at startup. If any required pane is
+    dead, it must exit immediately with an error that tells the user to recover."""
+    import json
+    db_file = str(tmp_path / "tasks.db")
+    state = {
+        "project": "test_proj",
+        "port": 0,
+        "db": db_file,
+        "session": "crew_test_proj",
+        "agents": ["claude", "codex"],
+        "pane_ids": ["%10", "%20"],
+    }
+    (tmp_path / "test_proj").mkdir()
+    (tmp_path / "test_proj" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._pane_alive", return_value=False):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "test_proj",
+            "--base", str(tmp_path),
+        ])
+
+    assert result.exit_code != 0
+    assert "dead" in result.output.lower() or "recover" in result.output.lower()
+
+
+# U-C41: crew run proceeds past pane check when all panes are alive
+def test_u_c41_run_proceeds_when_all_panes_alive(tmp_path):
+    """crew run must not emit a 'dead panes' error when all panes are alive."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    TaskQueue(db_file)  # initialize DB schema
+    state = {
+        "project": "test_proj2",
+        "port": 0,
+        "db": db_file,
+        "session": "crew_test_proj2",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "test_proj2").mkdir()
+    (tmp_path / "test_proj2" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    # Pane alive — pane check passes. Use timeout=1 so the wait loop exits fast.
+    with patch("agent_crew.cli._pane_alive", return_value=True):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "test_proj2",
+            "--base", str(tmp_path),
+            "--timeout", "1",
+        ])
+
+    # Error must NOT be about dead panes — if it is, the pane check logic is wrong.
+    output_lower = result.output.lower()
+    assert "dead panes" not in output_lower
+
+
+# U-C42: crew status shows all terminal statuses (failed, needs_human, cancelled)
+def test_u_c42_status_shows_all_terminal_statuses(tmp_path):
+    """crew status must display failed, needs_human, and cancelled tasks, not just
+    queued/running/done. Regression: _STATUS_ALIASES omitted these statuses."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    tq = TaskQueue(db_file)
+
+    state = {
+        "project": "proj42",
+        "port": 9999,
+        "db": db_file,
+        "session": "crew_proj42",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj42").mkdir()
+    (tmp_path / "proj42" / "state.json").write_text(json.dumps(state))
+
+    from agent_crew.protocol import TaskRequest, TaskResult
+    import uuid
+
+    # Create tasks in terminal statuses
+    for status in ("failed", "needs_human", "cancelled"):
+        task = TaskRequest(
+            task_id=str(uuid.uuid4()),
+            task_type="implement",
+            description=f"task with status {status}",
+            branch="main",
+            priority=3,
+            context={},
+        )
+        tq.enqueue(task)
+        # Transition through in_progress to reach terminal status
+        dequeued = tq.dequeue()
+        assert dequeued is not None
+        if status != "cancelled":
+            result_obj = TaskResult(
+                task_id=dequeued.task_id,
+                status=status,
+                summary=f"finished with {status}",
+                verdict=None,
+                findings=[],
+            )
+            tq.submit_result(dequeued.task_id, result_obj)
+        else:
+            tq.cancel(dequeued.task_id)
+
+    runner = CliRunner()
+    # Server is "unreachable" — force DB fallback path
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=Exception("unreachable")), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, ["status", "proj42", "--base", str(tmp_path)])
+
+    output = result.output.lower()
+    assert "failed" in output
+    assert "needs_human" in output or "needs human" in output
+    assert "cancelled" in output
+
+
+# U-C43: crew status uses server as source of truth when reachable
+def test_u_c43_status_uses_server_when_reachable(tmp_path):
+    """When the server is reachable, crew status must query the server API,
+    not the local DB, and show all tasks returned by the server."""
+    import json
+
+    db_file = str(tmp_path / "tasks.db")
+    state = {
+        "project": "proj43",
+        "port": 9998,
+        "db": db_file,
+        "session": "crew_proj43",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj43").mkdir()
+    (tmp_path / "proj43" / "state.json").write_text(json.dumps(state))
+
+    # Server returns one task of each status
+    server_tasks = [
+        {"task_id": "t1", "task_type": "implement", "description": "server-task-pending",
+         "branch": "main", "priority": 3, "context": {}, "status": "pending"},
+        {"task_id": "t2", "task_type": "review", "description": "server-task-failed",
+         "branch": "main", "priority": 3, "context": {}, "status": "failed"},
+    ]
+
+    def mock_fetch(port, status):
+        return [t for t in server_tasks if t["status"] == status]
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=mock_fetch), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, ["status", "proj43", "--base", str(tmp_path)])
+
+    assert "server-task-pending" in result.output
+    assert "server-task-failed" in result.output
+
+
+# U-C44: crew status falls back to DB with warning when server is unreachable
+def test_u_c44_status_falls_back_to_db_with_warning(tmp_path):
+    """When the server is unreachable, crew status must fall back to the local DB
+    and print a warning so the operator knows the data may be stale."""
+    import json
+    from agent_crew.queue import TaskQueue
+    from agent_crew.protocol import TaskRequest
+
+    db_file = str(tmp_path / "tasks.db")
+    tq = TaskQueue(db_file)
+
+    pending_task = TaskRequest(
+        task_id="db-task-001",
+        task_type="implement",
+        description="db-only task description",
+        branch="main",
+        priority=2,
+        context={},
+    )
+    tq.enqueue(pending_task)
+
+    state = {
+        "project": "proj44",
+        "port": 9997,
+        "db": db_file,
+        "session": "crew_proj44",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj44").mkdir()
+    (tmp_path / "proj44" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=Exception("connection refused")), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, ["status", "proj44", "--base", str(tmp_path)])
+
+    output = result.output.lower()
+    # Must warn about server being unreachable / data being from DB
+    assert "unreachable" in output or "fallback" in output or "db" in output or "offline" in output
+    # Must still show DB tasks
+    assert "db-only task description" in result.output
+
+
+# U-C45: crew run exits immediately with clear error when server is unreachable
+def test_u_c45_run_exits_immediately_when_server_unreachable(tmp_path):
+    """crew run must not hang 70+ seconds when the server is down. It should
+    perform a health check at startup and exit within 5 seconds with a clear
+    error message naming the port and suggesting 'crew recover'."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    TaskQueue(db_file)
+    state = {
+        "project": "proj45",
+        "port": 9996,  # nothing listening here
+        "db": db_file,
+        "session": "crew_proj45",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj45").mkdir()
+    (tmp_path / "proj45" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    # Panes look alive (so pane check passes), but server is down
+    with patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("agent_crew.cli._port_listening", return_value=False):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "proj45",
+            "--base", str(tmp_path),
+        ])
+
+    assert result.exit_code != 0
+    output = result.output.lower()
+    # Must mention port and suggest recovery
+    assert "9996" in result.output
+    assert "unreachable" in output or "not running" in output or "server" in output
+    assert "recover" in output or "status" in output
+
+
+# U-C46: crew run proceeds normally when server is reachable
+def test_u_c46_run_proceeds_when_server_reachable(tmp_path):
+    """crew run must NOT emit a 'server unreachable' error when the server
+    responds to the health check."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    TaskQueue(db_file)
+    state = {
+        "project": "proj46",
+        "port": 9995,
+        "db": db_file,
+        "session": "crew_proj46",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj46").mkdir()
+    (tmp_path / "proj46" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli._fetch_tasks_by_status", return_value=[]), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "proj46",
+            "--base", str(tmp_path),
+            "--timeout", "1",
+        ])
+
+    output = result.output.lower()
+    assert "server" not in output or "unreachable" not in output
+
+
+# U-C47: /health endpoint returns 200 OK with status field
+def test_u_c47_health_endpoint_returns_ok():
+    """The server must expose GET /health returning {status: ok} so that
+    crew run can perform a fast liveness check without waiting for a full
+    task operation."""
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    try:
+        app = create_app(db_path)
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("status") == "ok"
+    finally:
+        os.unlink(db_path)
+
+
+# U-C48: crew setup --help shows single-agent usage example
+def test_u_c48_setup_help_shows_single_agent_example():
+    """crew setup --help must include an example showing --agents for single-agent
+    mode so users know they can spawn only one agent."""
+    runner = CliRunner()
+    result = runner.invoke(crew, ["setup", "--help"])
+    assert result.exit_code == 0
+    # The help text must hint at single-agent usage with --agents
+    assert "--agents" in result.output
+    # Must show a concrete agent name as example (codex or claude)
+    assert "codex" in result.output or "claude" in result.output
+    # Must show the pattern "crew setup" or similar context
+    assert "single" in result.output.lower() or "example" in result.output.lower() or "e.g." in result.output.lower()
+
+
+# U-C49: crew setup prints a Tip line after completing successfully
+def test_u_c49_setup_prints_tip_after_completion(tmp_path):
+    """After a successful setup, cli.py must print a Tip line mentioning --agents
+    so users discover the single-agent mode."""
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        if cmd == "display-message":
+            # First call returns session:window, subsequent calls return numeric values
+            joined = " ".join(args)
+            if "#S:#I" in joined:
+                return MagicMock(returncode=0, stdout="crew:0\n", stderr="")
+            if "window_width" in joined:
+                return MagicMock(returncode=0, stdout="200\n", stderr="")
+            if "pane_width" in joined:
+                return MagicMock(returncode=0, stdout="100\n", stderr="")
+            return MagicMock(returncode=0, stdout="crew\n", stderr="")
+        if cmd == "split-window":
+            return MagicMock(returncode=0, stdout="%99\n", stderr="")
+        if cmd == "select-layout":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if cmd in ("list-panes", "list-windows"):
+            return MagicMock(returncode=0, stdout="0\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 12345
+
+    runner = CliRunner(env={"TMUX_PANE": "%0"})
+    with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
+         patch("agent_crew.cli._read_state", return_value=None), \
+         patch("agent_crew.cli.setup_module.find_free_port", return_value=19999), \
+         patch("agent_crew.cli.setup_module.write_port_file"), \
+         patch("agent_crew.cli.setup_module.create_worktrees", return_value={"claude": str(tmp_path / "wt")}), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_sessions_json"), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
+         patch("agent_crew.cli._write_state"), \
+         patch("os.getcwd", return_value=str(tmp_path)):
+        result = runner.invoke(crew, ["setup", "myproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    output = result.output.lower()
+    assert "tip" in output
+    assert "--agents" in result.output

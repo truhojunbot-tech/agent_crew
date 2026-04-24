@@ -201,6 +201,18 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def requeue(self, task_id: str) -> None:
+        """Roll an in_progress task back to pending so it can be dequeued again."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET status = 'pending' WHERE task_id = ? AND status = 'in_progress'",
+                (task_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def cancel(self, task_id: str) -> None:
         conn = self._connect()
         try:
@@ -304,6 +316,29 @@ class TaskQueue:
                 return json.loads(row["context"])
             except Exception:
                 return {}
+        finally:
+            conn.close()
+
+    def list_all_with_status(self) -> List[dict]:
+        """Return all tasks as raw dicts including the status field."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, task_type, description, branch, priority, context, status "
+                "FROM tasks ORDER BY priority ASC, created_at ASC"
+            ).fetchall()
+            return [
+                {
+                    "task_id": r["task_id"],
+                    "task_type": r["task_type"],
+                    "description": r["description"],
+                    "branch": r["branch"],
+                    "priority": r["priority"],
+                    "context": json.loads(r["context"]) if r["context"] else {},
+                    "status": r["status"],
+                }
+                for r in rows
+            ]
         finally:
             conn.close()
 

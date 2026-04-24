@@ -221,7 +221,12 @@ _STATUS_ALIASES = (
     ("queued", "pending"),
     ("running", "in_progress"),
     ("done", "completed"),
+    ("failed", "failed"),
+    ("needs_human", "needs_human"),
+    ("cancelled", "cancelled"),
 )
+# Reverse map: DB status → display label (used in DB fallback)
+_DB_STATUS_TO_DISPLAY = {api: disp for disp, api in _STATUS_ALIASES}
 
 def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
     import urllib.request
@@ -239,10 +244,20 @@ def crew():
 
 @crew.command()
 @click.argument("project")
-@click.option("--agents", default=_DEFAULT_AGENTS, help="Comma-separated agent names")
+@click.option("--agents", default=_DEFAULT_AGENTS,
+              help="Comma-separated agent names. e.g. --agents codex  (single-agent mode)")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True, help="Base directory for state/worktrees")
 def setup(project: str, agents: str, base: str):
-    """Configure environment for PROJECT."""
+    """Configure environment for PROJECT.
+
+    Examples:
+
+      crew setup myproj                        # default: claude,codex,gemini
+
+      crew setup myproj --agents codex         # single-agent task
+
+      crew setup myproj --agents claude,codex  # two agents
+    """
     cwd = os.getcwd()
     if not setup_module.validate_git_repo(cwd):
         raise click.ClickException("not a git repository")
@@ -468,6 +483,7 @@ def setup(project: str, agents: str, base: str):
     })
 
     click.echo(f"Setup complete: {project} on port {port}")
+    click.echo("Tip: use --agents <name> to spawn only specific agents (e.g. --agents claude)")
 
 
 @crew.command()
@@ -518,13 +534,26 @@ def status(project: str, base: str, preview: int):
             for display_status, api_status in _STATUS_ALIASES
         }
     except Exception:
-        click.echo("\nTASKS: (server unreachable)")
+        click.echo("\nTASKS: (server unreachable — showing DB state, may be stale)")
+        if db_file and os.path.exists(db_file):
+            try:
+                from agent_crew.queue import TaskQueue as _TQ
+                _tq_all = _TQ(db_file)
+                _all_tasks = _tq_all.list_all_with_status()
+                task_groups = {}
+                for _t in _all_tasks:
+                    _st = _t.get("status", "unknown")
+                    _disp = _DB_STATUS_TO_DISPLAY.get(_st, _st)
+                    task_groups.setdefault(_disp, []).append(_t)
+            except Exception:
+                task_groups = None
 
     if task_groups:
         total = sum(len(tasks) for tasks in task_groups.values())
         click.echo(f"\nTasks: {total}")
-        for display_status, _ in _STATUS_ALIASES:
-            tasks = task_groups[display_status]
+        for display_status, tasks in task_groups.items():
+            if not tasks:
+                continue
             click.echo(f"\n{display_status.upper()} ({len(tasks)}):")
             for t in tasks:
                 def _get(key, default=None):
@@ -907,6 +936,20 @@ def run_cmd(task: str, db: str, project: str, base: str,
             raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
         db = state["db"]
 
+    # Pane liveness check — if any required pane is dead, refuse to run.
+    # A dead pane means tasks will be pushed but silently lost; the user must
+    # run 'crew recover' first to restore the panes.
+    if project:
+        _st = _read_state(base, project)
+        if _st:
+            _pane_ids = _st.get("pane_ids") or []
+            _dead = [p for p in _pane_ids if not _pane_alive(p)]
+            if _dead:
+                raise click.ClickException(
+                    f"Dead panes detected — run crew recover first "
+                    f"(dead: {', '.join(_dead)})"
+                )
+
     from agent_crew.loop import (
         DEFAULT_MAX_ITER,
         build_feedback,
@@ -1073,6 +1116,14 @@ def run_cmd(task: str, db: str, project: str, base: str,
         _pstate = _read_state(base, project)
         if _pstate:
             _run_port = _pstate.get("port", 0)
+
+    # Fast server liveness check — avoid the 70+ second task-wait timeout when
+    # the server is simply not running (crashed or not yet started).
+    if _run_port and not _port_listening(_run_port, timeout=5.0):
+        raise click.ClickException(
+            f"Server at port {_run_port} unreachable — "
+            f"check crew status or run crew recover"
+        )
 
     # Create GitHub issue if requested
     issue_number = None

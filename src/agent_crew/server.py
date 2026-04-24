@@ -26,6 +26,19 @@ class ResolveBody(BaseModel):
     status: Literal["approved", "rejected"]
 
 
+def _pane_alive_for_push(pane_id: str) -> bool:
+    """Return True if the tmux pane exists and can receive a push.
+
+    Uses ``tmux list-panes -t <pane_id>`` which exits non-zero if the pane is
+    gone (session killed, window closed, pane closed after crash).
+    """
+    r = subprocess.run(
+        ["tmux", "list-panes", "-t", pane_id],
+        capture_output=True,
+    )
+    return r.returncode == 0
+
+
 def _pane_has_task(pane_id: str) -> bool:
     """Return True if the pane's visible text still contains the task marker.
 
@@ -159,6 +172,15 @@ def create_app(
                 logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
                 return
 
+        # Verify pane is alive before pushing — dead pane causes silent task loss.
+        if not _pane_alive_for_push(pane_id):
+            logger.error(
+                f"_try_push_next: pane {pane_id} is dead — rolling task "
+                f"{task.task_id} back to queued"
+            )
+            q().requeue(task.task_id)
+            return
+
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
         push_fn(pane_id, _format_task_message(task, port))
 
@@ -182,6 +204,15 @@ def create_app(
         if task is None:
             logger.debug(f"_try_push_discuss: no pending discuss task for agent {agent}")
             return
+        # Verify pane is alive before pushing — dead pane causes silent task loss.
+        if not _pane_alive_for_push(pane_id):
+            logger.error(
+                f"_try_push_discuss: pane {pane_id} is dead — rolling discuss task "
+                f"{task.task_id} back to queued"
+            )
+            q().requeue(task.task_id)
+            return
+
         logger.info(f"_try_push_discuss: dequeued task_id={task.task_id} for agent={agent}, calling push_fn")
         push_fn(pane_id, _format_task_message(task, port))
 
@@ -292,6 +323,10 @@ def create_app(
         except Exception as e:
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
 
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):

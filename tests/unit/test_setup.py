@@ -1,6 +1,8 @@
 from unittest.mock import MagicMock, patch
 
 from agent_crew.setup import (
+    _collect_active_ports,
+    _is_port_listening,
     create_worktrees,
     find_free_port,
     pretrust_claude_worktree,
@@ -61,14 +63,15 @@ def test_u_se04_write_sessions_json(tmp_path):
         assert "cmd" in agent
 
 
-# U-SE05: find_free_port — 8100 bind fails, returns 8101
+# U-SE05: find_free_port — 8100 bind fails (OS rejects it), returns 8101
 def test_u_se05_find_free_port():
     mock_sock = MagicMock()
     mock_sock.__enter__ = lambda s: s
     mock_sock.__exit__ = MagicMock(return_value=False)
     mock_sock.bind.side_effect = lambda addr: (_ for _ in ()).throw(OSError()) if addr[1] == 8100 else None
 
-    with patch("agent_crew.setup.socket.socket", return_value=mock_sock):
+    with patch("agent_crew.setup._collect_active_ports", return_value=set()), \
+         patch("agent_crew.setup.socket.socket", return_value=mock_sock):
         port = find_free_port(start=8100)
     assert port == 8101
 
@@ -194,3 +197,89 @@ def test_u_se14_pretrust_noop_when_no_claude_worktree(tmp_path):
         pretrust_claude_worktree({"codex": str(tmp_path / "wt_codex")})
     # File untouched.
     assert _json.loads(config.read_text()) == original
+
+
+# U-SE15: find_free_port skips ports from active project port files
+def test_u_se15_find_free_port_skips_active_port_files():
+    """Port 8100 is referenced by an active server — must be skipped without bind attempt."""
+    mock_sock = MagicMock()
+    mock_sock.__enter__ = lambda s: s
+    mock_sock.__exit__ = MagicMock(return_value=False)
+    mock_sock.bind.side_effect = None  # 8101 binds fine
+
+    with patch("agent_crew.setup._collect_active_ports", return_value={8100}), \
+         patch("agent_crew.setup.socket.socket", return_value=mock_sock):
+        port = find_free_port(start=8100)
+
+    assert port == 8101
+    called_ports = [call[0][0][1] for call in mock_sock.bind.call_args_list]
+    assert 8100 not in called_ports
+
+
+# U-SE16: find_free_port reuses port from dead project (stale port file, no server)
+def test_u_se16_find_free_port_reuses_dead_project_port():
+    """Port 8100 in a stale port file but server is dead — must be eligible."""
+    mock_sock = MagicMock()
+    mock_sock.__enter__ = lambda s: s
+    mock_sock.__exit__ = MagicMock(return_value=False)
+    mock_sock.bind.side_effect = None  # 8100 binds fine
+
+    with patch("agent_crew.setup._collect_active_ports", return_value=set()), \
+         patch("agent_crew.setup.socket.socket", return_value=mock_sock):
+        port = find_free_port(start=8100)
+
+    assert port == 8100
+
+
+# U-SE17: _collect_active_ports scans all ~/.agent_crew/*/port files
+def test_u_se17_collect_active_ports_scans_all_port_files(tmp_path):
+    """Only ports whose servers are listening are returned."""
+    (tmp_path / "proj_a").mkdir()
+    (tmp_path / "proj_a" / "port").write_text("8100")
+    (tmp_path / "proj_b").mkdir()
+    (tmp_path / "proj_b" / "port").write_text("8101")
+    (tmp_path / "proj_c").mkdir()  # no port file
+
+    with patch("agent_crew.setup._is_port_listening", side_effect=lambda p: p == 8100):
+        active = _collect_active_ports(base=str(tmp_path))
+
+    assert active == {8100}
+    assert 8101 not in active
+
+
+# U-SE18: _collect_active_ports silently skips corrupt port files
+def test_u_se18_collect_active_ports_handles_corrupt_port_files(tmp_path):
+    """A port file with non-integer content is silently skipped."""
+    (tmp_path / "bad_proj").mkdir()
+    (tmp_path / "bad_proj" / "port").write_text("not-a-number")
+    (tmp_path / "good_proj").mkdir()
+    (tmp_path / "good_proj" / "port").write_text("8200")
+
+    with patch("agent_crew.setup._is_port_listening", return_value=True):
+        active = _collect_active_ports(base=str(tmp_path))
+
+    assert 8200 in active  # no exception for bad_proj
+
+
+# U-SE19: _is_port_listening returns True when a server is bound
+def test_u_se19_is_port_listening_returns_true():
+    import socket as real_socket
+    server = real_socket.socket(real_socket.AF_INET, real_socket.SOCK_STREAM)
+    server.setsockopt(real_socket.SOL_SOCKET, real_socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    port = server.getsockname()[1]
+    try:
+        assert _is_port_listening(port) is True
+    finally:
+        server.close()
+
+
+# U-SE20: _is_port_listening returns False for an unbound port
+def test_u_se20_is_port_listening_returns_false():
+    import socket as real_socket
+    s = real_socket.socket(real_socket.AF_INET, real_socket.SOCK_STREAM)
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    assert _is_port_listening(port) is False
