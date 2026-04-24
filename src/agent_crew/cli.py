@@ -77,6 +77,36 @@ _PANE_IDLE_PATTERNS = [
 ]
 
 
+def _auto_detect_project(base: str) -> str | None:
+    """Try to auto-detect active project from crew state directory.
+
+    Returns project name if found, else None.
+    Strategy: check ~/.agent_crew for state.json files and return most recently
+    modified project's name.
+    """
+    try:
+        proj_dir = os.path.expanduser(base)
+        if not os.path.isdir(proj_dir):
+            return None
+
+        # Find all projects with state.json
+        projects_with_state = []
+        for entry in os.listdir(proj_dir):
+            state_path = os.path.join(proj_dir, entry, "state.json")
+            if os.path.isfile(state_path):
+                mtime = os.path.getmtime(state_path)
+                projects_with_state.append((entry, mtime))
+
+        if not projects_with_state:
+            return None
+
+        # Return the most recently modified project
+        projects_with_state.sort(key=lambda x: x[1], reverse=True)
+        return projects_with_state[0][0]
+    except Exception:
+        return None
+
+
 def _capture_pane(target: str) -> str | None:
     """Capture last 5 lines of a tmux pane. target is a pane_id (e.g. '%42')
     or a session:window.pane spec. Returns None if tmux fails."""
@@ -727,10 +757,19 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     if not db:
         if not project:
-            raise click.ClickException("--db or --project is required")
+            # Try to auto-detect project
+            detected = _auto_detect_project(base)
+            if not detected:
+                raise click.ClickException(
+                    "Error: --db or --project is required.\n"
+                    f"Usage: crew run \"task\" --project <name>\n"
+                    f"Or:    crew run \"task\" --db <path>/tasks.db\n"
+                    f"List projects: ls {os.path.expanduser(base)}/"
+                )
+            project = detected
         state = _read_state(base, project)
         if state is None:
-            raise click.ClickException(f"project {project!r} not found")
+            raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
         db = state["db"]
 
     from agent_crew.loop import (
@@ -1015,10 +1054,19 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     project_state = None
     if not db:
         if not project:
-            raise click.ClickException("--db or --project is required")
+            # Try to auto-detect project
+            detected = _auto_detect_project(base)
+            if not detected:
+                raise click.ClickException(
+                    "Error: --db or --project is required.\n"
+                    f"Usage: crew discuss \"topic\" --project <name>\n"
+                    f"Or:    crew discuss \"topic\" --db <path>/tasks.db\n"
+                    f"List projects: ls {os.path.expanduser(base)}/"
+                )
+            project = detected
         project_state = _read_state(base, project)
         if project_state is None:
-            raise click.ClickException(f"project {project!r} not found")
+            raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
         db = project_state["db"]
 
     from agent_crew.discussion import (
