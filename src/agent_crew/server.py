@@ -1,6 +1,8 @@
 import json
+import logging
 import os
 import subprocess
+import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -11,6 +13,13 @@ from pydantic import BaseModel
 
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="[%(asctime)s] %(levelname)s: %(message)s",
+    stream=sys.stderr,
+)
 
 
 class ResolveBody(BaseModel):
@@ -38,24 +47,39 @@ def _default_push(pane_id: str, text: str) -> None:
     shows the task marker (Enter was dropped or arrived too early), we wait and
     retry once.
     """
-    subprocess.run(
+    logger.debug(f"_default_push called: pane_id={pane_id}")
+    task_id = text.split("\n")[1].split(": ")[1] if "task_id:" in text else "unknown"
+    logger.info(f"PUSH START: task_id={task_id}, pane_id={pane_id}")
+
+    r1 = subprocess.run(
         ["tmux", "load-buffer", "-"],
         input=text,
         text=True,
         capture_output=True,
     )
-    subprocess.run(
+    logger.debug(f"load-buffer result: rc={r1.returncode}, stderr={r1.stderr[:100] if r1.stderr else 'ok'}")
+
+    r2 = subprocess.run(
         ["tmux", "paste-buffer", "-p", "-d", "-t", pane_id],
         capture_output=True,
     )
+    logger.debug(f"paste-buffer result: rc={r2.returncode}, stderr={r2.stderr[:100] if r2.stderr else 'ok'}")
+
     # Give the TUI time to process the bracketed-paste sequence.
     time.sleep(0.5)
-    subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
+
+    r3 = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
+    logger.debug(f"send-keys Enter result: rc={r3.returncode}, stderr={r3.stderr[:100] if r3.stderr else 'ok'}")
+
     # Verify delivery: if task marker still visible the Enter was dropped — retry once.
     time.sleep(0.3)
     if _pane_has_task(pane_id):
+        logger.warning(f"PUSH: task marker still visible, retrying Enter for {task_id}")
         time.sleep(0.2)
-        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
+        r4 = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
+        logger.debug(f"send-keys Enter retry result: rc={r4.returncode}")
+    else:
+        logger.info(f"PUSH SUCCESS: task_id={task_id} pushed to {pane_id}")
 
 
 def _format_task_message(task: TaskRequest, port: int) -> str:
@@ -102,19 +126,26 @@ def create_app(
 
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
+        logger.debug(f"_try_push_next: role={role}")
         if not pane_map:
+            logger.debug(f"_try_push_next: no pane_map")
             return
         pane_id = pane_map.get(role)
         if not pane_id:
+            logger.debug(f"_try_push_next: role {role} not in pane_map")
             return
         task_type = _ROLE_TO_TYPE.get(role)
         if task_type is None:
+            logger.warning(f"_try_push_next: role {role} not in _ROLE_TO_TYPE")
             return
         if q().has_in_progress(task_type):
+            logger.debug(f"_try_push_next: task_type {task_type} already in progress")
             return  # agent busy; will get pushed when current task completes
         task = q().dequeue(role=role)
         if task is None:
+            logger.debug(f"_try_push_next: no pending task for role {role}")
             return  # nothing pending
+        logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
         push_fn(pane_id, _format_task_message(task, port))
 
     def _try_push_discuss(agent: Optional[str]) -> None:
@@ -122,16 +153,22 @@ def create_app(
         to hold agent-name keys (e.g. 'claude', 'codex', 'gemini') alongside
         the role keys. Busy-check and dequeue are both scoped to the agent so
         concurrent panelists don't block each other."""
+        logger.debug(f"_try_push_discuss: agent={agent}")
         if not pane_map or not agent:
+            logger.debug(f"_try_push_discuss: no pane_map or agent")
             return
         pane_id = pane_map.get(agent)
         if not pane_id:
+            logger.debug(f"_try_push_discuss: agent {agent} not in pane_map")
             return
         if q().has_discuss_in_progress_for_agent(agent):
+            logger.debug(f"_try_push_discuss: discuss task in progress for agent {agent}")
             return
         task = q().dequeue_discuss_for_agent(agent)
         if task is None:
+            logger.debug(f"_try_push_discuss: no pending discuss task for agent {agent}")
             return
+        logger.info(f"_try_push_discuss: dequeued task_id={task.task_id} for agent={agent}, calling push_fn")
         push_fn(pane_id, _format_task_message(task, port))
 
     def _auto_enqueue_review(impl_task_id: str) -> None:
@@ -172,14 +209,21 @@ def create_app(
 
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
+        logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         task_id = q().enqueue(task)
+        logger.info(f"POST /tasks: enqueued task_id={task_id}")
         if task.task_type == "discuss":
             agent = task.context.get("agent") if isinstance(task.context, dict) else None
+            logger.info(f"POST /tasks: discuss task, calling _try_push_discuss with agent={agent}")
             _try_push_discuss(agent)
         else:
             role = _TYPE_TO_ROLE.get(task.task_type)
+            logger.info(f"POST /tasks: task_type={task.task_type} -> role={role}")
             if role:
+                logger.info(f"POST /tasks: calling _try_push_next for role={role}")
                 _try_push_next(role)
+            else:
+                logger.warning(f"POST /tasks: no role found for task_type={task.task_type}")
         return {"task_id": task_id}
 
     @app.get("/tasks/next")
@@ -203,23 +247,30 @@ def create_app(
 
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
+        logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
         ctx = q().get_task_context(task_id)
         try:
             task_type = q().submit_result(task_id, result)
+            logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
         except ValueError as e:
             msg = str(e)
+            logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
             status_code = 404 if "not found" in msg.lower() else 400
             raise HTTPException(status_code=status_code, detail=msg)
         if task_type == "discuss":
-            _try_push_discuss(ctx.get("agent") if isinstance(ctx, dict) else None)
+            agent = ctx.get("agent") if isinstance(ctx, dict) else None
+            logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
+            _try_push_discuss(agent)
         else:
             # Auto-transition: impl task completed → auto-enqueue review task
             if task_type == "implement" and result.status == "completed":
+                logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
                 _auto_enqueue_review(task_id)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
+            logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")
             if role:
                 _try_push_next(role)
         return {"status": "ok"}
