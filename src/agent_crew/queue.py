@@ -43,12 +43,15 @@ CREATE TABLE IF NOT EXISTS tasks (
     context     TEXT NOT NULL DEFAULT '{}',
     status      TEXT NOT NULL DEFAULT 'pending',
     created_at  REAL NOT NULL,
+    project     TEXT NOT NULL DEFAULT '',
     summary     TEXT,
     verdict     TEXT,
     findings    TEXT,
     pr_number   INTEGER
 )
 """
+
+_DDL_MIGRATE_PROJECT = "ALTER TABLE tasks ADD COLUMN project TEXT NOT NULL DEFAULT ''"
 
 _DDL_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -80,6 +83,11 @@ class TaskQueue:
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
         conn.execute(_DDL_CHECKPOINTS)
+        # Migrate existing DBs: add project column if absent
+        try:
+            conn.execute(_DDL_MIGRATE_PROJECT)
+        except Exception:
+            pass  # column already exists
         # Create indexes for performance
         for idx_stmt in _DDL_INDEXES.strip().split('\n'):
             if idx_stmt.strip():
@@ -97,8 +105,8 @@ class TaskQueue:
         try:
             conn.execute(
                 """
-                INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
+                INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
                 """,
                 (
                     task.task_id,
@@ -108,6 +116,7 @@ class TaskQueue:
                     task.priority,
                     json.dumps(task.context),
                     time.time(),
+                    task.project,
                 ),
             )
             conn.commit()
@@ -160,6 +169,7 @@ class TaskQueue:
                 branch=row["branch"],
                 priority=row["priority"],
                 context=json.loads(row["context"]),
+                project=row["project"] if row["project"] else "",
             )
         except Exception:
             try:
@@ -248,6 +258,7 @@ class TaskQueue:
                     branch=r["branch"],
                     priority=r["priority"],
                     context=json.loads(r["context"]),
+                    project=r["project"] if r["project"] else "",
                 )
                 for r in rows
             ]
@@ -325,6 +336,7 @@ class TaskQueue:
                 branch=chosen["branch"],
                 priority=chosen["priority"],
                 context=json.loads(chosen["context"]),
+                project=chosen["project"] if chosen["project"] else "",
             )
         except Exception:
             try:
@@ -353,11 +365,11 @@ class TaskQueue:
             conn.close()
 
     def list_all_with_status(self) -> List[dict]:
-        """Return all tasks as raw dicts including the status field."""
+        """Return all tasks as raw dicts including the status and project fields."""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, task_type, description, branch, priority, context, status "
+                "SELECT task_id, task_type, description, branch, priority, context, status, project "
                 "FROM tasks ORDER BY priority ASC, created_at ASC"
             ).fetchall()
             return [
@@ -369,6 +381,7 @@ class TaskQueue:
                     "priority": r["priority"],
                     "context": json.loads(r["context"]) if r["context"] else {},
                     "status": r["status"],
+                    "project": r["project"] if r["project"] else "",
                 }
                 for r in rows
             ]
@@ -395,6 +408,7 @@ class TaskQueue:
                     branch=r["branch"],
                     priority=r["priority"],
                     context=json.loads(r["context"]),
+                    project=r["project"] if r["project"] else "",
                 )
                 for r in rows
             ]

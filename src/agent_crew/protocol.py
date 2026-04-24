@@ -18,6 +18,7 @@ class TaskRequest:
     branch: str = ""
     priority: int = 3
     context: dict = field(default_factory=dict)
+    project: str = ""  # owner/name form, e.g. "org/myrepo". Used to detect cross-project routing.
 
     def __post_init__(self):
         if self.task_type not in _VALID_TASK_TYPES:

@@ -228,10 +228,10 @@ def create_app(
                 return
             impl_task = impl_tasks[0]
 
-            # Cross-project guard: if the impl task carries a project tag and the
-            # server was started for a different project, skip auto-review to
+            # Cross-project guard: if the impl task carries a top-level project tag
+            # and the server was started for a different project, skip auto-review to
             # prevent misrouting tasks across project queues.
-            impl_project = impl_task.context.get("project") if isinstance(impl_task.context, dict) else None
+            impl_project = impl_task.project  # top-level field, typed
             if impl_project and project and impl_project != project:
                 logger.warning(
                     f"_auto_enqueue_review: skipping cross-project review — "
@@ -240,7 +240,8 @@ def create_app(
                 return
 
             # Create review task with same description/branch, reference to impl task.
-            # Inherit project from impl task so downstream guards can detect misrouting.
+            # Inherit top-level project from impl task so the cross-project guard works
+            # for subsequent hops in the pipeline (review → test).
             review_context = {
                 "checklist_layers": ["test_quality", "code_quality", "business_gap"],
                 "reviewer_rejects_happy_path_only": True,
@@ -252,14 +253,13 @@ def create_app(
                 ),
                 "prev_task_id": impl_task_id,
             }
-            if impl_project:
-                review_context["project"] = impl_project
             review_req = TaskRequest(
                 task_id=f"review-{uuid.uuid4().hex[:8]}",
                 task_type="review",
                 description=impl_task.description,
                 branch=impl_task.branch,
                 context=review_context,
+                project=impl_project,  # top-level field propagated
             )
             q().enqueue(review_req)
             # Try to push the newly enqueued review task to reviewer pane

@@ -12,7 +12,7 @@ from fastapi.testclient import TestClient
 from agent_crew.server import create_app
 
 
-def _task_payload(task_id="t1", task_type="implement", description="do work", priority=3):
+def _task_payload(task_id="t1", task_type="implement", description="do work", priority=3, project=""):
     return {
         "task_id": task_id,
         "task_type": task_type,
@@ -20,6 +20,7 @@ def _task_payload(task_id="t1", task_type="implement", description="do work", pr
         "branch": "main",
         "priority": priority,
         "context": {},
+        "project": project,
     }
 
 
@@ -502,20 +503,20 @@ def test_u_sp20_auto_enqueue_review_inherits_project(tmp_db):
         project="project_a",
     )
     with TestClient(app) as client:
-        # Enqueue impl task with project in context
-        impl = dict(_task_payload("impl-sp20"), context={"project": "project_a"})
+        # Enqueue impl task with top-level project field
+        impl = _task_payload("impl-sp20", project="project_a")
         client.post("/tasks", json=impl)
 
         # Submit completed result → triggers _auto_enqueue_review
         r = client.post("/tasks/impl-sp20/result", json=_result_payload("impl-sp20"))
         assert r.status_code == 200
 
-    # The auto-created review task must carry project=project_a in context
+    # The auto-created review task must carry project="project_a" as a top-level field
     from agent_crew.queue import TaskQueue
     q = TaskQueue(tmp_db)
     review_tasks = [t for t in q.list_tasks() if t.task_type == "review"]
     assert len(review_tasks) == 1
-    assert review_tasks[0].context.get("project") == "project_a"
+    assert review_tasks[0].project == "project_a"
 
 
 # U-SP21: _auto_enqueue_review rejects cross-project impl tasks
@@ -531,8 +532,8 @@ def test_u_sp21_auto_enqueue_review_rejects_cross_project(tmp_db):
         project="project_a",   # server is for project_a
     )
     with TestClient(app) as client:
-        # Enqueue impl task belonging to a DIFFERENT project
-        impl = dict(_task_payload("impl-sp21"), context={"project": "project_b"})
+        # Enqueue impl task with top-level project=project_b (different from server's project_a)
+        impl = _task_payload("impl-sp21", project="project_b")
         client.post("/tasks", json=impl)
 
         # Submit result — should NOT auto-enqueue a review task
