@@ -30,8 +30,8 @@ def test_u_se02_create_worktrees():
     with patch("agent_crew.setup.subprocess.run", return_value=mock_result):
         result = create_worktrees("myproject", "/base", ["claude", "codex"], project_path="/mock/project")
     assert set(result.keys()) == {"claude", "codex"}
-    assert result["claude"] == "/base/myproject/claude"
-    assert result["codex"] == "/base/myproject/codex"
+    assert result["claude"] == "/base/worktrees/myproject/claude"
+    assert result["codex"] == "/base/worktrees/myproject/codex"
 
 
 # U-SE03: write_instruction_files — instructions.write() 호출됨 (mock)
@@ -84,7 +84,7 @@ def test_u_se07_create_worktrees_custom_agents():
         result = create_worktrees("proj", "/base", agents, project_path="/mock/project")
     assert set(result.keys()) == {"alpha", "beta", "gamma"}
     for agent in agents:
-        assert result[agent] == f"/base/proj/{agent}"
+        assert result[agent] == f"/base/worktrees/proj/{agent}"
 
 
 # U-SE08: start_agents_in_panes only launches the CLI — no kickoff prompt.

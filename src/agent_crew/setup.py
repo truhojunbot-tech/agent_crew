@@ -151,9 +151,12 @@ def create_worktrees(project: str, base: str, agents: list[str], project_path: s
 
     Args:
         project: project name (e.g., 'agent_crew')
-        base: base directory for worktrees (e.g., ~/.agent_crew)
+        base: base directory for state (e.g., ~/.agent_crew)
         agents: list of agent names
         project_path: explicit path to project git repo. If None, auto-detect.
+
+    Worktrees are stored at: base/worktrees/project/agent/
+    State (state.json, tasks.db) at: base/project/
     """
     if project_path is None:
         project_path = resolve_project_path(project)
@@ -163,25 +166,11 @@ def create_worktrees(project: str, base: str, agents: list[str], project_path: s
 
     worktrees = {}
     for agent in agents:
-        wt_path = os.path.join(base, project, agent)
+        wt_path = os.path.join(base, "worktrees", project, agent)
         branch = f"agent/{project}/{agent}"
         # Run git worktree add FROM the project repo, not from cwd
         result = subprocess.run(
             ["git", "-C", project_path, "worktree", "add", "-B", branch, wt_path],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0 and not os.path.isdir(wt_path):
-            raise RuntimeError(
-                f"Failed to create worktree for {agent}: {result.stderr.strip()}"
-            )
-        worktrees[agent] = wt_path
-    return worktrees
-    worktrees = {}
-    for agent in agents:
-        wt_path = os.path.join(base, project, agent)
-        branch = f"agent/{project}/{agent}"
-        result = subprocess.run(
-            ["git", "worktree", "add", "-B", branch, wt_path],
             capture_output=True, text=True,
         )
         if result.returncode != 0 and not os.path.isdir(wt_path):

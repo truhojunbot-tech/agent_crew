@@ -14,12 +14,13 @@
 ## 주요 경로
 
 - 소스: `~/alfred/projects/agent_crew/src/agent_crew/`
-- Worktrees: `~/.agent_crew/<project>/{claude,codex,gemini}/` (각 provider별 git worktree)
-  - 사용자 정의 가능: `crew setup <project> --base /custom/path`
-- 상태: `~/.agent_crew/<project>/state.json` (port, pane_map, worktrees 등)
-- 작업DB: `~/.agent_crew/<project>/tasks.db` (SQLite)
-- CLI: `~/.local/bin/crew`
-- 서버: FastAPI uvicorn, 포트는 state.json의 `port` 필드 (default 8100)
+- **Worktrees**: `~/.agent_crew/worktrees/<project>/{claude,codex,gemini}/` (각 provider별 git worktree)
+- **상태**: `~/.agent_crew/<project>/state.json` (port, pane_map, worktrees dict 등)
+- **작업DB**: `~/.agent_crew/<project>/tasks.db` (SQLite)
+- **CLI**: `~/.local/bin/crew`
+- **서버**: FastAPI uvicorn, 포트는 state.json의 `port` 필드 (default 8100)
+
+경로 커스터마이징: `crew setup <project> --base /custom/path`
 
 ## 핵심 파일
 
