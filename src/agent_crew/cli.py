@@ -224,6 +224,7 @@ _STATUS_ALIASES = (
     ("failed", "failed"),
     ("needs_human", "needs_human"),
     ("cancelled", "cancelled"),
+    ("orphaned", "orphaned"),
 )
 # Reverse map: DB status → display label (used in DB fallback)
 _DB_STATUS_TO_DISPLAY = {api: disp for disp, api in _STATUS_ALIASES}
@@ -1523,6 +1524,17 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
 
     from agent_crew import triage as triage_module
     from agent_crew.queue import TaskQueue
+
+    # Validate --repo matches the project's git origin to prevent cross-project enqueue.
+    if project:
+        try:
+            project_path = setup_module.resolve_project_path(project)
+        except RuntimeError:
+            project_path = ""
+        if project_path:
+            ok, err_msg = triage_module.validate_repo_origin(repo, project_path)
+            if not ok:
+                raise click.ClickException(err_msg)
 
     queue = TaskQueue(db)
 
