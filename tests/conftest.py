@@ -1,11 +1,26 @@
 import shutil
 import subprocess
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+
+
+@pytest.fixture(autouse=True)
+def _mock_pane_alive_for_push(request):
+    """Default all pane liveness checks to True in unit tests.
+
+    Tests that need to simulate dead panes use monkeypatch to override
+    agent_crew.server._pane_alive_for_push themselves.
+    """
+    if "no_pane_alive_mock" in request.keywords:
+        yield
+        return
+    with patch("agent_crew.server._pane_alive_for_push", return_value=True):
+        yield
 
 
 @pytest.fixture

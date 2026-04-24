@@ -572,3 +572,66 @@ def test_u_c39_auto_detect_base_is_file(tmp_path):
 
     result = _auto_detect_project(str(file_path))
     assert result is None
+
+
+# U-C40: crew run exits early with 'Dead panes detected' when a required pane is dead
+def test_u_c40_run_exits_on_dead_pane(tmp_path):
+    """crew run must check pane liveness at startup. If any required pane is
+    dead, it must exit immediately with an error that tells the user to recover."""
+    import json
+    db_file = str(tmp_path / "tasks.db")
+    state = {
+        "project": "test_proj",
+        "port": 0,
+        "db": db_file,
+        "session": "crew_test_proj",
+        "agents": ["claude", "codex"],
+        "pane_ids": ["%10", "%20"],
+    }
+    (tmp_path / "test_proj").mkdir()
+    (tmp_path / "test_proj" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._pane_alive", return_value=False):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "test_proj",
+            "--base", str(tmp_path),
+        ])
+
+    assert result.exit_code != 0
+    assert "dead" in result.output.lower() or "recover" in result.output.lower()
+
+
+# U-C41: crew run proceeds past pane check when all panes are alive
+def test_u_c41_run_proceeds_when_all_panes_alive(tmp_path):
+    """crew run must not emit a 'dead panes' error when all panes are alive."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    TaskQueue(db_file)  # initialize DB schema
+    state = {
+        "project": "test_proj2",
+        "port": 0,
+        "db": db_file,
+        "session": "crew_test_proj2",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "test_proj2").mkdir()
+    (tmp_path / "test_proj2" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    # Pane alive — pane check passes. Use timeout=1 so the wait loop exits fast.
+    with patch("agent_crew.cli._pane_alive", return_value=True):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "test_proj2",
+            "--base", str(tmp_path),
+            "--timeout", "1",
+        ])
+
+    # Error must NOT be about dead panes — if it is, the pane check logic is wrong.
+    output_lower = result.output.lower()
+    assert "dead panes" not in output_lower

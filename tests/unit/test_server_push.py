@@ -415,3 +415,75 @@ def test_u_sp17_auto_review_task_queryable(tmp_db):
         review = review_tasks[0]
         assert "impl-004" in str(review.get("context", {}))
         assert "Fix bug Y" in review["description"]
+
+
+# U-SP18: dead pane before push → task rolled back to queued, push_fn not called
+def test_u_sp18_dead_pane_rolls_back_task_to_queued(tmp_db, monkeypatch):
+    """If the target pane is dead, the dequeued task must be put back to 'queued'
+    and push_fn must NOT be called."""
+    from unittest.mock import MagicMock
+    from agent_crew.server import _pane_alive_for_push
+
+    # Patch pane liveness check to always return False (dead pane)
+    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane_id: False)
+
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"implementer": "%dead"},
+        port=8100,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("t-dead", "implement"))
+
+    # push_fn must NOT have been called
+    assert push.calls == []
+
+    # Task must be back in queued state (not in_progress or lost)
+    from agent_crew.queue import TaskQueue
+    q = TaskQueue(tmp_db)
+    tasks = q.list_tasks(status="pending")
+    task_ids = [t.task_id for t in tasks]
+    assert "t-dead" in task_ids
+
+
+# U-SP19: dead pane on result submission → next task rolled back, push_fn not called
+def test_u_sp19_dead_pane_on_result_next_task_requeued(tmp_db, monkeypatch):
+    """When a result triggers the next push but the pane is now dead, the next
+    task must be rolled back to queued and push_fn not called again."""
+    from agent_crew.server import _pane_alive_for_push
+
+    call_count = {"n": 0}
+
+    def pane_alive_side_effect(pane_id):
+        # First call (for t1 initial push) → alive; subsequent calls → dead
+        call_count["n"] += 1
+        return call_count["n"] == 1
+
+    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", pane_alive_side_effect)
+
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"implementer": "%100"},
+        port=8100,
+        push_fn=push,
+    )
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("t1", "implement"))
+        client.post("/tasks", json=_task_payload("t2", "implement"))
+        assert len(push.calls) == 1  # only t1 pushed (pane alive)
+
+        # Submit t1 result; pane now dead when trying to push t2
+        resp = client.post("/tasks/t1/result", json=_result_payload("t1"))
+        assert resp.status_code == 200
+
+    # t2 must NOT have been pushed
+    assert len(push.calls) == 1
+
+    # t2 must be back in queued/pending state
+    from agent_crew.queue import TaskQueue
+    q = TaskQueue(tmp_db)
+    tasks = q.list_tasks(status="pending")
+    assert any(t.task_id == "t2" for t in tasks)

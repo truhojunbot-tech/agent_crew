@@ -907,6 +907,20 @@ def run_cmd(task: str, db: str, project: str, base: str,
             raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
         db = state["db"]
 
+    # Pane liveness check — if any required pane is dead, refuse to run.
+    # A dead pane means tasks will be pushed but silently lost; the user must
+    # run 'crew recover' first to restore the panes.
+    if project:
+        _st = _read_state(base, project)
+        if _st:
+            _pane_ids = _st.get("pane_ids") or []
+            _dead = [p for p in _pane_ids if not _pane_alive(p)]
+            if _dead:
+                raise click.ClickException(
+                    f"Dead panes detected — run crew recover first "
+                    f"(dead: {', '.join(_dead)})"
+                )
+
     from agent_crew.loop import (
         DEFAULT_MAX_ITER,
         build_feedback,

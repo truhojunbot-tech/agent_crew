@@ -201,6 +201,18 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def requeue(self, task_id: str) -> None:
+        """Roll an in_progress task back to pending so it can be dequeued again."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET status = 'pending' WHERE task_id = ? AND status = 'in_progress'",
+                (task_id,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def cancel(self, task_id: str) -> None:
         conn = self._connect()
         try:
