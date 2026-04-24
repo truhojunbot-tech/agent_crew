@@ -221,6 +221,7 @@ def _load_pane_map() -> Optional[dict]:
     path = os.getenv("AGENT_CREW_PANE_MAP")
     if not path:
         return None
+    path = os.path.expanduser(path)  # Handle ~ in env var
     try:
         with open(path) as f:
             return json.load(f)
