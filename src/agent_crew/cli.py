@@ -134,6 +134,54 @@ def _pane_alive(pane_id: str) -> bool:
     return r.returncode == 0 and r.stdout.strip() == pane_id
 
 
+def _pane_cwd(pane_id: str) -> str | None:
+    """Get the current working directory of a tmux pane."""
+    r = subprocess.run(
+        ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_current_path}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return r.stdout.strip()
+    return None
+
+
+def _validate_pane_map(session: str, pane_ids: list[str], worktrees: dict[str, str], agent_list: list[str]) -> dict[str, str]:
+    """Validate that pane_ids exist and match expected worktrees.
+
+    Returns a dict of validation results with keys:
+    - 'valid': bool - all panes exist and match
+    - 'mismatches': list[tuple(agent, pane_id, issue)] - panes with issues
+    - 'suggestions': list[str] - remediation suggestions
+    """
+    mismatches = []
+
+    for agent, pane_id, expected_wt in zip(agent_list, pane_ids, [worktrees.get(a, "") for a in agent_list]):
+        if not _pane_alive(pane_id):
+            mismatches.append((agent, pane_id, "pane does not exist"))
+            continue
+
+        # Check working directory matches expected worktree
+        actual_cwd = _pane_cwd(pane_id)
+        if actual_cwd and expected_wt:
+            # Normalize paths for comparison
+            actual_normalized = os.path.normpath(actual_cwd)
+            expected_normalized = os.path.normpath(expected_wt)
+            if not actual_normalized.startswith(expected_normalized):
+                mismatches.append((agent, pane_id, f"cwd mismatch: {actual_cwd} != {expected_wt}"))
+
+    suggestions = []
+    if mismatches:
+        suggestions.append("Option 1: Run `crew recover` to recreate dead panes")
+        suggestions.append("Option 2: Manually fix state.json pane_ids and restart server")
+        suggestions.append("Option 3: Run `crew teardown` and `crew setup` to reinitialize")
+
+    return {
+        "valid": len(mismatches) == 0,
+        "mismatches": mismatches,
+        "suggestions": suggestions,
+    }
+
+
 def _verify_delivery(port: int, task_id: str, timeout: float = 15.0) -> bool:
     """Poll task status until it transitions out of 'pending' (i.e. pane received it).
     Returns True if delivered, False if still pending after timeout."""
@@ -455,6 +503,17 @@ def status(project: str, base: str, preview: int):
         f"{session_name}:0.{i}" for i in range(len(agent_list))
     ]
 
+    # Validate pane_ids match actual tmux state
+    worktrees = state.get("worktrees", {})
+    validation = _validate_pane_map(session_name, pane_targets, worktrees, agent_list)
+    if not validation["valid"]:
+        click.echo("\n⚠️  PANE VALIDATION ERROR:")
+        for agent, pane_id, issue in validation["mismatches"]:
+            click.echo(f"  {agent} ({pane_id}): {issue}")
+        click.echo("\nSuggestions:")
+        for suggestion in validation["suggestions"]:
+            click.echo(f"  {suggestion}")
+
     agent_status = {}
     for agent, target in zip(agent_list, pane_targets):
         result = subprocess.run(
@@ -518,6 +577,16 @@ def recover(project: str, base: str):
     proj_dir = _proj_dir(base, project)
     port_file = os.path.join(proj_dir, "port")
     recovered = []
+
+    # Validate pane_ids match actual tmux state
+    agent_list = state.get("agents", [])
+    pane_ids = state.get("pane_ids", [])
+    if agent_list and pane_ids:
+        validation = _validate_pane_map(session_name, pane_ids, worktrees, agent_list)
+        if not validation["valid"]:
+            click.echo("⚠️  State validation: pane_ids don't match actual tmux state")
+            click.echo("     This may happen if the tmux session was recreated or panes were moved")
+            click.echo("     Recovery will recreate dead panes and update state.json")
 
     # Ensure instruction files exist in all worktrees before agents start
     setup_module.write_instruction_files(worktrees, project, port_file)
