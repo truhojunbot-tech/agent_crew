@@ -330,6 +330,26 @@ def setup(project: str, agents: str, base: str):
     window_target = f"{session_name}:{window_index}"
     _crew_log(proj_dir, f"tmux using caller session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
 
+    # Check window width — main-vertical layout needs minimum width for readable panes
+    # (e.g., 80-wide window + 3 agents can create 1-char wide panes on the right)
+    window_width_result = subprocess.run(
+        ["tmux", "display-message", "-t", window_target, "-p", "#{window_width}"],
+        capture_output=True, text=True,
+    )
+    if window_width_result.returncode == 0:
+        try:
+            window_width = int(window_width_result.stdout.strip())
+            min_width_needed = (len(agent_list) + 1) * 60  # Coordinator (60) + agents (60 each min)
+            if window_width < min_width_needed:
+                click.echo(
+                    f"Warning: window width {window_width} may be too narrow for {len(agent_list)} agents.\n"
+                    f"         Minimum recommended: {min_width_needed} chars ({len(agent_list)+1} panes × 60)\n"
+                    f"         Agent panes may be unreadable (< 20 chars wide).",
+                    err=True,
+                )
+        except (ValueError, AttributeError):
+            pass  # Can't parse width, continue anyway
+
     pane_ids: list[str] = []
     for agent, wt_path in worktrees.items():
         result = subprocess.run(
@@ -350,6 +370,27 @@ def setup(project: str, agents: str, base: str):
         capture_output=True, text=True,
     )
     _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
+
+    # Verify pane widths are acceptable (avoid silent failures with 1-char wide panes)
+    if pane_ids:
+        pane_widths = []
+        for pane_id in pane_ids:
+            width_result = subprocess.run(
+                ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_width}"],
+                capture_output=True, text=True,
+            )
+            if width_result.returncode == 0:
+                try:
+                    width = int(width_result.stdout.strip())
+                    pane_widths.append((pane_id, width))
+                    if width < 20:
+                        click.echo(
+                            f"Warning: pane {pane_id} width is {width} chars (too narrow for CLI).\n"
+                            f"         Expand your tmux window or use fewer agents.",
+                            err=True,
+                        )
+                except (ValueError, AttributeError):
+                    pass
 
     # Write pane_map.json — server reads this at startup for push routing.
     # Two key flavors share one dict:
