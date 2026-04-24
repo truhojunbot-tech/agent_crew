@@ -240,6 +240,45 @@ def create_app(
             # Silently fail auto-enqueue — don't crash the result submission
             pass
 
+    _MAX_RETRIES = 2  # Maximum retry attempts per task
+
+    def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> None:
+        """Auto-retry a failed task if it hasn't exceeded max retries.
+        This provides resilience against transient failures."""
+        MAX_RETRIES = 2
+        if result.retry_count >= MAX_RETRIES:
+            logger.info(f"Task {task_id} failed with status={result.status}, but max retries ({MAX_RETRIES}) reached")
+            return
+        try:
+            # Get the original task to extract description, branch, and context
+            tasks = [t for t in q().list_tasks() if t.task_id == task_id]
+            if not tasks:
+                return
+            original_task = tasks[0]
+
+            # Create retry task with incremented retry count
+            retry_context = dict(original_task.context) if isinstance(original_task.context, dict) else {}
+            retry_context["retry_attempt"] = (result.retry_count or 0) + 1
+            retry_context["original_task_id"] = task_id
+
+            retry_req = TaskRequest(
+                task_id=f"retry-{task_id}-{uuid.uuid4().hex[:4]}",
+                task_type=task_type,  # type: ignore
+                description=original_task.description,
+                branch=original_task.branch,
+                priority=original_task.priority + 1,  # Bump priority for retries
+                context=retry_context,
+            )
+            q().enqueue(retry_req)
+            logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")
+            # Try to push the retry task
+            role = _TYPE_TO_ROLE.get(task_type)
+            if role:
+                _try_push_next(role)
+        except Exception as e:
+            logger.warning(f"Failed to auto-retry task {task_id}: {e}")
+            pass
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
@@ -297,6 +336,10 @@ def create_app(
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
             _try_push_discuss(agent)
         else:
+            # Auto-retry: failed task → auto-enqueue retry task (if under max retries)
+            if result.status == "failed":
+                logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, attempting auto-retry")
+                _auto_retry_failed_task(task_id, result, task_type)
             # Auto-transition: impl task completed → auto-enqueue review task
             if task_type == "implement" and result.status == "completed":
                 logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
