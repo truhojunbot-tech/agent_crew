@@ -207,6 +207,39 @@ def create_app(
             # Silently fail auto-enqueue — don't crash the result submission
             pass
 
+    def _auto_enqueue_test(review_task_id: str) -> None:
+        """Auto-enqueue a test task when a review task is approved.
+        This ensures testing is triggered independently of CLI timeout."""
+        try:
+            # Get the review task to extract description and branch
+            review_tasks = [t for t in q().list_tasks() if t.task_id == review_task_id]
+            if not review_tasks:
+                return
+            review_task = review_tasks[0]
+
+            # Get the review result to confirm it was approved
+            review_result = q().get_result(review_task_id)
+            if not review_result or review_result.verdict != "approve":
+                return
+
+            # Create test task with same description/branch, reference to review task
+            test_context = {
+                "prev_task_id": review_task_id,
+            }
+            test_req = TaskRequest(
+                task_id=f"test-{uuid.uuid4().hex[:8]}",
+                task_type="test",
+                description=review_task.description,
+                branch=review_task.branch,
+                context=test_context,
+            )
+            q().enqueue(test_req)
+            # Try to push the newly enqueued test task to tester pane
+            _try_push_next("tester")
+        except Exception:
+            # Silently fail auto-enqueue — don't crash the result submission
+            pass
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
@@ -268,6 +301,10 @@ def create_app(
             if task_type == "implement" and result.status == "completed":
                 logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
                 _auto_enqueue_review(task_id)
+            # Auto-transition: review task approved → auto-enqueue test task
+            if task_type == "review" and result.verdict == "approve":
+                logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
+                _auto_enqueue_test(task_id)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")
