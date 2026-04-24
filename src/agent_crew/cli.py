@@ -1106,6 +1106,14 @@ def run_cmd(task: str, db: str, project: str, base: str,
         if _pstate:
             _run_port = _pstate.get("port", 0)
 
+    # Fast server liveness check — avoid the 70+ second task-wait timeout when
+    # the server is simply not running (crashed or not yet started).
+    if _run_port and not _port_listening(_run_port, timeout=5.0):
+        raise click.ClickException(
+            f"Server at port {_run_port} unreachable — "
+            f"check crew status or run crew recover"
+        )
+
     # Create GitHub issue if requested
     issue_number = None
     if create_issue:

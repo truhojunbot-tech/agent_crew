@@ -779,3 +779,100 @@ def test_u_c44_status_falls_back_to_db_with_warning(tmp_path):
     assert "unreachable" in output or "fallback" in output or "db" in output or "offline" in output
     # Must still show DB tasks
     assert "db-only task description" in result.output
+
+
+# U-C45: crew run exits immediately with clear error when server is unreachable
+def test_u_c45_run_exits_immediately_when_server_unreachable(tmp_path):
+    """crew run must not hang 70+ seconds when the server is down. It should
+    perform a health check at startup and exit within 5 seconds with a clear
+    error message naming the port and suggesting 'crew recover'."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    TaskQueue(db_file)
+    state = {
+        "project": "proj45",
+        "port": 9996,  # nothing listening here
+        "db": db_file,
+        "session": "crew_proj45",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj45").mkdir()
+    (tmp_path / "proj45" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    # Panes look alive (so pane check passes), but server is down
+    with patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("agent_crew.cli._port_listening", return_value=False):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "proj45",
+            "--base", str(tmp_path),
+        ])
+
+    assert result.exit_code != 0
+    output = result.output.lower()
+    # Must mention port and suggest recovery
+    assert "9996" in result.output
+    assert "unreachable" in output or "not running" in output or "server" in output
+    assert "recover" in output or "status" in output
+
+
+# U-C46: crew run proceeds normally when server is reachable
+def test_u_c46_run_proceeds_when_server_reachable(tmp_path):
+    """crew run must NOT emit a 'server unreachable' error when the server
+    responds to the health check."""
+    import json
+    from agent_crew.queue import TaskQueue
+
+    db_file = str(tmp_path / "tasks.db")
+    TaskQueue(db_file)
+    state = {
+        "project": "proj46",
+        "port": 9995,
+        "db": db_file,
+        "session": "crew_proj46",
+        "agents": ["claude"],
+        "pane_ids": ["%10"],
+    }
+    (tmp_path / "proj46").mkdir()
+    (tmp_path / "proj46" / "state.json").write_text(json.dumps(state))
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli._fetch_tasks_by_status", return_value=[]), \
+         patch("agent_crew.cli.subprocess.run", return_value=MagicMock(returncode=1, stdout="")):
+        result = runner.invoke(crew, [
+            "run", "do something",
+            "--project", "proj46",
+            "--base", str(tmp_path),
+            "--timeout", "1",
+        ])
+
+    output = result.output.lower()
+    assert "server" not in output or "unreachable" not in output
+
+
+# U-C47: /health endpoint returns 200 OK with status field
+def test_u_c47_health_endpoint_returns_ok():
+    """The server must expose GET /health returning {status: ok} so that
+    crew run can perform a fast liveness check without waiting for a full
+    task operation."""
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+    import tempfile, os
+
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    try:
+        app = create_app(db_path)
+        client = TestClient(app)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data.get("status") == "ok"
+    finally:
+        os.unlink(db_path)

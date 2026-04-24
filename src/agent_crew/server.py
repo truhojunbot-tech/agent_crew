@@ -324,6 +324,10 @@ def create_app(
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
 
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
