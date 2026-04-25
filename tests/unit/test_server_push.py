@@ -324,6 +324,81 @@ def test_u_sp13_default_push_uses_bracketed_paste(monkeypatch):
     assert "capture-pane" in capture_args
 
 
+# U-SP13b: _pane_has_task detects collapsed `[Pasted text` placeholder so a
+# stuck large paste isn't mistaken for a successfully submitted task.
+# Background: Claude Code collapses long pastes into `[Pasted text #N +X lines]`,
+# so the raw `=== AGENT_CREW TASK ===` marker isn't visible — the previous
+# detection logic returned False (false positive of success).
+def test_u_sp13b_pane_has_task_detects_collapsed_paste(monkeypatch):
+    from unittest.mock import MagicMock
+    from agent_crew.server import _pane_has_task
+
+    mock_run = MagicMock(return_value=MagicMock(
+        returncode=0,
+        stdout="❯ [Pasted text #2 +42 lines]\n",
+    ))
+    monkeypatch.setattr("agent_crew.server.subprocess.run", mock_run)
+
+    assert _pane_has_task("%42") is True
+
+
+# U-SP13c: _default_push retries Enter with backoff when the marker stays
+# visible — covers the rapid-task-succession race where the first Enter is
+# consumed by Claude's post-completion UI transition (issue #74).
+def test_u_sp13c_default_push_retries_with_backoff(monkeypatch):
+    from unittest.mock import MagicMock
+    from agent_crew.server import _default_push
+
+    # Simulate marker visible for the first 2 capture-pane calls, gone on the
+    # 3rd. Each iteration: send-keys Enter + capture-pane (2 subprocess calls).
+    captures = [
+        MagicMock(returncode=0, stdout="=== AGENT_CREW TASK ==="),  # 1st check
+        MagicMock(returncode=0, stdout="=== AGENT_CREW TASK ==="),  # 2nd check
+        MagicMock(returncode=0, stdout=""),                          # 3rd check (clear)
+    ]
+    capture_iter = iter(captures)
+
+    def fake_run(cmd, *args, **kwargs):
+        if "capture-pane" in cmd:
+            return next(capture_iter)
+        return MagicMock(returncode=0, stdout="", stderr=b"")
+
+    sleeps: list[float] = []
+    monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_crew.server.time.sleep", lambda s: sleeps.append(s))
+
+    _default_push("%42", "=== AGENT_CREW TASK ===\ntask_id: t-074\nbody")
+
+    # Expected sequence: paste-settle sleep, then per-attempt (send Enter, sleep,
+    # capture-pane). 3 attempts to reach success, so 3 post-Enter sleeps.
+    # Total sleeps = 1 (paste settle) + 3 (per attempt) = 4.
+    assert len(sleeps) == 4
+    # Backoff increases monotonically across attempts.
+    assert sleeps[1] < sleeps[2] < sleeps[3]
+
+
+# U-SP13d: _default_push gives up after the configured max attempts and logs
+# an error — keeps the server from spinning forever on a wedged pane.
+def test_u_sp13d_default_push_gives_up_after_max_attempts(monkeypatch, caplog):
+    import logging
+    from unittest.mock import MagicMock
+    from agent_crew.server import _default_push
+
+    # Marker stays visible forever — every capture-pane returns it.
+    def fake_run(cmd, *args, **kwargs):
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="=== AGENT_CREW TASK ===")
+        return MagicMock(returncode=0, stdout="", stderr=b"")
+
+    monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
+    monkeypatch.setattr("agent_crew.server.time.sleep", lambda _: None)
+
+    with caplog.at_level(logging.ERROR, logger="agent_crew.server"):
+        _default_push("%42", "=== AGENT_CREW TASK ===\ntask_id: t-074\nbody")
+
+    assert any("PUSH FAILED" in rec.message for rec in caplog.records)
+
+
 # U-SP14: impl task completed → auto-enqueue review task
 def test_u_sp14_impl_completed_auto_enqueue_review(tmp_db):
     push = RecordingPush()

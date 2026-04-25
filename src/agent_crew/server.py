@@ -40,25 +40,38 @@ def _pane_alive_for_push(pane_id: str) -> bool:
 
 
 def _pane_has_task(pane_id: str) -> bool:
-    """Return True if the pane's visible text still contains the task marker.
+    """Return True if pane shows pending input (task marker or collapsed paste).
 
-    When the task is sitting unsubmitted in the composer, the marker is visible.
-    Once Enter is processed the composer clears and the marker disappears.
+    Two signals mean the buffer is still parked in the composer:
+    - ``=== AGENT_CREW TASK ===`` — short pastes render inline, marker visible.
+    - ``[Pasted text`` — Claude Code collapses long pastes; marker is hidden,
+      but the placeholder reveals that input wasn't submitted.
+
+    Once Enter is processed the composer clears and both signals disappear.
     """
     r = subprocess.run(
         ["tmux", "capture-pane", "-p", "-t", pane_id],
         capture_output=True, text=True,
     )
-    return "=== AGENT_CREW TASK ===" in r.stdout
+    out = r.stdout
+    return ("=== AGENT_CREW TASK ===" in out) or ("[Pasted text" in out)
+
+
+# Backoff schedule (seconds) for the per-attempt wait after Enter. The first
+# attempt mirrors the original 0.3s behaviour; subsequent attempts widen so
+# transient post-completion UI states (e.g. "Crunched for…", footer redraws,
+# cache compaction) have time to settle before the next Enter is sent.
+_PUSH_RETRY_DELAYS = (0.3, 0.5, 1.0, 2.0)
 
 
 def _default_push(pane_id: str, text: str) -> None:
-    """Send task via tmux bracketed paste, then retry Enter until task is submitted.
+    """Send task via tmux bracketed paste, then retry Enter until submitted.
 
     Bracketed-paste mode delivers the entire blob atomically. After paste we
-    wait for the TUI to finish consuming it, then send Enter. If the pane still
-    shows the task marker (Enter was dropped or arrived too early), we wait and
-    retry once.
+    wait for the TUI to finish consuming it, then send Enter. Some Claude UI
+    states (post-task footer animations, cache writes between back-to-back
+    tasks — issue #74) drop the first Enter without submitting; we re-send
+    Enter with backoff up to len(_PUSH_RETRY_DELAYS) times.
     """
     logger.debug(f"_default_push called: pane_id={pane_id}")
     task_id = text.split("\n")[1].split(": ")[1] if "task_id:" in text else "unknown"
@@ -81,18 +94,24 @@ def _default_push(pane_id: str, text: str) -> None:
     # Give the TUI time to process the bracketed-paste sequence.
     time.sleep(0.5)
 
-    r3 = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
-    logger.debug(f"send-keys Enter result: rc={r3.returncode}, stderr={r3.stderr[:100] if r3.stderr else 'ok'}")
+    for attempt, wait_after in enumerate(_PUSH_RETRY_DELAYS, start=1):
+        subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
+        time.sleep(wait_after)
+        if not _pane_has_task(pane_id):
+            logger.info(
+                f"PUSH SUCCESS: task_id={task_id} pushed to {pane_id} "
+                f"(attempt {attempt}/{len(_PUSH_RETRY_DELAYS)})"
+            )
+            return
+        logger.warning(
+            f"PUSH retry: attempt {attempt}/{len(_PUSH_RETRY_DELAYS)} for "
+            f"task_id={task_id} — composer still holding input"
+        )
 
-    # Verify delivery: if task marker still visible the Enter was dropped — retry once.
-    time.sleep(0.3)
-    if _pane_has_task(pane_id):
-        logger.warning(f"PUSH: task marker still visible, retrying Enter for {task_id}")
-        time.sleep(0.2)
-        r4 = subprocess.run(["tmux", "send-keys", "-t", pane_id, "Enter"], capture_output=True)
-        logger.debug(f"send-keys Enter retry result: rc={r4.returncode}")
-    else:
-        logger.info(f"PUSH SUCCESS: task_id={task_id} pushed to {pane_id}")
+    logger.error(
+        f"PUSH FAILED: task_id={task_id} still pending after "
+        f"{len(_PUSH_RETRY_DELAYS)} Enter attempts on {pane_id}"
+    )
 
 
 def _format_task_message(task: TaskRequest, port: int) -> str:
