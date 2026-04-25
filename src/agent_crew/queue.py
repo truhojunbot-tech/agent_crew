@@ -35,23 +35,27 @@ CREATE TABLE IF NOT EXISTS gates (
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS tasks (
-    task_id     TEXT PRIMARY KEY,
-    task_type   TEXT NOT NULL,
-    description TEXT NOT NULL,
-    branch      TEXT NOT NULL DEFAULT '',
-    priority    INTEGER NOT NULL DEFAULT 3,
-    context     TEXT NOT NULL DEFAULT '{}',
-    status      TEXT NOT NULL DEFAULT 'pending',
-    created_at  REAL NOT NULL,
-    project     TEXT NOT NULL DEFAULT '',
-    summary     TEXT,
-    verdict     TEXT,
-    findings    TEXT,
-    pr_number   INTEGER
+    task_id          TEXT PRIMARY KEY,
+    task_type        TEXT NOT NULL,
+    description      TEXT NOT NULL,
+    branch           TEXT NOT NULL DEFAULT '',
+    priority         INTEGER NOT NULL DEFAULT 3,
+    context          TEXT NOT NULL DEFAULT '{}',
+    status           TEXT NOT NULL DEFAULT 'pending',
+    created_at       REAL NOT NULL,
+    project          TEXT NOT NULL DEFAULT '',
+    summary          TEXT,
+    verdict          TEXT,
+    findings         TEXT,
+    pr_number        INTEGER,
+    last_activity_at REAL NOT NULL DEFAULT 0
 )
 """
 
 _DDL_MIGRATE_PROJECT = "ALTER TABLE tasks ADD COLUMN project TEXT NOT NULL DEFAULT ''"
+_DDL_MIGRATE_LAST_ACTIVITY = (
+    "ALTER TABLE tasks ADD COLUMN last_activity_at REAL NOT NULL DEFAULT 0"
+)
 
 _DDL_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -86,6 +90,10 @@ class TaskQueue:
         # Migrate existing DBs: add project column if absent
         try:
             conn.execute(_DDL_MIGRATE_PROJECT)
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute(_DDL_MIGRATE_LAST_ACTIVITY)
         except Exception:
             pass  # column already exists
         # Create indexes for performance
@@ -157,8 +165,8 @@ class TaskQueue:
                 return None
 
             conn.execute(
-                "UPDATE tasks SET status = 'in_progress' WHERE task_id = ?",
-                (row["task_id"],),
+                "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
+                (time.time(), row["task_id"]),
             )
             conn.execute("COMMIT")
 
@@ -325,8 +333,8 @@ class TaskQueue:
                 conn.execute("ROLLBACK")
                 return None
             conn.execute(
-                "UPDATE tasks SET status = 'in_progress' WHERE task_id = ?",
-                (chosen["task_id"],),
+                "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
+                (time.time(), chosen["task_id"]),
             )
             conn.execute("COMMIT")
             return TaskRequest(
@@ -543,6 +551,74 @@ class TaskQueue:
             if row is None:
                 return None
             return (row["checkpoint_num"], json.loads(row["state_snapshot"]))
+        finally:
+            conn.close()
+
+    def bump_activity(self, task_id: str, ts: Optional[float] = None) -> None:
+        """Refresh last_activity_at for a task. Called by the watchdog whenever
+        the agent's pane is observed busy, so the timeout/reminder clocks
+        restart from the most recent sign of life."""
+        if ts is None:
+            ts = time.time()
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET last_activity_at = ? WHERE task_id = ? AND status = 'in_progress'",
+                (ts, task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def list_in_progress_with_activity(self) -> List[dict]:
+        """Return dicts with the fields the watchdog needs to make timeout
+        decisions: task_id, task_type, context, last_activity_at, project."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, task_type, context, last_activity_at, project "
+                "FROM tasks WHERE status = 'in_progress'"
+            ).fetchall()
+            return [
+                {
+                    "task_id": r["task_id"],
+                    "task_type": r["task_type"],
+                    "context": json.loads(r["context"]) if r["context"] else {},
+                    "last_activity_at": r["last_activity_at"] or 0.0,
+                    "project": r["project"] if r["project"] else "",
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
+    def force_fail(self, task_id: str, summary: str) -> Optional[str]:
+        """Mark an in_progress task as failed (used by the watchdog when a pane
+        has been silent past the timeout). Returns the task_type so callers can
+        push the next task to the now-idle role, or None if the row wasn't
+        in_progress (e.g. result arrived just before the watchdog tick)."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT task_type, status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute(
+                "UPDATE tasks SET status = 'failed', summary = ? WHERE task_id = ?",
+                (summary, task_id),
+            )
+            conn.execute("COMMIT")
+            return row["task_type"]
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
