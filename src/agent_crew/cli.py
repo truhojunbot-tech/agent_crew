@@ -418,6 +418,13 @@ def setup(project: str, agents: str, base: str):
         role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
         pane_map[role] = pid
         pane_map[a] = pid
+    # Single-agent setups: the lone agent owns every standard role so a single
+    # pane handles implement/review/test tasks (otherwise unmapped roles cause
+    # tasks to silently sit in QUEUED — see issue #72).
+    if len(agent_list) == 1:
+        sole_pid = pane_ids[0]
+        for role in ("implementer", "reviewer", "tester"):
+            pane_map.setdefault(role, sole_pid)
     pane_map_file = os.path.join(proj_dir, "pane_map.json")
     with open(pane_map_file, "w") as f:
         json.dump(pane_map, f)
@@ -686,6 +693,7 @@ def recover(project: str, base: str):
             **os.environ,
             "AGENT_CREW_DB": db_file,
             "AGENT_CREW_PANE_MAP": pane_map_file,
+            "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
         }
         log_path = os.path.join(proj_dir, "server.log")
@@ -827,6 +835,12 @@ def recover(project: str, base: str):
                     role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
                     pane_map[role] = pid
                     pane_map[a] = pid
+                # Single-agent recovery mirrors setup behavior — fill missing
+                # roles so the lone pane handles all task types (issue #72).
+                if len(agent_list) == 1:
+                    sole_pid = new_pane_ids[0]
+                    for role in ("implementer", "reviewer", "tester"):
+                        pane_map.setdefault(role, sole_pid)
                 state["pane_ids"] = new_pane_ids
                 state["pane_map"] = pane_map
                 _write_state(base, project, state)

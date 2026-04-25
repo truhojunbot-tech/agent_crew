@@ -942,3 +942,100 @@ def test_u_c49_setup_prints_tip_after_completion(tmp_path):
     output = result.output.lower()
     assert "tip" in output
     assert "--agents" in result.output
+
+
+# U-C50: setup --agents <single> writes pane_map with implementer/reviewer/tester
+# all pointing at the lone agent's pane (issue #72: silent QUEUED for single-agent setups)
+def test_u_c50_single_agent_setup_fills_all_roles(tmp_path):
+    import json
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        if cmd == "display-message":
+            joined = " ".join(args)
+            if "#S:#I" in joined:
+                return MagicMock(returncode=0, stdout="crew:0\n", stderr="")
+            if "window_width" in joined:
+                return MagicMock(returncode=0, stdout="200\n", stderr="")
+            if "pane_width" in joined:
+                return MagicMock(returncode=0, stdout="100\n", stderr="")
+            return MagicMock(returncode=0, stdout="crew\n", stderr="")
+        if cmd == "split-window":
+            return MagicMock(returncode=0, stdout="%99\n", stderr="")
+        if cmd == "select-layout":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if cmd in ("list-panes", "list-windows"):
+            return MagicMock(returncode=0, stdout="0\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 12345
+    runner = CliRunner(env={"TMUX_PANE": "%0"})
+    with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
+         patch("agent_crew.cli._read_state", return_value=None), \
+         patch("agent_crew.cli.setup_module.find_free_port", return_value=19999), \
+         patch("agent_crew.cli.setup_module.write_port_file"), \
+         patch("agent_crew.cli.setup_module.create_worktrees", return_value={"codex": str(tmp_path / "wt")}), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_sessions_json"), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
+         patch("agent_crew.cli._write_state"), \
+         patch("os.getcwd", return_value=str(tmp_path)):
+        result = runner.invoke(crew, ["setup", "soloproj", "--agents", "codex", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    pane_map = json.loads((tmp_path / "soloproj" / "pane_map.json").read_text())
+    assert pane_map["codex"] == "%99"
+    assert pane_map["implementer"] == "%99"
+    assert pane_map["reviewer"] == "%99"
+    assert pane_map["tester"] == "%99"
+
+
+# U-C51: recover --agents <single> backfills missing standard roles in pane_map
+# (issue #72: ensure recovery path matches setup behavior for solo agents)
+def test_u_c51_single_agent_recover_fills_all_roles(tmp_path):
+    import json
+    proj_dir = tmp_path / "soloproj"
+    proj_dir.mkdir()
+    state = {
+        "project": "soloproj",
+        "port": 8100,
+        "session": "crew_soloproj",
+        "window": "0",
+        "agents": ["codex"],
+        "pane_ids": ["%1"],
+        "pane_map": {"codex": "%1", "reviewer": "%1"},
+        "worktrees": {"codex": "/tmp/wt/codex"},
+        "db": str(proj_dir / "tasks.db"),
+        "server_pid": 999,
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    def _fake_pane_alive(pane_id):
+        return False  # all panes dead → all recreated
+
+    def _fake_run(args, **_kw):
+        if "list-windows" in args:
+            return MagicMock(returncode=0, stdout="0", stderr="")
+        if "split-window" in args:
+            return MagicMock(returncode=0, stdout="%9\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli._pane_alive", side_effect=_fake_pane_alive), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes"):
+        result = runner.invoke(crew, ["recover", "soloproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    new_state = json.loads((proj_dir / "state.json").read_text())
+    assert new_state["pane_map"]["codex"] == "%9"
+    assert new_state["pane_map"]["reviewer"] == "%9"
+    assert new_state["pane_map"]["implementer"] == "%9"
+    assert new_state["pane_map"]["tester"] == "%9"
