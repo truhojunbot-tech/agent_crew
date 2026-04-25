@@ -1,3 +1,5 @@
+import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -37,6 +39,36 @@ def _pane_alive_for_push(pane_id: str) -> bool:
         capture_output=True,
     )
     return r.returncode == 0
+
+
+def _pane_is_busy(pane_id: str) -> bool:
+    """Return True if the pane shows the agent is actively processing.
+
+    Looks for indicators that the underlying CLI (Claude Code, codex, gemini)
+    is mid-thought:
+    - ``esc to interrupt`` — Claude/Codex footer while a tool/agent is running
+    - ``Crunched`` / ``Compacting`` — Claude active state lines
+    - ``Working`` / ``Thinking`` — alternate active states
+    - ``✻`` / ``✽`` — Claude spinner glyph
+
+    A False return means the pane is sitting idle (prompt visible, no spinner).
+    Used by the watchdog to decide whether to bump last_activity_at.
+    """
+    r = subprocess.run(
+        ["tmux", "capture-pane", "-p", "-t", pane_id],
+        capture_output=True, text=True,
+    )
+    out = r.stdout
+    busy_markers = (
+        "esc to interrupt",
+        "Crunched",
+        "Compacting",
+        "Working",
+        "Thinking",
+        "✻",
+        "✽",
+    )
+    return any(marker in out for marker in busy_markers)
 
 
 def _pane_has_task(pane_id: str) -> bool:
@@ -114,6 +146,30 @@ def _default_push(pane_id: str, text: str) -> None:
     )
 
 
+def _format_reminder_message(task_id: str, port: int, idle_seconds: float) -> str:
+    """Watchdog nudge: agent has been silent past the heartbeat threshold.
+
+    Includes the canonical POST template so the agent can resolve the task in
+    one paste even if the original block scrolled out of context.
+    """
+    return (
+        f"=== AGENT_CREW REMINDER ===\n"
+        f"task_id: {task_id}\n"
+        f"Your assigned task has been silent for {idle_seconds:.0f}s with no\n"
+        f"sign of activity in this pane. The crew stalls until you POST the\n"
+        f"result.\n"
+        f"\n"
+        f"If finished, POST now:\n"
+        f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"    -H 'Content-Type: application/json' \\\n"
+        f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"completed\","
+        f"\"summary\":\"...\",\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
+        f"\n"
+        f"If still working, ignore this — the next heartbeat will see you busy.\n"
+        f"=== END REMINDER ===\n"
+    )
+
+
 def _format_task_message(task: TaskRequest, port: int) -> str:
     ctx = json.dumps(task.context, ensure_ascii=False)
     return (
@@ -138,6 +194,11 @@ def create_app(
     port: int = 0,
     push_fn: Callable[[str, str], None] = _default_push,
     project: Optional[str] = None,
+    pane_busy_fn: Callable[[str], bool] = _pane_is_busy,
+    watchdog_interval: Optional[float] = None,
+    reminder_seconds: Optional[float] = None,
+    timeout_seconds: Optional[float] = None,
+    watchdog_disabled: Optional[bool] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -145,18 +206,53 @@ def create_app(
     agents know where to POST results). Defaults to 0 (messages will say port 0).
     push_fn: injectable for testing.
     project: optional project name used to guard against cross-project review routing.
+    pane_busy_fn: injectable pane-state probe for the watchdog. Defaults to
+        ``_pane_is_busy`` (tmux capture-pane based).
+    watchdog_interval: seconds between watchdog ticks. Falls back to env
+        ``AGENT_CREW_WATCHDOG_INTERVAL`` then 30s.
+    reminder_seconds: idle threshold (seconds) before pushing a reminder.
+        Falls back to env ``AGENT_CREW_REMINDER_SECONDS`` then 300s.
+    timeout_seconds: idle threshold (seconds) before auto-failing the task.
+        Falls back to env ``AGENT_CREW_TIMEOUT_SECONDS`` then 900s.
+    watchdog_disabled: skip the background loop entirely (tests). Falls back
+        to env ``AGENT_CREW_WATCHDOG_DISABLED``.
     """
+    if watchdog_interval is None:
+        watchdog_interval = float(os.getenv("AGENT_CREW_WATCHDOG_INTERVAL", "30"))
+    if reminder_seconds is None:
+        reminder_seconds = float(os.getenv("AGENT_CREW_REMINDER_SECONDS", "300"))
+    if timeout_seconds is None:
+        timeout_seconds = float(os.getenv("AGENT_CREW_TIMEOUT_SECONDS", "900"))
+    if watchdog_disabled is None:
+        watchdog_disabled = os.getenv("AGENT_CREW_WATCHDOG_DISABLED", "").lower() in (
+            "1", "true", "yes",
+        )
+
     state: dict = {}
+    reminded_task_ids: set[str] = set()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state["queue"] = TaskQueue(db_path)
-        yield
+        watchdog_task = None
+        if not watchdog_disabled:
+            watchdog_task = asyncio.create_task(_watchdog_loop())
+        try:
+            yield
+        finally:
+            if watchdog_task is not None:
+                watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watchdog_task
 
     app = FastAPI(lifespan=lifespan)
 
     def q() -> TaskQueue:
         return state["queue"]
+
+    # Expose watchdog tick on app.state so tests can drive it deterministically
+    # without the asyncio loop. Production code never reads this attribute.
+    app.state.reminded_task_ids = reminded_task_ids
 
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
@@ -236,6 +332,109 @@ def create_app(
 
         logger.info(f"_try_push_discuss: dequeued task_id={task.task_id} for agent={agent}, calling push_fn")
         push_fn(pane_id, _format_task_message(task, port))
+
+    def _resolve_pane_for_row(row: dict) -> Optional[str]:
+        """Find the pane assigned to an in_progress task row. Mirrors the routing
+        used by _try_push_next / _try_push_discuss so the watchdog inspects
+        the same pane that received the task."""
+        if not pane_map:
+            return None
+        ctx = row.get("context") or {}
+        task_type = row["task_type"]
+        if task_type == "discuss":
+            agent = ctx.get("agent") if isinstance(ctx, dict) else None
+            return pane_map.get(agent) if agent else None
+        if isinstance(ctx, dict) and ctx.get("agent_override"):
+            return pane_map.get(ctx["agent_override"])
+        role = _TYPE_TO_ROLE.get(task_type)
+        return pane_map.get(role) if role else None
+
+    def _watchdog_tick(now: float) -> dict:
+        """One pass of the heartbeat watchdog. Returns a summary of actions for
+        observability and tests:
+
+        - ``bumped``  — task_ids whose last_activity_at we refreshed
+        - ``reminded`` — task_ids that received a nudge for the first time
+        - ``timed_out`` — task_ids that we auto-failed
+        """
+        actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        if not pane_map:
+            return actions
+
+        rows = q().list_in_progress_with_activity()
+        in_progress_ids = {r["task_id"] for r in rows}
+        # Drop completed/failed tasks from the reminder dedupe set so a recycled
+        # task_id (or a re-enqueued retry) doesn't get its reminder suppressed.
+        reminded_task_ids.intersection_update(in_progress_ids)
+
+        for row in rows:
+            task_id = row["task_id"]
+            pane_id = _resolve_pane_for_row(row)
+            if not pane_id:
+                continue
+            try:
+                if pane_busy_fn(pane_id):
+                    q().bump_activity(task_id, ts=now)
+                    actions["bumped"].append(task_id)
+                    # Busy pane resets the reminder cycle — agent is alive.
+                    reminded_task_ids.discard(task_id)
+                    continue
+            except Exception:
+                logger.exception(f"watchdog: pane_busy_fn raised for {pane_id}")
+                continue
+
+            idle_for = now - (row["last_activity_at"] or now)
+            if idle_for >= timeout_seconds:
+                summary = (
+                    f"watchdog timeout: pane idle {idle_for:.0f}s without "
+                    f"sign of activity (threshold {timeout_seconds:.0f}s)"
+                )
+                tt = q().force_fail(task_id, summary)
+                logger.error(
+                    f"WATCHDOG TIMEOUT: task_id={task_id} marked failed; "
+                    f"task_type={tt}, idle_for={idle_for:.0f}s"
+                )
+                reminded_task_ids.discard(task_id)
+                actions["timed_out"].append(task_id)
+                if tt is not None:
+                    role = _TYPE_TO_ROLE.get(tt)
+                    if role:
+                        try:
+                            _try_push_next(role)
+                        except Exception:
+                            logger.exception(
+                                f"watchdog: failed to push next task for role {role}"
+                            )
+            elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
+                try:
+                    push_fn(pane_id, _format_reminder_message(task_id, port, idle_for))
+                except Exception:
+                    logger.exception(
+                        f"watchdog: failed to push reminder for {task_id}"
+                    )
+                else:
+                    reminded_task_ids.add(task_id)
+                    actions["reminded"].append(task_id)
+                    logger.warning(
+                        f"WATCHDOG REMINDER: task_id={task_id} idle for "
+                        f"{idle_for:.0f}s — nudged pane {pane_id}"
+                    )
+        return actions
+
+    # Stash the tick for tests; harmless in production (never read by handlers).
+    app.state.watchdog_tick = _watchdog_tick
+
+    async def _watchdog_loop() -> None:
+        """Periodic background sweep. Cancels cleanly on shutdown."""
+        try:
+            while True:
+                await asyncio.sleep(watchdog_interval)
+                try:
+                    _watchdog_tick(time.time())
+                except Exception:
+                    logger.exception("watchdog tick raised — continuing")
+        except asyncio.CancelledError:
+            return
 
     def _auto_enqueue_review(impl_task_id: str) -> None:
         """Auto-enqueue a review task when an impl task completes.
