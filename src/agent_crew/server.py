@@ -52,31 +52,28 @@ def _pane_alive_for_push(pane_id: str) -> bool:
 def _pane_is_busy(pane_id: str) -> bool:
     """Return True if the pane shows the agent is actively processing.
 
-    Looks for indicators that the underlying CLI (Claude Code, codex, gemini)
-    is mid-thought:
-    - ``esc to interrupt`` — Claude/Codex footer while a tool/agent is running
-    - ``Crunched`` / ``Compacting`` — Claude active state lines
-    - ``Working`` / ``Thinking`` — alternate active states
-    - ``✻`` / ``✽`` — Claude spinner glyph
+    The reliable signal across Claude Code / Codex / Gemini CLIs is the
+    ``esc to interrupt`` footer string. It only appears while the agent is
+    actively running a tool or generating output; the moment the agent goes
+    idle, the footer reverts to a non-interruptible variant
+    (e.g. ``⏵⏵ bypass permissions``).
 
-    A False return means the pane is sitting idle (prompt visible, no spinner).
+    Earlier versions also matched ``✻`` / ``✽`` spinner glyphs and the bare
+    words ``Crunched`` / ``Working`` / ``Thinking``, but Claude leaves
+    *past-tense* status lines on screen after a tool finishes —
+    ``✻ Cogitated for 5m 16s``, ``Crunched for 30s`` — which kept this
+    function returning True forever. That broke the watchdog (issue #84):
+    last_activity_at was bumped on every tick, so the idle clock never
+    started and reminders/timeouts never fired.
+
+    A False return means the pane is sitting idle (no agent footer banner).
     Used by the watchdog to decide whether to bump last_activity_at.
     """
     r = subprocess.run(
         ["tmux", "capture-pane", "-p", "-t", pane_id],
         capture_output=True, text=True,
     )
-    out = r.stdout
-    busy_markers = (
-        "esc to interrupt",
-        "Crunched",
-        "Compacting",
-        "Working",
-        "Thinking",
-        "✻",
-        "✽",
-    )
-    return any(marker in out for marker in busy_markers)
+    return "esc to interrupt" in r.stdout
 
 
 def _pane_has_task(pane_id: str) -> bool:
