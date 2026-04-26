@@ -63,13 +63,24 @@ def test_u_i05_failure_path_documented():
     assert "needs direction" in content.lower() or "needs_human" in content
 
 
-def test_u_i06_role_files_use_dotclaude_subdir():
-    """Instructions must be written to .claude/ so they don't conflict with the
-    project's root CLAUDE.md (which is tracked in git and reverts on checkout)."""
-    for role, path in ROLE_FILES.items():
-        assert path.startswith(".claude/"), (
-            f"Role {role!r} uses {path!r} — must use .claude/ prefix to avoid git conflicts"
-        )
+def test_u_i06_role_files_match_each_agent_cli_lookup_path():
+    """Each role's instruction file must live where that agent's CLI
+    actually reads from (Issue #110):
+
+    - implementer (claude) → `.claude/CLAUDE.md` (Claude Code merges
+      with the project root CLAUDE.md without conflict)
+    - reviewer (codex)     → `AGENTS.md` (Codex reads only the
+      project-root copy)
+    - tester (gemini)      → `GEMINI.md` (Gemini reads only the
+      project-root copy)
+
+    The previous all-`.claude/` layout meant codex/gemini never saw
+    the agent_crew prompts and led to the tester force-pushing over
+    the implementer's PR head.
+    """
+    assert ROLE_FILES["implementer"] == ".claude/CLAUDE.md"
+    assert ROLE_FILES["reviewer"] == "AGENTS.md"
+    assert ROLE_FILES["tester"] == "GEMINI.md"
 
 
 def test_u_i07_common_instructs_ignore_alfred_global():
