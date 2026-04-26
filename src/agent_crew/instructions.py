@@ -2,16 +2,37 @@ import os
 
 from agent_crew.prompts.task_loop import build_task_loop_prompt
 
-# The agent_crew instructions are written to .claude/CLAUDE.md inside each
-# worktree so they do not conflict with the project's own root CLAUDE.md (which
-# is tracked in git and would be reverted by any git operation).  Claude Code
-# merges all CLAUDE.md files it finds (global + project root + .claude/), so
-# this file takes effect alongside — and takes priority over — the root one.
+# Per-role instruction file paths inside each worktree (Issue #110 fix).
+#
+# The naive ".claude/<NAME>.md" layout used to keep our prompts isolated
+# from the project's own git-tracked instructions, but it only worked for
+# Claude Code — that CLI is the one that merges its `.claude/CLAUDE.md`
+# with the project-root CLAUDE.md. Codex reads only `AGENTS.md` at the
+# project root; Gemini reads only `GEMINI.md` at the project root.
+# Putting our reviewer/tester prompts under `.claude/` meant the agents
+# never actually saw them, which led to gemini taking task descriptions
+# as implementer instructions and force-pushing over the implementer's
+# work (alpha_engine PRs #801–#805).
+#
+# Layout:
+#   implementer → ".claude/CLAUDE.md"   Claude Code merges with root.
+#   reviewer    → "AGENTS.md"           Codex reads this at the root.
+#   tester      → "GEMINI.md"           Gemini reads this at the root.
+#
+# AGENTS.md / GEMINI.md may already exist in the project (developer-facing
+# guides). To avoid clobbering them, `write()` uses a marker-bracketed
+# section that gets idempotently replaced on each rewrite — see
+# `_AGENT_CREW_BLOCK_*` below.
 ROLE_FILES: dict = {
     "implementer": ".claude/CLAUDE.md",
-    "reviewer": ".claude/AGENTS.md",
-    "tester": ".claude/GEMINI.md",
+    "reviewer": "AGENTS.md",
+    "tester": "GEMINI.md",
 }
+
+# Marker-bracketed block — the only region `write()` touches in
+# AGENTS.md / GEMINI.md so a project's own content is preserved.
+_AGENT_CREW_BLOCK_BEGIN = "<!-- agent_crew:begin -->"
+_AGENT_CREW_BLOCK_END = "<!-- agent_crew:end -->"
 
 # Default agent name per role — used when a caller passes role but not the
 # agent identifier. The agent name is what appears inside the task-loop
@@ -336,6 +357,31 @@ def generate(role: str, project: str, port: int, agent: str = "") -> str:
     return content
 
 
+def _merge_agent_crew_block(existing: str, new_block: str) -> str:
+    """Idempotently embed the agent_crew block inside an existing file.
+
+    AGENTS.md / GEMINI.md may carry developer-facing content that must be
+    preserved across regenerations (Issue #110). The marker-bracketed
+    block below is the only region we own; everything else is left
+    untouched.
+
+    Behaviour:
+    - First write: prepend ``BEGIN ... END`` block, blank line, then the
+      pre-existing content.
+    - Re-write: replace just the existing ``BEGIN ... END`` block in place,
+      preserving any content above or below it.
+    """
+    bracketed = f"{_AGENT_CREW_BLOCK_BEGIN}\n{new_block}\n{_AGENT_CREW_BLOCK_END}"
+    begin = existing.find(_AGENT_CREW_BLOCK_BEGIN)
+    end = existing.find(_AGENT_CREW_BLOCK_END)
+    if begin == -1 or end == -1 or end < begin:
+        if not existing:
+            return bracketed + "\n"
+        return bracketed + "\n\n" + existing
+    end_marker_close = end + len(_AGENT_CREW_BLOCK_END)
+    return existing[:begin] + bracketed + existing[end_marker_close:]
+
+
 def write(
     role: str,
     worktree_path: str,
@@ -348,9 +394,26 @@ def write(
     with open(port_file) as f:
         port = int(f.read().strip())
     filename = ROLE_FILES[role]
-    content = generate(role, project, port, agent=agent)
+    new_block = generate(role, project, port, agent=agent)
     path = os.path.join(worktree_path, filename)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    if filename.startswith(".claude/"):
+        # `.claude/CLAUDE.md` is fully owned by agent_crew — overwrite
+        # entirely. No project-side content to preserve.
+        content = new_block
+    else:
+        existing = ""
+        if os.path.exists(path):
+            try:
+                with open(path) as f:
+                    existing = f.read()
+            except OSError:
+                existing = ""
+        content = _merge_agent_crew_block(existing, new_block)
+
     with open(path, "w") as f:
         f.write(content)
     return os.path.abspath(path)
