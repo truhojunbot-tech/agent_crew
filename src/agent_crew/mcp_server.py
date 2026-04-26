@@ -52,8 +52,27 @@ _DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
 
 
 def _task_to_dict(task: TaskRequest) -> dict[str, Any]:
-    """Serialize a TaskRequest dataclass to a JSON-friendly dict."""
-    return asdict(task)
+    """Serialize a TaskRequest dataclass to a JSON-friendly dict.
+
+    Applies the same task-type guard that the tmux push path uses
+    (`server._guard_description`), so MCP-pull and tmux-push deliver
+    semantically identical messages — Issue #110 phase 4-b.
+    """
+    # Local import to avoid an import cycle: server imports from queue
+    # and queue does not import server, but mcp_server is a sibling
+    # module; keeping the import inside the function makes the
+    # dependency direction explicit.
+    from agent_crew.server import _guard_description
+
+    payload = asdict(task)
+    try:
+        payload["description"] = _guard_description(task)
+    except Exception:
+        # If anything goes wrong with the guard logic, fall through with
+        # the unprefixed description. The system prompt's precedence
+        # block is the safety net.
+        pass
+    return payload
 
 
 def build_mcp_server(
