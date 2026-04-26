@@ -18,22 +18,19 @@ MCP tool surface in ``agent_crew/mcp_server.py``.
 """
 from __future__ import annotations
 
-# Mapping kept here (rather than imported from queue.py) so this module
-# stays free of runtime-data dependencies — tests can render prompts
-# without standing up SQLite.
-_ROLE_TO_TASK_TYPES: dict[str, tuple[str, ...]] = {
-    "implementer": ("implement",),
-    "reviewer": ("review",),
-    "tester": ("test",),
-    "panel": ("discuss",),
-}
-
-
 def build_task_loop_prompt(agent: str, role: str = "implementer") -> str:
-    """Return the full task-loop system prompt for ``agent`` in ``role``."""
+    """Return the full task-loop system prompt for ``agent``.
+
+    ``role`` is the agent's default role and informs the example call only.
+    The agent is *not* locked into that role — `get_next_task(agent=...)`
+    picks up tasks routed to this agent via ``context.agent_override``
+    even when their task_type doesn't match the default. That is what
+    enables dynamic role reassignment (#106 phase 3): operator overrides
+    via ``crew run --reviewer gemini`` and the rate-limit fallback chain
+    (#81) both work the same way — the task carries an override and the
+    agent picks it up regardless of its primary role.
+    """
     role_norm = role.lower() if role else "implementer"
-    types = _ROLE_TO_TASK_TYPES.get(role_norm, ("implement",))
-    types_str = " | ".join(types)
     return f"""You are {agent}, an agent in the agent_crew runtime.
 You have access to MCP tools from the "agent_crew" server.
 
@@ -43,21 +40,29 @@ Continuously execute this loop. Do NOT wait for tmux paste-buffer input —
 all task delivery goes through MCP tools below.
 
 ### 1. Pull the next task
-Call `get_next_task(agent="{agent}", role="{role_norm}")`.
-- Returns None → no work right now. Sleep 30 seconds, then call again.
-- Returns a task dict → proceed to step 2.
+Call `get_next_task(agent="{agent}")`.
+
+The server picks the right task for you based on:
+- Tasks routed to you via `context.agent_override` (operator override or
+  fallback chain) — regardless of task_type.
+- Otherwise tasks of your default role's task_type ({role_norm}).
+
+Returns:
+- None → no work right now. Sleep 30 seconds, then call again.
+- A task dict → proceed to step 2.
 
 ### 2. Read the task
 Required fields:
 - `task_id`: unique identifier (echo it back in submit_result)
-- `task_type`: one of {types_str}
+- `task_type`: `implement` | `review` | `test` | `discuss` — branch on this
+  to decide what to do (you may receive any type, not just your default)
 - `description`: natural-language prompt
 - `branch`: target git branch (may be empty for non-git tasks)
 - `priority`: integer, lower is higher priority
 - `context`: dict with task-specific fields (e.g. `pr_number`, `instructions`,
-  `prev_task_id`, `feedback`)
+  `prev_task_id`, `feedback`, `agent_override`)
 
-### 3. Execute the work
+### 3. Execute the work — branch on `task_type`
 
 **implement** — write tests first (TDD), implement until they pass, refactor,
 commit, open or update the PR. Set `pr_number` in `submit_result`.
@@ -111,11 +116,12 @@ def build_task_loop_prompt_compact(agent: str, role: str = "implementer") -> str
     version is enough to keep the loop alive until the next full session.
     """
     role_norm = role.lower() if role else "implementer"
-    return f"""You are {agent} ({role_norm}). agent_crew MCP tools available:
-get_next_task, submit_result, bump_activity, get_task, list_pending, cancel_task.
+    return f"""You are {agent} (default role: {role_norm}). agent_crew MCP tools \
+available: get_next_task, submit_result, bump_activity, get_task, list_pending, \
+cancel_task.
 
-Loop: get_next_task(agent="{agent}", role="{role_norm}") → execute → \
-bump_activity periodically → submit_result(...) → repeat. \
-Sleep 30s and retry on None. \
+Loop: get_next_task(agent="{agent}") → branch on task_type \
+(implement/review/test/discuss) → bump_activity periodically → \
+submit_result(...) → repeat. Sleep 30s on None. \
 On stuck: submit_result(status="needs_human", summary=<why>).
 """
