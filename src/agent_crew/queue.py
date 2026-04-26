@@ -133,24 +133,71 @@ class TaskQueue:
         return task.task_id
 
     def dequeue(self, agent: str = "", role: str = "") -> Optional[TaskRequest]:
+        """Atomically dequeue the next pending task for ``agent`` / ``role``.
+
+        Resolution order (Issue #106 phase 3 — supports dynamic role
+        reassignment via ``context.agent_override``):
+
+        1. ``agent`` given: prefer tasks whose ``context.agent_override``
+           equals ``agent``, regardless of task_type. Operator overrides
+           (``crew run --reviewer gemini``) and the rate-limit fallback
+           chain both flow through this path.
+        2. ``role`` given (with or without ``agent``): tasks of the
+           matching task_type WHERE either no override is set or the
+           override claims this agent. The latter clause prevents an
+           agent from stealing a task explicitly routed to another
+           agent. Stage 2 only runs after stage 1 has no candidate.
+        3. Neither given: any pending task, ordered by priority.
+        """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            if role:
+            row = None
+            if agent:
+                # Stage 1 — explicit override claim for this agent.
+                row = conn.execute(
+                    """
+                    SELECT * FROM tasks
+                    WHERE status = 'pending'
+                      AND json_extract(context, '$.agent_override') = ?
+                    ORDER BY priority ASC, created_at ASC
+                    LIMIT 1
+                    """,
+                    (agent,),
+                ).fetchone()
+
+            if row is None and role:
+                # Stage 2 — default role, skipping tasks claimed by others.
                 task_type_filter = _ROLE_TO_TYPE.get(role)
                 if task_type_filter is None:
                     conn.execute("ROLLBACK")
                     raise ValueError(f"Unknown role: {role!r}. Must be one of {list(_ROLE_TO_TYPE)}")
-                row = conn.execute(
-                    """
-                    SELECT * FROM tasks
-                    WHERE status = 'pending' AND task_type = ?
-                    ORDER BY priority ASC, created_at ASC
-                    LIMIT 1
-                    """,
-                    (task_type_filter,),
-                ).fetchone()
-            else:
+                if agent:
+                    row = conn.execute(
+                        """
+                        SELECT * FROM tasks
+                        WHERE status = 'pending' AND task_type = ?
+                          AND (
+                            json_extract(context, '$.agent_override') IS NULL
+                            OR json_extract(context, '$.agent_override') = ?
+                          )
+                        ORDER BY priority ASC, created_at ASC
+                        LIMIT 1
+                        """,
+                        (task_type_filter, agent),
+                    ).fetchone()
+                else:
+                    row = conn.execute(
+                        """
+                        SELECT * FROM tasks
+                        WHERE status = 'pending' AND task_type = ?
+                        ORDER BY priority ASC, created_at ASC
+                        LIMIT 1
+                        """,
+                        (task_type_filter,),
+                    ).fetchone()
+
+            if row is None and not agent and not role:
                 row = conn.execute(
                     """
                     SELECT * FROM tasks

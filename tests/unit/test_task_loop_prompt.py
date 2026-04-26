@@ -11,13 +11,18 @@ class TestFullPrompt:
         assert "claude" in p
         assert "[agent: claude]" in p
 
-    def test_role_drives_task_type_listing(self):
-        impl = build_task_loop_prompt("claude", role="implementer")
-        assert "one of implement" in impl
-        rev = build_task_loop_prompt("codex", role="reviewer")
-        assert "one of review" in rev
-        test = build_task_loop_prompt("gemini", role="tester")
-        assert "one of test" in test
+    def test_lists_all_task_types_for_dynamic_reassignment(self):
+        """Phase 3 (#106) — agents are no longer locked into a single
+        task_type. Every prompt must enumerate all four so the agent
+        knows how to dispatch when an override sends a non-default
+        type their way."""
+        for agent, role in [("claude", "implementer"), ("codex", "reviewer"),
+                            ("gemini", "tester")]:
+            p = build_task_loop_prompt(agent, role=role)
+            for task_type in ("implement", "review", "test", "discuss"):
+                assert task_type in p
+            # Default role still surfaces in the call example.
+            assert role in p
 
     def test_unknown_role_falls_back_to_implementer(self):
         p = build_task_loop_prompt("claude", role="weird")

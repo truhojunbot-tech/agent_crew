@@ -39,6 +39,17 @@ from agent_crew.queue import TaskQueue
 
 logger = logging.getLogger(__name__)
 
+# Default role per agent. The MCP `get_next_task(agent=...)` flow falls
+# back to this when no explicit ``role`` is passed, so each agent picks up
+# tasks of its primary type unless an override redirects work elsewhere.
+# Stays in lockstep with `setup._AGENT_TO_ROLE`; kept here so this module
+# stays free of `setup` import overhead.
+_DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
+    "claude": "implementer",
+    "codex": "reviewer",
+    "gemini": "tester",
+}
+
 
 def _task_to_dict(task: TaskRequest) -> dict[str, Any]:
     """Serialize a TaskRequest dataclass to a JSON-friendly dict."""
@@ -70,13 +81,26 @@ def build_mcp_server(
         agent: str = "",
         role: str = "",
     ) -> Optional[dict[str, Any]]:
-        """Pull the next task assigned to ``agent`` (or matching ``role``).
+        """Pull the next task for ``agent``.
 
-        Returns the task as a dict, or ``None`` when the queue has no work
-        ready for this agent. Tasks transition to ``in_progress`` atomically
-        — call ``submit_result`` when finished.
+        Resolution order matches `queue.dequeue` semantics:
+
+        - Tasks whose ``context.agent_override`` claims this agent come
+          first, regardless of task_type. Operator overrides
+          (``crew run --reviewer gemini``) and the rate-limit fallback
+          chain (#81) both rely on this path for dynamic role
+          reassignment.
+        - Otherwise the agent's *default* role is consulted — claude
+          picks implement, codex picks review, gemini picks test —
+          excluding tasks claimed by another agent's override. Pass an
+          explicit ``role=`` to override the default.
+
+        Returns the task as a JSON-friendly dict, or ``None`` when the
+        queue has no work ready. Tasks transition to ``in_progress``
+        atomically.
         """
-        task = queue.dequeue(agent=agent, role=role)
+        resolved_role = role or _DEFAULT_ROLE_FOR_AGENT.get(agent, "")
+        task = queue.dequeue(agent=agent, role=resolved_role)
         if task is None:
             return None
         return _task_to_dict(task)
