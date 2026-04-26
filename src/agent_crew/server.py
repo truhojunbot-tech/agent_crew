@@ -216,8 +216,45 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float) -> st
     )
 
 
+# Per-task-type guard prefixes inserted at the top of the description we
+# push to agents (Issue #110 phase 4-b). The task description is the
+# message the agent's LLM reads first, so a clear directive here cuts
+# off the "I'm a project developer, I'll just modify code" failure mode
+# that hit alpha_engine #801–#805 even when the system prompt would
+# have told the agent otherwise.
+_TASK_TYPE_GUARDS: dict[str, str] = {
+    "review": (
+        "[REVIEW ONLY — do NOT modify or push code. Read the PR diff via "
+        "`gh pr diff <pr_number>`, evaluate against the 3-layer checklist, "
+        "and report verdict via `submit_result`.]"
+    ),
+    "test": (
+        "[VERIFY ONLY — do NOT modify code, do NOT push, do NOT open or "
+        "force-push a PR. Run the test suite in a clean checkout against "
+        "the implementer's PR head and report pass/fail via `submit_result`.]"
+    ),
+}
+
+
+def _guard_description(task: TaskRequest) -> str:
+    """Prepend the task-type guard prefix to ``task.description`` if any.
+
+    Implement and discuss tasks are returned unchanged. Review/test get
+    a hard-coded prefix block — short, all-caps, in the language the
+    agent's LLM is most likely to anchor on. Idempotent: if the
+    description already starts with the guard, no double-prefix.
+    """
+    guard = _TASK_TYPE_GUARDS.get(task.task_type)
+    if not guard:
+        return task.description
+    if task.description.startswith(guard):
+        return task.description
+    return f"{guard}\n\n{task.description}"
+
+
 def _format_task_message(task: TaskRequest, port: int) -> str:
     ctx = json.dumps(task.context, ensure_ascii=False)
+    description = _guard_description(task)
     return (
         f"=== AGENT_CREW TASK ===\n"
         f"task_id: {task.task_id}\n"
@@ -225,7 +262,7 @@ def _format_task_message(task: TaskRequest, port: int) -> str:
         f"branch: {task.branch}\n"
         f"priority: {task.priority}\n"
         f"context: {ctx}\n"
-        f"description: {task.description}\n"
+        f"description: {description}\n"
         f"=== END TASK ===\n"
         f"Do the work described above, then POST result: "
         f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
