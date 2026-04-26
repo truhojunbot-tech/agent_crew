@@ -120,9 +120,50 @@ def _capture_pane(target: str) -> str | None:
 
 
 def _pane_looks_idle(pane_output: str) -> bool:
-    """Heuristic: does the pane output suggest the agent is idle/done?"""
+    """Last-line prompt heuristic — kept as a fallback signal alongside the
+    content-diff probe in `_wait`. Returns True if the last visible line
+    contains one of the canonical idle markers (bare prompt or completion
+    keyword). Brittle on multi-line agent footers (Claude Code's
+    ``⏵⏵ bypass permissions`` line is the last one when the prompt is
+    actually idle), so the watchdog and `_wait` rely primarily on
+    `_pane_changed` instead."""
     last_line = pane_output.rstrip().rsplit("\n", 1)[-1] if pane_output.strip() else ""
     return any(pat in last_line for pat in _PANE_IDLE_PATTERNS)
+
+
+# Per-pane snapshot for `_pane_changed`. Mutated only inside `_wait` (single
+# CLI invocation, single thread), so the dict can live at module scope.
+_PANE_CONTENT_LAST: dict[str, str] = {}
+
+
+def _reset_pane_content_cache() -> None:
+    """Clear the per-pane content snapshot. Test-only entry point."""
+    _PANE_CONTENT_LAST.clear()
+
+
+def _pane_changed(pane_target: str) -> bool:
+    """Return True if the pane capture differs from the previous call.
+
+    Text-agnostic idle detector — works against any agent CLI because it
+    compares whole captures rather than scraping for specific banner
+    strings (the same lesson #84-v2 codified for the server's watchdog).
+
+    First-call semantics: returns False (no prior snapshot to compare).
+    Mirrors `agent_crew.server._pane_is_busy` so the CLI and server use
+    the same convention. Callers seed the cache by calling once before
+    starting their idle clock.
+
+    tmux failure: returns False (inconclusive). The watchdog must never
+    auto-fail purely because a transient capture failed.
+    """
+    capture = _capture_pane(pane_target)
+    if capture is None:
+        return False
+    prev = _PANE_CONTENT_LAST.get(pane_target)
+    _PANE_CONTENT_LAST[pane_target] = capture
+    if prev is None:
+        return False
+    return capture != prev
 
 
 def _pane_alive(pane_id: str) -> bool:
@@ -1029,40 +1070,74 @@ def run_cmd(task: str, db: str, project: str, base: str,
             click.echo(f"  Auto-submit failed: {e}")
 
     def _wait(task_id: str):
+        # Reset the per-pane content cache so a fresh `_wait` invocation
+        # starts with no baseline (otherwise consecutive `crew run` calls
+        # would carry over stale snapshots from the previous task).
+        _reset_pane_content_cache()
         start_time = time.time()
         deadline = start_time + wait_timeout
-        fallback_start = start_time + 30  # grace period before pane checks
-        pane_idle_count = 0
+        # Grace period before any idle decision so the agent has time to
+        # acknowledge the paste, render its initial response, and stream
+        # the first tokens out.
+        idle_check_start = start_time + 30.0
+        # Threshold timeline for idle (issue #103):
+        # - <2min idle: silent
+        # - 2min idle: emit warning so the operator sees something happen
+        #   before the auto-fail kicks in
+        # - 5min idle: auto-fail with watchdog-shaped summary so the
+        #   fallback policy reroutes to the next agent in the chain
+        warn_after_idle_seconds = 120.0
+        fail_after_idle_seconds = 300.0
+        pane_idle_started_at: float | None = None
+        pane_warning_emitted = False
         last_progress_print = start_time
         while time.time() < deadline:
             result = queue.get_result(task_id)
             if result is not None:
-                elapsed = int(time.time() - start_time)
                 return result
-            # Print progress every 10 seconds during the wait
             now = time.time()
             if now - last_progress_print >= 10:
                 elapsed = int(now - start_time)
                 click.echo(f"  Waiting... ({elapsed}s elapsed)")
                 last_progress_print = now
-            # Pane capture fallback: after 30s, check every 10s
-            if first_pane_target and now > fallback_start:
-                pane_out = _capture_pane(first_pane_target)
-                if pane_out and _pane_looks_idle(pane_out):
-                    pane_idle_count += 1
-                    if pane_idle_count >= 3:
+            if first_pane_target and now > idle_check_start:
+                # Diff-based idle probe — text-agnostic, covers Claude
+                # Code's multi-line footer that the old last-line scan
+                # misses ("Cooked for 5m 4s" + "⏵⏵ bypass permissions").
+                changed = _pane_changed(first_pane_target)
+                if changed:
+                    pane_idle_started_at = None
+                    pane_warning_emitted = False
+                else:
+                    if pane_idle_started_at is None:
+                        pane_idle_started_at = now
+                    idle_for = now - pane_idle_started_at
+                    if (
+                        idle_for >= warn_after_idle_seconds
+                        and not pane_warning_emitted
+                    ):
+                        click.echo(
+                            f"Warning: pane has shown no activity for "
+                            f"{idle_for:.0f}s on task {task_id!r}. Auto-fail "
+                            f"in {fail_after_idle_seconds - idle_for:.0f}s "
+                            f"if it stays quiet."
+                        )
+                        pane_warning_emitted = True
+                    if idle_for >= fail_after_idle_seconds:
                         reason = (
-                            f"Auto-submitted: agent pane idle for 30s without POSTing result. "
-                            f"Task {task_id!r} marked failed so queue can proceed."
+                            f"watchdog timeout: CLI detected pane idle for "
+                            f"{idle_for:.0f}s on task {task_id!r} (no "
+                            f"capture changes since {warn_after_idle_seconds:.0f}s). "
+                            f"Auto-failed for queue cleanup."
                         )
                         click.echo(f"Warning: {reason}")
                         _auto_submit_failed(task_id, reason)
                         raise click.ClickException(
-                            f"task {task_id!r}: agent idle — result auto-submitted as failed. "
+                            f"task {task_id!r}: agent idle for "
+                            f"{idle_for:.0f}s — result auto-submitted as "
+                            f"failed (fallback policy will reroute). "
                             f"Check pane manually or re-run."
                         )
-                else:
-                    pane_idle_count = 0
                 time.sleep(10)
             else:
                 time.sleep(0.5)
@@ -1075,8 +1150,16 @@ def run_cmd(task: str, db: str, project: str, base: str,
         extension_seconds = max(300.0, wait_timeout / 2.0)
         extensions = 0
         while extensions < max_extensions:
-            pane_out = _capture_pane(first_pane_target) if first_pane_target else None
-            still_busy = bool(pane_out) and not _pane_looks_idle(pane_out)
+            if not first_pane_target:
+                break
+            # Diff probe: a single call after the priming snapshot left by
+            # the main poll loop. If the main loop never primed (e.g. very
+            # short --timeout that exited before the 30s grace period),
+            # prime here with one extra capture so the second one can
+            # actually compare.
+            if first_pane_target not in _PANE_CONTENT_LAST:
+                _pane_changed(first_pane_target)  # discard, just prime
+            still_busy = _pane_changed(first_pane_target)
             if not still_busy:
                 break
             extensions += 1
