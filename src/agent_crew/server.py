@@ -14,6 +14,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from agent_crew.anomaly import check_wrong_repo
+from agent_crew.fallback import (
+    default_agent_for_role,
+    has_rate_limit_signal,
+    load_fallback_chains,
+    next_agent,
+)
+from agent_crew.notify import notify_telegram
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
 
@@ -203,6 +210,7 @@ def create_app(
     anomaly_interval: Optional[float] = None,
     anomaly_disabled: Optional[bool] = None,
     state_path: Optional[str] = None,
+    fallback_disabled: Optional[bool] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -242,6 +250,10 @@ def create_app(
         anomaly_interval = float(os.getenv("AGENT_CREW_ANOMALY_INTERVAL", "600"))
     if anomaly_disabled is None:
         anomaly_disabled = os.getenv("AGENT_CREW_ANOMALY_DISABLED", "").lower() in (
+            "1", "true", "yes",
+        )
+    if fallback_disabled is None:
+        fallback_disabled = os.getenv("AGENT_CREW_FALLBACK_DISABLED", "").lower() in (
             "1", "true", "yes",
         )
 
@@ -602,6 +614,101 @@ def create_app(
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
 
+    def _auto_fallback_failed_task(
+        task_id: str,
+        result: TaskResult,
+        task_type: str,
+    ) -> bool:
+        """If the failure is rate-limit-shaped, reroute to the next agent in
+        the fallback chain. Returns True when fallback handled the task
+        (caller should skip auto_retry); False when caller should fall through
+        to the normal retry path.
+
+        On chain exhaustion, opens an ``escalation`` gate and tries to send a
+        Telegram alert via the #79 helper (best-effort).
+        """
+        if fallback_disabled:
+            return False
+        if not has_rate_limit_signal(result.summary, result.findings):
+            return False
+
+        try:
+            tasks = [t for t in q().list_tasks() if t.task_id == task_id]
+            if not tasks:
+                return False
+            original = tasks[0]
+            ctx = dict(original.context) if isinstance(original.context, dict) else {}
+
+            role = _TYPE_TO_ROLE.get(task_type)
+            current_agent = (
+                ctx.get("agent_override")
+                or (default_agent_for_role(role, pane_map) if (role and pane_map) else None)
+            )
+            excluded = list(ctx.get("fallback_excluded") or [])
+            if current_agent and current_agent not in excluded:
+                excluded.append(current_agent)
+
+            chains = load_fallback_chains(state_path)
+            successor = next_agent(task_type, current_agent, excluded, chains)
+
+            if successor is None:
+                # Chain exhausted — escalate.
+                logger.warning(
+                    f"_auto_fallback: chain exhausted for {task_id} "
+                    f"(task_type={task_type}, excluded={excluded}). Escalating."
+                )
+                msg = (
+                    f"agent_crew rate-limit fallback exhausted\n"
+                    f"task_id: {task_id}\n"
+                    f"task_type: {task_type}\n"
+                    f"tried agents: {', '.join(excluded) or '(none)'}\n"
+                    f"last summary: {(result.summary or '')[:200]}"
+                )
+                try:
+                    q().create_gate(
+                        GateRequest(
+                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
+                            type="escalation",
+                            message=msg,
+                            status="pending",
+                        )
+                    )
+                except Exception as e:
+                    logger.warning(f"_auto_fallback: failed to create escalation gate: {e}")
+                try:
+                    notify_telegram(msg)
+                except Exception:
+                    pass
+                return True
+
+            new_ctx = dict(ctx)
+            new_ctx["agent_override"] = successor
+            new_ctx["fallback_excluded"] = excluded
+            new_ctx["fallback_from_task_id"] = task_id
+            try:
+                fallback_req = TaskRequest(
+                    task_id=f"fallback-{task_id}-{uuid.uuid4().hex[:4]}",
+                    task_type=task_type,  # type: ignore
+                    description=original.description,
+                    branch=original.branch,
+                    priority=original.priority,
+                    context=new_ctx,
+                )
+                q().enqueue(fallback_req)
+                logger.info(
+                    f"_auto_fallback: rerouted {task_id} -> {successor} "
+                    f"(excluded={excluded})"
+                )
+                if role:
+                    _try_push_next(role)
+                return True
+            except Exception as e:
+                logger.warning(f"_auto_fallback: enqueue failed for {task_id}: {e}")
+                return False
+        except Exception as e:
+            logger.warning(f"_auto_fallback: unexpected error for {task_id}: {e}")
+            return False
+
     @app.get("/health")
     def health():
         return {"status": "ok"}
@@ -663,10 +770,12 @@ def create_app(
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
             _try_push_discuss(agent)
         else:
-            # Auto-retry: failed task → auto-enqueue retry task (if under max retries)
+            # Failure handling: rate-limit → reroute via fallback chain (#81),
+            # otherwise auto-retry the same role up to MAX_RETRIES.
             if result.status == "failed":
-                logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, attempting auto-retry")
-                _auto_retry_failed_task(task_id, result, task_type)
+                logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
+                if not _auto_fallback_failed_task(task_id, result, task_type):
+                    _auto_retry_failed_task(task_id, result, task_type)
             # Auto-transition: impl task completed → auto-enqueue review task
             if task_type == "implement" and result.status == "completed":
                 logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
