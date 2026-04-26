@@ -49,31 +49,54 @@ def _pane_alive_for_push(pane_id: str) -> bool:
     return r.returncode == 0
 
 
+# Per-pane snapshot of the previous capture, keyed by pane_id. Used by the
+# default pane-busy probe to decide "did anything change since the last
+# tick?". Tests inject their own busy_fn so this dict is only touched by the
+# default path; pollution between tests is handled by `_reset_pane_busy_cache`.
+_PANE_BUSY_LAST: dict[str, str] = {}
+
+
+def _reset_pane_busy_cache() -> None:
+    """Clear the per-pane diff cache. Test-only entry point."""
+    _PANE_BUSY_LAST.clear()
+
+
 def _pane_is_busy(pane_id: str) -> bool:
-    """Return True if the pane shows the agent is actively processing.
+    """Return True if the pane content changed since the previous call.
 
-    The reliable signal across Claude Code / Codex / Gemini CLIs is the
-    ``esc to interrupt`` footer string. It only appears while the agent is
-    actively running a tool or generating output; the moment the agent goes
-    idle, the footer reverts to a non-interruptible variant
-    (e.g. ``⏵⏵ bypass permissions``).
+    Pure content diff. Independent of any per-CLI banner text — Claude Code,
+    codex, and gemini all change `tmux capture-pane -p` output as work
+    progresses (token counters tick, spinner glyphs animate, output streams
+    in). A pane that is genuinely idle produces an identical capture across
+    consecutive calls.
 
-    Earlier versions also matched ``✻`` / ``✽`` spinner glyphs and the bare
-    words ``Crunched`` / ``Working`` / ``Thinking``, but Claude leaves
-    *past-tense* status lines on screen after a tool finishes —
-    ``✻ Cogitated for 5m 16s``, ``Crunched for 30s`` — which kept this
-    function returning True forever. That broke the watchdog (issue #84):
-    last_activity_at was bumped on every tick, so the idle clock never
-    started and reminders/timeouts never fired.
+    Earlier versions matched on banner strings (``✻``, ``Crunched``,
+    ``Working``, ``Thinking``, ``esc to interrupt``). Both approaches are
+    brittle: glyph forms persist as past-tense scrollback (the original #84
+    failure mode) and the canonical ``esc to interrupt`` is one Claude UI
+    refresh away from being renamed. Comparing whole captures sidesteps the
+    text dependency entirely.
 
-    A False return means the pane is sitting idle (no agent footer banner).
-    Used by the watchdog to decide whether to bump last_activity_at.
+    Edge cases:
+    - First call for a pane has no prior snapshot → returns False (idle).
+      That's safe because activity is freshly bumped at task enqueue, so the
+      idle clock is well below any threshold.
+    - tmux capture-pane failing returns False — the watchdog must never
+      crash on a transient pane-probe error.
     """
-    r = subprocess.run(
-        ["tmux", "capture-pane", "-p", "-t", pane_id],
-        capture_output=True, text=True,
-    )
-    return "esc to interrupt" in r.stdout
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        return False
+    if r.returncode != 0:
+        return False
+    current = r.stdout
+    prev = _PANE_BUSY_LAST.get(pane_id)
+    _PANE_BUSY_LAST[pane_id] = current
+    return prev is not None and current != prev
 
 
 def _pane_has_task(pane_id: str) -> bool:
