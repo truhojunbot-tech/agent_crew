@@ -102,6 +102,28 @@ def enqueue_test(queue, task_desc: str, branch: str, context: dict = {}, port: i
 _KNOWN_LAYERS = {"test_quality", "code_quality", "business_gap"}
 
 
+def _resolve_verdict(result: TaskResult) -> str:
+    """Map a TaskResult to one of {"approve", "request_changes"}.
+
+    Reviewer agents have been observed posting ``verdict=None`` with empty
+    ``findings`` when they have nothing to flag. The literal CLI rule
+    ``verdict == "approve"`` interprets that as a rejection and forces a
+    re-implementation round (issue #100 — codex, after a clean pass, sent
+    null/[] and the loop ran 4 unnecessary iterations).
+
+    Defensive read:
+    - explicit ``approve`` → ``approve``
+    - any value with non-empty findings → ``request_changes``
+    - missing/None verdict + empty findings → treat as ``approve``
+    """
+    if result.verdict == "approve":
+        return "approve"
+    findings = result.findings or []
+    if not result.verdict and not findings:
+        return "approve"
+    return "request_changes"
+
+
 def handle_review_result(
     result: TaskResult,
     iteration: int,
@@ -112,7 +134,8 @@ def handle_review_result(
     branch: str = "",
     port: int = 0,
 ) -> str:
-    if iteration >= max_iter and result.verdict != "approve":
+    verdict = _resolve_verdict(result)
+    if iteration >= max_iter and verdict != "approve":
         if queue is not None:
             gate = GateRequest(
                 id=f"gate-escalation-{uuid.uuid4().hex[:8]}",
@@ -121,7 +144,7 @@ def handle_review_result(
             )
             queue.create_gate(gate)
         return "escalate"
-    if result.verdict == "approve":
+    if verdict == "approve":
         if queue is not None and not no_tester and task_desc and branch:
             enqueue_test(queue, task_desc, branch, port=port)
         return "approved"
