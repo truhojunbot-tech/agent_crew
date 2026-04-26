@@ -16,6 +16,13 @@ _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 
 
 def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
+    """Return the shell command that launches the agent CLI in its worktree.
+
+    For codex, prefixes ``CODEX_HOME=<wt>/.codex_local`` so the agent reads
+    a worktree-local config (Issue #110 phase 5 — per-agent MCP). codex
+    has no project-local config-file discovery, so the env var is the
+    only way to scope its MCP registration to a single project.
+    """
     cmd = _AGENT_CMDS.get(agent, _DEFAULT_CMD)
     if "--continue" in cmd:
         has_history = worktree_path is not None and os.path.isdir(
@@ -23,6 +30,9 @@ def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
         )
         if not has_history:
             cmd = cmd.replace(" --continue", "")
+    if agent == "codex" and worktree_path:
+        codex_home = os.path.join(worktree_path, ".codex_local")
+        cmd = f"CODEX_HOME={codex_home} {cmd}"
     return cmd
 
 
@@ -204,27 +214,25 @@ def write_instruction_files(worktrees: dict, project: str, port_file: str) -> No
         instructions.write(role, wt_path, project, port_file, agent=agent)
 
 
-def write_mcp_config(worktree_path: str, db_path: str) -> str:
-    """Write a Claude-Code-style ``.mcp.json`` that registers the agent_crew
-    MCP server (Issue #106). The agent picks this up at session start, gets
-    the seven task-queue tools, and runs the pull loop instead of waiting
-    for tmux paste-buffer pushes.
-
-    Existing files are overwritten so re-runs of `crew setup` / `crew recover`
-    always reflect the current DB path.
-    """
-    import json
+def _mcp_python_invocation() -> tuple[str, list[str], str]:
+    """Resolve (interpreter, args, PYTHONPATH) for launching the agent_crew
+    MCP server as a subprocess from any agent CLI."""
     import sys
 
-    # Pin python interpreter explicitly so the agent CLI doesn't pick up a
-    # different one from PATH. PYTHONPATH carries the agent_crew sys.path so
-    # the `python -m agent_crew.mcp_server` lookup succeeds.
+    interpreter = sys.executable
+    args = ["-m", "agent_crew.mcp_server"]
     pythonpath = os.pathsep.join(p for p in sys.path if p)
+    return interpreter, args, pythonpath
+
+
+def _write_mcp_config_claude(worktree_path: str, db_path: str) -> str:
+    """Claude Code reads ``.mcp.json`` at the worktree root."""
+    interpreter, args, pythonpath = _mcp_python_invocation()
     config = {
         "mcpServers": {
             "agent_crew": {
-                "command": sys.executable,
-                "args": ["-m", "agent_crew.mcp_server"],
+                "command": interpreter,
+                "args": args,
                 "env": {
                     "AGENT_CREW_DB": db_path,
                     "PYTHONPATH": pythonpath,
@@ -233,16 +241,100 @@ def write_mcp_config(worktree_path: str, db_path: str) -> str:
         }
     }
     path = os.path.join(worktree_path, ".mcp.json")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump(config, f, indent=2)
     return os.path.abspath(path)
 
 
+def _write_mcp_config_codex(worktree_path: str, db_path: str) -> str:
+    """Codex looks at ``$CODEX_HOME/config.toml``. We point CODEX_HOME at
+    ``<worktree>/.codex_local`` from the agent's launch command (see
+    :func:`_get_agent_cmd`) and write the TOML here."""
+    interpreter, args, pythonpath = _mcp_python_invocation()
+    args_repr = "[" + ", ".join(f'"{a}"' for a in args) + "]"
+    toml_text = (
+        '[mcp_servers.agent_crew]\n'
+        f'command = "{interpreter}"\n'
+        f'args = {args_repr}\n'
+        '[mcp_servers.agent_crew.env]\n'
+        f'AGENT_CREW_DB = "{db_path}"\n'
+        f'PYTHONPATH = "{pythonpath}"\n'
+    )
+    codex_home = os.path.join(worktree_path, ".codex_local")
+    os.makedirs(codex_home, exist_ok=True)
+    path = os.path.join(codex_home, "config.toml")
+    with open(path, "w") as f:
+        f.write(toml_text)
+    return os.path.abspath(path)
+
+
+def _write_mcp_config_gemini(worktree_path: str, db_path: str) -> str:
+    """Gemini auto-discovers ``<worktree>/.gemini/settings.json`` when run
+    from inside the worktree (project scope). We merge our `mcpServers`
+    block into whatever else might already live there."""
+    interpreter, args, pythonpath = _mcp_python_invocation()
+    settings_dir = os.path.join(worktree_path, ".gemini")
+    os.makedirs(settings_dir, exist_ok=True)
+    path = os.path.join(settings_dir, "settings.json")
+    existing: dict = {}
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                existing = json.load(f) or {}
+            if not isinstance(existing, dict):
+                existing = {}
+        except (OSError, json.JSONDecodeError):
+            existing = {}
+    servers = existing.get("mcpServers")
+    if not isinstance(servers, dict):
+        servers = {}
+    servers["agent_crew"] = {
+        "command": interpreter,
+        "args": args,
+        "env": {
+            "AGENT_CREW_DB": db_path,
+            "PYTHONPATH": pythonpath,
+        },
+    }
+    existing["mcpServers"] = servers
+    with open(path, "w") as f:
+        json.dump(existing, f, indent=2)
+    return os.path.abspath(path)
+
+
+def write_mcp_config(
+    worktree_path: str,
+    db_path: str,
+    agent: str = "claude",
+) -> str:
+    """Write the per-worktree MCP config for ``agent``.
+
+    Each agent CLI reads its MCP registration from a different place,
+    so the default Claude-Code ``.mcp.json`` we used in #106 phase 2 was
+    invisible to codex and gemini (Issue #110 phase 5):
+
+    - claude → ``<worktree>/.mcp.json``
+    - codex  → ``<worktree>/.codex_local/config.toml`` (with ``CODEX_HOME``
+      env on launch — see ``_get_agent_cmd``)
+    - gemini → ``<worktree>/.gemini/settings.json`` (auto-discovered when
+      gemini is launched from the worktree)
+
+    Falls back to the claude path for unknown agent names so legacy
+    callers and ad-hoc one-off agents keep working.
+    """
+    if agent == "codex":
+        return _write_mcp_config_codex(worktree_path, db_path)
+    if agent == "gemini":
+        return _write_mcp_config_gemini(worktree_path, db_path)
+    return _write_mcp_config_claude(worktree_path, db_path)
+
+
 def write_mcp_configs(worktrees: dict, db_path: str) -> None:
-    """Apply :func:`write_mcp_config` to every agent worktree."""
-    for wt_path in worktrees.values():
-        write_mcp_config(wt_path, db_path)
+    """Apply :func:`write_mcp_config` to every agent worktree using the
+    correct per-agent config layout."""
+    for agent, wt_path in worktrees.items():
+        write_mcp_config(wt_path, db_path, agent=agent)
 
 
 def write_sessions_json(path: str, agents: list[dict]) -> None:
