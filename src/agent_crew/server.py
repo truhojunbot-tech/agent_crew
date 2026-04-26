@@ -178,22 +178,39 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float) -> st
     """Watchdog nudge: agent has been silent past the heartbeat threshold.
 
     Includes the canonical POST template so the agent can resolve the task in
-    one paste even if the original block scrolled out of context.
+    one paste even if the original block scrolled out of context. Also covers
+    the API stream-timeout recovery path (issue #85): after a transient
+    network failure the agent CLI may drop back to the prompt with no result
+    posted; this reminder is the canonical handoff to either retry or fail
+    out cleanly.
     """
     return (
         f"=== AGENT_CREW REMINDER ===\n"
         f"task_id: {task_id}\n"
-        f"Your assigned task has been silent for {idle_seconds:.0f}s with no\n"
-        f"sign of activity in this pane. The crew stalls until you POST the\n"
-        f"result.\n"
+        f"This pane has been silent for {idle_seconds:.0f}s with no sign of\n"
+        f"activity. The crew stalls until you POST a result for this task.\n"
         f"\n"
-        f"If finished, POST now:\n"
+        f"Pick one of the three paths below. Paste the curl block, edit the\n"
+        f"placeholders, run it.\n"
+        f"\n"
+        f"1) FINISHED — POST status=\"completed\":\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"completed\","
         f"\"summary\":\"...\",\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
         f"\n"
-        f"If still working, ignore this — the next heartbeat will see you busy.\n"
+        f"2) STREAM/API TIMEOUT (partial response, can't recover) — POST\n"
+        f"   status=\"failed\". The fallback policy will reroute this task\n"
+        f"   to the next agent in the chain automatically:\n"
+        f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"    -H 'Content-Type: application/json' \\\n"
+        f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"failed\","
+        f"\"summary\":\"API stream timeout — partial response, no recovery\","
+        f"\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
+        f"\n"
+        f"3) STILL WORKING — ignore this nudge. The next heartbeat will see\n"
+        f"   the pane churning and reset the idle clock. If you can't tell\n"
+        f"   why the pane went quiet, prefer path (2) over silence.\n"
         f"=== END REMINDER ===\n"
     )
 
@@ -449,14 +466,37 @@ def create_app(
                 reminded_task_ids.discard(task_id)
                 actions["timed_out"].append(task_id)
                 if tt is not None:
-                    role = _TYPE_TO_ROLE.get(tt)
-                    if role:
-                        try:
-                            _try_push_next(role)
-                        except Exception:
-                            logger.exception(
-                                f"watchdog: failed to push next task for role {role}"
-                            )
+                    # Reuse the rate-limit fallback hook so a stuck pane gets
+                    # routed to the next agent in the chain instead of just
+                    # falling through to the same role's pending queue. The
+                    # summary above contains "watchdog timeout" / "pane idle"
+                    # patterns that `is_rate_limit_error` recognizes (#85).
+                    synthetic_result = TaskResult(
+                        task_id=task_id,
+                        status="failed",
+                        summary=summary,
+                        verdict=None,
+                        findings=[],
+                        pr_number=None,
+                    )
+                    handled = False
+                    try:
+                        handled = _auto_fallback_failed_task(
+                            task_id, synthetic_result, tt
+                        )
+                    except Exception:
+                        logger.exception(
+                            f"watchdog: fallback hook raised for {task_id}"
+                        )
+                    if not handled:
+                        role = _TYPE_TO_ROLE.get(tt)
+                        if role:
+                            try:
+                                _try_push_next(role)
+                            except Exception:
+                                logger.exception(
+                                    f"watchdog: failed to push next task for role {role}"
+                                )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
                 try:
                     push_fn(pane_id, _format_reminder_message(task_id, port, idle_for))

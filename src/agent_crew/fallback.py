@@ -15,9 +15,12 @@ import os
 import re
 from typing import Any, Optional
 
-# Patterns surfaced by alpha_engine #756 / #759 across the three providers we
-# routinely run. Compiled case-insensitively. Add new ones here when an
-# additional provider message starts leaking through.
+# Failover signals: any failure summary that means "this agent can't make
+# forward progress, try a different one." Rate-limit messages are the bulk
+# of these (alpha_engine #756 / #759). Watchdog-timeout summaries (#85)
+# also qualify — a stuck pane after API stream-timeout recovers fastest by
+# routing the task to a fresh agent rather than retrying the same one.
+# Compiled case-insensitively.
 _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     r"usage limit",          # codex / openai
     r"rate[- ]?limit",       # claude / generic
@@ -27,6 +30,11 @@ _RATE_LIMIT_PATTERNS: tuple[str, ...] = (
     r"too many requests",    # http 429
     r"resource[_ ]exhausted",  # google "resource_exhausted"
     r"insufficient[_ ]quota",  # openai
+    r"stream[ _]idle[ _]timeout",  # claude code "API Stream idle timeout"
+    r"stream[ _]timeout",          # generic streaming-API timeout
+    r"watchdog timeout",           # agent_crew force_fail summary (#85)
+    r"pane idle",                  # alternate watchdog phrasing
+    r"partial response",           # claude code partial-response state
 )
 
 _RATE_LIMIT_RE = re.compile("|".join(_RATE_LIMIT_PATTERNS), re.IGNORECASE)
