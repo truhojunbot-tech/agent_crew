@@ -176,3 +176,145 @@ def test_u_t10_triage_cli_exits_on_repo_mismatch(tmp_path):
     assert result.exit_code != 0
     output = result.output.lower()
     assert "mismatch" in output or "wrong" in output or "repo" in output
+
+
+# ---------------------------------------------------------------------------
+# U-T11..U-T17 — dependency-aware selection (Issue #82)
+# ---------------------------------------------------------------------------
+
+
+from agent_crew.triage import (  # noqa: E402
+    fetch_recent_merge_history,
+    filter_blocked,
+    parse_dependencies,
+)
+
+
+# U-T11: parse_dependencies extracts Parent + Phase from issue body
+def test_u_t11_parse_dependencies_basic():
+    body = "Parent: #54 | Phase 2\n\nImplement RegimeDetector consumer."
+    deps = parse_dependencies(body)
+    assert deps["parents"] == [54]
+    assert deps["phase"] == 2
+
+
+def test_u_t11b_parse_dependencies_alternate_keywords():
+    """`depends on` and `blocked by` should both register parents."""
+    body = "Depends on #10 and blocked by #11. Phase 3."
+    deps = parse_dependencies(body)
+    assert sorted(deps["parents"]) == [10, 11]
+    assert deps["phase"] == 3
+
+
+def test_u_t11c_parse_dependencies_no_markers():
+    deps = parse_dependencies("Plain description, no metadata.")
+    assert deps["parents"] == []
+    assert deps["phase"] is None
+
+
+def test_u_t11d_parse_dependencies_none_body():
+    deps = parse_dependencies(None)
+    assert deps == {"parents": [], "phase": None}
+
+
+def test_u_t11e_parse_dependencies_dedupes():
+    body = "Parent: #54. Also Parent: #54. Depends on #54."
+    deps = parse_dependencies(body)
+    assert deps["parents"] == [54]
+
+
+# U-T12: parse_issues now propagates parents + phase fields
+def test_u_t12_parse_issues_carries_dependencies():
+    raw = [
+        {
+            "number": 100,
+            "title": "Build consumer",
+            "labels": [],
+            "body": "Parent: #54 | Phase 2",
+        }
+    ]
+    result = parse_issues(raw)
+    assert result[0]["parents"] == [54]
+    assert result[0]["phase"] == 2
+
+
+# U-T13: filter_blocked drops issues with open parents
+def test_u_t13_filter_blocked_drops_unmet_parent():
+    issues = [
+        {"number": 54, "title": "Foundation", "labels": [], "parents": [], "phase": 1},
+        {"number": 100, "title": "Consumer", "labels": [], "parents": [54], "phase": 2},
+    ]
+    eligible = filter_blocked(issues, closed_issue_numbers=set())
+    # #54 has no parents → eligible. #100 depends on #54 (open) → blocked.
+    assert {i["number"] for i in eligible} == {54}
+
+
+def test_u_t13b_filter_blocked_unblocks_when_parent_closed():
+    issues = [
+        {"number": 100, "title": "Consumer", "labels": [], "parents": [54], "phase": 2},
+    ]
+    # #54 is in the closed set — #100 is now eligible.
+    eligible = filter_blocked(issues, closed_issue_numbers={54})
+    assert {i["number"] for i in eligible} == {100}
+
+
+def test_u_t13c_filter_blocked_unblocks_when_parent_not_in_open_set():
+    # If a parent is neither in `closed` nor in the open list, treat it as
+    # already done (e.g. user closed-as-not-planned, or it was never an
+    # actual issue — happens with cross-repo refs).
+    issues = [
+        {"number": 100, "title": "Consumer", "labels": [], "parents": [9999], "phase": 2},
+    ]
+    eligible = filter_blocked(issues, closed_issue_numbers=set())
+    assert {i["number"] for i in eligible} == {100}
+
+
+# U-T14: build_prompt surfaces phase + parents to the agent
+def test_u_t14_build_prompt_shows_dependencies():
+    issues = [
+        {
+            "number": 54, "title": "Build foundation",
+            "labels": ["enhancement"], "parents": [], "phase": 1,
+        },
+        {
+            "number": 100, "title": "Wire consumer",
+            "labels": [], "parents": [54], "phase": 2,
+        },
+    ]
+    prompt = build_prompt(issues, "none")
+    assert "phase: 1" in prompt
+    assert "phase: 2" in prompt
+    assert "parents: #54" in prompt
+    # The instruction must explicitly mention dependency-aware selection
+    assert "dependencies" in prompt.lower() or "phase" in prompt.lower()
+
+
+# U-T15: fetch_recent_merge_history returns "none" on subprocess failure
+def test_u_t15_merge_history_subprocess_failure():
+    with patch(
+        "agent_crew.triage.subprocess.run",
+        side_effect=Exception("gh missing"),
+    ):
+        assert fetch_recent_merge_history("any/repo") == "none"
+
+
+def test_u_t15b_merge_history_empty_returns_none():
+    fake = MagicMock(stdout="[]", returncode=0)
+    with patch("agent_crew.triage.subprocess.run", return_value=fake):
+        assert fetch_recent_merge_history("any/repo") == "none"
+
+
+def test_u_t15c_merge_history_formats_pr_lines():
+    fake = MagicMock(
+        stdout=json.dumps(
+            [
+                {"number": 11, "title": "feat: A"},
+                {"number": 12, "title": "fix: B"},
+            ]
+        ),
+        returncode=0,
+    )
+    with patch("agent_crew.triage.subprocess.run", return_value=fake):
+        history = fetch_recent_merge_history("any/repo")
+    assert "#11" in history and "feat: A" in history
+    assert "#12" in history and "fix: B" in history
