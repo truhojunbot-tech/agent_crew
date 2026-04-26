@@ -1066,19 +1066,46 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 time.sleep(10)
             else:
                 time.sleep(0.5)
-        # Wrapper deadline hit before the agent posted a result. Don't leave
-        # the task in the DB as in_progress (#87). Auto-submit a failure with
-        # a watchdog-shaped summary so the rate-limit fallback policy reroutes
-        # to the next agent in the chain instead of stranding the loop.
+        # Wrapper deadline hit before the agent posted a result. Don't blanket-
+        # auto-fail (#92): if the pane shows the agent is still actively working,
+        # extend the deadline rather than killing legitimate long tasks. Cap the
+        # extensions to prevent runaway waits — with #84 v2 the watchdog will
+        # eventually catch a true zombie at its own threshold.
+        max_extensions = 3
+        extension_seconds = max(300.0, wait_timeout / 2.0)
+        extensions = 0
+        while extensions < max_extensions:
+            pane_out = _capture_pane(first_pane_target) if first_pane_target else None
+            still_busy = bool(pane_out) and not _pane_looks_idle(pane_out)
+            if not still_busy:
+                break
+            extensions += 1
+            deadline = time.time() + extension_seconds
+            click.echo(
+                f"Warning: task {task_id!r} hit {wait_timeout}s budget but pane "
+                f"still active. Extending deadline by {extension_seconds:.0f}s "
+                f"(extension {extensions}/{max_extensions})."
+            )
+            while time.time() < deadline:
+                result = queue.get_result(task_id)
+                if result is not None:
+                    return result
+                time.sleep(2.0)
+        # Either the pane never showed activity again or we exhausted the
+        # extension budget. Auto-submit a failure with a watchdog-shaped
+        # summary so the rate-limit fallback policy reroutes to the next
+        # agent in the chain instead of stranding the loop (#87).
         reason = (
             f"watchdog timeout: crew run wrapper exited after {wait_timeout}s "
-            f"without a result POST for task {task_id!r}. Auto-failed for queue cleanup."
+            f"({extensions} extension(s)) without a result POST for task {task_id!r}. "
+            f"Auto-failed for queue cleanup."
         )
         click.echo(f"Warning: {reason}")
         _auto_submit_failed(task_id, reason)
         raise click.ClickException(
-            f"task {task_id!r} timed out after {wait_timeout}s — auto-failed "
-            f"for queue cleanup. Inspect with `crew status {project}` and re-dispatch if needed."
+            f"task {task_id!r} timed out after {wait_timeout}s "
+            f"({extensions} extension(s)) — auto-failed for queue cleanup. "
+            f"Inspect with `crew status {project}` and re-dispatch if needed."
         )
 
     def _auto_resolve_gates(port: int) -> int:
