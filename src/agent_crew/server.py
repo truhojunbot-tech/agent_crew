@@ -552,9 +552,18 @@ def create_app(
         except asyncio.CancelledError:
             return
 
-    def _auto_enqueue_review(impl_task_id: str) -> None:
+    def _auto_enqueue_review(
+        impl_task_id: str,
+        pr_number: Optional[int] = None,
+    ) -> None:
         """Auto-enqueue a review task when an impl task completes.
-        This ensures review is triggered independently of CLI timeout."""
+        This ensures review is triggered independently of CLI timeout.
+
+        ``pr_number`` is the PR opened by the impl run (if any). It's threaded
+        into both the review task context and the rendered instructions so
+        the reviewer always pins findings to the live PR head commit instead
+        of an earlier round's diff (issue #86).
+        """
         try:
             # Get the original impl task to extract description and branch
             impl_tasks = [t for t in q().list_tasks() if t.task_id == impl_task_id]
@@ -573,6 +582,26 @@ def create_app(
                 )
                 return
 
+            # Build a freshness directive that is unambiguous about reviewing
+            # the live PR HEAD, not a stale local copy or an earlier round.
+            if pr_number is not None:
+                pr_directive = (
+                    f"\n\nFRESHNESS: review PR #{pr_number} at its CURRENT head. "
+                    f"Run `gh pr diff {pr_number}` (and/or "
+                    f"`gh pr view {pr_number} --json commits`) FIRST. Do NOT "
+                    f"reuse line numbers from any earlier review round — they "
+                    f"reference the prior commit. Pin every finding to the "
+                    f"latest commit's file:line."
+                )
+            else:
+                pr_directive = (
+                    f"\n\nFRESHNESS: identify the PR for branch "
+                    f"{impl_task.branch!r} via `gh pr list --head "
+                    f"{impl_task.branch}`, then `gh pr diff <num>` to fetch "
+                    f"the live head before pinning findings. Do NOT review "
+                    f"from a stale local copy."
+                )
+
             # Create review task with same description/branch, reference to impl task.
             # Inherit top-level project from impl task so the cross-project guard works
             # for subsequent hops in the pipeline (review → test).
@@ -584,8 +613,10 @@ def create_app(
                     "1) test_quality — coverage, edge cases, mocks; "
                     "2) code_quality — naming, error handling, SOLID; "
                     "3) business_gap — requirements met, logging, observability."
+                    + pr_directive
                 ),
                 "prev_task_id": impl_task_id,
+                "pr_number": pr_number,
             }
             review_req = TaskRequest(
                 task_id=f"review-{uuid.uuid4().hex[:8]}",
@@ -836,10 +867,12 @@ def create_app(
                 logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
                 if not _auto_fallback_failed_task(task_id, result, task_type):
                     _auto_retry_failed_task(task_id, result, task_type)
-            # Auto-transition: impl task completed → auto-enqueue review task
+            # Auto-transition: impl task completed → auto-enqueue review task.
+            # Pass through the PR number from the impl result so the reviewer
+            # task description nails down which PR head to diff (#86).
             if task_type == "implement" and result.status == "completed":
                 logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
-                _auto_enqueue_review(task_id)
+                _auto_enqueue_review(task_id, pr_number=result.pr_number)
             # Auto-transition: review task approved → auto-enqueue test task
             if task_type == "review" and result.verdict == "approve":
                 logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
