@@ -359,6 +359,11 @@ def setup(project: str, agents: str, base: str):
     # Instruction files (into each worktree)
     setup_module.write_instruction_files(worktrees, project, port_file)
 
+    # MCP config (Issue #106) — register agent_crew MCP server in each
+    # worktree so agents pull tasks via MCP instead of receiving via tmux.
+    db_file = os.path.join(proj_dir, "tasks.db")
+    setup_module.write_mcp_configs(worktrees, db_file)
+
     # sessions.json
     sessions_file = os.path.join(proj_dir, "sessions.json")
     agent_dicts = [{"name": a, "pane": i} for i, a in enumerate(agent_list)]
@@ -727,6 +732,9 @@ def recover(project: str, base: str):
 
     # Ensure instruction files exist in all worktrees before agents start
     setup_module.write_instruction_files(worktrees, project, port_file)
+
+    # Refresh MCP config too — picks up any path changes on recover (#106).
+    setup_module.write_mcp_configs(worktrees, db_file)
 
     # Restart server if not listening
     if not _port_listening(port, timeout=1.0):

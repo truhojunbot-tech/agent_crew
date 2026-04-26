@@ -1,5 +1,7 @@
 import os
 
+from agent_crew.prompts.task_loop import build_task_loop_prompt
+
 # The agent_crew instructions are written to .claude/CLAUDE.md inside each
 # worktree so they do not conflict with the project's own root CLAUDE.md (which
 # is tracked in git and would be reverted by any git operation).  Claude Code
@@ -9,6 +11,15 @@ ROLE_FILES: dict = {
     "implementer": ".claude/CLAUDE.md",
     "reviewer": ".claude/AGENTS.md",
     "tester": ".claude/GEMINI.md",
+}
+
+# Default agent name per role — used when a caller passes role but not the
+# agent identifier. The agent name is what appears inside the task-loop
+# prompt's `[agent: NAME]` tag and the `get_next_task(agent=...)` arg.
+_DEFAULT_AGENT_FOR_ROLE: dict = {
+    "implementer": "claude",
+    "reviewer": "codex",
+    "tester": "gemini",
 }
 
 _COMMON = """\
@@ -308,19 +319,36 @@ and submit your opinion in the result `summary`.
 }
 
 
-def generate(role: str, project: str, port: int) -> str:
+def generate(role: str, project: str, port: int, agent: str = "") -> str:
+    """Render the role's instruction file.
+
+    ``agent`` is the canonical agent identifier (``claude``/``codex``/``gemini``)
+    used by the MCP task-loop prompt (Issue #106) for both the
+    ``get_next_task(agent=...)`` argument and the ``[agent: NAME]`` tag.
+    Falls back to the role's default agent when omitted, which keeps
+    legacy callers working unchanged.
+    """
+    resolved_agent = agent or _DEFAULT_AGENT_FOR_ROLE.get(role, role)
+    task_loop = build_task_loop_prompt(resolved_agent, role=role)
     section = _ROLE_SECTIONS.get(role, f"## Role: {role}\n")
-    content = (_COMMON + section).replace("<project>", project).replace("<port>", str(port))
+    body = task_loop + "\n---\n\n" + _COMMON + section
+    content = body.replace("<project>", project).replace("<port>", str(port))
     return content
 
 
-def write(role: str, worktree_path: str, project: str, port_file: str) -> str:
+def write(
+    role: str,
+    worktree_path: str,
+    project: str,
+    port_file: str,
+    agent: str = "",
+) -> str:
     if role not in ROLE_FILES:
         raise ValueError(f"Unknown role: {role!r}. Must be one of {list(ROLE_FILES)}")
     with open(port_file) as f:
         port = int(f.read().strip())
     filename = ROLE_FILES[role]
-    content = generate(role, project, port)
+    content = generate(role, project, port, agent=agent)
     path = os.path.join(worktree_path, filename)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
