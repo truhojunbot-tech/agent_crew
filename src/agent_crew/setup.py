@@ -10,7 +10,11 @@ from agent_crew import instructions, session
 _AGENT_CMDS = {
     "claude": "claude --dangerously-skip-permissions --continue",
     "codex": "codex --dangerously-bypass-approvals-and-sandbox",
-    "gemini": "gemini --yolo",
+    # ``--approval-mode yolo`` is the policy-engine flag that fully
+    # bypasses every tool prompt (including shell/git which the legacy
+    # ``--yolo`` short flag was observed to miss when an MCP server is
+    # registered alongside built-in tools — Issue #110 phase 5b).
+    "gemini": "gemini --approval-mode yolo",
 }
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 
@@ -247,6 +251,33 @@ def _write_mcp_config_claude(worktree_path: str, db_path: str) -> str:
     return os.path.abspath(path)
 
 
+def _bootstrap_codex_auth(codex_home: str) -> None:
+    """Copy ``~/.codex/auth.json`` into a worktree-local ``$CODEX_HOME``.
+
+    With ``CODEX_HOME=<wt>/.codex_local`` codex no longer falls back to
+    ``~/.codex`` for authentication — it would prompt for a fresh OAuth
+    flow on every worktree. Reuse the operator's existing auth by
+    copying the credentials file in once at setup. We do NOT symlink
+    because codex rewrites this file on token refresh and the symlink
+    could leak token expiry between unrelated sessions.
+
+    Idempotent: skipped silently when the global file is missing or
+    already mirrored. Permission mode 0600 is preserved.
+    """
+    src = os.path.expanduser("~/.codex/auth.json")
+    if not os.path.isfile(src):
+        return
+    dst = os.path.join(codex_home, "auth.json")
+    try:
+        with open(src, "rb") as fsrc, open(dst, "wb") as fdst:
+            fdst.write(fsrc.read())
+        os.chmod(dst, 0o600)
+    except OSError:
+        # Don't crash setup over a missing auth file — codex will just
+        # prompt the user to log in once when it next starts up.
+        return
+
+
 def _write_mcp_config_codex(worktree_path: str, db_path: str) -> str:
     """Codex looks at ``$CODEX_HOME/config.toml``. We point CODEX_HOME at
     ``<worktree>/.codex_local`` from the agent's launch command (see
@@ -266,6 +297,7 @@ def _write_mcp_config_codex(worktree_path: str, db_path: str) -> str:
     path = os.path.join(codex_home, "config.toml")
     with open(path, "w") as f:
         f.write(toml_text)
+    _bootstrap_codex_auth(codex_home)
     return os.path.abspath(path)
 
 
