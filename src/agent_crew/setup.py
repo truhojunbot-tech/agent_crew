@@ -201,7 +201,48 @@ _AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "teste
 def write_instruction_files(worktrees: dict, project: str, port_file: str) -> None:
     for agent, wt_path in worktrees.items():
         role = _AGENT_TO_ROLE.get(agent, "implementer")
-        instructions.write(role, wt_path, project, port_file)
+        instructions.write(role, wt_path, project, port_file, agent=agent)
+
+
+def write_mcp_config(worktree_path: str, db_path: str) -> str:
+    """Write a Claude-Code-style ``.mcp.json`` that registers the agent_crew
+    MCP server (Issue #106). The agent picks this up at session start, gets
+    the seven task-queue tools, and runs the pull loop instead of waiting
+    for tmux paste-buffer pushes.
+
+    Existing files are overwritten so re-runs of `crew setup` / `crew recover`
+    always reflect the current DB path.
+    """
+    import json
+    import sys
+
+    # Pin python interpreter explicitly so the agent CLI doesn't pick up a
+    # different one from PATH. PYTHONPATH carries the agent_crew sys.path so
+    # the `python -m agent_crew.mcp_server` lookup succeeds.
+    pythonpath = os.pathsep.join(p for p in sys.path if p)
+    config = {
+        "mcpServers": {
+            "agent_crew": {
+                "command": sys.executable,
+                "args": ["-m", "agent_crew.mcp_server"],
+                "env": {
+                    "AGENT_CREW_DB": db_path,
+                    "PYTHONPATH": pythonpath,
+                },
+            }
+        }
+    }
+    path = os.path.join(worktree_path, ".mcp.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(config, f, indent=2)
+    return os.path.abspath(path)
+
+
+def write_mcp_configs(worktrees: dict, db_path: str) -> None:
+    """Apply :func:`write_mcp_config` to every agent worktree."""
+    for wt_path in worktrees.values():
+        write_mcp_config(wt_path, db_path)
 
 
 def write_sessions_json(path: str, agents: list[dict]) -> None:
