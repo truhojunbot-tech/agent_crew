@@ -20,6 +20,7 @@ from agent_crew.fallback import (
     load_fallback_chains,
     next_agent,
 )
+from agent_crew.loop import _resolve_verdict
 from agent_crew.notify import notify_telegram
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
@@ -643,9 +644,14 @@ def create_app(
                 return
             review_task = review_tasks[0]
 
-            # Get the review result to confirm it was approved
+            # Get the review result to confirm it was approved. Use the
+            # defensive verdict resolver from loop.py so reviewers that
+            # post `verdict=null` with empty findings still trip the
+            # auto-test (#100).
             review_result = q().get_result(review_task_id)
-            if not review_result or review_result.verdict != "approve":
+            if not review_result:
+                return
+            if _resolve_verdict(review_result) != "approve":
                 return
 
             # Create test task with same description/branch, reference to review task
@@ -873,8 +879,10 @@ def create_app(
             if task_type == "implement" and result.status == "completed":
                 logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
                 _auto_enqueue_review(task_id, pr_number=result.pr_number)
-            # Auto-transition: review task approved → auto-enqueue test task
-            if task_type == "review" and result.verdict == "approve":
+            # Auto-transition: review approved → auto-enqueue test task. Use
+            # the defensive verdict resolver so a clean `verdict=null`+`[]`
+            # review counts as approved (#100).
+            if task_type == "review" and _resolve_verdict(result) == "approve":
                 logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                 _auto_enqueue_test(task_id)
             # Task done → that role is now idle → push the next pending task of the same role.
