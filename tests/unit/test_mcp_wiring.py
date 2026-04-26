@@ -98,14 +98,27 @@ class TestWriteMcpConfig:
 
 
 class TestWriteMcpConfigs:
-    def test_applies_to_each_worktree(self, tmp_path):
-        wt_a = tmp_path / "a"
-        wt_b = tmp_path / "b"
-        wt_a.mkdir()
-        wt_b.mkdir()
-        worktrees = {"claude": str(wt_a), "codex": str(wt_b)}
+    def test_applies_correct_layout_per_agent(self, tmp_path):
+        """Phase 5 (#110): each agent's config file lives where that
+        CLI actually reads it from. Detailed per-agent assertions live
+        in test_mcp_config_per_agent.py — this is the dispatch smoke
+        test."""
+        wt_c = tmp_path / "c"
+        wt_x = tmp_path / "x"
+        wt_g = tmp_path / "g"
+        for p in (wt_c, wt_x, wt_g):
+            p.mkdir()
+        worktrees = {
+            "claude": str(wt_c),
+            "codex": str(wt_x),
+            "gemini": str(wt_g),
+        }
         crew_setup.write_mcp_configs(worktrees, "/db/tasks.db")
-        for wt in (wt_a, wt_b):
-            assert (wt / ".mcp.json").exists()
-            config = json.loads((wt / ".mcp.json").read_text())
-            assert config["mcpServers"]["agent_crew"]["env"]["AGENT_CREW_DB"] == "/db/tasks.db"
+        # claude → .mcp.json
+        assert (wt_c / ".mcp.json").exists()
+        config = json.loads((wt_c / ".mcp.json").read_text())
+        assert config["mcpServers"]["agent_crew"]["env"]["AGENT_CREW_DB"] == "/db/tasks.db"
+        # codex → .codex_local/config.toml
+        assert (wt_x / ".codex_local" / "config.toml").exists()
+        # gemini → .gemini/settings.json
+        assert (wt_g / ".gemini" / "settings.json").exists()
