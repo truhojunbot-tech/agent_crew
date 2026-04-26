@@ -15,8 +15,10 @@ class TestNotifyTelegram:
     def test_missing_bot_token_returns_false_no_httpx_call(self):
         """If TELEGRAM_BOT_TOKEN is absent, return False without calling httpx."""
         with patch.dict("os.environ", {}, clear=True):
-            result = notify_telegram("test message", chat_id="123")
-            assert result is False
+            with patch("agent_crew.notify.httpx.post") as mock_post:
+                result = notify_telegram("test message", chat_id="123")
+                assert result is False
+                mock_post.assert_not_called()
 
     def test_missing_chat_id_env_and_no_arg_returns_false(self):
         """If TELEGRAM_CHAT_ID missing from env and no chat_id arg, return False."""

@@ -25,7 +25,7 @@ def notify_telegram(message: str, chat_id: Optional[str] = None) -> bool:
         if not bot_token:
             return False
 
-        resolved_chat_id = chat_id or os.getenv("TELEGRAM_CHAT_ID")
+        resolved_chat_id = chat_id if chat_id is not None else os.getenv("TELEGRAM_CHAT_ID")
         if not resolved_chat_id:
             return False
 
@@ -55,6 +55,6 @@ def notify_console(message: str) -> bool:
     """
     try:
         print(message, file=sys.stderr)
-        return True
     except Exception:
-        return False
+        pass
+    return True
