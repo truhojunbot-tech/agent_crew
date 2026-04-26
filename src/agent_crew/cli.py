@@ -1066,7 +1066,20 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 time.sleep(10)
             else:
                 time.sleep(0.5)
-        raise click.ClickException(f"task {task_id!r} timed out after {wait_timeout}s")
+        # Wrapper deadline hit before the agent posted a result. Don't leave
+        # the task in the DB as in_progress (#87). Auto-submit a failure with
+        # a watchdog-shaped summary so the rate-limit fallback policy reroutes
+        # to the next agent in the chain instead of stranding the loop.
+        reason = (
+            f"watchdog timeout: crew run wrapper exited after {wait_timeout}s "
+            f"without a result POST for task {task_id!r}. Auto-failed for queue cleanup."
+        )
+        click.echo(f"Warning: {reason}")
+        _auto_submit_failed(task_id, reason)
+        raise click.ClickException(
+            f"task {task_id!r} timed out after {wait_timeout}s — auto-failed "
+            f"for queue cleanup. Inspect with `crew status {project}` and re-dispatch if needed."
+        )
 
     def _auto_resolve_gates(port: int) -> int:
         """Resolve any pending gates via HTTP. Returns count of resolved gates."""
