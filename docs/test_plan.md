@@ -17,7 +17,7 @@
 **Conventions**:
 - All tests under `tests/`
 - Fixtures in `tests/conftest.py`
-- Temp directories via `tmp_path` fixture (no real `/tmp/agent_crew` pollution)
+- Temp directories via `tmp_path` fixture (no real `~/.agent_crew` pollution)
 - SQLite uses `:memory:` or temp file for unit/integration tests
 
 ---
@@ -232,7 +232,7 @@ End-to-end tests using real CLI, tmux, and git. Run in isolated temp directory w
 ```bash
 # stub agent: reads task from server, writes a result
 #!/bin/bash
-PORT=$(cat /tmp/agent_crew/$PROJECT/port)
+PORT=$(cat ~/.agent_crew/$PROJECT/port)
 TASK=$(curl -s "http://localhost:$PORT/tasks/next?agent=$AGENT&role=$ROLE")
 # ... process task ...
 curl -s -X POST "http://localhost:$PORT/tasks/$TASK_ID/result" -d '{"status":"completed","summary":"done"}'

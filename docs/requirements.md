@@ -280,7 +280,7 @@ crew teardown <project>                               # cleanup worktrees + serv
 ## 11. Security
 
 - No credentials stored in any project file
-- All runtime state (`sessions.json`, `agent_crew.db`, `port`) lives in `/tmp` — not in repo
+- All runtime state (`state.json`, `sessions.json`, `tasks.db`, `port`) lives under `$HOME/.agent_crew/<project>/` — never in the user's git repo
 - All secrets passed via environment variables
 - Public repo must contain no user-specific paths, tokens, or hostnames
 
@@ -289,8 +289,9 @@ crew teardown <project>                               # cleanup worktrees + serv
 ## 12. Environment Variables
 
 ```
-AGENT_CREW_WORKTREES   base path for git worktrees (default: $HOME/.agent_crew/worktrees)
-AGENT_CREW_COMM_DIR    base path for comm dirs     (default: /tmp/agent_crew)
+AGENT_CREW_BASE        base path for per-project state + worktrees (default: $HOME/.agent_crew)
+AGENT_CREW_DB          SQLite task DB path (set per-project by `crew setup`; uvicorn fallback only)
+AGENT_CREW_PANE_MAP    pane_map.json path (set per-project by `crew setup`)
 AGENT_CREW_PORT        force a fixed server port   (default: auto, starting from 8100)
 SESSION_MAX_HOURS      session age before refresh  (default: 24)
 SESSION_MAX_FAILURES   consecutive failures before refresh (default: 2)
