@@ -266,6 +266,7 @@ def test_u_c20_recover_all_panes_alive_noop(tmp_path):
          patch("agent_crew.cli._pane_alive", return_value=True), \
          patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
          patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
         result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
 
@@ -315,6 +316,7 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
          patch("agent_crew.cli._pane_alive", side_effect=_fake_pane_alive), \
          patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
          patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
         result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
 
@@ -371,7 +373,9 @@ def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
     runner = CliRunner()
     with patch("agent_crew.cli._port_listening", return_value=True), \
          patch("agent_crew.cli._pane_alive", return_value=False), \
+         patch("agent_crew.cli.os.path.isdir", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run) as mock_run, \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
          patch("agent_crew.cli.setup_module.start_agents_in_panes") as mock_start:
         result = runner.invoke(crew, ["recover", "rcproj", "--base", str(tmp_path)])
 
