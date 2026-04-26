@@ -13,6 +13,7 @@ from typing import Callable, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from agent_crew.anomaly import check_wrong_repo
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
 
@@ -199,6 +200,9 @@ def create_app(
     reminder_seconds: Optional[float] = None,
     timeout_seconds: Optional[float] = None,
     watchdog_disabled: Optional[bool] = None,
+    anomaly_interval: Optional[float] = None,
+    anomaly_disabled: Optional[bool] = None,
+    state_path: Optional[str] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -216,6 +220,13 @@ def create_app(
         Falls back to env ``AGENT_CREW_TIMEOUT_SECONDS`` then 900s.
     watchdog_disabled: skip the background loop entirely (tests). Falls back
         to env ``AGENT_CREW_WATCHDOG_DISABLED``.
+    anomaly_interval: seconds between wrong-repo anomaly sweeps (Issue #80).
+        Falls back to env ``AGENT_CREW_ANOMALY_INTERVAL`` then 600s.
+    anomaly_disabled: skip the anomaly sweep entirely. Falls back to
+        ``AGENT_CREW_ANOMALY_DISABLED`` (or auto-disabled when no
+        ``AGENT_CREW_GH_USERNAME`` is configured).
+    state_path: path to the per-project state.json — used by the anomaly
+        sweep to auto-detect the expected repo allow-list.
     """
     if watchdog_interval is None:
         watchdog_interval = float(os.getenv("AGENT_CREW_WATCHDOG_INTERVAL", "30"))
@@ -227,6 +238,12 @@ def create_app(
         watchdog_disabled = os.getenv("AGENT_CREW_WATCHDOG_DISABLED", "").lower() in (
             "1", "true", "yes",
         )
+    if anomaly_interval is None:
+        anomaly_interval = float(os.getenv("AGENT_CREW_ANOMALY_INTERVAL", "600"))
+    if anomaly_disabled is None:
+        anomaly_disabled = os.getenv("AGENT_CREW_ANOMALY_DISABLED", "").lower() in (
+            "1", "true", "yes",
+        )
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
@@ -234,16 +251,19 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state["queue"] = TaskQueue(db_path)
-        watchdog_task = None
+        background_tasks: list[asyncio.Task] = []
         if not watchdog_disabled:
-            watchdog_task = asyncio.create_task(_watchdog_loop())
+            background_tasks.append(asyncio.create_task(_watchdog_loop()))
+        if not anomaly_disabled:
+            background_tasks.append(asyncio.create_task(_anomaly_loop()))
         try:
             yield
         finally:
-            if watchdog_task is not None:
-                watchdog_task.cancel()
+            for task in background_tasks:
+                task.cancel()
+            for task in background_tasks:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await watchdog_task
+                    await task
 
     app = FastAPI(lifespan=lifespan)
 
@@ -433,6 +453,30 @@ def create_app(
                     _watchdog_tick(time.time())
                 except Exception:
                     logger.exception("watchdog tick raised — continuing")
+        except asyncio.CancelledError:
+            return
+
+    def _anomaly_tick() -> dict:
+        """Sync entry point for the wrong-repo anomaly sweep (Issue #80)."""
+        return check_wrong_repo(state_path=state_path)
+
+    # Stash for tests (drive without the asyncio loop).
+    app.state.anomaly_tick = _anomaly_tick
+
+    async def _anomaly_loop() -> None:
+        """Periodic wrong-repo sweep. Cancels cleanly on shutdown."""
+        try:
+            while True:
+                await asyncio.sleep(anomaly_interval)
+                try:
+                    result = _anomaly_tick()
+                    if result.get("anomalies"):
+                        logger.warning(
+                            f"anomaly sweep: {result['anomalies']} wrong-repo events "
+                            f"(notified={result.get('notified')})"
+                        )
+                except Exception:
+                    logger.exception("anomaly tick raised — continuing")
         except asyncio.CancelledError:
             return
 
@@ -748,4 +792,5 @@ app = create_app(
     db_path=os.path.expanduser(os.getenv("AGENT_CREW_DB", "/tmp/agent_crew_default.db")),
     pane_map=_load_pane_map(),
     port=int(os.getenv("AGENT_CREW_PORT", "0") or 0),
+    state_path=os.path.expanduser(os.getenv("AGENT_CREW_STATE", "")) or None,
 )

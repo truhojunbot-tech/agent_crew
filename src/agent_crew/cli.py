@@ -434,11 +434,13 @@ def setup(project: str, agents: str, base: str):
     # AGENT_CREW_PANE_MAP tells the server where to push tasks; AGENT_CREW_PORT is
     # embedded in push messages so agents know where to POST results.
     db_file = os.path.join(proj_dir, "tasks.db")
+    state_file = _state_path(base, project)
     pythonpath = os.pathsep.join(p for p in sys.path if p)
     server_env = {
         **os.environ,
         "AGENT_CREW_DB": db_file,
         "AGENT_CREW_PANE_MAP": pane_map_file,
+        "AGENT_CREW_STATE": state_file,
         "AGENT_CREW_PORT": str(port),
         "PYTHONPATH": pythonpath,
     }
@@ -689,10 +691,12 @@ def recover(project: str, base: str):
     if not _port_listening(port, timeout=1.0):
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         pane_map_file = os.path.join(proj_dir, "pane_map.json")
+        state_file = _state_path(base, project)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
             "AGENT_CREW_PANE_MAP": pane_map_file,
+            "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
         }
