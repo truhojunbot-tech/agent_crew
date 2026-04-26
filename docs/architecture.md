@@ -37,8 +37,8 @@
 ### 2.1 Task Queue + Gate Server
 
 - **Runtime**: FastAPI + uvicorn, runs as a background process
-- **Port**: auto-selected starting from 8100; written to `/tmp/agent_crew/<project>/port`
-- **Persistence**: SQLite at `/tmp/agent_crew/<project>/agent_crew.db`
+- **Port**: auto-selected starting from 8100; written to `~/.agent_crew/<project>/port`
+- **Persistence**: SQLite at `~/.agent_crew/<project>/tasks.db`
 - **Atomicity**: dequeue (inside `/tasks/next` and inside push) wraps in a DB transaction — no double-assignment
 - **Crash recovery**: SQLite persists all state; on restart, pending/in_progress tasks are preserved. `crew recover` relaunches the server.
 - **Push model**: the server loads `pane_map.json` (`{role: pane_id}`) at startup and, on `POST /tasks`, delivers each task to the target role's pane via `tmux send-keys`. Agents do NOT poll — they receive tasks via pane input and POST results back. On `POST /tasks/{id}/result`, the server checks for more pending tasks of that role and pushes the next one automatically. Agents still may call `GET /tasks/next` for observability or recovery, but it is not the primary delivery path.
@@ -111,7 +111,7 @@ Conversational-agent CLIs (Claude, Codex, Gemini) don't reliably maintain a `whi
 
 Tracks tmux pane lifecycle per agent.
 
-**State file**: `/tmp/agent_crew/<project>/sessions.json`
+**State file**: `~/.agent_crew/<project>/state.json`
 
 ```json
 {
@@ -300,14 +300,20 @@ agent_crew/
 
 ```
 $HOME/.agent_crew/worktrees/<project>/<agent>/   git worktrees (persistent)
-/tmp/agent_crew/<project>/
+$HOME/.agent_crew/<project>/
   port              Task Queue server port
-  sessions.json     session state (including agent restart commands)
-  agent_crew.db     SQLite task + gate store
+  state.json        project state (port, session, pane_ids, pane_map, worktrees, db path)
+  sessions.json     per-agent session lifecycle (cmd, started_at, failures)
+  pane_map.json     role → pane_id mapping consumed by the push model
+  tasks.db          SQLite task + gate store
+  server.log        uvicorn stdout/stderr (background server)
+  crew.log          crew CLI activity log
   synthesis.md      discussion output (overwritten each run)
 ```
 
-Nothing written inside the user's git repo. All runtime state in `/tmp`.
+Nothing written inside the user's git repo. All runtime state in `$HOME/.agent_crew/`
+so it survives reboot — the queue, in-progress tasks, and pane bindings persist
+across sessions.
 
 ---
 
