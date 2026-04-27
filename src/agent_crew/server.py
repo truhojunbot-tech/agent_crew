@@ -640,6 +640,17 @@ def create_app(
                     f"from a stale local copy."
                 )
 
+            # Identify which agent actually implemented this task. Prefer the
+            # explicit override (set by upstream fallback), else fall back to
+            # the role's default mapping. Recorded in review_context so the
+            # rate-limit fallback handler can skip it during reviewer
+            # selection (#117 — self-review prevention).
+            impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
+            implementer_agent = (
+                impl_ctx.get("agent_override")
+                or (default_agent_for_role("implementer", pane_map) if pane_map else None)
+            )
+
             # Create review task with same description/branch, reference to impl task.
             # Inherit top-level project from impl task so the cross-project guard works
             # for subsequent hops in the pipeline (review → test).
@@ -656,6 +667,8 @@ def create_app(
                 "prev_task_id": impl_task_id,
                 "pr_number": pr_number,
             }
+            if implementer_agent:
+                review_context["implementer_agent"] = implementer_agent
             review_req = TaskRequest(
                 task_id=f"review-{uuid.uuid4().hex[:8]}",
                 task_type="review",
@@ -691,10 +704,23 @@ def create_app(
             if _resolve_verdict(review_result) != "approve":
                 return
 
+            # Propagate upstream agent identities so review/test fallback can
+            # avoid self-review and self-test (#117).
+            review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
+            implementer_agent = review_ctx.get("implementer_agent")
+            reviewer_agent = (
+                review_ctx.get("agent_override")
+                or (default_agent_for_role("reviewer", pane_map) if pane_map else None)
+            )
+
             # Create test task with same description/branch, reference to review task
             test_context = {
                 "prev_task_id": review_task_id,
             }
+            if implementer_agent:
+                test_context["implementer_agent"] = implementer_agent
+            if reviewer_agent:
+                test_context["reviewer_agent"] = reviewer_agent
             test_req = TaskRequest(
                 task_id=f"test-{uuid.uuid4().hex[:8]}",
                 task_type="test",
@@ -779,6 +805,14 @@ def create_app(
                 or (default_agent_for_role(role, pane_map) if (role and pane_map) else None)
             )
             excluded = list(ctx.get("fallback_excluded") or [])
+            # Self-review/self-test prevention (#117): any upstream agent
+            # already in the lineage (impl→review→test) must be excluded so
+            # the chain doesn't loop the task back to a participant whose
+            # output is being judged.
+            for upstream_key in ("implementer_agent", "reviewer_agent"):
+                upstream = ctx.get(upstream_key)
+                if upstream and upstream not in excluded:
+                    excluded.append(upstream)
             if current_agent and current_agent not in excluded:
                 excluded.append(current_agent)
 
