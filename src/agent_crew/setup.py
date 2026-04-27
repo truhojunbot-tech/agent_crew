@@ -14,7 +14,11 @@ _AGENT_CMDS = {
     # bypasses every tool prompt (including shell/git which the legacy
     # ``--yolo`` short flag was observed to miss when an MCP server is
     # registered alongside built-in tools — Issue #110 phase 5b).
-    "gemini": "gemini --approval-mode yolo",
+    # ``--model gemini-2.5-flash``: tester 단계에서 gemini-2.5-pro의 long-context
+    # 응답이 streaming 없이 모델 처리에 머무는 구간이 길어 watchdog 300s
+    # idle 오탐을 자주 일으켰다 (#115). flash는 응답이 가벼워 idle 빈도가
+    # 줄고 테스트 실행/검토 작업 품질엔 영향이 작다.
+    "gemini": "gemini --approval-mode yolo --model gemini-2.5-flash",
 }
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 
