@@ -34,6 +34,12 @@ try:
 except ImportError:  # pragma: no cover — surfaced loud at import time
     FastMCP = None  # type: ignore
 
+from agent_crew.loop import _resolve_verdict
+from agent_crew.pipeline import (
+    auto_enqueue_review,
+    auto_enqueue_test,
+    auto_fallback_failed_task,
+)
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
@@ -162,6 +168,18 @@ def build_mcp_server(
             task_type = queue.submit_result(task_id, result)
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
+
+        # Stage cascade — same hooks as the HTTP path so the pipeline does
+        # not stall after the first stage when an agent uses MCP-only
+        # delivery (#123). Push side-effects are not part of the cascade
+        # contract; agents pull tasks themselves on the MCP loop.
+        if task_type == "implement" and result.status == "completed":
+            auto_enqueue_review(queue, task_id, pr_number=result.pr_number)
+        elif task_type == "review" and _resolve_verdict(result) == "approve":
+            auto_enqueue_test(queue, task_id)
+        if result.status == "failed":
+            auto_fallback_failed_task(queue, task_id, result, task_type)
+
         return {"acknowledged": True, "task_id": task_id, "task_type": task_type}
 
     @mcp.tool()

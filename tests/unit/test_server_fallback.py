@@ -108,9 +108,11 @@ def test_u_fb03_chain_exhaustion_creates_escalation_gate(tmp_db):
     notify_calls: list = []
 
     # Patch notify_telegram to capture the call without going to the network.
-    import agent_crew.server as server_mod
-    original_notify = server_mod.notify_telegram
-    server_mod.notify_telegram = lambda msg, **kw: (notify_calls.append(msg), True)[1]
+    # The escalation hook moved into agent_crew.pipeline as part of #123;
+    # patch that module's symbol so the lambda actually intercepts the call.
+    import agent_crew.pipeline as pipeline_mod
+    original_notify = pipeline_mod.notify_telegram
+    pipeline_mod.notify_telegram = lambda msg, **kw: (notify_calls.append(msg), True)[1]
     try:
         app = _make_app(tmp_db, push_calls=push_calls)
         with TestClient(app) as client:
@@ -127,7 +129,7 @@ def test_u_fb03_chain_exhaustion_creates_escalation_gate(tmp_db):
             )
             client.post(f"/tasks/{fb2.task_id}/result", json=_result(fb2.task_id, summary="usage limit"))
     finally:
-        server_mod.notify_telegram = original_notify
+        pipeline_mod.notify_telegram = original_notify
 
     # No 4th fallback enqueued.
     fallback_tasks = [
