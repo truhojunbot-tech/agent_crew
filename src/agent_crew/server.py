@@ -330,6 +330,21 @@ def create_app(
             "1", "true", "yes",
         )
 
+    # Phase 6a of the tmux→MCP cutover (Issue #119). The flag selects
+    # whether the server actively pushes new tasks via tmux paste-buffer
+    # (legacy ``push``), relies entirely on the agent's MCP pull loop
+    # (``mcp``), or runs both paths concurrently (``both`` — default;
+    # safe because MCP get_next_task is atomic and a task already
+    # delivered via push transitions to in_progress before MCP could
+    # return it).
+    #
+    # Anything unrecognized falls back to ``both`` so a config typo
+    # never silently disables delivery.
+    _delivery_raw = os.getenv("AGENT_CREW_DELIVERY", "both").strip().lower()
+    if _delivery_raw not in ("push", "mcp", "both"):
+        _delivery_raw = "both"
+    _push_enabled = _delivery_raw in ("push", "both")
+
     state: dict = {}
     reminded_task_ids: set[str] = set()
 
@@ -362,6 +377,9 @@ def create_app(
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
         logger.debug(f"_try_push_next: role={role}")
+        if not _push_enabled:
+            logger.debug(f"_try_push_next: push disabled (AGENT_CREW_DELIVERY={_delivery_raw})")
+            return
         if not pane_map:
             logger.debug(f"_try_push_next: no pane_map")
             return
@@ -412,6 +430,9 @@ def create_app(
         the role keys. Busy-check and dequeue are both scoped to the agent so
         concurrent panelists don't block each other."""
         logger.debug(f"_try_push_discuss: agent={agent}")
+        if not _push_enabled:
+            logger.debug(f"_try_push_discuss: push disabled (AGENT_CREW_DELIVERY={_delivery_raw})")
+            return
         if not pane_map or not agent:
             logger.debug(f"_try_push_discuss: no pane_map or agent")
             return
