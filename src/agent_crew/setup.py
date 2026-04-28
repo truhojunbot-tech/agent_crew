@@ -233,8 +233,82 @@ def _mcp_python_invocation() -> tuple[str, list[str], str]:
     return interpreter, args, pythonpath
 
 
+def _write_postcompact_hook_claude(
+    worktree_path: str,
+    *,
+    agent: str,
+    role: str,
+) -> str:
+    """Drop a per-worktree PostCompact hook into ``.claude/settings.local.json``
+    so Claude Code reinjects the compact task-loop prompt after ``/compact``.
+
+    Without this, the long task-loop system prompt — which tells the agent
+    to keep calling ``get_next_task`` — gets dropped at compaction and the
+    pull loop stalls until the operator manually re-prompts. The hook
+    runs ``build_task_loop_prompt_compact(agent, role)`` and emits the
+    Claude Code ``additionalContext`` payload that re-establishes the loop
+    in one turn (Issue #122).
+
+    Returns the absolute path to the settings file. Idempotent — overwrites
+    any prior version with fresh interpreter / PYTHONPATH values so the
+    hook keeps working across env changes.
+    """
+    interpreter, _, pythonpath = _mcp_python_invocation()
+
+    # Single-line python invocation; we go through `-c` so we don't have
+    # to ship a separate hook script and risk it falling out of sync.
+    # Prompt contains no shell-special chars but we still pipe via JSON to
+    # be safe.
+    snippet = (
+        "import json; "
+        "from agent_crew.prompts.task_loop import build_task_loop_prompt_compact; "
+        "print(json.dumps({"
+        "'hookSpecificOutput': {"
+        "'hookEventName': 'PostCompact', "
+        f"'additionalContext': build_task_loop_prompt_compact({agent!r}, {role!r})"
+        "}}))"
+    )
+    # Prepend the env so the subprocess Claude Code spawns picks up our
+    # PYTHONPATH (Claude Code does not inherit per-worktree mcp env into
+    # hook commands).
+    command = (
+        f'PYTHONPATH="{pythonpath}" "{interpreter}" -c "{snippet}"'
+    )
+
+    settings = {
+        "hooks": {
+            "PostCompact": [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": command,
+                            "timeout": 10,
+                        }
+                    ],
+                }
+            ]
+        }
+    }
+    settings_dir = os.path.join(worktree_path, ".claude")
+    os.makedirs(settings_dir, exist_ok=True)
+    path = os.path.join(settings_dir, "settings.local.json")
+    with open(path, "w") as f:
+        json.dump(settings, f, indent=2)
+    return os.path.abspath(path)
+
+
 def _write_mcp_config_claude(worktree_path: str, db_path: str) -> str:
-    """Claude Code reads ``.mcp.json`` at the worktree root."""
+    """Claude Code reads ``.mcp.json`` at the worktree root.
+
+    Also drops a PostCompact hook into ``.claude/settings.local.json`` so
+    the task-loop prompt survives compaction (#122). The hook is keyed to
+    claude+implementer because that is the canonical claude worktree
+    role; if the operator routes a different task_type to this pane via
+    `agent_override`, the precedence block in the loop prompt itself
+    handles role disambiguation.
+    """
     interpreter, args, pythonpath = _mcp_python_invocation()
     config = {
         "mcpServers": {
@@ -252,6 +326,9 @@ def _write_mcp_config_claude(worktree_path: str, db_path: str) -> str:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     with open(path, "w") as f:
         json.dump(config, f, indent=2)
+    _write_postcompact_hook_claude(
+        worktree_path, agent="claude", role="implementer"
+    )
     return os.path.abspath(path)
 
 
