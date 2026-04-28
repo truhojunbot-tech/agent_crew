@@ -14,14 +14,12 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from agent_crew.anomaly import check_wrong_repo
-from agent_crew.fallback import (
-    default_agent_for_role,
-    has_rate_limit_signal,
-    load_fallback_chains,
-    next_agent,
-)
 from agent_crew.loop import _resolve_verdict
-from agent_crew.notify import notify_telegram
+from agent_crew.pipeline import (
+    auto_enqueue_review as _pipeline_auto_enqueue_review,
+    auto_enqueue_test as _pipeline_auto_enqueue_test,
+    auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
+)
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
 
@@ -594,146 +592,33 @@ def create_app(
         impl_task_id: str,
         pr_number: Optional[int] = None,
     ) -> None:
-        """Auto-enqueue a review task when an impl task completes.
-        This ensures review is triggered independently of CLI timeout.
+        """HTTP-side wrapper: run the transport-agnostic cascade then push.
 
-        ``pr_number`` is the PR opened by the impl run (if any). It's threaded
-        into both the review task context and the rendered instructions so
-        the reviewer always pins findings to the live PR head commit instead
-        of an earlier round's diff (issue #86).
+        The body of the cascade lives in ``agent_crew.pipeline`` so the MCP
+        ``submit_result`` path can fire the same hook (#123). This wrapper
+        only adds the tmux push side-effect, which the MCP path skips —
+        agents on the MCP loop pull tasks themselves.
         """
-        try:
-            # Get the original impl task to extract description and branch
-            impl_tasks = [t for t in q().list_tasks() if t.task_id == impl_task_id]
-            if not impl_tasks:
-                return
-            impl_task = impl_tasks[0]
-
-            # Cross-project guard: if the impl task carries a top-level project tag
-            # and the server was started for a different project, skip auto-review to
-            # prevent misrouting tasks across project queues.
-            impl_project = impl_task.project  # top-level field, typed
-            if impl_project and project and impl_project != project:
-                logger.warning(
-                    f"_auto_enqueue_review: skipping cross-project review — "
-                    f"impl project={impl_project!r}, server project={project!r}"
-                )
-                return
-
-            # Build a freshness directive that is unambiguous about reviewing
-            # the live PR HEAD, not a stale local copy or an earlier round.
-            if pr_number is not None:
-                pr_directive = (
-                    f"\n\nFRESHNESS: review PR #{pr_number} at its CURRENT head. "
-                    f"Run `gh pr diff {pr_number}` (and/or "
-                    f"`gh pr view {pr_number} --json commits`) FIRST. Do NOT "
-                    f"reuse line numbers from any earlier review round — they "
-                    f"reference the prior commit. Pin every finding to the "
-                    f"latest commit's file:line."
-                )
-            else:
-                pr_directive = (
-                    f"\n\nFRESHNESS: identify the PR for branch "
-                    f"{impl_task.branch!r} via `gh pr list --head "
-                    f"{impl_task.branch}`, then `gh pr diff <num>` to fetch "
-                    f"the live head before pinning findings. Do NOT review "
-                    f"from a stale local copy."
-                )
-
-            # Identify which agent actually implemented this task. Prefer the
-            # explicit override (set by upstream fallback), else fall back to
-            # the role's default mapping. Recorded in review_context so the
-            # rate-limit fallback handler can skip it during reviewer
-            # selection (#117 — self-review prevention).
-            impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
-            implementer_agent = (
-                impl_ctx.get("agent_override")
-                or (default_agent_for_role("implementer", pane_map) if pane_map else None)
-            )
-
-            # Create review task with same description/branch, reference to impl task.
-            # Inherit top-level project from impl task so the cross-project guard works
-            # for subsequent hops in the pipeline (review → test).
-            review_context = {
-                "checklist_layers": ["test_quality", "code_quality", "business_gap"],
-                "reviewer_rejects_happy_path_only": True,
-                "instructions": (
-                    "3-layer review: "
-                    "1) test_quality — coverage, edge cases, mocks; "
-                    "2) code_quality — naming, error handling, SOLID; "
-                    "3) business_gap — requirements met, logging, observability."
-                    + pr_directive
-                ),
-                "prev_task_id": impl_task_id,
-                "pr_number": pr_number,
-            }
-            if implementer_agent:
-                review_context["implementer_agent"] = implementer_agent
-            review_req = TaskRequest(
-                task_id=f"review-{uuid.uuid4().hex[:8]}",
-                task_type="review",
-                description=impl_task.description,
-                branch=impl_task.branch,
-                context=review_context,
-                project=impl_project,  # top-level field propagated
-            )
-            q().enqueue(review_req)
-            # Try to push the newly enqueued review task to reviewer pane
+        review_id = _pipeline_auto_enqueue_review(
+            q(),
+            impl_task_id,
+            pr_number,
+            pane_map=pane_map,
+            server_project=project,
+        )
+        if review_id:
             _try_push_next("reviewer")
-        except Exception:
-            # Silently fail auto-enqueue — don't crash the result submission
-            pass
 
     def _auto_enqueue_test(review_task_id: str) -> None:
-        """Auto-enqueue a test task when a review task is approved.
-        This ensures testing is triggered independently of CLI timeout."""
-        try:
-            # Get the review task to extract description and branch
-            review_tasks = [t for t in q().list_tasks() if t.task_id == review_task_id]
-            if not review_tasks:
-                return
-            review_task = review_tasks[0]
-
-            # Get the review result to confirm it was approved. Use the
-            # defensive verdict resolver from loop.py so reviewers that
-            # post `verdict=null` with empty findings still trip the
-            # auto-test (#100).
-            review_result = q().get_result(review_task_id)
-            if not review_result:
-                return
-            if _resolve_verdict(review_result) != "approve":
-                return
-
-            # Propagate upstream agent identities so review/test fallback can
-            # avoid self-review and self-test (#117).
-            review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-            implementer_agent = review_ctx.get("implementer_agent")
-            reviewer_agent = (
-                review_ctx.get("agent_override")
-                or (default_agent_for_role("reviewer", pane_map) if pane_map else None)
-            )
-
-            # Create test task with same description/branch, reference to review task
-            test_context = {
-                "prev_task_id": review_task_id,
-            }
-            if implementer_agent:
-                test_context["implementer_agent"] = implementer_agent
-            if reviewer_agent:
-                test_context["reviewer_agent"] = reviewer_agent
-            test_req = TaskRequest(
-                task_id=f"test-{uuid.uuid4().hex[:8]}",
-                task_type="test",
-                description=review_task.description,
-                branch=review_task.branch,
-                context=test_context,
-            )
-            q().enqueue(test_req)
-            # Try to push the newly enqueued test task to tester pane
+        """HTTP-side wrapper: run the transport-agnostic cascade then push.
+        See ``_auto_enqueue_review`` for the rationale (#123)."""
+        test_id = _pipeline_auto_enqueue_test(
+            q(),
+            review_task_id,
+            pane_map=pane_map,
+        )
+        if test_id:
             _try_push_next("tester")
-        except Exception:
-            # Silently fail auto-enqueue — don't crash the result submission
-            pass
 
     _MAX_RETRIES = 2  # Maximum retry attempts per task
 
@@ -779,103 +664,28 @@ def create_app(
         result: TaskResult,
         task_type: str,
     ) -> bool:
-        """If the failure is rate-limit-shaped, reroute to the next agent in
-        the fallback chain. Returns True when fallback handled the task
-        (caller should skip auto_retry); False when caller should fall through
-        to the normal retry path.
+        """HTTP-side wrapper around the transport-agnostic fallback hook.
 
-        On chain exhaustion, opens an ``escalation`` gate and tries to send a
-        Telegram alert via the #79 helper (best-effort).
+        The decision logic moved to ``agent_crew.pipeline.auto_fallback_failed_task``
+        so MCP can call the same path (#123). Push side-effect stays
+        HTTP-only — when fallback enqueues a successor task, nudge that
+        role's pane.
         """
-        if fallback_disabled:
-            return False
-        if not has_rate_limit_signal(result.summary, result.findings):
-            return False
-
-        try:
-            tasks = [t for t in q().list_tasks() if t.task_id == task_id]
-            if not tasks:
-                return False
-            original = tasks[0]
-            ctx = dict(original.context) if isinstance(original.context, dict) else {}
-
+        handled = _pipeline_auto_fallback_failed_task(
+            q(),
+            task_id,
+            result,
+            task_type,
+            pane_map=pane_map,
+            state_path=state_path,
+            fallback_disabled=bool(fallback_disabled),
+        )
+        if handled:
             role = _TYPE_TO_ROLE.get(task_type)
-            current_agent = (
-                ctx.get("agent_override")
-                or (default_agent_for_role(role, pane_map) if (role and pane_map) else None)
-            )
-            excluded = list(ctx.get("fallback_excluded") or [])
-            # Self-review/self-test prevention (#117): any upstream agent
-            # already in the lineage (impl→review→test) must be excluded so
-            # the chain doesn't loop the task back to a participant whose
-            # output is being judged.
-            for upstream_key in ("implementer_agent", "reviewer_agent"):
-                upstream = ctx.get(upstream_key)
-                if upstream and upstream not in excluded:
-                    excluded.append(upstream)
-            if current_agent and current_agent not in excluded:
-                excluded.append(current_agent)
-
-            chains = load_fallback_chains(state_path)
-            successor = next_agent(task_type, current_agent, excluded, chains)
-
-            if successor is None:
-                # Chain exhausted — escalate.
-                logger.warning(
-                    f"_auto_fallback: chain exhausted for {task_id} "
-                    f"(task_type={task_type}, excluded={excluded}). Escalating."
-                )
-                msg = (
-                    f"agent_crew rate-limit fallback exhausted\n"
-                    f"task_id: {task_id}\n"
-                    f"task_type: {task_type}\n"
-                    f"tried agents: {', '.join(excluded) or '(none)'}\n"
-                    f"last summary: {(result.summary or '')[:200]}"
-                )
-                try:
-                    q().create_gate(
-                        GateRequest(
-                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
-                            type="escalation",
-                            message=msg,
-                            status="pending",
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(f"_auto_fallback: failed to create escalation gate: {e}")
-                try:
-                    notify_telegram(msg)
-                except Exception:
-                    pass
-                return True
-
-            new_ctx = dict(ctx)
-            new_ctx["agent_override"] = successor
-            new_ctx["fallback_excluded"] = excluded
-            new_ctx["fallback_from_task_id"] = task_id
-            try:
-                fallback_req = TaskRequest(
-                    task_id=f"fallback-{task_id}-{uuid.uuid4().hex[:4]}",
-                    task_type=task_type,  # type: ignore
-                    description=original.description,
-                    branch=original.branch,
-                    priority=original.priority,
-                    context=new_ctx,
-                )
-                q().enqueue(fallback_req)
-                logger.info(
-                    f"_auto_fallback: rerouted {task_id} -> {successor} "
-                    f"(excluded={excluded})"
-                )
-                if role:
-                    _try_push_next(role)
-                return True
-            except Exception as e:
-                logger.warning(f"_auto_fallback: enqueue failed for {task_id}: {e}")
-                return False
-        except Exception as e:
-            logger.warning(f"_auto_fallback: unexpected error for {task_id}: {e}")
-            return False
+            if role:
+                # No-op when no successor was enqueued (escalation path).
+                _try_push_next(role)
+        return handled
 
     @app.get("/health")
     def health():

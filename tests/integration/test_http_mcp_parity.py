@@ -233,21 +233,13 @@ class TestSubmitResultParity:
         }
         assert snap_a == snap_b
 
-    @pytest.mark.xfail(
-        reason=(
-            "Known parity gap: HTTP submit_result auto-enqueues the next "
-            "stage (impl→review, review→test) via _auto_enqueue_review / "
-            "_auto_enqueue_test, which live inside create_app. MCP "
-            "submit_result calls queue.submit_result directly and skips "
-            "those hooks, so the pipeline stalls after the first stage if "
-            "an agent only uses MCP. Must be resolved before #119 cutover. "
-            "Tracking: #123."
-        ),
-        strict=True,
-    )
     def test_completed_impl_auto_enqueues_review_on_both_sides(
         self, parity_pair, tmp_path
     ):
+        """Cascade hook parity (#123 closed): both transports now run the
+        same `pipeline.auto_enqueue_review` after `submit_result`, so an
+        MCP-only agent sees the review task land just like the HTTP path.
+        Was strict-xfail before #123."""
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-cascade-1")
         http_client.get("/tasks/next", params={"role": "implementer"})
