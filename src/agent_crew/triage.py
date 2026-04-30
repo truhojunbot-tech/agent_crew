@@ -19,6 +19,22 @@ _PHASE_PATTERN = r"phase\s*[:\-]?\s*(\d+)"  # "Phase 2", "Phase: 2", "Phase-2"
 _PARENT_RE = re.compile("|".join(_PARENT_PATTERNS), re.IGNORECASE)
 _PHASE_RE = re.compile(_PHASE_PATTERN, re.IGNORECASE)
 
+# Severity tiers for deterministic pre-sort (Issue #131).
+# Lower score = higher priority. LLM only sees candidates of the same tier,
+# so dependency-aware logic still applies within each tier.
+_SEVERITY_TIER: list[set[str]] = [
+    {"blocker", "blocked", "critical", "p0"},
+    {"p1", "high"},
+]
+
+
+def _severity_score(labels: list[str]) -> int:
+    label_set = {l.lower() for l in labels}
+    for score, tier in enumerate(_SEVERITY_TIER):
+        if tier & label_set:
+            return score
+    return len(_SEVERITY_TIER)
+
 
 def parse_dependencies(body: Optional[str]) -> dict:
     """Extract dependency hints from an issue body.
@@ -256,9 +272,13 @@ def run(
     filtered = filter_processed(issues)
     closed = fetch_closed_issue_numbers(repo)
     eligible = filter_blocked(filtered, closed)
+    # Pre-sort by severity so the LLM only sees same-tier candidates (#131).
+    eligible.sort(key=lambda i: (_severity_score(i["labels"]), i.get("phase") or 999))
+    top_score = _severity_score(eligible[0]["labels"]) if eligible else 0
+    top_tier = [i for i in eligible if _severity_score(i["labels"]) == top_score]
     if merge_history == "none":
         merge_history = fetch_recent_merge_history(repo)
-    prompt = build_prompt(eligible, merge_history)
+    prompt = build_prompt(top_tier, merge_history)
     if prompt is None:
         return None
     response_text = agent_fn(prompt)
