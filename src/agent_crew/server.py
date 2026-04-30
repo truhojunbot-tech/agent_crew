@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -60,26 +61,50 @@ def _reset_pane_busy_cache() -> None:
     _PANE_BUSY_LAST.clear()
 
 
+# Patterns that are ONLY present on-screen while the agent is actively
+# processing. They are cleared from the terminal UI as soon as the model
+# stops generating, so they never appear in past-turn scrollback (#138).
+# Checked against the bottom N lines of the visible pane only.
+_THINKING_ACTIVE_RE = re.compile(
+    r"esc to interrupt"
+    r"|✶ Quantumizing"
+    r"|✻ Baked"
+    r"|✳"
+    r"|↓ \d+[\d.,]*[kKmM]?\s+tokens"
+    r"|Working\.\.\."
+    r"|Thinking\.\.\.",
+    re.IGNORECASE,
+)
+_THINKING_TAIL_LINES = 10
+
+
+def _pane_is_thinking(capture: str) -> bool:
+    """Return True if the bottom lines of a pane capture show active thinking.
+
+    Checks only the last _THINKING_TAIL_LINES lines to avoid matching
+    past-turn output that scrolled up (#84). 'esc to interrupt' is the most
+    reliable signal — it is displayed by Claude/Gemini/Codex exactly while
+    they are generating and is cleared the moment they stop (#138).
+    """
+    tail = "\n".join(capture.splitlines()[-_THINKING_TAIL_LINES:])
+    return bool(_THINKING_ACTIVE_RE.search(tail))
+
+
 def _pane_is_busy(pane_id: str) -> bool:
-    """Return True if the pane content changed since the previous call.
+    """Return True if the pane is actively processing.
 
-    Pure content diff. Independent of any per-CLI banner text — Claude Code,
-    codex, and gemini all change `tmux capture-pane -p` output as work
-    progresses (token counters tick, spinner glyphs animate, output streams
-    in). A pane that is genuinely idle produces an identical capture across
-    consecutive calls.
-
-    Earlier versions matched on banner strings (``✻``, ``Crunched``,
-    ``Working``, ``Thinking``, ``esc to interrupt``). Both approaches are
-    brittle: glyph forms persist as past-tense scrollback (the original #84
-    failure mode) and the canonical ``esc to interrupt`` is one Claude UI
-    refresh away from being renamed. Comparing whole captures sidesteps the
-    text dependency entirely.
+    Two complementary signals (either is sufficient):
+    1. Content diff — the capture changed since the previous call (spinner
+       ticking, output streaming in, token counter incrementing).
+    2. Thinking markers — the visible bottom lines contain live-only
+       indicators such as ``esc to interrupt`` that are cleared from the
+       terminal as soon as the model stops generating. This catches long
+       silent thinking phases where the capture is momentarily static (#138).
 
     Edge cases:
-    - First call for a pane has no prior snapshot → returns False (idle).
-      That's safe because activity is freshly bumped at task enqueue, so the
-      idle clock is well below any threshold.
+    - First call for a pane has no prior snapshot → content diff is False but
+      thinking markers still apply. If the pane really just received a task
+      and is processing, the thinking signal fires.
     - tmux capture-pane failing returns False — the watchdog must never
       crash on a transient pane-probe error.
     """
@@ -95,7 +120,7 @@ def _pane_is_busy(pane_id: str) -> bool:
     current = r.stdout
     prev = _PANE_BUSY_LAST.get(pane_id)
     _PANE_BUSY_LAST[pane_id] = current
-    return prev is not None and current != prev
+    return (prev is not None and current != prev) or _pane_is_thinking(current)
 
 
 def _pane_has_task(pane_id: str) -> bool:

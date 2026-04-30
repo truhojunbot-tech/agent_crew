@@ -118,3 +118,67 @@ def test_reset_cache_makes_next_call_act_like_first():
         _reset_pane_busy_cache()
         # After reset the next call has no prior snapshot again.
         assert _pane_is_busy("%999") is False
+
+
+# ---------------------------------------------------------------------------
+# Thinking-marker fallback (#138) — static capture + live thinking indicator
+# ---------------------------------------------------------------------------
+
+
+from agent_crew.server import _pane_is_thinking  # noqa: E402
+
+
+def test_pane_is_thinking_detects_esc_to_interrupt():
+    """`esc to interrupt` in the bottom lines → True."""
+    capture = (
+        "Previous output line 1\n"
+        "Previous output line 2\n"
+        "✶ Quantumizing… (2m 40s · ↓ 6.2k tokens · almost done thinking)\n"
+        " esc to interrupt\n"
+    )
+    assert _pane_is_thinking(capture) is True
+
+
+def test_pane_is_thinking_detects_token_counter():
+    """Token counter like '↓ 6.2k tokens' also fires."""
+    capture = "doing stuff\n" * 20 + "↓ 6.2k tokens\n"
+    assert _pane_is_thinking(capture) is True
+
+
+def test_pane_is_thinking_past_tense_scrollback_not_triggered():
+    """Past-tense thinking output scrolled away (beyond the tail window) must
+    NOT fire the thinking marker (#84 regression guard).
+    Thinking lines come first; 25 neutral lines push them above the 10-line tail.
+    """
+    old_thinking = "✶ Quantumizing… (2m 40s · ↓ 6.2k tokens)\nesc to interrupt\n"
+    neutral_lines = "some completed output line\n" * 25
+    current_bottom = "❯ \n ⏵⏵ bypass permissions on\n"
+    capture = old_thinking + neutral_lines + current_bottom
+    assert _pane_is_thinking(capture) is False
+
+
+def test_pane_is_busy_returns_true_on_thinking_even_if_capture_unchanged(
+    _isolate_busy_cache,
+):
+    """#138 regression: static capture + 'esc to interrupt' → busy regardless
+    of whether there is a prior snapshot. Thinking markers fire immediately."""
+    thinking_capture = (
+        "✶ Quantumizing… (2m 40s · ↓ 6.2k tokens)\n"
+        " esc to interrupt\n"
+    )
+    cap = _captured(thinking_capture)
+    with patch("agent_crew.server.subprocess.run", return_value=cap):
+        # First call: no prior snapshot, but thinking marker present → busy
+        assert _pane_is_busy("%888") is True
+        # Second call: same text + thinking marker → still busy
+        assert _pane_is_busy("%888") is True
+
+
+def test_pane_is_busy_returns_false_without_thinking_and_static(
+    _isolate_busy_cache,
+):
+    """Static capture with no thinking markers → genuinely idle."""
+    cap = _captured("❯ \n ⏵⏵ bypass permissions on\n")
+    with patch("agent_crew.server.subprocess.run", return_value=cap):
+        assert _pane_is_busy("%888") is False  # priming
+        assert _pane_is_busy("%888") is False  # idle
