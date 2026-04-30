@@ -61,33 +61,120 @@ def _reset_pane_busy_cache() -> None:
     _PANE_BUSY_LAST.clear()
 
 
-# Patterns that are ONLY present on-screen while the agent is actively
-# processing. They are cleared from the terminal UI as soon as the model
-# stops generating, so they never appear in past-turn scrollback (#138).
-# Checked against the bottom N lines of the visible pane only.
-_THINKING_ACTIVE_RE = re.compile(
-    r"esc to interrupt"
-    r"|✶ Quantumizing"
-    r"|✻ Baked"
-    r"|✳"
-    r"|↓ \d+[\d.,]*[kKmM]?\s+tokens"
-    r"|Working\.\.\."
-    r"|Thinking\.\.\.",
-    re.IGNORECASE,
+_WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").lower() in (
+    "1", "true", "yes",
 )
-_THINKING_TAIL_LINES = 10
+_WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
 
 
-def _pane_is_thinking(capture: str) -> bool:
-    """Return True if the bottom lines of a pane capture show active thinking.
+def _prepare_worktree_for_task(
+    worktree_path: str,
+    task_id: str,
+    task_branch: str,
+    role: str,
+) -> None:
+    """Sync worktree to origin and checkout the right branch before task dispatch.
 
-    Checks only the last _THINKING_TAIL_LINES lines to avoid matching
-    past-turn output that scrolled up (#84). 'esc to interrupt' is the most
-    reliable signal — it is displayed by Claude/Gemini/Codex exactly while
-    they are generating and is cleared the moment they stop (#138).
+    - All roles: stash local changes, fetch origin (catches stale worktrees that
+      missed weeks of merged PRs, #141).
+    - implementer: checkout a fresh branch per task from origin/main so each
+      impl task starts clean and pushes to its own PR branch (#140).
+    - reviewer/tester: checkout the task's PR branch from origin so reviews
+      run against the actual changed code, not stale main (#141).
+
+    Failures are logged but never propagate — task dispatch continues even if
+    the git prep encounters a transient error (e.g. merge conflict on stash pop).
     """
-    tail = "\n".join(capture.splitlines()[-_THINKING_TAIL_LINES:])
-    return bool(_THINKING_ACTIVE_RE.search(tail))
+    try:
+        _prepare_worktree_for_task_inner(worktree_path, task_id, task_branch, role)
+    except Exception:
+        logger.exception(
+            f"_prepare_worktree_for_task: unexpected error for {role} "
+            f"task_id={task_id} — continuing"
+        )
+
+
+def _prepare_worktree_for_task_inner(
+    worktree_path: str,
+    task_id: str,
+    task_branch: str,
+    role: str,
+) -> None:
+    """Inner (may raise). Wrapped by _prepare_worktree_for_task."""
+    main_branch = _WORKTREE_MAIN_BRANCH
+    # Stash any leftover uncommitted changes so checkout doesn't fail.
+    subprocess.run(
+        ["git", "-C", worktree_path, "stash", "push", "-u",
+         "-m", f"agent_crew pre-{task_id[:8]}"],
+        capture_output=True, text=True,
+    )
+    # Fetch all remote branches so the target ref is up to date.
+    subprocess.run(
+        ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
+        capture_output=True, text=True,
+    )
+
+    if role == "implementer":
+        # Fresh branch per task from origin/main (#140). Use task.branch when
+        # set (crew run --branch), otherwise derive from task_id.
+        branch = task_branch if task_branch else f"agent/{task_id[:12]}"
+        r = subprocess.run(
+            ["git", "-C", worktree_path, "checkout", "-B", branch,
+             f"origin/{main_branch}"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                f"_prepare_worktree_for_task: implementer checkout {branch} "
+                f"from origin/{main_branch} failed: {r.stderr.strip()}"
+            )
+    else:
+        # Reviewer/tester: checkout the PR branch from origin (#141).
+        # If the branch is absent on origin (merged, deleted) fall back to
+        # origin/main so the worktree is at least current.
+        prefix = "review" if role == "reviewer" else "test"
+        local_branch = f"{prefix}/{task_id[:8]}"
+        target_ref = f"origin/{task_branch}" if task_branch else f"origin/{main_branch}"
+        r = subprocess.run(
+            ["git", "-C", worktree_path, "checkout", "-B", local_branch, target_ref],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                f"_prepare_worktree_for_task: {role} checkout {local_branch} "
+                f"from {target_ref} failed, falling back to origin/{main_branch}: "
+                f"{r.stderr.strip()}"
+            )
+            subprocess.run(
+                ["git", "-C", worktree_path, "checkout", "-B", local_branch,
+                 f"origin/{main_branch}"],
+                capture_output=True, text=True,
+            )
+
+
+def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
+    """Derive {role: worktree_path} from state.json.
+
+    state.json stores worktrees as {agent_name: path}. We convert agent names
+    to roles (implementer/reviewer/tester) so the server can look up the
+    right worktree for a given role without importing setup.py at runtime.
+    """
+    if not state_path or not os.path.exists(state_path):
+        return {}
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+        worktrees = state.get("worktrees", {})
+        _AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}
+        result: dict[str, str] = {}
+        for agent, path in worktrees.items():
+            role = _AGENT_TO_ROLE.get(agent)
+            if role and path:
+                result[role] = path
+        return result
+    except Exception:
+        logger.exception("_load_worktree_map: failed to read state.json")
+        return {}
 
 
 def _pane_is_busy(pane_id: str) -> bool:
@@ -368,6 +455,7 @@ def create_app(
     anomaly_disabled: Optional[bool] = None,
     state_path: Optional[str] = None,
     fallback_disabled: Optional[bool] = None,
+    worktree_map: Optional[dict] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -392,7 +480,12 @@ def create_app(
         ``AGENT_CREW_GH_USERNAME`` is configured).
     state_path: path to the per-project state.json — used by the anomaly
         sweep to auto-detect the expected repo allow-list.
+    worktree_map: {role: worktree_path} — when provided the server prepares
+        each worktree (fetch + branch checkout) before dispatching a task to
+        it. Falls back to _load_worktree_map(state_path) if omitted.
     """
+    if worktree_map is None:
+        worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
     if watchdog_interval is None:
         watchdog_interval = float(os.getenv("AGENT_CREW_WATCHDOG_INTERVAL", "30"))
     if reminder_seconds is None:
@@ -504,6 +597,24 @@ def create_app(
             )
             q().requeue(task.task_id)
             return
+
+        # #140/#141: prepare worktree branch before task delivery.
+        if worktree_map and not _WORKTREE_SYNC_DISABLED:
+            wt_path = worktree_map.get(role)
+            if wt_path:
+                try:
+                    _prepare_worktree_for_task(
+                        wt_path, task.task_id, task.branch or "", role
+                    )
+                    logger.info(
+                        f"_try_push_next: worktree prepared for {role} "
+                        f"task_id={task.task_id} branch={task.branch or '(none)'}"
+                    )
+                except Exception:
+                    logger.exception(
+                        f"_try_push_next: worktree prep failed for {role} "
+                        f"task_id={task.task_id} — continuing with dispatch"
+                    )
 
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
         # #133: clear oversized context before pushing so claude doesn't stall.
