@@ -1,4 +1,5 @@
 import json
+import re
 from unittest.mock import MagicMock, patch
 
 from click.testing import CliRunner
@@ -318,3 +319,55 @@ def test_u_t15c_merge_history_formats_pr_lines():
         history = fetch_recent_merge_history("any/repo")
     assert "#11" in history and "feat: A" in history
     assert "#12" in history and "fix: B" in history
+
+
+# U-T16: severity pre-sort — blocker beats nice-to-have (#131)
+def test_u_t16_severity_score_tiers():
+    from agent_crew.triage import _severity_score
+    assert _severity_score(["blocker", "bug"]) < _severity_score(["enhancement"])
+    assert _severity_score(["blocked"]) < _severity_score(["p1"])
+    assert _severity_score(["critical"]) < _severity_score(["high"])
+    assert _severity_score(["p0"]) < _severity_score([])
+    assert _severity_score(["p1"]) < _severity_score(["nice-to-have"])
+    # Same tier → same score
+    assert _severity_score(["blocker"]) == _severity_score(["p0"])
+
+
+def test_u_t17_triage_run_picks_blocker_over_nice_to_have(tmp_db):
+    """run() must hand only the top-severity tier to the LLM (#131)."""
+    from unittest.mock import MagicMock, patch
+    from agent_crew.triage import run
+    from agent_crew.queue import TaskQueue
+
+    queue = TaskQueue(tmp_db)
+
+    blocker_issues = [
+        {"number": 875, "title": "Blocker 1", "labels": [{"name": "bug"}, {"name": "blocked"}], "body": ""},
+        {"number": 876, "title": "Blocker 2", "labels": [{"name": "blocker"}], "body": ""},
+    ]
+    nice_issues = [
+        {"number": 888, "title": "Nice-to-have: code hygiene", "labels": [{"name": "enhancement"}], "body": ""},
+    ]
+    all_issues = blocker_issues + nice_issues
+
+    seen_prompts: list[str] = []
+
+    def agent_fn(prompt: str) -> str:
+        seen_prompts.append(prompt)
+        # Always pick the first issue listed in the prompt
+        m = re.search(r"#(\d+):", prompt)
+        num = m.group(1) if m else "875"
+        return f"ISSUE: {num}\nDESCRIPTION: fix blocker"
+
+    with (
+        patch("agent_crew.triage.fetch_issues_from_gh", return_value=all_issues),
+        patch("agent_crew.triage.fetch_closed_issue_numbers", return_value=set()),
+        patch("agent_crew.triage.fetch_recent_merge_history", return_value="none"),
+    ):
+        result = run(queue, "org/repo", agent_fn, branch="main")
+
+    assert result is not None
+    # The prompt must NOT mention the nice-to-have issue
+    assert len(seen_prompts) == 1
+    assert "#888" not in seen_prompts[0], "nice-to-have leaked into blocker-tier prompt"
+    assert "#875" in seen_prompts[0] or "#876" in seen_prompts[0]
