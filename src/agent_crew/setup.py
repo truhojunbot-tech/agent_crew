@@ -86,6 +86,16 @@ def start_agents_in_panes(
     for agent, target in zip(agents, pane_targets):
         wt_path = worktrees.get(agent) if worktrees else None
         cmd = _get_agent_cmd(agent, wt_path)
+        # #142: ensure the pane is at a shell prompt before launching.
+        # If an old agent process (e.g. gemini without --approval-mode yolo) is
+        # still running, send-keys -l feeds the cmd as chat input instead of
+        # executing it in the shell. Ctrl+C interrupts any interactive process;
+        # 'q' + Enter covers CLIs that catch Ctrl+C and present a quit prompt.
+        # Safe on fresh panes: Ctrl+C on an idle shell is a no-op.
+        subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
+        time.sleep(0.3)
+        subprocess.run(["tmux", "send-keys", "-t", target, "q", "Enter"], capture_output=True)
+        time.sleep(0.3)
         _send_literal_text(target, cmd)
         _send_enter(target)
         if agent == "codex":

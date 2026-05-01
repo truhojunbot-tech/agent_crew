@@ -108,15 +108,18 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
          patch("agent_crew.setup.time.sleep"):
         start_agents_in_panes("crew_proj", ["claude"])
 
-    # 2 calls per agent (launch command + Enter); no kickoff prompt
-    assert mock_run.call_count == 2
-    launch_args = mock_run.call_args_list[0][0][0]
-    enter_args = mock_run.call_args_list[1][0][0]
-    # literal send for the launch command
-    assert "-l" in launch_args
-    assert "claude" in launch_args[-1]
-    # Enter send to submit launch
-    assert "Enter" in enter_args
+    # 4 calls per agent: C-c escape, q+Enter escape, launch cmd, Enter (#142)
+    assert mock_run.call_count == 4
+    all_args = [call[0][0] for call in mock_run.call_args_list]
+    # Escape sequence: first two calls send C-c and then q/Enter
+    assert any("C-c" in " ".join(a) for a in all_args), "Ctrl+C escape not sent"
+    assert any("q" in a for a in all_args), "q escape not sent"
+    # Launch cmd: literal send with agent cmd
+    literal_calls = [a for a in all_args if "-l" in a]
+    assert literal_calls, "no literal send found"
+    assert any("claude" in " ".join(a) for a in literal_calls)
+    # Enter to submit launch
+    assert any("Enter" in a for a in all_args)
     # Must NOT send any prompt text that references the AGENT_CREW TASK block
     for call in mock_run.call_args_list:
         args = call[0][0]
