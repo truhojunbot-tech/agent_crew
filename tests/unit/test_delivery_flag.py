@@ -134,3 +134,41 @@ class TestMcpStillCascadesAfterSubmit:
         assert any(t["task_type"] == "review" for t in tasks)
         # No push fired anywhere along the way.
         assert push.calls == []
+
+
+class TestMcpDeliveryWarnings:
+    """#145 — delivery=mcp must emit WARNING so misconfigured envs are visible."""
+
+    def test_post_task_warns_when_delivery_is_mcp(
+        self, tmp_db, monkeypatch, caplog
+    ):
+        import logging
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "mcp")
+        push = _RecordingPush()
+        app = create_app(
+            db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push,
+        )
+        with caplog.at_level(logging.WARNING, logger="agent_crew.server"):
+            with TestClient(app) as client:
+                client.post("/tasks", json=_task_payload("t-warn"))
+        warning_msgs = [r.message for r in caplog.records if r.levelno >= logging.WARNING]
+        assert any("mcp" in m.lower() for m in warning_msgs), \
+            f"Expected a WARNING mentioning 'mcp', got: {warning_msgs}"
+
+    def test_no_warn_when_delivery_is_push(
+        self, tmp_db, monkeypatch, caplog
+    ):
+        import logging
+        monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+        push = _RecordingPush()
+        app = create_app(
+            db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push,
+        )
+        with caplog.at_level(logging.WARNING, logger="agent_crew.server"):
+            with TestClient(app) as client:
+                client.post("/tasks", json=_task_payload("t-no-warn"))
+        delivery_warns = [
+            r for r in caplog.records
+            if r.levelno >= logging.WARNING and "delivery" in r.message.lower()
+        ]
+        assert delivery_warns == [], f"Unexpected delivery warnings: {delivery_warns}"
