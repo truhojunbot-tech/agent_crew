@@ -462,7 +462,11 @@ def create_app(
         """If the role has an available pane and is idle, dequeue and push the next task."""
         logger.debug(f"_try_push_next: role={role}")
         if not _push_enabled:
-            logger.debug(f"_try_push_next: push disabled (AGENT_CREW_DELIVERY={_delivery_raw})")
+            logger.warning(
+                f"_try_push_next: AGENT_CREW_DELIVERY={_delivery_raw!r} — tmux push disabled. "
+                "Tasks will only be delivered if an MCP client polls GET /tasks/next; "
+                "if no MCP client is active they will accumulate until the watchdog auto-fails them."
+            )
             return
         if not pane_map:
             logger.debug(f"_try_push_next: no pane_map")
@@ -525,7 +529,10 @@ def create_app(
         concurrent panelists don't block each other."""
         logger.debug(f"_try_push_discuss: agent={agent}")
         if not _push_enabled:
-            logger.debug(f"_try_push_discuss: push disabled (AGENT_CREW_DELIVERY={_delivery_raw})")
+            logger.warning(
+                f"_try_push_discuss: AGENT_CREW_DELIVERY={_delivery_raw!r} — tmux push disabled. "
+                "Discuss tasks will only be delivered if an MCP client polls GET /tasks/next."
+            )
             return
         if not pane_map or not agent:
             logger.debug(f"_try_push_discuss: no pane_map or agent")
@@ -853,6 +860,11 @@ def create_app(
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         task_id = q().enqueue(task)
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
+        if not _push_enabled:
+            logger.warning(
+                f"POST /tasks: AGENT_CREW_DELIVERY={_delivery_raw!r} — task {task_id} enqueued "
+                "but tmux push is disabled; an MCP client must poll GET /tasks/next to receive it"
+            )
         if task.task_type == "discuss":
             agent = task.context.get("agent") if isinstance(task.context, dict) else None
             logger.info(f"POST /tasks: discuss task, calling _try_push_discuss with agent={agent}")

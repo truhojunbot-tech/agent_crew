@@ -1,9 +1,12 @@
 import fcntl
 import json
+import logging
 import os
 import socket
 import subprocess
 import time
+
+_logger = logging.getLogger(__name__)
 
 from agent_crew import instructions, session
 
@@ -21,6 +24,14 @@ _AGENT_CMDS = {
     "gemini": "gemini --approval-mode yolo --model gemini-2.5-flash",
 }
 _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
+
+# Substrings expected in pane output after a successful CLI boot.
+# Used by start_agents_in_panes to warn when the CLI doesn't appear to have started.
+_CLI_READY_MARKERS: dict[str, tuple[str, ...]] = {
+    "claude": ("bypass permissions", "skip permissions"),
+    "codex": ("gpt", "codex>", "enter your task"),
+    "gemini": ("gemini", "yolo"),
+}
 
 
 def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
@@ -107,6 +118,33 @@ def start_agents_in_panes(
     # Give agent CLIs time to finish their own boot banners before the first
     # task push might arrive.
     time.sleep(3)
+
+    # Verify each pane shows an expected CLI ready-indicator. A missing marker
+    # means the CLI binary likely failed to start (missing install, bad flags,
+    # leftover interactive prompt, etc.) — warn loudly so the operator knows
+    # before the first task is pushed into a dead pane.
+    for agent, target in zip(agents, pane_targets):
+        markers = _CLI_READY_MARKERS.get(agent)
+        if not markers:
+            continue
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", target],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            _logger.warning(
+                "start_agents_in_panes: cannot capture pane %s for %s — tmux error",
+                target, agent,
+            )
+            continue
+        content = result.stdout.lower()
+        if not any(m.lower() in content for m in markers):
+            _logger.warning(
+                "start_agents_in_panes: pane %s (%s) shows no CLI-ready indicator "
+                "(checked: %r). The agent CLI may not have started correctly — "
+                "inspect the pane before submitting tasks.",
+                target, agent, markers,
+            )
 
 
 def pretrust_claude_worktree(worktrees: dict[str, str]) -> None:
