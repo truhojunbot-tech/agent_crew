@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import time
@@ -96,6 +97,65 @@ def _pane_is_busy(pane_id: str) -> bool:
     prev = _PANE_BUSY_LAST.get(pane_id)
     _PANE_BUSY_LAST[pane_id] = current
     return prev is not None and current != prev
+
+
+_TOKEN_CLEAR_THRESHOLD = int(os.getenv("AGENT_CREW_TOKEN_CLEAR_THRESHOLD", "200000"))
+_TOKEN_COUNT_RE = re.compile(r"save\s+([\d,]+(?:\.\d+)?[kKmM]?)\s+tokens", re.IGNORECASE)
+
+
+def _pane_token_count(pane_id: str) -> int:
+    """Return the token count hinted in the pane status bar, or 0.
+
+    Claude Code shows "new task? /clear to save 544.1k tokens" when context
+    is large. We parse that hint to detect saturation (#133).
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        return 0
+    m = _TOKEN_COUNT_RE.search(r.stdout)
+    if not m:
+        return 0
+    raw = m.group(1).replace(",", "")
+    if raw.lower().endswith("k"):
+        return int(float(raw[:-1]) * 1_000)
+    if raw.lower().endswith("m"):
+        return int(float(raw[:-1]) * 1_000_000)
+    return int(float(raw))
+
+
+def _pane_clear_context(pane_id: str) -> None:
+    """Send /clear to a Claude pane to reset context (#133)."""
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "/clear", "Enter"],
+                   capture_output=True)
+    import time as _time
+    _time.sleep(2.0)
+
+
+_GEMINI_PERMISSION_RE = re.compile(r"Allow execution of .+\?", re.IGNORECASE)
+
+
+def _pane_dismiss_permission_prompt(pane_id: str) -> bool:
+    """If a gemini permission prompt is visible, auto-select 'Allow for this session'.
+
+    Returns True if a prompt was found and dismissed (#134).
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        return False
+    if not _GEMINI_PERMISSION_RE.search(r.stdout):
+        return False
+    subprocess.run(["tmux", "send-keys", "-t", pane_id, "2", "Enter"],
+                   capture_output=True)
+    logger.info(f"_pane_dismiss_permission_prompt: dismissed gemini prompt on {pane_id}")
+    return True
 
 
 def _pane_has_task(pane_id: str) -> bool:
@@ -422,6 +482,16 @@ def create_app(
             return
 
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
+        # #133: clear oversized context before pushing so claude doesn't stall.
+        tok = _pane_token_count(pane_id)
+        if tok >= _TOKEN_CLEAR_THRESHOLD:
+            logger.info(
+                f"_try_push_next: pane {pane_id} has {tok} tokens "
+                f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
+            )
+            _pane_clear_context(pane_id)
+        # #134: auto-dismiss gemini permission prompt if present.
+        _pane_dismiss_permission_prompt(pane_id)
         push_fn(pane_id, _format_task_message(task, port))
 
     def _try_push_discuss(agent: Optional[str]) -> None:
@@ -499,6 +569,9 @@ def create_app(
             if not pane_id:
                 continue
             try:
+                # #134: dismiss gemini permission prompt before busy-check so
+                # the prompt doesn't freeze the pane and appear as idle.
+                _pane_dismiss_permission_prompt(pane_id)
                 if pane_busy_fn(pane_id):
                     q().bump_activity(task_id, ts=now)
                     actions["bumped"].append(task_id)
@@ -568,6 +641,45 @@ def create_app(
                         f"WATCHDOG REMINDER: task_id={task_id} idle for "
                         f"{idle_for:.0f}s — nudged pane {pane_id}"
                     )
+        # #136: re-dispatch stale pending tasks that were never picked up.
+        # A task stays "pending" when the target pane was busy at enqueue time
+        # and no subsequent push fired. We nudge _try_push_next so the role's
+        # pane gets another delivery attempt.
+        stale_pending_seconds = float(
+            os.getenv("AGENT_CREW_STALE_PENDING_SECONDS", "120")
+        )
+        try:
+            stale = q().list_stale_pending(stale_pending_seconds, now)
+        except Exception:
+            logger.exception("watchdog: list_stale_pending raised — skipping")
+            stale = []
+        # Collect unique roles so we only fire _try_push_next once per role.
+        stale_roles: set[str] = set()
+        for sp in stale:
+            task_type = sp.get("task_type", "")
+            ctx = sp.get("context") or {}
+            if task_type == "discuss":
+                agent = ctx.get("agent") if isinstance(ctx, dict) else None
+                if agent and agent in (pane_map or {}):
+                    stale_roles.add(f"discuss:{agent}")
+            else:
+                role = _TYPE_TO_ROLE.get(task_type)
+                if role:
+                    stale_roles.add(role)
+        for role_key in stale_roles:
+            try:
+                if role_key.startswith("discuss:"):
+                    _try_push_discuss(role_key.split(":", 1)[1])
+                else:
+                    _try_push_next(role_key)
+                logger.info(f"watchdog: re-dispatched stale pending for role={role_key}")
+            except Exception:
+                logger.exception(
+                    f"watchdog: re-dispatch failed for role={role_key}"
+                )
+        if stale_roles:
+            actions["stale_redispatched"] = list(stale_roles)
+
         return actions
 
     # Stash the tick for tests; harmless in production (never read by handlers).

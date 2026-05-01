@@ -669,6 +669,32 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def list_stale_pending(self, older_than_seconds: float, now: float) -> List[dict]:
+        """Return pending tasks whose created_at is more than older_than_seconds ago.
+
+        Used by the watchdog (#136) to re-dispatch tasks that were enqueued but
+        never picked up (e.g. pane was busy or push was missed).
+        """
+        cutoff = now - older_than_seconds
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, task_type, context, created_at FROM tasks "
+                "WHERE status = 'pending' AND created_at < ?",
+                (cutoff,),
+            ).fetchall()
+            return [
+                {
+                    "task_id": r["task_id"],
+                    "task_type": r["task_type"],
+                    "context": json.loads(r["context"]) if r["context"] else {},
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
     def list_checkpoints(self, task_id: str) -> List[dict]:
         """List all checkpoints for a task."""
         conn = self._connect()
