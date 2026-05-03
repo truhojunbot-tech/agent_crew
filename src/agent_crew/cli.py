@@ -1311,6 +1311,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
         review_context = {}
         if reviewer:
             review_context["agent_override"] = reviewer
+        if no_tester:
+            review_context["no_tester"] = True
         review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, context=review_context, port=_run_port)
         click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
         review_start = time.time()

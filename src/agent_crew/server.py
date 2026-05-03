@@ -177,6 +177,19 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
         return {}
 
 
+_THINKING_TAIL_LINES = 10
+_THINKING_RE = re.compile(r"esc to interrupt|↓\s*[\d,.]+[kKmM]?\s*tokens", re.IGNORECASE)
+
+
+def _pane_is_thinking(capture: str) -> bool:
+    """Return True when the last visible lines contain active LLM generation markers.
+    Only the bottom _THINKING_TAIL_LINES lines are checked so scrolled-away
+    past-tense thinking output does not trigger false positives (#138).
+    """
+    tail = "\n".join(capture.splitlines()[-_THINKING_TAIL_LINES:])
+    return bool(_THINKING_RE.search(tail))
+
+
 def _pane_is_busy(pane_id: str) -> bool:
     """Return True if the pane is actively processing.
 
@@ -737,6 +750,16 @@ def create_app(
                 )
                 reminded_task_ids.discard(task_id)
                 actions["timed_out"].append(task_id)
+                # Interrupt hung pane: kills child processes (e.g. gh pr view)
+                # and breaks the LLM CLI out of infinite "Thinking". Safe on
+                # idle panes — Ctrl+C on a shell prompt is a no-op.
+                try:
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", pane_id, "C-c"],
+                        capture_output=True, timeout=3
+                    )
+                except Exception:
+                    logger.warning(f"watchdog: failed to interrupt pane {pane_id}")
                 if tt is not None:
                     # Reuse the rate-limit fallback hook so a stuck pane gets
                     # routed to the next agent in the chain instead of just
@@ -1042,10 +1065,15 @@ def create_app(
                 _auto_enqueue_review(task_id, pr_number=result.pr_number)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
-            # review counts as approved (#100).
+            # review counts as approved (#100). Skip when the review task was
+            # created with no_tester=True (set by `crew run --no-tester`).
             if task_type == "review" and _resolve_verdict(result) == "approve":
-                logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
-                _auto_enqueue_test(task_id)
+                review_ctx = ctx if isinstance(ctx, dict) else {}
+                if review_ctx.get("no_tester"):
+                    logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
+                else:
+                    logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
+                    _auto_enqueue_test(task_id)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")

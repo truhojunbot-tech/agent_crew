@@ -134,3 +134,70 @@ class TestMcpStillCascadesAfterSubmit:
         assert any(t["task_type"] == "review" for t in tasks)
         # No push fired anywhere along the way.
         assert push.calls == []
+
+
+# ---------------------------------------------------------------------------
+# no_tester context flag (#148) — review approved with no_tester=True must
+# NOT enqueue a test task.
+# ---------------------------------------------------------------------------
+
+def _review_task_payload(task_id="r1", no_tester=False):
+    return {
+        "task_id": task_id,
+        "task_type": "review",
+        "description": "review the code",
+        "branch": "feat",
+        "priority": 3,
+        "context": {"no_tester": True} if no_tester else {},
+        "project": "",
+    }
+
+
+def _approved_result(task_id):
+    return {
+        "task_id": task_id,
+        "status": "completed",
+        "summary": "lgtm",
+        "verdict": "approve",
+        "findings": [],
+        "pr_number": None,
+    }
+
+
+class TestNoTesterFlag:
+    def test_no_tester_true_skips_test_enqueue(self, tmp_db, monkeypatch):
+        """Review approved with no_tester=True in context → no test task queued."""
+        monkeypatch.delenv("AGENT_CREW_DELIVERY", raising=False)
+        push = _RecordingPush()
+        app = create_app(
+            db_path=tmp_db,
+            pane_map={"implementer": "%100", "reviewer": "%200", "tester": "%300"},
+            port=8100,
+            push_fn=push,
+            watchdog_disabled=True,
+        )
+        from agent_crew.queue import TaskQueue
+        with TestClient(app) as client:
+            client.post("/tasks", json=_review_task_payload("r-skip", no_tester=True))
+            client.post(f"/tasks/r-skip/result", json=_approved_result("r-skip"))
+            tasks = client.get("/tasks").json()
+        test_tasks = [t for t in tasks if t["task_type"] == "test"]
+        assert test_tasks == [], "no_tester=True must suppress test enqueue"
+
+    def test_no_tester_false_enqueues_test(self, tmp_db, monkeypatch):
+        """Review approved with no_tester absent → test task is enqueued (default)."""
+        monkeypatch.delenv("AGENT_CREW_DELIVERY", raising=False)
+        push = _RecordingPush()
+        app = create_app(
+            db_path=tmp_db,
+            pane_map={"implementer": "%100", "reviewer": "%200", "tester": "%300"},
+            port=8100,
+            push_fn=push,
+            watchdog_disabled=True,
+        )
+        with TestClient(app) as client:
+            client.post("/tasks", json=_review_task_payload("r-test", no_tester=False))
+            client.post(f"/tasks/r-test/result", json=_approved_result("r-test"))
+            tasks = client.get("/tasks").json()
+        test_tasks = [t for t in tasks if t["task_type"] == "test"]
+        assert len(test_tasks) == 1, "test task must be enqueued when no_tester is absent"
