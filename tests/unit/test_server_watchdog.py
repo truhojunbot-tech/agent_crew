@@ -267,3 +267,35 @@ def test_u_wd07_pane_busy_fn_exception_swallowed(tmp_db):
         result = app.state.watchdog_tick(now=2500.0)
 
     assert result == {"bumped": [], "reminded": [], "timed_out": []}
+
+
+# U-WD08: Watchdog timeout sends C-c to hung pane before routing fallback (#148).
+def test_u_wd08_timeout_sends_ctrl_c_to_pane(tmp_db, monkeypatch):
+    """After force_fail, watchdog must send C-c to the hung pane so child
+    processes (e.g. `gh pr view`) are killed and the CLI can receive the
+    fallback task."""
+    import subprocess as _sp
+    busy = _PaneState()
+    push = _RecordingPush()
+    app = _make_app(tmp_db, panes={"implementer": "%100"},
+                    busy_fn=busy, push_fn=push,
+                    reminder=300.0, timeout=900.0)
+
+    sent_keys = []
+
+    def fake_run(cmd, **kwargs):
+        if "send-keys" in cmd:
+            sent_keys.append(cmd)
+        result = _sp.CompletedProcess(cmd, 0, stdout="", stderr="")
+        return result
+
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("t-hung"))
+        TaskQueue(tmp_db).bump_activity("t-hung", ts=1000.0)
+        monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
+        app.state.watchdog_tick(now=2500.0)
+
+    # Must have sent C-c to the hung pane
+    ctrl_c_calls = [c for c in sent_keys if "C-c" in c]
+    assert ctrl_c_calls, "watchdog must send C-c to hung pane on timeout"
+    assert any("%100" in " ".join(c) for c in ctrl_c_calls)

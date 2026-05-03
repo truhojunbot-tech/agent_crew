@@ -61,33 +61,133 @@ def _reset_pane_busy_cache() -> None:
     _PANE_BUSY_LAST.clear()
 
 
-# Patterns that are ONLY present on-screen while the agent is actively
-# processing. They are cleared from the terminal UI as soon as the model
-# stops generating, so they never appear in past-turn scrollback (#138).
-# Checked against the bottom N lines of the visible pane only.
-_THINKING_ACTIVE_RE = re.compile(
-    r"esc to interrupt"
-    r"|✶ Quantumizing"
-    r"|✻ Baked"
-    r"|✳"
-    r"|↓ \d+[\d.,]*[kKmM]?\s+tokens"
-    r"|Working\.\.\."
-    r"|Thinking\.\.\.",
-    re.IGNORECASE,
+_WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").lower() in (
+    "1", "true", "yes",
 )
+_WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
+
+
+def _prepare_worktree_for_task(
+    worktree_path: str,
+    task_id: str,
+    task_branch: str,
+    role: str,
+) -> None:
+    """Sync worktree to origin and checkout the right branch before task dispatch.
+
+    - All roles: stash local changes, fetch origin (catches stale worktrees that
+      missed weeks of merged PRs, #141).
+    - implementer: checkout a fresh branch per task from origin/main so each
+      impl task starts clean and pushes to its own PR branch (#140).
+    - reviewer/tester: checkout the task's PR branch from origin so reviews
+      run against the actual changed code, not stale main (#141).
+
+    Failures are logged but never propagate — task dispatch continues even if
+    the git prep encounters a transient error (e.g. merge conflict on stash pop).
+    """
+    try:
+        _prepare_worktree_for_task_inner(worktree_path, task_id, task_branch, role)
+    except Exception:
+        logger.exception(
+            f"_prepare_worktree_for_task: unexpected error for {role} "
+            f"task_id={task_id} — continuing"
+        )
+
+
+def _prepare_worktree_for_task_inner(
+    worktree_path: str,
+    task_id: str,
+    task_branch: str,
+    role: str,
+) -> None:
+    """Inner (may raise). Wrapped by _prepare_worktree_for_task."""
+    main_branch = _WORKTREE_MAIN_BRANCH
+    # Stash any leftover uncommitted changes so checkout doesn't fail.
+    subprocess.run(
+        ["git", "-C", worktree_path, "stash", "push", "-u",
+         "-m", f"agent_crew pre-{task_id[:8]}"],
+        capture_output=True, text=True,
+    )
+    # Fetch all remote branches so the target ref is up to date.
+    subprocess.run(
+        ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
+        capture_output=True, text=True,
+    )
+
+    if role == "implementer":
+        # Fresh branch per task from origin/main (#140). Use task.branch when
+        # set (crew run --branch), otherwise derive from task_id.
+        branch = task_branch if task_branch else f"agent/{task_id[:12]}"
+        r = subprocess.run(
+            ["git", "-C", worktree_path, "checkout", "-B", branch,
+             f"origin/{main_branch}"],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                f"_prepare_worktree_for_task: implementer checkout {branch} "
+                f"from origin/{main_branch} failed: {r.stderr.strip()}"
+            )
+    else:
+        # Reviewer/tester: checkout the PR branch from origin (#141).
+        # If the branch is absent on origin (merged, deleted) fall back to
+        # origin/main so the worktree is at least current.
+        prefix = "review" if role == "reviewer" else "test"
+        local_branch = f"{prefix}/{task_id[:8]}"
+        target_ref = f"origin/{task_branch}" if task_branch else f"origin/{main_branch}"
+        r = subprocess.run(
+            ["git", "-C", worktree_path, "checkout", "-B", local_branch, target_ref],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            logger.warning(
+                f"_prepare_worktree_for_task: {role} checkout {local_branch} "
+                f"from {target_ref} failed, falling back to origin/{main_branch}: "
+                f"{r.stderr.strip()}"
+            )
+            subprocess.run(
+                ["git", "-C", worktree_path, "checkout", "-B", local_branch,
+                 f"origin/{main_branch}"],
+                capture_output=True, text=True,
+            )
+
+
+def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
+    """Derive {role: worktree_path} from state.json.
+
+    state.json stores worktrees as {agent_name: path}. We convert agent names
+    to roles (implementer/reviewer/tester) so the server can look up the
+    right worktree for a given role without importing setup.py at runtime.
+    """
+    if not state_path or not os.path.exists(state_path):
+        return {}
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+        worktrees = state.get("worktrees", {})
+        _AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}
+        result: dict[str, str] = {}
+        for agent, path in worktrees.items():
+            role = _AGENT_TO_ROLE.get(agent)
+            if role and path:
+                result[role] = path
+        return result
+    except Exception:
+        logger.exception("_load_worktree_map: failed to read state.json")
+        return {}
+
+
 _THINKING_TAIL_LINES = 10
+_THINKING_RE = re.compile(r"esc to interrupt|↓\s*[\d,.]+[kKmM]?\s*tokens", re.IGNORECASE)
 
 
 def _pane_is_thinking(capture: str) -> bool:
-    """Return True if the bottom lines of a pane capture show active thinking.
-
-    Checks only the last _THINKING_TAIL_LINES lines to avoid matching
-    past-turn output that scrolled up (#84). 'esc to interrupt' is the most
-    reliable signal — it is displayed by Claude/Gemini/Codex exactly while
-    they are generating and is cleared the moment they stop (#138).
+    """Return True when the last visible lines contain active LLM generation markers.
+    Only the bottom _THINKING_TAIL_LINES lines are checked so scrolled-away
+    past-tense thinking output does not trigger false positives (#138).
     """
     tail = "\n".join(capture.splitlines()[-_THINKING_TAIL_LINES:])
-    return bool(_THINKING_ACTIVE_RE.search(tail))
+    return bool(_THINKING_RE.search(tail))
 
 
 def _pane_is_busy(pane_id: str) -> bool:
@@ -368,6 +468,7 @@ def create_app(
     anomaly_disabled: Optional[bool] = None,
     state_path: Optional[str] = None,
     fallback_disabled: Optional[bool] = None,
+    worktree_map: Optional[dict] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -392,7 +493,12 @@ def create_app(
         ``AGENT_CREW_GH_USERNAME`` is configured).
     state_path: path to the per-project state.json — used by the anomaly
         sweep to auto-detect the expected repo allow-list.
+    worktree_map: {role: worktree_path} — when provided the server prepares
+        each worktree (fetch + branch checkout) before dispatching a task to
+        it. Falls back to _load_worktree_map(state_path) if omitted.
     """
+    if worktree_map is None:
+        worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
     if watchdog_interval is None:
         watchdog_interval = float(os.getenv("AGENT_CREW_WATCHDOG_INTERVAL", "30"))
     if reminder_seconds is None:
@@ -462,7 +568,11 @@ def create_app(
         """If the role has an available pane and is idle, dequeue and push the next task."""
         logger.debug(f"_try_push_next: role={role}")
         if not _push_enabled:
-            logger.debug(f"_try_push_next: push disabled (AGENT_CREW_DELIVERY={_delivery_raw})")
+            logger.warning(
+                f"_try_push_next: AGENT_CREW_DELIVERY={_delivery_raw!r} — tmux push disabled. "
+                "Tasks will only be delivered if an MCP client polls GET /tasks/next; "
+                "if no MCP client is active they will accumulate until the watchdog auto-fails them."
+            )
             return
         if not pane_map:
             logger.debug(f"_try_push_next: no pane_map")
@@ -505,6 +615,24 @@ def create_app(
             q().requeue(task.task_id)
             return
 
+        # #140/#141: prepare worktree branch before task delivery.
+        if worktree_map and not _WORKTREE_SYNC_DISABLED:
+            wt_path = worktree_map.get(role)
+            if wt_path:
+                try:
+                    _prepare_worktree_for_task(
+                        wt_path, task.task_id, task.branch or "", role
+                    )
+                    logger.info(
+                        f"_try_push_next: worktree prepared for {role} "
+                        f"task_id={task.task_id} branch={task.branch or '(none)'}"
+                    )
+                except Exception:
+                    logger.exception(
+                        f"_try_push_next: worktree prep failed for {role} "
+                        f"task_id={task.task_id} — continuing with dispatch"
+                    )
+
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
         # #133: clear oversized context before pushing so claude doesn't stall.
         tok = _pane_token_count(pane_id)
@@ -525,7 +653,10 @@ def create_app(
         concurrent panelists don't block each other."""
         logger.debug(f"_try_push_discuss: agent={agent}")
         if not _push_enabled:
-            logger.debug(f"_try_push_discuss: push disabled (AGENT_CREW_DELIVERY={_delivery_raw})")
+            logger.warning(
+                f"_try_push_discuss: AGENT_CREW_DELIVERY={_delivery_raw!r} — tmux push disabled. "
+                "Discuss tasks will only be delivered if an MCP client polls GET /tasks/next."
+            )
             return
         if not pane_map or not agent:
             logger.debug(f"_try_push_discuss: no pane_map or agent")
@@ -619,6 +750,16 @@ def create_app(
                 )
                 reminded_task_ids.discard(task_id)
                 actions["timed_out"].append(task_id)
+                # Interrupt hung pane: kills child processes (e.g. gh pr view)
+                # and breaks the LLM CLI out of infinite "Thinking". Safe on
+                # idle panes — Ctrl+C on a shell prompt is a no-op.
+                try:
+                    subprocess.run(
+                        ["tmux", "send-keys", "-t", pane_id, "C-c"],
+                        capture_output=True, timeout=3
+                    )
+                except Exception:
+                    logger.warning(f"watchdog: failed to interrupt pane {pane_id}")
                 if tt is not None:
                     # Reuse the rate-limit fallback hook so a stuck pane gets
                     # routed to the next agent in the chain instead of just
@@ -853,6 +994,11 @@ def create_app(
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         task_id = q().enqueue(task)
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
+        if not _push_enabled:
+            logger.warning(
+                f"POST /tasks: AGENT_CREW_DELIVERY={_delivery_raw!r} — task {task_id} enqueued "
+                "but tmux push is disabled; an MCP client must poll GET /tasks/next to receive it"
+            )
         if task.task_type == "discuss":
             agent = task.context.get("agent") if isinstance(task.context, dict) else None
             logger.info(f"POST /tasks: discuss task, calling _try_push_discuss with agent={agent}")
@@ -919,10 +1065,15 @@ def create_app(
                 _auto_enqueue_review(task_id, pr_number=result.pr_number)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
-            # review counts as approved (#100).
+            # review counts as approved (#100). Skip when the review task was
+            # created with no_tester=True (set by `crew run --no-tester`).
             if task_type == "review" and _resolve_verdict(result) == "approve":
-                logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
-                _auto_enqueue_test(task_id)
+                review_ctx = ctx if isinstance(ctx, dict) else {}
+                if review_ctx.get("no_tester"):
+                    logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
+                else:
+                    logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
+                    _auto_enqueue_test(task_id)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")

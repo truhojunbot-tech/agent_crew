@@ -1,6 +1,7 @@
 from unittest.mock import MagicMock, patch
 
 from agent_crew.setup import (
+    _CLI_READY_MARKERS,
     _collect_active_ports,
     _is_port_listening,
     create_worktrees,
@@ -108,8 +109,8 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
          patch("agent_crew.setup.time.sleep"):
         start_agents_in_panes("crew_proj", ["claude"])
 
-    # 4 calls per agent: C-c escape, q+Enter escape, launch cmd, Enter (#142)
-    assert mock_run.call_count == 4
+    # 5 calls per agent: C-c (#142) + q+Enter (#142) + launch cmd + Enter + capture-pane (#147)
+    assert mock_run.call_count == 5
     all_args = [call[0][0] for call in mock_run.call_args_list]
     # Escape sequence: first two calls send C-c and then q/Enter
     assert any("C-c" in " ".join(a) for a in all_args), "Ctrl+C escape not sent"
@@ -120,6 +121,8 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
     assert any("claude" in " ".join(a) for a in literal_calls)
     # Enter to submit launch
     assert any("Enter" in a for a in all_args)
+    # capture-pane to verify CLI started
+    assert any("capture-pane" in " ".join(a) for a in all_args), "capture-pane verify not sent"
     # Must NOT send any prompt text that references the AGENT_CREW TASK block
     for call in mock_run.call_args_list:
         args = call[0][0]
@@ -286,3 +289,36 @@ def test_u_se20_is_port_listening_returns_false():
     port = s.getsockname()[1]
     s.close()
     assert _is_port_listening(port) is False
+
+
+# U-SE21: start_agents_in_panes warns when pane shows no CLI-ready indicator (#146)
+def test_u_se21_start_agents_warns_when_cli_not_detected():
+    """If the capture-pane output contains none of the expected markers, a
+    WARNING must be logged so the operator can inspect the pane before pushing."""
+    empty_capture = MagicMock(returncode=0)
+    empty_capture.stdout = "bash-5.1$ "  # no CLI marker in raw output
+
+    with patch("agent_crew.setup.subprocess.run", return_value=empty_capture), \
+         patch("agent_crew.setup.time.sleep"), \
+         patch("agent_crew.setup._logger") as mock_log:
+        start_agents_in_panes("crew", ["claude"])
+
+    # warning.call_count should be 1 — one per agent that failed the check
+    assert mock_log.warning.call_count >= 1
+    warning_msg = mock_log.warning.call_args_list[0][0][0]
+    assert "CLI-ready indicator" in warning_msg or "CLI" in warning_msg.lower()
+
+
+# U-SE22: start_agents_in_panes does NOT warn when CLI-ready indicator found (#146)
+def test_u_se22_start_agents_no_warn_when_cli_detected():
+    """When the pane contains a known CLI marker, no warning should be emitted."""
+    marker = _CLI_READY_MARKERS["claude"][0]  # e.g. "bypass permissions"
+    good_capture = MagicMock(returncode=0)
+    good_capture.stdout = f"some preamble\n{marker}\n❯ "
+
+    with patch("agent_crew.setup.subprocess.run", return_value=good_capture), \
+         patch("agent_crew.setup.time.sleep"), \
+         patch("agent_crew.setup._logger") as mock_log:
+        start_agents_in_panes("crew", ["claude"])
+
+    assert mock_log.warning.call_count == 0
