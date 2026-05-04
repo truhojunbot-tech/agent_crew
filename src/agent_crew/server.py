@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from agent_crew.anomaly import check_wrong_repo
+from agent_crew.fallback import is_rate_limit_error
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
     auto_enqueue_review as _pipeline_auto_enqueue_review,
@@ -188,6 +189,21 @@ def _pane_is_thinking(capture: str) -> bool:
     """
     tail = "\n".join(capture.splitlines()[-_THINKING_TAIL_LINES:])
     return bool(_THINKING_RE.search(tail))
+
+
+def _pane_has_usage_limit(pane_id: str) -> bool:
+    """Return True when the pane capture contains a rate-limit / usage-limit
+    message, meaning the agent is blocked and can't accept new tasks (#151)."""
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0:
+            return False
+        return is_rate_limit_error(r.stdout)
+    except Exception:
+        return False
 
 
 def _pane_is_busy(pane_id: str) -> bool:
@@ -633,6 +649,41 @@ def create_app(
                         f"task_id={task.task_id} — continuing with dispatch"
                     )
 
+        # #151: if target pane shows a usage-limit message, immediately reroute
+        # via fallback rather than pushing into a blocked agent.
+        if _pane_has_usage_limit(pane_id):
+            blocked_agent = next(
+                (k for k, v in (pane_map or {}).items() if v == pane_id and k in ("claude", "codex", "gemini")),
+                None,
+            )
+            logger.warning(
+                f"_try_push_next: pane {pane_id} shows usage-limit — "
+                f"skipping push, routing task {task.task_id} to fallback "
+                f"(blocked_agent={blocked_agent})"
+            )
+            usage_limit_summary = (
+                f"usage limit detected on pane {pane_id}"
+                + (f" (agent={blocked_agent})" if blocked_agent else "")
+            )
+            task_type_for_fb = _ROLE_TO_TYPE.get(role)
+            if task_type_for_fb:
+                fb_result = TaskResult(
+                    task_id=task.task_id,
+                    status="failed",
+                    summary=usage_limit_summary,
+                    verdict=None,
+                    findings=[],
+                    pr_number=None,
+                )
+                q().force_fail(task.task_id, usage_limit_summary)
+                try:
+                    _auto_fallback_failed_task(task.task_id, fb_result, task_type_for_fb)
+                except Exception:
+                    logger.exception(f"_try_push_next: fallback failed for usage-limited task {task.task_id}")
+            else:
+                q().requeue(task.task_id)
+            return
+
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
         # #133: clear oversized context before pushing so claude doesn't stall.
         tok = _pane_token_count(pane_id)
@@ -738,7 +789,13 @@ def create_app(
                 continue
 
             idle_for = now - (row["last_activity_at"] or now)
-            if idle_for >= timeout_seconds:
+            # #152: require at least one reminder before timing out. This
+            # prevents a newly-dispatched task (whose pane was occupied by
+            # a prior task) from being force-failed before it ever had a
+            # chance to be picked up. A task that has never been reminded
+            # has not yet had idle_for ≥ reminder_seconds confirmed, so we
+            # treat it as still within its dispatch-grace window.
+            if idle_for >= timeout_seconds and task_id in reminded_task_ids:
                 summary = (
                     f"watchdog timeout: pane idle {idle_for:.0f}s without "
                     f"sign of activity (threshold {timeout_seconds:.0f}s)"
@@ -1085,6 +1142,13 @@ def create_app(
     def cancel_task(task_id: str):
         q().cancel(task_id)
         return {"status": "cancelled"}
+
+    @app.post("/tasks/expire-stale", status_code=200)
+    def expire_stale_tasks(older_than: float = 600.0):
+        """Cancel in_progress tasks idle longer than ``older_than`` seconds.
+        Returns list of cancelled task_ids."""
+        cancelled = q().expire_stale(older_than_seconds=older_than)
+        return {"cancelled": cancelled}
 
     @app.post("/gates", status_code=201)
     def post_gate(gate: GateRequest):

@@ -703,10 +703,86 @@ def status(project: str, base: str, preview: int):
             click.echo(f"  In progress: {role_running}")
 
 
+@crew.group("task")
+def task_group():
+    """Manage individual tasks in the queue."""
+
+
+@task_group.command("cancel")
+@click.argument("task_id")
+@click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--db", default="", help="SQLite DB path (standalone)")
+def task_cancel(task_id: str, project: str, base: str, db: str):
+    """Cancel TASK_ID (marks as cancelled, orphans dependents)."""
+    from agent_crew.queue import TaskQueue
+    if not db:
+        if not project:
+            detected = _auto_detect_project(base)
+            if not detected:
+                raise click.ClickException("--db or --project is required")
+            project = detected
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+    TaskQueue(db).cancel(task_id)
+    click.echo(f"Cancelled: {task_id}")
+
+
+@task_group.command("expire-stale")
+@click.option("--project", default="", help="Project name")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--db", default="", help="SQLite DB path (standalone)")
+@click.option("--older-than", default=600, type=int, show_default=True,
+              help="Cancel in_progress tasks idle longer than N seconds")
+@click.option("--dry-run", is_flag=True, help="Print which tasks would be cancelled, but don't cancel")
+def task_expire_stale(project: str, base: str, db: str, older_than: int, dry_run: bool):
+    """Cancel stale in_progress tasks (idle > --older-than seconds)."""
+    import time as _t
+    from agent_crew.queue import TaskQueue
+    if not db:
+        if not project:
+            detected = _auto_detect_project(base)
+            if not detected:
+                raise click.ClickException("--db or --project is required")
+            project = detected
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+    q = TaskQueue(db)
+    if dry_run:
+        cutoff = _t.time() - older_than
+        import sqlite3 as _sq
+        conn = _sq.connect(db)
+        conn.row_factory = _sq.Row
+        rows = conn.execute(
+            "SELECT task_id, task_type, last_activity_at FROM tasks "
+            "WHERE status = 'in_progress' AND last_activity_at < ?", (cutoff,)
+        ).fetchall()
+        conn.close()
+        if not rows:
+            click.echo("No stale tasks found.")
+        for r in rows:
+            idle = int(_t.time() - (r["last_activity_at"] or 0))
+            click.echo(f"  would cancel: {r['task_id']} ({r['task_type']}, idle {idle}s)")
+        return
+    cancelled = q.expire_stale(older_than_seconds=float(older_than))
+    if cancelled:
+        click.echo(f"Cancelled {len(cancelled)} stale task(s): {', '.join(cancelled)}")
+    else:
+        click.echo("No stale tasks found.")
+
+
 @crew.command()
 @click.argument("project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
-def recover(project: str, base: str):
+@click.option("--reset-stale", is_flag=True,
+              help="Also cancel in_progress tasks idle > --stale-seconds")
+@click.option("--stale-seconds", default=600, type=int, show_default=True,
+              help="Idle threshold for --reset-stale")
+def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
     """Recover a crashed PROJECT: restart server and recreate tmux panes."""
     state = _read_state(base, project)
     if state is None:
@@ -909,6 +985,14 @@ def recover(project: str, base: str):
         click.echo(f"Recovered: {', '.join(recovered)}")
     else:
         click.echo("Nothing to recover: server and tmux already running.")
+
+    if reset_stale:
+        from agent_crew.queue import TaskQueue
+        cancelled = TaskQueue(db_file).expire_stale(older_than_seconds=float(stale_seconds))
+        if cancelled:
+            click.echo(f"Reset stale: cancelled {len(cancelled)} task(s): {', '.join(cancelled)}")
+        else:
+            click.echo(f"Reset stale: no in_progress tasks older than {stale_seconds}s.")
 
 
 @crew.command()
