@@ -259,9 +259,9 @@ def _verify_delivery(port: int, task_id: str, timeout: float = 15.0) -> bool:
 
 
 _STATUS_ALIASES = (
-    ("queued", "pending"),
-    ("running", "in_progress"),
-    ("done", "completed"),
+    ("pending", "pending"),
+    ("in_progress", "in_progress"),
+    ("completed", "completed"),
     ("failed", "failed"),
     ("needs_human", "needs_human"),
     ("cancelled", "cancelled"),
@@ -627,7 +627,7 @@ def status(project: str, base: str, preview: int):
                 click.echo(f"  [{tid}] p{prio} {ttype}{agent} — {desc}")
                 # Preview result summary/verdict for completed tasks so you can
                 # peek at discuss outputs without re-running the whole panel.
-                if display_status == "done" and preview > 0 and tid != "?":
+                if display_status == "completed" and preview > 0 and tid != "?":
                     r = _load_result(tid)
                     if r is not None:
                         verdict = getattr(r, "verdict", None)
@@ -682,8 +682,8 @@ def status(project: str, base: str, preview: int):
     # Performance metrics
     if _queue_for_preview is not None and task_groups:
         click.echo("\nMetrics:")
-        all_done = task_groups.get("done", [])
-        all_running = task_groups.get("running", [])
+        all_done = task_groups.get("completed", [])
+        all_running = task_groups.get("in_progress", [])
 
         # Count tasks by type in done list
         type_counts = {}
