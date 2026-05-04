@@ -166,6 +166,7 @@ def test_u_wd04_reminder_dedupe_resets_after_busy(tmp_db):
 
 
 # U-WD05: Idle ≥ timeout → task auto-failed, role released, queued task pushed.
+# Timeout requires a prior reminder (#152: dispatch-grace window).
 def test_u_wd05_idle_past_timeout_auto_fails_and_pushes_next(tmp_db):
     busy = _PaneState()
     push = _RecordingPush()
@@ -181,7 +182,9 @@ def test_u_wd05_idle_past_timeout_auto_fails_and_pushes_next(tmp_db):
         assert len(push.calls) == 1, "second task should have been queued"
 
         TaskQueue(tmp_db).bump_activity("t-stuck", ts=1000.0)
-        # idle_for = 1500s → past timeout (900s).
+        # First: fire reminder tick (idle_for=400s ≥ reminder=300s).
+        app.state.watchdog_tick(now=1400.0)
+        # Then: fire timeout tick (idle_for=1500s ≥ timeout=900s).
         result = app.state.watchdog_tick(now=2500.0)
 
     assert result["timed_out"] == ["t-stuck"]
@@ -190,9 +193,10 @@ def test_u_wd05_idle_past_timeout_auto_fails_and_pushes_next(tmp_db):
     all_with_status = TaskQueue(tmp_db).list_all_with_status()
     stuck_status = next(r["status"] for r in all_with_status if r["task_id"] == "t-stuck")
     assert stuck_status == "failed"
-    # Next queued task pushed to the now-idle implementer pane.
-    assert len(push.calls) == 2
-    assert "t-next" in push.calls[1][1]
+    # push.calls: initial t-stuck + reminder nudge + t-next dispatch
+    # (#152: timeout requires a prior reminder, so reminder fires at tick 1)
+    assert len(push.calls) == 3
+    assert "t-next" in push.calls[2][1]
 
 
 # U-WD06: discuss tasks → watchdog uses context.agent for pane resolution.
@@ -292,7 +296,10 @@ def test_u_wd08_timeout_sends_ctrl_c_to_pane(tmp_db, monkeypatch):
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("t-hung"))
         TaskQueue(tmp_db).bump_activity("t-hung", ts=1000.0)
+        # First tick: send reminder (idle_for=400s ≥ reminder=300s).
+        app.state.watchdog_tick(now=1400.0)
         monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
+        # Second tick: timeout fires (idle_for=1500s ≥ timeout=900s).
         app.state.watchdog_tick(now=2500.0)
 
     # Must have sent C-c to the hung pane

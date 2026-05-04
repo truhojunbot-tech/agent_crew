@@ -128,8 +128,11 @@ def test_watchdog_timeout_routes_to_next_agent_via_fallback(tmp_db):
     )
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-stream"))
-        # Force last_activity_at to a known value, then tick past timeout.
+        # Force last_activity_at to a known value.
         TaskQueue(tmp_db).bump_activity("impl-stream", ts=1000.0)
+        # First tick: fire reminder (idle_for=400s ≥ reminder=300s, #152).
+        app.state.watchdog_tick(now=1400.0)
+        # Second tick: fire timeout (idle_for=1500s ≥ timeout=900s).
         result = app.state.watchdog_tick(now=2500.0)
 
     assert result["timed_out"] == ["impl-stream"]

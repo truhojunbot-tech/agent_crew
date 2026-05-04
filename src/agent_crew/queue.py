@@ -298,6 +298,28 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def expire_stale(self, older_than_seconds: float = 600.0) -> List[str]:
+        """Cancel in_progress tasks whose last_activity_at is older than
+        ``older_than_seconds``. Returns list of cancelled task_ids."""
+        cutoff = time.time() - older_than_seconds
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
+                (cutoff,),
+            ).fetchall()
+            task_ids = [r["task_id"] for r in rows]
+            if task_ids:
+                placeholders = ",".join("?" * len(task_ids))
+                conn.execute(
+                    f"UPDATE tasks SET status = 'cancelled' WHERE task_id IN ({placeholders})",
+                    task_ids,
+                )
+                conn.commit()
+            return task_ids
+        finally:
+            conn.close()
+
     def list_orphaned(self) -> List[TaskRequest]:
         """Return all tasks with status='orphaned'."""
         conn = self._connect()
@@ -464,6 +486,7 @@ class TaskQueue:
                     priority=r["priority"],
                     context=json.loads(r["context"]),
                     project=r["project"] if r["project"] else "",
+                    status=r["status"],
                 )
                 for r in rows
             ]
