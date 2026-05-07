@@ -624,6 +624,17 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def get_task_status(self, task_id: str) -> Optional[str]:
+        """Return the current DB status of a task, or None if not found (#159)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            return row["status"] if row else None
+        finally:
+            conn.close()
+
     def bump_activity(self, task_id: str, ts: Optional[float] = None) -> None:
         """Refresh last_activity_at for a task. Called by the watchdog whenever
         the agent's pane is observed busy, so the timeout/reminder clocks

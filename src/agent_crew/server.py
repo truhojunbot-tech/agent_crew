@@ -206,6 +206,52 @@ def _pane_has_usage_limit(pane_id: str) -> bool:
         return False
 
 
+# Visible strings in pane content that indicate an agent CLI is running.
+# Must be lowercase for case-insensitive matching.
+_AGENT_CLI_INDICATORS: tuple[str, ...] = (
+    "bypass permissions",   # claude --dangerously-skip-permissions
+    "skip permissions",     # claude
+    "claude code",          # claude code header
+    "gemini",               # gemini CLI footer
+    "yolo",                 # gemini --approval-mode yolo
+    "codex>",               # codex interactive prompt
+    "enter your task",      # codex ready state
+)
+
+_BASH_PROMPT_RE = re.compile(r"(?:^|\n)[^\n]*?\$\s*$|(?:^|\n)[^\n]*?❯\s*$", re.MULTILINE)
+
+
+def _pane_has_bash_prompt(pane_id: str) -> bool:
+    """Return True when the pane appears to be at a bare shell prompt,
+    indicating the agent CLI has crashed or never started (#158).
+
+    Heuristic: the last non-empty line ends with ``$`` or ``❯`` (typical
+    bash/zsh prompts) AND the full capture contains no known agent CLI
+    ready-indicators. Using both conditions avoids false positives from
+    pane content that incidentally contains a ``$`` (e.g. shell variables
+    visible in agent output).
+
+    Returns False on any tmux error — we must never block a push based on
+    an inconclusive probe.
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "capture-pane", "-p", "-t", pane_id],
+            capture_output=True, text=True,
+        )
+    except Exception:
+        return False
+    if r.returncode != 0:
+        return False
+    content = r.stdout
+    # If any agent CLI indicator is visible, the CLI is running — not bash.
+    if any(ind in content.lower() for ind in _AGENT_CLI_INDICATORS):
+        return False
+    # Check that the last non-empty line looks like a shell prompt.
+    last_line = content.rstrip().rsplit("\n", 1)[-1] if content.strip() else ""
+    return bool(re.search(r"\$\s*$|❯\s*$", last_line))
+
+
 def _pane_is_busy(pane_id: str) -> bool:
     """Return True if the pane is actively processing.
 
@@ -682,6 +728,16 @@ def create_app(
                     logger.exception(f"_try_push_next: fallback failed for usage-limited task {task.task_id}")
             else:
                 q().requeue(task.task_id)
+            return
+
+        # #158: if pane shows a bare shell prompt (agent CLI crashed), requeue
+        # the task instead of pushing bash commands into it.
+        if _pane_has_bash_prompt(pane_id):
+            logger.warning(
+                f"_try_push_next: pane {pane_id} shows bare shell prompt — "
+                f"agent CLI appears crashed. Requeuing task {task.task_id}."
+            )
+            q().requeue(task.task_id)
             return
 
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
