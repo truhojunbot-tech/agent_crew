@@ -1394,6 +1394,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
     impl_context = {}
     if implementer:
         impl_context["agent_override"] = implementer
+    if no_tester:
+        impl_context["no_tester"] = True
 
     impl_id = enqueue_implement(queue, task, branch, context=impl_context, port=_run_port)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
@@ -1436,7 +1438,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
             if _run_port:
                 _drain_resolvable_gates(_run_port)
             if not no_tester:
-                test_id = enqueue_test(queue, task, branch, port=_run_port)
+                test_id = enqueue_test(queue, task, branch, prev_task_id=review_id, port=_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_start = time.time()
                 test_result = _wait(test_id)
