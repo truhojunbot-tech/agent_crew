@@ -1102,6 +1102,20 @@ def create_app(
     def health():
         return {"status": "ok"}
 
+    @app.post("/pane_map/reload")
+    def reload_pane_map():
+        """Re-read pane_map.json from disk and update routing in-place.
+        Called by `crew setup` when panes are recreated without restarting the server."""
+        new_pm = _load_pane_map()
+        if new_pm is None:
+            return {"status": "error", "message": "AGENT_CREW_PANE_MAP not set or file missing"}
+        if pane_map is None:
+            return {"status": "error", "message": "server pane_map is None (cannot update in-place)"}
+        pane_map.clear()
+        pane_map.update(new_pm)
+        logger.info(f"pane_map reloaded: {pane_map}")
+        return {"status": "ok", "pane_map": pane_map}
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")

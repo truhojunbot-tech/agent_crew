@@ -316,16 +316,30 @@ def setup(project: str, agents: str, base: str):
             )
             return
         if server_alive:
-            # Server is alive even though panes may be dead (e.g. session restart).
-            # Do NOT touch panes, sessions, or the server. Any automated caller
-            # (ScheduleWakeup, cron, etc.) must not recreate panes — that risks
-            # splitting into the wrong tmux session when pane IDs get reused.
-            # A human must run `crew teardown && crew setup` to recreate panes.
-            click.echo(
-                f"Project {project!r} server is alive on port {existing_state['port']}. "
-                "Panes may be gone — run `crew teardown && crew setup` to recreate them."
+            # Server alive but panes dead (session was restarted). Check if we're in
+            # the original coordinator session — if so, safely recreate panes here.
+            # If we're in a different session (e.g. ScheduleWakeup fired in 'trader'),
+            # block immediately to prevent panes in the wrong session.
+            current_session_r = subprocess.run(
+                ["tmux", "display-message", "-p", "#S"],
+                capture_output=True, text=True,
             )
-            return
+            current_session = current_session_r.stdout.strip()
+            expected_session = existing_state.get("session", "")
+            if current_session != expected_session:
+                click.echo(
+                    f"Project {project!r} server alive on port {existing_state['port']}. "
+                    f"Panes belong to session '{expected_session}', but current session is "
+                    f"'{current_session}'. Run setup from '{expected_session}' to recreate panes."
+                )
+                return
+            # Same session: panes are dead because session was recreated. Recreate panes only —
+            # reuse the existing server and port (no teardown needed).
+            click.echo(
+                f"Project {project!r} server alive on port {existing_state['port']}. "
+                "Recreating panes in the same session..."
+            )
+            _reuse_server = True
         else:
             click.echo(f"Project {project!r} has stale state (server down). Re-initializing...")
 
@@ -336,19 +350,25 @@ def setup(project: str, agents: str, base: str):
                 capture_output=True, text=True,
             )
 
-    # Warn if other project panes exist in this window
+    _reuse_server = locals().get("_reuse_server", False)
+
+    # Warn if other project panes exist in the SAME SESSION (skip on pane-recreation path)
     tmux_pane_env_pre = os.environ.get("TMUX_PANE", "")
-    if tmux_pane_env_pre:
+    if tmux_pane_env_pre and not _reuse_server:
+        cur_sess_r = subprocess.run(
+            ["tmux", "display-message", "-p", "#S"], capture_output=True, text=True
+        )
+        cur_sess = cur_sess_r.stdout.strip()
         other_states = []
         for entry in os.listdir(base) if os.path.isdir(base) else []:
             if entry == project:
                 continue
             st = _read_state(base, entry)
-            if st and any(_pane_alive(p) for p in st.get("pane_ids", [])):
+            if st and st.get("session") == cur_sess and any(_pane_alive(p) for p in st.get("pane_ids", [])):
                 other_states.append(entry)
         if other_states:
             click.echo(
-                f"Warning: live panes from other project(s) detected: {other_states}. "
+                f"Warning: live panes from other project(s) in this session: {other_states}. "
                 "These will share the same tmux window."
             )
             if not click.confirm("Continue?", default=False):
@@ -357,16 +377,20 @@ def setup(project: str, agents: str, base: str):
     agent_list = [a.strip() for a in agents.split(",") if a.strip()]
     proj_dir = _proj_dir(base, project)
     os.makedirs(proj_dir, exist_ok=True)
-    _crew_log(proj_dir, f"setup START agents={agent_list}")
+    _crew_log(proj_dir, f"setup START agents={agent_list} reuse_server={_reuse_server}")
 
     # Worktrees
     worktrees = setup_module.create_worktrees(project, base, agent_list)
     _crew_log(proj_dir, f"worktrees created: {list(worktrees.values())}")
 
-    # Port + port file
+    # Port + port file — reuse existing when server is already running
     port_file = os.path.join(proj_dir, "port")
-    port = setup_module.find_free_port()
-    setup_module.write_port_file(port_file, port)
+    if _reuse_server and existing_state is not None:
+        port = existing_state["port"]
+        server_pid = existing_state["server_pid"]
+    else:
+        port = setup_module.find_free_port()
+        setup_module.write_port_file(port_file, port)
 
     # Instruction files (into each worktree)
     setup_module.write_instruction_files(worktrees, project, port_file)
@@ -488,40 +512,77 @@ def setup(project: str, agents: str, base: str):
         json.dump(pane_map, f)
     _crew_log(proj_dir, f"pane_map written: {pane_map}")
 
-    # Start server — include sys.path in PYTHONPATH so subprocess can import agent_crew.
-    # AGENT_CREW_PANE_MAP tells the server where to push tasks; AGENT_CREW_PORT is
-    # embedded in push messages so agents know where to POST results.
+    # Start server — skip if reusing existing server (pane-only recreation path).
     db_file = os.path.join(proj_dir, "tasks.db")
-    state_file = _state_path(base, project)
-    pythonpath = os.pathsep.join(p for p in sys.path if p)
-    server_env = {
-        **os.environ,
-        "AGENT_CREW_DB": db_file,
-        "AGENT_CREW_PANE_MAP": pane_map_file,
-        "AGENT_CREW_STATE": state_file,
-        "AGENT_CREW_PORT": str(port),
-        "PYTHONPATH": pythonpath,
-    }
-    log_file = open(os.path.join(proj_dir, "server.log"), "w")
-    server_proc = subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
-         "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
-        env=server_env,
-        stdout=log_file,
-        stderr=log_file,
-    )
-    server_pid = server_proc.pid
-    _crew_log(proj_dir, f"server started pid={server_pid} port={port}")
-
-    # Wait until server is ready (up to 15 s) before returning
-    if not _port_listening(port, timeout=15.0):
-        server_proc.terminate()
-        log_file.close()
-        _crew_log(proj_dir, f"server failed to start on port {port}")
-        raise click.ClickException(
-            f"server failed to start on port {port}. "
-            f"Check {os.path.join(proj_dir, 'server.log')}"
+    if not _reuse_server:
+        state_file = _state_path(base, project)
+        pythonpath = os.pathsep.join(p for p in sys.path if p)
+        server_env = {
+            **os.environ,
+            "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PANE_MAP": pane_map_file,
+            "AGENT_CREW_STATE": state_file,
+            "AGENT_CREW_PORT": str(port),
+            "PYTHONPATH": pythonpath,
+        }
+        log_file = open(os.path.join(proj_dir, "server.log"), "w")
+        server_proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
+             "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
+            env=server_env,
+            stdout=log_file,
+            stderr=log_file,
         )
+        server_pid = server_proc.pid
+        _crew_log(proj_dir, f"server started pid={server_pid} port={port}")
+
+        # Wait until server is ready (up to 15 s) before returning
+        if not _port_listening(port, timeout=15.0):
+            server_proc.terminate()
+            log_file.close()
+            _crew_log(proj_dir, f"server failed to start on port {port}")
+            raise click.ClickException(
+                f"server failed to start on port {port}. "
+                f"Check {os.path.join(proj_dir, 'server.log')}"
+            )
+    else:
+        # Pane-recreation path: kill old server and restart on the same port so it
+        # picks up the new pane_map.json. The DB is preserved — no tasks are lost.
+        old_pid = existing_state.get("server_pid") if existing_state else None
+        if old_pid:
+            try:
+                os.kill(old_pid, signal.SIGTERM)
+                _crew_log(proj_dir, f"old server SIGTERM pid={old_pid}")
+                time.sleep(1)
+            except (ProcessLookupError, OSError):
+                pass
+        state_file = _state_path(base, project)
+        pythonpath = os.pathsep.join(p for p in sys.path if p)
+        server_env = {
+            **os.environ,
+            "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PANE_MAP": pane_map_file,
+            "AGENT_CREW_STATE": state_file,
+            "AGENT_CREW_PORT": str(port),
+            "PYTHONPATH": pythonpath,
+        }
+        log_file = open(os.path.join(proj_dir, "server.log"), "a")
+        server_proc = subprocess.Popen(
+            [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
+             "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
+            env=server_env,
+            stdout=log_file,
+            stderr=log_file,
+        )
+        server_pid = server_proc.pid
+        _crew_log(proj_dir, f"server restarted pid={server_pid} port={port}")
+        if not _port_listening(port, timeout=15.0):
+            server_proc.terminate()
+            log_file.close()
+            raise click.ClickException(
+                f"server failed to restart on port {port}. "
+                f"Check {os.path.join(proj_dir, 'server.log')}"
+            )
 
     # Pre-accept Claude's workspace-trust dialog for the claude worktree path
     # so --dangerously-skip-permissions doesn't get blocked on an interactive
