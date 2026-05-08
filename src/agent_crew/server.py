@@ -1187,9 +1187,15 @@ def create_app(
             # Auto-transition: impl task completed → auto-enqueue review task.
             # Pass through the PR number from the impl result so the reviewer
             # task description nails down which PR head to diff (#86).
+            # Skip when coordinator_managed=True — `crew run` drives transitions itself
+            # to avoid duplicate tasks and _wait() blocking on the wrong task_id.
+            _task_ctx = ctx if isinstance(ctx, dict) else {}
             if task_type == "implement" and result.status == "completed":
-                logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
-                _auto_enqueue_review(task_id, pr_number=result.pr_number)
+                if _task_ctx.get("coordinator_managed"):
+                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto review enqueue")
+                else:
+                    logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
+                    _auto_enqueue_review(task_id, pr_number=result.pr_number)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
             # review counts as approved (#100). Skip when the review task was
@@ -1198,6 +1204,8 @@ def create_app(
                 review_ctx = ctx if isinstance(ctx, dict) else {}
                 if review_ctx.get("no_tester"):
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
+                elif review_ctx.get("coordinator_managed"):
+                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto test enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id)
