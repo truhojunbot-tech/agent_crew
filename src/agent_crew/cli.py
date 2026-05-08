@@ -1558,6 +1558,49 @@ def run_cmd(task: str, db: str, project: str, base: str,
     click.echo(f"❌ Max iterations ({max_iter}) reached without approval.")
 
 
+# ---------------------------------------------------------------------------
+# GitHub Discussion helpers (used by `discuss --github-discussion`)
+# ---------------------------------------------------------------------------
+
+def _parse_gh_discussion_url(url: str) -> tuple[str, str, int]:
+    """Parse https://github.com/OWNER/REPO/discussions/NNN → (owner, repo, number)."""
+    import re
+    m = re.match(r"https?://github\.com/([^/]+)/([^/]+)/discussions/(\d+)", url.strip())
+    if not m:
+        raise click.UsageError(f"Invalid GitHub discussion URL: {url!r}")
+    return m.group(1), m.group(2), int(m.group(3))
+
+
+def _gh_discussion_node_id(owner: str, repo: str, number: int) -> str:
+    """Return the GraphQL node ID of a GitHub Discussion."""
+    import subprocess, json
+    query = (
+        f'query {{ repository(owner:"{owner}", name:"{repo}") '
+        f'{{ discussion(number:{number}) {{ id }} }} }}'
+    )
+    r = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={query}"],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(r.stdout)
+    return data["data"]["repository"]["discussion"]["id"]
+
+
+def _post_gh_discussion_comment(node_id: str, body: str) -> str:
+    """Post a comment to a GitHub Discussion and return the new comment ID."""
+    import subprocess, json
+    mutation = (
+        f'mutation {{ addDiscussionComment(input:{{discussionId:"{node_id}", '
+        f"body:{json.dumps(body)}}}) {{ comment {{ id }} }} }}"
+    )
+    r = subprocess.run(
+        ["gh", "api", "graphql", "-f", f"query={mutation}"],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(r.stdout)
+    return data["data"]["addDiscussionComment"]["comment"]["id"]
+
+
 @crew.command()
 @click.argument("topic")
 @click.option("--agents", default="",
@@ -1578,9 +1621,13 @@ def run_cmd(task: str, db: str, project: str, base: str,
 @click.option("--timeout", default=300, type=int, show_default=True, help="Task wait timeout in seconds")
 @click.option("--nowait", is_flag=True,
               help="Enqueue panel tasks and return immediately. Track progress via `crew status`.")
+@click.option("--github-discussion", default="",
+              help="Post each agent opinion as a GitHub Discussion comment "
+                   "(https://github.com/OWNER/REPO/discussions/NNN). "
+                   "Each comment is prefixed with [agent: NAME].")
 def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: bool,
             db: str, project: str, base: str, output: str, branch: str,
-            timeout: int, nowait: bool):
+            timeout: int, nowait: bool, github_discussion: str):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
         raise click.UsageError("topic must not be empty")
@@ -1701,6 +1748,16 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             click.echo(f"  {agent} ({perspectives_map[agent]}): {tid}")
         return
 
+    # GitHub Discussion setup — resolve node ID once before the rounds loop.
+    _gh_node_id: str = ""
+    if github_discussion:
+        try:
+            _gh_owner, _gh_repo, _gh_num = _parse_gh_discussion_url(github_discussion)
+            _gh_node_id = _gh_discussion_node_id(_gh_owner, _gh_repo, _gh_num)
+            click.echo(f"GitHub Discussion: {github_discussion} (node={_gh_node_id})")
+        except Exception as e:
+            raise click.ClickException(f"Failed to resolve GitHub discussion: {e}") from e
+
     prior_synthesis = ""
     final_synthesis = ""
     partial_hit = False
@@ -1743,6 +1800,17 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
 
         if not panel_results:
             break
+
+        # Post each agent's opinion as a GitHub Discussion comment.
+        if _gh_node_id:
+            for pr in panel_results:
+                round_tag = f" (round {round_num})" if rounds > 1 else ""
+                body = f"[agent: {pr['agent']}]{round_tag}\n\n{pr['summary']}"
+                try:
+                    comment_id = _post_gh_discussion_comment(_gh_node_id, body)
+                    click.echo(f"  GitHub comment posted: {pr['agent']} → {comment_id}")
+                except Exception as e:
+                    click.echo(f"  WARNING: failed to post GitHub comment for {pr['agent']}: {e}", err=True)
 
         synthesis_label = (
             f"Round {round_num} synthesis."
