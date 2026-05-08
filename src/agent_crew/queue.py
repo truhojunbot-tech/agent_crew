@@ -132,6 +132,25 @@ class TaskQueue:
             conn.close()
         return task.task_id
 
+    def patch_context(self, task_id: str, extra: dict) -> None:
+        """Merge ``extra`` into the existing context of a pending task."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT context FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None:
+                return
+            existing = json.loads(row["context"] or "{}")
+            merged = {**existing, **extra}
+            conn.execute(
+                "UPDATE tasks SET context=? WHERE task_id=?",
+                (json.dumps(merged), task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def dequeue(self, agent: str = "", role: str = "") -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -621,6 +640,17 @@ class TaskQueue:
             if row is None:
                 return None
             return (row["checkpoint_num"], json.loads(row["state_snapshot"]))
+        finally:
+            conn.close()
+
+    def get_task_status(self, task_id: str) -> Optional[str]:
+        """Return the current DB status of a task, or None if not found (#159)."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            return row["status"] if row else None
         finally:
             conn.close()
 

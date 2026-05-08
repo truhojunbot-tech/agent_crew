@@ -112,6 +112,8 @@ def auto_enqueue_review(
         }
         if implementer_agent:
             review_context["implementer_agent"] = implementer_agent
+        if impl_ctx.get("no_tester"):
+            review_context["no_tester"] = True
 
         review_id = f"review-{uuid.uuid4().hex[:8]}"
         review_req = TaskRequest(

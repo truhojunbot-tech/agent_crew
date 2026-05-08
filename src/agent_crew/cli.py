@@ -1246,6 +1246,20 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 time.sleep(10)
             else:
                 time.sleep(0.5)
+        # #159: if the task was never picked up (still pending), stop waiting
+        # without auto-failing. The task stays in queue and will be dispatched
+        # when an agent becomes free. This prevents a crew run that launched
+        # while all agents were busy from permanently killing the queued task.
+        task_status_now = queue.get_task_status(task_id)
+        if task_status_now == "pending":
+            proj_hint = repr(project) if project else "(project)"
+            click.echo(
+                f"Task queued (ID={task_id!r}) but not picked up within "
+                f"{wait_timeout:.0f}s. "
+                f"Check: crew status {proj_hint}"
+            )
+            raise click.exceptions.Exit(0)
+
         # Wrapper deadline hit before the agent posted a result. Don't blanket-
         # auto-fail (#92): if the pane shows the agent is still actively working,
         # extend the deadline rather than killing legitimate long tasks. Cap the
@@ -1393,6 +1407,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
     impl_context = {}
     if implementer:
         impl_context["agent_override"] = implementer
+    if no_tester:
+        impl_context["no_tester"] = True
 
     impl_id = enqueue_implement(queue, task, branch, context=impl_context, port=_run_port)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
@@ -1435,7 +1451,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
             if _run_port:
                 _drain_resolvable_gates(_run_port)
             if not no_tester:
-                test_id = enqueue_test(queue, task, branch, port=_run_port)
+                test_id = enqueue_test(queue, task, branch, prev_task_id=review_id, port=_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_start = time.time()
                 test_result = _wait(test_id)
