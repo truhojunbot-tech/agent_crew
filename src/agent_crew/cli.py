@@ -315,9 +315,21 @@ def setup(project: str, agents: str, base: str):
                 f"and server on port {existing_state['port']}. Reusing."
             )
             return
-        click.echo(f"Project {project!r} has stale state (panes dead or server down). Re-initializing...")
+        if server_alive:
+            # Server is alive even though panes may be dead (e.g. session restart).
+            # Do NOT touch panes, sessions, or the server. Any automated caller
+            # (ScheduleWakeup, cron, etc.) must not recreate panes — that risks
+            # splitting into the wrong tmux session when pane IDs get reused.
+            # A human must run `crew teardown && crew setup` to recreate panes.
+            click.echo(
+                f"Project {project!r} server is alive on port {existing_state['port']}. "
+                "Panes may be gone — run `crew teardown && crew setup` to recreate them."
+            )
+            return
+        else:
+            click.echo(f"Project {project!r} has stale state (server down). Re-initializing...")
 
-        # Kill old panes to prevent duplicates when creating new ones
+        # Kill old (dead) panes to prevent duplicates when creating new ones
         for pane_id in existing_pane_ids:
             subprocess.run(
                 ["tmux", "kill-pane", "-t", pane_id],
@@ -352,8 +364,8 @@ def setup(project: str, agents: str, base: str):
     _crew_log(proj_dir, f"worktrees created: {list(worktrees.values())}")
 
     # Port + port file
-    port = setup_module.find_free_port()
     port_file = os.path.join(proj_dir, "port")
+    port = setup_module.find_free_port()
     setup_module.write_port_file(port_file, port)
 
     # Instruction files (into each worktree)
@@ -391,6 +403,20 @@ def setup(project: str, agents: str, base: str):
     window_index = window_index or "0"
     window_target = f"{session_name}:{window_index}"
     _crew_log(proj_dir, f"tmux using caller session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
+
+    # Guard against stale TMUX_PANE pointing to a reused pane in a different session.
+    # This happens when: (1) the original session dies, (2) tmux recycles the pane ID
+    # for a new session, (3) a ScheduleWakeup fires in the surviving Claude process and
+    # calls crew setup — TMUX_PANE now resolves to the wrong (e.g. trader) session.
+    if existing_state is not None:
+        expected_session = existing_state.get("session")
+        if expected_session and session_name != expected_session:
+            raise click.ClickException(
+                f"TMUX_PANE resolved to session {session_name!r} but this project was "
+                f"set up in {expected_session!r}. Refusing to split panes in an unrelated "
+                "session (likely a stale ScheduleWakeup after session restart). "
+                "Run `crew teardown` then `crew setup` manually to re-initialize."
+            )
 
     # Check window width — main-vertical layout needs minimum width for readable panes
     # (e.g., 80-wide window + 3 agents can create 1-char wide panes on the right)
@@ -498,7 +524,8 @@ def setup(project: str, agents: str, base: str):
         stdout=log_file,
         stderr=log_file,
     )
-    _crew_log(proj_dir, f"server started pid={server_proc.pid} port={port}")
+    server_pid = server_proc.pid
+    _crew_log(proj_dir, f"server started pid={server_pid} port={port}")
 
     # Wait until server is ready (up to 15 s) before returning
     if not _port_listening(port, timeout=15.0):
@@ -534,7 +561,7 @@ def setup(project: str, agents: str, base: str):
         "agents": agent_list,
         "worktrees": worktrees,
         "db": db_file,
-        "server_pid": server_proc.pid,
+        "server_pid": server_pid,
         "sessions_file": sessions_file,
     })
 
