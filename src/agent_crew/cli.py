@@ -1465,7 +1465,13 @@ def run_cmd(task: str, db: str, project: str, base: str,
         else:
             raise click.ClickException("Failed to create GitHub issue")
 
-    impl_context = {}
+    # coordinator_managed tells the server to skip auto-transitions (impl→review,
+    # review→test). Without this flag the server and coordinator both enqueue the
+    # next phase independently, creating duplicate tasks and causing _wait() to
+    # block on the coordinator's copy while the agent completes the server's copy.
+    _CM = {"coordinator_managed": True}
+
+    impl_context = {**_CM}
     if implementer:
         impl_context["agent_override"] = implementer
     if no_tester:
@@ -1482,7 +1488,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         impl_elapsed = int(time.time() - impl_start)
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
-        review_context = {}
+        review_context = {**_CM}
         if reviewer:
             review_context["agent_override"] = reviewer
         if no_tester:
@@ -1512,7 +1518,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
             if _run_port:
                 _drain_resolvable_gates(_run_port)
             if not no_tester:
-                test_id = enqueue_test(queue, task, branch, prev_task_id=review_id, port=_run_port)
+                test_id = enqueue_test(queue, task, branch, prev_task_id=review_id,
+                                       context={**_CM}, port=_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_start = time.time()
                 test_result = _wait(test_id)
@@ -1529,7 +1536,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 else:
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
                     impl_id = enqueue_implement(queue, task, branch,
-                                               context={"retry": True}, port=_run_port)
+                                               context={**_CM, "retry": True}, port=_run_port)
                     continue
             else:
                 if _run_port:
@@ -1543,7 +1550,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         # request_changes: re-implement with feedback
         click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
         feedback = build_feedback(review_result)
-        retry_context = {"feedback": feedback}
+        retry_context = {**_CM, "feedback": feedback}
         if implementer:
             retry_context["agent_override"] = implementer
         impl_id = enqueue_implement(queue, task, branch, context=retry_context, port=_run_port)
