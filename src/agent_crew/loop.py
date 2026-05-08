@@ -70,6 +70,12 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
             if task.task_type == "review":
                 task_ctx = task.context if isinstance(task.context, dict) else {}
                 if task_ctx.get("prev_task_id") == prev_task_id:
+                    # Merge caller context (e.g. no_tester) onto the existing task.
+                    if context:
+                        try:
+                            queue.patch_context(task.task_id, context)
+                        except Exception:
+                            pass
                     return task.task_id
     except Exception:
         pass  # If we can't query, just create a new one
@@ -86,13 +92,26 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
     return queue.enqueue(req)
 
 
-def enqueue_test(queue, task_desc: str, branch: str, context: dict = {}, port: int = 0) -> str:
+def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", context: dict = {}, port: int = 0) -> str:
+    # Check if a test task already exists for this review task (auto-transition case).
+    # This makes enqueue_test idempotent when the server has auto-created a test.
+    if prev_task_id:
+        try:
+            for task in queue.list_tasks():
+                if task.task_type == "test":
+                    task_ctx = task.context if isinstance(task.context, dict) else {}
+                    if task_ctx.get("prev_task_id") == prev_task_id:
+                        return task.task_id
+        except Exception:
+            pass  # If we can't query, just create a new one
+
+    merged_context = {"prev_task_id": prev_task_id, **context} if prev_task_id else context
     req = TaskRequest(
         task_id=f"test-{uuid.uuid4().hex[:8]}",
         task_type="test",
         description=task_desc,
         branch=branch,
-        context=context,
+        context=merged_context,
     )
     if port:
         return _post_task_http(port, req)
