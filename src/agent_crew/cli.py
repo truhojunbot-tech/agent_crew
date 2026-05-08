@@ -404,20 +404,6 @@ def setup(project: str, agents: str, base: str):
     window_target = f"{session_name}:{window_index}"
     _crew_log(proj_dir, f"tmux using caller session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
 
-    # Guard against stale TMUX_PANE pointing to a reused pane in a different session.
-    # This happens when: (1) the original session dies, (2) tmux recycles the pane ID
-    # for a new session, (3) a ScheduleWakeup fires in the surviving Claude process and
-    # calls crew setup — TMUX_PANE now resolves to the wrong (e.g. trader) session.
-    if existing_state is not None:
-        expected_session = existing_state.get("session")
-        if expected_session and session_name != expected_session:
-            raise click.ClickException(
-                f"TMUX_PANE resolved to session {session_name!r} but this project was "
-                f"set up in {expected_session!r}. Refusing to split panes in an unrelated "
-                "session (likely a stale ScheduleWakeup after session restart). "
-                "Run `crew teardown` then `crew setup` manually to re-initialize."
-            )
-
     # Check window width — main-vertical layout needs minimum width for readable panes
     # (e.g., 80-wide window + 3 agents can create 1-char wide panes on the right)
     window_width_result = subprocess.run(
