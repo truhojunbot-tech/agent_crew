@@ -29,7 +29,7 @@ _DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
 # Used by start_agents_in_panes to warn when the CLI doesn't appear to have started.
 _CLI_READY_MARKERS: dict[str, tuple[str, ...]] = {
     "claude": ("bypass permissions", "skip permissions"),
-    "codex": ("gpt", "codex>", "enter your task"),
+    "codex": ("gpt-", "codex>", "enter your task", "explain this codebase"),
     "gemini": ("gemini", "yolo"),
 }
 
@@ -110,14 +110,17 @@ def start_agents_in_panes(
         _send_literal_text(target, cmd)
         _send_enter(target)
         if agent == "codex":
-            # codex prints a trust prompt after launch; "1" accepts the current
-            # directory as trusted so the CLI reaches the ready state.
-            time.sleep(1)
-            _send_literal_text(target, "1")
-            _send_enter(target)
+            # codex shows a two-step trust dialog after launch:
+            # 1) "1. Yes / 2. No" — cursor already on 1, Enter accepts
+            # 2) "Press enter to continue" — needs a second Enter
+            # The dialog takes ~3s to appear so we wait before responding.
+            time.sleep(3)
+            _send_enter(target)   # accept option 1 (already highlighted)
+            time.sleep(0.5)
+            _send_enter(target)   # dismiss "Press enter to continue"
     # Give agent CLIs time to finish their own boot banners before the first
-    # task push might arrive.
-    time.sleep(3)
+    # task push might arrive. Codex needs extra time after the trust dialog.
+    time.sleep(5)
 
     # Verify each pane shows an expected CLI ready-indicator. A missing marker
     # means the CLI binary likely failed to start (missing install, bad flags,
