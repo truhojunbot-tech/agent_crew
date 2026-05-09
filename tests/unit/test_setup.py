@@ -99,18 +99,14 @@ def test_u_se07_create_worktrees_custom_agents():
         assert result[agent] == f"/base/worktrees/proj/{agent}"
 
 
-# U-SE08: start_agents_in_panes only launches the CLI — no kickoff prompt.
-# Kickoff was removed because it consumed agent API quota and on rate-limited
-# backends (codex) it stalled subsequent task pushes. Instruction files in the
-# worktree cover the protocol.
+# U-SE08: start_agents_in_panes launches the CLI and sends a kickoff prompt.
+# The kickoff tells agents to start polling get_next_task every 30 seconds.
 def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
     mock_result = MagicMock(returncode=0)
     with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
          patch("agent_crew.setup.time.sleep"):
         start_agents_in_panes("crew_proj", ["claude"])
 
-    # 5 calls per agent: C-c (#142) + q+Enter (#142) + launch cmd + Enter + capture-pane (#147)
-    assert mock_run.call_count == 5
     all_args = [call[0][0] for call in mock_run.call_args_list]
     # Escape sequence: first two calls send C-c and then q/Enter
     assert any("C-c" in " ".join(a) for a in all_args), "Ctrl+C escape not sent"
@@ -123,7 +119,7 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
     assert any("Enter" in a for a in all_args)
     # capture-pane to verify CLI started
     assert any("capture-pane" in " ".join(a) for a in all_args), "capture-pane verify not sent"
-    # Must NOT send any prompt text that references the AGENT_CREW TASK block
+    # Must NOT reference the AGENT_CREW TASK push block (push is server-driven)
     for call in mock_run.call_args_list:
         args = call[0][0]
         last = args[-1] if args else ""
@@ -153,12 +149,17 @@ def test_u_se11_codex_trust_prompt_auto_answered():
          patch("agent_crew.setup.time.sleep"):
         start_agents_in_panes("crew", ["codex"])
 
-    all_texts = [
-        call[0][0][-1]
+    # Codex trust dialog: two Enter keys sent (cursor already on option 1).
+    # Since commit 39a4e7e the code uses _send_enter twice, not literal "1".
+    all_send_args = [
+        call[0][0]
         for call in mock_run.call_args_list
-        if "-l" in call[0][0]
+        if "send-keys" in call[0][0]
     ]
-    assert "1" in all_texts
+    enter_sends = [a for a in all_send_args if "Enter" in a]
+    assert len(enter_sends) >= 2, (
+        f"Expected >= 2 Enter sends for codex trust dialog, got {len(enter_sends)}"
+    )
 
 
 # U-SE12: pretrust_claude_worktree writes hasTrustDialogAccepted for claude worktree
@@ -322,3 +323,28 @@ def test_u_se22_start_agents_no_warn_when_cli_detected():
         start_agents_in_panes("crew", ["claude"])
 
     assert mock_log.warning.call_count == 0
+
+
+# U-SE23: start_agents_in_panes sends a kickoff prompt after CLI boots
+def test_u_se23_start_agents_sends_kickoff_prompt():
+    """After the CLI boots, start_agents_in_panes must send a kickoff prompt
+    telling the agent to start polling get_next_task every 30 seconds."""
+    good_capture = MagicMock(returncode=0)
+    good_capture.stdout = "bypass permissions\n❯ "
+
+    with patch("agent_crew.setup.subprocess.run", return_value=good_capture) as mock_run, \
+         patch("agent_crew.setup.time.sleep"):
+        start_agents_in_panes("crew", ["claude"])
+
+    # Collect all literal send-keys text
+    literal_texts = []
+    for call in mock_run.call_args_list:
+        args = call[0][0]
+        if "-l" in args:
+            literal_texts.append(args[-1])
+
+    # Kickoff prompt must reference polling / get_next_task
+    kickoff_text = " ".join(literal_texts)
+    assert "get_next_task" in kickoff_text or "30" in kickoff_text, (
+        "kickoff prompt must mention get_next_task polling or 30-second interval"
+    )

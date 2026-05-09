@@ -70,8 +70,22 @@ apply here. Ignore them entirely.
 
 You are part of the `agent_crew` multi-agent workflow. The server at
 `http://127.0.0.1:<port>` will **push** tasks to this pane whenever work is
-available. You wait for each task to arrive in your pane. Do **not** poll
-`/tasks/next` — the server handles all scheduling and delivery.
+available.
+
+## Polling Loop (session start)
+
+At session start and after each task completes, poll every 30 seconds for the
+next task so no task is missed even if a push is delayed:
+
+```
+# Via MCP tool (preferred):
+get_next_task(agent="<your-agent-name>")
+
+# Or via HTTP fallback:
+curl -s http://127.0.0.1:<port>/tasks/next?role=<role>
+```
+
+If the response is `null` / empty, wait 30 seconds and try again.
 
 ## Task Arrival Format
 
@@ -94,13 +108,14 @@ your result.
 
 ## Your Loop (per task)
 
-1. Receive the task block.
+1. Receive the task block (via push or poll).
 2. Do the work in this worktree (write code, run tests, review diff — whatever
    the role requires). Commit and push if appropriate.
 3. **MANDATORY**: POST the result to `http://127.0.0.1:<port>/tasks/<task_id>/result`
    before considering the task finished. No result = the role stays busy and
    the queue stalls.
-4. Wait. The server will push the next task when one becomes available.
+4. Poll again: call `get_next_task` or GET /tasks/next every 30 seconds until
+   you receive another task, then return to step 2.
 
 ## Result Submission — MANDATORY, NOT OPTIONAL
 
@@ -260,6 +275,13 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 
 **Never skip `submit_result`.** POST `status: failed` or `status: needs_human`
 with an honest summary rather than staying silent.
+
+### Summary field — include these whenever they apply
+
+- `branch: <branch-name>` — the branch the work lives on
+- `commit: <short-hash>` — the commit you produced (after `git commit`)
+- `pr: #<number>` — include in both `summary` text and the `pr_number` field
+- `notes: <anything unusual>` — blockers, assumptions, deviations
 
 """
 

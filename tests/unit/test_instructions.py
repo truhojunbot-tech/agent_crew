@@ -91,3 +91,36 @@ def test_u_i07_common_instructs_ignore_alfred_global():
     assert "alfred" in lower
     assert "telegram" in lower  # explicitly prohibited
     assert "skill" in lower     # skill invocation prohibited
+
+
+def test_u_i08_common_includes_polling_routine():
+    """_COMMON (push/both mode) must include 30-second polling routine.
+
+    Agents should poll GET /tasks/next (or MCP get_next_task) every 30
+    seconds at session start and after each task completes. This makes
+    push-mode agents resilient to missed pushes.
+    """
+    content = generate("implementer", "myproject", 8100)
+    lower = content.lower()
+    # Polling routine present
+    assert "30 second" in lower or "30s" in lower
+    # No longer says "do not poll" — polling is now allowed/encouraged
+    assert "do not poll" not in lower
+
+
+def test_u_i09_mcp_common_includes_result_format_guidance():
+    """_MCP_COMMON must include summary-field format (branch/commit/notes)
+    and a concrete curl-style example so agents know exactly what to include.
+    """
+    from agent_crew.instructions import _MCP_COMMON
+    assert "branch:" in _MCP_COMMON
+    assert "commit:" in _MCP_COMMON
+    assert "notes:" in _MCP_COMMON
+
+
+def test_u_i10_common_post_result_strengthened():
+    """POST result instruction must be unmistakably mandatory in both modes."""
+    from agent_crew.instructions import _COMMON, _MCP_COMMON
+    # Both modes must carry "never skip" or equivalent mandatory language
+    assert "never skip" in _COMMON.lower() or "mandatory" in _COMMON.lower()
+    assert "never skip" in _MCP_COMMON.lower() or "mandatory" in _MCP_COMMON.lower()

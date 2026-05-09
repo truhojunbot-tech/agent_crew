@@ -69,16 +69,13 @@ def start_agents_in_panes(
 ) -> None:
     """Start agent CLIs in tmux panes.
 
-    Push model: server delivers tasks to the pane via tmux send-keys when new
-    tasks arrive. Agents do NOT poll — they wait for pane messages, parse the
-    task, do the work, and POST results back.
+    Hybrid model: the server delivers tasks via tmux send-keys (push), and
+    agents also poll ``get_next_task`` via MCP every 30 seconds as a fallback
+    so no task is missed if a push is delayed or the pane was briefly busy.
 
-    No kickoff prompt is sent. Each worktree already contains the role-specific
-    instruction file (CLAUDE.md / AGENTS.md / GEMINI.md) which the agent CLI
-    auto-loads, and that file explicitly documents the ``=== AGENT_CREW TASK ===``
-    protocol. Sending an extra kickoff prompt wastes per-agent API quota (and
-    for rate-limited backends like codex, it cascades: the kickoff gets throttled,
-    leaving the subsequent task push in a dead composer state).
+    After CLI boot, a kickoff prompt is sent to each agent instructing them to
+    start calling ``get_next_task(agent=...)`` every 30 seconds. This prompt
+    starts the polling loop without waiting for a push to arrive.
 
     pane_targets (optional): explicit tmux targets per agent (e.g. pane_ids
     like ``%42``). When omitted, falls back to ``<session>:0.<i>`` which
@@ -154,6 +151,21 @@ def start_agents_in_panes(
                 "inspect the pane before submitting tasks.",
                 target, agent, markers,
             )
+
+    # Send a kickoff prompt to each agent to start their polling loop.
+    # Agents are instructed to call get_next_task(agent=...) every 30 seconds
+    # so tasks are picked up even if a tmux push is delayed or missed.
+    for agent, target in zip(agents, pane_targets):
+        kickoff = (
+            f"Start your task loop now: call get_next_task(agent=\"{agent}\") "
+            f"via the agent_crew MCP server every 30 seconds. "
+            f"If it returns None, wait 30 seconds and try again. "
+            f"When a task arrives, branch on task_type, do the work, "
+            f"then call submit_result. Loop indefinitely."
+        )
+        _send_literal_text(target, kickoff)
+        _send_enter(target)
+        time.sleep(0.3)
 
 
 def pretrust_claude_worktree(worktrees: dict[str, str]) -> None:
