@@ -315,3 +315,143 @@ class TestDispatchOnResult:
 
         # Either B or retry-A pushed — at minimum one additional push.
         assert len(push.calls) >= 2, "A push must fire after failed result + pending tasks"
+
+
+# ---------------------------------------------------------------------------
+# Review feedback: wire error_info into real failure paths; cancel chain on loop
+# ---------------------------------------------------------------------------
+
+class TestErrorInfoWiring:
+    """Review feedback for #167: error_info must be stored in ALL failure paths,
+    not just the force_fail signature."""
+
+    # U-167-05: watchdog force_fail wires structured error_info into DB.
+    def test_u_167_05_watchdog_force_fail_includes_error_info(self, tmp_db):
+        push = _RecordingPush()
+        busy = _PaneState()
+        app = create_app(
+            db_path=tmp_db,
+            pane_map={"implementer": "%100"},
+            port=8100,
+            push_fn=push,
+            pane_busy_fn=busy,
+            reminder_seconds=50.0,
+            timeout_seconds=100.0,
+            watchdog_disabled=True,
+        )
+        with TestClient(app) as client:
+            _post_task(client, "t1")
+            q = TaskQueue(tmp_db)
+            q.set_push_at("t1", ts=50.0)
+            q.bump_activity("t1", ts=50.0)
+            # Add to reminded set so the timeout path fires (not just reminder).
+            app.state.reminded_task_ids.add("t1")
+            # now=300: idle_for=250 >= timeout(100) and reminded → force_fail.
+            app.state.watchdog_tick(now=300.0)
+
+        conn = TaskQueue(tmp_db)._connect()
+        row = conn.execute(
+            "SELECT error_info, status FROM tasks WHERE task_id = 't1'"
+        ).fetchone()
+        conn.close()
+        assert row["status"] == "failed"
+        assert row["error_info"] is not None, (
+            "watchdog force_fail must store structured error_info in DB"
+        )
+        info = json.loads(row["error_info"])
+        assert info.get("reason") == "watchdog_timeout"
+        assert "idle_seconds" in info
+
+    # U-167-06: submit_result with status='failed' stores error_info from TaskResult.
+    def test_u_167_06_submit_result_failed_stores_error_info(self, tmp_db):
+        q = TaskQueue(tmp_db)
+        q.enqueue(_task("t1"))
+        q.dequeue(role="implementer")
+        result = TaskResult(
+            task_id="t1",
+            status="failed",
+            summary="api stream cut",
+            verdict=None,
+            findings=[],
+            error_info={"reason": "api_stream_timeout", "details": "no response after 120s"},
+        )
+        q.submit_result("t1", result)
+        conn = q._connect()
+        row = conn.execute("SELECT error_info FROM tasks WHERE task_id = 't1'").fetchone()
+        conn.close()
+        assert row["error_info"] is not None
+        stored = json.loads(row["error_info"])
+        assert stored["reason"] == "api_stream_timeout"
+
+
+class TestFallbackCancellation:
+    """Review feedback: fallback loop guard must cancel the original task,
+    not just open a gate; auto_retry must use DB retry count."""
+
+    # U-167-07: fallback chain loop cancels the original_task_id task.
+    def test_u_167_07_fallback_chain_cancels_original_on_loop(self, tmp_db):
+        """When fallback_chain_depth >= MAX, the original_task_id task must be
+        marked 'cancelled' — not just have an escalation gate opened."""
+        from agent_crew.pipeline import auto_fallback_failed_task
+
+        q = TaskQueue(tmp_db)
+        # Seed the root original task as already failed.
+        q.enqueue(_task("orig-root"))
+        q.dequeue(role="implementer")
+        q.force_fail("orig-root", "first failure")
+
+        # Simulate a fallback at depth=3 that traces back to orig-root.
+        q.enqueue(_task("fb3", ctx={
+            "fallback_chain_depth": 3,
+            "agent_override": "gemini",
+            "fallback_excluded": ["claude", "codex", "gemini"],
+            "original_task_id": "orig-root",
+        }))
+        q.dequeue(role="implementer")
+        result = TaskResult(
+            task_id="fb3",
+            status="failed",
+            summary="usage limit hit",
+            verdict=None,
+            findings=[],
+        )
+        auto_fallback_failed_task(
+            q, "fb3", result, "implement",
+            pane_map={"implementer": "%1", "claude": "%1", "codex": "%2", "gemini": "%3"},
+        )
+
+        pending = q.list_tasks(status="pending")
+        assert len(pending) == 0, "No new pending task on loop detection"
+
+        orig_tasks = [t for t in q.list_tasks() if t.task_id == "orig-root"]
+        assert orig_tasks[0].status == "cancelled", (
+            "original_task_id must be cancelled when fallback loop is detected"
+        )
+
+    # U-167-08: auto_retry reads retry count from DB context, not result.retry_count.
+    def test_u_167_08_auto_retry_uses_db_retry_count(self, tmp_db):
+        """result.retry_count is always 0 from agents; the server must check
+        context.retry_attempt stored in the DB to prevent infinite retries."""
+        push = _RecordingPush()
+        app = create_app(
+            db_path=tmp_db,
+            pane_map={"implementer": "%100"},
+            port=8100,
+            push_fn=push,
+            watchdog_disabled=True,
+            fallback_disabled=True,
+        )
+        with TestClient(app) as client:
+            # Enqueue a task that has already been retried twice (at max).
+            _post_task(client, "A", ctx={"retry_attempt": 2})
+            # Agent submits failure with retry_count=0 (agents never fill this).
+            _post_result(client, "A", status="failed", summary="generic failure")
+
+        q = TaskQueue(tmp_db)
+        # The retry task must NOT have been created — check pending + in_progress.
+        # (In tests, _pane_alive_for_push=True so a retry task would be immediately
+        #  pushed to in_progress, not left pending — check all active statuses.)
+        active = [t for t in q.list_tasks() if t.status in ("pending", "in_progress")]
+        assert len(active) == 0, (
+            "No retry task (in any active status) when DB context.retry_attempt >= MAX_RETRIES"
+        )

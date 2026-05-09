@@ -239,18 +239,33 @@ def auto_fallback_failed_task(
         ctx = dict(original.context) if isinstance(original.context, dict) else {}
 
         # #167: stop infinite fallback loops — if the chain has already been
-        # retried MAX_FALLBACK_CHAIN_DEPTH times, escalate without creating
-        # another fallback task.
+        # retried MAX_FALLBACK_CHAIN_DEPTH times, cancel the original task and
+        # escalate without creating another fallback task.
         if ctx.get("fallback_chain_depth", 0) >= MAX_FALLBACK_CHAIN_DEPTH:
             logger.warning(
                 f"auto_fallback: fallback_chain_depth={ctx.get('fallback_chain_depth')} "
-                f">= MAX ({MAX_FALLBACK_CHAIN_DEPTH}) for {task_id} — escalating without retry."
+                f">= MAX ({MAX_FALLBACK_CHAIN_DEPTH}) for {task_id} — cancelling chain."
             )
+            # Cancel the original root task so the chain has a definitive
+            # terminal state of "cancelled" (not "failed") in the DB.
+            original_task_id = ctx.get("original_task_id")
+            if original_task_id:
+                try:
+                    queue.cancel(original_task_id)
+                    logger.info(
+                        f"auto_fallback: cancelled original task {original_task_id} "
+                        f"due to fallback loop detection"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"auto_fallback: failed to cancel original task {original_task_id}: {e}"
+                    )
             msg = (
                 f"agent_crew fallback loop detected\n"
                 f"task_id: {task_id}\n"
                 f"task_type: {task_type}\n"
                 f"chain_depth: {ctx.get('fallback_chain_depth')}\n"
+                f"original_task_id: {original_task_id or '(unknown)'}\n"
                 f"last summary: {(result.summary or '')[:200]}"
             )
             try:
@@ -324,6 +339,9 @@ def auto_fallback_failed_task(
         new_ctx["fallback_excluded"] = excluded
         new_ctx["fallback_from_task_id"] = task_id
         new_ctx["fallback_chain_depth"] = ctx.get("fallback_chain_depth", 0) + 1
+        # Carry the root task_id through the chain so loop detection can
+        # cancel the original task when the depth limit is reached (#167).
+        new_ctx["original_task_id"] = ctx.get("original_task_id") or task_id
         try:
             fallback_req = TaskRequest(
                 task_id=f"fallback-{task_id}-{uuid.uuid4().hex[:4]}",

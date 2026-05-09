@@ -275,10 +275,15 @@ class TaskQueue:
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             task_type = row["task_type"]
+            # #167: persist structured error_info for failed results so post-mortem
+            # debugging has machine-readable data, not just the free-form summary.
+            error_info_json = None
+            if result.status == "failed" and result.error_info:
+                error_info_json = json.dumps(result.error_info)
             conn.execute(
                 """
                 UPDATE tasks
-                SET status = ?, summary = ?, verdict = ?, findings = ?, pr_number = ?
+                SET status = ?, summary = ?, verdict = ?, findings = ?, pr_number = ?, error_info = ?
                 WHERE task_id = ?
                 """,
                 (
@@ -287,6 +292,7 @@ class TaskQueue:
                     result.verdict,
                     json.dumps(result.findings),
                     result.pr_number,
+                    error_info_json,
                     task_id,
                 ),
             )

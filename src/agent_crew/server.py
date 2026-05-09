@@ -897,7 +897,15 @@ def create_app(
                 )
                 if pane_tail:
                     summary += f"\npane_tail:\n{pane_tail}"
-                tt = q().force_fail(task_id, summary)
+                # #167: pass structured error_info so post-mortem queries have
+                # machine-readable data, not just the free-form summary text.
+                watchdog_error_info = {
+                    "reason": "watchdog_timeout",
+                    "idle_seconds": round(idle_for, 1),
+                    "threshold_seconds": timeout_seconds,
+                    "pane_id": pane_id,
+                }
+                tt = q().force_fail(task_id, summary, error_info=watchdog_error_info)
                 logger.error(
                     f"WATCHDOG TIMEOUT: task_id={task_id} marked failed; "
                     f"task_type={tt}, idle_for={idle_for:.0f}s"
@@ -1078,9 +1086,6 @@ def create_app(
         """Auto-retry a failed task if it hasn't exceeded max retries.
         This provides resilience against transient failures."""
         MAX_RETRIES = 2
-        if result.retry_count >= MAX_RETRIES:
-            logger.info(f"Task {task_id} failed with status={result.status}, but max retries ({MAX_RETRIES}) reached")
-            return
         try:
             # Get the original task to extract description, branch, and context
             tasks = [t for t in q().list_tasks() if t.task_id == task_id]
@@ -1088,9 +1093,25 @@ def create_app(
                 return
             original_task = tasks[0]
 
+            # #167: use the DB context retry_attempt, not result.retry_count.
+            # Agents always submit retry_count=0 (they don't track it); the DB
+            # context is the authoritative source of how many times this chain
+            # has been retried.
+            db_retry_attempt = (
+                original_task.context.get("retry_attempt", 0)
+                if isinstance(original_task.context, dict)
+                else 0
+            )
+            if db_retry_attempt >= MAX_RETRIES:
+                logger.info(
+                    f"Task {task_id} failed (status={result.status}), "
+                    f"but DB retry_attempt={db_retry_attempt} >= MAX_RETRIES={MAX_RETRIES}"
+                )
+                return
+
             # Create retry task with incremented retry count
             retry_context = dict(original_task.context) if isinstance(original_task.context, dict) else {}
-            retry_context["retry_attempt"] = (result.retry_count or 0) + 1
+            retry_context["retry_attempt"] = db_retry_attempt + 1
             retry_context["original_task_id"] = task_id
 
             retry_req = TaskRequest(
