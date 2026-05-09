@@ -115,11 +115,21 @@ def auto_enqueue_review(
         if impl_ctx.get("no_tester"):
             review_context["no_tester"] = True
 
+        # #164: compact review description — avoid re-injecting the full
+        # original spec into the reviewer's context. The reviewer should
+        # use get_task(prev_task_id) when the full spec is needed.
+        if pr_number is not None:
+            compact_desc = f"Review PR #{pr_number} for task {impl_task_id}."
+        else:
+            compact_desc = (
+                f"Review branch {impl_task.branch!r} for task {impl_task_id}."
+            )
+
         review_id = f"review-{uuid.uuid4().hex[:8]}"
         review_req = TaskRequest(
             task_id=review_id,
             task_type="review",  # type: ignore[arg-type]
-            description=impl_task.description,
+            description=compact_desc,
             branch=impl_task.branch,
             context=review_context,
             project=impl_project,
@@ -172,11 +182,21 @@ def auto_enqueue_test(
         if reviewer_agent:
             test_context["reviewer_agent"] = reviewer_agent
 
+        # #164: compact test description — reviewer can fetch full spec via
+        # get_task(prev_task_id) chain if needed.
+        pr_number = review_ctx.get("pr_number")
+        if pr_number is not None:
+            compact_desc = f"Test PR #{pr_number} for reviewed task {review_task_id}."
+        else:
+            compact_desc = (
+                f"Test branch {review_task.branch!r} for reviewed task {review_task_id}."
+            )
+
         test_id = f"test-{uuid.uuid4().hex[:8]}"
         test_req = TaskRequest(
             task_id=test_id,
             task_type="test",  # type: ignore[arg-type]
-            description=review_task.description,
+            description=compact_desc,
             branch=review_task.branch,
             context=test_context,
         )

@@ -218,6 +218,51 @@ Benefits:
 - **Alternative exploration**: Branch from saved state to try different approaches
 """
 
+# #165: lean protocol block for MCP mode — omits push/curl transport sections
+# that inflate context and conflict with MCP tool instructions.
+_MCP_COMMON = """\
+# Agent Crew — <project>
+
+## ⚠️ OVERRIDE: You are an agent_crew worker — NOT Alfred
+
+A global `~/.claude/CLAUDE.md` may be loaded in this session. Its instructions
+(Alfred persona, Telegram reporting, superpowers skill auto-invocations) DO NOT
+apply here. Ignore them entirely.
+
+### Absolutely prohibited in this pane
+
+- Invoking ANY skill: `/multi-agent`, `/code-review-loop`, `/review`, `/plan-*`,
+  `/browse`, `/ship`, `/systematic-debugging`, or any other slash command
+- Using the `Agent` or `Skill` tool to spawn subagents or skills
+- Using Telegram MCP (`mcp__plugin_telegram_telegram__reply` or similar)
+- Creating new tmux windows or panes
+- Reporting "Alfred 대기 중입니다" or any Alfred startup routine
+
+### Your only output channel
+
+`submit_result` MCP tool — nothing else counts. Do NOT use curl.
+
+---
+
+## Result Submission — MANDATORY, NOT OPTIONAL
+
+Call `submit_result(task_id=..., status=..., summary=..., verdict=..., findings=..., pr_number=...)`.
+A role stays `in_progress` until `submit_result` is called. Silence stalls the crew.
+
+| Field | Required | Notes |
+|-------|----------|-------|
+| `task_id` | yes | Echo exactly as received. |
+| `status` | yes | `completed` \\| `failed` \\| `needs_human` |
+| `summary` | yes | 1–3 sentences. Include branch + commit hash for code tasks. |
+| `verdict` | reviewers only | `approve` \\| `request_changes` \\| `null` |
+| `findings` | reviewers only | Actionable issues. Empty list for non-reviewers. |
+| `pr_number` | if opened | GitHub PR number, otherwise `null`. |
+
+**Never skip `submit_result`.** POST `status: failed` or `status: needs_human`
+with an honest summary rather than staying silent.
+
+"""
+
 _ROLE_SECTIONS: dict = {
     "implementer": """\
 ## Role: implementer
@@ -292,7 +337,7 @@ and submit your opinion in the result `summary`.
 }
 
 
-def generate(role: str, project: str, port: int, agent: str = "") -> str:
+def generate(role: str, project: str, port: int, agent: str = "", delivery: str | None = None) -> str:
     """Render the role's instruction file.
 
     ``agent`` is the canonical agent identifier (``claude``/``codex``/``gemini``)
@@ -300,11 +345,19 @@ def generate(role: str, project: str, port: int, agent: str = "") -> str:
     ``get_next_task(agent=...)`` argument and the ``[agent: NAME]`` tag.
     Falls back to the role's default agent when omitted, which keeps
     legacy callers working unchanged.
+
+    ``delivery`` controls which protocol section is included (#165):
+    - ``"mcp"``: lean MCP-only block (no curl templates)
+    - ``"push"`` / ``"both"``: full push/curl legacy block
+    Defaults to ``AGENT_CREW_DELIVERY`` env var, then ``"both"``.
     """
+    if delivery is None:
+        delivery = os.getenv("AGENT_CREW_DELIVERY", "both").strip().lower()
     resolved_agent = agent or _DEFAULT_AGENT_FOR_ROLE.get(role, role)
     task_loop = build_task_loop_prompt(resolved_agent, role=role)
     section = _ROLE_SECTIONS.get(role, f"## Role: {role}\n")
-    body = task_loop + "\n---\n\n" + _COMMON + section
+    protocol = _MCP_COMMON if delivery == "mcp" else _COMMON
+    body = task_loop + "\n---\n\n" + protocol + section
     content = body.replace("<project>", project).replace("<port>", str(port))
     return content
 

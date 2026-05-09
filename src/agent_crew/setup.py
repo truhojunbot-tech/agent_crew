@@ -52,6 +52,12 @@ def _get_agent_cmd(agent: str, worktree_path: str | None = None) -> str:
     if agent == "codex" and worktree_path:
         codex_home = os.path.join(worktree_path, ".codex_local")
         cmd = f"CODEX_HOME={codex_home} {cmd}"
+    if agent == "claude" and worktree_path:
+        # Scope the Telegram plugin state dir to the worktree so the agent's
+        # bun (if --channels loads it) never reads ~/.claude/channels/telegram/
+        # and never steals the real trader bot token (#168).
+        telegram_state = os.path.join(worktree_path, ".telegram")
+        cmd = f"TELEGRAM_STATE_DIR={telegram_state} {cmd}"
     return cmd
 
 
@@ -261,6 +267,26 @@ def create_worktrees(project: str, base: str, agents: list[str], project_path: s
                 f"Failed to create worktree for {agent}: {result.stderr.strip()}"
             )
         worktrees[agent] = wt_path
+
+    # Create per-worktree .telegram/ state dirs for claude agents (#168).
+    # Prevents the Telegram plugin bun (if loaded via --channels or session
+    # history) from falling back to ~/.claude/channels/telegram/ and
+    # accidentally reading the real trader bot token.
+    for agent, wt_path in worktrees.items():
+        if agent == "claude":
+            try:
+                telegram_dir = os.path.join(wt_path, ".telegram")
+                os.makedirs(telegram_dir, exist_ok=True)
+                env_path = os.path.join(telegram_dir, ".env")
+                if not os.path.exists(env_path):
+                    with open(env_path, "w") as f:
+                        f.write("TELEGRAM_BOT_TOKEN=DISABLED_AGENT_CREW_WORKER\n")
+            except OSError:
+                _logger.warning(
+                    "create_worktrees: could not create .telegram dir for %s at %s",
+                    agent, wt_path,
+                )
+
     return worktrees
 
 
