@@ -762,6 +762,9 @@ def create_app(
         # #134: auto-dismiss gemini permission prompt if present.
         _pane_dismiss_permission_prompt(pane_id)
         push_fn(pane_id, _format_task_message(task, port))
+        # #152: record the moment the task was actually pushed to the pane
+        # so the watchdog measures idle_for from push time, not dequeue time.
+        q().set_push_at(task.task_id)
 
     def _try_push_discuss(agent: Optional[str]) -> None:
         """Discuss tasks fan out per agent, not per role. pane_map is expected
@@ -800,6 +803,8 @@ def create_app(
 
         logger.info(f"_try_push_discuss: dequeued task_id={task.task_id} for agent={agent}, calling push_fn")
         push_fn(pane_id, _format_task_message(task, port))
+        # #152: record push time for watchdog idle clock.
+        q().set_push_at(task.task_id)
 
     def _resolve_pane_for_row(row: dict) -> Optional[str]:
         """Find the pane assigned to an in_progress task row. Mirrors the routing
@@ -854,7 +859,19 @@ def create_app(
                 logger.exception(f"watchdog: pane_busy_fn raised for {pane_id}")
                 continue
 
-            idle_for = now - (row["last_activity_at"] or now)
+            # #152: idle clock starts from push_at (when the task was actually
+            # delivered to the pane) not from last_activity_at (which is set at
+            # dequeue time, potentially while the pane was busy with a prior task).
+            # Fall back to last_activity_at if push_at is 0 (MCP-dequeued tasks
+            # that were never pushed) or if push_at is in the future (fake-time
+            # tests where the push happened after the simulated now=).
+            push_at = row.get("push_at") or 0.0
+            last_act = row["last_activity_at"] or 0.0
+            if push_at > 0 and push_at <= now:
+                clock_start = max(push_at, last_act)
+            else:
+                clock_start = last_act if last_act > 0 else now
+            idle_for = now - clock_start
             # #152: require at least one reminder before timing out. This
             # prevents a newly-dispatched task (whose pane was occupied by
             # a prior task) from being force-failed before it ever had a

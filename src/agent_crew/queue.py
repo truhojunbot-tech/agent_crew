@@ -56,6 +56,8 @@ _DDL_MIGRATE_PROJECT = "ALTER TABLE tasks ADD COLUMN project TEXT NOT NULL DEFAU
 _DDL_MIGRATE_LAST_ACTIVITY = (
     "ALTER TABLE tasks ADD COLUMN last_activity_at REAL NOT NULL DEFAULT 0"
 )
+_DDL_MIGRATE_PUSH_AT = "ALTER TABLE tasks ADD COLUMN push_at REAL NOT NULL DEFAULT 0"
+_DDL_MIGRATE_ERROR_INFO = "ALTER TABLE tasks ADD COLUMN error_info TEXT DEFAULT NULL"
 
 _DDL_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS checkpoints (
@@ -94,6 +96,14 @@ class TaskQueue:
             pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_LAST_ACTIVITY)
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute(_DDL_MIGRATE_PUSH_AT)
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute(_DDL_MIGRATE_ERROR_INFO)
         except Exception:
             pass  # column already exists
         # Create indexes for performance
@@ -670,13 +680,38 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def set_push_at(self, task_id: str, ts: Optional[float] = None) -> None:
+        """Record when push_fn was called for a task (bug #152).
+        The watchdog uses push_at as the start of the idle clock so dispatch-queue
+        wait time is excluded from the idle measurement."""
+        if ts is None:
+            ts = time.time()
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET push_at = ? WHERE task_id = ? AND status = 'in_progress'",
+                (ts, task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def _reset_push_at(self, task_id: str) -> None:
+        """Force push_at back to 0 (test helper — simulates MCP-dequeued tasks)."""
+        conn = self._connect()
+        try:
+            conn.execute("UPDATE tasks SET push_at = 0 WHERE task_id = ?", (task_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
     def list_in_progress_with_activity(self) -> List[dict]:
         """Return dicts with the fields the watchdog needs to make timeout
-        decisions: task_id, task_type, context, last_activity_at, project."""
+        decisions: task_id, task_type, context, last_activity_at, push_at, project."""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, task_type, context, last_activity_at, project "
+                "SELECT task_id, task_type, context, last_activity_at, push_at, project "
                 "FROM tasks WHERE status = 'in_progress'"
             ).fetchall()
             return [
@@ -685,6 +720,7 @@ class TaskQueue:
                     "task_type": r["task_type"],
                     "context": json.loads(r["context"]) if r["context"] else {},
                     "last_activity_at": r["last_activity_at"] or 0.0,
+                    "push_at": r["push_at"] or 0.0,
                     "project": r["project"] if r["project"] else "",
                 }
                 for r in rows
@@ -692,7 +728,7 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def force_fail(self, task_id: str, summary: str) -> Optional[str]:
+    def force_fail(self, task_id: str, summary: str, error_info: Optional[dict] = None) -> Optional[str]:
         """Mark an in_progress task as failed (used by the watchdog when a pane
         has been silent past the timeout). Returns the task_type so callers can
         push the next task to the now-idle role, or None if the row wasn't
@@ -708,8 +744,8 @@ class TaskQueue:
                 conn.execute("ROLLBACK")
                 return None
             conn.execute(
-                "UPDATE tasks SET status = 'failed', summary = ? WHERE task_id = ?",
-                (summary, task_id),
+                "UPDATE tasks SET status = 'failed', summary = ?, error_info = ? WHERE task_id = ?",
+                (summary, json.dumps(error_info) if error_info is not None else None, task_id),
             )
             conn.execute("COMMIT")
             return row["task_type"]

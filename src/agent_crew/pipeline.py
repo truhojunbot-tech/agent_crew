@@ -34,6 +34,8 @@ from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE
 
 logger = logging.getLogger(__name__)
 
+MAX_FALLBACK_CHAIN_DEPTH = 3
+
 
 def auto_enqueue_review(
     queue: TaskQueue,
@@ -236,6 +238,38 @@ def auto_fallback_failed_task(
         original = tasks[0]
         ctx = dict(original.context) if isinstance(original.context, dict) else {}
 
+        # #167: stop infinite fallback loops — if the chain has already been
+        # retried MAX_FALLBACK_CHAIN_DEPTH times, escalate without creating
+        # another fallback task.
+        if ctx.get("fallback_chain_depth", 0) >= MAX_FALLBACK_CHAIN_DEPTH:
+            logger.warning(
+                f"auto_fallback: fallback_chain_depth={ctx.get('fallback_chain_depth')} "
+                f">= MAX ({MAX_FALLBACK_CHAIN_DEPTH}) for {task_id} — escalating without retry."
+            )
+            msg = (
+                f"agent_crew fallback loop detected\n"
+                f"task_id: {task_id}\n"
+                f"task_type: {task_type}\n"
+                f"chain_depth: {ctx.get('fallback_chain_depth')}\n"
+                f"last summary: {(result.summary or '')[:200]}"
+            )
+            try:
+                queue.create_gate(
+                    GateRequest(
+                        id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
+                        type="escalation",
+                        message=msg,
+                        status="pending",
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
+            try:
+                notify_telegram(msg)
+            except Exception:
+                pass
+            return True
+
         role = _TYPE_TO_ROLE.get(task_type)
         current_agent = (
             ctx.get("agent_override")
@@ -289,6 +323,7 @@ def auto_fallback_failed_task(
         new_ctx["agent_override"] = successor
         new_ctx["fallback_excluded"] = excluded
         new_ctx["fallback_from_task_id"] = task_id
+        new_ctx["fallback_chain_depth"] = ctx.get("fallback_chain_depth", 0) + 1
         try:
             fallback_req = TaskRequest(
                 task_id=f"fallback-{task_id}-{uuid.uuid4().hex[:4]}",
