@@ -419,16 +419,23 @@ def _default_push(pane_id: str, text: str) -> None:
     )
 
 
-def _format_reminder_message(task_id: str, port: int, idle_seconds: float) -> str:
+def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mcp_mode: bool = False) -> str:
     """Watchdog nudge: agent has been silent past the heartbeat threshold.
 
-    Includes the canonical POST template so the agent can resolve the task in
-    one paste even if the original block scrolled out of context. Also covers
-    the API stream-timeout recovery path (issue #85): after a transient
-    network failure the agent CLI may drop back to the prompt with no result
-    posted; this reminder is the canonical handoff to either retry or fail
-    out cleanly.
+    In MCP mode (#162) emits a short one-liner — agents already have
+    ``submit_result`` / ``bump_activity`` MCP tools, so the curl templates
+    are legacy transport baggage that inflates model context unnecessarily.
+
+    In push (legacy) mode, includes the full curl template so the agent can
+    resolve the task in one paste even if the original block scrolled out of
+    context.
     """
+    if mcp_mode:
+        return (
+            f"AGENT_CREW REMINDER: task {task_id} idle {idle_seconds:.0f}s. "
+            f"If still working call bump_activity(task_id='{task_id}'). "
+            f"If done or blocked call submit_result(...)."
+        )
     return (
         f"=== AGENT_CREW REMINDER ===\n"
         f"task_id: {task_id}\n"
@@ -742,8 +749,11 @@ def create_app(
 
         logger.info(f"_try_push_next: dequeued task_id={task.task_id}, calling push_fn")
         # #133: clear oversized context before pushing so claude doesn't stall.
+        # #163: skip auto-clear in MCP mode — long-lived sessions benefit from
+        # cache hits; clearing can turn cache-hit patterns into cache-create
+        # spikes. Auto-clear only applies to push (tmux-paste) delivery.
         tok = _pane_token_count(pane_id)
-        if tok >= _TOKEN_CLEAR_THRESHOLD:
+        if _push_enabled and tok >= _TOKEN_CLEAR_THRESHOLD:
             logger.info(
                 f"_try_push_next: pane {pane_id} has {tok} tokens "
                 f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
@@ -852,10 +862,24 @@ def create_app(
             # has not yet had idle_for ≥ reminder_seconds confirmed, so we
             # treat it as still within its dispatch-grace window.
             if idle_for >= timeout_seconds and task_id in reminded_task_ids:
+                # Capture last 20 lines of pane for debugging (#167)
+                pane_tail = ""
+                try:
+                    cap = subprocess.run(
+                        ["tmux", "capture-pane", "-p", "-t", pane_id],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    if cap.returncode == 0:
+                        lines = [l for l in cap.stdout.splitlines() if l.strip()]
+                        pane_tail = "\n".join(lines[-20:])
+                except Exception:
+                    pass
                 summary = (
                     f"watchdog timeout: pane idle {idle_for:.0f}s without "
                     f"sign of activity (threshold {timeout_seconds:.0f}s)"
                 )
+                if pane_tail:
+                    summary += f"\npane_tail:\n{pane_tail}"
                 tt = q().force_fail(task_id, summary)
                 logger.error(
                     f"WATCHDOG TIMEOUT: task_id={task_id} marked failed; "
@@ -907,7 +931,7 @@ def create_app(
                                 )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
                 try:
-                    push_fn(pane_id, _format_reminder_message(task_id, port, idle_for))
+                    push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
                 except Exception:
                     logger.exception(
                         f"watchdog: failed to push reminder for {task_id}"

@@ -490,7 +490,8 @@ def test_u_sp17_auto_review_task_queryable(tmp_db):
         assert len(review_tasks) >= 1
         review = review_tasks[0]
         assert "impl-004" in str(review.get("context", {}))
-        assert "Fix bug Y" in review["description"]
+        # #164: review description is now compact (task ID reference, not full spec)
+        assert "impl-004" in review["description"]
 
 
 # U-SP18: dead pane before push → task rolled back to queued, push_fn not called
