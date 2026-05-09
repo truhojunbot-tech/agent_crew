@@ -699,6 +699,44 @@ def test_u_sp22b_gate_approve_dispatches_pending_when_idle(tmp_db):
     assert resp.json() == {"status": "resolved"}
 
 
+def test_u_sp22c_gate_approve_dispatches_all_roles_once_panes_recover(tmp_db):
+    """If tasks piled up while panes were unavailable, approving a gate should
+    advance the crew by dispatching one pending task per idle role."""
+    from unittest.mock import patch
+
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={"implementer": "%100", "reviewer": "%200", "tester": "%300"},
+        port=9999,
+        push_fn=push,
+        watchdog_disabled=True,
+    )
+
+    gate_payload = {"id": "gate-sp22c", "type": "approval", "message": "resume"}
+
+    dead_then_alive = [False, False, False, True, True, True]
+
+    with patch("agent_crew.server._pane_alive_for_push", side_effect=dead_then_alive):
+        with TestClient(app) as client:
+            client.post("/gates", json=gate_payload)
+            client.post("/tasks", json=_task_payload("impl-sp22c", "implement"))
+            client.post("/tasks", json=_task_payload("review-sp22c", "review"))
+            client.post("/tasks", json=_task_payload("test-sp22c", "test"))
+
+            assert push.calls == []
+
+            resp = client.post("/gates/gate-sp22c/resolve", json={"status": "approved"})
+            assert resp.status_code == 200
+            assert resp.json() == {"status": "resolved"}
+
+    pushed_ids = {pane_id: text for pane_id, text in push.calls}
+    assert len(push.calls) == 3
+    assert "impl-sp22c" in pushed_ids["%100"]
+    assert "review-sp22c" in pushed_ids["%200"]
+    assert "test-sp22c" in pushed_ids["%300"]
+
+
 # U-SP23: POST /gates/{id}/resolve rejected → _try_push_next NOT called
 def test_u_sp23_gate_reject_no_push(tmp_db):
     """Rejecting a gate must NOT trigger _try_push_next."""

@@ -1,3 +1,4 @@
+import json
 import pathlib
 from unittest.mock import MagicMock, patch
 
@@ -1043,3 +1044,62 @@ def test_u_c51_single_agent_recover_fills_all_roles(tmp_path):
     assert new_state["pane_map"]["reviewer"] == "%9"
     assert new_state["pane_map"]["implementer"] == "%9"
     assert new_state["pane_map"]["tester"] == "%9"
+
+
+def test_u_c52_discuss_help_default_timeout_is_300():
+    runner = CliRunner()
+    result = runner.invoke(crew, ["discuss", "--help"])
+    assert result.exit_code == 0
+    assert "--timeout INTEGER" in result.output
+    assert "[default: 300]" in result.output
+
+
+def test_u_c53_status_lists_queue_in_progress_and_completed_tasks(tmp_path):
+    proj_dir = tmp_path / "proj"
+    proj_dir.mkdir()
+    state = {
+        "project": "proj",
+        "port": 8100,
+        "session": "crew_proj",
+        "agents": ["claude"],
+        "pane_ids": ["%1"],
+        "worktrees": {"claude": str(tmp_path / "wt")},
+        "db": str(proj_dir / "tasks.db"),
+    }
+    (proj_dir / "state.json").write_text(json.dumps(state))
+
+    task_groups = {
+        "pending": [
+            {"task_id": "q1", "task_type": "implement", "description": "queued work", "priority": 1, "context": {}},
+        ],
+        "in_progress": [
+            {"task_id": "r1", "task_type": "review", "description": "active review", "priority": 2, "context": {}},
+        ],
+        "completed": [
+            {"task_id": "t1", "task_type": "test", "description": "finished test", "priority": 3, "context": {}},
+        ],
+        "failed": [],
+        "needs_human": [],
+        "cancelled": [],
+        "orphaned": [],
+    }
+
+    def _fake_run(args, **_kwargs):
+        if "capture-pane" in args:
+            return MagicMock(returncode=0, stdout="working on task q1\n")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=lambda _port, status: task_groups[status]), \
+         patch("agent_crew.cli._validate_pane_map", return_value={"valid": True, "mismatches": [], "suggestions": []}), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run):
+        result = runner.invoke(crew, ["status", "proj", "--base", str(tmp_path), "--preview", "0"])
+
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "Queue: 1" in out
+    assert "In Progress: 1" in out
+    assert "Completed: 1" in out
+    assert "PENDING (1):" in out
+    assert "IN_PROGRESS (1):" in out
+    assert "COMPLETED (1):" in out
