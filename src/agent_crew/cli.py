@@ -678,9 +678,17 @@ def status(project: str, base: str, preview: int):
             except Exception:
                 task_groups = None
 
-    if task_groups:
+    if task_groups is not None:
+        pending_count = len(task_groups.get("pending", []))
+        in_progress_count = len(task_groups.get("in_progress", []))
+        completed_count = len(task_groups.get("completed", []))
+        failed_count = len(task_groups.get("failed", []))
         total = sum(len(tasks) for tasks in task_groups.values())
-        click.echo(f"\nTasks: {total}")
+        click.echo(f"\nTasks: {total} total  |  "
+                   f"Queue: {pending_count}  |  "
+                   f"In Progress: {in_progress_count}  |  "
+                   f"Completed: {completed_count}"
+                   + (f"  |  Failed: {failed_count}" if failed_count else ""))
         for display_status, tasks in task_groups.items():
             if not tasks:
                 continue

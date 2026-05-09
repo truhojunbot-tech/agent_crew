@@ -1275,6 +1275,16 @@ def create_app(
             q().resolve_gate(gate_id, approved=body.status == "approved")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
+        if body.status == "approved":
+            # Gate approved → push next pending tasks for all roles so the crew
+            # continues without manual intervention after a human approval.
+            for role in ("implementer", "reviewer", "tester"):
+                try:
+                    _try_push_next(role)
+                except Exception:
+                    logger.exception(
+                        f"resolve_gate: _try_push_next({role!r}) raised after gate approval"
+                    )
         return {"status": "resolved"}
 
     @app.post("/tasks/{task_id}/checkpoint", status_code=201)
