@@ -171,6 +171,72 @@ def _status_all_projects(base: str) -> None:
         click.echo(f"{name:<20} {port:<6} {pending:>7} {in_prog:>7} {done:>6} {failed:>7}  {server_status}")
 
 
+def _resolve_tmux_window(proj_dir: str) -> tuple[str, str]:
+    """Return (session_name, window_index) of the tmux window that should host agent panes.
+
+    Strategy:
+    1. Walk the process tree upward from the current PID to find a process whose
+       PID matches a tmux pane_pid. This correctly resolves the session even when
+       TMUX_PANE was inherited from a parent session (e.g. alfred spawning crew-work).
+    2. Fall back to TMUX_PANE env var (legacy behaviour) if the PID walk fails.
+    """
+    # Step 1: build pid→(session, window) map from tmux
+    try:
+        panes_result = subprocess.run(
+            ["tmux", "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}\t#{window_index}"],
+            capture_output=True, text=True,
+        )
+        if panes_result.returncode == 0:
+            pane_map: dict[int, tuple[str, str]] = {}
+            for line in panes_result.stdout.strip().splitlines():
+                parts = line.split("\t")
+                if len(parts) == 3:
+                    try:
+                        pane_map[int(parts[0])] = (parts[1], parts[2])
+                    except ValueError:
+                        pass
+
+            # Walk process tree upward until we hit a pane PID
+            pid = os.getpid()
+            seen: set[int] = set()
+            while pid and pid not in seen:
+                seen.add(pid)
+                if pid in pane_map:
+                    session_name, window_index = pane_map[pid]
+                    _crew_log(proj_dir, f"tmux PID walk resolved pid={pid} → {session_name}:{window_index}")
+                    return session_name, window_index
+                try:
+                    with open(f"/proc/{pid}/status") as fh:
+                        for line in fh:
+                            if line.startswith("PPid:"):
+                                pid = int(line.split()[1])
+                                break
+                        else:
+                            break
+                except OSError:
+                    break
+    except Exception as exc:
+        _crew_log(proj_dir, f"tmux PID walk failed: {exc}")
+
+    # Step 2: fall back to TMUX_PANE
+    tmux_pane_env = os.environ.get("TMUX_PANE", "")
+    if not tmux_pane_env:
+        raise click.ClickException(
+            "crew setup must run inside a tmux session. Start tmux first, then re-run."
+        )
+    current = subprocess.run(
+        ["tmux", "display-message", "-p", "-t", tmux_pane_env, "#S:#I"],
+        capture_output=True, text=True,
+    )
+    if current.returncode != 0 or not current.stdout.strip():
+        raise click.ClickException(
+            f"failed to read caller tmux session: {current.stderr.strip() or current.stdout.strip()}"
+        )
+    session_name, _, window_index = current.stdout.strip().partition(":")
+    _crew_log(proj_dir, f"tmux TMUX_PANE fallback: {session_name}:{window_index or '0'}")
+    return session_name, window_index or "0"
+
+
 def _capture_pane(target: str) -> str | None:
     """Capture last 5 lines of a tmux pane. target is a pane_id (e.g. '%42')
     or a session:window.pane spec. Returns None if tmux fails."""
@@ -473,37 +539,8 @@ def setup(project: str, agents: str, base: str):
     # the left (full height); agents stack vertically on the right via
     # main-vertical layout. No width preflight — narrow windows get narrower
     # agent panes rather than an error.
-    #
-    # CREW_TMUX_SESSION overrides auto-detection. Use it when running crew setup
-    # from a delegated session (e.g. crew-work) that inherited a different
-    # TMUX_PANE from its parent — without the override, panes would be created
-    # in the parent's window instead of the intended one.
-    # Format: "session" or "session:window" (default window = 0).
-    crew_session_override = os.environ.get("CREW_TMUX_SESSION", "")
-    if crew_session_override:
-        parts = crew_session_override.split(":", 1)
-        session_name = parts[0]
-        window_index = parts[1] if len(parts) > 1 else "0"
-        window_target = f"{session_name}:{window_index}"
-        _crew_log(proj_dir, f"tmux using CREW_TMUX_SESSION override: session={session_name} window={window_index}")
-    else:
-        tmux_pane_env = os.environ.get("TMUX_PANE", "")
-        if not tmux_pane_env:
-            raise click.ClickException(
-                "crew setup must run inside a tmux session (or set CREW_TMUX_SESSION=session:window). "
-                "Start tmux first, then re-run."
-            )
-        current = subprocess.run(
-            ["tmux", "display-message", "-p", "-t", tmux_pane_env, "#S:#I"],
-            capture_output=True, text=True,
-        )
-        if current.returncode != 0 or not current.stdout.strip():
-            raise click.ClickException(
-                f"failed to read caller tmux session: {current.stderr.strip() or current.stdout.strip()}"
-            )
-        session_name, _, window_index = current.stdout.strip().partition(":")
-        window_index = window_index or "0"
-        window_target = f"{session_name}:{window_index}"
+    session_name, window_index = _resolve_tmux_window(proj_dir)
+    window_target = f"{session_name}:{window_index}"
     _crew_log(proj_dir, f"tmux using session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
 
     # Check window width — main-vertical layout needs minimum width for readable panes
