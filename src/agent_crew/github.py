@@ -121,3 +121,35 @@ def get_pr_url(repo: Optional[str], pr_number: str) -> str:
     if not repo:
         repo = get_repo() or "owner/repo"
     return f"https://github.com/{repo}/pull/{pr_number}"
+
+
+def merge_pr(
+    pr_number: int,
+    merge_method: str = "squash",
+    repo: Optional[str] = None,
+) -> bool:
+    """Merge a GitHub PR via gh CLI. Returns True on success.
+
+    merge_method must be one of: squash, merge, rebase.
+    Failures are swallowed and return False so callers never crash the pipeline (#171).
+    """
+    if not check_gh_installed():
+        return False
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return False
+    try:
+        result = subprocess.run(
+            [
+                "gh", "pr", "merge", str(pr_number),
+                f"--{merge_method}",
+                "--repo", repo,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False

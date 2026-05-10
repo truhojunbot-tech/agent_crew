@@ -540,10 +540,23 @@ def write_mcp_configs(worktrees: dict, db_path: str) -> None:
         write_mcp_config(wt_path, db_path, agent=agent)
 
 
-def write_sessions_json(path: str, agents: list[dict]) -> None:
+def write_sessions_json(
+    path: str,
+    agents: list[dict],
+    worktrees: dict[str, str] | None = None,
+) -> None:
+    """Write sessions.json with the full launch command per agent.
+
+    ``worktrees`` (optional) maps agent name → worktree path. When provided,
+    the stored command includes per-worktree env prefixes (e.g.
+    ``TELEGRAM_STATE_DIR``) so session-recovery relaunches don't fall back to
+    the real bot token (#168).
+    """
     enriched = []
     for agent in agents:
-        cmd = _AGENT_CMDS.get(agent.get("name", ""), _DEFAULT_CMD)
+        name = agent.get("name", "")
+        wt_path = (worktrees or {}).get(name)
+        cmd = _get_agent_cmd(name, wt_path)
         enriched.append({**agent, "cmd": cmd, "started_at": time.time(), "failures": 0})
     session.save_sessions(path, enriched)
 

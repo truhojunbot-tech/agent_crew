@@ -1109,6 +1109,18 @@ def create_app(
                 )
                 return
 
+            # #161: review tasks with no branch AND no pr_number have no way to
+            # locate a PR — retrying will produce the same failure. Abort early
+            # to prevent the review-retry loop.
+            if task_type == "review":
+                task_ctx = original_task.context if isinstance(original_task.context, dict) else {}
+                if not original_task.branch and not task_ctx.get("pr_number"):
+                    logger.warning(
+                        f"_auto_retry_failed_task: skipping review retry for {task_id} "
+                        f"— no branch and no pr_number; retry would loop (#161)"
+                    )
+                    return
+
             # Create retry task with incremented retry count
             retry_context = dict(original_task.context) if isinstance(original_task.context, dict) else {}
             retry_context["retry_attempt"] = db_retry_attempt + 1
@@ -1131,6 +1143,22 @@ def create_app(
         except Exception as e:
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
+
+    def _auto_merge_pr(pr_number: int) -> None:
+        """Merge PR via gh CLI after the pipeline approves it (#171).
+
+        Failures are logged and swallowed — a merge error must never break
+        the result-submission response.
+        """
+        from agent_crew.github import get_repo, merge_pr
+        repo = get_repo()
+        ok = merge_pr(pr_number, merge_method="squash", repo=repo)
+        if ok:
+            logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) — #171")
+        else:
+            logger.warning(
+                f"_auto_merge_pr: gh pr merge #{pr_number} failed or gh not available — #171"
+            )
 
     def _auto_fallback_failed_task(
         task_id: str,
@@ -1264,13 +1292,23 @@ def create_app(
             # created with no_tester=True (set by `crew run --no-tester`).
             if task_type == "review" and _resolve_verdict(result) == "approve":
                 review_ctx = ctx if isinstance(ctx, dict) else {}
+                pr_number = result.pr_number or review_ctx.get("pr_number")
                 if review_ctx.get("no_tester"):
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
+                    # #171: no tester stage → merge immediately on review approval
+                    if pr_number and not review_ctx.get("coordinator_managed"):
+                        _auto_merge_pr(int(pr_number))
                 elif review_ctx.get("coordinator_managed"):
                     logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto test enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id)
+            # #171: test passed → merge the PR. pr_number carried via test context.
+            if task_type == "test" and result.status == "completed":
+                if not _task_ctx.get("coordinator_managed"):
+                    test_pr = result.pr_number or _task_ctx.get("pr_number")
+                    if test_pr:
+                        _auto_merge_pr(int(test_pr))
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")

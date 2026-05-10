@@ -403,7 +403,7 @@ def setup(project: str, agents: str, base: str):
     # sessions.json
     sessions_file = os.path.join(proj_dir, "sessions.json")
     agent_dicts = [{"name": a, "pane": i} for i, a in enumerate(agent_list)]
-    setup_module.write_sessions_json(sessions_file, agent_dicts)
+    setup_module.write_sessions_json(sessions_file, agent_dicts, worktrees=worktrees)
 
     # Agent panes live in the caller's own tmux window. Coordinator stays on
     # the left (full height); agents stack vertically on the right via

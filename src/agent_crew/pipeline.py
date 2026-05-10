@@ -57,6 +57,17 @@ def auto_enqueue_review(
             return None
         impl_task = impl_tasks[0]
 
+        # #161: no-PR guard — if the impl task has neither a branch nor a
+        # pr_number, there is nothing for the reviewer to locate. Retrying
+        # will also fail, creating an unbounded loop. Skip auto-review
+        # and log so the operator can investigate.
+        if not impl_task.branch and pr_number is None:
+            logger.warning(
+                f"auto_enqueue_review: skipping — impl task {impl_task_id} has "
+                f"no branch and no pr_number; reviewer has nothing to find (#161)"
+            )
+            return None
+
         # Cross-project guard: if the impl task carries a top-level project tag
         # and the server was started for a different project, skip auto-review
         # to prevent misrouting tasks across project queues.
@@ -178,7 +189,10 @@ def auto_enqueue_test(
             or (default_agent_for_role("reviewer", pane_map) if pane_map else None)
         )
 
-        test_context = {"prev_task_id": review_task_id}
+        pr_number = review_ctx.get("pr_number")
+        test_context: dict = {"prev_task_id": review_task_id}
+        if pr_number is not None:
+            test_context["pr_number"] = pr_number  # #171: propagate for post-test merge
         if implementer_agent:
             test_context["implementer_agent"] = implementer_agent
         if reviewer_agent:
@@ -186,7 +200,6 @@ def auto_enqueue_test(
 
         # #164: compact test description — reviewer can fetch full spec via
         # get_task(prev_task_id) chain if needed.
-        pr_number = review_ctx.get("pr_number")
         if pr_number is not None:
             compact_desc = f"Test PR #{pr_number} for reviewed task {review_task_id}."
         else:
