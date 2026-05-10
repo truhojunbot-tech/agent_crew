@@ -980,6 +980,28 @@ def create_app(
         except Exception:
             logger.exception("watchdog: list_stale_pending raised — skipping")
             stale = []
+        # #145: in MCP-only mode, tmux re-dispatch is a no-op. If tasks are still
+        # pending after the stale window, no MCP client is connected — auto-fail them
+        # so the crew doesn't hang silently forever.
+        if not _push_enabled and stale:
+            for sp in stale:
+                tid = sp.get("task_id")
+                if not tid:
+                    continue
+                summary = (
+                    f"watchdog: AGENT_CREW_DELIVERY=mcp — no MCP client dequeued "
+                    f"task {tid} within {stale_pending_seconds:.0f}s"
+                )
+                logger.error(f"watchdog #145 mcp-no-client auto-fail: {summary}")
+                try:
+                    q().force_fail_pending(tid, summary, error_info={
+                        "reason": "mcp_no_client",
+                        "stale_seconds": stale_pending_seconds,
+                    })
+                    actions.setdefault("mcp_no_client_failed", []).append(tid)
+                except Exception:
+                    logger.exception(f"watchdog #145: force_fail_pending raised for task {tid}")
+            return actions
         # Collect unique roles so we only fire _try_push_next once per role.
         stale_roles: set[str] = set()
         for sp in stale:
@@ -1232,6 +1254,16 @@ def create_app(
 
     @app.get("/tasks/next")
     def get_next_task(role: str = "", agent: str = ""):
+        # #172: in MCP-only mode the LLM must use the get_next_task MCP tool,
+        # not curl-poll this HTTP endpoint — block to prevent idle token burn.
+        if not _push_enabled:
+            raise HTTPException(
+                status_code=405,
+                detail=(
+                    f"HTTP task polling disabled (AGENT_CREW_DELIVERY={_delivery_raw!r}). "
+                    "Use the MCP get_next_task tool instead of curl-polling this endpoint."
+                ),
+            )
         task = q().dequeue(agent=agent, role=role)
         if task is None:
             return None

@@ -791,6 +791,37 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def force_fail_pending(self, task_id: str, summary: str, error_info: Optional[dict] = None) -> Optional[str]:
+        """Mark a pending task as failed (#145 — MCP no-client auto-fail).
+
+        Like force_fail but operates on pending tasks rather than in_progress ones.
+        Returns the task_type, or None if the row isn't pending.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT task_type, status FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["status"] != "pending":
+                conn.execute("ROLLBACK")
+                return None
+            conn.execute(
+                "UPDATE tasks SET status = 'failed', summary = ?, error_info = ? WHERE task_id = ?",
+                (summary, json.dumps(error_info) if error_info is not None else None, task_id),
+            )
+            conn.execute("COMMIT")
+            return row["task_type"]
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def list_stale_pending(self, older_than_seconds: float, now: float) -> List[dict]:
         """Return pending tasks whose created_at is more than older_than_seconds ago.
 
