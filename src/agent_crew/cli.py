@@ -482,13 +482,16 @@ def setup(project: str, agents: str, base: str):
 
     _reuse_server = locals().get("_reuse_server", False)
 
+    # proj_dir needed early for logging in _resolve_tmux_window
+    proj_dir = _proj_dir(base, project)
+    os.makedirs(proj_dir, exist_ok=True)
+
     # Warn if other project panes exist in the SAME SESSION (skip on pane-recreation path)
-    tmux_pane_env_pre = os.environ.get("TMUX_PANE", "")
-    if tmux_pane_env_pre and not _reuse_server:
-        cur_sess_r = subprocess.run(
-            ["tmux", "display-message", "-p", "#S"], capture_output=True, text=True
-        )
-        cur_sess = cur_sess_r.stdout.strip()
+    if not _reuse_server:
+        try:
+            cur_sess, _ = _resolve_tmux_window(proj_dir)
+        except click.ClickException:
+            cur_sess = ""
         other_states = []
         for entry in os.listdir(base) if os.path.isdir(base) else []:
             if entry == project:
@@ -505,8 +508,6 @@ def setup(project: str, agents: str, base: str):
                 raise click.ClickException("Aborted.")
 
     agent_list = [a.strip() for a in agents.split(",") if a.strip()]
-    proj_dir = _proj_dir(base, project)
-    os.makedirs(proj_dir, exist_ok=True)
     _crew_log(proj_dir, f"setup START agents={agent_list} reuse_server={_reuse_server}")
 
     # Worktrees
@@ -1055,19 +1056,8 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
 
     if not has_session:
         # Original session is gone — fall back to current tmux session/window.
-        tmux_pane_env = os.environ.get("TMUX_PANE", "")
-        dm_target = ["-t", tmux_pane_env] if tmux_pane_env else []
-        current = subprocess.run(
-            ["tmux", "display-message", "-p"] + dm_target + ["#S:#I"],
-            capture_output=True, text=True,
-        )
-        if current.returncode != 0 or not current.stdout.strip():
-            raise click.ClickException(
-                f"tmux session {session_name!r} missing and not running inside tmux. "
-                f"Start a tmux session and re-run recover."
-            )
-        cur_session, _, cur_window = current.stdout.strip().partition(":")
-        window_target = f"{cur_session}:{cur_window or '0'}"
+        cur_session, cur_window = _resolve_tmux_window(proj_dir)
+        window_target = f"{cur_session}:{cur_window}"
         pane_ids: list[str] = []
         for _, wt_path in worktrees.items():
             result = subprocess.run(
