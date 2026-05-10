@@ -348,3 +348,25 @@ def test_u_se23_start_agents_sends_kickoff_prompt():
     assert "get_next_task" in kickoff_text or "30" in kickoff_text, (
         "kickoff prompt must mention get_next_task polling or 30-second interval"
     )
+
+
+# U-SE24: kickoff prompt explicitly mentions GET /tasks/next fallback polling
+def test_u_se24_start_agents_kickoff_mentions_http_polling():
+    """The kickoff prompt should name the HTTP polling endpoint explicitly so
+    agents can recover even when the MCP loop is unavailable."""
+    good_capture = MagicMock(returncode=0)
+    good_capture.stdout = "bypass permissions\n❯ "
+
+    with patch("agent_crew.setup.subprocess.run", return_value=good_capture) as mock_run, \
+         patch("agent_crew.setup.time.sleep"):
+        start_agents_in_panes("crew", ["claude"])
+
+    literal_texts = []
+    for call in mock_run.call_args_list:
+        args = call[0][0]
+        if "-l" in args:
+            literal_texts.append(args[-1])
+
+    kickoff_text = " ".join(literal_texts)
+    assert "/tasks/next" in kickoff_text
+    assert "30 seconds" in kickoff_text

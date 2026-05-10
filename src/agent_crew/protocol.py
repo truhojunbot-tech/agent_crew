@@ -37,6 +37,7 @@ class TaskResult:
     findings: list[str] = field(default_factory=list)
     pr_number: Optional[int] = None
     retry_count: int = 0  # Track number of retry attempts
+    error_info: Optional[dict] = None  # Structured error payload for debugging (#167)
 
     def __post_init__(self):
         if self.status not in _VALID_RESULT_STATUSES:

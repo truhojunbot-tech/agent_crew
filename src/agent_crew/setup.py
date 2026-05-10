@@ -159,7 +159,8 @@ def start_agents_in_panes(
         kickoff = (
             f"Start your task loop now: call get_next_task(agent=\"{agent}\") "
             f"via the agent_crew MCP server every 30 seconds. "
-            f"If it returns None, wait 30 seconds and try again. "
+            f"If MCP is unavailable, poll GET /tasks/next every 30 seconds. "
+            f"If either returns None, wait 30 seconds and try again. "
             f"When a task arrives, branch on task_type, do the work, "
             f"then call submit_result. Loop indefinitely."
         )
