@@ -473,24 +473,38 @@ def setup(project: str, agents: str, base: str):
     # the left (full height); agents stack vertically on the right via
     # main-vertical layout. No width preflight — narrow windows get narrower
     # agent panes rather than an error.
-    tmux_pane_env = os.environ.get("TMUX_PANE", "")
-    if not tmux_pane_env:
-        raise click.ClickException(
-            "crew setup must run inside a tmux session. "
-            "Start tmux first, then re-run."
+    #
+    # CREW_TMUX_SESSION overrides auto-detection. Use it when running crew setup
+    # from a delegated session (e.g. crew-work) that inherited a different
+    # TMUX_PANE from its parent — without the override, panes would be created
+    # in the parent's window instead of the intended one.
+    # Format: "session" or "session:window" (default window = 0).
+    crew_session_override = os.environ.get("CREW_TMUX_SESSION", "")
+    if crew_session_override:
+        parts = crew_session_override.split(":", 1)
+        session_name = parts[0]
+        window_index = parts[1] if len(parts) > 1 else "0"
+        window_target = f"{session_name}:{window_index}"
+        _crew_log(proj_dir, f"tmux using CREW_TMUX_SESSION override: session={session_name} window={window_index}")
+    else:
+        tmux_pane_env = os.environ.get("TMUX_PANE", "")
+        if not tmux_pane_env:
+            raise click.ClickException(
+                "crew setup must run inside a tmux session (or set CREW_TMUX_SESSION=session:window). "
+                "Start tmux first, then re-run."
+            )
+        current = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", tmux_pane_env, "#S:#I"],
+            capture_output=True, text=True,
         )
-    current = subprocess.run(
-        ["tmux", "display-message", "-p", "-t", tmux_pane_env, "#S:#I"],
-        capture_output=True, text=True,
-    )
-    if current.returncode != 0 or not current.stdout.strip():
-        raise click.ClickException(
-            f"failed to read caller tmux session: {current.stderr.strip() or current.stdout.strip()}"
-        )
-    session_name, _, window_index = current.stdout.strip().partition(":")
-    window_index = window_index or "0"
-    window_target = f"{session_name}:{window_index}"
-    _crew_log(proj_dir, f"tmux using caller session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
+        if current.returncode != 0 or not current.stdout.strip():
+            raise click.ClickException(
+                f"failed to read caller tmux session: {current.stderr.strip() or current.stdout.strip()}"
+            )
+        session_name, _, window_index = current.stdout.strip().partition(":")
+        window_index = window_index or "0"
+        window_target = f"{session_name}:{window_index}"
+    _crew_log(proj_dir, f"tmux using session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
 
     # Check window width — main-vertical layout needs minimum width for readable panes
     # (e.g., 80-wide window + 3 agents can create 1-char wide panes on the right)
