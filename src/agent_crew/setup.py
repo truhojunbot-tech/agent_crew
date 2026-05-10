@@ -121,41 +121,35 @@ def start_agents_in_panes(
             _send_enter(target)   # accept option 1 (already highlighted)
             time.sleep(0.5)
             _send_enter(target)   # dismiss "Press enter to continue"
-    # Give agent CLIs time to finish their own boot banners before the first
-    # task push might arrive. Codex needs extra time after the trust dialog.
-    time.sleep(5)
+    # Wait for each agent CLI to become ready, then send kickoff.
+    # Per-agent polling replaces the hardcoded sleep(5): each agent gets up to
+    # _KICKOFF_MAX_WAIT seconds to show a CLI-ready marker so the kickoff prompt
+    # always lands at an active input cursor rather than mid-startup noise.
+    _KICKOFF_POLL_INTERVAL = 2
+    _KICKOFF_MAX_WAIT = 30
 
-    # Verify each pane shows an expected CLI ready-indicator. A missing marker
-    # means the CLI binary likely failed to start (missing install, bad flags,
-    # leftover interactive prompt, etc.) — warn loudly so the operator knows
-    # before the first task is pushed into a dead pane.
     for agent, target in zip(agents, pane_targets):
         markers = _CLI_READY_MARKERS.get(agent)
-        if not markers:
-            continue
-        result = subprocess.run(
-            ["tmux", "capture-pane", "-p", "-t", target],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            _logger.warning(
-                "start_agents_in_panes: cannot capture pane %s for %s — tmux error",
-                target, agent,
-            )
-            continue
-        content = result.stdout.lower()
-        if not any(m.lower() in content for m in markers):
-            _logger.warning(
-                "start_agents_in_panes: pane %s (%s) shows no CLI-ready indicator "
-                "(checked: %r). The agent CLI may not have started correctly — "
-                "inspect the pane before submitting tasks.",
-                target, agent, markers,
-            )
-
-    # Send a kickoff prompt to each agent to start their polling loop.
-    # Agents are instructed to call get_next_task(agent=...) every 30 seconds
-    # so tasks are picked up even if a tmux push is delayed or missed.
-    for agent, target in zip(agents, pane_targets):
+        if markers:
+            deadline = time.time() + _KICKOFF_MAX_WAIT
+            ready = False
+            while time.time() < deadline:
+                r = subprocess.run(
+                    ["tmux", "capture-pane", "-p", "-t", target],
+                    capture_output=True, text=True,
+                )
+                if r.returncode == 0 and any(m.lower() in r.stdout.lower() for m in markers):
+                    ready = True
+                    break
+                time.sleep(_KICKOFF_POLL_INTERVAL)
+            if not ready:
+                _logger.warning(
+                    "start_agents_in_panes: pane %s (%s) not ready after %ss — "
+                    "kickoff sent anyway but agent may not receive it correctly.",
+                    target, agent, _KICKOFF_MAX_WAIT,
+                )
+        else:
+            time.sleep(5)
         kickoff = (
             f"Start your task loop now: call get_next_task(agent=\"{agent}\") "
             f"via the agent_crew MCP server every 30 seconds. "

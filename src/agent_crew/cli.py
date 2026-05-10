@@ -1256,10 +1256,11 @@ def teardown(project: str, base: str):
 @click.option("--repo", default="", help="GitHub repo (owner/repo format)")
 @click.option("--implementer", default="", help="Agent for implementation (claude/codex/gemini)")
 @click.option("--reviewer", default="", help="Agent for review (claude/codex/gemini)")
+@click.option("--auto-merge", is_flag=True, help="Auto-merge PR via gh when loop completes successfully")
 def run_cmd(task: str, db: str, project: str, base: str,
             max_iter: int, no_tester: bool, branch: str, timeout: int,
             create_issue: bool, create_pr: bool, repo: str,
-            implementer: str, reviewer: str):
+            implementer: str, reviewer: str, auto_merge: bool):
     """Run TASK through the code-review loop."""
     if not task.strip():
         raise click.UsageError("task must not be empty")
@@ -1558,6 +1559,27 @@ def run_cmd(task: str, db: str, project: str, base: str,
             except Exception as exc:
                 click.echo(f"Warning: could not sync worktree {agent!r} to {main_branch}: {exc}")
 
+    def _auto_merge_pr(pr_number: int | None, repo_url: str) -> None:
+        if not pr_number:
+            click.echo("  Note: no PR number in results — skipping auto-merge")
+            return
+        if not github.check_gh_installed():
+            click.echo("Warning: gh CLI not installed, skipping auto-merge")
+            return
+        resolved_repo = repo_url or github.get_repo()
+        if not resolved_repo:
+            click.echo("Warning: cannot auto-merge — repo not determined")
+            return
+        r = subprocess.run(
+            ["gh", "pr", "merge", str(pr_number), "--repo", resolved_repo,
+             "--squash", "--delete-branch"],
+            capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            click.echo(f"  Auto-merged PR #{pr_number}.")
+        else:
+            click.echo(f"Warning: auto-merge failed: {r.stderr.strip()}")
+
     def _create_and_report_pr(branch_name: str, repo_url: str, task_desc: str) -> None:
         """Create a GitHub PR and report the result."""
         if not github.check_gh_installed():
@@ -1632,10 +1654,13 @@ def run_cmd(task: str, db: str, project: str, base: str,
     if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0):
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
 
+    _loop_pr_number: int | None = None  # first PR number seen across all results
+
     for iteration in range(1, max_iter + 1):
         impl_start = time.time()
-        _wait(impl_id)
+        impl_result = _wait(impl_id)
         impl_elapsed = int(time.time() - impl_start)
+        _loop_pr_number = _loop_pr_number or getattr(impl_result, "pr_number", None)
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
         review_context = {**_CM}
@@ -1676,12 +1701,15 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 test_elapsed = int(time.time() - test_start)
                 test_outcome = handle_test_result(test_result)
                 if test_outcome == "passed":
+                    _loop_pr_number = _loop_pr_number or getattr(test_result, "pr_number", None)
                     if _run_port:
                         _drain_resolvable_gates(_run_port)
                     click.echo(f"[{iteration}/{max_iter}] ✅ Tests passed ({test_elapsed}s). Loop complete.")
                     # Create PR if requested
                     if create_pr:
                         _create_and_report_pr(branch, repo, task)
+                    if auto_merge:
+                        _auto_merge_pr(_loop_pr_number, repo)
                     if _run_worktrees:
                         _sync_worktrees_to_main(_run_worktrees)  # #166
                     return
@@ -1697,6 +1725,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 # Create PR if requested
                 if create_pr:
                     _create_and_report_pr(branch, repo, task)
+                if auto_merge:
+                    _auto_merge_pr(_loop_pr_number, repo)
                 if _run_worktrees:
                     _sync_worktrees_to_main(_run_worktrees)  # #166
             return
