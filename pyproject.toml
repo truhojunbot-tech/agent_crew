@@ -26,4 +26,5 @@ markers = [
   "unit: unit tests",
   "integration: integration tests",
   "e2e: end-to-end tests",
+  "stress: stress tests (50-run simulations)",
 ]
