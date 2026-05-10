@@ -355,6 +355,33 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def reset_stale_to_pending(self, older_than_seconds: float = 600.0) -> List[str]:
+        """Reset in_progress tasks idle > ``older_than_seconds`` back to pending.
+
+        Unlike ``expire_stale`` (which cancels them), this returns the tasks to
+        the queue so they can be picked up again. Used by ``crew recover
+        --reset-stale`` (#155).
+        """
+        cutoff = time.time() - older_than_seconds
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
+                (cutoff,),
+            ).fetchall()
+            task_ids = [r["task_id"] for r in rows]
+            if task_ids:
+                placeholders = ",".join("?" * len(task_ids))
+                conn.execute(
+                    f"UPDATE tasks SET status = 'pending', last_activity_at = ? "
+                    f"WHERE task_id IN ({placeholders})",
+                    [time.time()] + task_ids,
+                )
+                conn.commit()
+            return task_ids
+        finally:
+            conn.close()
+
     def list_orphaned(self) -> List[TaskRequest]:
         """Return all tasks with status='orphaned'."""
         conn = self._connect()

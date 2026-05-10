@@ -107,6 +107,70 @@ def _auto_detect_project(base: str) -> str | None:
         return None
 
 
+def _status_all_projects(base: str) -> None:
+    """Print a one-line summary for every known project in base (#170).
+
+    For each project with a state.json the function queries the server (if
+    alive) or the local DB (if the server is down) for task counts.
+    """
+    proj_root = os.path.expanduser(base)
+    if not os.path.isdir(proj_root):
+        click.echo(f"No projects found (base dir {proj_root!r} does not exist).")
+        return
+
+    projects = []
+    for entry in sorted(os.listdir(proj_root)):
+        state_path = os.path.join(proj_root, entry, "state.json")
+        if os.path.isfile(state_path):
+            try:
+                with open(state_path) as f:
+                    st = json.load(f)
+                projects.append((entry, st))
+            except Exception:
+                pass
+
+    if not projects:
+        click.echo("No projects found.")
+        return
+
+    click.echo(f"{'PROJECT':<20} {'PORT':<6} {'PENDING':>7} {'IN_PROG':>7} {'DONE':>6} {'FAILED':>7}  STATUS")
+    click.echo("-" * 70)
+    for name, st in projects:
+        port = st.get("port", 0)
+        db_file = st.get("db", "")
+        alive = False
+        pending = in_prog = done = failed = 0
+        # Try live server first
+        try:
+            if port and _port_listening(port, timeout=1.0):
+                alive = True
+                for api_status, disp in [("pending", "p"), ("in_progress", "ip"), ("completed", "c"), ("failed", "f")]:
+                    tasks = _fetch_tasks_by_status(port, api_status)
+                    if disp == "p":
+                        pending = len(tasks)
+                    elif disp == "ip":
+                        in_prog = len(tasks)
+                    elif disp == "c":
+                        done = len(tasks)
+                    else:
+                        failed = len(tasks)
+        except Exception:
+            alive = False
+        # Fall back to DB
+        if not alive and db_file and os.path.exists(db_file):
+            try:
+                from agent_crew.queue import TaskQueue as _TQ
+                rows = _TQ(db_file).list_all_with_status()
+                pending = sum(1 for r in rows if r.get("status") == "pending")
+                in_prog = sum(1 for r in rows if r.get("status") == "in_progress")
+                done = sum(1 for r in rows if r.get("status") == "completed")
+                failed = sum(1 for r in rows if r.get("status") == "failed")
+            except Exception:
+                pass
+        server_status = "up" if alive else "down"
+        click.echo(f"{name:<20} {port:<6} {pending:>7} {in_prog:>7} {done:>6} {failed:>7}  {server_status}")
+
+
 def _capture_pane(target: str) -> str | None:
     """Capture last 5 lines of a tmux pane. target is a pane_id (e.g. '%42')
     or a session:window.pane spec. Returns None if tmux fails."""
@@ -617,12 +681,17 @@ def setup(project: str, agents: str, base: str):
 
 
 @crew.command()
-@click.argument("project")
+@click.argument("project", default="", required=False)
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--preview", default=200, type=int, show_default=True,
               help="Chars of result summary to preview for completed tasks (0 to disable)")
 def status(project: str, base: str, preview: int):
-    """Show status of PROJECT."""
+    """Show status of PROJECT. Omit PROJECT to list all known projects (#170)."""
+    # #170: no project → enumerate all projects under base
+    if not project:
+        _status_all_projects(base)
+        return
+
     state = _read_state(base, project)
     if state is None:
         raise click.ClickException(f"project {project!r} not found. Run setup first.")
@@ -861,7 +930,7 @@ def task_expire_stale(project: str, base: str, db: str, older_than: int, dry_run
 @click.argument("project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--reset-stale", is_flag=True,
-              help="Also cancel in_progress tasks idle > --stale-seconds")
+              help="Reset in_progress tasks idle > --stale-seconds back to pending so they can be retried")
 @click.option("--stale-seconds", default=600, type=int, show_default=True,
               help="Idle threshold for --reset-stale")
 def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
@@ -1070,9 +1139,10 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
 
     if reset_stale:
         from agent_crew.queue import TaskQueue
-        cancelled = TaskQueue(db_file).expire_stale(older_than_seconds=float(stale_seconds))
-        if cancelled:
-            click.echo(f"Reset stale: cancelled {len(cancelled)} task(s): {', '.join(cancelled)}")
+        # #155: reset to pending (not cancel) so tasks can be retried
+        reset = TaskQueue(db_file).reset_stale_to_pending(older_than_seconds=float(stale_seconds))
+        if reset:
+            click.echo(f"Reset stale: {len(reset)} task(s) → pending: {', '.join(reset)}")
         else:
             click.echo(f"Reset stale: no in_progress tasks older than {stale_seconds}s.")
 
@@ -1418,6 +1488,35 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 return total
             total += resolved
 
+    def _sync_worktrees_to_main(worktrees: dict) -> None:
+        """Reset all agent worktrees to origin/main after a crew run completes.
+
+        Prevents state divergence (#166): after a run the worktrees may be on
+        different feature branches. Syncing to origin/main ensures the next run
+        starts from a clean, consistent baseline.
+        Failures are logged but never propagate — a sync error must not mask a
+        successful run result.
+        """
+        main_branch = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+        for agent, wt_path in worktrees.items():
+            if not wt_path or not os.path.isdir(wt_path):
+                continue
+            try:
+                subprocess.run(
+                    ["git", "-C", wt_path, "stash", "push", "-u", "-m", "agent_crew post-run sync"],
+                    capture_output=True, text=True,
+                )
+                subprocess.run(
+                    ["git", "-C", wt_path, "fetch", "origin", "--quiet"],
+                    capture_output=True, text=True,
+                )
+                subprocess.run(
+                    ["git", "-C", wt_path, "checkout", "-B", main_branch, f"origin/{main_branch}"],
+                    capture_output=True, text=True,
+                )
+            except Exception as exc:
+                click.echo(f"Warning: could not sync worktree {agent!r} to {main_branch}: {exc}")
+
     def _create_and_report_pr(branch_name: str, repo_url: str, task_desc: str) -> None:
         """Create a GitHub PR and report the result."""
         if not github.check_gh_installed():
@@ -1440,12 +1539,14 @@ def run_cmd(task: str, db: str, project: str, base: str,
         else:
             click.echo("Warning: Failed to create GitHub PR")
 
-    # Determine port for gate resolution (available when --project is set)
+    # Determine port and worktrees (available when --project is set)
     _run_port = 0
+    _run_worktrees: dict = {}
     if project:
         _pstate = _read_state(base, project)
         if _pstate:
             _run_port = _pstate.get("port", 0)
+            _run_worktrees = _pstate.get("worktrees", {})
 
     # Fast server liveness check — avoid the 70+ second task-wait timeout when
     # the server is simply not running (crashed or not yet started).
@@ -1540,6 +1641,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     # Create PR if requested
                     if create_pr:
                         _create_and_report_pr(branch, repo, task)
+                    if _run_worktrees:
+                        _sync_worktrees_to_main(_run_worktrees)  # #166
                     return
                 else:
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
@@ -1553,6 +1656,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 # Create PR if requested
                 if create_pr:
                     _create_and_report_pr(branch, repo, task)
+                if _run_worktrees:
+                    _sync_worktrees_to_main(_run_worktrees)  # #166
             return
 
         # request_changes: re-implement with feedback
