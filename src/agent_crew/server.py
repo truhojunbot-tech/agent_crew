@@ -249,7 +249,10 @@ def _pane_has_bash_prompt(pane_id: str) -> bool:
         return False
     # Check that the last non-empty line looks like a shell prompt.
     last_line = content.rstrip().rsplit("\n", 1)[-1] if content.strip() else ""
-    return bool(re.search(r"\$\s*$|❯\s*$", last_line))
+    # #173: also detect bash multi-line continuation prompt (>) which occurs
+    # when partial text (e.g. a REMINDER block) is injected into bash causing
+    # a syntax error and leaving the shell stuck in multi-line input mode.
+    return bool(re.search(r"\$\s*$|❯\s*$|^>\s*$", last_line))
 
 
 def _pane_is_busy(pane_id: str) -> bool:
@@ -955,14 +958,30 @@ def create_app(
                                     f"watchdog: failed to push next task for role {role}"
                                 )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
-                try:
-                    push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
-                except Exception:
-                    logger.exception(
-                        f"watchdog: failed to push reminder for {task_id}"
+                # #173: if pane is stuck in bash error state (> prompt from
+                # partial-text injection), send Ctrl+C to recover instead of
+                # pushing a reminder that would be injected into bash again.
+                if _pane_has_bash_prompt(pane_id):
+                    logger.warning(
+                        f"watchdog: pane {pane_id} in bash error/prompt state — "
+                        f"sending Ctrl+C to recover instead of reminder for {task_id}"
                     )
+                    try:
+                        subprocess.run(
+                            ["tmux", "send-keys", "-t", pane_id, "C-c"],
+                            capture_output=True, timeout=3,
+                        )
+                    except Exception:
+                        logger.warning(f"watchdog: failed to send Ctrl+C to {pane_id}")
                 else:
-                    reminded_task_ids.add(task_id)
+                    try:
+                        push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
+                    except Exception:
+                        logger.exception(
+                            f"watchdog: failed to push reminder for {task_id}"
+                        )
+                    else:
+                        reminded_task_ids.add(task_id)
                     actions["reminded"].append(task_id)
                     logger.warning(
                         f"WATCHDOG REMINDER: task_id={task_id} idle for "
