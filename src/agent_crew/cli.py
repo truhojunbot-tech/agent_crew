@@ -1242,6 +1242,34 @@ def teardown(project: str, base: str):
     click.echo(f"Teardown complete: {project}")
 
 
+def _sync_worktrees_to_main(worktrees: dict) -> None:
+    """Reset all agent worktrees to origin/main.
+
+    Used both before a crew run/discuss (so agents start from latest main)
+    and after a run completes (so the next run isn't stale). Failures are
+    logged but never propagated — a sync error must not block the task.
+    """
+    main_branch = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    for agent, wt_path in worktrees.items():
+        if not wt_path or not os.path.isdir(wt_path):
+            continue
+        try:
+            subprocess.run(
+                ["git", "-C", wt_path, "stash", "push", "-u", "-m", "agent_crew sync"],
+                capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", wt_path, "fetch", "origin", "--quiet"],
+                capture_output=True, text=True,
+            )
+            subprocess.run(
+                ["git", "-C", wt_path, "checkout", "-B", main_branch, f"origin/{main_branch}"],
+                capture_output=True, text=True,
+            )
+        except Exception as exc:
+            click.echo(f"Warning: could not sync worktree {agent!r} to {main_branch}: {exc}")
+
+
 @crew.command("run")
 @click.argument("task")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
@@ -1424,7 +1452,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                             f"failed (fallback policy will reroute). "
                             f"Check pane manually or re-run."
                         )
-                time.sleep(10)
+                time.sleep(2)  # #177: 10s→2s reduces coordinator lag on task completion
             else:
                 time.sleep(0.5)
         # #159: if the task was never picked up (still pending), stop waiting
@@ -1530,35 +1558,6 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 return total
             total += resolved
 
-    def _sync_worktrees_to_main(worktrees: dict) -> None:
-        """Reset all agent worktrees to origin/main after a crew run completes.
-
-        Prevents state divergence (#166): after a run the worktrees may be on
-        different feature branches. Syncing to origin/main ensures the next run
-        starts from a clean, consistent baseline.
-        Failures are logged but never propagate — a sync error must not mask a
-        successful run result.
-        """
-        main_branch = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
-        for agent, wt_path in worktrees.items():
-            if not wt_path or not os.path.isdir(wt_path):
-                continue
-            try:
-                subprocess.run(
-                    ["git", "-C", wt_path, "stash", "push", "-u", "-m", "agent_crew post-run sync"],
-                    capture_output=True, text=True,
-                )
-                subprocess.run(
-                    ["git", "-C", wt_path, "fetch", "origin", "--quiet"],
-                    capture_output=True, text=True,
-                )
-                subprocess.run(
-                    ["git", "-C", wt_path, "checkout", "-B", main_branch, f"origin/{main_branch}"],
-                    capture_output=True, text=True,
-                )
-            except Exception as exc:
-                click.echo(f"Warning: could not sync worktree {agent!r} to {main_branch}: {exc}")
-
     def _auto_merge_pr(pr_number: int | None, repo_url: str) -> None:
         if not pr_number:
             click.echo("  Note: no PR number in results — skipping auto-merge")
@@ -1641,6 +1640,13 @@ def run_cmd(task: str, db: str, project: str, base: str,
     # review→test). Without this flag the server and coordinator both enqueue the
     # next phase independently, creating duplicate tasks and causing _wait() to
     # block on the coordinator's copy while the agent completes the server's copy.
+    # Sync all worktrees to latest origin/main before starting (#175, #176).
+    # Agents may be on stale branches from the previous run; reset them so the
+    # implementer always branches off the most recent merged state.
+    if _run_worktrees:
+        click.echo("Syncing worktrees to origin/main...")
+        _sync_worktrees_to_main(_run_worktrees)
+
     _CM = {"coordinator_managed": True}
 
     impl_context = {**_CM}
@@ -1941,6 +1947,14 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             click.echo(f"GitHub Discussion: {github_discussion} (node={_gh_node_id})")
         except Exception as e:
             raise click.ClickException(f"Failed to resolve GitHub discussion: {e}") from e
+
+    # Sync worktrees to latest origin/main before discussion (#175).
+    # Agents may be on stale branches; reset them so analysis is based on
+    # current code rather than a snapshot from crew setup time.
+    _discuss_worktrees = project_state.get("worktrees", {}) if project_state else {}
+    if _discuss_worktrees:
+        click.echo("Syncing worktrees to origin/main...")
+        _sync_worktrees_to_main(_discuss_worktrees)
 
     prior_synthesis = ""
     final_synthesis = ""
