@@ -1647,7 +1647,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         click.echo("Syncing worktrees to origin/main...")
         _sync_worktrees_to_main(_run_worktrees)
 
-    _CM = {"coordinator_managed": True}
+    _CM: dict = {"coordinator_managed": True}
 
     impl_context = {**_CM}
     if implementer:
@@ -1674,6 +1674,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
             review_context["agent_override"] = reviewer
         if no_tester:
             review_context["no_tester"] = True
+        if _loop_pr_number:
+            review_context["pr_number"] = _loop_pr_number
         review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, context=review_context, port=_run_port)
         click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
         review_start = time.time()
@@ -1929,6 +1931,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     if nowait:
         # Fire-and-forget: enqueue round 1 only, emit task_ids, exit.
         context: dict = {"round": 1}
+        if github_discussion:
+            context["github_discussion"] = github_discussion
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
@@ -1965,6 +1969,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         context = {"round": round_num}
         if round_num > 1 and prior_synthesis:
             context["prior_synthesis"] = prior_synthesis
+        if github_discussion:
+            context["github_discussion"] = github_discussion
 
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,

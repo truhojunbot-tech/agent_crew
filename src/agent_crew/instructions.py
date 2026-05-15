@@ -321,9 +321,34 @@ you set `verdict: "approve"`:
 Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
 `findings`.
 
+### Post GitHub PR comment (mandatory)
+
+After completing the review, post your findings directly to GitHub before submitting
+the result. Use `pr_number` from `context` if set; otherwise look it up by branch:
+
+```bash
+# branch and context.pr_number are in the AGENT_CREW TASK block above
+PR_NUM=<context.pr_number>   # use this if non-null
+if [ -z "$PR_NUM" ] || [ "$PR_NUM" = "null" ]; then
+  PR_NUM=$(gh pr list --head "<branch>" --json number --jq '.[0].number' 2>/dev/null)
+fi
+if [ -n "$PR_NUM" ]; then
+  gh pr review "$PR_NUM" --comment -b "[agent_crew review]
+**Verdict:** approve  ← replace with your actual verdict
+**Summary:** <your summary>
+
+**Findings:**
+- <finding 1>
+- <finding 2>"
+fi
+```
+
+Use `--comment` only (not `--approve` or `--request-changes` — GitHub blocks same-account approval).
+
 ### Result checklist (reviewer)
 
 Before you POST the result, verify:
+- [ ] GitHub PR comment posted (see above)
 - [ ] `status: completed` (the review itself completed, regardless of verdict)
 - [ ] `verdict` is `approve` or `request_changes` — never `null`
 - [ ] `findings` lists concrete, actionable items when verdict is
@@ -351,8 +376,26 @@ Before you POST the result, verify:
 You analyze the topic from your assigned perspective (see `context.perspective`)
 and submit your opinion in the result `summary`.
 
+### Post GitHub Discussion comment (if provided)
+
+If `context.github_discussion` contains a URL, post your opinion directly to GitHub
+before submitting the result:
+
+```bash
+URL="<context.github_discussion>"  # e.g. https://github.com/owner/repo/discussions/42
+if [ -n "$URL" ] && [ "$URL" != "null" ]; then
+  OWNER=$(echo "$URL" | sed 's|https://github.com/||' | cut -d/ -f1)
+  REPO=$(echo "$URL" | sed 's|https://github.com/||' | cut -d/ -f2)
+  NUM=$(echo "$URL" | rev | cut -d/ -f1 | rev)
+  NODE=$(gh api graphql -f query="{ repository(owner:\"$OWNER\",name:\"$REPO\") { discussion(number:$NUM) { id } } }" --jq '.data.repository.discussion.id')
+  BODY=$(printf '[agent_crew: %s]\n\n%s' "<context.perspective>" "<your opinion>")
+  gh api graphql -f query="mutation { addDiscussionComment(input:{discussionId:\"$NODE\",body:$(printf '%s' "$BODY" | jq -Rs .)}) { comment { id } } }"
+fi
+```
+
 ### Result checklist (panel)
 
+- [ ] GitHub Discussion comment posted if `context.github_discussion` is set
 - [ ] `status: completed`
 - [ ] `summary` contains your perspective-grounded opinion (not a rehash of the topic)
 - [ ] `verdict: null`, `findings: []`, `pr_number: null`
