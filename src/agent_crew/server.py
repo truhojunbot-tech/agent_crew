@@ -1161,6 +1161,19 @@ def create_app(
             _fail_if_active(task.task_id, "no_worktree")
             return
 
+        # Prepare worktree: stash local changes, fetch origin, checkout right branch.
+        if not _WORKTREE_SYNC_DISABLED:
+            try:
+                _prepare_worktree_for_task(wt, task.task_id, task.branch or "", role)
+                logger.info(
+                    f"dispatcher: worktree prepared for {role} "
+                    f"task_id={task.task_id} branch={task.branch or '(none)'}"
+                )
+            except Exception:
+                logger.exception(
+                    f"dispatcher: worktree prep failed for {role} task_id={task.task_id} — continuing"
+                )
+
         message = _format_task_message(task, port)
         # Per-role log file so `tail -f dispatch_{role}.log` in the pane
         # shows a continuous stream across all tasks for that role.
@@ -1210,6 +1223,14 @@ def create_app(
         except Exception:
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
+        finally:
+            # Reset worktree after task (success or failure) so it's clean for the next task.
+            try:
+                subprocess.run(["git", "-C", wt, "checkout", "."], capture_output=True)
+                subprocess.run(["git", "-C", wt, "clean", "-fd"], capture_output=True)
+                logger.debug(f"dispatcher: worktree reset after task={task.task_id} role={role}")
+            except Exception:
+                logger.exception(f"dispatcher: worktree reset failed for {role} task={task.task_id}")
 
     async def _dispatcher_loop() -> None:
         """Poll DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn headless
