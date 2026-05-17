@@ -1,4 +1,5 @@
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -59,6 +60,23 @@ _DDL_MIGRATE_LAST_ACTIVITY = (
 _DDL_MIGRATE_PUSH_AT = "ALTER TABLE tasks ADD COLUMN push_at REAL NOT NULL DEFAULT 0"
 _DDL_MIGRATE_ERROR_INFO = "ALTER TABLE tasks ADD COLUMN error_info TEXT DEFAULT NULL"
 
+_DDL_ATTRIBUTION = """
+CREATE TABLE IF NOT EXISTS task_attribution (
+    task_id          TEXT PRIMARY KEY,
+    project          TEXT NOT NULL DEFAULT '',
+    agent            TEXT NOT NULL DEFAULT '',
+    role             TEXT NOT NULL DEFAULT '',
+    task_type        TEXT NOT NULL DEFAULT '',
+    worktree_path    TEXT NOT NULL DEFAULT '',
+    codex_logs_path  TEXT NOT NULL DEFAULT '',
+    repo_url         TEXT NOT NULL DEFAULT '',
+    git_branch       TEXT NOT NULL DEFAULT '',
+    created_at       REAL NOT NULL,
+    updated_at       REAL NOT NULL,
+    status           TEXT NOT NULL DEFAULT 'pending'
+)
+"""
+
 _DDL_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS checkpoints (
     checkpoint_id TEXT PRIMARY KEY,
@@ -88,6 +106,7 @@ class TaskQueue:
         conn = self._connect()
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
+        conn.execute(_DDL_ATTRIBUTION)
         conn.execute(_DDL_CHECKPOINTS)
         # Migrate existing DBs: add project column if absent
         try:
@@ -758,6 +777,56 @@ class TaskQueue:
                 }
                 for r in rows
             ]
+        finally:
+            conn.close()
+
+    def record_attribution(
+        self,
+        task_id: str,
+        project: str = "",
+        agent: str = "",
+        role: str = "",
+        task_type: str = "",
+        worktree_path: str = "",
+        repo_url: str = "",
+        git_branch: str = "",
+        status: str = "pending",
+    ) -> None:
+        """Upsert a durable attribution record so quota systems can map token
+        usage back to the project even after worktrees are torn down."""
+        codex_logs_path = (
+            os.path.join(worktree_path, ".codex_local", "logs_2.sqlite")
+            if agent == "codex" and worktree_path
+            else ""
+        )
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                INSERT INTO task_attribution
+                    (task_id, project, agent, role, task_type, worktree_path,
+                     codex_logs_path, repo_url, git_branch, created_at, updated_at, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    status=excluded.status, updated_at=excluded.updated_at
+                """,
+                (task_id, project, agent, role, task_type, worktree_path,
+                 codex_logs_path, repo_url, git_branch, now, now, status),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def update_attribution_status(self, task_id: str, status: str) -> None:
+        """Update the status field of an existing attribution record."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE task_attribution SET status=?, updated_at=? WHERE task_id=?",
+                (status, time.time(), task_id),
+            )
+            conn.commit()
         finally:
             conn.close()
 

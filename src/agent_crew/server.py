@@ -1161,6 +1161,42 @@ def create_app(
             _fail_if_active(task.task_id, "no_worktree")
             return
 
+        # Record durable attribution before dispatch so quota systems can map
+        # token usage back to the project even after worktrees are torn down (#174).
+        try:
+            _repo_url = subprocess.run(
+                ["git", "-C", wt, "remote", "get-url", "origin"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            _git_branch = subprocess.run(
+                ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
+                capture_output=True, text=True, timeout=5,
+            ).stdout.strip()
+            q().record_attribution(
+                task_id=task.task_id,
+                project=task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2]),
+                agent=agent,
+                role=role,
+                task_type=task.task_type,
+                worktree_path=wt,
+                repo_url=_repo_url,
+                git_branch=_git_branch,
+                status="in_progress",
+            )
+            # Append-only JSONL for external quota scanners that outlive the DB.
+            _attr_jsonl = os.path.join(os.path.dirname(db_path), "attribution.jsonl")
+            import datetime as _dt2
+            with open(_attr_jsonl, "a") as _af:
+                _af.write(json.dumps({
+                    "task_id": task.task_id, "project": task.project,
+                    "agent": agent, "role": role, "task_type": task.task_type,
+                    "worktree_path": wt, "repo_url": _repo_url,
+                    "git_branch": _git_branch, "status": "in_progress",
+                    "created_at": _dt2.datetime.utcnow().isoformat(),
+                }) + "\n")
+        except Exception:
+            logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
+
         # Prepare worktree: stash local changes, fetch origin, checkout right branch.
         if not _WORKTREE_SYNC_DISABLED:
             try:
@@ -1496,6 +1532,11 @@ def create_app(
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
+        # #174: update durable attribution status on result submission.
+        try:
+            q().update_attribution_status(task_id, result.status)
+        except Exception:
+            logger.exception(f"POST /tasks/{task_id}/result: attribution status update failed")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
         ctx = q().get_task_context(task_id)
