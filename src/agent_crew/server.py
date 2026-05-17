@@ -1272,9 +1272,9 @@ def create_app(
                 "--resume", "latest", "--yolo",
                 "--output-format", "stream-json",
             ]
-        else:  # codex
+        else:  # codex — resume last session for context continuity; falls back to fresh if none exists
             cmd = [
-                "codex", "exec",
+                "codex", "exec", "resume", "--last",
                 "--dangerously-bypass-approvals-and-sandbox",
                 message,
             ]

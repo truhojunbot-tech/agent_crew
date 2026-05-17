@@ -77,7 +77,8 @@ def _process_line(raw: str) -> Optional[str]:
     try:
         ev = json.loads(raw)
     except json.JSONDecodeError:
-        return f"{_DIM}{raw[:120]}{_RESET}"
+        # Codex outputs plain text (no --json flag); show as normal agent text.
+        return f"{_GREEN}  {raw[:160]}{_RESET}"
 
     t = ev.get("type", "")
 
