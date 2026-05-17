@@ -31,6 +31,10 @@ htmlcov/
 *.sqlite
 port
 sessions.json
+state.json
+pane_map.json
+*.log
+*.jsonl
 
 # Agent crew local state (per-worktree)
 .claude/
