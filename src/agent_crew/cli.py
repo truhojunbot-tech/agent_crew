@@ -536,93 +536,94 @@ def setup(project: str, agents: str, base: str):
     agent_dicts = [{"name": a, "pane": i} for i, a in enumerate(agent_list)]
     setup_module.write_sessions_json(sessions_file, agent_dicts, worktrees=worktrees)
 
-    # Agent panes live in the caller's own tmux window. Coordinator stays on
-    # the left (full height); agents stack vertically on the right via
-    # main-vertical layout. No width preflight — narrow windows get narrower
-    # agent panes rather than an error.
-    session_name, window_index = _resolve_tmux_window(proj_dir)
-    window_target = f"{session_name}:{window_index}"
-    _crew_log(proj_dir, f"tmux using session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
+    _dispatcher_mode = os.getenv("AGENT_CREW_DISPATCHER", "1").lower() not in ("0", "false", "no")
 
-    # Check window width — main-vertical layout needs minimum width for readable panes
-    # (e.g., 80-wide window + 3 agents can create 1-char wide panes on the right)
-    window_width_result = subprocess.run(
-        ["tmux", "display-message", "-t", window_target, "-p", "#{window_width}"],
-        capture_output=True, text=True,
-    )
-    if window_width_result.returncode == 0:
-        try:
-            window_width = int(window_width_result.stdout.strip())
-            min_width_needed = (len(agent_list) + 1) * 60  # Coordinator (60) + agents (60 each min)
-            if window_width < min_width_needed:
-                click.echo(
-                    f"Warning: window width {window_width} may be too narrow for {len(agent_list)} agents.\n"
-                    f"         Minimum recommended: {min_width_needed} chars ({len(agent_list)+1} panes × 60)\n"
-                    f"         Agent panes may be unreadable (< 20 chars wide).",
-                    err=True,
-                )
-        except (ValueError, AttributeError):
-            pass  # Can't parse width, continue anyway
+    if not _dispatcher_mode:
+        # Agent panes live in the caller's own tmux window. Coordinator stays on
+        # the left (full height); agents stack vertically on the right via
+        # main-vertical layout. No width preflight — narrow windows get narrower
+        # agent panes rather than an error.
+        session_name, window_index = _resolve_tmux_window(proj_dir)
+        window_target = f"{session_name}:{window_index}"
+        _crew_log(proj_dir, f"tmux using session={session_name} window={window_index}: {_tmux_snapshot(session_name)}")
 
-    pane_ids: list[str] = []
-    for agent, wt_path in worktrees.items():
-        result = subprocess.run(
-            ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
-             "-P", "-F", "#{pane_id}"],
+        # Check window width — main-vertical layout needs minimum width for readable panes
+        window_width_result = subprocess.run(
+            ["tmux", "display-message", "-t", window_target, "-p", "#{window_width}"],
             capture_output=True, text=True,
         )
-        pane_id = result.stdout.strip()
-        rc = result.returncode
-        _crew_log(proj_dir, f"split-window agent={agent} rc={rc} pane_id={pane_id!r} stderr={result.stderr.strip()!r}")
-        if pane_id:
-            pane_ids.append(pane_id)
+        if window_width_result.returncode == 0:
+            try:
+                window_width = int(window_width_result.stdout.strip())
+                min_width_needed = (len(agent_list) + 1) * 60
+                if window_width < min_width_needed:
+                    click.echo(
+                        f"Warning: window width {window_width} may be too narrow for {len(agent_list)} agents.\n"
+                        f"         Minimum recommended: {min_width_needed} chars ({len(agent_list)+1} panes × 60)\n"
+                        f"         Agent panes may be unreadable (< 20 chars wide).",
+                        err=True,
+                    )
+            except (ValueError, AttributeError):
+                pass
 
-    # Coordinator fills the left column; agent panes stack top-to-bottom on
-    # the right. main-vertical reorganizes panes regardless of split order.
-    layout_result = subprocess.run(
-        ["tmux", "select-layout", "-t", window_target, "main-vertical"],
-        capture_output=True, text=True,
-    )
-    _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
-
-    # Verify pane widths are acceptable (avoid silent failures with 1-char wide panes)
-    if pane_ids:
-        pane_widths = []
-        for pane_id in pane_ids:
-            width_result = subprocess.run(
-                ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_width}"],
+        pane_ids: list[str] = []
+        for agent, wt_path in worktrees.items():
+            result = subprocess.run(
+                ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
+                 "-P", "-F", "#{pane_id}"],
                 capture_output=True, text=True,
             )
-            if width_result.returncode == 0:
-                try:
-                    width = int(width_result.stdout.strip())
-                    pane_widths.append((pane_id, width))
-                    if width < 20:
-                        click.echo(
-                            f"Warning: pane {pane_id} width is {width} chars (too narrow for CLI).\n"
-                            f"         Expand your tmux window or use fewer agents.",
-                            err=True,
-                        )
-                except (ValueError, AttributeError):
-                    pass
+            pane_id = result.stdout.strip()
+            rc = result.returncode
+            _crew_log(proj_dir, f"split-window agent={agent} rc={rc} pane_id={pane_id!r} stderr={result.stderr.strip()!r}")
+            if pane_id:
+                pane_ids.append(pane_id)
 
-    # Write pane_map.json — server reads this at startup for push routing.
-    # Two key flavors share one dict:
-    #   role key (implementer/reviewer/tester) — routes implement/review/test tasks
-    #   agent-name key (claude/codex/gemini)    — routes discuss tasks (panelists
-    #                                              fan out per agent)
-    pane_map: dict[str, str] = {}
-    for a, pid in zip(agent_list, pane_ids):
-        role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
-        pane_map[role] = pid
-        pane_map[a] = pid
-    # Single-agent setups: the lone agent owns every standard role so a single
-    # pane handles implement/review/test tasks (otherwise unmapped roles cause
-    # tasks to silently sit in QUEUED — see issue #72).
-    if len(agent_list) == 1:
-        sole_pid = pane_ids[0]
-        for role in ("implementer", "reviewer", "tester"):
-            pane_map.setdefault(role, sole_pid)
+        layout_result = subprocess.run(
+            ["tmux", "select-layout", "-t", window_target, "main-vertical"],
+            capture_output=True, text=True,
+        )
+        _crew_log(proj_dir, f"select-layout rc={layout_result.returncode} after: {_tmux_snapshot(session_name)}")
+
+        if pane_ids:
+            for pane_id in pane_ids:
+                width_result = subprocess.run(
+                    ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_width}"],
+                    capture_output=True, text=True,
+                )
+                if width_result.returncode == 0:
+                    try:
+                        width = int(width_result.stdout.strip())
+                        if width < 20:
+                            click.echo(
+                                f"Warning: pane {pane_id} width is {width} chars (too narrow for CLI).\n"
+                                f"         Expand your tmux window or use fewer agents.",
+                                err=True,
+                            )
+                    except (ValueError, AttributeError):
+                        pass
+
+        # Write pane_map.json — server reads this at startup for push routing.
+        pane_map: dict[str, str] = {}
+        for a, pid in zip(agent_list, pane_ids):
+            role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+            pane_map[role] = pid
+            pane_map[a] = pid
+        if len(agent_list) == 1:
+            sole_pid = pane_ids[0]
+            for role in ("implementer", "reviewer", "tester"):
+                pane_map.setdefault(role, sole_pid)
+    else:
+        # Dispatcher mode: no tmux panes — server spawns headless subprocesses.
+        session_name = subprocess.run(
+            ["tmux", "display-message", "-p", "#S"],
+            capture_output=True, text=True,
+        ).stdout.strip()
+        window_index = 0
+        pane_ids = []
+        pane_map = {}
+        _crew_log(proj_dir, "dispatcher mode: skipping pane creation")
+
     pane_map_file = os.path.join(proj_dir, "pane_map.json")
     with open(pane_map_file, "w") as f:
         json.dump(pane_map, f)
@@ -640,6 +641,7 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
+            **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         log_file = open(os.path.join(proj_dir, "server.log"), "w")
         server_proc = subprocess.Popen(
@@ -681,6 +683,7 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
+            **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         log_file = open(os.path.join(proj_dir, "server.log"), "a")
         server_proc = subprocess.Popen(
@@ -705,13 +708,18 @@ def setup(project: str, agents: str, base: str):
     # "Trust this folder?" prompt at first launch.
     setup_module.pretrust_claude_worktree(worktrees)
 
-    # Start agent CLIs. Agents wait for pane pushes; no kickoff prompt, no
-    # polling loop. Instructions live in each worktree's CLAUDE.md/AGENTS.md/GEMINI.md
-    # which the CLIs auto-load.
-    setup_module.start_agents_in_panes(
-        session_name, agent_list, pane_targets=pane_ids or None, worktrees=worktrees
-    )
-    _crew_log(proj_dir, f"agents started pane_ids={pane_ids}")
+    if not _dispatcher_mode:
+        # Start agent CLIs in tmux panes (push model).
+        setup_module.start_agents_in_panes(
+            session_name, agent_list, pane_targets=pane_ids or None, worktrees=worktrees
+        )
+        _crew_log(proj_dir, f"agents started pane_ids={pane_ids}")
+    else:
+        if pane_ids:
+            setup_module.start_log_viewers_in_panes(agent_list, pane_ids, proj_dir)
+            _crew_log(proj_dir, f"log viewers started pane_ids={pane_ids}")
+        click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
+        _crew_log(proj_dir, "dispatcher mode: log viewers started")
 
     _write_state(base, project, {
         "project": project,

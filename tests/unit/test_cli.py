@@ -975,7 +975,7 @@ def test_u_c50_single_agent_setup_fills_all_roles(tmp_path):
 
     mock_proc = MagicMock()
     mock_proc.pid = 12345
-    runner = CliRunner(env={"TMUX_PANE": "%0"})
+    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "0"})
     with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
          patch("agent_crew.cli._read_state", return_value=None), \
          patch("agent_crew.cli.setup_module.find_free_port", return_value=19999), \

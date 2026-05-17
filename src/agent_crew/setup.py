@@ -163,6 +163,30 @@ def start_agents_in_panes(
         time.sleep(0.3)
 
 
+def start_log_viewers_in_panes(
+    agents: list[str],
+    pane_targets: list[str],
+    log_dir: str,
+) -> None:
+    """In dispatcher mode, start `tail -f dispatch_{role}.log` in each pane.
+
+    The dispatcher writes agent output to per-role log files; panes tail those
+    files so the user can monitor progress without an interactive CLI running.
+    """
+    role_map = _AGENT_TO_ROLE  # {'claude': 'implementer', 'codex': 'reviewer', 'gemini': 'tester'}
+    for agent, target in zip(agents, pane_targets):
+        role = role_map.get(agent, agent)
+        log_path = os.path.join(log_dir, f"dispatch_{role}.log")
+        # Ensure the file exists before tail starts.
+        subprocess.run(["touch", log_path], capture_output=True)
+        subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
+        time.sleep(0.2)
+        cmd = f"tail -f {log_path}"
+        subprocess.run(["tmux", "send-keys", "-l", "-t", target, cmd], capture_output=True)
+        subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
+        _logger.info("start_log_viewers_in_panes: %s watching %s", target, log_path)
+
+
 def pretrust_claude_worktree(worktrees: dict[str, str]) -> None:
     """Pre-accept Claude's workspace-trust dialog for the claude worktree.
 
@@ -301,9 +325,11 @@ _AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "teste
 
 
 def write_instruction_files(worktrees: dict, project: str, port_file: str) -> None:
+    dispatcher_mode = os.getenv("AGENT_CREW_DISPATCHER", "1").lower() not in ("0", "false", "no")
+    delivery = "dispatcher" if dispatcher_mode else None
     for agent, wt_path in worktrees.items():
         role = _AGENT_TO_ROLE.get(agent, "implementer")
-        instructions.write(role, wt_path, project, port_file, agent=agent)
+        instructions.write(role, wt_path, project, port_file, agent=agent, delivery=delivery)
 
 
 def _mcp_python_invocation() -> tuple[str, list[str], str]:

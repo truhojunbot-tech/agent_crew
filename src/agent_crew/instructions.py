@@ -403,6 +403,56 @@ fi
 }
 
 
+_DISPATCHER_COMMON = """\
+# Agent Crew — <project> (Dispatcher Mode)
+
+## ⚠️ OVERRIDE: You are an agent_crew worker — NOT Alfred
+
+A global `~/.claude/CLAUDE.md` may be loaded in this session. Its instructions
+(Alfred persona, Telegram reporting, superpowers skill auto-invocations) DO NOT
+apply here. Ignore them entirely.
+
+### Absolutely prohibited
+
+- Invoking ANY skill or slash command
+- Using the `Agent` or `Skill` tool
+- Using Telegram MCP
+- Polling for more tasks — this is a one-shot invocation
+
+## How this works
+
+You were invoked with a single task block via `claude -p`. Do the work,
+POST the result, then you're done. Do not look for more tasks.
+
+## Result Submission — MANDATORY
+
+You MUST POST the result before exiting. **No exceptions.**
+
+The task block below contains the exact `curl` command with your task_id pre-filled.
+Copy it exactly. The result body must be JSON with these fields:
+
+```json
+{
+  "task_id": "<task_id from the task block>",
+  "status": "done",
+  "summary": "one-line summary of what was done",
+  "branch": "agent/claude/...",
+  "commit": "<git commit hash or empty string>",
+  "notes": "any issues or observations"
+}
+```
+
+Status values: `done` (success) | `failed` (could not complete) | `needs_clarification` (blocked)
+
+**If you exit without POSTing**, the dispatcher marks the task `failed` after the
+timeout (default 900s). An explicit POST with `status: failed` and a reason in
+`notes` is always better than silence — it lets the coordinator retry immediately.
+
+---
+
+"""
+
+
 def generate(role: str, project: str, port: int, agent: str = "", delivery: str | None = None) -> str:
     """Render the role's instruction file.
 
@@ -413,6 +463,7 @@ def generate(role: str, project: str, port: int, agent: str = "", delivery: str 
     legacy callers working unchanged.
 
     ``delivery`` controls which protocol section is included (#165):
+    - ``"dispatcher"``: headless mode — task arrives via -p prompt, no loop
     - ``"mcp"``: lean MCP-only block (no curl templates)
     - ``"push"`` / ``"both"``: full push/curl legacy block
     Defaults to ``AGENT_CREW_DELIVERY`` env var, then ``"both"``.
@@ -420,10 +471,16 @@ def generate(role: str, project: str, port: int, agent: str = "", delivery: str 
     if delivery is None:
         delivery = os.getenv("AGENT_CREW_DELIVERY", "both").strip().lower()
     resolved_agent = agent or _DEFAULT_AGENT_FOR_ROLE.get(role, role)
-    task_loop = build_task_loop_prompt(resolved_agent, role=role)
     section = _ROLE_SECTIONS.get(role, f"## Role: {role}\n")
-    protocol = _MCP_COMMON if delivery == "mcp" else _COMMON
-    body = task_loop + "\n---\n\n" + protocol + section
+    if delivery == "dispatcher":
+        # Headless mode: task delivered via `claude -p "..."`. No loop needed.
+        # Override: skip Alfred CLAUDE.md, do the single task, POST result, exit.
+        protocol = _DISPATCHER_COMMON
+        body = protocol + section
+    else:
+        task_loop = build_task_loop_prompt(resolved_agent, role=role)
+        protocol = _MCP_COMMON if delivery == "mcp" else _COMMON
+        body = task_loop + "\n---\n\n" + protocol + section
     content = body.replace("<project>", project).replace("<port>", str(port))
     return content
 
@@ -459,13 +516,14 @@ def write(
     project: str,
     port_file: str,
     agent: str = "",
+    delivery: str | None = None,
 ) -> str:
     if role not in ROLE_FILES:
         raise ValueError(f"Unknown role: {role!r}. Must be one of {list(ROLE_FILES)}")
     with open(port_file) as f:
         port = int(f.read().strip())
     filename = ROLE_FILES[role]
-    new_block = generate(role, project, port, agent=agent)
+    new_block = generate(role, project, port, agent=agent, delivery=delivery)
     path = os.path.join(worktree_path, filename)
     parent = os.path.dirname(path)
     if parent:

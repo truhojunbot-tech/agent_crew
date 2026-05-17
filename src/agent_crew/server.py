@@ -607,17 +607,54 @@ def create_app(
         _delivery_raw = "both"
     _push_enabled = _delivery_raw in ("push", "both")
 
+    _dispatcher_enabled = os.getenv("AGENT_CREW_DISPATCHER", "0").lower() not in ("0", "false", "no")
+
     state: dict = {}
     reminded_task_ids: set[str] = set()
+
+    def _requeue_orphans() -> None:
+        """On startup, reset in_progress tasks to pending and clean their worktrees.
+
+        In dispatcher mode the server process owns agent subprocesses. A server
+        restart means those subprocesses were killed, so any in_progress task is
+        definitively incomplete and safe to re-queue.
+        """
+        tq = state["queue"]
+        orphans = tq.list_tasks(status="in_progress")
+        if not orphans:
+            return
+        logger.info(f"dispatcher: re-queuing {len(orphans)} orphaned in_progress task(s)")
+        for task in orphans:
+            role = task.context.get("role", "")
+            wt = worktree_map.get(role) if worktree_map else None
+            if wt and os.path.isdir(wt):
+                try:
+                    subprocess.run(
+                        ["git", "checkout", "."],
+                        cwd=wt, capture_output=True,
+                    )
+                    subprocess.run(
+                        ["git", "clean", "-fd"],
+                        cwd=wt, capture_output=True,
+                    )
+                    logger.info(f"dispatcher: cleaned worktree {wt} for task {task.task_id}")
+                except Exception:
+                    logger.exception(f"dispatcher: failed to clean worktree {wt}")
+            tq.requeue(task.task_id)
+            logger.info(f"dispatcher: re-queued task {task.task_id} (role={role})")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state["queue"] = TaskQueue(db_path)
         background_tasks: list[asyncio.Task] = []
-        if not watchdog_disabled:
-            background_tasks.append(asyncio.create_task(_watchdog_loop()))
-        if not anomaly_disabled:
-            background_tasks.append(asyncio.create_task(_anomaly_loop()))
+        if _dispatcher_enabled:
+            _requeue_orphans()
+            background_tasks.append(asyncio.create_task(_dispatcher_loop()))
+        else:
+            if not watchdog_disabled:
+                background_tasks.append(asyncio.create_task(_watchdog_loop()))
+            if not anomaly_disabled:
+                background_tasks.append(asyncio.create_task(_anomaly_loop()))
         try:
             yield
         finally:
@@ -1088,6 +1125,141 @@ def create_app(
                     logger.exception("anomaly tick raised — continuing")
         except asyncio.CancelledError:
             return
+
+    # ── Headless dispatcher (subprocess-per-task model) ──────────────────────
+    # Maps task_type → role → agent CLI.  discuss is handled separately.
+    _DISPATCH_TYPE_TO_ROLE: dict[str, str] = {
+        "implement": "implementer",
+        "review": "reviewer",
+        "test": "tester",
+    }
+    _DISPATCH_ROLE_TO_AGENT: dict[str, str] = {
+        "implementer": "claude",
+        "reviewer": "codex",
+        "tester": "gemini",
+    }
+
+    def _fail_if_active(task_id: str, reason: str) -> None:
+        """Fail a task only when it is still in_progress (agent may have submitted first)."""
+        tasks = q().list_tasks(status="in_progress")
+        if any(t.task_id == task_id for t in tasks):
+            try:
+                q().submit_result(
+                    task_id,
+                    TaskResult(task_id=task_id, status="failed", summary=reason,
+                               error_info={"reason": reason}),
+                )
+            except Exception:
+                logger.exception(f"_fail_if_active: could not fail task {task_id}")
+
+    async def _dispatch_task(task: TaskRequest, role: str) -> None:
+        """Spawn a headless agent subprocess for one task and await its exit."""
+        agent = _DISPATCH_ROLE_TO_AGENT.get(role, "claude")
+        wt = worktree_map.get(role)
+        if not wt:
+            logger.error(f"dispatcher: no worktree for role={role!r} task={task.task_id}")
+            _fail_if_active(task.task_id, "no_worktree")
+            return
+
+        message = _format_task_message(task, port)
+        # Per-role log file so `tail -f dispatch_{role}.log` in the pane
+        # shows a continuous stream across all tasks for that role.
+        log_path = os.path.join(os.path.dirname(db_path), f"dispatch_{role}.log")
+
+        if agent == "claude":
+            cmd = [
+                "claude", "-p", message,
+                "--continue", "--dangerously-skip-permissions",
+                "--output-format", "stream-json",
+            ]
+        elif agent == "gemini":
+            cmd = [
+                "gemini", "-p", message,
+                "--resume", "latest", "--yolo",
+                "--output-format", "stream-json",
+            ]
+        else:  # codex
+            cmd = ["codex", "exec", "resume", "--last", message]
+
+        timeout_secs = float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", "900"))
+        logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt}")
+        try:
+            import datetime as _dt
+            with open(log_path, "a") as log_f:
+                log_f.write(
+                    f"\n{'='*60}\n"
+                    f"TASK {task.task_id} | {role} | "
+                    f"{_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+                    f"{'='*60}\n"
+                )
+            with open(log_path, "ab") as log_f:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd, stdout=log_f, stderr=log_f, cwd=wt,
+                )
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=timeout_secs)
+            except asyncio.TimeoutError:
+                proc.kill()
+                logger.error(f"dispatcher: timeout {timeout_secs}s task={task.task_id}")
+                _fail_if_active(task.task_id, "dispatcher_timeout")
+                return
+            if proc.returncode != 0:
+                _fail_if_active(task.task_id, f"exit_{proc.returncode}")
+            else:
+                _fail_if_active(task.task_id, "no_result_submitted")
+        except Exception:
+            logger.exception(f"dispatcher: error task={task.task_id}")
+            _fail_if_active(task.task_id, "dispatcher_exception")
+
+    async def _dispatcher_loop() -> None:
+        """Poll DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn headless
+        agent subprocesses.  One concurrent task per role (same --continue session
+        cannot be shared across parallel invocations).
+        """
+        active_roles: set[str] = set()
+        active_tasks: dict[str, asyncio.Task] = {}  # task_id → asyncio.Task
+        task_roles: dict[str, str] = {}  # task_id → role
+
+        interval = float(os.getenv("AGENT_CREW_DISPATCH_INTERVAL", "2"))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    # Reap completed dispatches, freeing their slots.
+                    done = [tid for tid, t in list(active_tasks.items()) if t.done()]
+                    for tid in done:
+                        active_tasks.pop(tid, None)
+                        role = task_roles.pop(tid, None)
+                        if role:
+                            active_roles.discard(role)
+
+                    for role in ("implementer", "reviewer", "tester"):
+                        if role in active_roles:
+                            continue
+                        task = q().dequeue(role=role)
+                        if task is None:
+                            continue
+                        active_roles.add(role)
+                        task_roles[task.task_id] = role
+
+                        async def _run(t: TaskRequest = task, r: str = role) -> None:
+                            try:
+                                await _dispatch_task(t, r)
+                            finally:
+                                active_roles.discard(r)
+                                active_tasks.pop(t.task_id, None)
+                                task_roles.pop(t.task_id, None)
+
+                        active_tasks[task.task_id] = asyncio.create_task(_run())
+                except Exception:
+                    logger.exception("dispatcher loop raised — continuing")
+        except asyncio.CancelledError:
+            for t in active_tasks.values():
+                t.cancel()
+            return
+
+    app.state.dispatcher_enabled = _dispatcher_enabled
+    # ── End headless dispatcher ───────────────────────────────────────────────
 
     def _auto_enqueue_review(
         impl_task_id: str,
