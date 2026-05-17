@@ -1534,6 +1534,28 @@ def create_app(
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
             # review counts as approved (#100). Skip when the review task was
             # created with no_tester=True (set by `crew run --no-tester`).
+            # #178: post review verdict as GitHub PR comment
+            if task_type == "review":
+                _review_pr = result.pr_number or (ctx.get("pr_number") if isinstance(ctx, dict) else None)
+                if _review_pr:
+                    try:
+                        from agent_crew.github import post_review_comment
+                        _reviewer_agent = next(
+                            (k for k, v in (pane_map or {}).items() if k in ("claude", "codex", "gemini")),
+                            "agent",
+                        )
+                        post_review_comment(
+                            pr_number=int(_review_pr),
+                            verdict=result.verdict,
+                            summary=result.summary or "",
+                            findings=result.findings or [],
+                            task_id=task_id,
+                            reviewer=_reviewer_agent,
+                        )
+                        logger.info(f"POST /tasks/{task_id}/result: posted review comment on PR #{_review_pr}")
+                    except Exception:
+                        logger.exception(f"POST /tasks/{task_id}/result: failed to post review comment on PR #{_review_pr}")
+
             if task_type == "review" and _resolve_verdict(result) == "approve":
                 review_ctx = ctx if isinstance(ctx, dict) else {}
                 pr_number = result.pr_number or review_ctx.get("pr_number")

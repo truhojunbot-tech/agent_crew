@@ -116,6 +116,48 @@ def create_pr(
     return None
 
 
+def post_review_comment(
+    pr_number: int,
+    verdict: Optional[str],
+    summary: str,
+    findings: list,
+    task_id: str,
+    reviewer: str = "agent",
+    repo: Optional[str] = None,
+) -> bool:
+    """Post a review result as a PR comment via gh CLI. Returns True on success."""
+    if not check_gh_installed():
+        return False
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return False
+
+    verdict_label = "✅ approve" if verdict == "approve" else "🔄 request_changes"
+    lines = [f"[agent_crew review] verdict: {verdict_label}", ""]
+    if findings:
+        lines.append("**Findings:**")
+        for f in findings:
+            lines.append(f"- {f}")
+        lines.append("")
+    if summary:
+        lines.append(f"**Summary:** {summary}")
+        lines.append("")
+    lines.append(f"> reviewer: {reviewer} | task: {task_id}")
+    body = "\n".join(lines)
+
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body", body],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def get_pr_url(repo: Optional[str], pr_number: str) -> str:
     """Format a PR URL from repo and PR number."""
     if not repo:
