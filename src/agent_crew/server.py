@@ -68,11 +68,29 @@ _WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").low
 _WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
 
 
+def _resolve_pr_head_branch(pr_number: int) -> Optional[str]:
+    """Return the head ref name for a GitHub PR, or None on failure."""
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--json", "headRefName",
+             "-q", ".headRefName"],
+            capture_output=True, text=True, timeout=15,
+        )
+        if r.returncode == 0:
+            branch = r.stdout.strip()
+            if branch:
+                return branch
+    except Exception:
+        pass
+    return None
+
+
 def _prepare_worktree_for_task(
     worktree_path: str,
     task_id: str,
     task_branch: str,
     role: str,
+    task_context: Optional[dict] = None,
 ) -> None:
     """Sync worktree to origin and checkout the right branch before task dispatch.
 
@@ -81,13 +99,17 @@ def _prepare_worktree_for_task(
     - implementer: checkout a fresh branch per task from origin/main so each
       impl task starts clean and pushes to its own PR branch (#140).
     - reviewer/tester: checkout the task's PR branch from origin so reviews
-      run against the actual changed code, not stale main (#141).
+      run against the actual changed code, not stale main (#141, #186).
+      When task_context carries pr_number, the actual PR head ref is resolved
+      via `gh pr view` so the worktree tracks the real PR branch rather than
+      the base branch stored in task.branch.
 
     Failures are logged but never propagate — task dispatch continues even if
     the git prep encounters a transient error (e.g. merge conflict on stash pop).
     """
     try:
-        _prepare_worktree_for_task_inner(worktree_path, task_id, task_branch, role)
+        _prepare_worktree_for_task_inner(worktree_path, task_id, task_branch, role,
+                                         task_context=task_context or {})
     except Exception:
         logger.exception(
             f"_prepare_worktree_for_task: unexpected error for {role} "
@@ -100,9 +122,12 @@ def _prepare_worktree_for_task_inner(
     task_id: str,
     task_branch: str,
     role: str,
+    task_context: Optional[dict] = None,
 ) -> None:
     """Inner (may raise). Wrapped by _prepare_worktree_for_task."""
     main_branch = _WORKTREE_MAIN_BRANCH
+    if task_context is None:
+        task_context = {}
     # Stash any leftover uncommitted changes so checkout doesn't fail.
     subprocess.run(
         ["git", "-C", worktree_path, "stash", "push", "-u",
@@ -113,6 +138,7 @@ def _prepare_worktree_for_task_inner(
     subprocess.run(
         ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
         capture_output=True, text=True,
+        timeout=60,
     )
 
     if role == "implementer":
@@ -130,12 +156,30 @@ def _prepare_worktree_for_task_inner(
                 f"from origin/{main_branch} failed: {r.stderr.strip()}"
             )
     else:
-        # Reviewer/tester: checkout the PR branch from origin (#141).
-        # If the branch is absent on origin (merged, deleted) fall back to
-        # origin/main so the worktree is at least current.
+        # Reviewer/tester: checkout the PR branch from origin (#141, #186).
+        # task.branch holds the base branch (e.g. main), not the PR head.
+        # Resolve the actual PR head ref from pr_number when available so
+        # the worktree always mirrors the real PR, not a stale base branch.
         prefix = "review" if role == "reviewer" else "test"
         local_branch = f"{prefix}/{task_id[:8]}"
-        target_ref = f"origin/{task_branch}" if task_branch else f"origin/{main_branch}"
+
+        pr_branch = task_branch  # fallback: base branch from task.branch
+        pr_number = task_context.get("pr_number")
+        if pr_number:
+            resolved = _resolve_pr_head_branch(int(pr_number))
+            if resolved:
+                pr_branch = resolved
+                logger.info(
+                    f"_prepare_worktree_for_task: resolved PR #{pr_number} "
+                    f"head → {pr_branch!r} for {role} {task_id}"
+                )
+            else:
+                logger.warning(
+                    f"_prepare_worktree_for_task: could not resolve PR #{pr_number} "
+                    f"head for {role} {task_id} — falling back to task.branch={task_branch!r}"
+                )
+
+        target_ref = f"origin/{pr_branch}" if pr_branch else f"origin/{main_branch}"
         r = subprocess.run(
             ["git", "-C", worktree_path, "checkout", "-B", local_branch, target_ref],
             capture_output=True, text=True,
@@ -161,6 +205,7 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
     right worktree for a given role without importing setup.py at runtime.
     """
     if not state_path or not os.path.exists(state_path):
+        logger.warning(f"_load_worktree_map: state_path={state_path!r} missing → worktree_map={{}}")
         return {}
     try:
         with open(state_path) as f:
@@ -172,6 +217,7 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
             role = _AGENT_TO_ROLE.get(agent)
             if role and path:
                 result[role] = path
+        logger.info(f"_load_worktree_map: state_path={state_path!r} → worktree_map={result}")
         return result
     except Exception:
         logger.exception("_load_worktree_map: failed to read state.json")
@@ -730,7 +776,8 @@ def create_app(
             if wt_path:
                 try:
                     _prepare_worktree_for_task(
-                        wt_path, task.task_id, task.branch or "", role
+                        wt_path, task.task_id, task.branch or "", role,
+                        task_context=task.context if isinstance(task.context, dict) else {},
                     )
                     logger.info(
                         f"_try_push_next: worktree prepared for {role} "
@@ -1149,9 +1196,10 @@ def create_app(
     async def _dispatch_task(task: TaskRequest, role: str) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
         agent = _DISPATCH_ROLE_TO_AGENT.get(role, "claude")
+        logger.debug(f"dispatcher: _dispatch_task enter role={role!r} worktree_map_keys={list(worktree_map.keys())} task={task.task_id}")
         wt = worktree_map.get(role)
         if not wt:
-            logger.error(f"dispatcher: no worktree for role={role!r} task={task.task_id}")
+            logger.error(f"dispatcher: no worktree for role={role!r} worktree_map={worktree_map!r} task={task.task_id}")
             _fail_if_active(task.task_id, "no_worktree")
             return
 
@@ -1194,7 +1242,10 @@ def create_app(
         # Prepare worktree: stash local changes, fetch origin, checkout right branch.
         if not _WORKTREE_SYNC_DISABLED:
             try:
-                _prepare_worktree_for_task(wt, task.task_id, task.branch or "", role)
+                _prepare_worktree_for_task(
+                    wt, task.task_id, task.branch or "", role,
+                    task_context=task.context if isinstance(task.context, dict) else {},
+                )
                 logger.info(
                     f"dispatcher: worktree prepared for {role} "
                     f"task_id={task.task_id} branch={task.branch or '(none)'}"
@@ -1213,7 +1264,7 @@ def create_app(
             cmd = [
                 "claude", "-p", message,
                 "--continue", "--dangerously-skip-permissions",
-                "--output-format", "stream-json",
+                "--verbose", "--output-format", "stream-json",
             ]
         elif agent == "gemini":
             cmd = [
@@ -1222,7 +1273,11 @@ def create_app(
                 "--output-format", "stream-json",
             ]
         else:  # codex
-            cmd = ["codex", "exec", "resume", "--last", message]
+            cmd = [
+                "codex", "exec",
+                "--dangerously-bypass-approvals-and-sandbox",
+                message,
+            ]
 
         timeout_secs = float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", "900"))
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt}")
@@ -1271,11 +1326,15 @@ def create_app(
         active_tasks: dict[str, asyncio.Task] = {}  # task_id → asyncio.Task
         task_roles: dict[str, str] = {}  # task_id → role
 
+        # Inverse of _DISPATCH_ROLE_TO_AGENT: agent → role (for worktree lookup)
+        _AGENT_TO_ROLE: dict[str, str] = {v: k for k, v in _DISPATCH_ROLE_TO_AGENT.items()}
+
         interval = float(os.getenv("AGENT_CREW_DISPATCH_INTERVAL", "2"))
         try:
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    logger.debug(f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} active_roles={active_roles}")
                     # Reap completed dispatches, freeing their slots.
                     done = [tid for tid, t in list(active_tasks.items()) if t.done()]
                     for tid in done:
@@ -1302,6 +1361,30 @@ def create_app(
                                 task_roles.pop(t.task_id, None)
 
                         active_tasks[task.task_id] = asyncio.create_task(_run())
+
+                    # Discuss tasks are per-agent (not per-role); dispatch concurrently.
+                    for agent in ("claude", "codex", "gemini"):
+                        slot_key = f"discuss_{agent}"
+                        if slot_key in active_roles:
+                            continue
+                        task = q().dequeue_discuss_for_agent(agent)
+                        if task is None:
+                            continue
+                        role = _AGENT_TO_ROLE.get(agent, "implementer")
+                        active_roles.add(slot_key)
+                        task_roles[task.task_id] = slot_key
+
+                        async def _run_discuss(
+                            t: TaskRequest = task, r: str = role, s: str = slot_key
+                        ) -> None:
+                            try:
+                                await _dispatch_task(t, r)
+                            finally:
+                                active_roles.discard(s)
+                                active_tasks.pop(t.task_id, None)
+                                task_roles.pop(t.task_id, None)
+
+                        active_tasks[task.task_id] = asyncio.create_task(_run_discuss())
                 except Exception:
                     logger.exception("dispatcher loop raised — continuing")
         except asyncio.CancelledError:
