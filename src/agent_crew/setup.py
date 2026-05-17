@@ -181,7 +181,7 @@ def start_log_viewers_in_panes(
         subprocess.run(["touch", log_path], capture_output=True)
         subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
         time.sleep(0.2)
-        cmd = f"tail -f {log_path}"
+        cmd = f"crew-log-viewer {log_path}"
         subprocess.run(["tmux", "send-keys", "-l", "-t", target, cmd], capture_output=True)
         subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
         _logger.info("start_log_viewers_in_panes: %s watching %s", target, log_path)

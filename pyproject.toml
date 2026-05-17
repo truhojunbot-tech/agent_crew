@@ -15,6 +15,7 @@ dependencies = [
 
 [project.scripts]
 crew = "agent_crew.cli:crew"
+crew-log-viewer = "agent_crew.log_viewer:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
