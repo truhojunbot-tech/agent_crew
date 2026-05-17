@@ -218,7 +218,7 @@ _AGENT_CLI_INDICATORS: tuple[str, ...] = (
     "enter your task",      # codex ready state
 )
 
-_BASH_PROMPT_RE = re.compile(r"(?:^|\n)[^\n]*?\$\s*$|(?:^|\n)[^\n]*?❯\s*$", re.MULTILINE)
+
 
 
 def _pane_has_bash_prompt(pane_id: str) -> bool:
@@ -1127,12 +1127,6 @@ def create_app(
             return
 
     # ── Headless dispatcher (subprocess-per-task model) ──────────────────────
-    # Maps task_type → role → agent CLI.  discuss is handled separately.
-    _DISPATCH_TYPE_TO_ROLE: dict[str, str] = {
-        "implement": "implementer",
-        "review": "reviewer",
-        "test": "tester",
-    }
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = {
         "implementer": "claude",
         "reviewer": "codex",
@@ -1349,8 +1343,6 @@ def create_app(
         )
         if test_id:
             _try_push_next("tester")
-
-    _MAX_RETRIES = 2  # Maximum retry attempts per task
 
     def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> None:
         """Auto-retry a failed task if it hasn't exceeded max retries.
@@ -1582,7 +1574,7 @@ def create_app(
                     try:
                         from agent_crew.github import post_review_comment
                         _reviewer_agent = next(
-                            (k for k, v in (pane_map or {}).items() if k in ("claude", "codex", "gemini")),
+                            (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
                             "agent",
                         )
                         post_review_comment(
