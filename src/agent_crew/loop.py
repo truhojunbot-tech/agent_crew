@@ -131,10 +131,15 @@ def _resolve_verdict(result: TaskResult) -> str:
     null/[] and the loop ran 4 unnecessary iterations).
 
     Defensive read:
+    - dispatcher failure (timeout/exit_X/no_result) → ``request_changes``
+      (NEVER silently approve a crashed/quota-exhausted review)
     - explicit ``approve`` → ``approve``
     - any value with non-empty findings → ``request_changes``
-    - missing/None verdict + empty findings → treat as ``approve``
+    - missing/None verdict + empty findings on a completed task → ``approve``
     """
+    status = getattr(result, "status", None)
+    if status and status != "completed":
+        return "request_changes"
     if result.verdict == "approve":
         return "approve"
     findings = result.findings or []

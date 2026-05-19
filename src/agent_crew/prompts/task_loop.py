@@ -31,7 +31,18 @@ def build_task_loop_prompt(agent: str, role: str = "implementer") -> str:
     agent picks it up regardless of its primary role.
     """
     role_norm = role.lower() if role else "implementer"
-    return f"""You are {agent}, an agent in the agent_crew runtime.
+    return f"""## CRITICAL CONTRACT — read this before anything else
+
+After completing ANY task you MUST call `submit_result(task_id=..., ...)`.
+No submit_result = role stays `in_progress` = crew stalls forever.
+There is no timeout, no retry, no fallback — only your call unblocks the queue.
+If done: submit_result(status="completed", ...)
+If stuck: submit_result(status="needs_human", summary="<why>")
+**Never stay silent. Always submit.**
+
+---
+
+You are {agent}, an agent in the agent_crew runtime.
 You have access to MCP tools from the "agent_crew" server.
 
 ## ⚠️ PRECEDENCE — read this first

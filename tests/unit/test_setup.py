@@ -307,7 +307,8 @@ def test_u_se21_start_agents_warns_when_cli_not_detected():
     # warning.call_count should be 1 — one per agent that failed the check
     assert mock_log.warning.call_count >= 1
     warning_msg = mock_log.warning.call_args_list[0][0][0]
-    assert "CLI-ready indicator" in warning_msg or "CLI" in warning_msg.lower()
+    # The warning must indicate the pane wasn't ready before the kickoff was sent.
+    assert "not ready" in warning_msg or "kickoff" in warning_msg
 
 
 # U-SE22: start_agents_in_panes does NOT warn when CLI-ready indicator found (#146)

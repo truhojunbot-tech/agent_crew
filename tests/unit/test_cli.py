@@ -1103,3 +1103,417 @@ def test_u_c53_status_lists_queue_in_progress_and_completed_tasks(tmp_path):
     assert "PENDING (1):" in out
     assert "IN_PROGRESS (1):" in out
     assert "COMPLETED (1):" in out
+
+
+# U-C56: dispatcher mode setup creates tail panes but writes empty pane_map to server
+def test_u_c56_dispatcher_setup_creates_panes_with_empty_server_pane_map(tmp_path):
+    """In dispatcher mode:
+    - tmux panes must be created (for tail -f log viewing)
+    - pane_map.json written to disk must be {} so the server never uses push routing
+    - state.json pane_ids must be populated (for crew status display)
+
+    Root cause of bug: pane_map was written with actual pane IDs in dispatcher mode,
+    causing the server to attempt tmux push to tail panes → watchdog timeout loop.
+    """
+    import json
+
+    split_pane_calls = []
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        joined = " ".join(str(a) for a in args)
+        if cmd == "display-message":
+            if "#S:#I" in joined:
+                return MagicMock(returncode=0, stdout="crew:0\n", stderr="")
+            if "#S" in joined:
+                return MagicMock(returncode=0, stdout="crew\n", stderr="")
+        if cmd == "split-window":
+            pane_id = f"%{200 + len(split_pane_calls)}"
+            split_pane_calls.append(pane_id)
+            return MagicMock(returncode=0, stdout=f"{pane_id}\n", stderr="")
+        if cmd == "select-layout":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if cmd in ("list-panes", "list-windows", "send-keys", "touch"):
+            return MagicMock(returncode=0, stdout="0\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 12345
+    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "1"})
+    with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
+         patch("agent_crew.cli._read_state", return_value=None), \
+         patch("agent_crew.cli.setup_module.find_free_port", return_value=19998), \
+         patch("agent_crew.cli.setup_module.write_port_file"), \
+         patch("agent_crew.cli.setup_module.create_worktrees", return_value={
+             "claude": str(tmp_path / "wt_claude"),
+             "codex": str(tmp_path / "wt_codex"),
+             "gemini": str(tmp_path / "wt_gemini"),
+         }), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_sessions_json"), \
+         patch("agent_crew.cli.setup_module.write_mcp_configs"), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes"), \
+         patch("agent_crew.cli._write_state"), \
+         patch("os.getcwd", return_value=str(tmp_path)):
+        result = runner.invoke(crew, ["setup", "dispproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+
+    # Panes must have been created (split-window calls happened).
+    assert len(split_pane_calls) == 3, (
+        f"Expected 3 split-window calls for 3 agents, got {len(split_pane_calls)}"
+    )
+
+    # pane_map.json must be empty — server must NOT route via push in dispatcher mode.
+    pane_map = json.loads((tmp_path / "dispproj" / "pane_map.json").read_text())
+    assert pane_map == {}, (
+        f"pane_map.json must be {{}} in dispatcher mode, got {pane_map!r}. "
+        "Non-empty pane_map causes server to push tasks to tail panes → watchdog loop."
+    )
+
+
+# U-C54: crew discuss auto-detects current git branch when --branch not given
+def test_u_c54_discuss_auto_detects_branch_from_cwd(tmp_path):
+    """When the user is on a feature branch and doesn't pass --branch,
+    crew discuss must detect the branch via git and pass it to the enqueued tasks.
+
+    Root cause of bug: discuss always defaulted branch to 'main', causing the
+    worktree to sync origin/main and miss files that only existed on the feature branch.
+    """
+    import sqlite3
+
+    db_path = str(tmp_path / "tasks.db")
+    runner = CliRunner()
+
+    FEATURE_BRANCH = "agent/claude-cli/1314-risk-budget"
+
+    with patch("agent_crew.cli.subprocess.check_output", return_value=FEATURE_BRANCH.encode()):
+        result = runner.invoke(crew, [
+            "discuss", "Risk budget separation",
+            "--db", db_path,
+            "--agents", "analyst,critic",
+            "--nowait",
+        ])
+
+    assert result.exit_code == 0, result.output
+
+    # Verify the tasks were enqueued with the auto-detected branch, not 'main'.
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT task_type, status, branch FROM tasks").fetchall()
+    conn.close()
+
+    assert len(rows) == 2
+    branches_used = {r["branch"] for r in rows}
+    assert branches_used == {FEATURE_BRANCH}, (
+        f"Expected branch={FEATURE_BRANCH!r} in all tasks, got: {branches_used}"
+    )
+
+
+# U-C55: crew discuss falls back to 'main' when git command fails
+def test_u_c55_discuss_branch_fallback_on_git_error(tmp_path):
+    """When git rev-parse fails (not a git repo or git not installed),
+    crew discuss must silently fall back to 'main' rather than crashing."""
+    import sqlite3
+
+    db_path = str(tmp_path / "tasks.db")
+    runner = CliRunner()
+
+    with patch("agent_crew.cli.subprocess.check_output", side_effect=Exception("not a git repo")):
+        result = runner.invoke(crew, [
+            "discuss", "Risk budget separation",
+            "--db", db_path,
+            "--agents", "analyst,critic",
+            "--nowait",
+        ])
+
+    assert result.exit_code == 0, result.output
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute("SELECT branch FROM tasks").fetchall()
+    conn.close()
+
+    branches_used = {r["branch"] for r in rows}
+    # '' (empty) or 'main' are both acceptable fallbacks — task must still be enqueued.
+    assert len(rows) == 2
+    assert branches_used <= {"", "main"}
+
+
+# U-C57: dispatcher mode setup — split-window fails → pane_ids empty → log viewers silently skipped but setup succeeds
+def test_u_c57_dispatcher_setup_split_window_fail_graceful(tmp_path):
+    """When tmux split-window fails in dispatcher mode (e.g. no tmux session),
+    pane_ids should be empty, start_log_viewers_in_panes must NOT be called,
+    pane_map.json stays {}, and setup exits 0.
+
+    This tests that the 'if pane_ids:' guard prevents a crash when pane creation fails.
+    """
+    import json
+
+    log_viewers_called_with = []
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        joined = " ".join(str(a) for a in args)
+        if cmd == "display-message":
+            if "#S:#I" in joined:
+                return MagicMock(returncode=0, stdout="crew:0\n", stderr="")
+            if "#S" in joined:
+                return MagicMock(returncode=0, stdout="crew\n", stderr="")
+        if cmd == "split-window":
+            # Simulate failure: returncode != 0, empty stdout
+            return MagicMock(returncode=1, stdout="", stderr="no session\n")
+        if cmd == "select-layout":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if cmd in ("list-panes", "list-windows", "send-keys"):
+            return MagicMock(returncode=0, stdout="0\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    def _fake_log_viewers(agents, pane_ids, proj_dir):
+        log_viewers_called_with.append(list(pane_ids))
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 12345
+    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "1"})
+    with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
+         patch("agent_crew.cli._read_state", return_value=None), \
+         patch("agent_crew.cli.setup_module.find_free_port", return_value=19997), \
+         patch("agent_crew.cli.setup_module.write_port_file"), \
+         patch("agent_crew.cli.setup_module.create_worktrees", return_value={
+             "claude": str(tmp_path / "wt_claude"),
+         }), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_sessions_json"), \
+         patch("agent_crew.cli.setup_module.write_mcp_configs"), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes", side_effect=_fake_log_viewers), \
+         patch("agent_crew.cli._write_state"), \
+         patch("os.getcwd", return_value=str(tmp_path)):
+        result = runner.invoke(crew, ["setup", "failproj", "--base", str(tmp_path), "--agents", "claude"])
+
+    assert result.exit_code == 0, result.output
+
+    # Log viewers must NOT be called when pane_ids is empty.
+    assert log_viewers_called_with == [], (
+        f"start_log_viewers_in_panes must not be called with empty pane_ids, "
+        f"was called with: {log_viewers_called_with}"
+    )
+
+    # pane_map.json must be {} — no push routing regardless.
+    pane_map = json.loads((tmp_path / "failproj" / "pane_map.json").read_text())
+    assert pane_map == {}
+
+
+# U-C58: crew recover restores AGENT_CREW_DISPATCHER in server env for dispatcher-mode projects
+def test_u_c58_recover_passes_dispatcher_env_to_server(tmp_path):
+    """When a dispatcher-mode project's server dies and recover restarts it,
+    the new server process must receive AGENT_CREW_DISPATCHER=1 in its env.
+
+    Without this fix the recovered server starts in push mode, tries to write to
+    tmux panes, and immediately errors because pane_map.json is {} (no IDs).
+    """
+    state = {
+        "project": "recproj",
+        "port": 19996,
+        "session": "testsess",
+        "window": "0",
+        "pane_ids": ["%300"],
+        "pane_map": {},
+        "agents": ["claude"],
+        "worktrees": {"claude": str(tmp_path / "wt_claude")},
+        "db": str(tmp_path / "tasks.db"),
+        "server_pid": 99999,
+        "sessions_file": str(tmp_path / "sessions.json"),
+        "dispatcher_mode": True,
+    }
+    (tmp_path / "recproj").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wt_claude").mkdir(parents=True, exist_ok=True)
+
+    popen_envs = []
+
+    def _fake_popen(args, env=None, **_kwargs):
+        popen_envs.append(env or {})
+        m = MagicMock()
+        m.pid = 11111
+        return m
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        if cmd == "has-session":
+            return MagicMock(returncode=0)
+        if cmd == "list-panes":
+            return MagicMock(returncode=0, stdout="%300\n")
+        if cmd == "display-message":
+            return MagicMock(returncode=0, stdout="0\n")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._read_state", return_value=state), \
+         patch("agent_crew.cli._port_listening", side_effect=[False, True]), \
+         patch("agent_crew.cli.subprocess.Popen", side_effect=_fake_popen), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_mcp_configs"), \
+         patch("agent_crew.cli._write_state"), \
+         patch("agent_crew.cli._pane_alive", return_value=True), \
+         patch("os.path.isdir", return_value=True):
+        result = runner.invoke(crew, ["recover", "recproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert popen_envs, "Server must have been (re)started via Popen"
+    server_env = popen_envs[0]
+    assert server_env.get("AGENT_CREW_DISPATCHER") == "1", (
+        f"Recovered dispatcher-mode server must get AGENT_CREW_DISPATCHER=1, "
+        f"got env: {dict(server_env)}"
+    )
+
+
+# U-C59: crew recover (dead session) in dispatcher mode starts log viewers, not interactive agents
+def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path):
+    """When the tmux session is gone and recover recreates panes for a
+    dispatcher-mode project, it must call start_log_viewers_in_panes — not
+    start_agents_in_panes. Interactive CLIs in log-viewer panes would clobber
+    the tail -f display and confuse the coordinator.
+    """
+    state = {
+        "project": "deadproj",
+        "port": 19995,
+        "session": "gone_session",
+        "window": "0",
+        "pane_ids": [],
+        "pane_map": {},
+        "agents": ["claude"],
+        "worktrees": {"claude": str(tmp_path / "wt_claude")},
+        "db": str(tmp_path / "tasks.db"),
+        "server_pid": 99998,
+        "sessions_file": str(tmp_path / "sessions.json"),
+        "dispatcher_mode": True,
+    }
+    (tmp_path / "deadproj").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "wt_claude").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "deadproj" / "pane_map.json").write_text("{}")
+
+    agents_started = []
+    log_viewers_started = []
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        joined = " ".join(str(a) for a in args)
+        if cmd == "has-session":
+            return MagicMock(returncode=1)  # session gone
+        if cmd == "display-message":
+            if "#S:#I" in joined:
+                return MagicMock(returncode=0, stdout="alfred:0\n")
+            return MagicMock(returncode=0, stdout="alfred\n")
+        if cmd == "split-window":
+            return MagicMock(returncode=0, stdout="%400\n", stderr="")
+        if cmd == "select-layout":
+            return MagicMock(returncode=0, stdout="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    runner = CliRunner()
+    with patch("agent_crew.cli._read_state", return_value=state), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.subprocess.Popen"), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_mcp_configs"), \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes",
+               side_effect=lambda *a, **kw: agents_started.append(a)), \
+         patch("agent_crew.cli.setup_module.start_log_viewers_in_panes",
+               side_effect=lambda agents, pids, proj: log_viewers_started.append(pids)), \
+         patch("agent_crew.cli._write_state"), \
+         patch("agent_crew.cli._pane_alive", return_value=False):
+        result = runner.invoke(crew, ["recover", "deadproj", "--base", str(tmp_path)])
+
+    assert result.exit_code == 0, result.output
+    assert agents_started == [], (
+        f"start_agents_in_panes must NOT be called in dispatcher mode, got: {agents_started}"
+    )
+    assert log_viewers_started, "start_log_viewers_in_panes must be called in dispatcher mode"
+
+    # pane_map.json must remain {} after recovery in dispatcher mode.
+    pane_map = json.loads((tmp_path / "deadproj" / "pane_map.json").read_text())
+    assert pane_map == {}, (
+        f"pane_map.json must stay {{}} in dispatcher mode after recover, got: {pane_map!r}"
+    )
+
+
+# U-C60: _AGENT_TO_ROLE fallback — non-standard agents get 'implementer' role
+def test_u_c60_agent_to_role_fallback_for_unknown_agents(tmp_path):
+    """When agents list contains names not in _AGENT_TO_ROLE (e.g. 'analyst', 'critic'),
+    role assignment must fall back to 'implementer' — not crash or assign a wrong role.
+
+    This validates the .get(a, 'implementer') fallback used in setup and recover
+    pane_map building, and that the pane_map is still written correctly.
+    """
+    import json
+
+    split_pane_calls = []
+
+    def _fake_run(args, **_kw):
+        cmd = args[1] if len(args) > 1 else ""
+        joined = " ".join(str(a) for a in args)
+        if cmd == "display-message":
+            if "#S:#I" in joined:
+                return MagicMock(returncode=0, stdout="crew:0\n", stderr="")
+            if "#S" in joined:
+                return MagicMock(returncode=0, stdout="crew\n", stderr="")
+        if cmd == "split-window":
+            pane_id = f"%{500 + len(split_pane_calls)}"
+            split_pane_calls.append(pane_id)
+            return MagicMock(returncode=0, stdout=f"{pane_id}\n", stderr="")
+        if cmd == "select-layout":
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if cmd in ("list-panes", "list-windows", "send-keys"):
+            return MagicMock(returncode=0, stdout="0\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    mock_proc = MagicMock()
+    mock_proc.pid = 12345
+    captured_state = {}
+
+    def _fake_write_state(_base, _project, state_data):
+        captured_state.update(state_data)
+
+    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "0"})
+    with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
+         patch("agent_crew.cli._read_state", return_value=None), \
+         patch("agent_crew.cli.setup_module.find_free_port", return_value=19994), \
+         patch("agent_crew.cli.setup_module.write_port_file"), \
+         patch("agent_crew.cli.setup_module.create_worktrees", return_value={
+             "analyst": str(tmp_path / "wt_analyst"),
+             "critic": str(tmp_path / "wt_critic"),
+         }), \
+         patch("agent_crew.cli.setup_module.write_instruction_files"), \
+         patch("agent_crew.cli.setup_module.write_sessions_json"), \
+         patch("agent_crew.cli.setup_module.write_mcp_configs"), \
+         patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
+         patch("agent_crew.cli.subprocess.Popen", return_value=mock_proc), \
+         patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.cli.setup_module.pretrust_claude_worktree"), \
+         patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
+         patch("agent_crew.cli._write_state", side_effect=_fake_write_state), \
+         patch("os.getcwd", return_value=str(tmp_path)):
+        result = runner.invoke(crew, [
+            "setup", "unknownproj", "--base", str(tmp_path),
+            "--agents", "analyst,critic"
+        ])
+
+    assert result.exit_code == 0, result.output
+
+    pane_map = captured_state.get("pane_map", {})
+    # Both unknown agents must be mapped — role fallback to 'implementer'
+    assert "analyst" in pane_map, f"'analyst' must be in pane_map, got: {pane_map}"
+    assert "critic" in pane_map, f"'critic' must be in pane_map, got: {pane_map}"
+    # Role fallback: 'implementer' must be in the map (first unknown agent maps to it)
+    assert "implementer" in pane_map, (
+        f"'implementer' role key must be in pane_map via fallback, got: {pane_map}"
+    )

@@ -614,23 +614,69 @@ def setup(project: str, agents: str, base: str):
             for role in ("implementer", "reviewer", "tester"):
                 pane_map.setdefault(role, sole_pid)
     else:
-        # Dispatcher mode: no tmux panes — server spawns headless subprocesses.
-        session_name = subprocess.run(
-            ["tmux", "display-message", "-p", "#S"],
-            capture_output=True, text=True,
-        ).stdout.strip()
-        window_index = 0
+        # Dispatcher mode: create panes for log visibility but run tail -f instead
+        # of interactive CLIs. Agents spawn as headless subprocesses per task.
+        session_name, window_index = _resolve_tmux_window(proj_dir)
+        window_target = f"{session_name}:{window_index}"
+        _crew_log(proj_dir, f"dispatcher mode: creating log-viewer panes in {window_target}")
+
         pane_ids = []
+        for agent, wt_path in worktrees.items():
+            result = subprocess.run(
+                ["tmux", "split-window", "-h", "-c", wt_path, "-t", window_target,
+                 "-P", "-F", "#{pane_id}"],
+                capture_output=True, text=True,
+            )
+            pane_id = result.stdout.strip()
+            rc = result.returncode
+            _crew_log(proj_dir, f"split-window agent={agent} rc={rc} pane_id={pane_id!r}")
+            if pane_id:
+                pane_ids.append(pane_id)
+
+        subprocess.run(
+            ["tmux", "select-layout", "-t", window_target, "main-vertical"],
+            capture_output=True, text=True,
+        )
+
         pane_map = {}
-        _crew_log(proj_dir, "dispatcher mode: skipping pane creation")
+        for a, pid in zip(agent_list, pane_ids):
+            role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+            pane_map[role] = pid
+            pane_map[a] = pid
+        if len(agent_list) == 1:
+            sole_pid = pane_ids[0] if pane_ids else ""
+            for role in ("implementer", "reviewer", "tester"):
+                pane_map.setdefault(role, sole_pid)
 
     pane_map_file = os.path.join(proj_dir, "pane_map.json")
+    # In dispatcher mode the server spawns subprocesses — pane_map must be
+    # empty so the push path is never used. Pane IDs are kept in state.json
+    # only for `crew status` display.
+    server_pane_map = {} if _dispatcher_mode else pane_map
     with open(pane_map_file, "w") as f:
-        json.dump(pane_map, f)
-    _crew_log(proj_dir, f"pane_map written: {pane_map}")
+        json.dump(server_pane_map, f)
+    _crew_log(proj_dir, f"pane_map written: {server_pane_map}")
+
+    # Write state.json BEFORE starting the server so the server reads correct
+    # worktrees from state.json on startup. server_pid is backfilled below.
+    db_file = os.path.join(proj_dir, "tasks.db")
+    _write_state(base, project, {
+        "project": project,
+        "port": port,
+        "port_file": port_file,
+        "session": session_name,
+        "window": window_index,
+        "pane_ids": pane_ids,
+        "pane_map": pane_map,
+        "agents": agent_list,
+        "worktrees": worktrees,
+        "db": db_file,
+        "server_pid": 0,
+        "sessions_file": sessions_file,
+        "dispatcher_mode": _dispatcher_mode,
+    })
 
     # Start server — skip if reusing existing server (pane-only recreation path).
-    db_file = os.path.join(proj_dir, "tasks.db")
     if not _reuse_server:
         state_file = _state_path(base, project)
         pythonpath = os.pathsep.join(p for p in sys.path if p)
@@ -721,20 +767,10 @@ def setup(project: str, agents: str, base: str):
         click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
         _crew_log(proj_dir, "dispatcher mode: log viewers started")
 
-    _write_state(base, project, {
-        "project": project,
-        "port": port,
-        "port_file": port_file,
-        "session": session_name,
-        "window": window_index,
-        "pane_ids": pane_ids,
-        "pane_map": pane_map,
-        "agents": agent_list,
-        "worktrees": worktrees,
-        "db": db_file,
-        "server_pid": server_pid,
-        "sessions_file": sessions_file,
-    })
+    # Backfill server_pid now that Popen has run.
+    final_state = _read_state(base, project) or {}
+    final_state["server_pid"] = server_pid
+    _write_state(base, project, final_state)
 
     click.echo(f"Setup complete: {project} on port {port}")
     click.echo("Tip: use --agents <name> to spawn only specific agents (e.g. --agents claude)")
@@ -822,6 +858,7 @@ def status(project: str, base: str, preview: int):
             if not tasks:
                 continue
             click.echo(f"\n{display_status.upper()} ({len(tasks)}):")
+            _now = time.time()
             for t in tasks:
                 def _get(key, default=None):
                     if isinstance(t, dict):
@@ -832,10 +869,22 @@ def status(project: str, base: str, preview: int):
                 prio = _get("priority")
                 desc = str(_get("description") or "")[:50]
                 ctx = _get("context") or {}
-                agent = ""
-                if isinstance(ctx, dict) and ctx.get("agent"):
-                    agent = f" @{ctx['agent']}"
-                click.echo(f"  [{tid}] p{prio} {ttype}{agent} — {desc}")
+                branch = _get("branch") or ""
+                created_at = _get("created_at")
+                agent_tag = ""
+                if isinstance(ctx, dict):
+                    agent_tag = f" @{ctx['agent_override']}" if ctx.get("agent_override") else (f" @{ctx['agent']}" if ctx.get("agent") else "")
+                age_tag = ""
+                if created_at:
+                    age_s = int(_now - float(created_at))
+                    if age_s >= 3600:
+                        age_tag = f" [{age_s // 3600}h{(age_s % 3600) // 60}m]"
+                    elif age_s >= 60:
+                        age_tag = f" [{age_s // 60}m{age_s % 60}s]"
+                    else:
+                        age_tag = f" [{age_s}s]"
+                branch_tag = f" ({branch})" if branch else ""
+                click.echo(f"  [{tid}] p{prio} {ttype}{agent_tag}{age_tag}{branch_tag} — {desc}")
                 # Preview result summary/verdict for completed tasks so you can
                 # peek at discuss outputs without re-running the whole panel.
                 if display_status == "completed" and preview > 0 and tid != "?":
@@ -1005,6 +1054,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
     db_file = state["db"]
     proj_dir = _proj_dir(base, project)
     port_file = os.path.join(proj_dir, "port")
+    _dispatcher_mode = state.get("dispatcher_mode", False)
     recovered = []
 
     # Validate pane_ids match actual tmux state
@@ -1035,6 +1085,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
+            **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         log_path = os.path.join(proj_dir, "server.log")
         log_file = open(log_path, "a")
@@ -1081,16 +1132,28 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
             capture_output=True,
         )
         if pane_ids:
-            setup_module.start_agents_in_panes(
-                cur_session,
-                state.get("agents", []),
-                pane_targets=pane_ids,
-                worktrees=worktrees,
-            )
+            if _dispatcher_mode:
+                setup_module.start_log_viewers_in_panes(
+                    state.get("agents", []), pane_ids, proj_dir
+                )
+            else:
+                setup_module.start_agents_in_panes(
+                    cur_session,
+                    state.get("agents", []),
+                    pane_targets=pane_ids,
+                    worktrees=worktrees,
+                )
             state["session"] = cur_session
             state["window"] = cur_window or "0"
             state["pane_ids"] = pane_ids
             _write_state(base, project, state)
+            if _dispatcher_mode:
+                pane_map_file = os.path.join(proj_dir, "pane_map.json")
+                try:
+                    with open(pane_map_file, "w") as f:
+                        json.dump({}, f)
+                except OSError:
+                    pass
         recovered.append("tmux")
     else:
         # Session exists — validate window before touching tmux to avoid killing wrong panes
@@ -1155,10 +1218,15 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
                     ["tmux", "select-layout", "-t", window_target, "main-vertical"],
                     capture_output=True,
                 )
-                setup_module.start_agents_in_panes(
-                    session_name, dead_agents,
-                    pane_targets=dead_targets, worktrees=worktrees,
-                )
+                if _dispatcher_mode:
+                    setup_module.start_log_viewers_in_panes(
+                        dead_agents, dead_targets, proj_dir
+                    )
+                else:
+                    setup_module.start_agents_in_panes(
+                        session_name, dead_agents,
+                        pane_targets=dead_targets, worktrees=worktrees,
+                    )
                 pane_map = state.get("pane_map", {})
                 for a, pid in zip(agent_list, new_pane_ids):
                     role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
@@ -1174,9 +1242,10 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
                 state["pane_map"] = pane_map
                 _write_state(base, project, state)
                 pane_map_file = os.path.join(proj_dir, "pane_map.json")
+                server_pane_map = {} if _dispatcher_mode else pane_map
                 try:
                     with open(pane_map_file, "w") as f:
-                        json.dump(pane_map, f)
+                        json.dump(server_pane_map, f)
                 except OSError:
                     pass
                 recovered.append(f"panes({len(dead_agents)})")
@@ -1889,6 +1958,21 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     else:
         perspective_pool = DEFAULT_PERSPECTIVES
 
+    # Auto-detect branch from CWD when the user didn't specify one explicitly.
+    # This prevents discuss tasks from always syncing to origin/main when the
+    # relevant files live on a feature branch that's checked out in the caller's
+    # working directory.
+    if branch == "main":
+        try:
+            _detected = subprocess.check_output(
+                ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+                stderr=subprocess.DEVNULL,
+            ).decode().strip()
+            if _detected and _detected not in ("", "HEAD", "main"):
+                branch = _detected
+        except Exception:
+            pass
+
     queue = TaskQueue(db)
     perspectives_map = assign_perspectives(agent_list, perspectives=perspective_pool)
 
@@ -1944,6 +2028,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
+            branch=branch,
         )
         click.echo(f"Discussion queued ({len(task_ids)} tasks). Track via `crew status`:")
         for agent, tid in zip(agent_list, task_ids):
@@ -1983,6 +2068,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
+            branch=branch,
         )
         results_map, missing, idle_status = _wait_all(task_ids)
 

@@ -158,9 +158,29 @@ def start_agents_in_panes(
             f"When a task arrives, branch on task_type, do the work, "
             f"then call submit_result. Loop indefinitely."
         )
-        _send_literal_text(target, kickoff)
+        # Use load-buffer + paste-buffer for reliable delivery of long text.
+        # tmux send-keys -l can silently drop characters when the pane is
+        # processing startup output at the same time.
+        r_load = subprocess.run(
+            ["tmux", "load-buffer", "-"],
+            input=kickoff,
+            text=True,
+            capture_output=True,
+        )
+        if r_load.returncode != 0:
+            _logger.warning(
+                "start_agents_in_panes: load-buffer failed for %s (%s): %s",
+                target, agent, r_load.stderr,
+            )
+            _send_literal_text(target, kickoff)
+        else:
+            subprocess.run(
+                ["tmux", "paste-buffer", "-p", "-d", "-t", target],
+                capture_output=True,
+            )
+        time.sleep(0.5)
         _send_enter(target)
-        time.sleep(0.3)
+        time.sleep(0.5)
 
 
 def start_log_viewers_in_panes(
@@ -386,6 +406,14 @@ def _write_postcompact_hook_claude(
     )
 
     settings = {
+        # Disable Telegram/Discord plugins for worktree subagents: these headless
+        # claude -p processes must not start bun servers that steal the coordinator
+        # session's bot connection. The worktree .telegram dir has a disabled token
+        # as a second layer, but disabling the plugin here is the primary guard.
+        "enabledPlugins": {
+            "telegram@claude-plugins-official": False,
+            "discord@claude-plugins-official": False,
+        },
         "hooks": {
             "PostCompact": [
                 {

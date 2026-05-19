@@ -9,6 +9,7 @@ DEFAULT_PERSPECTIVES: list[str] = ["analyst", "critic", "advocate", "risk"]
 def enqueue_panel_tasks(
     queue, agents: list[str], topic: str, context: dict, port: int = 0,
     perspectives: dict[str, str] | None = None,
+    branch: str = "",
 ) -> list[str]:
     """Enqueue one discuss task per agent.
 
@@ -19,6 +20,7 @@ def enqueue_panel_tasks(
         this from context to frame its opinion (see instructions.py).
     Callers should pass a pre-computed `perspectives` dict from
     `assign_perspectives(agents)` so both sides of the equation agree.
+    Pass `branch` so the server worktree syncs the right branch before dispatching.
     """
     perspective_map = perspectives or assign_perspectives(agents)
     task_ids = []
@@ -28,6 +30,7 @@ def enqueue_panel_tasks(
             task_id=f"{agent}-{uuid.uuid4().hex[:8]}",
             task_type="discuss",
             description=f"Discuss: {topic}",
+            branch=branch,
             context=ctx,
         )
         task_id = _post_task_http(port, req) if port else queue.enqueue(req)

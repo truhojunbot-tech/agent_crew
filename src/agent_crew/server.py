@@ -1291,8 +1291,17 @@ def create_app(
                     f"{'='*60}\n"
                 )
             with open(log_path, "ab") as log_f:
+                # Override TELEGRAM_STATE_DIR to worktree's .telegram so the
+                # subagent doesn't inherit the crew server's state dir and steal
+                # the coordinator bot's Telegram connection.
+                # Strip PYTHONPATH/PYTHONHOME so codex/gemini python wrappers
+                # don't load the server's 3.10 stdlib under a 3.12 interpreter
+                # (causes "SRE module mismatch" crash on subprocess startup).
+                _dispatch_env = {**os.environ, "TELEGRAM_STATE_DIR": os.path.join(wt, ".telegram")}
+                _dispatch_env.pop("PYTHONPATH", None)
+                _dispatch_env.pop("PYTHONHOME", None)
                 proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=log_f, stderr=log_f, cwd=wt,
+                    *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                 )
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout_secs)
