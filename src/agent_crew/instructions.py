@@ -306,6 +306,37 @@ Before you POST the result, verify:
 - [ ] `pr_number` set if you opened a PR; otherwise `null`
 - [ ] `status` is `completed` (or `failed`/`needs_human` with honest reason)
 - [ ] `verdict: null`, `findings: []` (implementers don't fill these)
+
+### ⛔ Delegating review / test to the next role — DO NOT use `crew run`
+
+When you need the reviewer (codex) or tester (gemini) to take over after your
+implementation, **do not** call `crew run "Review PR ..."`. `crew run` is a
+top-level loop client and forces `task_type=implement` regardless of the
+prompt — the review pane only picks tasks with `task_type=review`, so your
+task sits unrouted and the reviewer goes idle.
+
+**Correct pattern**: POST directly to the server with the explicit task_type:
+
+```bash
+TASK_ID="review-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
+curl -sS -X POST http://127.0.0.1:<port>/tasks \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "task_id": "'"$TASK_ID"'",
+    "task_type": "review",          // or "test" for tester
+    "description": "Review PR #<n> — <one-line context>",
+    "branch": "<PR head branch>",
+    "priority": 3,
+    "project": "<your project name>",
+    "context": {"pr_number": <n>}
+  }'
+```
+
+- For tester delegation use `"task_type": "test"` and `"task_id": "test-..."`.
+- `pr_number` in context lets the dispatcher checkout the PR head branch
+  on the reviewer/tester worktree automatically (see #186).
+- After delegation, your implement task is done — POST your result and
+  return to polling. The next role will handle the rest of the loop.
 """,
     "reviewer": """\
 ## Role: reviewer
@@ -354,6 +385,29 @@ Before you POST the result, verify:
 - [ ] `findings` lists concrete, actionable items when verdict is
   `request_changes`; may be empty on `approve`
 - [ ] `summary` names the PR reviewed and the headline judgement
+
+### ⛔ Delegating test to the next role — DO NOT use `crew run`
+
+After you `approve`, if the loop needs the tester (gemini) to verify the PR
+on a clean checkout, **do not** call `crew run "Test PR ..."`. `crew run`
+forces `task_type=implement` and the tester pane only picks `task_type=test`.
+
+POST directly with the explicit type:
+
+```bash
+TASK_ID="test-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
+curl -sS -X POST http://127.0.0.1:<port>/tasks \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "task_id": "'"$TASK_ID"'",
+    "task_type": "test",
+    "description": "Test PR #<n> — verify <branch> passes the suite",
+    "branch": "<PR head branch>",
+    "priority": 3,
+    "project": "<your project name>",
+    "context": {"pr_number": <n>}
+  }'
+```
 """,
     "tester": """\
 ## Role: tester

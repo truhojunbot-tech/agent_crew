@@ -14,6 +14,7 @@ from typing import Callable, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
+from agent_crew import instructions
 from agent_crew.anomaly import check_wrong_repo
 from agent_crew.fallback import is_rate_limit_error
 from agent_crew.loop import _resolve_verdict
@@ -197,12 +198,17 @@ def _prepare_worktree_for_task_inner(
             )
 
 
+_DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}
+_DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
+
+
 def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
     """Derive {role: worktree_path} from state.json.
 
-    state.json stores worktrees as {agent_name: path}. We convert agent names
-    to roles (implementer/reviewer/tester) so the server can look up the
-    right worktree for a given role without importing setup.py at runtime.
+    Prefers the explicit ``roles`` list (new schema, supports same agent on
+    multiple roles like claude implementer + claude reviewer). Falls back to
+    the legacy ``worktrees: {agent: path}`` map with hardcoded role mapping
+    when ``roles`` is absent.
     """
     if not state_path or not os.path.exists(state_path):
         logger.warning(f"_load_worktree_map: state_path={state_path!r} missing → worktree_map={{}}")
@@ -210,18 +216,51 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
     try:
         with open(state_path) as f:
             state = json.load(f)
+        # New schema: explicit roles list with per-role worktree.
+        roles_list = state.get("roles")
+        if roles_list:
+            result = {
+                r["role"]: r["worktree"]
+                for r in roles_list
+                if r.get("role") and r.get("worktree")
+            }
+            logger.info(f"_load_worktree_map: state_path={state_path!r} (roles) → worktree_map={result}")
+            return result
+        # Legacy schema: agent-keyed worktrees + default role mapping.
         worktrees = state.get("worktrees", {})
-        _AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}
-        result: dict[str, str] = {}
+        result = {}
         for agent, path in worktrees.items():
-            role = _AGENT_TO_ROLE.get(agent)
+            role = _DEFAULT_AGENT_TO_ROLE.get(agent)
             if role and path:
                 result[role] = path
-        logger.info(f"_load_worktree_map: state_path={state_path!r} → worktree_map={result}")
+        logger.info(f"_load_worktree_map: state_path={state_path!r} (legacy) → worktree_map={result}")
         return result
     except Exception:
         logger.exception("_load_worktree_map: failed to read state.json")
         return {}
+
+
+def _load_role_to_agent(state_path: Optional[str]) -> dict[str, str]:
+    """Load {role: agent_name} mapping from state.json's roles list.
+
+    Falls back to the hardcoded default when state.json lacks a roles list
+    (legacy setups). Always returns all 3 roles populated — missing roles
+    default to the legacy assignment.
+    """
+    result = dict(_DEFAULT_ROLE_TO_AGENT)
+    if not state_path or not os.path.exists(state_path):
+        return result
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+        for r in state.get("roles") or []:
+            role = r.get("role")
+            agent = r.get("agent")
+            if role and agent:
+                result[role] = agent
+    except Exception:
+        logger.exception("_load_role_to_agent: failed to read state.json")
+    return result
 
 
 _THINKING_TAIL_LINES = 10
@@ -1174,11 +1213,10 @@ def create_app(
             return
 
     # ── Headless dispatcher (subprocess-per-task model) ──────────────────────
-    _DISPATCH_ROLE_TO_AGENT: dict[str, str] = {
-        "implementer": "claude",
-        "reviewer": "codex",
-        "tester": "gemini",
-    }
+    # Built from state.json's "roles" field when present; falls back to the
+    # hardcoded default (claude/codex/gemini). This is what lets the same
+    # agent serve multiple roles (e.g. claude implementer + claude reviewer).
+    _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
 
     def _fail_if_active(task_id: str, reason: str) -> None:
         """Fail a task only when it is still in_progress (agent may have submitted first)."""
@@ -1196,8 +1234,32 @@ def create_app(
     async def _dispatch_task(task: TaskRequest, role: str) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
         agent = _DISPATCH_ROLE_TO_AGENT.get(role, "claude")
-        logger.debug(f"dispatcher: _dispatch_task enter role={role!r} worktree_map_keys={list(worktree_map.keys())} task={task.task_id}")
-        wt = worktree_map.get(role)
+        wt_override: Optional[str] = None
+        # Honor agent_override in task.context — e.g. `crew run --reviewer gemini`
+        # (#188). Without this the CLI flag has no effect and review always
+        # routes to the role's default agent (codex), making it a SPOF.
+        _ctx = task.context if isinstance(task.context, dict) else {}
+        _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
+        if _override and _override != agent:
+            for _r, _a in _DISPATCH_ROLE_TO_AGENT.items():
+                if _a == _override:
+                    _wt_candidate = worktree_map.get(_r)
+                    if _wt_candidate:
+                        wt_override = _wt_candidate
+                        break
+            if wt_override:
+                logger.info(
+                    f"dispatcher: agent_override {_override} → wt={wt_override} "
+                    f"(task={task.task_id}, role={role})"
+                )
+                agent = _override
+            else:
+                logger.warning(
+                    f"dispatcher: agent_override={_override!r} has no worktree; "
+                    f"falling back to role default agent={agent}"
+                )
+        logger.debug(f"dispatcher: _dispatch_task enter role={role!r} worktree_map_keys={list(worktree_map.keys())} task={task.task_id} agent={agent}")
+        wt = wt_override or worktree_map.get(role)
         if not wt:
             logger.error(f"dispatcher: no worktree for role={role!r} worktree_map={worktree_map!r} task={task.task_id}")
             _fail_if_active(task.task_id, "no_worktree")
@@ -1319,12 +1381,52 @@ def create_app(
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
             # Reset worktree after task (success or failure) so it's clean for the next task.
+            # The cleanup wipes agent_crew's per-role protocol files (.claude/CLAUDE.md
+            # is untracked → `git clean -fd` removes it; AGENTS.md / GEMINI.md are often
+            # tracked → `git checkout .` reverts the agent_crew block back to the
+            # project's committed version). Both paths break the implementer's review
+            # delegation flow (issue #187). After the reset we re-write all role
+            # protocol files so the next dispatch finds them intact.
             try:
-                subprocess.run(["git", "-C", wt, "checkout", "."], capture_output=True)
-                subprocess.run(["git", "-C", wt, "clean", "-fd"], capture_output=True)
+                subprocess.run(
+                    ["git", "-C", wt, "checkout", "."],
+                    capture_output=True,
+                )
+                subprocess.run(
+                    [
+                        "git", "-C", wt, "clean", "-fd",
+                        "-e", ".claude/CLAUDE.md",
+                        "-e", "AGENTS.md",
+                        "-e", "GEMINI.md",
+                    ],
+                    capture_output=True,
+                )
                 logger.debug(f"dispatcher: worktree reset after task={task.task_id} role={role}")
             except Exception:
                 logger.exception(f"dispatcher: worktree reset failed for {role} task={task.task_id}")
+            # Re-apply agent_crew protocol files for every role we host. Idempotent —
+            # implementer's .claude/CLAUDE.md is overwritten; AGENTS.md/GEMINI.md get
+            # the marker block re-merged onto the project's content.
+            try:
+                _port_file = os.path.join(os.path.dirname(db_path), "port")
+                if os.path.exists(_port_file):
+                    _proj = (
+                        task.project
+                        or os.path.basename(os.path.dirname(db_path))
+                        or "project"
+                    )
+                    for _r, _wt in worktree_map.items():
+                        if not _wt:
+                            continue
+                        _agent = _DISPATCH_ROLE_TO_AGENT.get(_r, "")
+                        instructions.write(
+                            _r, _wt, _proj, _port_file,
+                            agent=_agent, delivery="dispatcher",
+                        )
+            except Exception:
+                logger.exception(
+                    f"dispatcher: protocol re-write failed after task={task.task_id} role={role}"
+                )
 
     async def _dispatcher_loop() -> None:
         """Poll DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn headless
@@ -1335,8 +1437,16 @@ def create_app(
         active_tasks: dict[str, asyncio.Task] = {}  # task_id → asyncio.Task
         task_roles: dict[str, str] = {}  # task_id → role
 
-        # Inverse of _DISPATCH_ROLE_TO_AGENT: agent → role (for worktree lookup)
-        _AGENT_TO_ROLE: dict[str, str] = {v: k for k, v in _DISPATCH_ROLE_TO_AGENT.items()}
+        # Inverse of _DISPATCH_ROLE_TO_AGENT: agent → role (for worktree lookup).
+        # When the same agent maps to multiple roles (e.g. claude on both
+        # implementer and reviewer), prefer implementer for discuss dispatch
+        # since discuss tasks are exploratory rather than review-specific.
+        _AGENT_TO_ROLE: dict[str, str] = {}
+        _ROLE_PRIORITY = {"implementer": 0, "reviewer": 1, "tester": 2}
+        for _role, _agent in _DISPATCH_ROLE_TO_AGENT.items():
+            current = _AGENT_TO_ROLE.get(_agent)
+            if current is None or _ROLE_PRIORITY.get(_role, 99) < _ROLE_PRIORITY.get(current, 99):
+                _AGENT_TO_ROLE[_agent] = _role
 
         interval = float(os.getenv("AGENT_CREW_DISPATCH_INTERVAL", "2"))
         try:

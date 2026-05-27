@@ -508,11 +508,34 @@ def setup(project: str, agents: str, base: str):
                 raise click.ClickException("Aborted.")
 
     agent_list = [a.strip() for a in agents.split(",") if a.strip()]
-    _crew_log(proj_dir, f"setup START agents={agent_list} reuse_server={_reuse_server}")
+    # role_based mode is triggered by duplicate agent names (e.g.
+    # ``--agents claude,claude,gemini``). Positions map 1:1 to roles
+    # (implementer/reviewer/tester), so the same agent can hold multiple roles
+    # with distinct worktrees instead of colliding on a single per-agent dir.
+    _role_based = len(set(agent_list)) != len(agent_list) and len(agent_list) >= 2
+    _crew_log(proj_dir, f"setup START agents={agent_list} role_based={_role_based} reuse_server={_reuse_server}")
 
     # Worktrees
-    worktrees = setup_module.create_worktrees(project, base, agent_list)
+    worktrees = setup_module.create_worktrees(
+        project, base, agent_list, role_based=_role_based
+    )
     _crew_log(proj_dir, f"worktrees created: {list(worktrees.values())}")
+
+    # Build authoritative role list. In role_based mode positions map to
+    # roles; in legacy mode roles come from the default agent→role table.
+    _ROLES = ("implementer", "reviewer", "tester")
+    roles_meta: list[dict] = []
+    if _role_based:
+        for i, _a in enumerate(agent_list):
+            if i >= len(_ROLES):
+                break
+            _r = _ROLES[i]
+            roles_meta.append({"role": _r, "agent": _a, "worktree": worktrees[_r]})
+    else:
+        for _a in agent_list:
+            _r = setup_module._AGENT_TO_ROLE.get(_a, "implementer")
+            if _a in worktrees:
+                roles_meta.append({"role": _r, "agent": _a, "worktree": worktrees[_a]})
 
     # Port + port file — reuse existing when server is already running
     port_file = os.path.join(proj_dir, "port")
@@ -524,17 +547,19 @@ def setup(project: str, agents: str, base: str):
         setup_module.write_port_file(port_file, port)
 
     # Instruction files (into each worktree)
-    setup_module.write_instruction_files(worktrees, project, port_file)
+    setup_module.write_instruction_files(worktrees, project, port_file, roles=roles_meta)
 
     # MCP config (Issue #106) — register agent_crew MCP server in each
     # worktree so agents pull tasks via MCP instead of receiving via tmux.
     db_file = os.path.join(proj_dir, "tasks.db")
-    setup_module.write_mcp_configs(worktrees, db_file)
+    setup_module.write_mcp_configs(worktrees, db_file, roles=roles_meta)
 
     # sessions.json
     sessions_file = os.path.join(proj_dir, "sessions.json")
     agent_dicts = [{"name": a, "pane": i} for i, a in enumerate(agent_list)]
-    setup_module.write_sessions_json(sessions_file, agent_dicts, worktrees=worktrees)
+    setup_module.write_sessions_json(
+        sessions_file, agent_dicts, worktrees=worktrees, roles=roles_meta
+    )
 
     _dispatcher_mode = os.getenv("AGENT_CREW_DISPATCHER", "1").lower() not in ("0", "false", "no")
 
@@ -605,10 +630,16 @@ def setup(project: str, agents: str, base: str):
 
         # Write pane_map.json — server reads this at startup for push routing.
         pane_map: dict[str, str] = {}
-        for a, pid in zip(agent_list, pane_ids):
-            role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
-            pane_map[role] = pid
-            pane_map[a] = pid
+        if _role_based:
+            for i, (a, pid) in enumerate(zip(agent_list, pane_ids)):
+                role = _ROLES[i] if i < len(_ROLES) else "implementer"
+                pane_map[role] = pid
+                pane_map[a] = pid
+        else:
+            for a, pid in zip(agent_list, pane_ids):
+                role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+                pane_map[role] = pid
+                pane_map[a] = pid
         if len(agent_list) == 1:
             sole_pid = pane_ids[0]
             for role in ("implementer", "reviewer", "tester"):
@@ -639,10 +670,16 @@ def setup(project: str, agents: str, base: str):
         )
 
         pane_map = {}
-        for a, pid in zip(agent_list, pane_ids):
-            role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
-            pane_map[role] = pid
-            pane_map[a] = pid
+        if _role_based:
+            for i, (a, pid) in enumerate(zip(agent_list, pane_ids)):
+                role = _ROLES[i] if i < len(_ROLES) else "implementer"
+                pane_map[role] = pid
+                pane_map[a] = pid
+        else:
+            for a, pid in zip(agent_list, pane_ids):
+                role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
+                pane_map[role] = pid
+                pane_map[a] = pid
         if len(agent_list) == 1:
             sole_pid = pane_ids[0] if pane_ids else ""
             for role in ("implementer", "reviewer", "tester"):
@@ -670,6 +707,8 @@ def setup(project: str, agents: str, base: str):
         "pane_map": pane_map,
         "agents": agent_list,
         "worktrees": worktrees,
+        "roles": roles_meta,
+        "role_based": _role_based,
         "db": db_file,
         "server_pid": 0,
         "sessions_file": sessions_file,
@@ -762,7 +801,9 @@ def setup(project: str, agents: str, base: str):
         _crew_log(proj_dir, f"agents started pane_ids={pane_ids}")
     else:
         if pane_ids:
-            setup_module.start_log_viewers_in_panes(agent_list, pane_ids, proj_dir)
+            setup_module.start_log_viewers_in_panes(
+                agent_list, pane_ids, proj_dir, role_based=_role_based
+            )
             _crew_log(proj_dir, f"log viewers started pane_ids={pane_ids}")
         click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
         _crew_log(proj_dir, "dispatcher mode: log viewers started")
@@ -1134,7 +1175,8 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         if pane_ids:
             if _dispatcher_mode:
                 setup_module.start_log_viewers_in_panes(
-                    state.get("agents", []), pane_ids, proj_dir
+                    state.get("agents", []), pane_ids, proj_dir,
+                    role_based=bool(state.get("role_based")),
                 )
             else:
                 setup_module.start_agents_in_panes(

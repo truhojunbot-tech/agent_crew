@@ -1273,7 +1273,7 @@ def test_u_c57_dispatcher_setup_split_window_fail_graceful(tmp_path):
             return MagicMock(returncode=0, stdout="0\n", stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
 
-    def _fake_log_viewers(agents, pane_ids, proj_dir):
+    def _fake_log_viewers(agents, pane_ids, proj_dir, **kw):
         log_viewers_called_with.append(list(pane_ids))
 
     mock_proc = MagicMock()
@@ -1428,7 +1428,7 @@ def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path
          patch("agent_crew.cli.setup_module.start_agents_in_panes",
                side_effect=lambda *a, **kw: agents_started.append(a)), \
          patch("agent_crew.cli.setup_module.start_log_viewers_in_panes",
-               side_effect=lambda agents, pids, proj: log_viewers_started.append(pids)), \
+               side_effect=lambda agents, pids, proj, **kw: log_viewers_started.append(pids)), \
          patch("agent_crew.cli._write_state"), \
          patch("agent_crew.cli._pane_alive", return_value=False):
         result = runner.invoke(crew, ["recover", "deadproj", "--base", str(tmp_path)])

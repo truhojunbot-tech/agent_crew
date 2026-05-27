@@ -187,15 +187,22 @@ def start_log_viewers_in_panes(
     agents: list[str],
     pane_targets: list[str],
     log_dir: str,
+    role_based: bool = False,
 ) -> None:
     """In dispatcher mode, start `tail -f dispatch_{role}.log` in each pane.
 
     The dispatcher writes agent output to per-role log files; panes tail those
     files so the user can monitor progress without an interactive CLI running.
+
+    When ``role_based`` is True, positions in the ``agents`` list map directly
+    to roles (implementer/reviewer/tester) regardless of duplicate names —
+    pane 0 watches dispatch_implementer.log even if agent[0] == agent[1].
     """
-    role_map = _AGENT_TO_ROLE  # {'claude': 'implementer', 'codex': 'reviewer', 'gemini': 'tester'}
-    for agent, target in zip(agents, pane_targets):
-        role = role_map.get(agent, agent)
+    for i, (agent, target) in enumerate(zip(agents, pane_targets)):
+        if role_based and i < len(ROLES):
+            role = ROLES[i]
+        else:
+            role = _AGENT_TO_ROLE.get(agent, agent)
         log_path = os.path.join(log_dir, f"dispatch_{role}.log")
         # Ensure the file exists before tail starts.
         subprocess.run(["touch", log_path], capture_output=True)
@@ -207,8 +214,11 @@ def start_log_viewers_in_panes(
         _logger.info("start_log_viewers_in_panes: %s watching %s", target, log_path)
 
 
-def pretrust_claude_worktree(worktrees: dict[str, str]) -> None:
-    """Pre-accept Claude's workspace-trust dialog for the claude worktree.
+def pretrust_claude_worktree(
+    worktrees: dict[str, str],
+    roles: list[dict] | None = None,
+) -> None:
+    """Pre-accept Claude's workspace-trust dialog for every claude worktree.
 
     `--dangerously-skip-permissions` bypasses tool permissions but not the
     workspace-trust dialog, so setup would otherwise stall on a "Trust this
@@ -216,25 +226,35 @@ def pretrust_claude_worktree(worktrees: dict[str, str]) -> None:
     projects[<abs_path>].hasTrustDialogAccepted — we pre-seed it here so the
     dialog is skipped on first launch. Other Claude sessions may write this
     file concurrently, so we hold an exclusive flock across read-modify-write.
+
+    Walks all (role, agent, worktree) entries so role_based mode with multiple
+    claude worktrees (e.g. claude implementer + claude reviewer) is covered.
     """
-    wt_path = worktrees.get("claude")
-    if not wt_path:
+    claude_wts: list[str] = []
+    for role, agent, wt_path in _iter_role_entries(worktrees, roles):
+        if agent == "claude" and wt_path:
+            claude_wts.append(wt_path)
+    if not claude_wts:
         return
     config = os.path.expanduser("~/.claude.json")
     if not os.path.exists(config):
         return
-    wt_abs = os.path.abspath(wt_path)
     with open(config, "r+") as f:
         fcntl.flock(f.fileno(), fcntl.LOCK_EX)
         try:
             data = json.load(f)
-            proj = data.setdefault("projects", {}).setdefault(wt_abs, {})
-            if proj.get("hasTrustDialogAccepted") is True:
-                return
-            proj["hasTrustDialogAccepted"] = True
-            f.seek(0)
-            f.truncate()
-            json.dump(data, f, indent=2)
+            projects = data.setdefault("projects", {})
+            changed = False
+            for wt_path in claude_wts:
+                wt_abs = os.path.abspath(wt_path)
+                proj = projects.setdefault(wt_abs, {})
+                if proj.get("hasTrustDialogAccepted") is not True:
+                    proj["hasTrustDialogAccepted"] = True
+                    changed = True
+            if changed:
+                f.seek(0)
+                f.truncate()
+                json.dump(data, f, indent=2)
         finally:
             fcntl.flock(f.fileno(), fcntl.LOCK_UN)
 
@@ -277,18 +297,37 @@ def resolve_project_path(project: str) -> str:
     )
 
 
-def create_worktrees(project: str, base: str, agents: list[str], project_path: str | None = None) -> dict[str, str]:
+ROLES = ("implementer", "reviewer", "tester")
+
+
+def create_worktrees(
+    project: str,
+    base: str,
+    agents: list[str],
+    project_path: str | None = None,
+    *,
+    role_based: bool = False,
+) -> dict[str, str]:
     """Create git worktrees for agents.
 
     Args:
         project: project name (e.g., 'agent_crew')
         base: base directory for state (e.g., ~/.agent_crew)
-        agents: list of agent names
+        agents: list of agent names. Order maps to roles when role_based=True
+            (position 0=implementer, 1=reviewer, 2=tester).
         project_path: explicit path to project git repo. If None, auto-detect.
+        role_based: when True, the same agent name may appear multiple times
+            (e.g. ``["claude","claude","gemini"]``) and worktrees are keyed by
+            role (implementer/reviewer/tester) rather than agent name. Each
+            role gets its own filesystem directory so duplicate-agent
+            entries don't collide on shared git state.
 
-    Worktrees are stored at: base/worktrees/project/agent/ (new)
-    For backward compatibility, existing worktrees at base/project/agent/ are reused.
-    State (state.json, tasks.db) at: base/project/
+    Worktrees are stored at:
+      base/worktrees/<project>/<agent>/  (default)
+      base/worktrees/<project>/<role>/   (role_based=True)
+    For backward compatibility, existing worktrees at base/<project>/<agent>/
+    are reused when role_based=False.
+    State (state.json, tasks.db) at: base/<project>/
     """
     if project_path is None:
         project_path = resolve_project_path(project)
@@ -296,47 +335,81 @@ def create_worktrees(project: str, base: str, agents: list[str], project_path: s
     if not validate_git_repo(project_path):
         raise RuntimeError(f"Project path {project_path!r} is not a git repository")
 
-    worktrees = {}
-    for agent in agents:
-        # Check for existing worktree at old location (backward compatibility)
-        old_wt_path = os.path.join(base, project, agent)
-        if os.path.isdir(old_wt_path):
-            # Reuse existing worktree at old location
-            worktrees[agent] = old_wt_path
-            continue
+    worktrees: dict[str, str] = {}
 
-        # Create new worktree at architecture-compliant location
-        wt_path = os.path.join(base, "worktrees", project, agent)
-        branch = f"agent/{project}/{agent}"
-        # Run git worktree add FROM the project repo, not from cwd
-        result = subprocess.run(
-            ["git", "-C", project_path, "worktree", "add", "-B", branch, wt_path],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0 and not os.path.isdir(wt_path):
-            raise RuntimeError(
-                f"Failed to create worktree for {agent}: {result.stderr.strip()}"
+    if role_based:
+        # Map position → role; each role gets its own dir, branch.
+        for i, agent in enumerate(agents):
+            if i >= len(ROLES):
+                _logger.warning(
+                    "create_worktrees: role_based mode ignores agent[%d]=%r (max %d roles)",
+                    i, agent, len(ROLES),
+                )
+                break
+            role = ROLES[i]
+            wt_path = os.path.join(base, "worktrees", project, role)
+            branch = f"agent/{project}/{role}"
+            result = subprocess.run(
+                ["git", "-C", project_path, "worktree", "add", "-B", branch, wt_path],
+                capture_output=True, text=True,
             )
-        worktrees[agent] = wt_path
+            if result.returncode != 0 and not os.path.isdir(wt_path):
+                raise RuntimeError(
+                    f"Failed to create worktree for role={role} agent={agent}: "
+                    f"{result.stderr.strip()}"
+                )
+            worktrees[role] = wt_path
+    else:
+        for agent in agents:
+            # Check for existing worktree at old location (backward compatibility)
+            old_wt_path = os.path.join(base, project, agent)
+            if os.path.isdir(old_wt_path):
+                # Reuse existing worktree at old location
+                worktrees[agent] = old_wt_path
+                continue
+
+            # Create new worktree at architecture-compliant location
+            wt_path = os.path.join(base, "worktrees", project, agent)
+            branch = f"agent/{project}/{agent}"
+            # Run git worktree add FROM the project repo, not from cwd
+            result = subprocess.run(
+                ["git", "-C", project_path, "worktree", "add", "-B", branch, wt_path],
+                capture_output=True, text=True,
+            )
+            if result.returncode != 0 and not os.path.isdir(wt_path):
+                raise RuntimeError(
+                    f"Failed to create worktree for {agent}: {result.stderr.strip()}"
+                )
+            worktrees[agent] = wt_path
 
     # Create per-worktree .telegram/ state dirs for claude agents (#168).
     # Prevents the Telegram plugin bun (if loaded via --channels or session
     # history) from falling back to ~/.claude/channels/telegram/ and
     # accidentally reading the real trader bot token.
-    for agent, wt_path in worktrees.items():
-        if agent == "claude":
-            try:
-                telegram_dir = os.path.join(wt_path, ".telegram")
-                os.makedirs(telegram_dir, exist_ok=True)
-                env_path = os.path.join(telegram_dir, ".env")
-                if not os.path.exists(env_path):
-                    with open(env_path, "w") as f:
-                        f.write("TELEGRAM_BOT_TOKEN=DISABLED_AGENT_CREW_WORKER\n")
-            except OSError:
-                _logger.warning(
-                    "create_worktrees: could not create .telegram dir for %s at %s",
-                    agent, wt_path,
-                )
+    # In role_based mode, identify claude worktrees by checking which positions
+    # the agents list assigned claude to (positions map 1:1 to ROLES).
+    claude_worktrees: list[str] = []
+    if role_based:
+        for i, agent in enumerate(agents[: len(ROLES)]):
+            if agent == "claude":
+                claude_worktrees.append(worktrees[ROLES[i]])
+    else:
+        if "claude" in worktrees:
+            claude_worktrees.append(worktrees["claude"])
+
+    for wt_path in claude_worktrees:
+        try:
+            telegram_dir = os.path.join(wt_path, ".telegram")
+            os.makedirs(telegram_dir, exist_ok=True)
+            env_path = os.path.join(telegram_dir, ".env")
+            if not os.path.exists(env_path):
+                with open(env_path, "w") as f:
+                    f.write("TELEGRAM_BOT_TOKEN=DISABLED_AGENT_CREW_WORKER\n")
+        except OSError:
+            _logger.warning(
+                "create_worktrees: could not create .telegram dir at %s",
+                wt_path,
+            )
 
     return worktrees
 
@@ -344,11 +417,39 @@ def create_worktrees(project: str, base: str, agents: list[str], project_path: s
 _AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}
 
 
-def write_instruction_files(worktrees: dict, project: str, port_file: str) -> None:
+def _iter_role_entries(
+    worktrees: dict,
+    roles: list[dict] | None = None,
+) -> list[tuple[str, str, str]]:
+    """Normalize (role, agent, worktree_path) entries.
+
+    Prefers an explicit ``roles`` list when provided (new role_based schema).
+    Falls back to deriving roles from worktrees dict keys when the keys look
+    like agent names (legacy schema).
+    """
+    if roles:
+        return [
+            (r["role"], r["agent"], r["worktree"])
+            for r in roles
+            if r.get("role") and r.get("agent") and r.get("worktree")
+        ]
+    out: list[tuple[str, str, str]] = []
+    for key, path in worktrees.items():
+        # Legacy: key is agent name → look up role via default map.
+        role = _AGENT_TO_ROLE.get(key, "implementer")
+        out.append((role, key, path))
+    return out
+
+
+def write_instruction_files(
+    worktrees: dict,
+    project: str,
+    port_file: str,
+    roles: list[dict] | None = None,
+) -> None:
     dispatcher_mode = os.getenv("AGENT_CREW_DISPATCHER", "1").lower() not in ("0", "false", "no")
     delivery = "dispatcher" if dispatcher_mode else None
-    for agent, wt_path in worktrees.items():
-        role = _AGENT_TO_ROLE.get(agent, "implementer")
+    for role, agent, wt_path in _iter_role_entries(worktrees, roles):
         instructions.write(role, wt_path, project, port_file, agent=agent, delivery=delivery)
 
 
@@ -581,10 +682,20 @@ def write_mcp_config(
     return _write_mcp_config_claude(worktree_path, db_path)
 
 
-def write_mcp_configs(worktrees: dict, db_path: str) -> None:
+def write_mcp_configs(
+    worktrees: dict,
+    db_path: str,
+    roles: list[dict] | None = None,
+) -> None:
     """Apply :func:`write_mcp_config` to every agent worktree using the
-    correct per-agent config layout."""
-    for agent, wt_path in worktrees.items():
+    correct per-agent config layout.
+
+    When ``roles`` is provided (new role_based schema), uses each entry's
+    agent name for the per-agent config layout. Otherwise assumes the
+    worktrees dict is keyed by agent name (legacy schema).
+    """
+    for role, agent, wt_path in _iter_role_entries(worktrees, roles):
+        del role  # config layout is agent-specific, role not used
         write_mcp_config(wt_path, db_path, agent=agent)
 
 
@@ -592,6 +703,7 @@ def write_sessions_json(
     path: str,
     agents: list[dict],
     worktrees: dict[str, str] | None = None,
+    roles: list[dict] | None = None,
 ) -> None:
     """Write sessions.json with the full launch command per agent.
 
@@ -599,11 +711,20 @@ def write_sessions_json(
     the stored command includes per-worktree env prefixes (e.g.
     ``TELEGRAM_STATE_DIR``) so session-recovery relaunches don't fall back to
     the real bot token (#168).
+
+    ``roles`` (optional) is the new role_based schema's role list. When given,
+    the i-th ``agents`` entry's worktree is looked up via ``roles[i]`` so
+    duplicate agent names (e.g. claude implementer + claude reviewer) resolve
+    to distinct worktrees by position.
     """
     enriched = []
-    for agent in agents:
+    for i, agent in enumerate(agents):
         name = agent.get("name", "")
-        wt_path = (worktrees or {}).get(name)
+        wt_path: str | None = None
+        if roles and i < len(roles):
+            wt_path = roles[i].get("worktree")
+        if wt_path is None:
+            wt_path = (worktrees or {}).get(name)
         cmd = _get_agent_cmd(name, wt_path)
         enriched.append({**agent, "cmd": cmd, "started_at": time.time(), "failures": 0})
     session.save_sessions(path, enriched)
