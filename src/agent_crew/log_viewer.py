@@ -80,6 +80,12 @@ def _process_line(raw: str) -> Optional[str]:
         # Codex outputs plain text (no --json flag); show as normal agent text.
         return f"{_GREEN}  {raw[:160]}{_RESET}"
 
+    # JSON literals that aren't objects (bare ints, lists, strings) appear when
+    # codex echoes numeric tokens or array fragments on a line by themselves.
+    # Render as plain text instead of crashing the viewer.
+    if not isinstance(ev, dict):
+        return f"{_GREEN}  {_trunc(raw, 160)}{_RESET}"
+
     t = ev.get("type", "")
 
     if t == "assistant":
@@ -158,7 +164,10 @@ def tail_and_format(path: str) -> None:
         while True:
             line = f.readline()
             if line:
-                formatted = _process_line(line)
+                try:
+                    formatted = _process_line(line)
+                except Exception as exc:
+                    formatted = f"{_RED}  [log_viewer parse error: {exc}] {line.strip()[:160]}{_RESET}"
                 if formatted is not None:
                     print(formatted, flush=True)
             else:
