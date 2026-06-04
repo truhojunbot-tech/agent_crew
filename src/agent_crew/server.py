@@ -1386,9 +1386,14 @@ def create_app(
             except ValueError:
                 _cap_mb = 50
             _cap_gemini_session_size(wt, max_mb=_cap_mb)
+            # Pin to a stable model — gemini-cli's default rotates and has
+            # hit MODEL_CAPACITY_EXHAUSTED on preview models. Override with
+            # AGENT_CREW_GEMINI_MODEL if needed.
+            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-2.5-flash")
             cmd = [
                 "gemini", "-p", message,
                 "--resume", "latest", "--yolo",
+                "--model", _gemini_model,
                 "--output-format", "stream-json",
             ]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
