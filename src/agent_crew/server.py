@@ -202,6 +202,55 @@ _DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester"
 _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 
 
+def _cap_gemini_session_size(cwd: str, max_mb: int = 50) -> None:
+    """Archive gemini-cli session files larger than ``max_mb`` for ``cwd``.
+
+    Without this, ``gemini -p --resume latest`` will silently re-load a
+    multi-hundred-MB session jsonl on every dispatch and blow past gemini's
+    1M input-token limit, causing every tester task to fail with
+    `DONE (0 turns)` before the agent ever sees the prompt. Once at the cap
+    the file is moved to ``chats/_archive/`` (reversible) and gemini starts
+    a fresh session on the next launch.
+    """
+    import pathlib
+    try:
+        projects_path = pathlib.Path.home() / ".gemini" / "projects.json"
+        if not projects_path.exists():
+            return
+        with open(projects_path) as f:
+            projects = json.load(f).get("projects", {})
+        cwd_real = os.path.realpath(cwd)
+        project_dir = projects.get(cwd) or projects.get(cwd_real)
+        if not project_dir:
+            return
+        chats_dir = pathlib.Path.home() / ".gemini" / "tmp" / project_dir / "chats"
+        if not chats_dir.is_dir():
+            return
+        archive_dir = chats_dir / "_archive"
+        threshold = max_mb * 1024 * 1024
+        for sess in chats_dir.glob("session-*.jsonl"):
+            try:
+                size = sess.stat().st_size
+            except OSError:
+                continue
+            if size <= threshold:
+                continue
+            try:
+                archive_dir.mkdir(exist_ok=True)
+                sess.rename(archive_dir / sess.name)
+                logger.warning(
+                    f"_cap_gemini_session_size: archived {sess.name} "
+                    f"({size // (1024 * 1024)}MB > {max_mb}MB cap) "
+                    f"from {chats_dir}"
+                )
+            except OSError:
+                logger.exception(
+                    f"_cap_gemini_session_size: failed to archive {sess}"
+                )
+    except Exception:
+        logger.exception("_cap_gemini_session_size: unexpected error")
+
+
 def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
     """Derive {role: worktree_path} from state.json.
 
@@ -1329,6 +1378,14 @@ def create_app(
                 "--verbose", "--output-format", "stream-json",
             ]
         elif agent == "gemini":
+            # Archive bloated session files so --resume latest doesn't blow
+            # past gemini's 1M input-token limit (sessions grow unbounded
+            # across tasks). Threshold tunable via AGENT_CREW_GEMINI_SESSION_MAX_MB.
+            try:
+                _cap_mb = int(os.getenv("AGENT_CREW_GEMINI_SESSION_MAX_MB", "50"))
+            except ValueError:
+                _cap_mb = 50
+            _cap_gemini_session_size(wt, max_mb=_cap_mb)
             cmd = [
                 "gemini", "-p", message,
                 "--resume", "latest", "--yolo",
