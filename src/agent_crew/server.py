@@ -1386,10 +1386,9 @@ def create_app(
             except ValueError:
                 _cap_mb = 50
             _cap_gemini_session_size(wt, max_mb=_cap_mb)
-            # Pin to a stable model — gemini-cli's default rotates and has
-            # hit MODEL_CAPACITY_EXHAUSTED on preview models. Override with
-            # AGENT_CREW_GEMINI_MODEL if needed.
-            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-2.5-flash")
+            # Pin the model explicitly so kickoffs don't get routed to a
+            # rotating default. Override via AGENT_CREW_GEMINI_MODEL.
+            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-3-flash-preview")
             cmd = [
                 "gemini", "-p", message,
                 "--resume", "latest", "--yolo",
