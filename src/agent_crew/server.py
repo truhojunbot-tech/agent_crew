@@ -1431,11 +1431,12 @@ def create_app(
                 _cap_mb = 50
             _cap_gemini_session_size(wt, max_mb=_cap_mb)
             # Pin the model explicitly so kickoffs don't get routed to a
-            # rotating default. gemini-3.5-flash is GA as of May 2026 with
-            # a 1M input window and stable capacity allocation, unlike the
-            # preview-tier gemini-3-flash-preview which has been chronically
-            # MODEL_CAPACITY_EXHAUSTED. Override via AGENT_CREW_GEMINI_MODEL.
-            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-3.5-flash")
+            # rotating default. gemini-3.5-* is announced but returned 404
+            # ModelNotFound on this account/region as of 2026-06-05;
+            # gemini-3-flash-preview has been chronically MODEL_CAPACITY_
+            # EXHAUSTED. gemini-2.5-pro is the stable higher-tier line and
+            # works today. Override via AGENT_CREW_GEMINI_MODEL.
+            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-2.5-pro")
             cmd = [
                 "gemini", "-p", message,
                 "--resume", "latest", "--yolo",
