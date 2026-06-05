@@ -202,6 +202,41 @@ _DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester"
 _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 
 
+def _detect_transient_error_in_log(
+    log_path: str,
+    tail_bytes: int = 16384,
+) -> Optional[str]:
+    """Scan the tail of a dispatch log for upstream transient errors.
+
+    Claude can exit cleanly (rc=0) after emitting a stream-json `result`
+    block with ``is_error=true, api_error_status=429`` when Anthropic's
+    server returns a temporary throttle — explicitly *not* the user's
+    quota limit. Gemini hits ``MODEL_CAPACITY_EXHAUSTED`` 429s on preview
+    models. In either case the right action is to requeue, not to fail
+    the task permanently.
+
+    Returns a short tag identifying the cause, or ``None`` if no
+    transient signature is present.
+    """
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - tail_bytes))
+            tail = f.read().decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    if '"api_error_status":429' in tail:
+        return "claude_429"
+    if "Server is temporarily limiting requests" in tail:
+        return "claude_throttle"
+    if "MODEL_CAPACITY_EXHAUSTED" in tail:
+        return "gemini_capacity"
+    if "RESOURCE_EXHAUSTED" in tail:
+        return "gemini_resource_exhausted"
+    return None
+
+
 def _cap_gemini_session_size(cwd: str, max_mb: int = 50) -> None:
     """Archive gemini-cli session files larger than ``max_mb`` for ``cwd``.
 
@@ -1267,6 +1302,15 @@ def create_app(
     # agent serve multiple roles (e.g. claude implementer + claude reviewer).
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
 
+    # task_id → transient retry count, used to decide whether an upstream
+    # 429 (claude throttle / gemini capacity-exhausted) gets requeued or
+    # finally failed. In-memory; resets on server restart.
+    _transient_retries: dict[str, int] = {}
+    try:
+        _MAX_TRANSIENT_RETRY = int(os.getenv("AGENT_CREW_TRANSIENT_RETRY_MAX", "3"))
+    except ValueError:
+        _MAX_TRANSIENT_RETRY = 3
+
     def _fail_if_active(task_id: str, reason: str) -> None:
         """Fail a task only when it is still in_progress (agent may have submitted first)."""
         tasks = q().list_tasks(status="in_progress")
@@ -1387,8 +1431,10 @@ def create_app(
                 _cap_mb = 50
             _cap_gemini_session_size(wt, max_mb=_cap_mb)
             # Pin the model explicitly so kickoffs don't get routed to a
-            # rotating default. Override via AGENT_CREW_GEMINI_MODEL.
-            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-3-flash-preview")
+            # rotating default. gemini-3-flash-preview has been MODEL_CAPACITY_
+            # EXHAUSTED on Google's side; gemini-2.5-pro is the stable
+            # higher-tier line. Override via AGENT_CREW_GEMINI_MODEL.
+            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-2.5-pro")
             cmd = [
                 "gemini", "-p", message,
                 "--resume", "latest", "--yolo",
@@ -1433,6 +1479,34 @@ def create_app(
                 logger.error(f"dispatcher: timeout {timeout_secs}s task={task.task_id}")
                 _fail_if_active(task.task_id, "dispatcher_timeout")
                 return
+            # Before deciding fail-vs-requeue, look for upstream transient
+            # errors in the dispatch log (claude 429, gemini capacity).
+            # These come back as a clean rc=0 with an `is_error` result, or
+            # rc=1 from gemini-cli after it exhausts its internal retries.
+            _transient = _detect_transient_error_in_log(log_path)
+            if _transient:
+                _n = _transient_retries.get(task.task_id, 0) + 1
+                _transient_retries[task.task_id] = _n
+                if _n <= _MAX_TRANSIENT_RETRY:
+                    try:
+                        q().requeue(task.task_id)
+                        logger.warning(
+                            f"dispatcher: transient {_transient} on "
+                            f"task={task.task_id} — requeued "
+                            f"(attempt {_n}/{_MAX_TRANSIENT_RETRY})"
+                        )
+                        return
+                    except Exception:
+                        logger.exception(
+                            f"dispatcher: requeue failed for task={task.task_id}"
+                        )
+                else:
+                    logger.error(
+                        f"dispatcher: transient {_transient} on "
+                        f"task={task.task_id} — giving up after "
+                        f"{_MAX_TRANSIENT_RETRY} retries"
+                    )
+                    _transient_retries.pop(task.task_id, None)
             if proc.returncode != 0:
                 _fail_if_active(task.task_id, f"exit_{proc.returncode}")
             else:
