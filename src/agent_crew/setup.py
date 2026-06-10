@@ -2,6 +2,7 @@ import fcntl
 import json
 import logging
 import os
+import re
 import socket
 import subprocess
 import time
@@ -11,7 +12,7 @@ _logger = logging.getLogger(__name__)
 from agent_crew import instructions, session
 
 _AGENT_CMDS = {
-    "claude": "claude --dangerously-skip-permissions --continue",
+    "claude": "claude --dangerously-skip-permissions --continue --model claude-opus-4-7",
     "codex": "codex --dangerously-bypass-approvals-and-sandbox",
     # ``--approval-mode yolo`` is the policy-engine flag that fully
     # bypasses every tool prompt (including shell/git which the legacy
@@ -23,7 +24,7 @@ _AGENT_CMDS = {
     # 줄고 테스트 실행/검토 작업 품질엔 영향이 작다.
     "gemini": "gemini --approval-mode yolo --model gemini-2.5-flash",
 }
-_DEFAULT_CMD = "claude --dangerously-skip-permissions --continue"
+_DEFAULT_CMD = "claude --dangerously-skip-permissions --continue --model claude-opus-4-7"
 
 # Substrings expected in pane output after a successful CLI boot.
 # Used by start_agents_in_panes to warn when the CLI doesn't appear to have started.
@@ -411,7 +412,72 @@ def create_worktrees(
                 wt_path,
             )
 
+    # Convert HTTPS GitHub origin → SSH so dispatched agents (gemini in
+    # particular) don't hit "could not read Username" when they run git
+    # operations in their non-interactive shell wrappers (#189). Only acts
+    # when (a) origin is an HTTPS github.com URL, and (b) SSH auth to
+    # github.com actually works on this host — otherwise it's a no-op so
+    # users without SSH keys aren't broken. Honors AGENT_CREW_PREFER_HTTPS=1
+    # as an opt-out.
+    if os.environ.get("AGENT_CREW_PREFER_HTTPS", "").lower() not in ("1", "true", "yes"):
+        _convert_origin_to_ssh_if_safe(project_path)
+
     return worktrees
+
+
+def _convert_origin_to_ssh_if_safe(project_path: str) -> None:
+    """Switch ``project_path``'s ``origin`` from HTTPS GitHub URL to SSH.
+
+    Worktrees share the parent repo's remote config, so a single change to
+    the project repo's origin propagates to every agent worktree. Safe to
+    skip when origin isn't HTTPS github.com, or when SSH auth isn't
+    available — in either case the original URL is preserved.
+    """
+    try:
+        cur = subprocess.run(
+            ["git", "-C", project_path, "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if cur.returncode != 0:
+            return
+        url = cur.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return
+
+    m = re.match(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
+    if not m:
+        return  # Not an HTTPS github URL — leave alone.
+    owner, repo = m.group(1), m.group(2)
+    ssh_url = f"git@github.com:{owner}/{repo}.git"
+
+    # Probe SSH auth before switching — silently skip if SSH won't work.
+    probe = subprocess.run(
+        ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+         "-o", "StrictHostKeyChecking=accept-new", "git@github.com"],
+        capture_output=True, text=True, timeout=15,
+    )
+    # `ssh -T git@github.com` exits 1 on success too — auth is judged by
+    # the welcome line in stderr.
+    if "successfully authenticated" not in (probe.stderr + probe.stdout).lower():
+        _logger.info(
+            "create_worktrees: SSH probe to github.com failed; "
+            "leaving origin as HTTPS (%s)", url,
+        )
+        return
+
+    set_result = subprocess.run(
+        ["git", "-C", project_path, "remote", "set-url", "origin", ssh_url],
+        capture_output=True, text=True, timeout=5,
+    )
+    if set_result.returncode == 0:
+        _logger.info(
+            "create_worktrees: switched origin %s → %s (#189)", url, ssh_url,
+        )
+    else:
+        _logger.warning(
+            "create_worktrees: failed to set ssh origin: %s",
+            set_result.stderr.strip(),
+        )
 
 
 _AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}

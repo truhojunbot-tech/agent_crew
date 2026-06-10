@@ -208,15 +208,15 @@ def _detect_transient_error_in_log(
 ) -> Optional[str]:
     """Scan the tail of a dispatch log for upstream transient errors.
 
-    Claude can exit cleanly (rc=0) after emitting a stream-json `result`
-    block with ``is_error=true, api_error_status=429`` when Anthropic's
-    server returns a temporary throttle — explicitly *not* the user's
-    quota limit. Gemini hits ``MODEL_CAPACITY_EXHAUSTED`` 429s on preview
-    models. In either case the right action is to requeue, not to fail
-    the task permanently.
+    Claude can exit cleanly (rc=0) after writing a JSONL `result` block
+    with ``is_error=true, api_error_status=429`` when Anthropic's server
+    returns a temporary throttle — explicitly *not* the user's quota limit.
+    Gemini hits ``MODEL_CAPACITY_EXHAUSTED`` 429s on preview models. In
+    either case the right action is to requeue, not to fail the task
+    permanently.
 
-    Returns a short tag identifying the cause, or ``None`` if no
-    transient signature is present.
+    Returns a short tag identifying the cause, or ``None`` if no transient
+    signature is present.
     """
     try:
         with open(log_path, "rb") as f:

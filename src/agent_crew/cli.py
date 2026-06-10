@@ -2367,3 +2367,93 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
         if cycles and cycle >= cycles:
             break
         _time.sleep(seconds)
+
+
+@crew.command()
+@click.argument("task_type", type=click.Choice(["implement", "review", "test"]))
+@click.argument("description")
+@click.option("--project", default="", help="Project name (reads DB/port from state)")
+@click.option("--db", default="", help="SQLite DB path (standalone, no project)")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--branch", default="main", show_default=True,
+              help="Git branch the task targets")
+@click.option("--pr", "pr_number", default=0, type=int,
+              help="PR number to attach to context (for review/test tasks)")
+@click.option("--prev-task-id", default="",
+              help="Task id this one depends on (typically the impl task id "
+                   "for review, or the review id for test).")
+@click.option("--priority", default=3, type=int, show_default=True)
+@click.option("--task-id", default="",
+              help="Override task_id (default: <type>-<random8hex>)")
+def enqueue(task_type: str, description: str, project: str, db: str, base: str,
+            branch: str, pr_number: int, prev_task_id: str, priority: int,
+            task_id: str):
+    """Enqueue a single TASK_TYPE task without entering the loop.
+
+    Use this when an agent (e.g. a claude implementer) needs to delegate
+    work to the next role — POST a review or test task directly instead of
+    calling `crew run`, which always coerces task_type=implement and leaves
+    the downstream pane idle (#187).
+
+    Examples:
+
+        crew enqueue review "Review PR #1666" --project alpha_engine \\
+            --branch agent/claude-cli/1665-feature --pr 1666 \\
+            --prev-task-id impl-abcd1234
+
+        crew enqueue test "Verify PR #1666" --project alpha_engine \\
+            --branch agent/claude-cli/1665-feature --prev-task-id review-...
+    """
+    import uuid as _uuid
+    import urllib.request as _urllib_req
+
+    if not db:
+        if not project:
+            raise click.ClickException("--db or --project is required")
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+        port = state.get("port", 0)
+    else:
+        port = 0
+
+    if not task_id:
+        task_id = f"{task_type[:9]}-{_uuid.uuid4().hex[:8]}"
+
+    context: dict = {}
+    if prev_task_id:
+        context["prev_task_id"] = prev_task_id
+    if pr_number:
+        context["pr_number"] = pr_number
+
+    payload = {
+        "task_id": task_id,
+        "task_type": task_type,
+        "description": description,
+        "branch": branch,
+        "priority": priority,
+        "context": context,
+        "project": project,
+    }
+
+    if port:
+        req = _urllib_req.Request(
+            f"http://127.0.0.1:{port}/tasks",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with _urllib_req.urlopen(req, timeout=10) as resp:
+                if resp.status >= 300:
+                    raise click.ClickException(
+                        f"POST /tasks failed: HTTP {resp.status}"
+                    )
+        except Exception as exc:
+            raise click.ClickException(f"POST /tasks failed: {exc}") from exc
+    else:
+        from agent_crew.queue import TaskQueue, TaskRequest
+        TaskQueue(db).enqueue(TaskRequest(**payload))
+
+    click.echo(task_id)
