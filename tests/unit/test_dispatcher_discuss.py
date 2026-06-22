@@ -66,9 +66,11 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path):
     async def fake_subprocess(*args, **kwargs):
         # Determine which agent based on command args
         cmd_args = list(args)
-        if cmd_args and "gemini" in str(cmd_args[0]):
+        cmd0 = str(cmd_args[0]) if cmd_args else ""
+        # gemini role now dispatches via the `agy` binary (Antigravity CLI).
+        if "gemini" in cmd0 or cmd0.endswith("/agy") or cmd0 == "agy":
             dispatched_agents.append("gemini")
-        elif cmd_args and "codex" in str(cmd_args[0]):
+        elif "codex" in cmd0:
             dispatched_agents.append("codex")
         else:
             dispatched_agents.append("claude")

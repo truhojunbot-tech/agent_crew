@@ -1422,26 +1422,23 @@ def create_app(
                 "--verbose", "--output-format", "stream-json",
             ]
         elif agent == "gemini":
-            # Archive bloated session files so --resume latest doesn't blow
-            # past gemini's 1M input-token limit (sessions grow unbounded
-            # across tasks). Threshold tunable via AGENT_CREW_GEMINI_SESSION_MAX_MB.
-            try:
-                _cap_mb = int(os.getenv("AGENT_CREW_GEMINI_SESSION_MAX_MB", "50"))
-            except ValueError:
-                _cap_mb = 50
-            _cap_gemini_session_size(wt, max_mb=_cap_mb)
-            # Pin the model explicitly so kickoffs don't get routed to a
-            # rotating default. gemini-3.5-* is announced but returned 404
-            # ModelNotFound on this account/region as of 2026-06-05;
-            # gemini-3-flash-preview has been chronically MODEL_CAPACITY_
-            # EXHAUSTED. gemini-2.5-pro is the stable higher-tier line and
-            # works today. Override via AGENT_CREW_GEMINI_MODEL.
-            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-2.5-pro")
+            # gemini-cli + oauth-personal stopped serving on 2026-06-18
+            # (IneligibleTierError) and the replacement, Antigravity CLI
+            # (`agy`), now ships a CPU-compat build (1.0.10+) that runs on
+            # this host. Switch the dispatched binary accordingly:
+            #   `gemini --resume latest --yolo`  →  `agy --continue --dangerously-skip-permissions`
+            #   `--output-format stream-json` has no equivalent — agy prints
+            #   plain stdout, which the dispatcher captures into the log file
+            #   the same way.
+            # Pin model explicitly so kickoffs don't get routed to a rotating
+            # default. gemini-3.5-flash is GA on agy and matches the prior
+            # capacity tier we'd been targeting. Override via
+            # AGENT_CREW_GEMINI_MODEL.
+            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-3.5-flash")
             cmd = [
-                "gemini", "-p", message,
-                "--resume", "latest", "--yolo",
+                "agy", "-p", message,
+                "--continue", "--dangerously-skip-permissions",
                 "--model", _gemini_model,
-                "--output-format", "stream-json",
             ]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
             cmd = [

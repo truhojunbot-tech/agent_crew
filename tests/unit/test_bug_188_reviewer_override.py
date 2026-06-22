@@ -53,7 +53,9 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path):
     async def fake_subprocess(*args, **kwargs):
         cmd0 = str(args[0]) if args else ""
         cwd = kwargs.get("cwd", "")
-        if "gemini" in cmd0:
+        # gemini role now dispatches via the `agy` binary (Antigravity CLI)
+        # after Google retired gemini-cli for oauth-personal on 2026-06-18.
+        if "gemini" in cmd0 or cmd0.endswith("/agy") or cmd0 == "agy":
             spawn_log.append(("gemini", cwd))
         elif "codex" in cmd0:
             spawn_log.append(("codex", cwd))
@@ -119,7 +121,9 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path):
     async def fake_subprocess(*args, **kwargs):
         cmd0 = str(args[0]) if args else ""
         cwd = kwargs.get("cwd", "")
-        if "gemini" in cmd0:
+        # gemini role now dispatches via the `agy` binary (Antigravity CLI)
+        # after Google retired gemini-cli for oauth-personal on 2026-06-18.
+        if "gemini" in cmd0 or cmd0.endswith("/agy") or cmd0 == "agy":
             spawn_log.append(("gemini", cwd))
         elif "codex" in cmd0:
             spawn_log.append(("codex", cwd))

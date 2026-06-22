@@ -440,10 +440,12 @@ def _convert_origin_to_ssh_if_safe(project_path: str) -> None:
         )
         if cur.returncode != 0:
             return
-        url = cur.stdout.strip()
+        url = cur.stdout.strip() if isinstance(cur.stdout, str) else ""
     except (OSError, subprocess.SubprocessError):
         return
 
+    if not url:
+        return
     m = re.match(r"^https://github\.com/([^/]+)/([^/]+?)(?:\.git)?$", url)
     if not m:
         return  # Not an HTTPS github URL — leave alone.
