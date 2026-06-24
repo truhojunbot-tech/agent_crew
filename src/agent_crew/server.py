@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -202,21 +203,37 @@ _DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester"
 _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 
 
+# Tags that mean "retryable in the next few minutes" (server-side load-shed).
+_TRANSIENT_RETRIABLE_TAGS = frozenset({
+    "claude_429",
+    "claude_throttle",
+    "gemini_capacity",
+    "gemini_resource_exhausted",
+})
+# Tags that mean "exhausted for hours+; retry is futile". Surface as a
+# clear-reason failure instead.
+_TRANSIENT_NONRETRIABLE_TAGS = frozenset({
+    "gemini_quota_exhausted",
+    "gemini_ineligible_tier",
+})
+
+
 def _detect_transient_error_in_log(
     log_path: str,
     tail_bytes: int = 16384,
 ) -> Optional[str]:
-    """Scan the tail of a dispatch log for upstream transient errors.
+    """Scan the tail of a dispatch log for upstream errors worth distinguishing.
 
-    Claude can exit cleanly (rc=0) after writing a JSONL `result` block
-    with ``is_error=true, api_error_status=429`` when Anthropic's server
-    returns a temporary throttle — explicitly *not* the user's quota limit.
-    Gemini hits ``MODEL_CAPACITY_EXHAUSTED`` 429s on preview models. In
-    either case the right action is to requeue, not to fail the task
-    permanently.
-
-    Returns a short tag identifying the cause, or ``None`` if no transient
-    signature is present.
+    Returns one of:
+      retryable (transient; requeue makes sense in a minute or two):
+        - ``claude_429``                — Anthropic temp throttle (api_error_status:429)
+        - ``claude_throttle``           — "Server is temporarily limiting requests"
+        - ``gemini_capacity``           — google MODEL_CAPACITY_EXHAUSTED (preview)
+        - ``gemini_resource_exhausted`` — generic 429 RESOURCE_EXHAUSTED
+      non-retryable (clear reason; no point in immediate retry):
+        - ``gemini_quota_exhausted``    — daily user quota hit; reset 2-3h away
+        - ``gemini_ineligible_tier``    — oauth-personal serving-disabled (#195)
+      ``None`` if no transient signature is present.
     """
     try:
         with open(log_path, "rb") as f:
@@ -226,6 +243,12 @@ def _detect_transient_error_in_log(
             tail = f.read().decode("utf-8", errors="replace")
     except OSError:
         return None
+    # Order matters: more specific markers first (QUOTA before RESOURCE since
+    # QUOTA_EXHAUSTED responses also contain "RESOURCE_EXHAUSTED").
+    if "QUOTA_EXHAUSTED" in tail or "Your quota will reset" in tail:
+        return "gemini_quota_exhausted"
+    if "IneligibleTierError" in tail:
+        return "gemini_ineligible_tier"
     if '"api_error_status":429' in tail:
         return "claude_429"
     if "Server is temporarily limiting requests" in tail:
@@ -1468,22 +1491,35 @@ def create_app(
                 _dispatch_env = {**os.environ, "TELEGRAM_STATE_DIR": os.path.join(wt, ".telegram")}
                 _dispatch_env.pop("PYTHONPATH", None)
                 _dispatch_env.pop("PYTHONHOME", None)
+                # start_new_session=True puts proc in its own process group so
+                # we can kill the whole tree on timeout — agent CLIs (gemini,
+                # agy, codex) spawn helper children that survive a plain
+                # proc.kill() and reparent to PID 1 as orphans (#191).
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
+                    start_new_session=True,
                 )
+            _timed_out = False
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout_secs)
             except asyncio.TimeoutError:
-                proc.kill()
+                _timed_out = True
+                # Kill the entire process group, not just the direct child.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
                 logger.error(f"dispatcher: timeout {timeout_secs}s task={task.task_id}")
-                _fail_if_active(task.task_id, "dispatcher_timeout")
-                return
-            # Before deciding fail-vs-requeue, look for upstream transient
-            # errors in the dispatch log (claude 429, gemini capacity).
-            # These come back as a clean rc=0 with an `is_error` result, or
-            # rc=1 from gemini-cli after it exhausts its internal retries.
+            # Inspect the dispatch log tail for upstream errors — applies to
+            # both clean exit AND timeout (#190). Claude can return rc=0 with
+            # api_error_status:429; gemini-cli often hangs on retry loops past
+            # the 15-minute timeout. Both need the same routing decision.
             _transient = _detect_transient_error_in_log(log_path)
-            if _transient:
+            if _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
                 if _n <= _MAX_TRANSIENT_RETRY:
@@ -1505,8 +1541,19 @@ def create_app(
                         f"task={task.task_id} — giving up after "
                         f"{_MAX_TRANSIENT_RETRY} retries"
                     )
-                    _transient_retries.pop(task.task_id, None)
-            if proc.returncode != 0:
+                _fail_if_active(task.task_id, f"transient_{_transient}_max_retries")
+            elif _transient in _TRANSIENT_NONRETRIABLE_TAGS:
+                # Quota / tier failures — won't recover in minutes, no point
+                # retrying. Surface the cause clearly so operators see why
+                # the task died (#192).
+                logger.error(
+                    f"dispatcher: {_transient} on task={task.task_id} — "
+                    "failing without retry (quota reset / migration required)"
+                )
+                _fail_if_active(task.task_id, _transient)
+            elif _timed_out:
+                _fail_if_active(task.task_id, "dispatcher_timeout")
+            elif proc.returncode != 0:
                 _fail_if_active(task.task_id, f"exit_{proc.returncode}")
             else:
                 _fail_if_active(task.task_id, "no_result_submitted")
@@ -1514,6 +1561,13 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
+            # Pop the per-task transient-retry counter so the in-memory dict
+            # doesn't grow unbounded across long-running servers (#194). Tasks
+            # that requeued and then succeeded never re-enter this block under
+            # the same task_id (queue.requeue resets status but the dispatch
+            # path issues a fresh _dispatch_task invocation for the requeued
+            # row), so cleaning here is safe.
+            _transient_retries.pop(task.task_id, None)
             # Reset worktree after task (success or failure) so it's clean for the next task.
             # The cleanup wipes agent_crew's per-role protocol files (.claude/CLAUDE.md
             # is untracked → `git clean -fd` removes it; AGENTS.md / GEMINI.md are often
