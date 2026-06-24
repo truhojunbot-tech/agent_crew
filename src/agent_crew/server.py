@@ -309,6 +309,40 @@ def _cap_gemini_session_size(cwd: str, max_mb: int = 50) -> None:
         logger.exception("_cap_gemini_session_size: unexpected error")
 
 
+def _rotate_log_if_oversized(path: str, max_mb: int, keep: int = 3) -> None:
+    """Rotate ``path`` to ``path.1`` (and shift older files up) when it
+    exceeds ``max_mb``. Keeps at most ``keep`` numbered rotations on disk;
+    the oldest is dropped.
+
+    Cheap to call per dispatch — os.stat is O(1); rotation only fires when
+    the threshold is actually crossed (#193). Best-effort: silently skips
+    on errors so a rotation hiccup doesn't take down the dispatcher.
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size <= max_mb * 1024 * 1024:
+        return
+    try:
+        # Slide path.(keep-1) → drop; path.(keep-2) → path.(keep-1); ...
+        oldest = f"{path}.{keep}"
+        if os.path.exists(oldest):
+            os.remove(oldest)
+        for i in range(keep - 1, 0, -1):
+            src = f"{path}.{i}"
+            dst = f"{path}.{i + 1}"
+            if os.path.exists(src):
+                os.rename(src, dst)
+        os.rename(path, f"{path}.1")
+        logger.info(
+            "log rotation: %s (%dMB > %dMB cap) → %s.1",
+            path, size // (1024 * 1024), max_mb, path,
+        )
+    except OSError:
+        logger.exception("log rotation failed for %s", path)
+
+
 def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
     """Derive {role: worktree_path} from state.json.
 
@@ -1568,6 +1602,17 @@ def create_app(
             # path issues a fresh _dispatch_task invocation for the requeued
             # row), so cleaning here is safe.
             _transient_retries.pop(task.task_id, None)
+            # Rotate dispatch logs and the attribution ledger when they cross
+            # the cap (#193). Append-only paths grew to >100MB in production.
+            try:
+                _log_cap_mb = int(os.getenv("AGENT_CREW_LOG_MAX_MB", "50"))
+            except ValueError:
+                _log_cap_mb = 50
+            _rotate_log_if_oversized(log_path, _log_cap_mb)
+            _rotate_log_if_oversized(
+                os.path.join(os.path.dirname(db_path), "attribution.jsonl"),
+                _log_cap_mb,
+            )
             # Reset worktree after task (success or failure) so it's clean for the next task.
             # The cleanup wipes agent_crew's per-role protocol files (.claude/CLAUDE.md
             # is untracked → `git clean -fd` removes it; AGENTS.md / GEMINI.md are often
