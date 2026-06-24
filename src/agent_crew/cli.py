@@ -316,6 +316,73 @@ def _pane_cwd(pane_id: str) -> str | None:
     return None
 
 
+def _pane_current_command(pane_id: str) -> str:
+    """Return the name of the foreground command in a tmux pane (empty
+    string if the pane is gone). Used by the agent-liveness check (#195)."""
+    r = subprocess.run(
+        ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_current_command}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode != 0:
+        return ""
+    return r.stdout.strip()
+
+
+# Foreground commands we consider "healthy" for a given agent's pane.
+# Legacy mode: agent CLI runs interactively (claude / codex / gemini / agy /
+# node/python wrappers thereof). Dispatcher mode: pane just tails a log via
+# `crew-log-viewer` (a python3 process). A bash/sh prompt means the prior
+# process exited — the canonical crash signature from #195.
+_HEALTHY_PANE_COMMANDS_LEGACY = {
+    "claude": {"claude", "node"},
+    "codex":  {"codex", "node"},
+    "gemini": {"gemini", "agy", "node"},
+}
+_HEALTHY_PANE_COMMAND_DISPATCHER = {"python", "python3"}
+_DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
+
+
+def _detect_dead_agent_panes(
+    agents: list[str],
+    pane_ids: list[str],
+    dispatcher_mode: bool,
+) -> list[tuple[str, str, str]]:
+    """Find panes whose agent process has crashed (dropped to a shell).
+
+    Returns a list of ``(agent, pane_id, current_command)`` tuples for every
+    pane whose foreground command no longer matches the expected agent CLI
+    (legacy mode) or log viewer (dispatcher mode). Empty list if everything
+    looks healthy.
+
+    Powers the agent-liveness check in `crew recover` (#195). Deliberately
+    conservative: an unrecognized command (something we don't know about
+    that's also not a shell) is NOT flagged as dead — we'd rather miss a
+    crash than restart a healthy custom process.
+    """
+    dead: list[tuple[str, str, str]] = []
+    for agent, pane_id in zip(agents, pane_ids):
+        if not pane_id or not _pane_alive(pane_id):
+            dead.append((agent, pane_id, "(missing)"))
+            continue
+        cmd = _pane_current_command(pane_id)
+        if cmd in _DEAD_PANE_COMMANDS:
+            dead.append((agent, pane_id, cmd))
+            continue
+        if dispatcher_mode:
+            if cmd and cmd not in _HEALTHY_PANE_COMMAND_DISPATCHER:
+                # Could still be healthy (custom viewer); only flag the
+                # canonical shell-prompt case above.
+                pass
+        else:
+            healthy = _HEALTHY_PANE_COMMANDS_LEGACY.get(agent, set())
+            if cmd and healthy and cmd not in healthy:
+                # Same conservative rule — only the explicit shell case
+                # above counts as "dead". An unknown command may be a
+                # legitimate wrapper.
+                pass
+    return dead
+
+
 def _tmux_target_valid(target: str) -> bool:
     """Validate that a tmux target (session:window.pane) actually exists.
 
@@ -1291,6 +1358,25 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
                 except OSError:
                     pass
                 recovered.append(f"panes({len(dead_agents)})")
+
+    # Agent-liveness check (#195). Before today, recover only confirmed that
+    # the server was up and tmux panes existed — it never inspected whether
+    # the agent CLI inside each pane was still running. A crashed codex that
+    # dropped its pane to a bash prompt looked identical to a healthy one.
+    # Now we flag panes whose foreground command is a shell so operators see
+    # which agents need attention.
+    final_pane_ids = state.get("pane_ids", [])
+    final_agents = state.get("agents", [])
+    if final_agents and final_pane_ids:
+        dead = _detect_dead_agent_panes(
+            final_agents, final_pane_ids, dispatcher_mode=_dispatcher_mode,
+        )
+        if dead:
+            click.echo("⚠️  Agent-liveness check: the following panes look crashed:")
+            for agent, pid, cmd in dead:
+                click.echo(f"     {agent:8s} pane={pid:8s} current_command={cmd}")
+            click.echo("     (recover only restarts dead PANES, not crashed agent CLIs —")
+            click.echo("      restart the agent inside each pane manually if needed.)")
 
     if recovered:
         click.echo(f"Recovered: {', '.join(recovered)}")
