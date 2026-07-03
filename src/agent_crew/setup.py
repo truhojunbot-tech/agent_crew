@@ -12,7 +12,7 @@ _logger = logging.getLogger(__name__)
 from agent_crew import instructions, session
 
 _AGENT_CMDS = {
-    "claude": "claude --dangerously-skip-permissions --continue --model claude-opus-4-7",
+    "claude": "claude --dangerously-skip-permissions --continue --model claude-sonnet-5",
     "codex": "codex --dangerously-bypass-approvals-and-sandbox",
     # ``--approval-mode yolo`` is the policy-engine flag that fully
     # bypasses every tool prompt (including shell/git which the legacy
@@ -24,7 +24,7 @@ _AGENT_CMDS = {
     # 줄고 테스트 실행/검토 작업 품질엔 영향이 작다.
     "gemini": "gemini --approval-mode yolo --model gemini-2.5-flash",
 }
-_DEFAULT_CMD = "claude --dangerously-skip-permissions --continue --model claude-opus-4-7"
+_DEFAULT_CMD = "claude --dangerously-skip-permissions --continue --model claude-sonnet-5"
 
 # Substrings expected in pane output after a successful CLI boot.
 # Used by start_agents_in_panes to warn when the CLI doesn't appear to have started.
