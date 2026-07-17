@@ -44,6 +44,11 @@ def test_gemini_resource_exhausted_detected(tmp_path):
     assert _detect_transient_error_in_log(log) == "gemini_resource_exhausted"
 
 
+def test_codex_capacity_detected(tmp_path):
+    log = _write(tmp_path, "ERROR: Selected model is at capacity. Please try a different model.\n")
+    assert _detect_transient_error_in_log(log) == "codex_capacity"
+
+
 def test_only_tail_is_scanned(tmp_path):
     # 20KB of innocuous prefix, transient marker only at the end.
     big = ("x" * 20480) + '"api_error_status":429'

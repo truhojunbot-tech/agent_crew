@@ -209,6 +209,7 @@ _TRANSIENT_RETRIABLE_TAGS = frozenset({
     "claude_throttle",
     "gemini_capacity",
     "gemini_resource_exhausted",
+    "codex_capacity",
 })
 # Tags that mean "exhausted for hours+; retry is futile". Surface as a
 # clear-reason failure instead.
@@ -230,6 +231,7 @@ def _detect_transient_error_in_log(
         - ``claude_throttle``           — "Server is temporarily limiting requests"
         - ``gemini_capacity``           — google MODEL_CAPACITY_EXHAUSTED (preview)
         - ``gemini_resource_exhausted`` — generic 429 RESOURCE_EXHAUSTED
+        - ``codex_capacity``            — openai "Selected model is at capacity" (#196)
       non-retryable (clear reason; no point in immediate retry):
         - ``gemini_quota_exhausted``    — daily user quota hit; reset 2-3h away
         - ``gemini_ineligible_tier``    — oauth-personal serving-disabled (#195)
@@ -257,6 +259,8 @@ def _detect_transient_error_in_log(
         return "gemini_capacity"
     if "RESOURCE_EXHAUSTED" in tail:
         return "gemini_resource_exhausted"
+    if "Selected model is at capacity" in tail:
+        return "codex_capacity"
     return None
 
 
@@ -1488,10 +1492,11 @@ def create_app(
             #   plain stdout, which the dispatcher captures into the log file
             #   the same way.
             # Pin model explicitly so kickoffs don't get routed to a rotating
-            # default. gemini-3.5-flash is GA on agy and matches the prior
-            # capacity tier we'd been targeting. Override via
+            # default. agy 1.1.x switched --model to take the display name
+            # from `agy models` rather than a slug (e.g. "gemini-3.5-flash"
+            # now 400s with "model ... is not recognized"). Override via
             # AGENT_CREW_GEMINI_MODEL.
-            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "gemini-3.5-flash")
+            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.5 Flash (Medium)")
             cmd = [
                 "agy", "-p", message,
                 "--continue", "--dangerously-skip-permissions",
