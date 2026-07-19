@@ -216,6 +216,7 @@ _TRANSIENT_RETRIABLE_TAGS = frozenset({
 _TRANSIENT_NONRETRIABLE_TAGS = frozenset({
     "gemini_quota_exhausted",
     "gemini_ineligible_tier",
+    "agy_quota_exhausted",
 })
 
 
@@ -235,6 +236,8 @@ def _detect_transient_error_in_log(
       non-retryable (clear reason; no point in immediate retry):
         - ``gemini_quota_exhausted``    — daily user quota hit; reset 2-3h away
         - ``gemini_ineligible_tier``    — oauth-personal serving-disabled (#195)
+        - ``agy_quota_exhausted``       — agy "Individual quota reached" (#197);
+          rolling per-account cap, log states its own reset countdown
       ``None`` if no transient signature is present.
     """
     try:
@@ -251,6 +254,8 @@ def _detect_transient_error_in_log(
         return "gemini_quota_exhausted"
     if "IneligibleTierError" in tail:
         return "gemini_ineligible_tier"
+    if "Individual quota reached" in tail:
+        return "agy_quota_exhausted"
     if '"api_error_status":429' in tail:
         return "claude_429"
     if "Server is temporarily limiting requests" in tail:

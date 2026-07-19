@@ -49,6 +49,15 @@ def test_codex_capacity_detected(tmp_path):
     assert _detect_transient_error_in_log(log) == "codex_capacity"
 
 
+def test_agy_quota_exhausted_detected(tmp_path):
+    log = _write(
+        tmp_path,
+        "Error: Individual quota reached. Please upgrade your subscription "
+        "to increase your limits. Resets in 1h26m40s.\n",
+    )
+    assert _detect_transient_error_in_log(log) == "agy_quota_exhausted"
+
+
 def test_only_tail_is_scanned(tmp_path):
     # 20KB of innocuous prefix, transient marker only at the end.
     big = ("x" * 20480) + '"api_error_status":429'

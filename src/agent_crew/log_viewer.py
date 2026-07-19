@@ -162,7 +162,20 @@ def tail_and_format(path: str) -> None:
 
     try:
         while True:
-            line = f.readline()
+            # This process only ever reads a log file and prints — there's
+            # nothing for Ctrl+C to usefully interrupt, and an operator
+            # attached to the tmux pane (mistaking it for an interactive
+            # agent CLI) sending SIGINT used to kill the viewer and drop
+            # the pane to a bare shell, which then looked like a crashed
+            # agent (#195 liveness check would flag it). Absorb it and
+            # keep tailing instead of exiting.
+            try:
+                line = f.readline()
+            except KeyboardInterrupt:
+                print(f"{_RED}  [log_viewer] Ctrl+C ignored — this pane only "
+                      f"monitors the log; use tmux kill-pane to stop it{_RESET}",
+                      flush=True)
+                continue
             if line:
                 try:
                     formatted = _process_line(line)
@@ -172,8 +185,6 @@ def tail_and_format(path: str) -> None:
                     print(formatted, flush=True)
             else:
                 time.sleep(0.2)
-    except KeyboardInterrupt:
-        pass
     finally:
         f.close()
 
