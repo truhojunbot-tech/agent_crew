@@ -6,6 +6,7 @@ Usage:
     # or: crew-log-viewer <path>  (entry point)
 """
 import json
+import signal
 import sys
 import time
 from typing import Optional
@@ -160,22 +161,19 @@ def tail_and_format(path: str) -> None:
             except FileNotFoundError:
                 time.sleep(0.5)
 
+    # This process only ever reads a log file and prints — there's nothing
+    # for Ctrl+C to usefully interrupt, and an operator attached to the tmux
+    # pane (mistaking it for an interactive agent CLI) sending SIGINT used to
+    # kill the viewer and drop the pane to a bare shell, which then looked
+    # like a crashed agent (#195 liveness check would flag it). A signal can
+    # land during readline(), sleep(), or print() alike, so a blanket
+    # try/except around one call isn't enough — mask SIGINT at the process
+    # level instead of trying to catch KeyboardInterrupt everywhere.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+
     try:
         while True:
-            # This process only ever reads a log file and prints — there's
-            # nothing for Ctrl+C to usefully interrupt, and an operator
-            # attached to the tmux pane (mistaking it for an interactive
-            # agent CLI) sending SIGINT used to kill the viewer and drop
-            # the pane to a bare shell, which then looked like a crashed
-            # agent (#195 liveness check would flag it). Absorb it and
-            # keep tailing instead of exiting.
-            try:
-                line = f.readline()
-            except KeyboardInterrupt:
-                print(f"{_RED}  [log_viewer] Ctrl+C ignored — this pane only "
-                      f"monitors the log; use tmux kill-pane to stop it{_RESET}",
-                      flush=True)
-                continue
+            line = f.readline()
             if line:
                 try:
                     formatted = _process_line(line)

@@ -6,6 +6,7 @@ When codex emitted a line containing a bare JSON literal like `1` or
 `AttributeError: 'int' object has no attribute 'get'`. The reviewer pane
 (running the log viewer for codex output) died and dropped to bash.
 """
+import signal
 from unittest.mock import patch
 
 import pytest
@@ -52,15 +53,20 @@ class _StopTest(Exception):
 
 
 class _FakeFile:
+    """Records the SIGINT handler in effect on the first readline() call,
+    then plays back a scripted sequence of lines before raising _StopTest
+    to end the (otherwise infinite) tail loop.
+    """
     def __init__(self, calls):
         self._calls = calls
         self._i = 0
+        self.sigint_handler_seen = None
 
     def readline(self):
+        if self.sigint_handler_seen is None:
+            self.sigint_handler_seen = signal.getsignal(signal.SIGINT)
         action = self._calls[self._i]
         self._i += 1
-        if action is KeyboardInterrupt:
-            raise KeyboardInterrupt
         if action is _StopTest:
             raise _StopTest
         return action
@@ -69,16 +75,21 @@ class _FakeFile:
         pass
 
 
-def test_ctrl_c_does_not_kill_the_viewer(capsys):
+def test_ctrl_c_does_not_kill_the_viewer():
     """Regression: a pane operator hitting Ctrl+C used to kill the passive
     log-viewer process and drop the pane to a bare shell, which then looked
     like a crashed agent. The viewer only tails and prints — there's nothing
-    for Ctrl+C to usefully interrupt, so it must survive SIGINT.
+    for Ctrl+C to usefully interrupt — so it masks SIGINT for the process
+    rather than relying on catching KeyboardInterrupt at one call site
+    (a signal can land during readline(), sleep(), or print() alike).
     """
-    fake = _FakeFile([KeyboardInterrupt, "hello\n", _StopTest])
-    with patch("agent_crew.log_viewer.open", return_value=fake, create=True), \
-         patch("agent_crew.log_viewer.time.sleep"):
-        with pytest.raises(_StopTest):
-            tail_and_format("/fake/path")
-    out = capsys.readouterr().out
-    assert "hello" in out
+    original_handler = signal.getsignal(signal.SIGINT)
+    fake = _FakeFile(["hello\n", _StopTest])
+    try:
+        with patch("agent_crew.log_viewer.open", return_value=fake, create=True), \
+             patch("agent_crew.log_viewer.time.sleep"):
+            with pytest.raises(_StopTest):
+                tail_and_format("/fake/path")
+    finally:
+        signal.signal(signal.SIGINT, original_handler)
+    assert fake.sigint_handler_seen is signal.SIG_IGN
