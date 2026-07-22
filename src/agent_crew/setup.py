@@ -209,10 +209,23 @@ def start_log_viewers_in_panes(
         subprocess.run(["touch", log_path], capture_output=True)
         subprocess.run(["tmux", "send-keys", "-t", target, "C-c"], capture_output=True)
         time.sleep(0.2)
-        cmd = f"crew-log-viewer {log_path}"
+        # Wrapped in a respawn loop, not launched bare: these panes have
+        # repeatedly been hijacked by other agents (e.g. alpha_engine's own
+        # session `pkill -f crew-log-viewer`-ing this pane to run an
+        # interactive `codex`/`gemini` CLI directly instead of going through
+        # the dispatcher queue). SIGINT-masking alone (log_viewer.py) doesn't
+        # help against that — SIGTERM/pkill still kills it. This loop
+        # reclaims the pane within ~1s of any exit, and the echoed notice
+        # tells whoever is watching why their interactive session vanished.
+        cmd = (
+            f"while true; do crew-log-viewer {log_path}; "
+            f"echo '[crew] this pane is dispatcher-managed — use `crew enqueue`"
+            f" instead of running an agent CLI here directly; relaunching in 1s'; "
+            f"sleep 1; done"
+        )
         subprocess.run(["tmux", "send-keys", "-l", "-t", target, cmd], capture_output=True)
         subprocess.run(["tmux", "send-keys", "-t", target, "Enter"], capture_output=True)
-        _logger.info("start_log_viewers_in_panes: %s watching %s", target, log_path)
+        _logger.info("start_log_viewers_in_panes: %s watching %s (respawn-supervised)", target, log_path)
 
 
 def pretrust_claude_worktree(

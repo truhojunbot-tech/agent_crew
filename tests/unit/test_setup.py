@@ -9,6 +9,7 @@ from agent_crew.setup import (
     pretrust_claude_worktree,
     validate_git_repo,
     start_agents_in_panes,
+    start_log_viewers_in_panes,
     write_instruction_files,
     write_port_file,
     write_sessions_json,
@@ -126,6 +127,29 @@ def test_u_se08_start_agents_in_panes_uses_literal_send_keys():
         assert "AGENT_CREW TASK" not in last
         assert "while true" not in last
         assert "mktemp" not in last
+
+
+def test_u_se08b_log_viewer_panes_respawn_on_death(tmp_path):
+    """Regression: dispatcher-mode panes have repeatedly been hijacked by
+    other agents pkill-ing crew-log-viewer to run an interactive CLI
+    directly in that pane instead of going through the dispatcher queue.
+    The launch command must wrap crew-log-viewer in a respawn loop so the
+    pane is reclaimed within ~1s of any exit, not launch it bare.
+    """
+    mock_result = MagicMock(returncode=0)
+    with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
+         patch("agent_crew.setup.time.sleep"):
+        start_log_viewers_in_panes(["claude"], ["%1"], str(tmp_path))
+
+    literal_calls = [
+        call[0][0] for call in mock_run.call_args_list
+        if "-l" in call[0][0]
+    ]
+    assert literal_calls, "no literal send found"
+    cmd = literal_calls[0][-1]
+    assert "while true" in cmd
+    assert "crew-log-viewer" in cmd
+    assert "crew enqueue" in cmd
 
 
 # U-SE09: _get_agent_cmd — claude omits --continue when .claude/projects/ absent
