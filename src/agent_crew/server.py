@@ -210,6 +210,7 @@ _TRANSIENT_RETRIABLE_TAGS = frozenset({
     "gemini_capacity",
     "gemini_resource_exhausted",
     "codex_capacity",
+    "agy_timeout",
 })
 # Tags that mean "exhausted for hours+; retry is futile". Surface as a
 # clear-reason failure instead.
@@ -233,6 +234,9 @@ def _detect_transient_error_in_log(
         - ``gemini_capacity``           — google MODEL_CAPACITY_EXHAUSTED (preview)
         - ``gemini_resource_exhausted`` — generic 429 RESOURCE_EXHAUSTED
         - ``codex_capacity``            — openai "Selected model is at capacity" (#196)
+        - ``agy_timeout``               — agy "Error: timeout waiting for response"
+          (#199); backend model-call timeout, distinct from the account-level
+          quota cap (agy_quota_exhausted below)
       non-retryable (clear reason; no point in immediate retry):
         - ``gemini_quota_exhausted``    — daily user quota hit; reset 2-3h away
         - ``gemini_ineligible_tier``    — oauth-personal serving-disabled (#195)
@@ -266,6 +270,8 @@ def _detect_transient_error_in_log(
         return "gemini_resource_exhausted"
     if "Selected model is at capacity" in tail:
         return "codex_capacity"
+    if "Error: timeout waiting for response" in tail:
+        return "agy_timeout"
     return None
 
 

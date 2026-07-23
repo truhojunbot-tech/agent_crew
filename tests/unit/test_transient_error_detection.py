@@ -58,6 +58,24 @@ def test_agy_quota_exhausted_detected(tmp_path):
     assert _detect_transient_error_in_log(log) == "agy_quota_exhausted"
 
 
+def test_agy_timeout_detected(tmp_path):
+    log = _write(tmp_path, "I will run the entire test suite.\nError: timeout waiting for response\n")
+    assert _detect_transient_error_in_log(log) == "agy_timeout"
+
+
+def test_agy_quota_takes_priority_over_agy_timeout(tmp_path):
+    # Both signatures could plausibly appear together; quota is the more
+    # specific / actionable diagnosis (retry is definitely futile until
+    # reset), so it must win over the generic timeout tag.
+    log = _write(
+        tmp_path,
+        "Error: timeout waiting for response\n"
+        "Error: Individual quota reached. Please upgrade your subscription "
+        "to increase your limits. Resets in 5m.\n",
+    )
+    assert _detect_transient_error_in_log(log) == "agy_quota_exhausted"
+
+
 def test_only_tail_is_scanned(tmp_path):
     # 20KB of innocuous prefix, transient marker only at the end.
     big = ("x" * 20480) + '"api_error_status":429'
