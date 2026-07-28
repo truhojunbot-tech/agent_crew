@@ -224,8 +224,19 @@ _TRANSIENT_NONRETRIABLE_TAGS = frozenset({
 def _detect_transient_error_in_log(
     log_path: str,
     tail_bytes: int = 16384,
+    since_offset: int = 0,
 ) -> Optional[str]:
     """Scan the tail of a dispatch log for upstream errors worth distinguishing.
+
+    ``dispatch_{role}.log`` is one continuously-appended file shared by every
+    task dispatched for that role, not one file per task. A blind tail scan
+    can therefore pick up an error signature left over from a *previous*
+    task's failure (e.g. a quota message a few hundred bytes before EOF) and
+    misattribute it to the current task, wrongly marking a retryable failure
+    (or even a clean run) as the older task's non-retryable reason. Pass the
+    file offset captured right after writing this task's ``TASK <id>``
+    marker as ``since_offset`` so the scan never looks earlier than where
+    this task's own output begins (#200).
 
     Returns one of:
       retryable (transient; requeue makes sense in a minute or two):
@@ -248,7 +259,8 @@ def _detect_transient_error_in_log(
         with open(log_path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            f.seek(max(0, size - tail_bytes))
+            start = max(0, size - tail_bytes, since_offset)
+            f.seek(min(start, size))
             tail = f.read().decode("utf-8", errors="replace")
     except OSError:
         return None
@@ -1531,6 +1543,9 @@ def create_app(
                     f"{_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
                     f"{'='*60}\n"
                 )
+            # Captured after the marker so the transient-error scan below
+            # never reads into a prior task's leftover output (#200).
+            _task_log_start_offset = os.path.getsize(log_path)
             with open(log_path, "ab") as log_f:
                 # Override TELEGRAM_STATE_DIR to worktree's .telegram so the
                 # subagent doesn't inherit the crew server's state dir and steal
@@ -1568,7 +1583,9 @@ def create_app(
             # both clean exit AND timeout (#190). Claude can return rc=0 with
             # api_error_status:429; gemini-cli often hangs on retry loops past
             # the 15-minute timeout. Both need the same routing decision.
-            _transient = _detect_transient_error_in_log(log_path)
+            _transient = _detect_transient_error_in_log(
+                log_path, since_offset=_task_log_start_offset
+            )
             if _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n

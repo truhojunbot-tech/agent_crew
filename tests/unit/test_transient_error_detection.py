@@ -85,3 +85,28 @@ def test_only_tail_is_scanned(tmp_path):
 
 def test_missing_file_returns_none(tmp_path):
     assert _detect_transient_error_in_log(str(tmp_path / "nonexistent.log")) is None
+
+
+def test_since_offset_ignores_prior_task_error(tmp_path):
+    # dispatch_{role}.log is shared across every task for that role. A
+    # previous task's non-retryable quota message sitting just before EOF
+    # must not bleed into detection for the *current* task, whose own
+    # output (after since_offset) only contains a retryable timeout (#200).
+    prior = "Error: Individual quota reached. Please upgrade your subscription.\n"
+    marker = "=" * 60 + "\nTASK current-task | tester | 2026-07-28 10:45:39\n" + "=" * 60 + "\n"
+    log = _write(tmp_path, prior)
+    offset = len(prior.encode("utf-8"))
+    with open(log, "a") as f:
+        f.write(marker)
+        f.write("Error: timeout waiting for response\n")
+    assert _detect_transient_error_in_log(log, since_offset=offset) == "agy_timeout"
+
+
+def test_since_offset_still_detects_current_task_quota(tmp_path):
+    marker = "=" * 60 + "\nTASK current-task | tester | 2026-07-28 10:45:39\n" + "=" * 60 + "\n"
+    log = _write(tmp_path, "some earlier unrelated content\n")
+    offset = len("some earlier unrelated content\n".encode("utf-8"))
+    with open(log, "a") as f:
+        f.write(marker)
+        f.write("Error: Individual quota reached. Resets in 1h.\n")
+    assert _detect_transient_error_in_log(log, since_offset=offset) == "agy_quota_exhausted"
