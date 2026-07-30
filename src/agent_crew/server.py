@@ -1534,6 +1534,12 @@ def create_app(
 
         timeout_secs = float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", "900"))
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt}")
+        # Only pop the retry counter on a terminal outcome. Flipped to False
+        # right before the early `return` on a successful requeue — that
+        # `return` still runs `finally`, so without this flag the counter
+        # was erased every attempt and _MAX_TRANSIENT_RETRY never actually
+        # capped anything (#201).
+        _terminal = True
         try:
             import datetime as _dt
             with open(log_path, "a") as log_f:
@@ -1597,6 +1603,7 @@ def create_app(
                             f"task={task.task_id} — requeued "
                             f"(attempt {_n}/{_MAX_TRANSIENT_RETRY})"
                         )
+                        _terminal = False
                         return
                     except Exception:
                         logger.exception(
@@ -1628,13 +1635,13 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
-            # Pop the per-task transient-retry counter so the in-memory dict
-            # doesn't grow unbounded across long-running servers (#194). Tasks
-            # that requeued and then succeeded never re-enter this block under
-            # the same task_id (queue.requeue resets status but the dispatch
-            # path issues a fresh _dispatch_task invocation for the requeued
-            # row), so cleaning here is safe.
-            _transient_retries.pop(task.task_id, None)
+            # Pop the per-task transient-retry counter once the task reaches
+            # a terminal outcome, so the in-memory dict doesn't grow
+            # unbounded across long-running servers (#194). Left in place
+            # (_terminal=False) across a successful requeue so the count
+            # actually accumulates across retries (#201).
+            if _terminal:
+                _transient_retries.pop(task.task_id, None)
             # Rotate dispatch logs and the attribution ledger when they cross
             # the cap (#193). Append-only paths grew to >100MB in production.
             try:
