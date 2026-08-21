@@ -396,7 +396,11 @@ class TaskQueue:
             # the same transaction, so it's set regardless of whether this
             # came from the agent's own POST /tasks/{id}/result or an
             # internal dispatcher failure path (_fail_if_active calls this
-            # method directly) — both funnel through here.
+            # method directly) — both funnel through here. status is set
+            # alongside outcome/completed_at (not left at 'in_progress') so
+            # the row can't end up internally contradictory — a terminal
+            # outcome sitting next to a stale in_progress status broke
+            # status-based external queries (review of PR #203, finding 3).
             outcome = result.status
             if result.status == "failed" and isinstance(result.error_info, dict):
                 reason = result.error_info.get("reason")
@@ -404,8 +408,8 @@ class TaskQueue:
                     outcome = f"failed:{reason}"
             now = time.time()
             conn.execute(
-                "UPDATE task_attribution SET outcome=?, completed_at=?, updated_at=? WHERE task_id=?",
-                (outcome, now, now, task_id),
+                "UPDATE task_attribution SET status=?, outcome=?, completed_at=?, updated_at=? WHERE task_id=?",
+                (result.status, outcome, now, now, task_id),
             )
             conn.commit()
             return task_type

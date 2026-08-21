@@ -53,7 +53,7 @@ and `test_u_i202_same_worktree_shared_across_roles`.
 |---|---|---|
 | `~/.agent_crew/<project>/tasks.db` → `context_state` table | SQLite | current context identity per `(project, agent, worktree_path)`; durable, survives restart |
 | `~/.agent_crew/<project>/tasks.db` → `task_attribution` table | SQLite | one row per task, with context/lineage/outcome fields |
-| `~/.agent_crew/<project>/attribution.jsonl` | append-only JSONL | one line per dispatch, same fields as `task_attribution` — for consumers that outlive the DB or want to tail rather than query |
+| `~/.agent_crew/<project>/attribution.jsonl` | append-only JSONL | **at least two** lines per task — one at dispatch (`status="in_progress"`), one more when it reaches a terminal state (`status`/`outcome`/`completed_at` populated) — always a verbatim `task_attribution` row (never hand-built separately, so it can't drift from the DB shape). Consumers take the most recent line per `task_id` as current state. For consumers that outlive the DB or want to tail rather than query. |
 | `~/.agent_crew/<project>/context_events.jsonl` | append-only JSONL | lifecycle event stream (§6) — kept **separate** from `attribution.jsonl` on purpose, since events have a different, heterogeneous shape per `event_type` and mixing them would be a breaking change for existing `attribution.jsonl` readers |
 
 ## 4. `context_state` (durable identity, one row per context)
@@ -76,6 +76,20 @@ acceptance criteria. Ordinary worktree file resets (`git checkout .` /
 `git clean -fd`, run after every task) do **not** reset the context —
 they clean tracked/untracked files, not the provider's own conversation
 state for that directory.
+
+**Dispatch is serialized per resolved context, not just per role.** Role
+slots (`implementer`/`reviewer`/`tester`) alone don't prevent two
+*different* roles from resolving into the *same* `(agent, worktree_path)`
+— e.g. `agent_override` routing a `reviewer` task into `gemini`'s worktree
+while `tester`'s own gemini task is also pending. Running both
+`--continue` processes against the same directory at once would corrupt
+that one provider conversation, and would also make `session_task_index`/
+`previous_task_id` meaningless (two tasks racing to claim "next"). The
+dispatcher tracks an `active_worktrees` set alongside the existing
+`active_roles` set: a task whose resolved worktree is already in flight
+under a different role is put back on the queue and retried on the next
+poll tick rather than dispatched concurrently. See
+`test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized`.
 
 ## 5. `task_attribution` (one row per task)
 

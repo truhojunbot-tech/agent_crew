@@ -98,3 +98,24 @@ def record_context_event(events_path: str, event_type: str, **fields) -> None:
     }
     with open(events_path, "a") as f:
         f.write(json.dumps(payload) + "\n")
+
+
+def append_attribution_jsonl(jsonl_path: str, attribution_row: dict) -> None:
+    """Append one line to ``attribution.jsonl`` mirroring a
+    ``task_attribution`` DB row verbatim (whatever ``TaskQueue.
+    get_attribution()`` returns).
+
+    Called at least twice per task — once at dispatch time
+    (``status="in_progress"``) and once more when it reaches a terminal
+    state (``status`` + ``outcome`` + ``completed_at`` populated) — so a
+    tail-only consumer that never touches the DB can still observe the
+    final outcome, not just the in-flight snapshot (#202 review finding:
+    PR #203 originally wrote only the dispatch-time line). Consumers
+    should treat this as one row per ``(task_id, updated_at)`` and take the
+    most recent line per ``task_id`` as current state, same as they would
+    reading the DB row directly — this function deliberately reuses the
+    DB row shape instead of hand-building a separate dict so the two can
+    never drift apart.
+    """
+    with open(jsonl_path, "a") as f:
+        f.write(json.dumps(attribution_row) + "\n")

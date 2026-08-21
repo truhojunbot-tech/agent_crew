@@ -11,8 +11,10 @@ Covers the acceptance criteria directly:
     instance against the same db_path)
   - Agent Crew works with no external consumer of context_events.jsonl
 """
+import asyncio
 import json
 import os
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -425,3 +427,70 @@ def test_u_i202_works_with_no_external_consumer(tmp_db, tmp_path):
 
     tasks = TaskQueue(tmp_db).list_tasks()
     assert any(t.task_id == "plain-1" for t in tasks)
+
+
+def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, tmp_path):
+    """#202 review of PR #203, finding 1: role-level exclusivity alone
+    doesn't stop a tester task (default agent gemini) and a reviewer task
+    with agent_override=gemini from both being dispatched at once — they
+    occupy different role slots but resolve to the SAME gemini worktree,
+    so running both `agy --continue` processes concurrently would corrupt
+    that one provider conversation. The dispatcher must serialize by the
+    resolved worktree, not just by role."""
+    state, wt_paths = _worktree_state(tmp_path)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+    gemini_wt = str(wt_paths["gemini"])
+
+    intervals = []  # (cwd, start, end)
+    lock = threading.Lock()
+
+    async def fake_subprocess(*args, **kwargs):
+        cwd = kwargs.get("cwd")
+        start = time.time()
+
+        async def _wait():
+            await asyncio.sleep(0.3)
+            end = time.time()
+            with lock:
+                intervals.append((cwd, start, end))
+            return 1
+
+        proc = MagicMock()
+        proc.returncode = 1
+        proc.kill = MagicMock()
+        proc.wait = _wait
+        proc.pid = 999999
+        return proc
+
+    with patch.dict(os.environ, {
+        "AGENT_CREW_DISPATCHER": "1",
+        "AGENT_CREW_DISPATCH_INTERVAL": "0.05",
+        "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1",
+        "AGENT_CREW_TRANSIENT_RETRY_MAX": "0",
+    }):
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+                app = create_app(
+                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    watchdog_disabled=True, anomaly_disabled=True,
+                )
+                with TestClient(app) as client:
+                    # tester's normal task lands in gemini's worktree by default.
+                    client.post("/tasks", json=_task_payload("tester-1", task_type="test"))
+                    # reviewer task overridden to gemini lands in the SAME worktree.
+                    client.post("/tasks", json=_task_payload(
+                        "review-1", task_type="review", context={"agent_override": "gemini"},
+                    ))
+                    time.sleep(1.5)
+
+    gemini_intervals = [iv for iv in intervals if iv[0] == gemini_wt]
+    assert len(gemini_intervals) == 2, (
+        f"expected both tasks to eventually dispatch into {gemini_wt}, got {intervals}"
+    )
+    gemini_intervals.sort(key=lambda iv: iv[1])
+    (_, first_start, first_end), (_, second_start, second_end) = gemini_intervals
+    assert second_start >= first_end, (
+        f"two dispatches into the same worktree overlapped — "
+        f"first={first_start:.3f}-{first_end:.3f} second={second_start:.3f}-{second_end:.3f}"
+    )
