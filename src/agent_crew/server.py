@@ -17,6 +17,11 @@ from pydantic import BaseModel
 
 from agent_crew import instructions
 from agent_crew.anomaly import check_wrong_repo
+from agent_crew.context_identity import (
+    detect_context_compaction,
+    extract_claude_session_id,
+    record_context_event,
+)
 from agent_crew.fallback import is_rate_limit_error
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
@@ -1395,6 +1400,17 @@ def create_app(
     except ValueError:
         _MAX_TRANSIENT_RETRY = 3
 
+    # #202: append-only context lifecycle event stream, separate from
+    # attribution.jsonl (see context_identity.record_context_event).
+    _context_events_path = os.path.join(os.path.dirname(db_path), "context_events.jsonl")
+    # context_key → seen since this process started. A resume that's read
+    # from a context_state row already present in the DB (i.e. NOT created
+    # by this process) is a durable-restart recovery, not a first-touch
+    # resume — the first such resolution per process gets its own
+    # "context_recovered" event so restart-survival is directly observable
+    # instead of just inferrable (#202 acceptance criterion).
+    _seen_context_keys_this_process: set[str] = set()
+
     def _fail_if_active(task_id: str, reason: str) -> None:
         """Fail a task only when it is still in_progress (agent may have submitted first)."""
         tasks = q().list_tasks(status="in_progress")
@@ -1404,6 +1420,15 @@ def create_app(
                     task_id,
                     TaskResult(task_id=task_id, status="failed", summary=reason,
                                error_info={"reason": reason}),
+                )
+                _attr = q().get_attribution(task_id)
+                record_context_event(
+                    _context_events_path, "task_failed",
+                    task_id=task_id, reason=reason,
+                    project=(_attr or {}).get("project"),
+                    role=(_attr or {}).get("role"),
+                    agent=(_attr or {}).get("agent"),
+                    context_id=(_attr or {}).get("context_id"),
                 )
             except Exception:
                 logger.exception(f"_fail_if_active: could not fail task {task_id}")
@@ -1442,6 +1467,83 @@ def create_app(
             _fail_if_active(task.task_id, "no_worktree")
             return
 
+        _project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
+        # #202: capture the model in use where it's actually known. Only
+        # gemini passes an explicit --model flag today; claude/codex rely on
+        # their own CLI/config defaults with no reliable flag here, so their
+        # model stays unknown (empty) rather than guessed. Resolved once,
+        # here, and reused below when building the gemini `cmd` so the two
+        # can't drift apart.
+        _known_model = (
+            os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.5 Flash (Medium)")
+            if agent == "gemini" else ""
+        )
+
+        # #202: resolve durable context identity before dispatch. A context
+        # is scoped by (project, agent, worktree) — not role — since
+        # agent_override can route a task from one role into another
+        # agent's worktree and genuinely resume that agent's ongoing
+        # conversation (Agent ≠ Role ≠ Context). An explicit
+        # task.context["context_reset"] forces a new context/generation;
+        # otherwise the very first dispatch into a (project, agent,
+        # worktree) triple is automatically "fresh" and every later one
+        # "resume"s it.
+        _force_context_reset = bool(_ctx.get("context_reset")) if isinstance(_ctx, dict) else False
+        _ctx_info = q().get_or_create_context(
+            project=_project, agent=agent, worktree_path=wt, role=role,
+            task_id=task.task_id, force_reset=_force_context_reset,
+        )
+        _context_key = _ctx_info["context_key"]
+        _is_recovery = (
+            _ctx_info["context_policy"] == "resume"
+            and _context_key not in _seen_context_keys_this_process
+        )
+        _seen_context_keys_this_process.add(_context_key)
+        if _ctx_info["context_policy"] == "fresh":
+            _ctx_event_type = "context_created" if _ctx_info["context_generation"] == 1 else "context_reset"
+        elif _is_recovery:
+            # First time THIS process has resolved a context row it didn't
+            # create itself — it must have survived a restart (#202
+            # "context/task lifecycle survives Agent Crew restart").
+            _ctx_event_type = "context_recovered"
+        else:
+            _ctx_event_type = "context_resumed"
+        try:
+            record_context_event(
+                _context_events_path, _ctx_event_type,
+                task_id=task.task_id, project=_project, role=role, agent=agent,
+                context_id=_ctx_info["context_id"],
+                context_generation=_ctx_info["context_generation"],
+                session_task_index=_ctx_info["session_task_index"],
+                previous_task_id=_ctx_info["previous_task_id"],
+            )
+            # A provider swap relative to the role's *configured default*
+            # agent means retry/fallback routing redirected this dispatch —
+            # surface it as its own event so that lineage doesn't have to
+            # be re-derived from task.context on every read.
+            _role_default_agent = _DISPATCH_ROLE_TO_AGENT.get(role)
+            if _role_default_agent and agent != _role_default_agent:
+                record_context_event(
+                    _context_events_path, "provider_fallback",
+                    task_id=task.task_id, project=_project, role=role,
+                    from_agent=_role_default_agent, to_agent=agent,
+                    context_id=_ctx_info["context_id"],
+                )
+            record_context_event(
+                _context_events_path, "task_started",
+                task_id=task.task_id, project=_project, role=role, agent=agent,
+                task_type=task.task_type, context_id=_ctx_info["context_id"],
+            )
+        except Exception:
+            logger.exception(f"dispatcher: context event emission failed for task={task.task_id}")
+
+        # retry_of / fallback_of: lineage set by _auto_retry_failed_task and
+        # pipeline.auto_fallback_failed_task respectively when they enqueue
+        # a follow-up task (#202 — reconstructable without re-deriving from
+        # each task's own context dict).
+        _retry_of = _ctx.get("original_task_id", "") if "retry_attempt" in _ctx else ""
+        _fallback_of = _ctx.get("fallback_from_task_id", "") if isinstance(_ctx, dict) else ""
+
         # Record durable attribution before dispatch so quota systems can map
         # token usage back to the project even after worktrees are torn down (#174).
         try:
@@ -1455,7 +1557,7 @@ def create_app(
             ).stdout.strip()
             q().record_attribution(
                 task_id=task.task_id,
-                project=task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2]),
+                project=_project,
                 agent=agent,
                 role=role,
                 task_type=task.task_type,
@@ -1463,6 +1565,15 @@ def create_app(
                 repo_url=_repo_url,
                 git_branch=_git_branch,
                 status="in_progress",
+                model=_known_model,
+                context_id=_ctx_info["context_id"],
+                provider_session_id=_ctx_info.get("provider_session_id") or "",
+                context_policy=_ctx_info["context_policy"],
+                context_generation=_ctx_info["context_generation"],
+                session_task_index=_ctx_info["session_task_index"],
+                previous_task_id=_ctx_info.get("previous_task_id") or "",
+                retry_of=_retry_of,
+                fallback_of=_fallback_of,
             )
             # Append-only JSONL for external quota scanners that outlive the DB.
             _attr_jsonl = os.path.join(os.path.dirname(db_path), "attribution.jsonl")
@@ -1474,6 +1585,15 @@ def create_app(
                     "worktree_path": wt, "repo_url": _repo_url,
                     "git_branch": _git_branch, "status": "in_progress",
                     "created_at": _dt2.datetime.utcnow().isoformat(),
+                    "model": _known_model,
+                    "context_id": _ctx_info["context_id"],
+                    "provider_session_id": _ctx_info.get("provider_session_id"),
+                    "context_policy": _ctx_info["context_policy"],
+                    "context_generation": _ctx_info["context_generation"],
+                    "session_task_index": _ctx_info["session_task_index"],
+                    "previous_task_id": _ctx_info.get("previous_task_id"),
+                    "retry_of": _retry_of or None,
+                    "fallback_of": _fallback_of or None,
                 }) + "\n")
         except Exception:
             logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
@@ -1518,12 +1638,13 @@ def create_app(
             # default. agy 1.1.x switched --model to take the display name
             # from `agy models` rather than a slug (e.g. "gemini-3.5-flash"
             # now 400s with "model ... is not recognized"). Override via
-            # AGENT_CREW_GEMINI_MODEL.
-            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.5 Flash (Medium)")
+            # AGENT_CREW_GEMINI_MODEL. (_known_model resolved earlier,
+            # before dispatch, so the attribution record and this cmd can't
+            # drift apart — #202.)
             cmd = [
                 "agy", "-p", message,
                 "--continue", "--dangerously-skip-permissions",
-                "--model", _gemini_model,
+                "--model", _known_model,
             ]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
             cmd = [
@@ -1592,6 +1713,28 @@ def create_app(
             _transient = _detect_transient_error_in_log(
                 log_path, since_offset=_task_log_start_offset
             )
+            # #202: best-effort provider_session_id capture + compaction
+            # detection, scoped to just this task's own output (same
+            # since_offset technique as #200, so a previous task's leftover
+            # text can't bleed into it). Both are observational — a miss
+            # doesn't mean anything went wrong, just that nothing reliable
+            # was observed on stdout for this provider.
+            try:
+                with open(log_path, "r", errors="replace") as _lf:
+                    _lf.seek(_task_log_start_offset)
+                    _task_log_tail = _lf.read()
+                if agent == "claude":
+                    _discovered_session_id = extract_claude_session_id(_task_log_tail)
+                    if _discovered_session_id and _discovered_session_id != _ctx_info.get("provider_session_id"):
+                        q().update_context_provider_session_id(_context_key, _discovered_session_id)
+                if detect_context_compaction(_task_log_tail):
+                    record_context_event(
+                        _context_events_path, "context_compacted",
+                        task_id=task.task_id, project=_project, role=role, agent=agent,
+                        context_id=_ctx_info["context_id"],
+                    )
+            except Exception:
+                logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
             if _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
@@ -2015,6 +2158,23 @@ def create_app(
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
             status_code = 404 if "not found" in msg.lower() else 400
             raise HTTPException(status_code=status_code, detail=msg)
+        # #202: lifecycle event for the agent-self-reported terminal outcome
+        # (the internal dispatcher-detected failure paths emit their own
+        # task_failed from _fail_if_active — this covers the case where the
+        # agent process itself completed and called back here).
+        try:
+            _attr = q().get_attribution(task_id)
+            record_context_event(
+                _context_events_path,
+                "task_completed" if result.status == "completed" else "task_failed",
+                task_id=task_id, outcome=result.status,
+                project=(_attr or {}).get("project"),
+                role=(_attr or {}).get("role"),
+                agent=(_attr or {}).get("agent"),
+                context_id=(_attr or {}).get("context_id"),
+            )
+        except Exception:
+            logger.exception(f"POST /tasks/{task_id}/result: context event emission failed")
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")

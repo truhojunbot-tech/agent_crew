@@ -68,7 +68,10 @@ crew teardown myproject
 - **Port**: auto-selected starting from 8100, written to `~/.agent_crew/<project>/port`
 - **Worktrees**: `~/.agent_crew/<project>/{claude,codex,gemini}/`
 
-See [docs/architecture.md](docs/architecture.md) for full design details.
+See [docs/architecture.md](docs/architecture.md) for full design details, and
+[docs/context_identity_contract.md](docs/context_identity_contract.md) for the
+durable context identity + lifecycle telemetry contract external tools can
+observe (task↔context attribution, retry/fallback lineage, restart recovery).
 
 ## Security
 
