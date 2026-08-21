@@ -494,3 +494,99 @@ def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, t
         f"two dispatches into the same worktree overlapped — "
         f"first={first_start:.3f}-{first_end:.3f} second={second_start:.3f}-{second_end:.3f}"
     )
+
+
+# ---------------------------------------------------------------------------
+# #202 review round 2: terminal attribution.jsonl line + atomic status update
+# ---------------------------------------------------------------------------
+
+def test_u_i202_attribution_terminal_state_on_agent_success(tmp_db, tmp_path):
+    """The agent's own POST /tasks/{id}/result completion must (a) flip
+    task_attribution.status from 'in_progress' to the terminal status
+    atomically with outcome/completed_at, and (b) append a SECOND
+    attribution.jsonl line reflecting that terminal state — not leave a
+    tail-only consumer stuck seeing only the dispatch-time snapshot."""
+    from agent_crew.context_identity import append_attribution_jsonl
+    from agent_crew.protocol import TaskRequest
+
+    state, wt_paths = _worktree_state(tmp_path)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+    attr_jsonl_path = os.path.join(str(tmp_path), "attribution.jsonl")
+
+    with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1", "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
+        app = create_app(
+            db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+            watchdog_disabled=True, anomaly_disabled=True,
+        )
+        with TestClient(app) as client:
+            q = TaskQueue(tmp_db)
+            q.enqueue(TaskRequest(task_id="succ-1", task_type="test", description="d", context={}))
+            # Mirror exactly what _dispatch_task does at dispatch time: record
+            # the in_progress attribution row, then append its dispatch-time
+            # JSONL snapshot.
+            q.record_attribution(
+                task_id="succ-1", project="p", agent="gemini", role="tester",
+                task_type="test", worktree_path=str(wt_paths["gemini"]),
+                status="in_progress", context_id="ctx-succ-1",
+            )
+            append_attribution_jsonl(attr_jsonl_path, q.get_attribution("succ-1"))
+
+            # Simulate the agent CLI's own completion callback.
+            resp = client.post("/tasks/succ-1/result", json={
+                "task_id": "succ-1", "status": "completed", "summary": "done",
+            })
+            assert resp.status_code == 200
+
+    row = TaskQueue(tmp_db).get_attribution("succ-1")
+    assert row["status"] == "completed", "status must be updated atomically with outcome, not left in_progress"
+    assert row["outcome"] == "completed"
+    assert row["completed_at"] > 0
+
+    succ_lines = [e for e in _read_jsonl(attr_jsonl_path) if e.get("task_id") == "succ-1"]
+    assert len(succ_lines) == 2, f"expected dispatch-time + terminal lines, got {succ_lines}"
+    assert succ_lines[0]["status"] == "in_progress"
+    assert succ_lines[1]["status"] == "completed"
+    assert succ_lines[1]["outcome"] == "completed"
+
+
+def test_u_i202_attribution_terminal_state_on_internal_dispatcher_failure(tmp_db, tmp_path):
+    """A task that fails via an INTERNAL dispatcher path (subprocess exits
+    non-zero without the agent ever POSTing a result — _fail_if_active,
+    not the agent-self-report HTTP endpoint) must get the same terminal
+    treatment: status flips to 'failed' and a terminal attribution.jsonl
+    line is appended."""
+    state, wt_paths = _worktree_state(tmp_path)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+
+    fake_subprocess = _make_fake_subprocess()  # returncode=1, never posts a result
+
+    with patch.dict(os.environ, {
+        "AGENT_CREW_DISPATCHER": "1",
+        "AGENT_CREW_DISPATCH_INTERVAL": "0.05",
+        "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1",
+        "AGENT_CREW_TRANSIENT_RETRY_MAX": "0",
+    }):
+        with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
+            with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+                app = create_app(
+                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    watchdog_disabled=True, anomaly_disabled=True,
+                )
+                with TestClient(app) as client:
+                    resp = client.post("/tasks", json=_task_payload("fail-internal-1"))
+                    assert resp.status_code == 201
+                    time.sleep(0.6)
+
+    task_id = "fail-internal-1"
+
+    row = TaskQueue(tmp_db).get_attribution(task_id)
+    assert row is not None
+    assert row["status"] == "failed", f"expected status=failed after internal dispatcher failure, got {row['status']!r}"
+    assert row["outcome"].startswith("failed"), f"expected an outcome reason, got {row['outcome']!r}"
+    assert row["completed_at"] > 0
+
+    matching_lines = [e for e in _read_jsonl(os.path.join(str(tmp_path), "attribution.jsonl")) if e.get("task_id") == task_id]
+    assert len(matching_lines) >= 2, f"expected dispatch-time + terminal lines, got {matching_lines}"
+    assert matching_lines[-1]["status"] == "failed"
