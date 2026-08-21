@@ -3,8 +3,10 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from typing import List, Optional
 
+from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 
 _ROLE_TO_TYPE = {
@@ -77,6 +79,74 @@ CREATE TABLE IF NOT EXISTS task_attribution (
 )
 """
 
+# Durable context identity (#202) — one row per (project, agent,
+# worktree_path). NOT keyed by role: agent_override can route a task from
+# one role into another agent's worktree, and doing so genuinely resumes
+# that agent's ongoing provider conversation regardless of which role
+# nominally owns the task (Agent ≠ Role ≠ Context).
+_DDL_CONTEXT_STATE = """
+CREATE TABLE IF NOT EXISTS context_state (
+    context_key          TEXT PRIMARY KEY,
+    project              TEXT NOT NULL DEFAULT '',
+    role                 TEXT NOT NULL DEFAULT '',
+    agent                TEXT NOT NULL DEFAULT '',
+    worktree_path        TEXT NOT NULL DEFAULT '',
+    context_id           TEXT NOT NULL,
+    context_generation   INTEGER NOT NULL DEFAULT 1,
+    session_task_index   INTEGER NOT NULL DEFAULT 0,
+    provider_session_id  TEXT,
+    last_task_id         TEXT,
+    created_at           REAL NOT NULL,
+    updated_at           REAL NOT NULL
+)
+"""
+
+# task_attribution migrations (#202) — durable context identity + lineage
+# fields, added via the same defensive ALTER-TABLE pattern as the existing
+# tasks-table migrations below. All nullable/defaulted so existing rows
+# (written before this migration) remain valid.
+_DDL_MIGRATE_ATTR_SCHEMA_VERSION = (
+    "ALTER TABLE task_attribution ADD COLUMN schema_version INTEGER NOT NULL DEFAULT 1"
+)
+_DDL_MIGRATE_ATTR_MODEL = "ALTER TABLE task_attribution ADD COLUMN model TEXT DEFAULT ''"
+_DDL_MIGRATE_ATTR_CONTEXT_ID = "ALTER TABLE task_attribution ADD COLUMN context_id TEXT DEFAULT ''"
+_DDL_MIGRATE_ATTR_PROVIDER_SESSION_ID = (
+    "ALTER TABLE task_attribution ADD COLUMN provider_session_id TEXT DEFAULT ''"
+)
+_DDL_MIGRATE_ATTR_CONTEXT_POLICY = (
+    "ALTER TABLE task_attribution ADD COLUMN context_policy TEXT DEFAULT ''"
+)
+_DDL_MIGRATE_ATTR_CONTEXT_GENERATION = (
+    "ALTER TABLE task_attribution ADD COLUMN context_generation INTEGER DEFAULT 0"
+)
+_DDL_MIGRATE_ATTR_SESSION_TASK_INDEX = (
+    "ALTER TABLE task_attribution ADD COLUMN session_task_index INTEGER DEFAULT 0"
+)
+_DDL_MIGRATE_ATTR_PREVIOUS_TASK_ID = (
+    "ALTER TABLE task_attribution ADD COLUMN previous_task_id TEXT DEFAULT ''"
+)
+_DDL_MIGRATE_ATTR_RETRY_OF = "ALTER TABLE task_attribution ADD COLUMN retry_of TEXT DEFAULT ''"
+_DDL_MIGRATE_ATTR_FALLBACK_OF = "ALTER TABLE task_attribution ADD COLUMN fallback_of TEXT DEFAULT ''"
+_DDL_MIGRATE_ATTR_STARTED_AT = "ALTER TABLE task_attribution ADD COLUMN started_at REAL DEFAULT 0"
+_DDL_MIGRATE_ATTR_COMPLETED_AT = "ALTER TABLE task_attribution ADD COLUMN completed_at REAL DEFAULT 0"
+_DDL_MIGRATE_ATTR_OUTCOME = "ALTER TABLE task_attribution ADD COLUMN outcome TEXT DEFAULT ''"
+
+_DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
+    _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
+    _DDL_MIGRATE_ATTR_MODEL,
+    _DDL_MIGRATE_ATTR_CONTEXT_ID,
+    _DDL_MIGRATE_ATTR_PROVIDER_SESSION_ID,
+    _DDL_MIGRATE_ATTR_CONTEXT_POLICY,
+    _DDL_MIGRATE_ATTR_CONTEXT_GENERATION,
+    _DDL_MIGRATE_ATTR_SESSION_TASK_INDEX,
+    _DDL_MIGRATE_ATTR_PREVIOUS_TASK_ID,
+    _DDL_MIGRATE_ATTR_RETRY_OF,
+    _DDL_MIGRATE_ATTR_FALLBACK_OF,
+    _DDL_MIGRATE_ATTR_STARTED_AT,
+    _DDL_MIGRATE_ATTR_COMPLETED_AT,
+    _DDL_MIGRATE_ATTR_OUTCOME,
+)
+
 _DDL_CHECKPOINTS = """
 CREATE TABLE IF NOT EXISTS checkpoints (
     checkpoint_id TEXT PRIMARY KEY,
@@ -108,6 +178,7 @@ class TaskQueue:
         conn.execute(_DDL_GATES)
         conn.execute(_DDL_ATTRIBUTION)
         conn.execute(_DDL_CHECKPOINTS)
+        conn.execute(_DDL_CONTEXT_STATE)
         # Migrate existing DBs: add project column if absent
         try:
             conn.execute(_DDL_MIGRATE_PROJECT)
@@ -125,6 +196,12 @@ class TaskQueue:
             conn.execute(_DDL_MIGRATE_ERROR_INFO)
         except Exception:
             pass  # column already exists
+        # #202: durable context identity + lineage columns on task_attribution.
+        for _stmt in _DDL_MIGRATE_ATTRIBUTION_COLUMNS:
+            try:
+                conn.execute(_stmt)
+            except Exception:
+                pass  # column already exists
         # Create indexes for performance
         for idx_stmt in _DDL_INDEXES.strip().split('\n'):
             if idx_stmt.strip():
@@ -314,6 +391,25 @@ class TaskQueue:
                     error_info_json,
                     task_id,
                 ),
+            )
+            # #202: record the final outcome on the attribution row too, in
+            # the same transaction, so it's set regardless of whether this
+            # came from the agent's own POST /tasks/{id}/result or an
+            # internal dispatcher failure path (_fail_if_active calls this
+            # method directly) — both funnel through here. status is set
+            # alongside outcome/completed_at (not left at 'in_progress') so
+            # the row can't end up internally contradictory — a terminal
+            # outcome sitting next to a stale in_progress status broke
+            # status-based external queries (review of PR #203, finding 3).
+            outcome = result.status
+            if result.status == "failed" and isinstance(result.error_info, dict):
+                reason = result.error_info.get("reason")
+                if reason:
+                    outcome = f"failed:{reason}"
+            now = time.time()
+            conn.execute(
+                "UPDATE task_attribution SET status=?, outcome=?, completed_at=?, updated_at=? WHERE task_id=?",
+                (result.status, outcome, now, now, task_id),
             )
             conn.commit()
             return task_type
@@ -791,6 +887,19 @@ class TaskQueue:
         repo_url: str = "",
         git_branch: str = "",
         status: str = "pending",
+        # #202: durable context identity + lineage. All optional/backward
+        # compatible — existing callers that only pass the fields above
+        # keep working, and new rows without them default to empty/0.
+        model: str = "",
+        context_id: str = "",
+        provider_session_id: str = "",
+        context_policy: str = "",
+        context_generation: int = 0,
+        session_task_index: int = 0,
+        previous_task_id: str = "",
+        retry_of: str = "",
+        fallback_of: str = "",
+        started_at: float = 0.0,
     ) -> None:
         """Upsert a durable attribution record so quota systems can map token
         usage back to the project even after worktrees are torn down."""
@@ -806,13 +915,27 @@ class TaskQueue:
                 """
                 INSERT INTO task_attribution
                     (task_id, project, agent, role, task_type, worktree_path,
-                     codex_logs_path, repo_url, git_branch, created_at, updated_at, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     codex_logs_path, repo_url, git_branch, created_at, updated_at, status,
+                     schema_version, model, context_id, provider_session_id, context_policy,
+                     context_generation, session_task_index, previous_task_id, retry_of,
+                     fallback_of, started_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
-                    status=excluded.status, updated_at=excluded.updated_at
+                    status=excluded.status, updated_at=excluded.updated_at,
+                    model=excluded.model, context_id=excluded.context_id,
+                    provider_session_id=excluded.provider_session_id,
+                    context_policy=excluded.context_policy,
+                    context_generation=excluded.context_generation,
+                    session_task_index=excluded.session_task_index,
+                    previous_task_id=excluded.previous_task_id,
+                    retry_of=excluded.retry_of, fallback_of=excluded.fallback_of,
+                    started_at=excluded.started_at
                 """,
                 (task_id, project, agent, role, task_type, worktree_path,
-                 codex_logs_path, repo_url, git_branch, now, now, status),
+                 codex_logs_path, repo_url, git_branch, now, now, status,
+                 CONTEXT_SCHEMA_VERSION, model, context_id, provider_session_id,
+                 context_policy, context_generation, session_task_index,
+                 previous_task_id, retry_of, fallback_of, started_at or now),
             )
             conn.commit()
         finally:
@@ -827,6 +950,134 @@ class TaskQueue:
                 (status, time.time(), task_id),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def update_attribution_outcome(self, task_id: str, outcome: str) -> None:
+        """Record the final outcome + completion timestamp for a task's
+        attribution row (#202). Called once a task reaches a terminal state,
+        regardless of whether that happened via the agent's own result POST
+        or an internal dispatcher failure path — both funnel through
+        ``submit_result`` below."""
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE task_attribution SET outcome=?, completed_at=?, updated_at=? WHERE task_id=?",
+                (outcome, now, now, task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_or_create_context(
+        self,
+        project: str,
+        agent: str,
+        worktree_path: str,
+        role: str = "",
+        task_id: str = "",
+        force_reset: bool = False,
+    ) -> dict:
+        """Resolve the durable context identity for ``(project, agent,
+        worktree_path)`` (#202).
+
+        A context is scoped by agent+worktree, NOT role — see module-level
+        design note in ``context_identity.py``. Mints a new ``context_id``
+        (and bumps ``context_generation``) when no row exists yet for this
+        key, or when ``force_reset=True`` (caller made an explicit
+        ``context_reset`` request). Otherwise reuses the existing
+        ``context_id`` and increments ``session_task_index``.
+
+        Returns a dict: ``context_key, context_id, context_generation,
+        session_task_index, context_policy`` (``"fresh"`` or ``"resume"``),
+        ``previous_task_id``, ``provider_session_id``.
+        """
+        context_key = f"{project}::{agent}::{worktree_path}"
+        now = time.time()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM context_state WHERE context_key = ?", (context_key,)
+            ).fetchone()
+            if row is None or force_reset:
+                context_id = str(uuid.uuid4())
+                generation = (row["context_generation"] + 1) if row else 1
+                session_task_index = 1
+                policy = "fresh"
+                previous_task_id = row["last_task_id"] if row else None
+                provider_session_id = None
+                conn.execute(
+                    """
+                    INSERT INTO context_state
+                        (context_key, project, role, agent, worktree_path, context_id,
+                         context_generation, session_task_index, provider_session_id,
+                         last_task_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(context_key) DO UPDATE SET
+                        role=excluded.role, context_id=excluded.context_id,
+                        context_generation=excluded.context_generation,
+                        session_task_index=excluded.session_task_index,
+                        provider_session_id=excluded.provider_session_id,
+                        last_task_id=excluded.last_task_id, updated_at=excluded.updated_at
+                    """,
+                    (context_key, project, role, agent, worktree_path, context_id,
+                     generation, session_task_index, provider_session_id,
+                     task_id, now, now),
+                )
+            else:
+                context_id = row["context_id"]
+                generation = row["context_generation"]
+                session_task_index = row["session_task_index"] + 1
+                policy = "resume"
+                previous_task_id = row["last_task_id"]
+                provider_session_id = row["provider_session_id"]
+                conn.execute(
+                    """
+                    UPDATE context_state
+                    SET role=?, session_task_index=?, last_task_id=?, updated_at=?
+                    WHERE context_key=?
+                    """,
+                    (role, session_task_index, task_id, now, context_key),
+                )
+            conn.commit()
+            return {
+                "context_key": context_key,
+                "context_id": context_id,
+                "context_generation": generation,
+                "session_task_index": session_task_index,
+                "context_policy": policy,
+                "previous_task_id": previous_task_id,
+                "provider_session_id": provider_session_id,
+            }
+        finally:
+            conn.close()
+
+    def update_context_provider_session_id(self, context_key: str, provider_session_id: str) -> None:
+        """Record a provider-native session id observed for this context
+        (#202) — e.g. parsed from claude's stream-json output. Best-effort;
+        left null when the provider doesn't expose one reliably."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE context_state SET provider_session_id=?, updated_at=? WHERE context_key=?",
+                (provider_session_id, time.time(), context_key),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_attribution(self, task_id: str) -> Optional[dict]:
+        """Return the durable attribution row for ``task_id`` (#202), or
+        None if no attribution was ever recorded for it. Used to correlate
+        an internal dispatcher failure back to its project/role/agent/
+        context_id when emitting a ``task_failed`` lifecycle event."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM task_attribution WHERE task_id = ?", (task_id,)
+            ).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 

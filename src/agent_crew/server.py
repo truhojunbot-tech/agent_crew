@@ -17,6 +17,12 @@ from pydantic import BaseModel
 
 from agent_crew import instructions
 from agent_crew.anomaly import check_wrong_repo
+from agent_crew.context_identity import (
+    append_attribution_jsonl,
+    detect_context_compaction,
+    extract_claude_session_id,
+    record_context_event,
+)
 from agent_crew.fallback import is_rate_limit_error
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
@@ -1395,6 +1401,18 @@ def create_app(
     except ValueError:
         _MAX_TRANSIENT_RETRY = 3
 
+    # #202: append-only context lifecycle event stream, separate from
+    # attribution.jsonl (see context_identity.record_context_event).
+    _context_events_path = os.path.join(os.path.dirname(db_path), "context_events.jsonl")
+    _attr_jsonl_path = os.path.join(os.path.dirname(db_path), "attribution.jsonl")
+    # context_key → seen since this process started. A resume that's read
+    # from a context_state row already present in the DB (i.e. NOT created
+    # by this process) is a durable-restart recovery, not a first-touch
+    # resume — the first such resolution per process gets its own
+    # "context_recovered" event so restart-survival is directly observable
+    # instead of just inferrable (#202 acceptance criterion).
+    _seen_context_keys_this_process: set[str] = set()
+
     def _fail_if_active(task_id: str, reason: str) -> None:
         """Fail a task only when it is still in_progress (agent may have submitted first)."""
         tasks = q().list_tasks(status="in_progress")
@@ -1405,16 +1423,41 @@ def create_app(
                     TaskResult(task_id=task_id, status="failed", summary=reason,
                                error_info={"reason": reason}),
                 )
+                _attr = q().get_attribution(task_id)
+                record_context_event(
+                    _context_events_path, "task_failed",
+                    task_id=task_id, reason=reason,
+                    project=(_attr or {}).get("project"),
+                    role=(_attr or {}).get("role"),
+                    agent=(_attr or {}).get("agent"),
+                    context_id=(_attr or {}).get("context_id"),
+                )
+                # #202 review finding 2: append the terminal state too, not
+                # just the dispatch-time snapshot, so a JSONL-only consumer
+                # can see this task actually failed.
+                if _attr:
+                    append_attribution_jsonl(_attr_jsonl_path, _attr)
             except Exception:
                 logger.exception(f"_fail_if_active: could not fail task {task_id}")
 
-    async def _dispatch_task(task: TaskRequest, role: str) -> None:
-        """Spawn a headless agent subprocess for one task and await its exit."""
+    def _resolve_dispatch_target(task: TaskRequest, role: str) -> tuple[str, Optional[str]]:
+        """Resolve the (agent, worktree_path) a task will actually dispatch
+        into, honoring ``task.context["agent_override"]`` (#188) — e.g.
+        `crew run --reviewer gemini`. Without this the CLI flag has no
+        effect and review always routes to the role's default agent
+        (codex), making it a SPOF.
+
+        Pure/side-effect-free on purpose: shared by ``_dispatcher_loop``
+        (to serialize dispatch by the *resolved* worktree, not just role —
+        #202 review of PR #203, finding 1: two different roles' tasks can
+        both resolve into the same overridden agent's worktree and, since
+        role-level exclusivity doesn't see that, run concurrently against
+        one provider `--continue` conversation and corrupt it) and
+        ``_dispatch_task`` (to actually run it). Both callers resolving via
+        the same function means they can never disagree about the target.
+        """
         agent = _DISPATCH_ROLE_TO_AGENT.get(role, "claude")
         wt_override: Optional[str] = None
-        # Honor agent_override in task.context — e.g. `crew run --reviewer gemini`
-        # (#188). Without this the CLI flag has no effect and review always
-        # routes to the role's default agent (codex), making it a SPOF.
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         if _override and _override != agent:
@@ -1425,22 +1468,108 @@ def create_app(
                         wt_override = _wt_candidate
                         break
             if wt_override:
+                agent = _override
+        wt = wt_override or worktree_map.get(role)
+        return agent, wt
+
+    async def _dispatch_task(task: TaskRequest, role: str) -> None:
+        """Spawn a headless agent subprocess for one task and await its exit."""
+        _ctx = task.context if isinstance(task.context, dict) else {}
+        _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
+        agent, wt = _resolve_dispatch_target(task, role)
+        if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
+            if agent == _override:
                 logger.info(
-                    f"dispatcher: agent_override {_override} → wt={wt_override} "
+                    f"dispatcher: agent_override {_override} → wt={wt} "
                     f"(task={task.task_id}, role={role})"
                 )
-                agent = _override
             else:
                 logger.warning(
                     f"dispatcher: agent_override={_override!r} has no worktree; "
                     f"falling back to role default agent={agent}"
                 )
         logger.debug(f"dispatcher: _dispatch_task enter role={role!r} worktree_map_keys={list(worktree_map.keys())} task={task.task_id} agent={agent}")
-        wt = wt_override or worktree_map.get(role)
         if not wt:
             logger.error(f"dispatcher: no worktree for role={role!r} worktree_map={worktree_map!r} task={task.task_id}")
             _fail_if_active(task.task_id, "no_worktree")
             return
+
+        _project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
+        # #202: capture the model in use where it's actually known. Only
+        # gemini passes an explicit --model flag today; claude/codex rely on
+        # their own CLI/config defaults with no reliable flag here, so their
+        # model stays unknown (empty) rather than guessed. Resolved once,
+        # here, and reused below when building the gemini `cmd` so the two
+        # can't drift apart.
+        _known_model = (
+            os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.5 Flash (Medium)")
+            if agent == "gemini" else ""
+        )
+
+        # #202: resolve durable context identity before dispatch. A context
+        # is scoped by (project, agent, worktree) — not role — since
+        # agent_override can route a task from one role into another
+        # agent's worktree and genuinely resume that agent's ongoing
+        # conversation (Agent ≠ Role ≠ Context). An explicit
+        # task.context["context_reset"] forces a new context/generation;
+        # otherwise the very first dispatch into a (project, agent,
+        # worktree) triple is automatically "fresh" and every later one
+        # "resume"s it.
+        _force_context_reset = bool(_ctx.get("context_reset")) if isinstance(_ctx, dict) else False
+        _ctx_info = q().get_or_create_context(
+            project=_project, agent=agent, worktree_path=wt, role=role,
+            task_id=task.task_id, force_reset=_force_context_reset,
+        )
+        _context_key = _ctx_info["context_key"]
+        _is_recovery = (
+            _ctx_info["context_policy"] == "resume"
+            and _context_key not in _seen_context_keys_this_process
+        )
+        _seen_context_keys_this_process.add(_context_key)
+        if _ctx_info["context_policy"] == "fresh":
+            _ctx_event_type = "context_created" if _ctx_info["context_generation"] == 1 else "context_reset"
+        elif _is_recovery:
+            # First time THIS process has resolved a context row it didn't
+            # create itself — it must have survived a restart (#202
+            # "context/task lifecycle survives Agent Crew restart").
+            _ctx_event_type = "context_recovered"
+        else:
+            _ctx_event_type = "context_resumed"
+        try:
+            record_context_event(
+                _context_events_path, _ctx_event_type,
+                task_id=task.task_id, project=_project, role=role, agent=agent,
+                context_id=_ctx_info["context_id"],
+                context_generation=_ctx_info["context_generation"],
+                session_task_index=_ctx_info["session_task_index"],
+                previous_task_id=_ctx_info["previous_task_id"],
+            )
+            # A provider swap relative to the role's *configured default*
+            # agent means retry/fallback routing redirected this dispatch —
+            # surface it as its own event so that lineage doesn't have to
+            # be re-derived from task.context on every read.
+            _role_default_agent = _DISPATCH_ROLE_TO_AGENT.get(role)
+            if _role_default_agent and agent != _role_default_agent:
+                record_context_event(
+                    _context_events_path, "provider_fallback",
+                    task_id=task.task_id, project=_project, role=role,
+                    from_agent=_role_default_agent, to_agent=agent,
+                    context_id=_ctx_info["context_id"],
+                )
+            record_context_event(
+                _context_events_path, "task_started",
+                task_id=task.task_id, project=_project, role=role, agent=agent,
+                task_type=task.task_type, context_id=_ctx_info["context_id"],
+            )
+        except Exception:
+            logger.exception(f"dispatcher: context event emission failed for task={task.task_id}")
+
+        # retry_of / fallback_of: lineage set by _auto_retry_failed_task and
+        # pipeline.auto_fallback_failed_task respectively when they enqueue
+        # a follow-up task (#202 — reconstructable without re-deriving from
+        # each task's own context dict).
+        _retry_of = _ctx.get("original_task_id", "") if "retry_attempt" in _ctx else ""
+        _fallback_of = _ctx.get("fallback_from_task_id", "") if isinstance(_ctx, dict) else ""
 
         # Record durable attribution before dispatch so quota systems can map
         # token usage back to the project even after worktrees are torn down (#174).
@@ -1455,7 +1584,7 @@ def create_app(
             ).stdout.strip()
             q().record_attribution(
                 task_id=task.task_id,
-                project=task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2]),
+                project=_project,
                 agent=agent,
                 role=role,
                 task_type=task.task_type,
@@ -1463,18 +1592,27 @@ def create_app(
                 repo_url=_repo_url,
                 git_branch=_git_branch,
                 status="in_progress",
+                model=_known_model,
+                context_id=_ctx_info["context_id"],
+                provider_session_id=_ctx_info.get("provider_session_id") or "",
+                context_policy=_ctx_info["context_policy"],
+                context_generation=_ctx_info["context_generation"],
+                session_task_index=_ctx_info["session_task_index"],
+                previous_task_id=_ctx_info.get("previous_task_id") or "",
+                retry_of=_retry_of,
+                fallback_of=_fallback_of,
             )
-            # Append-only JSONL for external quota scanners that outlive the DB.
-            _attr_jsonl = os.path.join(os.path.dirname(db_path), "attribution.jsonl")
-            import datetime as _dt2
-            with open(_attr_jsonl, "a") as _af:
-                _af.write(json.dumps({
-                    "task_id": task.task_id, "project": task.project,
-                    "agent": agent, "role": role, "task_type": task.task_type,
-                    "worktree_path": wt, "repo_url": _repo_url,
-                    "git_branch": _git_branch, "status": "in_progress",
-                    "created_at": _dt2.datetime.utcnow().isoformat(),
-                }) + "\n")
+            # Append-only JSONL for external quota scanners that outlive the
+            # DB. Written from the DB row itself (not a hand-built dict) so
+            # the two representations can't drift apart (#202 review of PR
+            # #203, finding 2) — a second line gets appended at task
+            # completion (see _fail_if_active and the /result endpoint)
+            # with the same task_id and the terminal status/outcome/
+            # completed_at, so a tail-only consumer can observe the final
+            # result and not just this in-flight snapshot.
+            _attr_row = q().get_attribution(task.task_id)
+            if _attr_row:
+                append_attribution_jsonl(_attr_jsonl_path, _attr_row)
         except Exception:
             logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
 
@@ -1518,12 +1656,13 @@ def create_app(
             # default. agy 1.1.x switched --model to take the display name
             # from `agy models` rather than a slug (e.g. "gemini-3.5-flash"
             # now 400s with "model ... is not recognized"). Override via
-            # AGENT_CREW_GEMINI_MODEL.
-            _gemini_model = os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.5 Flash (Medium)")
+            # AGENT_CREW_GEMINI_MODEL. (_known_model resolved earlier,
+            # before dispatch, so the attribution record and this cmd can't
+            # drift apart — #202.)
             cmd = [
                 "agy", "-p", message,
                 "--continue", "--dangerously-skip-permissions",
-                "--model", _gemini_model,
+                "--model", _known_model,
             ]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
             cmd = [
@@ -1592,6 +1731,28 @@ def create_app(
             _transient = _detect_transient_error_in_log(
                 log_path, since_offset=_task_log_start_offset
             )
+            # #202: best-effort provider_session_id capture + compaction
+            # detection, scoped to just this task's own output (same
+            # since_offset technique as #200, so a previous task's leftover
+            # text can't bleed into it). Both are observational — a miss
+            # doesn't mean anything went wrong, just that nothing reliable
+            # was observed on stdout for this provider.
+            try:
+                with open(log_path, "r", errors="replace") as _lf:
+                    _lf.seek(_task_log_start_offset)
+                    _task_log_tail = _lf.read()
+                if agent == "claude":
+                    _discovered_session_id = extract_claude_session_id(_task_log_tail)
+                    if _discovered_session_id and _discovered_session_id != _ctx_info.get("provider_session_id"):
+                        q().update_context_provider_session_id(_context_key, _discovered_session_id)
+                if detect_context_compaction(_task_log_tail):
+                    record_context_event(
+                        _context_events_path, "context_compacted",
+                        task_id=task.task_id, project=_project, role=role, agent=agent,
+                        context_id=_ctx_info["context_id"],
+                    )
+            except Exception:
+                logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
             if _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
@@ -1704,9 +1865,18 @@ def create_app(
     async def _dispatcher_loop() -> None:
         """Poll DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn headless
         agent subprocesses.  One concurrent task per role (same --continue session
-        cannot be shared across parallel invocations).
+        cannot be shared across parallel invocations) — AND, since #202
+        review of PR #203 (finding 1), one concurrent task per *resolved*
+        worktree, since agent_override can route two different roles into
+        the same underlying agent/worktree/provider conversation. Role-slot
+        exclusivity alone doesn't see that — e.g. tester's normal gemini
+        task and a reviewer task with agent_override=gemini both occupy
+        different role slots but resolve to the same gemini worktree, and
+        running both `--continue` processes concurrently there would
+        corrupt that conversation. See _resolve_dispatch_target.
         """
         active_roles: set[str] = set()
+        active_worktrees: set[str] = set()
         active_tasks: dict[str, asyncio.Task] = {}  # task_id → asyncio.Task
         task_roles: dict[str, str] = {}  # task_id → role
 
@@ -1741,14 +1911,32 @@ def create_app(
                         task = q().dequeue(role=role)
                         if task is None:
                             continue
+                        _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        if _target_wt and _target_wt in active_worktrees:
+                            # Same worktree/provider conversation already in
+                            # flight under a different role slot — put the
+                            # task back and try again next tick, rather than
+                            # running two `--continue` processes against one
+                            # conversation concurrently.
+                            logger.info(
+                                f"dispatcher: deferring task={task.task_id} role={role} "
+                                f"agent={_target_agent} — target worktree {_target_wt} "
+                                "already active under another role this tick"
+                            )
+                            q().requeue(task.task_id)
+                            continue
                         active_roles.add(role)
+                        if _target_wt:
+                            active_worktrees.add(_target_wt)
                         task_roles[task.task_id] = role
 
-                        async def _run(t: TaskRequest = task, r: str = role) -> None:
+                        async def _run(t: TaskRequest = task, r: str = role, w: Optional[str] = _target_wt) -> None:
                             try:
                                 await _dispatch_task(t, r)
                             finally:
                                 active_roles.discard(r)
+                                if w:
+                                    active_worktrees.discard(w)
                                 active_tasks.pop(t.task_id, None)
                                 task_roles.pop(t.task_id, None)
 
@@ -1763,16 +1951,29 @@ def create_app(
                         if task is None:
                             continue
                         role = _AGENT_TO_ROLE.get(agent, "implementer")
+                        _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        if _target_wt and _target_wt in active_worktrees:
+                            logger.info(
+                                f"dispatcher: deferring discuss task={task.task_id} agent={agent} "
+                                f"— target worktree {_target_wt} already active this tick"
+                            )
+                            q().requeue(task.task_id)
+                            continue
                         active_roles.add(slot_key)
+                        if _target_wt:
+                            active_worktrees.add(_target_wt)
                         task_roles[task.task_id] = slot_key
 
                         async def _run_discuss(
-                            t: TaskRequest = task, r: str = role, s: str = slot_key
+                            t: TaskRequest = task, r: str = role, s: str = slot_key,
+                            w: Optional[str] = _target_wt,
                         ) -> None:
                             try:
                                 await _dispatch_task(t, r)
                             finally:
                                 active_roles.discard(s)
+                                if w:
+                                    active_worktrees.discard(w)
                                 active_tasks.pop(t.task_id, None)
                                 task_roles.pop(t.task_id, None)
 
@@ -1999,11 +2200,6 @@ def create_app(
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
-        # #174: update durable attribution status on result submission.
-        try:
-            q().update_attribution_status(task_id, result.status)
-        except Exception:
-            logger.exception(f"POST /tasks/{task_id}/result: attribution status update failed")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
         ctx = q().get_task_context(task_id)
@@ -2015,6 +2211,28 @@ def create_app(
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
             status_code = 404 if "not found" in msg.lower() else 400
             raise HTTPException(status_code=status_code, detail=msg)
+        # #202: lifecycle event for the agent-self-reported terminal outcome
+        # (the internal dispatcher-detected failure paths emit their own
+        # task_failed from _fail_if_active — this covers the case where the
+        # agent process itself completed and called back here).
+        try:
+            _attr = q().get_attribution(task_id)
+            record_context_event(
+                _context_events_path,
+                "task_completed" if result.status == "completed" else "task_failed",
+                task_id=task_id, outcome=result.status,
+                project=(_attr or {}).get("project"),
+                role=(_attr or {}).get("role"),
+                agent=(_attr or {}).get("agent"),
+                context_id=(_attr or {}).get("context_id"),
+            )
+            # #202 review finding 2: terminal-state line, not just the
+            # dispatch-time snapshot (q().submit_result already set
+            # status/outcome/completed_at on this row before we read it).
+            if _attr:
+                append_attribution_jsonl(_attr_jsonl_path, _attr)
+        except Exception:
+            logger.exception(f"POST /tasks/{task_id}/result: context event emission failed")
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
