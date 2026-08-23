@@ -76,6 +76,25 @@ def test_agy_quota_takes_priority_over_agy_timeout(tmp_path):
     assert _detect_transient_error_in_log(log) == "agy_quota_exhausted"
 
 
+def test_agy_subscriber_lag_detected_response_finished_variant(tmp_path):
+    log = _write(
+        tmp_path,
+        "I will check the current system time.\n"
+        "Error: the connection to the agent was interrupted before the "
+        "response finished: subscriber fell behind updates, stalled for 6s\n",
+    )
+    assert _detect_transient_error_in_log(log) == "agy_subscriber_lag"
+
+
+def test_agy_subscriber_lag_detected_response_started_variant(tmp_path):
+    log = _write(
+        tmp_path,
+        "Error: the connection to the agent was interrupted before the "
+        "response started: subscriber fell behind updates, stalled for 6s\n",
+    )
+    assert _detect_transient_error_in_log(log) == "agy_subscriber_lag"
+
+
 def test_only_tail_is_scanned(tmp_path):
     # 20KB of innocuous prefix, transient marker only at the end.
     big = ("x" * 20480) + '"api_error_status":429'
