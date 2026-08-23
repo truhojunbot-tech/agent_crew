@@ -217,6 +217,7 @@ _TRANSIENT_RETRIABLE_TAGS = frozenset({
     "gemini_resource_exhausted",
     "codex_capacity",
     "agy_timeout",
+    "agy_subscriber_lag",
 })
 # Tags that mean "exhausted for hours+; retry is futile". Surface as a
 # clear-reason failure instead.
@@ -254,6 +255,11 @@ def _detect_transient_error_in_log(
         - ``agy_timeout``               — agy "Error: timeout waiting for response"
           (#199); backend model-call timeout, distinct from the account-level
           quota cap (agy_quota_exhausted below)
+        - ``agy_subscriber_lag``        — agy "the connection to the agent was
+          interrupted ... subscriber fell behind updates, stalled for Xs"
+          (#205); a client-side streaming/backpressure hiccup between agy
+          and its backend, distinct from a model-call timeout — previously
+          fell through undetected to a bare ``exit_N`` with no retry
       non-retryable (clear reason; no point in immediate retry):
         - ``gemini_quota_exhausted``    — daily user quota hit; reset 2-3h away
         - ``gemini_ineligible_tier``    — oauth-personal serving-disabled (#195)
@@ -290,6 +296,8 @@ def _detect_transient_error_in_log(
         return "codex_capacity"
     if "Error: timeout waiting for response" in tail:
         return "agy_timeout"
+    if "subscriber fell behind updates" in tail:
+        return "agy_subscriber_lag"
     return None
 
 
