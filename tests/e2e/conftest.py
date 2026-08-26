@@ -29,6 +29,13 @@ import pytest
 
 
 @pytest.fixture
+def base_dir(tmp_path):
+    d = tmp_path / "base"
+    d.mkdir()
+    return str(d)
+
+
+@pytest.fixture
 def isolated_tmux_session():
     """A dedicated, disposable tmux session for one test.
 
@@ -48,59 +55,66 @@ def isolated_tmux_session():
         subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
 
 
+def _cleanup_project_dir(proj_dir: str) -> None:
+    state_path = os.path.join(proj_dir, "state.json")
+    try:
+        state = json.loads(open(state_path).read())
+    except (OSError, ValueError):
+        return
+
+    pid = state.get("server_pid")
+    if pid:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            pass
+
+    # Belt-and-suspenders: some shells survive the tmux pane's HUP long
+    # enough to relaunch crew-log-viewer once more before exiting. Kill
+    # any watch loop for this project's logs by the log path baked into
+    # its command line.
+    db_file = state.get("db", "")
+    log_dir = os.path.dirname(db_file) if db_file else proj_dir
+    for role in ("implementer", "reviewer", "tester"):
+        log_path = os.path.join(log_dir, f"dispatch_{role}.log")
+        subprocess.run(["pkill", "-f", f"crew-log-viewer {log_path}"], capture_output=True)
+
+
 @pytest.fixture
-def e2e_project(monkeypatch, isolated_tmux_session):
+def e2e_project(monkeypatch, isolated_tmux_session, base_dir):
     """Isolates `crew setup`/`recover` into `isolated_tmux_session` and
-    cleans up every artifact a test may have created.
+    cleans up every artifact a test may have created — the crew server
+    process (by pid, from state.json) and any surviving crew-log-viewer
+    watch loop. (`isolated_tmux_session`'s own finalizer separately kills
+    the tmux session and everything running inside it.)
 
-    Usage: call the fixture with each (base_dir, project) pair the test
-    set up, right after the `crew setup`/`recover` invocation that created
-    it, so teardown knows what to clean up:
-
-        def test_something(e2e_project, base_dir):
-            runner.invoke(crew, ["setup", "myproj", "--base", base_dir])
-            e2e_project(base_dir, "myproj")
-            ...
-
-    Teardown order: kill the crew server process (by pid, from state.json)
-    first — while it's still able to see its own tmux panes for any
-    graceful-shutdown bookkeeping — then let `isolated_tmux_session`'s own
-    finalizer kill the tmux session. Each step is independently
-    best-effort so one failure doesn't skip the rest.
+    Calling this with each (base_dir, project) pair a test sets up is
+    still useful for clarity/documentation, but is NOT what makes cleanup
+    reliable: `runner.invoke(crew, ["setup", ...])` never raises — Click's
+    CliRunner captures any exception into `result.exception` — so a setup
+    that spawns its server and writes state.json before failing later
+    still returns normally, and the explicit register() call after it
+    still runs. The real gap that mattered (#210 review) is a test whose
+    own assertions raise *before* it gets to call register() at all, or a
+    future test that simply forgets to. Teardown closes that gap by
+    additionally walking `base_dir` for every `state.json` any `crew
+    setup` under it wrote, register() calls or not.
     """
     monkeypatch.setenv("AGENT_CREW_TMUX_SESSION", isolated_tmux_session)
     registered: list[tuple[str, str]] = []
 
-    def register(base_dir: str, project: str) -> None:
-        registered.append((base_dir, project))
+    def register(base_dir_arg: str, project: str) -> None:
+        registered.append((base_dir_arg, project))
 
     try:
         yield register
     finally:
-        for base_dir, project in registered:
-            state_path = os.path.join(base_dir, project, "state.json")
-            try:
-                state = json.loads(open(state_path).read())
-            except (OSError, ValueError):
-                continue
+        discovered: set[str] = set()
+        for root, _dirs, files in os.walk(base_dir):
+            if "state.json" in files:
+                discovered.add(root)
+        for base_dir_arg, project in registered:
+            discovered.add(os.path.join(base_dir_arg, project))
 
-            pid = state.get("server_pid")
-            if pid:
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass
-
-            # Belt-and-suspenders: some shells survive the tmux pane's HUP
-            # long enough to relaunch crew-log-viewer once more before
-            # exiting. Kill any watch loop for this project's logs by the
-            # log path baked into its command line.
-            db_file = state.get("db", "")
-            proj_dir = os.path.dirname(db_file) if db_file else ""
-            if proj_dir:
-                for role in ("implementer", "reviewer", "tester"):
-                    log_path = os.path.join(proj_dir, f"dispatch_{role}.log")
-                    subprocess.run(
-                        ["pkill", "-f", f"crew-log-viewer {log_path}"],
-                        capture_output=True,
-                    )
+        for proj_dir in discovered:
+            _cleanup_project_dir(proj_dir)

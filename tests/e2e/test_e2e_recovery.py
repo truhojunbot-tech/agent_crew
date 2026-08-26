@@ -79,13 +79,6 @@ def git_repo(tmp_path):
     return repo
 
 
-@pytest.fixture
-def base_dir(tmp_path):
-    d = tmp_path / "base"
-    d.mkdir()
-    return str(d)
-
-
 def _read_state(base: str, project: str) -> dict:
     return json.loads(open(os.path.join(base, project, "state.json")).read())
 

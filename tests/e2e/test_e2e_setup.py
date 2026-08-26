@@ -48,13 +48,6 @@ def git_repo(tmp_path):
     return repo
 
 
-@pytest.fixture
-def base_dir(tmp_path):
-    d = tmp_path / "base"
-    d.mkdir()
-    return str(d)
-
-
 def _tmux_pane_exists(target: str) -> bool:
     """`target` may be a raw pane_id (e.g. '%246') or a 'session:window.pane'
     spec. Using pane_ids from state['pane_ids'] rather than a guessed index
@@ -218,3 +211,43 @@ def test_e_st06_double_setup_errors(monkeypatch, git_repo, base_dir, e2e_project
     second = runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
     assert second.exit_code == 0, second.output
     assert "already set up" in second.output
+
+
+# E-ST07 (#210 review): a `crew setup` that spawns its server and writes
+# state.json but is never explicitly registered with e2e_project (e.g. the
+# test's own assertions raised before it got the chance) must still have
+# its server pid reaped — teardown auto-discovers every state.json under
+# base_dir, register() calls or not.
+def test_e_st07_cleanup_reaps_unregistered_server(base_dir):
+    proj_dir = os.path.join(base_dir, "crashedproj")
+    os.makedirs(proj_dir, exist_ok=True)
+
+    dummy = subprocess.Popen(["sleep", "300"])
+    try:
+        assert dummy.poll() is None, "dummy process should start alive"
+
+        state = {
+            "project": "crashedproj",
+            "port": 0,
+            "server_pid": dummy.pid,
+            "db": os.path.join(proj_dir, "tasks.db"),
+            "session": "",
+            "agents": [],
+            "worktrees": {},
+        }
+        with open(os.path.join(proj_dir, "state.json"), "w") as f:
+            json.dump(state, f)
+
+        from tests.e2e.conftest import _cleanup_project_dir
+
+        # No register() call — this is exactly the gap the review flagged.
+        _cleanup_project_dir(proj_dir)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline and dummy.poll() is None:
+            time.sleep(0.1)
+        assert dummy.poll() is not None, "server pid should be reaped even without register()"
+    finally:
+        if dummy.poll() is None:
+            dummy.kill()
+        dummy.wait(timeout=5)
