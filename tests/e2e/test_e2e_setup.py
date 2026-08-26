@@ -1,7 +1,11 @@
 """
 E2E tests for crew setup / status / teardown CLI lifecycle.
 
-Real git repos and tmux sessions are used.
+Real git repos and tmux sessions are used, but every test runs its own
+`crew setup` inside a disposable tmux session (see `e2e_project` /
+`isolated_tmux_session` in conftest.py, #207) — never the session the test
+process itself happens to be running in.
+
 Agent CLIs (claude/codex/gemini) are never started — panes are created
 but left at a shell prompt (no command is sent).
 """
@@ -45,16 +49,15 @@ def git_repo(tmp_path):
     return repo
 
 
-@pytest.fixture
-def base_dir(tmp_path):
-    d = tmp_path / "base"
-    d.mkdir()
-    return str(d)
-
-
-def _tmux_pane_exists(session: str, pane: int = 0) -> bool:
+def _tmux_pane_exists(target: str) -> bool:
+    """`target` may be a raw pane_id (e.g. '%246') or a 'session:window.pane'
+    spec. Using pane_ids from state['pane_ids'] rather than a guessed index
+    is what actually identifies *the agent's* pane — dispatcher mode
+    split-windows a new pane for every agent (never commandeers the
+    session's original pane 0), so index 0 in a freshly created session is
+    the leftover shell from `tmux new-session`, not an agent pane."""
     result = subprocess.run(
-        ["tmux", "capture-pane", "-t", f"{session}:{pane}", "-p"],
+        ["tmux", "capture-pane", "-t", target, "-p"],
         capture_output=True,
     )
     return result.returncode == 0
@@ -71,33 +74,18 @@ def _port_listening(port: int, timeout: float = 5.0) -> bool:
     return False
 
 
-def _kill_server(state: dict) -> None:
-    pid = state.get("server_pid")
-    if pid:
-        try:
-            os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, OSError):
-            pass
-
-
-@pytest.fixture(autouse=True)
-def cleanup_tmux():
-    yield
-    for name in ("crew_testproj", "crew_myproj"):
-        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
-
-
 def _read_state(base_dir: str, project: str) -> dict:
     return json.loads(open(os.path.join(base_dir, project, "state.json")).read())
 
 
 # E-ST01: crew setup → worktrees created, panes exist, server running, port file written
 @requires_tmux
-def test_e_st01_setup_creates_artifacts(monkeypatch, git_repo, base_dir):
+def test_e_st01_setup_creates_artifacts(monkeypatch, git_repo, base_dir, e2e_project, isolated_tmux_session):
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
     result = runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
 
     assert result.exit_code == 0, result.output
     assert "Setup complete" in result.output
@@ -114,22 +102,23 @@ def test_e_st01_setup_creates_artifacts(monkeypatch, git_repo, base_dir):
     wt_path = state["worktrees"]["claude"]
     assert os.path.isdir(wt_path)
 
-    # tmux pane exists
-    assert _tmux_pane_exists("crew_testproj", 0)
+    # pane exists — in the isolated session, not wherever this test happened to run
+    assert state["session"] == isolated_tmux_session
+    assert len(state["pane_ids"]) == 1
+    assert _tmux_pane_exists(state["pane_ids"][0])
 
     # server already confirmed listening by setup command itself
     assert _port_listening(port, timeout=2.0), f"server not listening on {port}"
 
-    _kill_server(state)
-
 
 # E-ST02: crew status after setup → shows agent alive, port, 0 tasks
 @requires_tmux
-def test_e_st02_status_after_setup(monkeypatch, git_repo, base_dir):
+def test_e_st02_status_after_setup(monkeypatch, git_repo, base_dir, e2e_project):
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
     runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
     state = _read_state(base_dir, "testproj")
     port = state["port"]
 
@@ -138,21 +127,23 @@ def test_e_st02_status_after_setup(monkeypatch, git_repo, base_dir):
     assert result.exit_code == 0, result.output
     assert f"Port: {port}" in result.output
     assert "Tasks: 0" in result.output
-    assert "claude: alive" in result.output
-
-    _kill_server(state)
+    # Format is "claude (%246): alive" — the pane id is included.
+    assert "claude (" in result.output
+    assert "): alive" in result.output
 
 
 # E-ST03: crew teardown → worktrees removed, panes closed, port file deleted
 @requires_tmux
-def test_e_st03_teardown_cleans_up(monkeypatch, git_repo, base_dir):
+def test_e_st03_teardown_cleans_up(monkeypatch, git_repo, base_dir, e2e_project):
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
     runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
     state = _read_state(base_dir, "testproj")
     wt_path = state["worktrees"]["claude"]
     port_file = state["port_file"]
+    agent_pane_id = state["pane_ids"][0]
 
     result = runner.invoke(crew, ["teardown", "testproj", "--base", base_dir])
 
@@ -165,8 +156,9 @@ def test_e_st03_teardown_cleans_up(monkeypatch, git_repo, base_dir):
     # port file deleted (entire project dir removed)
     assert not os.path.exists(port_file)
 
-    # tmux pane closed
-    assert not _tmux_pane_exists("crew_testproj", 0)
+    # agent's pane closed (the session's original pane 0 from
+    # isolated_tmux_session is untouched — teardown only closes pane_ids)
+    assert not _tmux_pane_exists(agent_pane_id)
 
     # state file gone
     assert not os.path.exists(os.path.join(base_dir, "testproj", "state.json"))
@@ -187,11 +179,12 @@ def test_e_st04_setup_outside_git_repo(monkeypatch, tmp_path, base_dir):
 
 # E-ST05: crew setup --agents claude → only claude worktree/pane created
 @requires_tmux
-def test_e_st05_custom_agents(monkeypatch, git_repo, base_dir):
+def test_e_st05_custom_agents(monkeypatch, git_repo, base_dir, e2e_project, isolated_tmux_session):
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
     result = runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
 
     assert result.exit_code == 0, result.output
 
@@ -200,24 +193,104 @@ def test_e_st05_custom_agents(monkeypatch, git_repo, base_dir):
     assert "claude" in state["worktrees"]
     assert "codex" not in state["worktrees"]
     assert "gemini" not in state["worktrees"]
-    assert _tmux_pane_exists("crew_testproj", 0)
-    assert not _tmux_pane_exists("crew_testproj", 1)
+    assert state["session"] == isolated_tmux_session
+    assert len(state["pane_ids"]) == 1
+    assert _tmux_pane_exists(state["pane_ids"][0])
 
-    _kill_server(state)
 
-
-# E-ST06: double crew setup same project → second invocation errors out
+# E-ST06: double crew setup same project → second invocation is a no-op reuse,
+# not an error (setup() returns early with "already set up ... Reusing.").
 @requires_tmux
-def test_e_st06_double_setup_errors(monkeypatch, git_repo, base_dir):
+def test_e_st06_double_setup_errors(monkeypatch, git_repo, base_dir, e2e_project):
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
     first = runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
     assert first.exit_code == 0, first.output
 
     second = runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
-    assert second.exit_code != 0
+    assert second.exit_code == 0, second.output
     assert "already set up" in second.output
 
+
+# E-ST07 (#210 review): a `crew setup` that spawns its server and writes
+# state.json but is never explicitly registered with e2e_project (e.g. the
+# test's own assertions raised before it got the chance) must still have
+# its server pid reaped — teardown auto-discovers every state.json under
+# base_dir, register() calls or not. Exercises the actual two functions
+# e2e_project's finalizer calls (_discover_project_dirs then
+# _cleanup_project_dir for each hit), not a hand-rolled equivalent — this
+# would fail if either were changed to depend on register() again.
+def test_e_st07_cleanup_reaps_unregistered_server(base_dir):
+    from tests.e2e.conftest import _cleanup_project_dir, _discover_project_dirs
+
+    proj_dir = os.path.join(base_dir, "crashedproj")
+    os.makedirs(proj_dir, exist_ok=True)
+
+    dummy = subprocess.Popen(["sleep", "300"])
+    try:
+        assert dummy.poll() is None, "dummy process should start alive"
+
+        state = {
+            "project": "crashedproj",
+            "port": 0,
+            "server_pid": dummy.pid,
+            "db": os.path.join(proj_dir, "tasks.db"),
+            "session": "",
+            "agents": [],
+            "worktrees": {},
+        }
+        with open(os.path.join(proj_dir, "state.json"), "w") as f:
+            json.dump(state, f)
+
+        # No register() call — this is exactly the gap the review flagged.
+        discovered = _discover_project_dirs(base_dir, registered=[])
+        assert proj_dir in discovered, "unregistered state.json must still be discovered"
+
+        for d in discovered:
+            _cleanup_project_dir(d)
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline and dummy.poll() is None:
+            time.sleep(0.1)
+        assert dummy.poll() is not None, "server pid should be reaped even without register()"
+    finally:
+        if dummy.poll() is None:
+            dummy.kill()
+        dummy.wait(timeout=5)
+
+
+# E-ST08 (#210 review): a setup failure *after* the server process starts
+# but before setup() returns (pretrust/pane/log-viewer startup all run
+# after Popen) must not leave state.json's server_pid at the pid=0
+# placeholder it's initially written with — otherwise cleanup tooling has
+# no way to find and kill the still-running detached server.
+@requires_tmux
+def test_e_st08_server_pid_persisted_before_post_start_failure(monkeypatch, git_repo, base_dir, e2e_project):
+    import agent_crew.cli as cli_module
+
+    monkeypatch.chdir(git_repo)
+    runner = CliRunner()
+
+    def _boom(_worktrees):
+        raise RuntimeError("simulated post-start setup failure")
+
+    monkeypatch.setattr(cli_module.setup_module, "pretrust_claude_worktree", _boom)
+
+    result = runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
+
+    # CliRunner captures the exception rather than propagating it — setup
+    # did not complete successfully.
+    assert result.exit_code != 0
+    assert result.exception is not None
+
     state = _read_state(base_dir, "testproj")
-    _kill_server(state)
+    pid = state["server_pid"]
+    assert pid != 0, "server_pid must be persisted before pretrust/pane startup can fail"
+
+    # The pid is real and killable — proves it's not just a nonzero
+    # placeholder but the actual Popen'd process.
+    os.kill(pid, 0)  # raises ProcessLookupError if not alive
+    os.kill(pid, signal.SIGTERM)

@@ -175,11 +175,26 @@ def _resolve_tmux_window(proj_dir: str) -> tuple[str, str]:
     """Return (session_name, window_index) of the tmux window that should host agent panes.
 
     Strategy:
+    0. AGENT_CREW_TMUX_SESSION, if set, wins outright (#207). Without this,
+       every path below always resolves to whatever real tmux session
+       happens to be ambient for the calling process — correct for a human
+       running `crew setup` interactively, but it means e2e tests exercising
+       `crew setup`/`recover` from inside a live operational session (e.g. a
+       bot's own tmux pane) split panes and spawn a crew-log-viewer watch
+       loop straight into that live session instead of a disposable one.
+       Tests set this var to force isolation; production callers never set
+       it, so real interactive behaviour is unchanged.
     1. Walk the process tree upward from the current PID to find a process whose
        PID matches a tmux pane_pid. This correctly resolves the session even when
        TMUX_PANE was inherited from a parent session (e.g. alfred spawning crew-work).
     2. Fall back to TMUX_PANE env var (legacy behaviour) if the PID walk fails.
     """
+    # Step 0: explicit override (tests only — see docstring)
+    _forced_session = os.environ.get("AGENT_CREW_TMUX_SESSION", "")
+    if _forced_session:
+        _crew_log(proj_dir, f"tmux session forced via AGENT_CREW_TMUX_SESSION: {_forced_session}:0")
+        return _forced_session, "0"
+
     # Step 1: build pid→(session, window) map from tmux
     try:
         panes_result = subprocess.run(
@@ -517,11 +532,15 @@ def setup(project: str, agents: str, base: str):
             # the original coordinator session — if so, safely recreate panes here.
             # If we're in a different session (e.g. ScheduleWakeup fired in 'trader'),
             # block immediately to prevent panes in the wrong session.
-            current_session_r = subprocess.run(
-                ["tmux", "display-message", "-p", "#S"],
-                capture_output=True, text=True,
-            )
-            current_session = current_session_r.stdout.strip()
+            _forced_session = os.environ.get("AGENT_CREW_TMUX_SESSION", "")
+            if _forced_session:
+                current_session = _forced_session
+            else:
+                current_session_r = subprocess.run(
+                    ["tmux", "display-message", "-p", "#S"],
+                    capture_output=True, text=True,
+                )
+                current_session = current_session_r.stdout.strip()
             expected_session = existing_state.get("session", "")
             if current_session != expected_session:
                 click.echo(
@@ -806,6 +825,15 @@ def setup(project: str, agents: str, base: str):
         server_pid = server_proc.pid
         _crew_log(proj_dir, f"server started pid={server_pid} port={port}")
 
+        # Persist server_pid immediately — before any later step that could
+        # still raise (port-listening wait, pretrust, pane/log-viewer
+        # startup) — so a partial-setup failure never leaves state.json
+        # pointing at the pid=0 placeholder while a real server process is
+        # still running and undiscoverable by cleanup tooling (#210 review).
+        _pid_state = _read_state(base, project) or {}
+        _pid_state["server_pid"] = server_pid
+        _write_state(base, project, _pid_state)
+
         # Wait until server is ready (up to 15 s) before returning
         if not _port_listening(port, timeout=15.0):
             server_proc.terminate()
@@ -847,6 +875,13 @@ def setup(project: str, agents: str, base: str):
         )
         server_pid = server_proc.pid
         _crew_log(proj_dir, f"server restarted pid={server_pid} port={port}")
+
+        # See the not-_reuse_server branch above: persist immediately so a
+        # later failure can't leave state.json pointing at a stale/zero pid.
+        _pid_state = _read_state(base, project) or {}
+        _pid_state["server_pid"] = server_pid
+        _write_state(base, project, _pid_state)
+
         if not _port_listening(port, timeout=15.0):
             server_proc.terminate()
             log_file.close()
@@ -875,10 +910,9 @@ def setup(project: str, agents: str, base: str):
         click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
         _crew_log(proj_dir, "dispatcher mode: log viewers started")
 
-    # Backfill server_pid now that Popen has run.
-    final_state = _read_state(base, project) or {}
-    final_state["server_pid"] = server_pid
-    _write_state(base, project, final_state)
+    # server_pid was already persisted immediately after each Popen above
+    # (both the fresh-start and pane-recreation-reuse branches) — no
+    # backfill needed here.
 
     click.echo(f"Setup complete: {project} on port {port}")
     click.echo("Tip: use --agents <name> to spawn only specific agents (e.g. --agents claude)")
