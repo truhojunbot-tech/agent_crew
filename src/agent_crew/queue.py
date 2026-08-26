@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -8,6 +9,8 @@ from typing import List, Optional
 
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+
+logger = logging.getLogger(__name__)
 
 _ROLE_TO_TYPE = {
     "coder": "implement",
@@ -411,6 +414,22 @@ class TaskQueue:
                 "UPDATE task_attribution SET status=?, outcome=?, completed_at=?, updated_at=? WHERE task_id=?",
                 (result.status, outcome, now, now, task_id),
             )
+            # #204: completed_at >= started_at is expected to always hold —
+            # started_at is set once at first dispatch and never rewritten
+            # (see record_attribution). It can only be violated by clock
+            # skew or a corrupted row; surface that explicitly rather than
+            # silently handing a downstream consumer a negative-duration
+            # window.
+            attr_row = conn.execute(
+                "SELECT started_at FROM task_attribution WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if attr_row is not None:
+                started_at = attr_row["started_at"]
+                if started_at and started_at > now:
+                    logger.warning(
+                        f"task_attribution timing invariant violated for {task_id!r}: "
+                        f"completed_at={now} < started_at={started_at}"
+                    )
             conn.commit()
             return task_type
         finally:
@@ -902,7 +921,19 @@ class TaskQueue:
         started_at: float = 0.0,
     ) -> None:
         """Upsert a durable attribution record so quota systems can map token
-        usage back to the project even after worktrees are torn down."""
+        usage back to the project even after worktrees are torn down.
+
+        #204: ``started_at`` is deliberately NOT in the ON CONFLICT UPDATE
+        clause. A transient-error retry (#199/#205) re-dispatches the *same*
+        task_id — sometimes several times — which calls this method again
+        for that task_id. If started_at were overwritten on every call, each
+        retry would silently erase the original first-attempt start time,
+        making it impossible to distinguish real queue/retry wait time from
+        execution time. The first INSERT sets it (to the caller's value, or
+        `now` if the caller didn't have one — dispatch time, not queue-
+        creation time); every subsequent UPSERT for that task_id leaves the
+        column untouched.
+        """
         codex_logs_path = (
             os.path.join(worktree_path, ".codex_local", "logs_2.sqlite")
             if agent == "codex" and worktree_path
@@ -928,8 +959,7 @@ class TaskQueue:
                     context_generation=excluded.context_generation,
                     session_task_index=excluded.session_task_index,
                     previous_task_id=excluded.previous_task_id,
-                    retry_of=excluded.retry_of, fallback_of=excluded.fallback_of,
-                    started_at=excluded.started_at
+                    retry_of=excluded.retry_of, fallback_of=excluded.fallback_of
                 """,
                 (task_id, project, agent, role, task_type, worktree_path,
                  codex_logs_path, repo_url, git_branch, now, now, status,
