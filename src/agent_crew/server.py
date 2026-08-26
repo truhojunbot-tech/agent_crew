@@ -2280,7 +2280,13 @@ def create_app(
                         )
                         post_review_comment(
                             pr_number=int(_review_pr),
-                            verdict=result.verdict,
+                            # #208: use the same defensive resolver as the
+                            # auto-enqueue-test decision below, so a clean
+                            # verdict=null+[] review (or a reviewer that only
+                            # states "approve" in prose) doesn't render as a
+                            # request_changes header while the summary says
+                            # approve.
+                            verdict=_resolve_verdict(result),
                             summary=result.summary or "",
                             findings=result.findings or [],
                             task_id=task_id,
