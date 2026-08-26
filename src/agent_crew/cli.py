@@ -175,11 +175,26 @@ def _resolve_tmux_window(proj_dir: str) -> tuple[str, str]:
     """Return (session_name, window_index) of the tmux window that should host agent panes.
 
     Strategy:
+    0. AGENT_CREW_TMUX_SESSION, if set, wins outright (#207). Without this,
+       every path below always resolves to whatever real tmux session
+       happens to be ambient for the calling process — correct for a human
+       running `crew setup` interactively, but it means e2e tests exercising
+       `crew setup`/`recover` from inside a live operational session (e.g. a
+       bot's own tmux pane) split panes and spawn a crew-log-viewer watch
+       loop straight into that live session instead of a disposable one.
+       Tests set this var to force isolation; production callers never set
+       it, so real interactive behaviour is unchanged.
     1. Walk the process tree upward from the current PID to find a process whose
        PID matches a tmux pane_pid. This correctly resolves the session even when
        TMUX_PANE was inherited from a parent session (e.g. alfred spawning crew-work).
     2. Fall back to TMUX_PANE env var (legacy behaviour) if the PID walk fails.
     """
+    # Step 0: explicit override (tests only — see docstring)
+    _forced_session = os.environ.get("AGENT_CREW_TMUX_SESSION", "")
+    if _forced_session:
+        _crew_log(proj_dir, f"tmux session forced via AGENT_CREW_TMUX_SESSION: {_forced_session}:0")
+        return _forced_session, "0"
+
     # Step 1: build pid→(session, window) map from tmux
     try:
         panes_result = subprocess.run(
@@ -517,11 +532,15 @@ def setup(project: str, agents: str, base: str):
             # the original coordinator session — if so, safely recreate panes here.
             # If we're in a different session (e.g. ScheduleWakeup fired in 'trader'),
             # block immediately to prevent panes in the wrong session.
-            current_session_r = subprocess.run(
-                ["tmux", "display-message", "-p", "#S"],
-                capture_output=True, text=True,
-            )
-            current_session = current_session_r.stdout.strip()
+            _forced_session = os.environ.get("AGENT_CREW_TMUX_SESSION", "")
+            if _forced_session:
+                current_session = _forced_session
+            else:
+                current_session_r = subprocess.run(
+                    ["tmux", "display-message", "-p", "#S"],
+                    capture_output=True, text=True,
+                )
+                current_session = current_session_r.stdout.strip()
             expected_session = existing_state.get("session", "")
             if current_session != expected_session:
                 click.echo(

@@ -5,6 +5,10 @@ E-RC01: Kill tmux session → crew recover → tmux session recreated
 E-RC02: Kill server process → crew recover → server restarted, port listening again
 E-RC03: Enqueue task → kill server → recover → task still pending (SQLite persistence)
 E-RC04: crew recover with no prior setup → ClickException: not found
+
+Every test that touches real tmux runs inside a disposable session (see
+`e2e_project` / `isolated_tmux_session` in conftest.py, #207) rather than
+whatever session happens to be running the test process.
 """
 
 import json
@@ -15,6 +19,7 @@ import socket
 import subprocess
 import threading
 import time
+import uuid
 
 import pytest
 import uvicorn
@@ -92,49 +97,60 @@ def _kill_server(pid: int) -> None:
         pass
 
 
-@pytest.fixture(autouse=True)
-def cleanup_tmux():
-    yield
-    for name in ("crew_rcproj",):
-        subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
-
-
 # ── E-RC01: Kill tmux → recover → session recreated ──────────────────────────
 
 @requires_tmux
-def test_e_rc01_recover_tmux(monkeypatch, git_repo, base_dir):
+def test_e_rc01_recover_tmux(monkeypatch, git_repo, base_dir, e2e_project, isolated_tmux_session):
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
     result = runner.invoke(crew, ["setup", "rcproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "rcproj")
     assert result.exit_code == 0, result.output
 
     state = _read_state(base_dir, "rcproj")
     session_name = state["session"]
+    assert session_name == isolated_tmux_session
 
     assert _tmux_session_exists(session_name)
     subprocess.run(["tmux", "kill-session", "-t", session_name], capture_output=True)
     assert not _tmux_session_exists(session_name)
 
-    result = runner.invoke(crew, ["recover", "rcproj", "--base", base_dir])
-    assert result.exit_code == 0, result.output
-    assert "tmux" in result.output.lower()
+    # In production, `crew recover` is run from wherever the operator's own
+    # tmux session currently is — necessarily a *different*, still-alive
+    # session from the one that just died. Simulate that "operator session"
+    # with a second disposable session, isolated the same way, so recover's
+    # fallback (`_resolve_tmux_window`) has somewhere real to land instead
+    # of retargeting the session we just killed.
+    operator_session = f"crew-test-{uuid.uuid4().hex[:10]}"
+    subprocess.run(
+        ["tmux", "new-session", "-d", "-s", operator_session, "-x", "220", "-y", "50"],
+        check=True,
+    )
+    try:
+        monkeypatch.setenv("AGENT_CREW_TMUX_SESSION", operator_session)
+        result = runner.invoke(crew, ["recover", "rcproj", "--base", base_dir])
+        assert result.exit_code == 0, result.output
+        assert "tmux" in result.output.lower()
 
-    assert _tmux_session_exists(session_name)
+        state2 = _read_state(base_dir, "rcproj")
+        assert state2["session"] == operator_session
+        assert _tmux_session_exists(operator_session)
 
-    # cleanup server
-    state2 = _read_state(base_dir, "rcproj")
-    _kill_server(state2["server_pid"])
+        _kill_server(state2["server_pid"])
+    finally:
+        subprocess.run(["tmux", "kill-session", "-t", operator_session], capture_output=True)
 
 
 # ── E-RC02: Kill server → recover → server listening again ───────────────────
 
 @requires_tmux
-def test_e_rc02_recover_server(monkeypatch, git_repo, base_dir):
+def test_e_rc02_recover_server(monkeypatch, git_repo, base_dir, e2e_project):
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
     result = runner.invoke(crew, ["setup", "rcproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "rcproj")
     assert result.exit_code == 0, result.output
 
     state = _read_state(base_dir, "rcproj")
@@ -154,9 +170,6 @@ def test_e_rc02_recover_server(monkeypatch, git_repo, base_dir):
     assert "server" in result.output.lower()
 
     assert _port_listening(port, timeout=10.0)
-
-    state2 = _read_state(base_dir, "rcproj")
-    _kill_server(state2["server_pid"])
 
 
 # ── E-RC03: SQLite persistence — task survives server kill ───────────────────
@@ -196,7 +209,9 @@ def test_e_rc03_sqlite_persistence(tmp_path):
     t.join(timeout=10.0)
     assert not _port_listening(port, timeout=2.0)
 
-    # Write minimal state for recover
+    # Write minimal state for recover. agents/worktrees are empty, so
+    # recover()'s tmux fallback never calls split-window — no pane isolation
+    # needed here (nothing gets created in any tmux session).
     state = {
         "project": "persistproj",
         "port": port,
