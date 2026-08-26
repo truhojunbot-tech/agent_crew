@@ -825,6 +825,15 @@ def setup(project: str, agents: str, base: str):
         server_pid = server_proc.pid
         _crew_log(proj_dir, f"server started pid={server_pid} port={port}")
 
+        # Persist server_pid immediately — before any later step that could
+        # still raise (port-listening wait, pretrust, pane/log-viewer
+        # startup) — so a partial-setup failure never leaves state.json
+        # pointing at the pid=0 placeholder while a real server process is
+        # still running and undiscoverable by cleanup tooling (#210 review).
+        _pid_state = _read_state(base, project) or {}
+        _pid_state["server_pid"] = server_pid
+        _write_state(base, project, _pid_state)
+
         # Wait until server is ready (up to 15 s) before returning
         if not _port_listening(port, timeout=15.0):
             server_proc.terminate()
@@ -866,6 +875,13 @@ def setup(project: str, agents: str, base: str):
         )
         server_pid = server_proc.pid
         _crew_log(proj_dir, f"server restarted pid={server_pid} port={port}")
+
+        # See the not-_reuse_server branch above: persist immediately so a
+        # later failure can't leave state.json pointing at a stale/zero pid.
+        _pid_state = _read_state(base, project) or {}
+        _pid_state["server_pid"] = server_pid
+        _write_state(base, project, _pid_state)
+
         if not _port_listening(port, timeout=15.0):
             server_proc.terminate()
             log_file.close()
@@ -894,10 +910,9 @@ def setup(project: str, agents: str, base: str):
         click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
         _crew_log(proj_dir, "dispatcher mode: log viewers started")
 
-    # Backfill server_pid now that Popen has run.
-    final_state = _read_state(base, project) or {}
-    final_state["server_pid"] = server_pid
-    _write_state(base, project, final_state)
+    # server_pid was already persisted immediately after each Popen above
+    # (both the fresh-start and pane-recreation-reuse branches) — no
+    # backfill needed here.
 
     click.echo(f"Setup complete: {project} on port {port}")
     click.echo("Tip: use --agents <name> to spawn only specific agents (e.g. --agents claude)")

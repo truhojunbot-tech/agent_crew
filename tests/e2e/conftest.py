@@ -55,6 +55,21 @@ def isolated_tmux_session():
         subprocess.run(["tmux", "kill-session", "-t", name], capture_output=True)
 
 
+def _discover_project_dirs(base_dir: str, registered: list) -> set:
+    """Every directory under `base_dir` containing a state.json, plus
+    whatever was explicitly registered. Split out from `e2e_project` so a
+    test can call it directly and prove discovery finds an unregistered
+    `crew setup` — register() calls are documentation of intent, not a
+    prerequisite for cleanup (#210 review)."""
+    discovered: set = set()
+    for root, _dirs, files in os.walk(base_dir):
+        if "state.json" in files:
+            discovered.add(root)
+    for base_dir_arg, project in registered:
+        discovered.add(os.path.join(base_dir_arg, project))
+    return discovered
+
+
 def _cleanup_project_dir(proj_dir: str) -> None:
     state_path = os.path.join(proj_dir, "state.json")
     try:
@@ -109,12 +124,5 @@ def e2e_project(monkeypatch, isolated_tmux_session, base_dir):
     try:
         yield register
     finally:
-        discovered: set[str] = set()
-        for root, _dirs, files in os.walk(base_dir):
-            if "state.json" in files:
-                discovered.add(root)
-        for base_dir_arg, project in registered:
-            discovered.add(os.path.join(base_dir_arg, project))
-
-        for proj_dir in discovered:
+        for proj_dir in _discover_project_dirs(base_dir, registered):
             _cleanup_project_dir(proj_dir)

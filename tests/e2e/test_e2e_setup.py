@@ -13,6 +13,7 @@ but left at a shell prompt (no command is sent).
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import time
@@ -217,8 +218,13 @@ def test_e_st06_double_setup_errors(monkeypatch, git_repo, base_dir, e2e_project
 # state.json but is never explicitly registered with e2e_project (e.g. the
 # test's own assertions raised before it got the chance) must still have
 # its server pid reaped — teardown auto-discovers every state.json under
-# base_dir, register() calls or not.
+# base_dir, register() calls or not. Exercises the actual two functions
+# e2e_project's finalizer calls (_discover_project_dirs then
+# _cleanup_project_dir for each hit), not a hand-rolled equivalent — this
+# would fail if either were changed to depend on register() again.
 def test_e_st07_cleanup_reaps_unregistered_server(base_dir):
+    from tests.e2e.conftest import _cleanup_project_dir, _discover_project_dirs
+
     proj_dir = os.path.join(base_dir, "crashedproj")
     os.makedirs(proj_dir, exist_ok=True)
 
@@ -238,10 +244,12 @@ def test_e_st07_cleanup_reaps_unregistered_server(base_dir):
         with open(os.path.join(proj_dir, "state.json"), "w") as f:
             json.dump(state, f)
 
-        from tests.e2e.conftest import _cleanup_project_dir
-
         # No register() call — this is exactly the gap the review flagged.
-        _cleanup_project_dir(proj_dir)
+        discovered = _discover_project_dirs(base_dir, registered=[])
+        assert proj_dir in discovered, "unregistered state.json must still be discovered"
+
+        for d in discovered:
+            _cleanup_project_dir(d)
 
         deadline = time.time() + 5.0
         while time.time() < deadline and dummy.poll() is None:
@@ -251,3 +259,38 @@ def test_e_st07_cleanup_reaps_unregistered_server(base_dir):
         if dummy.poll() is None:
             dummy.kill()
         dummy.wait(timeout=5)
+
+
+# E-ST08 (#210 review): a setup failure *after* the server process starts
+# but before setup() returns (pretrust/pane/log-viewer startup all run
+# after Popen) must not leave state.json's server_pid at the pid=0
+# placeholder it's initially written with — otherwise cleanup tooling has
+# no way to find and kill the still-running detached server.
+@requires_tmux
+def test_e_st08_server_pid_persisted_before_post_start_failure(monkeypatch, git_repo, base_dir, e2e_project):
+    import agent_crew.cli as cli_module
+
+    monkeypatch.chdir(git_repo)
+    runner = CliRunner()
+
+    def _boom(_worktrees):
+        raise RuntimeError("simulated post-start setup failure")
+
+    monkeypatch.setattr(cli_module.setup_module, "pretrust_claude_worktree", _boom)
+
+    result = runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
+
+    # CliRunner captures the exception rather than propagating it — setup
+    # did not complete successfully.
+    assert result.exit_code != 0
+    assert result.exception is not None
+
+    state = _read_state(base_dir, "testproj")
+    pid = state["server_pid"]
+    assert pid != 0, "server_pid must be persisted before pretrust/pane startup can fail"
+
+    # The pid is real and killable — proves it's not just a nonzero
+    # placeholder but the actual Popen'd process.
+    os.kill(pid, 0)  # raises ProcessLookupError if not alive
+    os.kill(pid, signal.SIGTERM)
