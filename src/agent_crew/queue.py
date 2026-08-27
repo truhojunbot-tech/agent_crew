@@ -683,6 +683,14 @@ class TaskQueue:
                     context=json.loads(r["context"]),
                     project=r["project"] if r["project"] else "",
                     status=r["status"],
+                    # #213: these columns are already in `r` (SELECT *) —
+                    # only actually meaningful once the task has a result,
+                    # but harmless/empty-default otherwise.
+                    summary=r["summary"] or "",
+                    verdict=r["verdict"],
+                    findings=json.loads(r["findings"]) if r["findings"] else [],
+                    pr_number=r["pr_number"],
+                    error_info=json.loads(r["error_info"]) if r["error_info"] else None,
                 )
                 for r in rows
             ]
