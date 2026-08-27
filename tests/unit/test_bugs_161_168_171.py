@@ -409,16 +409,23 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         queue = TaskQueue(tmp_db)
         assert len(_retry_ids_for(queue, "review-216b")) == 1
 
-    def test_u216_retry_still_enqueued_when_branch_has_pr_lookup_errors(self, tmp_db):
-        """branch_has_pr fails open (True) on its own, but this confirms the
-        caller doesn't add a second layer of pessimism on top of it."""
+    def test_u216_retry_still_enqueued_when_gh_pr_list_itself_errors(self, tmp_db):
+        """Exercises branch_has_pr's own fail-open logic end-to-end — mocks
+        the underlying `gh` subprocess call to genuinely fail (non-zero
+        exit), not branch_has_pr itself, so this actually proves a real gh
+        hiccup doesn't block a legitimate retry (#222 review round 2:
+        the prior version of this test only re-mocked branch_has_pr to
+        return True, which never exercised the error path at all)."""
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         with TestClient(app) as client, \
-             patch("agent_crew.github.branch_has_pr", return_value=True) as mock_bhp:
+             patch("agent_crew.github.check_gh_installed", return_value=True), \
+             patch("agent_crew.github.get_repo", return_value="owner/repo"), \
+             patch("agent_crew.github.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr="gh: network error")
             client.post("/tasks", json=_review_task_payload("review-216c", "agent/claude/gh-hiccup"))
             client.post("/tasks/review-216c/result", json=_failed_result_payload("review-216c"))
 
-        mock_bhp.assert_called_once()
+        assert mock_run.called, "branch_has_pr should have shelled out to gh"
         queue = TaskQueue(tmp_db)
         assert len(_retry_ids_for(queue, "review-216c")) == 1
 
