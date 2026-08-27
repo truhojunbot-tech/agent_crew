@@ -301,6 +301,32 @@ def _detect_transient_error_in_log(
     return None
 
 
+def _dispatch_timeout_for_role(role: str) -> float:
+    """Hard wall-clock timeout (seconds) for a dispatched subprocess.
+
+    ``implement`` tasks routinely run longer than review/test — they write
+    code across a real codebase and run test suites, not just read and
+    verdict — and a single shared 900s default was killing legitimately
+    still-working (not stuck) implementer subprocesses with
+    ``dispatcher_timeout`` (observed live on alpha_engine 2026-08-27: 3
+    consecutive kills on tasks whose own dispatch log showed them still
+    actively producing tool calls right up to the kill). ``implementer``
+    gets a longer default; every other role keeps the original 900s.
+
+    Both defaults remain overridable: ``AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER``
+    for the implementer role specifically, else ``AGENT_CREW_DISPATCH_TIMEOUT``
+    for that role or any other — so setting only the generic var still
+    raises every role uniformly, matching pre-existing behavior for anyone
+    already relying on it.
+    """
+    default = "1800" if role == "implementer" else "900"
+    if role == "implementer":
+        env_value = os.getenv("AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER")
+        if env_value is not None:
+            return float(env_value)
+    return float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", default))
+
+
 def _cap_gemini_session_size(cwd: str, max_mb: int = 50) -> None:
     """Archive gemini-cli session files larger than ``max_mb`` for ``cwd``.
 
@@ -1679,8 +1705,8 @@ def create_app(
                 message,
             ]
 
-        timeout_secs = float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", "900"))
-        logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt}")
+        timeout_secs = _dispatch_timeout_for_role(role)
+        logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
         # Only pop the retry counter on a terminal outcome. Flipped to False
         # right before the early `return` on a successful requeue — that
         # `return` still runs `finally`, so without this flag the counter
