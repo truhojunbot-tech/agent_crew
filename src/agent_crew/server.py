@@ -137,10 +137,21 @@ def _prepare_worktree_for_task_inner(
     if task_context is None:
         task_context = {}
     # Stash any leftover uncommitted changes so checkout doesn't fail.
+    # timeout=30: git commands here are plain local operations that should
+    # be near-instant. Without a timeout, a stuck git process (e.g. one
+    # blocked in uninterruptible disk I/O — observed live on alpha_engine
+    # 2026-08-27 during host-level swap pressure, where a fetch got stuck
+    # in D-state) runs synchronously inside this async dispatch path and
+    # freezes the entire event loop — including unrelated HTTP requests
+    # like /health — for as long as the git process stays stuck, which a
+    # signal-based timeout can't even interrupt once a process is truly in
+    # D-state. This can't fix that specific case (nothing userspace can),
+    # but it bounds every OTHER local git op here so one slow/stuck call
+    # fails that single task instead of being able to hang indefinitely.
     subprocess.run(
         ["git", "-C", worktree_path, "stash", "push", "-u",
          "-m", f"agent_crew pre-{task_id[:8]}"],
-        capture_output=True, text=True,
+        capture_output=True, text=True, timeout=30,
     )
     # Fetch all remote branches so the target ref is up to date.
     subprocess.run(
@@ -156,7 +167,7 @@ def _prepare_worktree_for_task_inner(
         r = subprocess.run(
             ["git", "-C", worktree_path, "checkout", "-B", branch,
              f"origin/{main_branch}"],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
             logger.warning(
@@ -190,7 +201,7 @@ def _prepare_worktree_for_task_inner(
         target_ref = f"origin/{pr_branch}" if pr_branch else f"origin/{main_branch}"
         r = subprocess.run(
             ["git", "-C", worktree_path, "checkout", "-B", local_branch, target_ref],
-            capture_output=True, text=True,
+            capture_output=True, text=True, timeout=30,
         )
         if r.returncode != 0:
             logger.warning(
@@ -201,7 +212,7 @@ def _prepare_worktree_for_task_inner(
             subprocess.run(
                 ["git", "-C", worktree_path, "checkout", "-B", local_branch,
                  f"origin/{main_branch}"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=30,
             )
 
 
