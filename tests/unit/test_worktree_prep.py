@@ -175,3 +175,83 @@ def test_prepare_worktree_failure_does_not_raise():
             _prepare_worktree_for_task("/wt/claude", "t-1", "branch", "implementer")
         except Exception as e:
             raise AssertionError(f"should not raise: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Every git subprocess.run call here must bound its own wall-clock time.
+#
+# Observed live on alpha_engine (2026-08-27): under host-level memory/swap
+# pressure, a `git fetch` in one worktree got stuck in uninterruptible disk
+# I/O (D state — not even killable by signal). That call already had
+# timeout=60, but stash/checkout did not, and subprocess.run() is a plain
+# blocking call made directly inside this async dispatch path — no timeout
+# means no bound on how long it can freeze the *entire* event loop,
+# including unrelated HTTP requests like /health. A timeout can't rescue a
+# process already wedged in D state, but it does bound every OTHER call
+# here so a slow-but-not-wedged git op fails its one task instead of being
+# able to hang indefinitely.
+# ---------------------------------------------------------------------------
+
+def _calls_with_kwargs(monkeypatch):
+    """Patch subprocess.run and return a list that accumulates (cmd, kwargs)."""
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw))
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
+    return calls
+
+
+def test_every_git_call_has_a_timeout_implementer_path(monkeypatch):
+    calls = _calls_with_kwargs(monkeypatch)
+
+    _prepare_worktree_for_task("/wt/claude", "task-abc123", "agent/feat-xyz", "implementer")
+
+    git_calls = [(cmd, kw) for cmd, kw in calls if cmd[:2] == ["git", "-C"]]
+    assert len(git_calls) >= 3, f"expected stash+fetch+checkout, got {git_calls}"
+    for cmd, kw in git_calls:
+        assert kw.get("timeout") is not None, f"no timeout on: {cmd}"
+
+
+def test_every_git_call_has_a_timeout_reviewer_path_including_fallback(monkeypatch):
+    calls = []
+    checkout_count = [0]
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw))
+        if cmd[:2] == ["git", "-C"] and "checkout" in cmd:
+            checkout_count[0] += 1
+            if checkout_count[0] == 1:
+                return MagicMock(returncode=1, stderr="pathspec not found")
+        return MagicMock(returncode=0, stderr="")
+
+    monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
+
+    _prepare_worktree_for_task("/wt/codex", "review-eeff5566", "agent/gone-branch", "reviewer")
+
+    git_calls = [(cmd, kw) for cmd, kw in calls if cmd[:2] == ["git", "-C"]]
+    checkouts = [(cmd, kw) for cmd, kw in git_calls if "checkout" in cmd]
+    assert len(checkouts) == 2, f"expected primary + fallback checkout, got {checkouts}"
+    for cmd, kw in git_calls:
+        assert kw.get("timeout") is not None, f"no timeout on: {cmd}"
+
+
+def test_stuck_git_process_fails_only_its_own_task_not_the_dispatcher():
+    """A git call that exceeds its timeout raises TimeoutExpired — the outer
+    wrapper must swallow it exactly like any other subprocess failure
+    (OSError case above), not let it propagate and take dispatch down with
+    it."""
+    import subprocess as subprocess_module
+
+    def fake_run(cmd, **kw):
+        if "stash" in cmd:
+            raise subprocess_module.TimeoutExpired(cmd=cmd, timeout=kw.get("timeout", 30))
+        return MagicMock(returncode=0, stderr="")
+
+    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
+        try:
+            _prepare_worktree_for_task("/wt/claude", "t-2", "branch", "implementer")
+        except Exception as e:
+            raise AssertionError(f"should not raise: {e}") from e
