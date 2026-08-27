@@ -159,3 +159,35 @@ class TestDiscussPostToOption:
 
         assert result.exit_code == 0, result.output
         mock_post.assert_not_called()
+
+    def test_u219_fully_missed_round_never_posts(self, tmp_path):
+        """#223 review: a round where NO panelist responds within the
+        timeout hits cli.py's `if not panel_results: break` — final_synthesis
+        stays empty and no file is ever written. --post-to must not fire on
+        that empty synthesis, and must not be reachable via a future
+        relocation of the `if final_synthesis:` guard either — this actually
+        runs the timeout path (no pre-staged results) rather than just
+        asserting the guard condition in isolation."""
+        db_path = str(tmp_path / "tasks.db")
+        output = str(tmp_path / "synthesis.md")
+        queue = TaskQueue(db_path)
+        task_ids = enqueue_panel_tasks(
+            queue, ["analyst", "critic"], "AI strategy", {"round": 1}, port=0
+        )
+        # Neither task_ids[0] nor [1] ever gets a result — both time out.
+
+        runner = CliRunner()
+        with patch("agent_crew.discussion.enqueue_panel_tasks", return_value=task_ids), \
+             patch("agent_crew.github.post_discussion_comment") as mock_post:
+            result = runner.invoke(crew, [
+                "discuss", "AI strategy",
+                "--db", db_path,
+                "--agents", "analyst,critic",
+                "--output", output,
+                "--timeout", "1",
+                "--post-to", "42",
+            ])
+
+        assert result.exit_code == 2, f"expected timeout exit 2, got {result.exit_code}: {result.output}"
+        mock_post.assert_not_called()
+        assert not pathlib.Path(output).exists(), "no synthesis file should be written when nobody completed"
