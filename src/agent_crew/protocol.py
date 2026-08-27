@@ -20,6 +20,18 @@ class TaskRequest:
     context: dict = field(default_factory=dict)
     project: str = ""  # owner/name form, e.g. "org/myrepo". Used to detect cross-project routing.
     status: str = "pending"  # DB status; populated by list_tasks, not stored on enqueue
+    # Result-preview fields (#213). Same pattern as `status` above: populated
+    # by list_tasks/get_task from the DB row when the task has finished, never
+    # sent or read on enqueue. Without these, GET /tasks and GET /tasks/{id}
+    # returned the request shape only — summary/verdict/findings/error_info
+    # sat filled in the DB but never reached a caller polling the HTTP API,
+    # which read as "the result was lost" and caused the same work to be
+    # re-run.
+    summary: str = ""
+    verdict: Optional[Literal["approve", "request_changes"]] = None
+    findings: list[str] = field(default_factory=list)
+    pr_number: Optional[int] = None
+    error_info: Optional[dict] = None
 
     def __post_init__(self):
         if self.task_type not in _VALID_TASK_TYPES:
