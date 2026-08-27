@@ -2103,6 +2103,23 @@ def create_app(
                         f"— no branch and no pr_number; retry would loop (#161)"
                     )
                     return
+                # #216: a branch IS set here, but if it genuinely has no PR
+                # (open or closed), a retry re-dispatches the exact same
+                # branch to the exact same "gh pr list" dead end — the agent
+                # rediscovers "no PR" itself, burning a full invocation to
+                # relearn what the dispatcher can check in one cheap `gh pr
+                # list` call. Observed live: 2 review tasks each retried
+                # twice (4 wasted attempts total) against branches with no
+                # PR the whole time.
+                if original_task.branch and not task_ctx.get("pr_number"):
+                    from agent_crew.github import branch_has_pr
+                    if not branch_has_pr(original_task.branch):
+                        logger.warning(
+                            f"_auto_retry_failed_task: skipping review retry for {task_id} "
+                            f"— branch {original_task.branch!r} has no PR (open or closed); "
+                            f"retry would hit the same dead end (#216)"
+                        )
+                        return
 
             # Create retry task with incremented retry count
             retry_context = dict(original_task.context) if isinstance(original_task.context, dict) else {}

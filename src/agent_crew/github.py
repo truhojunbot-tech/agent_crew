@@ -158,6 +158,37 @@ def post_review_comment(
         return False
 
 
+def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
+    """Return True iff `branch` has an open OR closed GitHub PR (#216).
+
+    Used to decide whether a review retry is even winnable before spending
+    an agent invocation on it — `gh pr list --head <branch>` is a cheap,
+    deterministic check the dispatcher can run itself, instead of
+    dispatching a whole review task only for the agent to independently
+    rediscover "no PR exists for this branch" for the second or third time
+    in a row. Fails open (returns True — "assume a retry might help") on
+    any gh/network error, since the goal here is only to skip a provably
+    futile retry, never to block a legitimate one on an unrelated hiccup.
+    """
+    if not branch or not check_gh_installed():
+        return True
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return True
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--head", branch,
+             "--state", "all", "--json", "number", "--limit", "1"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode != 0:
+            return True
+        return bool(json.loads(result.stdout or "[]"))
+    except Exception:
+        return True
+
+
 def get_pr_url(repo: Optional[str], pr_number: str) -> str:
     """Format a PR URL from repo and PR number."""
     if not repo:

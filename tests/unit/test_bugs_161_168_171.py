@@ -248,3 +248,98 @@ class TestAutoEnqueueTestPropagatesPrNumber:
         test_task = tasks[test_id]
         ctx = test_task.context if isinstance(test_task.context, dict) else {}
         assert "pr_number" not in ctx or ctx.get("pr_number") is None
+
+
+# ---------------------------------------------------------------------------
+# #216 — branch_has_pr (github.py) + _auto_retry_failed_task's use of it
+#
+# A review task can have a real, non-empty branch (so the #161 guard above
+# doesn't fire) whose PR genuinely doesn't exist — e.g. the implementer
+# reported "PR #N opened" without the API actually recording pr_number, and
+# separately pushed to a differently-named branch than the one recorded on
+# the task. Retrying re-dispatches the exact same branch to the exact same
+# "gh pr list" dead end. branch_has_pr() lets the dispatcher check that
+# cheaply itself before spending a whole agent invocation to relearn it.
+# ---------------------------------------------------------------------------
+
+from agent_crew.github import branch_has_pr
+
+
+class TestBranchHasPr:
+    def test_u216_true_when_pr_exists(self):
+        with patch("agent_crew.github.check_gh_installed", return_value=True), \
+             patch("agent_crew.github.get_repo", return_value="owner/repo"), \
+             patch("agent_crew.github.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='[{"number": 42}]')
+            assert branch_has_pr("agent/claude/some-branch") is True
+
+    def test_u216_false_when_no_pr_found(self):
+        with patch("agent_crew.github.check_gh_installed", return_value=True), \
+             patch("agent_crew.github.get_repo", return_value="owner/repo"), \
+             patch("agent_crew.github.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]")
+            assert branch_has_pr("agent/claude/4235-auto") is False
+
+    def test_u216_fails_open_true_on_gh_error(self):
+        """A gh/network hiccup must never be mistaken for a confirmed
+        no-PR verdict — fail open so a legitimate retry isn't blocked."""
+        with patch("agent_crew.github.check_gh_installed", return_value=True), \
+             patch("agent_crew.github.get_repo", return_value="owner/repo"), \
+             patch("agent_crew.github.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=1, stdout="")
+            assert branch_has_pr("agent/claude/some-branch") is True
+
+    def test_u216_fails_open_true_when_gh_not_installed(self):
+        with patch("agent_crew.github.check_gh_installed", return_value=False):
+            assert branch_has_pr("agent/claude/some-branch") is True
+
+    def test_u216_fails_open_true_on_empty_branch(self):
+        assert branch_has_pr("") is True
+
+    def test_u216_queries_the_right_branch_and_repo(self):
+        with patch("agent_crew.github.check_gh_installed", return_value=True), \
+             patch("agent_crew.github.get_repo", return_value="owner/repo"), \
+             patch("agent_crew.github.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]")
+            branch_has_pr("agent/claude/4235-auto")
+
+        args = mock_run.call_args[0][0]
+        assert "--head" in args and "agent/claude/4235-auto" in args
+        assert "--repo" in args and "owner/repo" in args
+        assert "--state" in args and "all" in args
+
+
+class TestAutoRetryReviewNoPrForBranchGuard:
+    """Mirrors the #161 guard-condition tests above, for the #216 case
+    where branch IS set but genuinely has no PR."""
+
+    def test_u216_skips_when_branch_set_but_no_pr_exists(self):
+        with patch("agent_crew.github.check_gh_installed", return_value=True), \
+             patch("agent_crew.github.get_repo", return_value="owner/repo"), \
+             patch("agent_crew.github.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout="[]")
+            original_branch = "agent/claude/4235-auto"
+            task_ctx = {}
+            should_skip = bool(original_branch) and not task_ctx.get("pr_number") and not branch_has_pr(original_branch)
+        assert should_skip
+
+    def test_u216_does_not_skip_when_branch_has_a_pr(self):
+        with patch("agent_crew.github.check_gh_installed", return_value=True), \
+             patch("agent_crew.github.get_repo", return_value="owner/repo"), \
+             patch("agent_crew.github.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(returncode=0, stdout='[{"number": 5}]')
+            original_branch = "agent/claude/has-a-pr"
+            task_ctx = {}
+            should_skip = bool(original_branch) and not task_ctx.get("pr_number") and not branch_has_pr(original_branch)
+        assert not should_skip
+
+    def test_u216_does_not_skip_when_pr_number_already_known(self):
+        """If pr_number is already in context, the #216 check (which only
+        applies when pr_number is absent) must not even run — no reason to
+        distrust a pr_number the caller already resolved."""
+        original_branch = "agent/claude/some-branch"
+        task_ctx = {"pr_number": 42}
+        # Guard condition from server.py: `if original_task.branch and not
+        # task_ctx.get("pr_number"):` — pr_number present short-circuits it.
+        would_check = bool(original_branch) and not task_ctx.get("pr_number")
+        assert not would_check
