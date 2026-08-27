@@ -343,3 +343,94 @@ class TestAutoRetryReviewNoPrForBranchGuard:
         # task_ctx.get("pr_number"):` — pr_number present short-circuits it.
         would_check = bool(original_branch) and not task_ctx.get("pr_number")
         assert not would_check
+
+
+# ---------------------------------------------------------------------------
+# #216 review finding: the tests above exercise the guard *condition* in
+# isolation, not the real _auto_retry_failed_task path — they'd still pass
+# if the branch_has_pr() call in server.py were removed or wired wrong.
+# These go through the real POST /tasks/{id}/result HTTP endpoint that
+# actually calls _auto_retry_failed_task, mocking agent_crew.github.branch_has_pr
+# (the module-level function _auto_retry_failed_task imports locally at call
+# time, same pattern as the #210 post_review_comment fix).
+# ---------------------------------------------------------------------------
+
+from fastapi.testclient import TestClient
+from agent_crew.server import create_app
+
+
+def _review_task_payload(task_id: str, branch: str) -> dict:
+    return {
+        "task_id": task_id,
+        "task_type": "review",
+        "description": "Review PR",
+        "branch": branch,
+        "priority": 3,
+        "context": {},
+        "project": "",
+    }
+
+
+def _failed_result_payload(task_id: str) -> dict:
+    return {
+        "task_id": task_id,
+        "status": "failed",
+        "summary": "Could not review branch: no open or closed GitHub PR resolves for that head branch.",
+        "verdict": None,
+        "findings": [],
+        "pr_number": None,
+    }
+
+
+def _retry_ids_for(queue: TaskQueue, original_task_id: str) -> list:
+    return [t.task_id for t in queue.list_tasks() if t.task_id.startswith(f"retry-{original_task_id}-")]
+
+
+class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
+    def test_u216_no_retry_enqueued_when_branch_has_no_pr(self, tmp_db):
+        app = create_app(db_path=tmp_db, watchdog_disabled=True)
+        with TestClient(app) as client, \
+             patch("agent_crew.github.branch_has_pr", return_value=False) as mock_bhp:
+            client.post("/tasks", json=_review_task_payload("review-216a", "agent/claude/4235-auto"))
+            client.post("/tasks/review-216a/result", json=_failed_result_payload("review-216a"))
+
+        mock_bhp.assert_called_once()
+        queue = TaskQueue(tmp_db)
+        assert _retry_ids_for(queue, "review-216a") == []
+
+    def test_u216_retry_enqueued_when_branch_has_a_pr(self, tmp_db):
+        app = create_app(db_path=tmp_db, watchdog_disabled=True)
+        with TestClient(app) as client, \
+             patch("agent_crew.github.branch_has_pr", return_value=True) as mock_bhp:
+            client.post("/tasks", json=_review_task_payload("review-216b", "agent/claude/has-a-pr"))
+            client.post("/tasks/review-216b/result", json=_failed_result_payload("review-216b"))
+
+        mock_bhp.assert_called_once()
+        queue = TaskQueue(tmp_db)
+        assert len(_retry_ids_for(queue, "review-216b")) == 1
+
+    def test_u216_retry_still_enqueued_when_branch_has_pr_lookup_errors(self, tmp_db):
+        """branch_has_pr fails open (True) on its own, but this confirms the
+        caller doesn't add a second layer of pessimism on top of it."""
+        app = create_app(db_path=tmp_db, watchdog_disabled=True)
+        with TestClient(app) as client, \
+             patch("agent_crew.github.branch_has_pr", return_value=True) as mock_bhp:
+            client.post("/tasks", json=_review_task_payload("review-216c", "agent/claude/gh-hiccup"))
+            client.post("/tasks/review-216c/result", json=_failed_result_payload("review-216c"))
+
+        mock_bhp.assert_called_once()
+        queue = TaskQueue(tmp_db)
+        assert len(_retry_ids_for(queue, "review-216c")) == 1
+
+    def test_u216_branch_has_pr_not_called_when_pr_number_already_known(self, tmp_db):
+        app = create_app(db_path=tmp_db, watchdog_disabled=True)
+        payload = _review_task_payload("review-216d", "agent/claude/known-pr")
+        payload["context"] = {"pr_number": 42}
+        with TestClient(app) as client, \
+             patch("agent_crew.github.branch_has_pr") as mock_bhp:
+            client.post("/tasks", json=payload)
+            client.post("/tasks/review-216d/result", json=_failed_result_payload("review-216d"))
+
+        mock_bhp.assert_not_called()
+        queue = TaskQueue(tmp_db)
+        assert len(_retry_ids_for(queue, "review-216d")) == 1
