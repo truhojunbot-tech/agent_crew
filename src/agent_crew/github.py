@@ -158,6 +158,43 @@ def post_review_comment(
         return False
 
 
+def post_discussion_comment(
+    issue_number: int,
+    topic: str,
+    synthesis: str,
+    repo: Optional[str] = None,
+) -> bool:
+    """Post a `crew discuss` synthesis as a comment on a GitHub issue (#219).
+    Returns True on success.
+
+    `crew discuss` only ever wrote the synthesis to a local file
+    (--output, default synthesis.md) — a caller that isn't sitting at the
+    terminal that ran it (a bot invoking it as a subprocess, a scheduled
+    job) had no way to actually receive the result short of separately
+    reading that file. --post-to <issue> gives it an active delivery path,
+    the same way review/test results already post to PRs.
+    """
+    if not check_gh_installed():
+        return False
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return False
+
+    body = f"[agent_crew discuss] {topic}\n\n{synthesis}"
+
+    try:
+        result = subprocess.run(
+            ["gh", "issue", "comment", str(issue_number), "--repo", repo, "--body", body],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
     """Return True iff `branch` has an open OR closed GitHub PR (#216).
 

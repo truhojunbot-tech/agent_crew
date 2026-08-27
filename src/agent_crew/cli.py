@@ -2056,9 +2056,13 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
               help="Post each agent opinion as a GitHub Discussion comment "
                    "(https://github.com/OWNER/REPO/discussions/NNN). "
                    "Each comment is prefixed with [agent: NAME].")
+@click.option("--post-to", default=0, type=int, metavar="ISSUE",
+              help="Post the final synthesis as a comment on this GitHub issue "
+                   "number once the discussion completes (#219). No effect with "
+                   "--nowait, since there's no synthesis yet when that returns.")
 def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: bool,
             db: str, project: str, base: str, output: str, branch: str,
-            timeout: int, nowait: bool, github_discussion: str):
+            timeout: int, nowait: bool, github_discussion: str, post_to: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
         raise click.UsageError("topic must not be empty")
@@ -2294,6 +2298,18 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     if final_synthesis:
         with open(output, "w") as f:
             f.write(final_synthesis)
+
+        if post_to:
+            from agent_crew.github import post_discussion_comment
+            if post_discussion_comment(post_to, topic, final_synthesis):
+                click.echo(f"Synthesis posted to issue #{post_to}")
+            else:
+                click.echo(
+                    f"Warning: failed to post synthesis to issue #{post_to} "
+                    f"(gh not installed, no repo detected, or the gh call failed) "
+                    f"— synthesis is still in {output}",
+                    err=True,
+                )
 
     if partial_hit:
         click.echo(
