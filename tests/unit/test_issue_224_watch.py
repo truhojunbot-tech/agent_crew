@@ -842,3 +842,217 @@ def test_reconcile_adopts_a_task_even_with_an_unusable_id(tmp_db, monkeypatch):
     assert out["resumed"] == [411], out
     assert out["released"] == []
     assert ClaimLedger(tmp_db).get(REPO, 411)["state"] == "enqueued"
+
+
+# ── 14. ledger/label divergence (review-5e08e761) ─────────────────────
+#
+# The ledger and the GitHub label are two non-transactional systems. Every
+# release path updates one then the other, so either order leaves a window:
+#
+#   release_stale() ok -> process dies / remove_label fails
+#     -> ledger says 'released' (retryable) but GitHub still shows
+#        agent_crew:claimed, and select_candidates() skips ANY issue with
+#        that label. The issue is stranded: retryable in theory, invisible
+#        in practice.
+#
+# ⛔Ordering the two writes cannot fix this — there is no order that makes
+#   two independent systems atomic. The cycle heals the divergence instead.
+
+
+def _released_with_label_still_set(tmp_db, number):
+    """Ledger released, GitHub label never cleared (the stranding state)."""
+    led = ClaimLedger(tmp_db)
+    led.try_claim(REPO, number, owner="dead-watcher")
+    led.release(REPO, number, reason="enqueue failed")
+    return led
+
+
+def test_released_but_still_labelled_issue_is_not_stranded(tmp_db):
+    """★The bug — retryable in the ledger, invisible to discovery."""
+    _released_with_label_still_set(tmp_db, 500)
+    gh = FakeGitHub([make_issue(500, "Stranded", ["bug", CLAIM_LABEL])])
+
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh)
+
+    assert result["reconciled_labels"] == [500], result
+    assert (500, CLAIM_LABEL) in gh.removed
+    # ...and it becomes selectable in the very same cycle.
+    assert result["enqueued"] == [500], result
+    assert len(TaskQueue(tmp_db).list_tasks()) == 1
+
+
+def test_dead_watcher_that_had_labelled_the_issue_recovers(tmp_db):
+    """★The realistic window-A crash: the dead watcher *did* add the label."""
+    ClaimLedger(tmp_db).try_claim(REPO, 501, owner="dead-watcher")
+    gh = FakeGitHub([make_issue(501, "Orphan with label", ["bug", CLAIM_LABEL])])
+
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh, reconcile_after=0.0)
+
+    assert result["reconciled_released"] == [501]
+    assert (501, CLAIM_LABEL) in gh.removed
+    assert result["enqueued"] == [501], result
+    assert len(TaskQueue(tmp_db).list_tasks()) == 1
+
+
+def test_label_reconcile_never_touches_an_issue_we_never_claimed(tmp_db):
+    """⛔★A label with no local ledger row belongs to ANOTHER manager.
+
+    That label is the only cross-database signal between managers that do
+    not share this SQLite file. Stripping it because we happen not to
+    recognise it would hand the same issue to two crews at once — the exact
+    failure the claim system exists to prevent.
+    """
+    gh = FakeGitHub([make_issue(502, "Someone else has this", ["bug", CLAIM_LABEL])])
+
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh)
+
+    assert result["reconciled_labels"] == []
+    assert gh.removed == []
+    assert result["enqueued"] == []
+
+
+def test_label_reconcile_leaves_live_claims_alone(tmp_db):
+    """`claimed` and `enqueued` rows are supposed to carry the label."""
+    led = ClaimLedger(tmp_db)
+    led.try_claim(REPO, 503, owner="me")
+    led.try_claim(REPO, 504, owner="me")
+    led.mark_enqueued(REPO, 504, "impl-live")
+    gh = FakeGitHub([
+        make_issue(503, "In flight", ["bug", CLAIM_LABEL]),
+        make_issue(504, "Queued", ["bug", CLAIM_LABEL]),
+    ])
+
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh)
+
+    assert result["reconciled_labels"] == []
+    assert gh.removed == []
+
+
+def test_abandoned_rows_keep_their_label(tmp_db):
+    """⚠️Deliberate: `abandoned` means agent_crew is parked on it, and
+    held_numbers already blocks it, so there is nothing to strand."""
+    led = ClaimLedger(tmp_db)
+    led.try_claim(REPO, 505, owner="me", max_attempts=1)
+    led.release(REPO, 505, reason="fail")
+    led.try_claim(REPO, 505, owner="me", max_attempts=1)  # -> abandoned
+    assert led.get(REPO, 505)["state"] == "abandoned"
+
+    gh = FakeGitHub([make_issue(505, "Parked", ["bug", CLAIM_LABEL])])
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh)
+
+    assert result["reconciled_labels"] == []
+    assert gh.removed == []
+
+
+def test_label_removal_failure_keeps_the_issue_skipped_then_recovers(tmp_db):
+    """⛔If GitHub refuses the removal, do NOT pretend locally and claim it.
+
+    Claiming an issue whose label we failed to clear would leave a second
+    manager seeing a claim that is no longer ours.
+    """
+    class NoRemove(FakeGitHub):
+        def remove_label(self, repo, number, label):
+            self.removed.append((number, label))
+            return False
+
+    _released_with_label_still_set(tmp_db, 506)
+    stubborn = NoRemove([make_issue(506, "Label stuck", ["bug", CLAIM_LABEL])])
+
+    first = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                      repo=REPO, gh=stubborn)
+    assert first["reconciled_labels"] == []
+    assert first["enqueued"] == []
+
+    # Next cycle, GitHub is healthy again — no manual intervention needed.
+    healthy = FakeGitHub([make_issue(506, "Label stuck", ["bug", CLAIM_LABEL])])
+    second = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=healthy)
+    assert second["reconciled_labels"] == [506]
+    assert second["enqueued"] == [506]
+
+
+def test_enqueue_failure_then_failed_label_removal_self_heals(tmp_db):
+    """End-to-end: the live release path diverges, the next cycle repairs it."""
+    class NoRemove(FakeGitHub):
+        def remove_label(self, repo, number, label):
+            self.removed.append((number, label))
+            return False
+
+    gh = NoRemove([make_issue(507, "Enqueue explodes", ["bug"])])
+    broken = MagicMock(wraps=TaskQueue(tmp_db))
+    broken.enqueue.side_effect = sqlite3.OperationalError("locked")
+
+    first = run_cycle(queue=broken, ledger=ClaimLedger(tmp_db), repo=REPO, gh=gh)
+    assert first["released"] == [507]
+    # The label add succeeded, the removal did not -> divergence exists now.
+    assert (507, CLAIM_LABEL) in gh.added
+
+    healthy = FakeGitHub([make_issue(507, "Enqueue explodes", ["bug", CLAIM_LABEL])])
+    second = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=healthy)
+
+    assert second["reconciled_labels"] == [507]
+    assert second["enqueued"] == [507]
+
+
+def test_reconcile_labels_survives_a_github_error(tmp_db):
+    """A raising gateway must not take the cycle down."""
+    from agent_crew.watch import reconcile_labels
+
+    _released_with_label_still_set(tmp_db, 508)
+
+    class Boom(FakeGitHub):
+        def remove_label(self, repo, number, label):
+            raise RuntimeError("gh exploded")
+
+    issues = [{"number": 508, "labels": ["bug", CLAIM_LABEL]}]
+    assert reconcile_labels(Boom(), ClaimLedger(tmp_db), REPO, issues) == []
+    assert CLAIM_LABEL in issues[0]["labels"]
+
+
+def test_manual_release_clears_the_label(tmp_db, monkeypatch):
+    """`crew claims --release` must clear GitHub too, or it strands the issue."""
+    from click.testing import CliRunner
+
+    from agent_crew import watch as watch_module
+    from agent_crew.cli import crew
+
+    led = ClaimLedger(tmp_db)
+    led.try_claim(REPO, 509, owner="me")
+    led.mark_enqueued(REPO, 509, "impl-dead")
+    gh = FakeGitHub([make_issue(509, "Parked", ["bug", CLAIM_LABEL])])
+    monkeypatch.setattr(watch_module, "GhCli", lambda *a, **k: gh)
+
+    result = CliRunner().invoke(crew, ["claims", "--db", tmp_db,
+                                       "--repo", REPO, "--release", "509"])
+
+    assert result.exit_code == 0, result.output
+    assert (509, CLAIM_LABEL) in gh.removed, result.output
+    assert led.get(REPO, 509)["state"] == "released"
+
+
+def test_manual_release_reports_a_failed_label_clear(tmp_db, monkeypatch):
+    """⛔Silence would let an operator believe the issue is free when it is not."""
+    from click.testing import CliRunner
+
+    from agent_crew import watch as watch_module
+    from agent_crew.cli import crew
+
+    ClaimLedger(tmp_db).try_claim(REPO, 510, owner="me")
+
+    class NoRemove(FakeGitHub):
+        def remove_label(self, repo, number, label):
+            return False
+
+    monkeypatch.setattr(watch_module, "GhCli",
+                        lambda *a, **k: NoRemove([make_issue(510, "x", ["bug"])]))
+    result = CliRunner().invoke(crew, ["claims", "--db", tmp_db,
+                                       "--repo", REPO, "--release", "510"])
+
+    assert result.exit_code == 0, result.output
+    assert "label" in result.output.lower(), result.output

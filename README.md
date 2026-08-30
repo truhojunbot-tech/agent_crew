@@ -122,6 +122,17 @@ if none exists the claim is released for retry and the label removed. The
 staleness gate is what keeps a reconciler from stealing a live peer's in-flight
 claim. If the queue can't be read, nothing is touched — recovery never guesses.
 
+**Ledger/label divergence.** The ledger and the GitHub label are two systems
+with no shared transaction, so every release writes one then the other. If the
+process dies (or the label write fails) in between, the ledger says `released`
+— retryable — while discovery still skips the issue for carrying the label:
+retryable on paper, invisible in practice. No ordering of the two writes fixes
+that, so each cycle repairs the divergence instead, clearing the label from any
+issue **this** ledger has in `released`. A claim label on an issue with no local
+row is left alone — it belongs to another manager, and that label is the only
+cross-database signal between crews that do not share this SQLite file.
+`crew claims --release` clears the label too, and says so if it cannot.
+
 **Failure handling.** A GitHub error backs off exponentially (30s → 15m cap);
 because discovery runs before any claim, an error cycle cannot strand a claim.
 If enqueue fails after a claim, the claim is released and the label removed, so

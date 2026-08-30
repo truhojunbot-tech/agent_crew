@@ -373,6 +373,25 @@ other's in-flight claims. Both transitions are compare-and-set on
 released path counts an attempt so a deterministically-crashing issue is parked
 as `abandoned` rather than re-claimed forever.
 
+**Label reconciliation.** The same divergence problem exists between the ledger
+and GitHub. A release updates the row and the label as two separate writes, so
+either order leaves a window where the ledger says `released` (retryable) but
+the issue still carries `agent_crew:claimed` — and `select_candidates` skips
+any labelled issue, so it is stranded. Ordering cannot fix two non-transactional
+systems, so `reconcile_labels` runs each cycle on the labels just fetched:
+
+| Issue carries the claim label | Local ledger row | Action |
+|---|---|---|
+| yes | `released` | clear the label (and drop it in-memory, so the issue is selectable this cycle) |
+| yes | `claimed` / `enqueued` | leave it — the claim is live |
+| yes | `abandoned` | leave it — `held_numbers` already blocks it, and the label correctly says agent_crew is parked |
+| yes | **no row at all** | leave it — another manager owns it |
+
+That last row is the important one: the label is the only signal between crews
+that do not share this database, so an unrecognised label is never stripped.
+If GitHub refuses the removal the issue stays skipped rather than being claimed
+with a stale peer-visible label, and the next cycle retries.
+
 **Failure ordering matters.** Discovery runs entirely before the first claim,
 so a GitHub outage produces an error cycle and an exponential backoff with no
 possibility of a half-claimed issue.

@@ -551,7 +551,6 @@ def reconcile_claims(
     ledger: ClaimLedger,
     repo: str,
     *,
-    gh=None,
     stale_after: float = CLAIM_STALE_AFTER_SECONDS,
     now: Optional[float] = None,
 ) -> dict:
@@ -625,13 +624,78 @@ def reconcile_claims(
             repo, number, reason="reconciled: interrupted before enqueue",
         ):
             out["released"].append(number)
-            if gh is not None:
-                _safe_remove_label(gh, repo, number)
+            # ⛔The label is deliberately NOT cleared here. `reconcile_labels`
+            #   owns that, runs immediately after, and retries every cycle —
+            #   so a failure to clear can never strand the issue.
             logger.info(
                 "watch: reconciled %s#%s — claimed but never enqueued, "
                 "released for retry (#224)", repo, number,
             )
     return out
+
+
+def reconcile_labels(gh, ledger: ClaimLedger, repo: str, issues: list) -> list:
+    """Clear `agent_crew:claimed` from issues our own ledger already released.
+
+    The ledger and the label are two systems with no shared transaction. Every
+    release path writes one then the other, so *either* order leaves a window:
+    if the process dies (or the label write fails) in between, the ledger says
+    `released` — retryable — while `select_candidates` still skips the issue
+    for carrying the label. Retryable in theory, invisible in practice.
+
+    ⛔No ordering of the two writes can fix that; two independent systems
+      cannot be made atomic by rearranging them. So the divergence is repaired
+      instead, every cycle, from the labels we just fetched.
+
+    ⛔★Only rows **this** ledger has in `released` are touched. A claim label
+      on an issue we have no row for belongs to another manager — that label
+      is the only cross-database signal between crews that do not share this
+      SQLite file, and stripping it because we do not recognise it would hand
+      one issue to two crews at once.
+
+    ⚠️`abandoned` rows keep their label on purpose: `held_numbers` already
+      blocks them, so nothing is stranded, and the label correctly advertises
+      that agent_crew is parked on the issue.
+
+    On success the label is also dropped from the in-memory issue, so the
+    freed issue is selectable in this same cycle rather than the next one. If
+    GitHub refuses the removal the issue stays skipped — claiming it while a
+    peer can still see our stale label would be worse than waiting.
+
+    Returns the issue numbers cleared. Never raises.
+    """
+    try:
+        states = {r["issue_number"]: r["state"] for r in ledger.list_claims(repo)}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("watch: cannot read claims for label reconcile: %s", exc)
+        return []
+    cleared = []
+    for issue in issues:
+        number = issue.get("number")
+        labels = issue.get("labels") or []
+        if CLAIM_LABEL not in labels or states.get(number) != "released":
+            continue
+        try:
+            removed = gh.remove_label(repo, number, CLAIM_LABEL)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("watch: stale label clear failed for %s#%s: %s",
+                           repo, number, exc)
+            continue
+        if not removed:
+            logger.info(
+                "watch: %s#%s is released but still carries %s and GitHub "
+                "refused the removal — leaving it skipped until that works",
+                repo, number, CLAIM_LABEL,
+            )
+            continue
+        issue["labels"] = [l for l in labels if l != CLAIM_LABEL]
+        cleared.append(number)
+        logger.info(
+            "watch: cleared stale %s from %s#%s — the claim was already "
+            "released, the label would have hidden it from discovery (#224)",
+            CLAIM_LABEL, repo, number,
+        )
+    return cleared
 
 
 def unblocked(issues: list, all_issues: list) -> list:
@@ -708,17 +772,8 @@ def run_cycle(
     owner = owner or default_owner()
     out: dict = {"enqueued": [], "released": [], "skipped": [],
                  "reconciled_resumed": [], "reconciled_released": [],
-                 "error": None}
+                 "reconciled_labels": [], "error": None}
 
-    # Recover claims orphaned by a watcher that died mid-sequence, before
-    # anything reads `held_numbers` — a released issue is then claimable in
-    # this same cycle rather than waiting for the next one. Runs every cycle,
-    # not just at startup, so a *peer* watcher's death is recovered too.
-    recovered = reconcile_claims(
-        queue, ledger, repo, gh=gh, stale_after=reconcile_after,
-    )
-    out["reconciled_resumed"] = recovered["resumed"]
-    out["reconciled_released"] = recovered["released"]
 
     # Discovery and parsing share one guard: both happen strictly before any
     # claim, so whatever goes wrong here cannot strand an issue.
@@ -735,6 +790,20 @@ def run_cycle(
         out["error"] = str(exc) or exc.__class__.__name__
         logger.warning("watch: issue discovery failed for %s: %s", repo, exc)
         return out
+
+    # Recovery runs before anything reads `held_numbers` or the labels, so an
+    # issue freed here is claimable in this same cycle rather than the next.
+    # Every cycle, not just at startup, so a *peer* watcher's death is
+    # recovered too.
+    recovered = reconcile_claims(queue, ledger, repo, stale_after=reconcile_after)
+    out["reconciled_resumed"] = recovered["resumed"]
+    out["reconciled_released"] = recovered["released"]
+
+    # Then repair ledger/label divergence, using the labels just fetched —
+    # including rows the step above just released. Without this, an issue
+    # whose claim was released but whose label survived is retryable in the
+    # ledger yet permanently invisible to `select_candidates`.
+    out["reconciled_labels"] = reconcile_labels(gh, ledger, repo, all_issues)
 
     candidates = select_candidates(
         unblocked(all_issues, all_issues),

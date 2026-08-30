@@ -2468,6 +2468,9 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
             for number in result.get("reconciled_released", []):
                 click.echo(f"[cycle {cycle}] recovered #{number} "
                            f"(stale claim released for retry)")
+            for number in result.get("reconciled_labels", []):
+                click.echo(f"[cycle {cycle}] recovered #{number} "
+                           f"(cleared stale claim label)")
             if result["error"]:
                 click.echo(f"[cycle {cycle}] github error: {result['error']} "
                            f"- backing off {delay:.0f}s")
@@ -2555,17 +2558,36 @@ def claims(repo: str, db: str, project: str, base: str, release_issue: int,
             raise click.ClickException(f"project {project!r} not found")
         db = state["db"]
 
-    from agent_crew.watch import ClaimLedger
+    from agent_crew import watch as watch_module
 
-    ledger = ClaimLedger(db)
+    ledger = watch_module.ClaimLedger(db)
 
     if release_issue:
         if not repo:
             raise click.ClickException("--repo is required with --release")
-        if ledger.force_release(repo, release_issue):
-            click.echo(f"Released {repo}#{release_issue}.")
-        else:
+        if not ledger.force_release(repo, release_issue):
             click.echo(f"No claim found for {repo}#{release_issue}.")
+            return
+        click.echo(f"Released {repo}#{release_issue}.")
+        # ⛔The ledger alone is not enough. `select_candidates` skips any issue
+        #   still carrying the claim label, so releasing without clearing it
+        #   leaves the issue retryable on paper and invisible in practice —
+        #   exactly the state this command exists to undo.
+        try:
+            cleared = watch_module.GhCli().remove_label(
+                repo, release_issue, watch_module.CLAIM_LABEL)
+        except Exception as exc:  # noqa: BLE001
+            cleared, exc_text = False, f" ({exc})"
+        else:
+            exc_text = ""
+        if cleared:
+            click.echo(f"Cleared the {watch_module.CLAIM_LABEL} label.")
+        else:
+            click.echo(
+                f"WARNING: could not clear the {watch_module.CLAIM_LABEL} "
+                f"label{exc_text} — the issue stays hidden from discovery "
+                f"until it is gone. A watch cycle will retry automatically."
+            )
         return
 
     rows = ledger.list_claims(repo)
