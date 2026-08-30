@@ -281,6 +281,7 @@ agent_crew/
 │       ├── server.py        # FastAPI Task Queue + Gate HTTP server
 │       ├── session.py       # SessionManager (tmux pane lifecycle)
 │       ├── triage.py        # GitHub issue triage + poll loop
+│       ├── watch.py         # Backlog ingestion: claim ledger + watch loop (#224)
 │       ├── discussion.py    # Discussion loop orchestration
 │       ├── loop.py          # Code-review loop orchestration
 │       ├── instructions.py  # Agent instruction file generator (CLAUDE.md/AGENTS.md/GEMINI.md)
@@ -305,7 +306,9 @@ $HOME/.agent_crew/<project>/
   state.json        project state (port, session, pane_ids, pane_map, worktrees, db path)
   sessions.json     per-agent session lifecycle (cmd, started_at, failures)
   pane_map.json     role → pane_id mapping consumed by the push model
-  tasks.db          SQLite task + gate store
+  tasks.db          SQLite task + gate store (+ `issue_claims`, the watch-mode
+                    claim ledger — same file so a claim and the task it produced
+                    cannot drift apart across a restart)
   server.log        uvicorn stdout/stderr (background server)
   crew.log          crew CLI activity log
   synthesis.md      discussion output (overwritten each run)
@@ -314,6 +317,42 @@ $HOME/.agent_crew/<project>/
 Nothing written inside the user's git repo. All runtime state in `$HOME/.agent_crew/`
 so it survives reboot — the queue, in-progress tasks, and pane bindings persist
 across sessions.
+
+---
+
+## 4.5 Backlog Ingestion (`crew triage --watch`, #224)
+
+The runtime is push-based by design: workers never poll. That left one gap —
+nothing turned an open GitHub issue into a queued task on its own. `watch.py`
+supplies that single hop, manager-side only:
+
+```
+GitHub open issue
+  → discovery      gh issue list (the ONLY GitHub polling in the system)
+  → eligibility    not done/claimed, no active task, no open PR, parents closed
+  → priority       deterministic policy; `priority:N` label overrides
+  → atomic claim   INSERT into issue_claims under BEGIN IMMEDIATE
+  → visible claim  add `agent_crew:claimed` on GitHub
+  → enqueue        TaskQueue.enqueue → the server's existing dispatcher picks
+                   the pending row up and pushes it, exactly as before
+```
+
+**The lock is the row, not the label.** `gh issue edit --add-label` is
+idempotent, so two watchers would both "succeed" and both enqueue. The
+`issue_claims` PRIMARY KEY taken under `BEGIN IMMEDIATE` is what makes the
+claim single-winner, and being on disk is what makes it restart-safe. The
+label exists because the claim must be externally visible, and as an advisory
+signal to managers that do not share this database.
+
+**Claim states.** `claimed` → `enqueued` on success. `released` (attempts+1) if
+the enqueue or the label write fails, so an issue is never parked in a fake
+in-progress state. `abandoned` once attempts exceed `--max-attempts`, which is
+what stops a permanently failing issue from being re-claimed every interval.
+`crew claims` lists them; `crew claims --release N` hands one back.
+
+**Failure ordering matters.** Discovery runs entirely before the first claim,
+so a GitHub outage produces an error cycle and an exponential backoff with no
+possibility of a half-claimed issue.
 
 ---
 
