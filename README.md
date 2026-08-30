@@ -112,6 +112,16 @@ outright. Ties break by phase, then issue number, so the same backlog always
 yields the same pick. When nothing is actionable, nothing is enqueued — the
 watcher never invents work.
 
+**Crash recovery.** `try_claim` commits before the label write and the enqueue,
+so a watcher that is *killed* mid-sequence (SIGKILL, teardown, power loss)
+would otherwise leave a row stuck in `claimed` — and `claimed` counts as held,
+locking the issue out permanently. Every cycle therefore starts by reconciling
+claims that have sat in `claimed` past `CLAIM_STALE_AFTER_SECONDS` (5 min): if
+a task for that issue already exists it is adopted (no duplicate enqueue), and
+if none exists the claim is released for retry and the label removed. The
+staleness gate is what keeps a reconciler from stealing a live peer's in-flight
+claim. If the queue can't be read, nothing is touched — recovery never guesses.
+
 **Failure handling.** A GitHub error backs off exponentially (30s → 15m cap);
 because discovery runs before any claim, an error cycle cannot strand a claim.
 If enqueue fails after a claim, the claim is released and the label removed, so

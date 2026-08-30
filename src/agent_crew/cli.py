@@ -2459,6 +2459,15 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
         )
 
         def _on_cycle(cycle: int, result: dict, delay: float) -> None:
+            # Recovery is reported first and separately — an operator seeing
+            # "recovered" repeatedly is looking at a watcher that keeps dying,
+            # which the enqueue counts alone would hide.
+            for number in result.get("reconciled_resumed", []):
+                click.echo(f"[cycle {cycle}] recovered #{number} "
+                           f"(task already existed, adopted)")
+            for number in result.get("reconciled_released", []):
+                click.echo(f"[cycle {cycle}] recovered #{number} "
+                           f"(stale claim released for retry)")
             if result["error"]:
                 click.echo(f"[cycle {cycle}] github error: {result['error']} "
                            f"- backing off {delay:.0f}s")

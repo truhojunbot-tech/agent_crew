@@ -62,6 +62,16 @@ MIN_INTERVAL_SECONDS = 10.0
 MAX_INTERVAL_SECONDS = 3600.0
 DEFAULT_INTERVAL_SECONDS = 300.0
 
+#: How long a row may sit in `claimed` before a peer treats it as orphaned.
+#:
+#: ⛔This gate is what separates "the owning watcher died" from "the owning
+#:   watcher is mid-cycle". A live claim becomes `enqueued` in well under a
+#:   second (the slowest step, a `gh` label write, is capped at 30s), so five
+#:   minutes is far outside normal. Without the gate, two watchers would steal
+#:   each other's in-flight claims and duplicate the very enqueue the ledger
+#:   exists to prevent.
+CLAIM_STALE_AFTER_SECONDS = 300.0
+
 DEFAULT_BACKOFF_BASE = 30.0
 DEFAULT_BACKOFF_CAP = 900.0
 
@@ -280,6 +290,31 @@ class ClaimLedger:
     def mark_enqueued(self, repo: str, number: int, task_id: str) -> None:
         self._set(repo, number, "task_id=?, state='enqueued'", (task_id,))
 
+    def finish_claim(self, repo: str, number: int, task_id: str) -> bool:
+        """`claimed` → `enqueued`, only if still `claimed` (compare-and-set).
+
+        Used by reconciliation to adopt a task that a dead watcher had already
+        enqueued. Conditional so two reconcilers racing on the same orphan
+        cannot both "recover" it.
+        """
+        return self._set(
+            repo, number, "task_id=?, state='enqueued'", (task_id,),
+            require_state="claimed",
+        )
+
+    def release_stale(self, repo: str, number: int, reason: str = "") -> bool:
+        """`claimed` → `released` (+1 attempt), only if still `claimed`.
+
+        The attempt counter is deliberately incremented: a watcher that dies
+        deterministically on one issue would otherwise re-claim it every cycle
+        forever. Counting it means the existing budget parks the issue as
+        `abandoned` and `crew claims` surfaces it.
+        """
+        return self._set(
+            repo, number, "state='released', reason=?, attempts=attempts+1",
+            (reason,), require_state="claimed",
+        )
+
     def release(self, repo: str, number: int, reason: str = "") -> None:
         """Give the issue back and count the attempt.
 
@@ -304,13 +339,16 @@ class ClaimLedger:
             repo, number, "state='released', reason=?, attempts=0", (reason,),
         )
 
-    def _set(self, repo: str, number: int, assignment: str, params: tuple) -> bool:
+    def _set(self, repo: str, number: int, assignment: str, params: tuple,
+             *, require_state: str = "") -> bool:
+        guard = " AND state=?" if require_state else ""
+        tail = (require_state,) if require_state else ()
         conn = self._connect()
         try:
             cur = conn.execute(
                 f"UPDATE issue_claims SET {assignment}, updated_at=? "
-                "WHERE repo=? AND issue_number=?",
-                (*params, time.time(), repo, number),
+                f"WHERE repo=? AND issue_number=?{guard}",
+                (*params, time.time(), repo, number, *tail),
             )
             return cur.rowcount > 0
         except sqlite3.OperationalError as exc:
@@ -478,6 +516,124 @@ def active_issue_numbers(queue, repo: str = "") -> set:
     return out
 
 
+def tasks_by_issue(queue, repo: str = "") -> Optional[dict]:
+    """`{issue number: task_id}` for **every** task, terminal ones included.
+
+    ⛔Distinct from `active_issue_numbers`, which excludes terminal tasks. For
+      reconciliation "did a task ever get created for this issue?" is the
+      question — a task that ran and failed still means the enqueue happened,
+      and re-doing it would resurrect the infinite re-run loop the attempt
+      budget exists to prevent.
+
+    Returns None (not `{}`) if the queue cannot be read, so callers can tell
+    "no tasks" apart from "no idea" and decline to act on the latter.
+    """
+    try:
+        rows = queue.list_all_with_status()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("watch: cannot read tasks for reconciliation: %s", exc)
+        return None
+    out: dict = {}
+    for row in rows or []:
+        context = row.get("context") or {}
+        number = context.get("issue")
+        if not isinstance(number, int):
+            continue
+        row_repo = context.get("repo") or ""
+        if repo and row_repo and row_repo != repo:
+            continue
+        out.setdefault(number, row.get("task_id") or "")
+    return out
+
+
+def reconcile_claims(
+    queue,
+    ledger: ClaimLedger,
+    repo: str,
+    *,
+    gh=None,
+    stale_after: float = CLAIM_STALE_AFTER_SECONDS,
+    now: Optional[float] = None,
+) -> dict:
+    """Recover claims orphaned by a watcher that died mid-sequence (#224 r1).
+
+    `try_claim` COMMITs, and only then do the label write, the enqueue and
+    `mark_enqueued` run — three separate operations. The `try`/`except` arms
+    around them handle *exceptions*, but not the process simply disappearing
+    (SIGKILL, host teardown, power loss). That leaves two windows:
+
+        A. dead after try_claim, before enqueue
+           → row stuck in `claimed`, and `held_numbers` treats `claimed` as
+             held, so the issue is locked out **forever**.
+        B. dead after enqueue, before mark_enqueued
+           → a task exists but the ledger still says `claimed`: same lock,
+             plus the claim never learns its task_id.
+
+    ⛔Wrapping the enqueue and the state change in one transaction — the
+      obvious fix — only addresses B. A happens strictly before the enqueue,
+      so no transaction around it can help. Recovery has to be reconciliation,
+      which covers both, so that is what this is.
+
+    Resolution is decided by evidence, never by guessing:
+
+        task exists for the issue  → adopt it (`claimed` → `enqueued`).
+                                     No duplicate is created.
+        no task exists             → the enqueue never happened; hand the
+                                     issue back (`claimed` → `released`,
+                                     +1 attempt) and drop the GitHub label.
+        queue unreadable           → do nothing at all.
+
+    Both transitions are compare-and-set on `state='claimed'`, so two
+    reconcilers racing on the same orphan cannot both act.
+
+    Returns `{"resumed": [int], "released": [int]}`. Never raises.
+    """
+    out: dict = {"resumed": [], "released": []}
+    now = time.time() if now is None else now
+    try:
+        rows = ledger.list_claims(repo)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("watch: cannot read claims for reconciliation: %s", exc)
+        return out
+
+    stale = [
+        r for r in rows
+        if r["state"] == "claimed" and (now - (r["updated_at"] or 0)) >= stale_after
+    ]
+    if not stale:
+        return out
+
+    known = tasks_by_issue(queue, repo)
+    if known is None:
+        return out  # unreadable queue — see docstring, we do not guess
+
+    for row in stale:
+        number = row["issue_number"]
+        # ⛔Branch on *presence*, not on the id being truthy. A task row with
+        #   an empty id is still proof the enqueue happened; treating it as
+        #   "no task" would release the claim and enqueue a second time.
+        if number in known:
+            if ledger.finish_claim(repo, number, known[number]):
+                task_id = known[number] or "(unknown id)"
+                out["resumed"].append(number)
+                logger.info(
+                    "watch: reconciled %s#%s — task %s already existed, "
+                    "adopting it instead of re-enqueueing (#224)",
+                    repo, number, task_id,
+                )
+        elif ledger.release_stale(
+            repo, number, reason="reconciled: interrupted before enqueue",
+        ):
+            out["released"].append(number)
+            if gh is not None:
+                _safe_remove_label(gh, repo, number)
+            logger.info(
+                "watch: reconciled %s#%s — claimed but never enqueued, "
+                "released for retry (#224)", repo, number,
+            )
+    return out
+
+
 def unblocked(issues: list, all_issues: list) -> list:
     """Drop issues whose declared parent is still open.
 
@@ -537,18 +693,32 @@ def run_cycle(
     project: str = "",
     max_claims: int = DEFAULT_MAX_CLAIMS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    reconcile_after: float = CLAIM_STALE_AFTER_SECONDS,
     rules=DEFAULT_PRIORITY_RULES,
 ) -> dict:
-    """One discovery→claim→enqueue pass. Never raises.
+    """One reconcile→discovery→claim→enqueue pass. Never raises.
 
     Returns `{"enqueued": [int], "released": [int], "skipped": [int],
+    "reconciled_resumed": [int], "reconciled_released": [int],
     "error": str | None}`. A non-None `error` means GitHub was unreachable
     this cycle — and because discovery happens before any claim, an error
     cycle cannot leave a half-claimed issue behind.
     """
     gh = gh if gh is not None else GhCli()
     owner = owner or default_owner()
-    out: dict = {"enqueued": [], "released": [], "skipped": [], "error": None}
+    out: dict = {"enqueued": [], "released": [], "skipped": [],
+                 "reconciled_resumed": [], "reconciled_released": [],
+                 "error": None}
+
+    # Recover claims orphaned by a watcher that died mid-sequence, before
+    # anything reads `held_numbers` — a released issue is then claimable in
+    # this same cycle rather than waiting for the next one. Runs every cycle,
+    # not just at startup, so a *peer* watcher's death is recovered too.
+    recovered = reconcile_claims(
+        queue, ledger, repo, gh=gh, stale_after=reconcile_after,
+    )
+    out["reconciled_resumed"] = recovered["resumed"]
+    out["reconciled_released"] = recovered["released"]
 
     # Discovery and parsing share one guard: both happen strictly before any
     # claim, so whatever goes wrong here cannot strand an issue.
@@ -641,6 +811,7 @@ def watch(
     max_cycles: int = 0,
     max_claims: int = DEFAULT_MAX_CLAIMS,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    reconcile_after: float = CLAIM_STALE_AFTER_SECONDS,
     rules=DEFAULT_PRIORITY_RULES,
     sleep_fn=time.sleep,
     on_cycle=None,
@@ -656,18 +827,22 @@ def watch(
     owner = owner or default_owner()
     failures = 0
     cycles = 0
-    totals = {"cycles": 0, "enqueued": [], "released": [], "errors": 0}
+    totals = {"cycles": 0, "enqueued": [], "released": [], "recovered": [],
+              "errors": 0}
 
     while True:
         cycles += 1
         result = run_cycle(
             queue=queue, ledger=ledger, repo=repo, gh=gh, branch=branch,
             owner=owner, project=project, max_claims=max_claims,
-            max_attempts=max_attempts, rules=rules,
+            max_attempts=max_attempts, reconcile_after=reconcile_after,
+            rules=rules,
         )
         totals["cycles"] = cycles
         totals["enqueued"].extend(result["enqueued"])
         totals["released"].extend(result["released"])
+        totals["recovered"].extend(
+            result["reconciled_resumed"] + result["reconciled_released"])
         if result["error"]:
             totals["errors"] += 1
             delay = backoff_seconds(failures)

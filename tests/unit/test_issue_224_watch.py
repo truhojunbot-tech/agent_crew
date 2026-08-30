@@ -620,3 +620,225 @@ def test_claims_cli_on_empty_ledger(tmp_db):
     result = CliRunner().invoke(crew, ["claims", "--db", tmp_db])
     assert result.exit_code == 0
     assert "No claims." in result.output
+
+
+# ── 13. crash recovery / reconciliation (review-b9ec68e7) ─────────────
+#
+# `try_claim` COMMITs, and only then do labelling, enqueue and
+# `mark_enqueued` run as separate operations. The try/except arms handle
+# *exceptions*, but not the process simply dying (SIGKILL, teardown, power
+# loss). Two windows leak:
+#
+#   A. dead after try_claim, before enqueue  -> row stuck 'claimed', and
+#      held_numbers() excludes 'claimed' forever = permanent lock.
+#   B. dead after enqueue, before mark_enqueued -> a task exists but the
+#      ledger still says 'claimed', so the issue is locked AND the ledger
+#      has no task_id.
+#
+# ⛔Wrapping enqueue+mark in one transaction would only fix B. A is the
+#   worse one and is unreachable that way, so recovery has to be
+#   reconciliation.
+
+
+def _interrupt_after_claim(tmp_db, number):
+    """Simulate death between try_claim and enqueue (window A)."""
+    ClaimLedger(tmp_db).try_claim(REPO, number, owner="dead-watcher")
+
+
+def _interrupt_after_enqueue(tmp_db, number, issue):
+    """Simulate death between enqueue and mark_enqueued (window B)."""
+    from agent_crew.watch import build_task
+
+    ClaimLedger(tmp_db).try_claim(REPO, number, owner="dead-watcher")
+    task = build_task(issue, REPO, "main")
+    TaskQueue(tmp_db).enqueue(task)
+    return task.task_id
+
+
+def test_death_after_claim_before_enqueue_does_not_lock_the_issue(tmp_db):
+    """★Window A — a new watcher must recover, not stare at a dead claim."""
+    _interrupt_after_claim(tmp_db, 400)
+    assert ClaimLedger(tmp_db).get(REPO, 400)["state"] == "claimed"
+
+    # A brand-new watcher process over the same DB.
+    gh = FakeGitHub([make_issue(400, "Orphaned claim", ["bug"])])
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh, reconcile_after=0.0)
+
+    assert result["reconciled_released"] == [400], result
+    assert result["enqueued"] == [400], result
+    assert len(TaskQueue(tmp_db).list_tasks()) == 1
+    assert ClaimLedger(tmp_db).get(REPO, 400)["state"] == "enqueued"
+
+
+def test_death_after_enqueue_before_mark_does_not_duplicate(tmp_db):
+    """★Window B — the task already exists; adopt it, never enqueue twice."""
+    issue = {"number": 401, "title": "Half-recorded", "labels": ["bug"],
+             "parents": [], "phase": None}
+    task_id = _interrupt_after_enqueue(tmp_db, 401, issue)
+    assert ClaimLedger(tmp_db).get(REPO, 401)["state"] == "claimed"
+
+    gh = FakeGitHub([make_issue(401, "Half-recorded", ["bug"])])
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh, reconcile_after=0.0)
+
+    assert result["reconciled_resumed"] == [401], result
+    assert result["enqueued"] == [], result
+    assert len(TaskQueue(tmp_db).list_tasks()) == 1
+    row = ClaimLedger(tmp_db).get(REPO, 401)
+    assert row["state"] == "enqueued"
+    assert row["task_id"] == task_id
+
+
+def test_reconcile_leaves_a_fresh_claim_alone(tmp_db):
+    """⛔A claim seconds old belongs to a *live* peer mid-cycle — hands off.
+
+    This is why reconciliation is staleness-gated rather than unconditional:
+    without it, two watchers would steal each other's in-flight claims and
+    duplicate the very enqueue the ledger exists to prevent.
+    """
+    _interrupt_after_claim(tmp_db, 402)
+
+    gh = FakeGitHub([make_issue(402, "Live peer holds this", ["bug"])])
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=gh)  # default staleness window
+
+    assert result["reconciled_released"] == []
+    assert result["reconciled_resumed"] == []
+    assert result["enqueued"] == []
+    assert ClaimLedger(tmp_db).get(REPO, 402)["state"] == "claimed"
+
+
+def test_reconcile_release_clears_the_github_label(tmp_db):
+    """The visible claim must go when the claim does."""
+    _interrupt_after_claim(tmp_db, 403)
+    gh = FakeGitHub([make_issue(403, "Stale", ["bug", CLAIM_LABEL])])
+
+    run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db), repo=REPO,
+              gh=gh, reconcile_after=0.0)
+
+    assert (403, CLAIM_LABEL) in gh.removed
+
+
+def test_repeated_interruption_is_bounded_by_the_attempt_budget(tmp_db):
+    """⛔A deterministically-crashing issue must not be re-claimed forever."""
+    gh = FakeGitHub([make_issue(404, "Crashes every time", ["bug"])])
+
+    for _ in range(4):
+        # Each round: recover the orphan, re-claim, then die again.
+        run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                  repo=REPO, gh=gh, reconcile_after=0.0, max_claims=0,
+                  max_attempts=3)
+        ClaimLedger(tmp_db).try_claim(REPO, 404, owner="dead", max_attempts=3)
+
+    row = ClaimLedger(tmp_db).get(REPO, 404)
+    assert row["attempts"] >= 3, row
+    # Once the budget is gone the issue is parked, not retried.
+    assert ClaimLedger(tmp_db).try_claim(REPO, 404, owner="x", max_attempts=3) is False
+
+
+def test_reconcile_does_nothing_when_tasks_cannot_be_read(tmp_db):
+    """⛔Never guess. Unreadable queue = no idea whether a task exists."""
+    _interrupt_after_claim(tmp_db, 405)
+    broken = MagicMock(wraps=TaskQueue(tmp_db))
+    broken.list_all_with_status.side_effect = sqlite3.OperationalError("locked")
+
+    result = run_cycle(queue=broken, ledger=ClaimLedger(tmp_db), repo=REPO,
+                       gh=FakeGitHub([make_issue(405, "x", ["bug"])]),
+                       reconcile_after=0.0)
+
+    assert result["reconciled_released"] == []
+    assert ClaimLedger(tmp_db).get(REPO, 405)["state"] == "claimed"
+
+
+def test_reconcile_adopts_even_a_terminally_failed_task(tmp_db):
+    """⛔A finished-and-failed task still counts as 'this issue was done'.
+
+    Re-enqueueing it here would resurrect exactly the infinite re-run loop
+    the attempt budget exists to prevent.
+    """
+    from agent_crew.protocol import TaskResult
+
+    issue = {"number": 406, "title": "Ran and failed", "labels": ["bug"],
+             "parents": [], "phase": None}
+    task_id = _interrupt_after_enqueue(tmp_db, 406, issue)
+    q = TaskQueue(tmp_db)
+    q.submit_result(task_id, TaskResult(task_id=task_id, status="failed",
+                                        summary="died"))
+
+    result = run_cycle(queue=TaskQueue(tmp_db), ledger=ClaimLedger(tmp_db),
+                       repo=REPO, gh=FakeGitHub([make_issue(406, "x", ["bug"])]),
+                       reconcile_after=0.0)
+
+    assert result["reconciled_resumed"] == [406]
+    assert result["enqueued"] == []
+    assert len(TaskQueue(tmp_db).list_tasks()) == 1
+
+
+def test_two_reconcilers_cannot_both_act_on_one_stale_claim(tmp_db):
+    """★The recovery transition is a CAS, like the claim itself."""
+    _interrupt_after_claim(tmp_db, 407)
+    barrier = threading.Barrier(2)
+    acted = []
+
+    def _worker(name):
+        led = ClaimLedger(tmp_db)
+        barrier.wait()
+        if led.release_stale(REPO, 407, reason=name):
+            acted.append(name)
+
+    threads = [threading.Thread(target=_worker, args=(f"r{i}",)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(acted) == 1, acted
+    assert ClaimLedger(tmp_db).get(REPO, 407)["attempts"] == 1
+
+
+def test_finish_claim_is_conditional_on_still_being_claimed(tmp_db):
+    led = ClaimLedger(tmp_db)
+    led.try_claim(REPO, 408, owner="a")
+    assert led.finish_claim(REPO, 408, "impl-x") is True
+    # Already enqueued — a second reconciler must not re-apply.
+    assert led.finish_claim(REPO, 408, "impl-y") is False
+    assert led.get(REPO, 408)["task_id"] == "impl-x"
+
+
+def test_reconcile_only_touches_claimed_rows(tmp_db):
+    """`enqueued` and `released` rows are not the reconciler's business."""
+    led = ClaimLedger(tmp_db)
+    led.try_claim(REPO, 409, owner="a")
+    led.mark_enqueued(REPO, 409, "impl-done")
+    led.try_claim(REPO, 410, owner="a")
+    led.release(REPO, 410, reason="earlier failure")
+
+    from agent_crew.watch import reconcile_claims
+
+    out = reconcile_claims(TaskQueue(tmp_db), ClaimLedger(tmp_db), REPO,
+                           stale_after=0.0)
+
+    assert out == {"resumed": [], "released": []}, out
+    assert led.get(REPO, 409)["state"] == "enqueued"
+    assert led.get(REPO, 410)["state"] == "released"
+
+
+def test_reconcile_adopts_a_task_even_with_an_unusable_id(tmp_db, monkeypatch):
+    """⛔Existence of the task is the evidence — not whether its id is truthy.
+
+    Branching on truthiness would send an empty-id row down the release path
+    and enqueue the work a second time.
+    """
+    from agent_crew import watch as watch_module
+
+    _interrupt_after_claim(tmp_db, 411)
+    monkeypatch.setattr(watch_module, "tasks_by_issue",
+                        lambda *a, **k: {411: ""})
+
+    out = watch_module.reconcile_claims(TaskQueue(tmp_db), ClaimLedger(tmp_db),
+                                        REPO, stale_after=0.0)
+
+    assert out["resumed"] == [411], out
+    assert out["released"] == []
+    assert ClaimLedger(tmp_db).get(REPO, 411)["state"] == "enqueued"

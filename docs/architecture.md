@@ -350,6 +350,29 @@ in-progress state. `abandoned` once attempts exceed `--max-attempts`, which is
 what stops a permanently failing issue from being re-claimed every interval.
 `crew claims` lists them; `crew claims --release N` hands one back.
 
+**Crash recovery (reconciliation).** The claim COMMITs, and only then do the
+label write, the enqueue and the state transition run — three separate
+operations. `try`/`except` covers exceptions but not the process dying, which
+leaves two windows: dead *before* the enqueue (row stuck `claimed` = permanent
+lock, since `held_numbers` treats `claimed` as held) and dead *after* the
+enqueue but before the transition (task exists, ledger stale). Wrapping the
+enqueue and the transition in one transaction would only fix the second; the
+first happens strictly earlier. So every cycle begins with `reconcile_claims`:
+
+| Stale `claimed` row | Evidence | Action |
+|---|---|---|
+| task exists for the issue (any status, terminal included) | the enqueue happened | adopt it — `claimed` → `enqueued`, no duplicate |
+| no task exists | the enqueue never happened | `claimed` → `released` (+1 attempt), label removed |
+| queue unreadable | unknown | do nothing |
+
+"Stale" means older than `CLAIM_STALE_AFTER_SECONDS` (300s). A live claim
+becomes `enqueued` in well under a second, so the gate reliably separates "the
+owner died" from "the owner is mid-cycle" — without it, peers would steal each
+other's in-flight claims. Both transitions are compare-and-set on
+`state='claimed'`, so two reconcilers cannot both recover one orphan, and the
+released path counts an attempt so a deterministically-crashing issue is parked
+as `abandoned` rather than re-claimed forever.
+
 **Failure ordering matters.** Discovery runs entirely before the first claim,
 so a GitHub outage produces an error cycle and an exponential backoff with no
 possibility of a half-claimed issue.
