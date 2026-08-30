@@ -281,6 +281,7 @@ agent_crew/
 │       ├── server.py        # FastAPI Task Queue + Gate HTTP server
 │       ├── session.py       # SessionManager (tmux pane lifecycle)
 │       ├── triage.py        # GitHub issue triage + poll loop
+│       ├── watch.py         # Backlog ingestion: claim ledger + watch loop (#224)
 │       ├── discussion.py    # Discussion loop orchestration
 │       ├── loop.py          # Code-review loop orchestration
 │       ├── instructions.py  # Agent instruction file generator (CLAUDE.md/AGENTS.md/GEMINI.md)
@@ -305,7 +306,9 @@ $HOME/.agent_crew/<project>/
   state.json        project state (port, session, pane_ids, pane_map, worktrees, db path)
   sessions.json     per-agent session lifecycle (cmd, started_at, failures)
   pane_map.json     role → pane_id mapping consumed by the push model
-  tasks.db          SQLite task + gate store
+  tasks.db          SQLite task + gate store (+ `issue_claims`, the watch-mode
+                    claim ledger — same file so a claim and the task it produced
+                    cannot drift apart across a restart)
   server.log        uvicorn stdout/stderr (background server)
   crew.log          crew CLI activity log
   synthesis.md      discussion output (overwritten each run)
@@ -314,6 +317,84 @@ $HOME/.agent_crew/<project>/
 Nothing written inside the user's git repo. All runtime state in `$HOME/.agent_crew/`
 so it survives reboot — the queue, in-progress tasks, and pane bindings persist
 across sessions.
+
+---
+
+## 4.5 Backlog Ingestion (`crew triage --watch`, #224)
+
+The runtime is push-based by design: workers never poll. That left one gap —
+nothing turned an open GitHub issue into a queued task on its own. `watch.py`
+supplies that single hop, manager-side only:
+
+```
+GitHub open issue
+  → discovery      gh issue list (the ONLY GitHub polling in the system)
+  → eligibility    not done/claimed, no active task, no open PR, parents closed
+  → priority       deterministic policy; `priority:N` label overrides
+  → atomic claim   INSERT into issue_claims under BEGIN IMMEDIATE
+  → visible claim  add `agent_crew:claimed` on GitHub
+  → enqueue        TaskQueue.enqueue → the server's existing dispatcher picks
+                   the pending row up and pushes it, exactly as before
+```
+
+**The lock is the row, not the label.** `gh issue edit --add-label` is
+idempotent, so two watchers would both "succeed" and both enqueue. The
+`issue_claims` PRIMARY KEY taken under `BEGIN IMMEDIATE` is what makes the
+claim single-winner, and being on disk is what makes it restart-safe. The
+label exists because the claim must be externally visible, and as an advisory
+signal to managers that do not share this database.
+
+**Claim states.** `claimed` → `enqueued` on success. `released` (attempts+1) if
+the enqueue or the label write fails, so an issue is never parked in a fake
+in-progress state. `abandoned` once attempts exceed `--max-attempts`, which is
+what stops a permanently failing issue from being re-claimed every interval.
+`crew claims` lists them; `crew claims --release N` hands one back.
+
+**Crash recovery (reconciliation).** The claim COMMITs, and only then do the
+label write, the enqueue and the state transition run — three separate
+operations. `try`/`except` covers exceptions but not the process dying, which
+leaves two windows: dead *before* the enqueue (row stuck `claimed` = permanent
+lock, since `held_numbers` treats `claimed` as held) and dead *after* the
+enqueue but before the transition (task exists, ledger stale). Wrapping the
+enqueue and the transition in one transaction would only fix the second; the
+first happens strictly earlier. So every cycle begins with `reconcile_claims`:
+
+| Stale `claimed` row | Evidence | Action |
+|---|---|---|
+| task exists for the issue (any status, terminal included) | the enqueue happened | adopt it — `claimed` → `enqueued`, no duplicate |
+| no task exists | the enqueue never happened | `claimed` → `released` (+1 attempt), label removed |
+| queue unreadable | unknown | do nothing |
+
+"Stale" means older than `CLAIM_STALE_AFTER_SECONDS` (300s). A live claim
+becomes `enqueued` in well under a second, so the gate reliably separates "the
+owner died" from "the owner is mid-cycle" — without it, peers would steal each
+other's in-flight claims. Both transitions are compare-and-set on
+`state='claimed'`, so two reconcilers cannot both recover one orphan, and the
+released path counts an attempt so a deterministically-crashing issue is parked
+as `abandoned` rather than re-claimed forever.
+
+**Label reconciliation.** The same divergence problem exists between the ledger
+and GitHub. A release updates the row and the label as two separate writes, so
+either order leaves a window where the ledger says `released` (retryable) but
+the issue still carries `agent_crew:claimed` — and `select_candidates` skips
+any labelled issue, so it is stranded. Ordering cannot fix two non-transactional
+systems, so `reconcile_labels` runs each cycle on the labels just fetched:
+
+| Issue carries the claim label | Local ledger row | Action |
+|---|---|---|
+| yes | `released` | clear the label (and drop it in-memory, so the issue is selectable this cycle) |
+| yes | `claimed` / `enqueued` | leave it — the claim is live |
+| yes | `abandoned` | leave it — `held_numbers` already blocks it, and the label correctly says agent_crew is parked |
+| yes | **no row at all** | leave it — another manager owns it |
+
+That last row is the important one: the label is the only signal between crews
+that do not share this database, so an unrecognised label is never stripped.
+If GitHub refuses the removal the issue stays skipped rather than being claimed
+with a stale peer-visible label, and the next cycle retries.
+
+**Failure ordering matters.** Discovery runs entirely before the first claim,
+so a GitHub outage produces an error cycle and an exponential backoff with no
+possibility of a half-claimed issue.
 
 ---
 

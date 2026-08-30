@@ -8,6 +8,7 @@ Multi-agent development crew system. Coordinates Claude, Codex, and Gemini agent
 │                                                     │
 │  crew setup       →  tmux panes + worktrees         │
 │  crew triage      →  AI selects GitHub issue        │
+│  crew triage --watch → claims issues continuously   │
 │  crew discuss     →  enqueue discussion tasks       │
 │  crew run         →  enqueue implement/review tasks  │
 │  crew status      →  session + task status          │
@@ -56,14 +57,96 @@ crew teardown myproject
 | `crew setup <project>` | Start server, create git worktrees, launch agent panes |
 | `crew run "<task>"` | Run implementer → reviewer → tester pipeline |
 | `crew discuss "<topic>"` | Send same topic to all agents for discussion |
-| `crew triage` | Auto-select and assign GitHub issues |
+| `crew triage` | Auto-select and assign GitHub issues (one-shot) |
+| `crew triage --watch` | **Unattended manager mode** — poll, claim, enqueue |
+| `crew claims` | Inspect / release watch-mode issue claims |
 | `crew status [project]` | Show queue / in-progress / completed tasks |
 | `crew recover <project>` | Restart server/panes after crash |
 | `crew teardown <project>` | Clean up worktrees, panes, and database |
 
+## Unattended manager mode (recommended)
+
+`crew triage` is one-shot: it picks an issue now and exits. That leaves a gap —
+filing a GitHub issue does not by itself produce any queued work, so somebody
+has to forward each issue to a management session by hand.
+
+`crew triage --watch` closes it. It is the recommended way to run Agent Crew
+unattended:
+
+```bash
+crew triage --repo owner/name --project myproject --watch --interval 5m
+```
+
+Each cycle it discovers open issues, filters to actionable ones, claims the
+highest-priority candidate, and enqueues it into the normal task queue:
+
+```
+GitHub open issue → discovery → eligibility → atomic claim → enqueue
+                  → implement → review → test → PR → next issue
+```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `--watch` | off | Enable the loop. Without it, `crew triage` is unchanged. |
+| `--interval` | `5m` | Poll interval. Clamped to 10s-1h. |
+| `--max-cycles` | `0` | Stop after N cycles (0 = until interrupted). |
+| `--max-claims` | `1` | Issues claimed per cycle. |
+| `--max-attempts` | `3` | Give up on an issue after N failed claim attempts. |
+
+**Claim safety.** A claim is a row in `issue_claims` (same SQLite file as the
+task queue) taken under `BEGIN IMMEDIATE`, so exactly one watcher wins even if
+several run concurrently, and the row survives a restart. The
+`agent_crew:claimed` label is added on GitHub so the claim is externally
+visible — but the label is *not* the lock, since `--add-label` is idempotent
+and would let two watchers both "succeed".
+
+**Eligibility.** An issue is skipped when it carries `agent_crew:done` or
+`agent_crew:claimed`, when a non-terminal task already references it, when an
+open PR references it, or when a declared parent (`Parent: #N`, `depends on
+#N`) is still open.
+
+**Priority.** Deterministic: `p0`/`critical`/`security` (1) → `bug`/
+`regression`/`production` (2) → unlabelled (3) → `enhancement`/`feature` (4) →
+`docs`/`chore` (5). An explicit `priority:N` label overrides the policy
+outright. Ties break by phase, then issue number, so the same backlog always
+yields the same pick. When nothing is actionable, nothing is enqueued — the
+watcher never invents work.
+
+**Crash recovery.** `try_claim` commits before the label write and the enqueue,
+so a watcher that is *killed* mid-sequence (SIGKILL, teardown, power loss)
+would otherwise leave a row stuck in `claimed` — and `claimed` counts as held,
+locking the issue out permanently. Every cycle therefore starts by reconciling
+claims that have sat in `claimed` past `CLAIM_STALE_AFTER_SECONDS` (5 min): if
+a task for that issue already exists it is adopted (no duplicate enqueue), and
+if none exists the claim is released for retry and the label removed. The
+staleness gate is what keeps a reconciler from stealing a live peer's in-flight
+claim. If the queue can't be read, nothing is touched — recovery never guesses.
+
+**Ledger/label divergence.** The ledger and the GitHub label are two systems
+with no shared transaction, so every release writes one then the other. If the
+process dies (or the label write fails) in between, the ledger says `released`
+— retryable — while discovery still skips the issue for carrying the label:
+retryable on paper, invisible in practice. No ordering of the two writes fixes
+that, so each cycle repairs the divergence instead, clearing the label from any
+issue **this** ledger has in `released`. A claim label on an issue with no local
+row is left alone — it belongs to another manager, and that label is the only
+cross-database signal between crews that do not share this SQLite file.
+`crew claims --release` clears the label too, and says so if it cannot.
+
+**Failure handling.** A GitHub error backs off exponentially (30s → 15m cap);
+because discovery runs before any claim, an error cycle cannot strand a claim.
+If enqueue fails after a claim, the claim is released and the label removed, so
+an issue is never left in a fake in-progress state — and after `--max-attempts`
+releases it is marked `abandoned` rather than re-claimed forever. Inspect with
+`crew claims`; hand one back with `crew claims --repo owner/name --release N`.
+
+Workers are unaffected: they remain push-driven and never poll GitHub.
+
 ## Architecture
 
 - **Push model**: server delivers tasks to agent panes via `tmux send-keys`. Agents do not poll — they receive tasks and POST results back to `POST /tasks/{id}/result`.
+- **Backlog ingestion** (opt-in): `crew triage --watch` is the only component
+  that polls GitHub, and it runs manager-side only.
 - **Persistence**: SQLite at `~/.agent_crew/<project>/tasks.db`
 - **Port**: auto-selected starting from 8100, written to `~/.agent_crew/<project>/port`
 - **Worktrees**: `~/.agent_crew/<project>/{claude,codex,gemini}/`

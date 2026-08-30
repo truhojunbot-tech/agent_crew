@@ -43,6 +43,19 @@ def _state_path(base: str, project: str) -> str:
     return os.path.join(base, project, "state.json")
 
 
+def _parse_interval(text: str) -> float:
+    """Parse a '30s' / '5m' / '1h' duration into seconds (#224)."""
+    import re as _re
+
+    m = _re.fullmatch(r"(\d+)\s*(s|m|h)?", (text or "").strip(), _re.IGNORECASE)
+    if not m:
+        raise click.ClickException(
+            f"Invalid interval: {text!r}. Use e.g. '30s', '5m', '1h'."
+        )
+    unit = (m.group(2) or "s").lower()
+    return float(int(m.group(1)) * {"s": 1, "m": 60, "h": 3600}[unit])
+
+
 def _read_state(base: str, project: str) -> dict | None:
     path = _state_path(base, project)
     if not os.path.exists(path):
@@ -2387,9 +2400,27 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
 @click.option("--branch", default="main", show_default=True)
 @click.option("--no-confirm", is_flag=True, help="Skip approval gate, enqueue task immediately")
 @click.option("--merge-history", default="none", show_default=True, help="Recent merge history text")
+@click.option("--watch", is_flag=True,
+              help="Run as an unattended manager: keep polling the repo, claim "
+                   "actionable issues and enqueue them (#224).")
+@click.option("--interval", default="5m", show_default=True,
+              help="Watch poll interval (e.g. 30s, 5m, 1h). Bounded to 10s-1h.")
+@click.option("--max-cycles", default=0, type=int,
+              help="Watch: stop after N cycles (0 = run until interrupted)")
+@click.option("--max-claims", default=1, type=int, show_default=True,
+              help="Watch: max issues claimed per cycle")
+@click.option("--max-attempts", default=3, type=int, show_default=True,
+              help="Watch: give up on an issue after N failed claim attempts")
 def triage(repo: str, db: str, project: str, base: str, branch: str,
-           no_confirm: bool, merge_history: str):
-    """Triage GitHub issues and select the next task."""
+           no_confirm: bool, merge_history: str, watch: bool, interval: str,
+           max_cycles: int, max_claims: int, max_attempts: int):
+    """Triage GitHub issues and select the next task.
+
+    Without --watch this is the original one-shot behaviour, unchanged.
+    With --watch it becomes the recommended unattended-manager mode (#224):
+    poll the repo, atomically claim actionable issues, and enqueue them into
+    the existing task queue. Workers stay push-driven either way.
+    """
     if not db:
         if not project:
             raise click.ClickException("--db or --project is required")
@@ -2413,6 +2444,60 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
                 raise click.ClickException(err_msg)
 
     queue = TaskQueue(db)
+
+    if watch:
+        # #224: unattended manager mode. Distinct from the LLM-pick path below —
+        # selection here is a deterministic policy, and every claim goes through
+        # the ledger so restarts and a second manager cannot double-enqueue.
+        from agent_crew import watch as watch_module
+
+        seconds = _parse_interval(interval)
+        ledger = watch_module.ClaimLedger(db)
+        click.echo(
+            f"Watching {repo} every {watch_module.clamp_interval(seconds):.0f}s "
+            f"(max {max_claims} claim(s)/cycle). Ctrl-C to stop."
+        )
+
+        def _on_cycle(cycle: int, result: dict, delay: float) -> None:
+            # Recovery is reported first and separately — an operator seeing
+            # "recovered" repeatedly is looking at a watcher that keeps dying,
+            # which the enqueue counts alone would hide.
+            for number in result.get("reconciled_resumed", []):
+                click.echo(f"[cycle {cycle}] recovered #{number} "
+                           f"(task already existed, adopted)")
+            for number in result.get("reconciled_released", []):
+                click.echo(f"[cycle {cycle}] recovered #{number} "
+                           f"(stale claim released for retry)")
+            for number in result.get("reconciled_labels", []):
+                click.echo(f"[cycle {cycle}] recovered #{number} "
+                           f"(cleared stale claim label)")
+            if result["error"]:
+                click.echo(f"[cycle {cycle}] github error: {result['error']} "
+                           f"- backing off {delay:.0f}s")
+            elif result["enqueued"]:
+                for number in result["enqueued"]:
+                    click.echo(f"[cycle {cycle}] claimed + enqueued #{number}")
+            elif result["released"]:
+                for number in result["released"]:
+                    click.echo(f"[cycle {cycle}] released #{number} (claim failed)")
+            else:
+                click.echo(f"[cycle {cycle}] no actionable issues")
+
+        try:
+            totals = watch_module.watch(
+                queue=queue, ledger=ledger, repo=repo, branch=branch,
+                project=project, interval=seconds, max_cycles=max_cycles,
+                max_claims=max_claims, max_attempts=max_attempts,
+                on_cycle=_on_cycle,
+            )
+        except KeyboardInterrupt:
+            click.echo("Stopped.")
+            return
+        click.echo(
+            f"Done: {totals['cycles']} cycle(s), "
+            f"{len(totals['enqueued'])} enqueued, {totals['errors']} error(s)."
+        )
+        return
 
     def _agent_fn(prompt: str) -> str:
         import re
@@ -2447,6 +2532,77 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
             return
         click.echo(f"Gate created: {result['gate_id']}")
         click.echo(f"Issue #{result['parsed']['issue']}: {result['parsed']['description']}")
+
+
+@crew.command()
+@click.option("--repo", default="", help="GitHub repo (owner/name); omit for all")
+@click.option("--db", default="", help="SQLite DB path (standalone)")
+@click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--release", "release_issue", default=0, type=int,
+              help="Hand issue N back to the pool (resets its attempt budget)")
+@click.option("--json", "as_json", is_flag=True, help="Emit raw JSON")
+def claims(repo: str, db: str, project: str, base: str, release_issue: int,
+           as_json: bool):
+    """Inspect or release watch-mode issue claims (#224).
+
+    A task that fails terminally leaves its claim in `enqueued`, and the
+    watcher will not re-take it — that is what prevents an infinite re-run
+    loop. This is where you see that and undo it deliberately.
+    """
+    if not db:
+        if not project:
+            raise click.ClickException("--db or --project is required")
+        state = _read_state(base, project)
+        if state is None:
+            raise click.ClickException(f"project {project!r} not found")
+        db = state["db"]
+
+    from agent_crew import watch as watch_module
+
+    ledger = watch_module.ClaimLedger(db)
+
+    if release_issue:
+        if not repo:
+            raise click.ClickException("--repo is required with --release")
+        if not ledger.force_release(repo, release_issue):
+            click.echo(f"No claim found for {repo}#{release_issue}.")
+            return
+        click.echo(f"Released {repo}#{release_issue}.")
+        # ⛔The ledger alone is not enough. `select_candidates` skips any issue
+        #   still carrying the claim label, so releasing without clearing it
+        #   leaves the issue retryable on paper and invisible in practice —
+        #   exactly the state this command exists to undo.
+        try:
+            cleared = watch_module.GhCli().remove_label(
+                repo, release_issue, watch_module.CLAIM_LABEL)
+        except Exception as exc:  # noqa: BLE001
+            cleared, exc_text = False, f" ({exc})"
+        else:
+            exc_text = ""
+        if cleared:
+            click.echo(f"Cleared the {watch_module.CLAIM_LABEL} label.")
+        else:
+            click.echo(
+                f"WARNING: could not clear the {watch_module.CLAIM_LABEL} "
+                f"label{exc_text} — the issue stays hidden from discovery "
+                f"until it is gone. A watch cycle will retry automatically."
+            )
+        return
+
+    rows = ledger.list_claims(repo)
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+        return
+    if not rows:
+        click.echo("No claims.")
+        return
+    for row in rows:
+        extra = f" ({row['reason']})" if row["reason"] else ""
+        click.echo(
+            f"{row['repo']}#{row['issue_number']:<6} {row['state']:<10} "
+            f"attempts={row['attempts']} task={row['task_id'] or '-'}{extra}"
+        )
 
 
 @crew.command()
