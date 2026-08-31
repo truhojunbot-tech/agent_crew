@@ -1547,7 +1547,7 @@ def create_app(
         # here, and reused below when building the gemini `cmd` so the two
         # can't drift apart.
         _known_model = (
-            os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.5 Flash (Medium)")
+            os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.7 Flash (Medium)")
             if agent == "gemini" else ""
         )
 
