@@ -20,6 +20,7 @@ import pytest
 from agent_crew.queue import TaskQueue
 from agent_crew.watch import (
     CLAIM_LABEL,
+    HOLD_LABEL,
     ClaimLedger,
     backoff_seconds,
     priority_for,
@@ -164,6 +165,34 @@ def test_issue_with_active_task_in_queue_is_skipped(queue, ledger):
 
 def test_done_labelled_issue_is_skipped(queue, ledger):
     gh = FakeGitHub([make_issue(15, "Finished", ["bug", "agent_crew:done"])])
+
+    assert run_cycle(queue=queue, ledger=ledger, repo=REPO, gh=gh)["enqueued"] == []
+
+
+def test_hold_labelled_issue_is_skipped(queue, ledger):
+    """#226: an operator must be able to say "leave this alone, it's a
+    design decision pending my go-ahead" without that also meaning
+    "urgent" (a bare "blocked" label maps to priority 1 -- claimed
+    FIRST -- which is the opposite of what's wanted here). HOLD_LABEL is
+    an eligibility gate, independent of DEFAULT_PRIORITY_RULES, so it
+    can't be shadowed by relabelling for urgency."""
+    gh = FakeGitHub([
+        make_issue(212, "Design decision pending", ["feature", HOLD_LABEL]),
+        make_issue(213, "Ordinary bug", ["bug"]),
+    ])
+
+    result = run_cycle(queue=queue, ledger=ledger, repo=REPO, gh=gh)
+
+    assert result["enqueued"] == [213]
+
+
+def test_hold_label_is_not_shadowed_by_urgency_relabelling(queue, ledger):
+    """Even a "blocked"/"p0" label (priority 1, claimed first under normal
+    policy) must not override an explicit hold -- the two are orthogonal
+    dimensions (urgency vs. eligibility), and eligibility wins."""
+    gh = FakeGitHub([
+        make_issue(214, "Urgent-looking but held", ["p0", "blocked", HOLD_LABEL]),
+    ])
 
     assert run_cycle(queue=queue, ledger=ledger, repo=REPO, gh=gh)["enqueued"] == []
 

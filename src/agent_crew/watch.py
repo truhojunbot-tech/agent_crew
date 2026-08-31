@@ -52,6 +52,15 @@ logger = logging.getLogger(__name__)
 CLAIM_LABEL = "agent_crew:claimed"
 #: Pre-existing marker, honoured here too: the issue is finished.
 DONE_LABEL = "agent_crew:done"
+#: Explicit "do not auto-claim this" marker for issues held pending a human
+#: decision (e.g. a design call, not a routine bug/feature). Distinct from
+#: the priority-policy labels in DEFAULT_PRIORITY_RULES on purpose: a bare
+#: "blocked"/"p0" label is a policy *tier* (and "blocked" maps to priority 1
+#: -- claimed FIRST), which is the opposite of what an operator wants when
+#: they need the watcher to leave an issue alone. This label is an
+#: eligibility gate, not a priority signal, so it can never be shadowed by
+#: relabelling for urgency.
+HOLD_LABEL = "agent_crew:hold"
 
 #: How many times one issue may be claimed-then-released before we stop.
 DEFAULT_MAX_ATTEMPTS = 3
@@ -140,7 +149,7 @@ def select_candidates(issues, *, claimed, active_issues, rules=DEFAULT_PRIORITY_
         if number in claimed or number in active_issues:
             continue
         labels = issue.get("labels") or []
-        if DONE_LABEL in labels or CLAIM_LABEL in labels:
+        if DONE_LABEL in labels or CLAIM_LABEL in labels or HOLD_LABEL in labels:
             continue
         out.append(issue)
     out.sort(key=lambda i: (

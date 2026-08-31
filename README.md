@@ -100,10 +100,14 @@ several run concurrently, and the row survives a restart. The
 visible — but the label is *not* the lock, since `--add-label` is idempotent
 and would let two watchers both "succeed".
 
-**Eligibility.** An issue is skipped when it carries `agent_crew:done` or
-`agent_crew:claimed`, when a non-terminal task already references it, when an
-open PR references it, or when a declared parent (`Parent: #N`, `depends on
-#N`) is still open.
+**Eligibility.** An issue is skipped when it carries `agent_crew:done`,
+`agent_crew:claimed`, or `agent_crew:hold`, when a non-terminal task already
+references it, when an open PR references it, or when a declared parent
+(`Parent: #N`, `depends on #N`) is still open. `agent_crew:hold` is for
+"leave this alone, it's a design decision pending an operator's explicit
+go-ahead" — deliberately independent of the priority policy below, since a
+bare `blocked`/`p0` label there means priority 1 (claimed *first*), the
+opposite of what a hold needs.
 
 **Priority.** Deterministic: `p0`/`critical`/`security` (1) → `bug`/
 `regression`/`production` (2) → unlabelled (3) → `enhancement`/`feature` (4) →
