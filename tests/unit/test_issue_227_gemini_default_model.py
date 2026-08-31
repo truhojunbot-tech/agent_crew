@@ -77,6 +77,13 @@ def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None):
         env.update(extra_env)
 
     with patch.dict(os.environ, env):
+        if "AGENT_CREW_GEMINI_MODEL" not in env:
+            # A host/CI override must not be able to mask a reverted
+            # default (review-45d57692) -- ensure the default-path test
+            # actually exercises the default, not whatever happens to be
+            # set outside this test. patch.dict restores the real
+            # environ on exit, so popping here is safe.
+            os.environ.pop("AGENT_CREW_GEMINI_MODEL", None)
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
