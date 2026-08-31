@@ -559,6 +559,35 @@ def _pane_has_bash_prompt(pane_id: str) -> bool:
     return bool(re.search(r"\$\s*$|❯\s*$|^>\s*$", last_line))
 
 
+#: Foreground commands that mean the agent CLI exited (#195 crash signature).
+_DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
+
+
+def _pane_liveness(pane_id: str) -> str:
+    """``alive`` | ``dead`` | ``unknown`` for the process in ``pane_id`` (#231).
+
+    Silence is not death. A pane running a full test suite produces no
+    capture changes for minutes, which `_pane_is_busy` reports as idle; this
+    is the second opinion the watchdog consults before destroying the task.
+    Conservative by design — anything that is not a shell counts as alive,
+    because a wrong "dead" verdict costs real work.
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p",
+             "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception:
+        return "unknown"
+    if r.returncode != 0:
+        return "unknown"
+    cmd = r.stdout.strip()
+    if not cmd:
+        return "unknown"
+    return "dead" if cmd in _DEAD_PANE_COMMANDS else "alive"
+
+
 def _pane_is_busy(pane_id: str) -> bool:
     """Return True if the pane is actively processing.
 
@@ -836,6 +865,8 @@ def create_app(
     push_fn: Callable[[str, str], None] = _default_push,
     project: Optional[str] = None,
     pane_busy_fn: Callable[[str], bool] = _pane_is_busy,
+    pane_liveness_fn=None,
+    alive_timeout_multiplier: Optional[float] = None,
     watchdog_interval: Optional[float] = None,
     reminder_seconds: Optional[float] = None,
     timeout_seconds: Optional[float] = None,
@@ -881,6 +912,15 @@ def create_app(
         reminder_seconds = float(os.getenv("AGENT_CREW_REMINDER_SECONDS", "300"))
     if timeout_seconds is None:
         timeout_seconds = float(os.getenv("AGENT_CREW_TIMEOUT_SECONDS", "900"))
+    if pane_liveness_fn is None:
+        pane_liveness_fn = _pane_liveness
+    if alive_timeout_multiplier is None:
+        # #231: how much longer a *demonstrably running* agent may stay quiet
+        # before the watchdog reaps it. A leash, not an exemption — this
+        # watchdog is the only bound on a pane-based task.
+        alive_timeout_multiplier = float(
+            os.getenv("AGENT_CREW_ALIVE_TIMEOUT_MULTIPLIER", "3")
+        )
     if watchdog_disabled is None:
         watchdog_disabled = os.getenv("AGENT_CREW_WATCHDOG_DISABLED", "").lower() in (
             "1", "true", "yes",
@@ -1223,7 +1263,19 @@ def create_app(
             # chance to be picked up. A task that has never been reminded
             # has not yet had idle_for ≥ reminder_seconds confirmed, so we
             # treat it as still within its dispatch-grace window.
-            if idle_for >= timeout_seconds and task_id in reminded_task_ids:
+            # #231: a quiet pane is not necessarily a dead one — a full test
+            # suite is silent for minutes. Ask what is actually running and
+            # give a live process a longer leash before reaping it. Bounded,
+            # not exempt: nothing else bounds a pane-based task.
+            effective_timeout = timeout_seconds
+            try:
+                _liveness = pane_liveness_fn(pane_id)
+            except Exception:
+                logger.exception(f"watchdog: pane_liveness_fn raised for {pane_id}")
+                _liveness = "unknown"
+            if _liveness == "alive":
+                effective_timeout = timeout_seconds * alive_timeout_multiplier
+            if idle_for >= effective_timeout and task_id in reminded_task_ids:
                 # Capture last 20 lines of pane for debugging (#167)
                 pane_tail = ""
                 try:
@@ -1238,7 +1290,8 @@ def create_app(
                     pass
                 summary = (
                     f"watchdog timeout: pane idle {idle_for:.0f}s without "
-                    f"sign of activity (threshold {timeout_seconds:.0f}s)"
+                    f"sign of activity (threshold {effective_timeout:.0f}s, "
+                    f"agent process {_liveness})"
                 )
                 if pane_tail:
                     summary += f"\npane_tail:\n{pane_tail}"
@@ -1247,7 +1300,8 @@ def create_app(
                 watchdog_error_info = {
                     "reason": "watchdog_timeout",
                     "idle_seconds": round(idle_for, 1),
-                    "threshold_seconds": timeout_seconds,
+                    "threshold_seconds": effective_timeout,
+                    "agent_liveness": _liveness,
                     "pane_id": pane_id,
                 }
                 tt = q().force_fail(task_id, summary, error_info=watchdog_error_info)

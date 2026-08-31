@@ -370,6 +370,63 @@ _HEALTHY_PANE_COMMAND_DISPATCHER = {"python", "python3"}
 _DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
 
 
+#: Idle window policy (#231).
+#:
+#: The old window was a flat 300s regardless of role, while #214 gives the
+#: implementer a 1800s dispatch budget. A full pytest suite is legitimately
+#: silent for 5+ minutes, so the watchdog was firing *below the length of
+#: normal work* — silence was being read as death. The window now scales
+#: with the caller's own timeout, with the previous 300s kept as a floor so
+#: short waits do not get slower to clean up.
+IDLE_FAIL_TIMEOUT_RATIO = 0.5
+IDLE_FAIL_FLOOR_SECONDS = 300.0
+IDLE_WARN_FRACTION = 0.5
+
+
+def idle_thresholds(wait_timeout: float) -> tuple[float, float]:
+    """``(warn_after, fail_after)`` seconds of pane silence for this task.
+
+    Scales with ``wait_timeout`` so a long-running role gets a proportionate
+    window, never dropping below the historical 300s.
+    """
+    try:
+        budget = float(wait_timeout)
+    except (TypeError, ValueError):
+        budget = 0.0
+    fail_after = max(IDLE_FAIL_FLOOR_SECONDS, budget * IDLE_FAIL_TIMEOUT_RATIO)
+    return fail_after * IDLE_WARN_FRACTION, fail_after
+
+
+def agent_liveness(pane_target: str) -> str:
+    """Is the agent in ``pane_target`` alive? ``alive`` | ``dead`` | ``unknown``.
+
+    Reuses the #195 crash signature: a pane whose foreground command is a
+    shell means the agent CLI exited. Anything else running is treated as
+    alive — deliberately conservative, because guessing "dead" is what
+    destroys real work, whereas guessing "alive" only costs a wait that the
+    caller's own timeout already bounds.
+    """
+    if not pane_target:
+        return "unknown"
+    cmd = _pane_current_command(pane_target)
+    if not cmd:
+        return "unknown"
+    return "dead" if cmd in _DEAD_PANE_COMMANDS else "alive"
+
+
+def should_auto_fail_idle(liveness: str) -> bool:
+    """Whether a pane that has gone quiet should be auto-failed (#231).
+
+    ⛔Only silence *plus* a dead process justifies failing. A quiet-but-alive
+      agent keeps its task — that is the entire bug this fixes.
+    ⚠️``unknown`` keeps the previous auto-fail behaviour on purpose. If tmux
+      cannot tell us anything, refusing to ever fail would let a genuinely
+      dead agent hold the queue for the whole wait_timeout on a transient
+      tmux hiccup.
+    """
+    return liveness != "alive"
+
+
 def _detect_dead_agent_panes(
     agents: list[str],
     pane_ids: list[str],
@@ -1646,16 +1703,20 @@ def run_cmd(task: str, db: str, project: str, base: str,
         # acknowledge the paste, render its initial response, and stream
         # the first tokens out.
         idle_check_start = start_time + 30.0
-        # Threshold timeline for idle (issue #103):
-        # - <2min idle: silent
-        # - 2min idle: emit warning so the operator sees something happen
-        #   before the auto-fail kicks in
-        # - 5min idle: auto-fail with watchdog-shaped summary so the
-        #   fallback policy reroutes to the next agent in the chain
-        warn_after_idle_seconds = 120.0
-        fail_after_idle_seconds = 300.0
+        # Threshold timeline for idle (issue #103), scaled per-task (#231):
+        # - <warn: silent
+        # - warn: emit warning so the operator sees something happen before
+        #   the auto-fail kicks in
+        # - fail: auto-fail *only if the agent process is actually gone* —
+        #   see should_auto_fail_idle(). A flat 300s used to fire below the
+        #   length of normal work (a full pytest run is silent for 5+ min),
+        #   which cost real work on #224.
+        warn_after_idle_seconds, fail_after_idle_seconds = idle_thresholds(
+            wait_timeout
+        )
         pane_idle_started_at: float | None = None
         pane_warning_emitted = False
+        pane_alive_notice_emitted = False
         last_progress_print = start_time
         while time.time() < deadline:
             result = queue.get_result(task_id)
@@ -1674,6 +1735,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 if changed:
                     pane_idle_started_at = None
                     pane_warning_emitted = False
+                    pane_alive_notice_emitted = False
                 else:
                     if pane_idle_started_at is None:
                         pane_idle_started_at = now
@@ -1690,10 +1752,26 @@ def run_cmd(task: str, db: str, project: str, base: str,
                         )
                         pane_warning_emitted = True
                     if idle_for >= fail_after_idle_seconds:
+                        # #231: silence alone is not death. Ask the pane what
+                        # is actually running before destroying the task —
+                        # this is the check whose absence lost real work.
+                        liveness = agent_liveness(first_pane_target)
+                        if not should_auto_fail_idle(liveness):
+                            if not pane_alive_notice_emitted:
+                                click.echo(
+                                    f"  Pane quiet for {idle_for:.0f}s but the "
+                                    f"agent process is still running — not "
+                                    f"auto-failing {task_id!r}. Bounded by the "
+                                    f"{wait_timeout:.0f}s task timeout."
+                                )
+                                pane_alive_notice_emitted = True
+                            time.sleep(2)
+                            continue
                         reason = (
                             f"watchdog timeout: CLI detected pane idle for "
                             f"{idle_for:.0f}s on task {task_id!r} (no "
-                            f"capture changes since {warn_after_idle_seconds:.0f}s). "
+                            f"capture changes since {warn_after_idle_seconds:.0f}s; "
+                            f"agent process {liveness}). "
                             f"Auto-failed for queue cleanup."
                         )
                         click.echo(f"Warning: {reason}")
