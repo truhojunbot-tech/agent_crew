@@ -56,6 +56,10 @@ TYPE_CODE = "code"
 TYPE_TEST = "test"
 TYPE_REVIEW = "pr_review"
 TYPE_EPISODE = "episode"
+#: #240 derived governance. Ranked below every authoritative type on
+#: purpose: a procedure may require a check, never overrule current code
+#: or the acceptance criteria.
+TYPE_PROCEDURE = "procedure"
 TYPE_EVIDENCE = "evidence"
 
 MANDATORY_TYPES = frozenset({TYPE_ISSUE, TYPE_AC})
@@ -82,7 +86,7 @@ DEFAULT_BUDGET = {"max_tokens": 4000, "max_items": 16, "type_caps": {}}
 _TYPE_RANK = {
     TYPE_ISSUE: 0, TYPE_AC: 1, TYPE_ADR: 2, TYPE_SPEC: 3,
     TYPE_TEST: 4, TYPE_CODE: 5, TYPE_REVIEW: 6,
-    TYPE_EVIDENCE: 7, TYPE_EPISODE: 8,
+    TYPE_EVIDENCE: 7, TYPE_PROCEDURE: 8, TYPE_EPISODE: 9,
 }
 
 
@@ -170,6 +174,7 @@ class ContextPack:
         out: dict = {}
         for a in self.items:
             key = "mandatory" if a.mandatory else (
+                "procedural" if a.artifact_type == TYPE_PROCEDURE else
                 "episodic" if a.artifact_type == TYPE_EPISODE else "authoritative")
             out[key] = out.get(key, 0) + a.est_tokens
         return out
@@ -690,3 +695,44 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         pack.degraded_reason = f"pack build failed: {exc}"
         logger.warning("context_pack: build failed for %s: %s", task_id, exc)
         return pack
+
+
+class ProcedureProvider(RetrievalProvider):
+    """Active procedures from #240, matched to this task.
+
+    Two separate mechanisms keep a rule from overruling the truth, and they
+    are worth not confusing:
+      - the issue and its AC are **mandatory**, and mandatory items sort ahead
+        of everything else regardless of type rank;
+      - `_TYPE_RANK` is what puts procedures below the *non-mandatory*
+        authoritative types (ADR, spec, code, test).
+    Together they deliver #240's non-goal: derived governance never outranks
+    current code or the acceptance criteria. Each item states why it matched;
+    an inclusion without a stated reason is not allowed in.
+    """
+
+    name = "procedural"
+    version = 1
+
+    def __init__(self, matched: Optional[list] = None):
+        # (procedure, reason) pairs, already scoped and triggered by
+        # procedural_memory.match_procedures().
+        self._matched = matched or []
+
+    def retrieve(self, query: RetrievalQuery) -> list:
+        out = []
+        for proc, reason in self._matched:
+            hard = proc.enforcement == "hard"
+            out.append(Artifact(
+                artifact_id=f"procedure:{proc.key}",
+                uri=f"procedure://{proc.procedure_id}/v{proc.version}",
+                artifact_type=TYPE_PROCEDURE,
+                revision=str(proc.version),
+                score=1.0 + (1.0 if hard else 0.0),
+                score_components={"matched": 1.0, "hard": 1.0 if hard else 0.0},
+                provenance=f"procedure {proc.key}: {reason}",
+                freshness=FRESH,
+                subject_key=f"procedure:{proc.procedure_id}",
+                excerpt=proc.render(),
+            ))
+        return out
