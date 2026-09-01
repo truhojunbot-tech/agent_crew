@@ -21,6 +21,8 @@ Metrics per mode:
 """
 
 import argparse
+import datetime
+import hashlib
 import json
 import os
 import statistics
@@ -163,12 +165,139 @@ OFFLINE_SAMPLE = [
 ]
 
 
+REPORT_COLUMNS = ["required_recall", "ac_present_rate", "mean_tokens",
+                  "irrelevant_ratio", "duplicate_ratio", "stale_conflict_rate",
+                  "p50_ms", "p95_ms"]
+REPORT_SCHEMA_VERSION = 1
+
+
+def build_report(issues: list, modes: list, *, sample_label: str) -> dict:
+    """One canonical result object. Everything else renders FROM this.
+
+    ⛔#243: the JSON and the Markdown must never be produced by separate runs.
+      Latency is the one nondeterministic metric here, so two runs of the same
+      revision disagree on p50/p95 while every deterministic metric matches —
+      which is exactly the divergence that shipped in PR #241 and is precisely
+      the shape that silently gives downstream consumers two baselines.
+    """
+    report = {m: summarise([run_mode(i, m) for i in issues]) for m in modes}
+    report["_schema_version"] = REPORT_SCHEMA_VERSION
+    report["_modes"] = list(modes)
+    report["_sample"] = sample_label
+    report["_generated_at"] = datetime.datetime.now(
+        datetime.timezone.utc).replace(microsecond=0).isoformat()
+    # Identity of THIS run, so a reader can tell two runs apart at a glance
+    # instead of having to diff the numbers.
+    report["_run_id"] = hashlib.sha256(
+        _json_dumps(report).encode()).hexdigest()[:12]
+    report["_canonical"] = (
+        "docs/context_pack_benchmark.json is canonical; the Markdown is "
+        "rendered from it in the same run"
+    )
+    report["_latency_note"] = (
+        "p50/p95 are wall-clock and will differ between runs on the same "
+        "revision; compare them only within one run_id"
+    )
+    report["_note"] = (
+        "semantic/hybrid not implemented — the provider contract admits it "
+        "without a dispatcher change, but no embedding backend ships, so no "
+        "semantic row is reported rather than a fabricated one"
+    )
+    return report
+
+
+def _json_dumps(report: dict) -> str:
+    return json.dumps(report, indent=2, sort_keys=True)
+
+
+def render_markdown(report: dict) -> str:
+    """Render the human-readable report FROM the canonical object.
+
+    Pure function of `report` — the reason #243 happened is that this table
+    used to be written by hand from a different run's terminal output.
+    """
+    modes = report.get("_modes") or []
+    lines = [
+        "# Context Pack benchmark (#239)",
+        "",
+        f"- run_id: `{report.get('_run_id')}`",
+        f"- generated_at: `{report.get('_generated_at')}`",
+        f"- sample: {report.get('_sample')}",
+        "",
+        f"> {report.get('_canonical')}.",
+        f"> {report.get('_latency_note')}.",
+        "",
+        "Regenerate both artifacts together with:",
+        "",
+        "```bash",
+        "python scripts/benchmark_context_pack.py --repo truhojunbot-tech/agent_crew \\",
+        "       --limit 14 --write-report docs",
+        "```",
+        "",
+        "| mode | " + " | ".join(REPORT_COLUMNS) + " |",
+        "|---" * (len(REPORT_COLUMNS) + 1) + "|",
+    ]
+    for m in modes:
+        r = report.get(m) or {}
+        lines.append("| " + m + " | "
+                     + " | ".join(str(r.get(c)) for c in REPORT_COLUMNS) + " |")
+    lines += [
+        "",
+        "## Reading this honestly",
+        "",
+        "**The win is real.** `current` retrieves *nothing* — today the dispatcher",
+        "ships the issue text and whatever the provider conversation happens to",
+        "still hold. Required-artifact recall is 0.0 because no retrieval happens",
+        "at all. The lexical pack retrieves every issue-named file that exists.",
+        "",
+        "**The cost is real too.** The pack is several times the size of the",
+        "current prompt, and most pack tokens fall outside the required set: the",
+        "lexical baseline over-retrieves, because `git grep -l` on identifier",
+        "keywords matches files that merely mention a symbol.",
+        "",
+        "**`irrelevant_ratio` is not a fair head-to-head.** `current` scores 0.000",
+        "trivially, because a mode that retrieves nothing cannot retrieve anything",
+        "irrelevant. The number is only meaningful *between retrieval modes*.",
+        "",
+        "**`ac_present_rate` measures the corpus, not the pack.** It reflects how",
+        "many sampled issues carry an `## Acceptance criteria` heading at all.",
+        "",
+        "## What this establishes",
+        "",
+        "A deterministic floor. Recall is solved; **precision is the open",
+        "problem**, and it is now measurable — which was the point of shipping",
+        "lexical before semantic rather than assuming embeddings help.",
+        "",
+        "## Not measured",
+        "",
+        f"- **semantic/hybrid** — {report.get('_note')}.",
+        "- **task/review outcome** — the pack is off by default and has not run",
+        "  in production, so there is no outcome sample yet.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_report(report: dict, out_dir: str) -> tuple:
+    """Write both artifacts from the same object, in one run (#243)."""
+    os.makedirs(out_dir, exist_ok=True)
+    j = os.path.join(out_dir, "context_pack_benchmark.json")
+    m = os.path.join(out_dir, "context_pack_benchmark.md")
+    with open(j, "w") as f:
+        f.write(_json_dumps(report) + "\n")
+    with open(m, "w") as f:
+        f.write(render_markdown(report))
+    return j, m
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--repo", default="truhojunbot-tech/agent_crew")
     ap.add_argument("--limit", type=int, default=12)
     ap.add_argument("--offline", action="store_true")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--write-report", metavar="DIR",
+                    help="write BOTH json and md from this one run (#243)")
     args = ap.parse_args()
 
     issues = OFFLINE_SAMPLE if args.offline else gh_closed_issues(args.repo, args.limit)
@@ -177,25 +306,22 @@ def main() -> int:
         return 1
 
     modes = ["current", MODE_LEXICAL]
-    report = {m: summarise([run_mode(i, m) for i in issues]) for m in modes}
-    report["_note"] = (
-        "semantic/hybrid not implemented — the provider contract admits it "
-        "without a dispatcher change, but no embedding backend ships, so no "
-        "semantic row is reported rather than a fabricated one"
-    )
-    report["_sample"] = f"{len(issues)} issues from {'offline sample' if args.offline else args.repo}"
+    label = f"{len(issues)} issues from {'offline sample' if args.offline else args.repo}"
+    report = build_report(issues, modes, sample_label=label)
 
-    if args.json:
-        print(json.dumps(report, indent=2))
+    if args.write_report:
+        j, m = write_report(report, args.write_report)
+        print(f"wrote {j}\nwrote {m}\nrun_id={report['_run_id']}")
         return 0
-    print(f"\nContext Pack benchmark — {report['_sample']}\n")
-    cols = ["required_recall", "ac_present_rate", "mean_tokens",
-            "irrelevant_ratio", "duplicate_ratio", "stale_conflict_rate",
-            "p50_ms", "p95_ms"]
-    print(f"{'mode':10s} " + " ".join(f"{c:>18s}" for c in cols))
+    if args.json:
+        print(_json_dumps(report))
+        return 0
+    print(f"\nContext Pack benchmark — {report['_sample']} "
+          f"(run_id={report['_run_id']})\n")
+    print(f"{'mode':10s} " + " ".join(f"{c:>18s}" for c in REPORT_COLUMNS))
     for m in modes:
         r = report[m]
-        print(f"{m:10s} " + " ".join(f"{str(r.get(c)):>18s}" for c in cols))
+        print(f"{m:10s} " + " ".join(f"{str(r.get(c)):>18s}" for c in REPORT_COLUMNS))
     print(f"\nnote: {report['_note']}")
     return 0
 

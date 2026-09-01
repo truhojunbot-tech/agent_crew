@@ -1,28 +1,37 @@
 {
+  "_canonical": "docs/context_pack_benchmark.json is canonical; the Markdown is rendered from it in the same run",
+  "_generated_at": "2026-09-01T15:12:23+00:00",
+  "_latency_note": "p50/p95 are wall-clock and will differ between runs on the same revision; compare them only within one run_id",
+  "_modes": [
+    "current",
+    "lexical"
+  ],
+  "_note": "semantic/hybrid not implemented \u2014 the provider contract admits it without a dispatcher change, but no embedding backend ships, so no semantic row is reported rather than a fabricated one",
+  "_run_id": "c421900744f5",
+  "_sample": "14 issues from truhojunbot-tech/agent_crew",
+  "_schema_version": 1,
   "current": {
+    "ac_present_rate": 0.286,
+    "duplicate_ratio": 0.0,
+    "irrelevant_ratio": 0.0,
+    "mean_tokens": 462.4,
     "n": 14,
     "n_with_required_artifacts": 1,
-    "required_recall": 0.0,
-    "ac_present_rate": 0.286,
-    "mean_tokens": 462.4,
-    "irrelevant_ratio": 0.0,
-    "duplicate_ratio": 0.0,
-    "stale_conflict_rate": 0.0,
     "p50_ms": 0.0,
-    "p95_ms": 0.0
+    "p95_ms": 0.0,
+    "required_recall": 0.0,
+    "stale_conflict_rate": 0.0
   },
   "lexical": {
+    "ac_present_rate": 0.286,
+    "duplicate_ratio": 0.0,
+    "irrelevant_ratio": 0.78,
+    "mean_tokens": 1941,
     "n": 14,
     "n_with_required_artifacts": 1,
+    "p50_ms": 53.1,
+    "p95_ms": 75.1,
     "required_recall": 1.0,
-    "ac_present_rate": 0.286,
-    "mean_tokens": 1790.9,
-    "irrelevant_ratio": 0.761,
-    "duplicate_ratio": 0.0,
-    "stale_conflict_rate": 0.0,
-    "p50_ms": 37.5,
-    "p95_ms": 68.7
-  },
-  "_note": "semantic/hybrid not implemented \u2014 the provider contract admits it without a dispatcher change, but no embedding backend ships, so no semantic row is reported rather than a fabricated one",
-  "_sample": "14 issues from truhojunbot-tech/agent_crew"
+    "stale_conflict_rate": 0.0
+  }
 }
