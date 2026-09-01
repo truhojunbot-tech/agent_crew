@@ -265,13 +265,28 @@ def _resolve_tmux_window(proj_dir: str) -> tuple[str, str]:
     return session_name, window_index or "0"
 
 
+#: Every tmux probe is bounded (#231 review-0ca0219f). These run inside the
+#: `crew run` wait loop, so a wedged tmux without a timeout could outlive the
+#: `wait_timeout` the watchdog exists to enforce.
+PANE_PROBE_TIMEOUT_S = 5.0
+
+
 def _capture_pane(target: str) -> str | None:
     """Capture last 5 lines of a tmux pane. target is a pane_id (e.g. '%42')
-    or a session:window.pane spec. Returns None if tmux fails."""
-    result = subprocess.run(
-        ["tmux", "capture-pane", "-t", target, "-p", "-S", "-5"],
-        capture_output=True, text=True,
-    )
+    or a session:window.pane spec. Returns None if tmux fails.
+
+    ⛔"tmux fails" includes tmux being absent or wedged, not just exiting
+      non-zero. This runs every poll of the `crew run` wait loop, so an
+      escaping exception here would abort the loop before it could
+      auto-submit a result and the task would sit in_progress forever.
+    """
+    try:
+        result = subprocess.run(
+            ["tmux", "capture-pane", "-t", target, "-p", "-S", "-5"],
+            capture_output=True, text=True, timeout=PANE_PROBE_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — a probe must never break the caller
+        return None
     if result.returncode != 0:
         return None
     return result.stdout
@@ -346,11 +361,20 @@ def _pane_cwd(pane_id: str) -> str | None:
 
 def _pane_current_command(pane_id: str) -> str:
     """Return the name of the foreground command in a tmux pane (empty
-    string if the pane is gone). Used by the agent-liveness check (#195)."""
-    r = subprocess.run(
-        ["tmux", "display-message", "-t", pane_id, "-p", "#{pane_current_command}"],
-        capture_output=True, text=True,
-    )
+    string if the pane is gone). Used by the agent-liveness check (#195).
+
+    ⛔Bounded and guarded: "gone" has to cover a missing or wedged tmux too,
+      or `agent_liveness` cannot keep the unknown-on-failure promise it makes
+      to the wait loop (review-0ca0219f).
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p",
+             "#{pane_current_command}"],
+            capture_output=True, text=True, timeout=PANE_PROBE_TIMEOUT_S,
+        )
+    except Exception:  # noqa: BLE001 — a probe must never break the caller
+        return ""
     if r.returncode != 0:
         return ""
     return r.stdout.strip()
@@ -408,7 +432,13 @@ def agent_liveness(pane_target: str) -> str:
     """
     if not pane_target:
         return "unknown"
-    cmd = _pane_current_command(pane_target)
+    try:
+        cmd = _pane_current_command(pane_target)
+    except Exception:  # noqa: BLE001
+        # Defence in depth. The helper is guarded, but this function states a
+        # policy the wait loop depends on — an escape here aborts `_wait`
+        # before it can auto-submit, stranding the task in_progress.
+        return "unknown"
     if not cmd:
         return "unknown"
     return "dead" if cmd in _DEAD_PANE_COMMANDS else "alive"

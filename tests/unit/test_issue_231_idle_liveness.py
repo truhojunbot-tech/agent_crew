@@ -248,3 +248,88 @@ def test_liveness_probe_failure_does_not_break_the_tick(tmp_db):
     result = _drive(_app(tmp_db, boom), tmp_db, "t-boom", tick_at=_PAST_BASE)
     # Falls back to the previous behaviour rather than crashing.
     assert result["timed_out"] == ["t-boom"]
+
+
+# ── 6. probe failures must never escape the wait loop (review-0ca0219f) ─
+#
+# `agent_liveness` documented "anything unreadable returns unknown" but never
+# enforced it: `_pane_current_command` ran subprocess WITHOUT a timeout and
+# the call was unguarded. A missing tmux (FileNotFoundError) or a stalled
+# tmux therefore propagated out of `_wait` at the auto-fail decision point —
+# BEFORE `_auto_submit_failed` could run — leaving the task stuck
+# in_progress and `crew run` hanging past its own wait_timeout.
+#
+# The same defect sat one line earlier in `_capture_pane`, on the same hot
+# path via `_pane_changed`, with the same consequence.
+
+import subprocess as _sp  # noqa: E402
+
+from agent_crew.cli import (  # noqa: E402
+    PANE_PROBE_TIMEOUT_S,
+    _capture_pane,
+    _pane_changed,
+    _pane_current_command,
+    _reset_pane_content_cache,
+)
+
+_PROBE_FAILURES = [
+    FileNotFoundError("tmux not installed"),
+    _sp.TimeoutExpired("tmux", 5),
+    OSError("fork failed"),
+]
+
+
+@pytest.mark.parametrize("exc", _PROBE_FAILURES, ids=lambda e: type(e).__name__)
+def test_liveness_never_raises_whatever_the_probe_does(exc):
+    """★The policy the docstring promised and the code did not keep."""
+    with patch("agent_crew.cli.subprocess.run", side_effect=exc):
+        assert agent_liveness("%1") == "unknown"
+
+
+@pytest.mark.parametrize("exc", _PROBE_FAILURES, ids=lambda e: type(e).__name__)
+def test_pane_current_command_absorbs_probe_failures(exc):
+    """Its docstring says "empty string if the pane is gone" — make it true
+    for a tmux that is missing or wedged, not just one that exits non-zero."""
+    with patch("agent_crew.cli.subprocess.run", side_effect=exc):
+        assert _pane_current_command("%1") == ""
+
+
+@pytest.mark.parametrize("exc", _PROBE_FAILURES, ids=lambda e: type(e).__name__)
+def test_capture_pane_absorbs_probe_failures(exc):
+    """⛔Same defect one line earlier on the same `_wait` path: `_pane_changed`
+    calls this every poll, so an escape here is equally fatal."""
+    with patch("agent_crew.cli.subprocess.run", side_effect=exc):
+        assert _capture_pane("%1") is None
+
+
+@pytest.mark.parametrize("exc", _PROBE_FAILURES, ids=lambda e: type(e).__name__)
+def test_pane_changed_stays_inconclusive_on_probe_failure(exc):
+    """A broken probe must read as "no change", never as an exception."""
+    _reset_pane_content_cache()
+    with patch("agent_crew.cli.subprocess.run", side_effect=exc):
+        assert _pane_changed("%1") is False
+
+
+def test_probes_pass_a_bounded_timeout():
+    """★A stalled tmux must not hang the loop forever. Without a timeout the
+    watchdog could outlive the wait_timeout it exists to enforce."""
+    seen = []
+
+    def _record(cmd, **kw):
+        seen.append(kw.get("timeout"))
+        return MagicMock(returncode=0, stdout="claude\n")
+
+    with patch("agent_crew.cli.subprocess.run", side_effect=_record):
+        _pane_current_command("%1")
+        _capture_pane("%1")
+
+    assert seen and all(t == PANE_PROBE_TIMEOUT_S for t in seen), seen
+    assert 0 < PANE_PROBE_TIMEOUT_S <= 10, "probe timeout must be short"
+
+
+def test_unknown_still_auto_fails_so_the_queue_is_cleaned_up():
+    """⛔The fix must not turn a broken probe into "never fail". A dead agent
+    behind a broken tmux still has to release the queue slot."""
+    with patch("agent_crew.cli.subprocess.run",
+               side_effect=FileNotFoundError("tmux")):
+        assert should_auto_fail_idle(agent_liveness("%1")) is True
