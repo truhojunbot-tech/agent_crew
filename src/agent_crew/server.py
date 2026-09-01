@@ -1681,6 +1681,11 @@ def create_app(
         # ⛔Nothing in agy's store is deleted or mutated — the oversized
         #   conversation is simply not resumed, so an in-flight context is
         #   never disturbed and the decision is reversible.
+        # ⛔Initialised before the gemini branch so the event gate below can
+        #   read it for ANY agent. This boolean is the cap decision itself —
+        #   `_force_context_reset` is not, because an operator's explicit
+        #   task.context.context_reset sets it too (review-99ad8ad0).
+        _agy_over = False
         _agy_cap_info = {}
         if agent == "gemini":
             _agy_over, _agy_cap_info = agy_context_exceeds_cap(wt)
@@ -1728,7 +1733,11 @@ def create_app(
             # #236: the generic context_reset event does not say WHY. Emit
             # the measured cause so a reset forced by the size cap is
             # distinguishable from an operator-requested one.
-            if _agy_cap_info.get("bytes", 0) and _force_context_reset:
+            # Gate on the cap decision, never on "a reset happened and the
+            # conversation has some bytes" — every conversation has bytes, and
+            # an operator reset would then be mislabelled as a cap trip,
+            # corrupting exactly the signal #236 added this event to measure.
+            if _agy_over:
                 record_context_event(
                     _context_events_path, "provider_context_capped",
                     task_id=task.task_id, project=_project, role=role, agent=agent,
@@ -2204,6 +2213,10 @@ def create_app(
             return
 
     app.state.dispatcher_enabled = _dispatcher_enabled
+    # Same rationale as watchdog_tick/anomaly_tick above: expose the dispatch
+    # path so a test can drive one real dispatch deterministically, rather
+    # than asserting against a helper the dispatcher may not actually call.
+    app.state.dispatch_task = _dispatch_task
     # ── End headless dispatcher ───────────────────────────────────────────────
 
     def _auto_enqueue_review(

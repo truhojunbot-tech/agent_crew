@@ -222,3 +222,137 @@ def test_surfaced_quota_still_wins_over_lag(tmp_path):
         "Error: Individual quota reached. Please upgrade your subscription.\n"
         "subscriber fell behind updates, stalled for 6s")
     assert _detect_transient_error_in_log(log) == "agy_quota_exhausted"
+
+
+# ── 5. the cap event must mean the cap tripped (review-99ad8ad0) ──────
+#
+# The event was gated on `_agy_cap_info["bytes"] and _force_context_reset`.
+# Both halves are wrong for this purpose: EVERY conversation has bytes, and
+# `_force_context_reset` is also set by an operator's explicit
+# task.context.context_reset. So an operator reset on a gemini worktree with
+# a small conversation emitted `provider_context_capped` — mislabelling a
+# deliberate reset as a size trip, and corrupting the exact signal #236 added
+# the event to measure.
+
+
+def _dispatch_and_collect_events(tmp_path, monkeypatch, *, task_context,
+                                 conversation_mb, cap_mb=64):
+    """Run one real dispatch and return the context lifecycle events."""
+    import asyncio
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "gemini"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(_json.dumps({"worktrees": {"gemini": str(wt)}}))
+    db = str(tmp_path / "t.db")
+    events_path = tmp_path / "context_events.jsonl"
+
+    import agent_crew.server as _srv
+
+    monkeypatch.setattr(
+        _srv, "agy_context_exceeds_cap",
+        lambda cwd, *a, **k: (
+            conversation_mb > cap_mb,
+            {"bytes": int(conversation_mb * 1024 * 1024),
+             "conversation_id": "conv-test", "cap_mb": cap_mb},
+        ))
+
+    async def _fake_exec(*cmd, **kwargs):
+        class _P:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
+                        _fake_exec)
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(task_id="cap-1", task_type="test",
+                              description="d", branch="main",
+                              context=task_context))
+        task = q.dequeue(role="tester")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "tester"))
+
+    if not events_path.exists():
+        return []
+    return [_json.loads(l) for l in events_path.read_text().splitlines() if l.strip()]
+
+
+def _types(events):
+    return [e.get("event_type") or e.get("type") for e in events]
+
+
+def test_explicit_operator_reset_below_the_cap_is_not_reported_as_capped(
+    tmp_path, monkeypatch,
+):
+    """★The regression: a deliberate reset must not be labelled a size trip."""
+    events = _dispatch_and_collect_events(
+        tmp_path, monkeypatch,
+        task_context={"context_reset": True},   # operator asked for it
+        conversation_mb=2,                       # well under the cap
+    )
+
+    # A first dispatch into a (project, agent, worktree) mints generation 1,
+    # which the existing code reports as `context_created`; a later forced
+    # reset reports `context_reset`. Either means a fresh context was minted,
+    # which is the property that matters here.
+    assert {"context_created", "context_reset"} & set(_types(events)), \
+        f"the operator's reset should still mint a context: {_types(events)}"
+    assert "provider_context_capped" not in _types(events), (
+        "an explicit reset below the cap was mislabelled as a cap trip:\n"
+        f"{_types(events)}")
+
+
+def test_cap_trip_still_emits_the_capped_event(tmp_path, monkeypatch):
+    """⛔The gate must not silence the real signal it exists to carry."""
+    events = _dispatch_and_collect_events(
+        tmp_path, monkeypatch,
+        task_context={},                 # no operator reset
+        conversation_mb=137,             # the alpha_engine shape
+    )
+
+    assert "provider_context_capped" in _types(events), _types(events)
+    capped = next(e for e in events
+                  if (e.get("event_type") or e.get("type")) == "provider_context_capped")
+    assert capped["bytes"] == 137 * 1024 * 1024
+    assert capped["conversation_id"] == "conv-test"
+    assert capped["cap_mb"] == 64
+
+
+def test_no_reset_and_under_the_cap_emits_nothing_capped(tmp_path, monkeypatch):
+    events = _dispatch_and_collect_events(
+        tmp_path, monkeypatch, task_context={}, conversation_mb=2)
+
+    assert "provider_context_capped" not in _types(events)
+
+
+def test_operator_reset_AND_a_real_cap_trip_still_reports_capped(
+    tmp_path, monkeypatch,
+):
+    """Both true at once: the cap genuinely tripped, so say so."""
+    events = _dispatch_and_collect_events(
+        tmp_path, monkeypatch,
+        task_context={"context_reset": True}, conversation_mb=137)
+
+    assert "provider_context_capped" in _types(events), _types(events)
