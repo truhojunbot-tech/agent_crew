@@ -43,6 +43,7 @@ import time
 import uuid
 from typing import Optional
 
+from agent_crew.context_pack import ISSUE_BODY_MAX_CHARS, cap_issue_body
 from agent_crew.protocol import TaskRequest
 from agent_crew.triage import parse_issues
 
@@ -81,10 +82,11 @@ DEFAULT_INTERVAL_SECONDS = 300.0
 #:   exists to prevent.
 CLAIM_STALE_AFTER_SECONDS = 300.0
 
-#: Cap on the issue body persisted into a task's context. Large enough for a
-#: full issue with acceptance criteria, small enough that the queue row stays
-#: sane.
-ISSUE_BODY_MAX_CHARS = 20000
+#: Cap on the issue body persisted into a task's context, and the capping
+#: itself. Both live in `context_pack` because the pack is what the cap can
+#: break: the AC section is carried across the limit and the omission is
+#: written into the text, so a large issue loses prose and never the criteria.
+#: Re-exported here because ingest is where the cap is applied.
 
 DEFAULT_BACKOFF_BASE = 30.0
 DEFAULT_BACKOFF_CAP = 900.0
@@ -742,6 +744,8 @@ def build_task(issue: dict, repo: str, branch: str, project: str = "",
     """
     number = issue["number"]
     title = issue.get("title") or f"issue #{number}"
+    url = issue.get("url") or f"https://github.com/{repo}/issues/{number}"
+    body, body_truncated = cap_issue_body(issue.get("body") or "", url=url)
     return TaskRequest(
         task_id=f"impl-watch-{uuid.uuid4().hex[:8]}",
         task_type="implement",
@@ -755,9 +759,13 @@ def build_task(issue: dict, repo: str, branch: str, project: str = "",
             # #239 review: persist the body we ALREADY fetched at discovery.
             # Without it the dispatcher had no source for the acceptance
             # criteria and the Context Pack silently shipped without them.
-            # Bounded so one enormous issue cannot bloat every task row.
-            "issue_body": (issue.get("body") or "")[:ISSUE_BODY_MAX_CHARS],
-            "issue_url": issue.get("url") or f"https://github.com/{repo}/issues/{number}",
+            # Bounded so one enormous issue cannot bloat every task row --
+            # but bounded by `cap_issue_body`, which keeps the AC and states
+            # what it dropped, because the first version of this cap was a
+            # blind slice that recreated the very bug it sits next to.
+            "issue_body": body,
+            "issue_body_truncated": body_truncated,
+            "issue_url": url,
             "repo": repo,
             "labels": list(issue.get("labels") or []),
             "source": "watch",

@@ -313,6 +313,18 @@ class IssueProvider(RetrievalProvider):
         return m.group(1).strip() if m else ""
 
     @classmethod
+    def extract_ac_block(cls, body: str) -> str:
+        """The AC section *including* its heading.
+
+        `extract_ac` returns the criteria alone, which is what the artifact
+        excerpt wants. Capping wants the heading too, so that whatever reads
+        the stored text later — including `extract_ac` itself — can still find
+        the section it was carried across the cap to preserve.
+        """
+        m = cls._AC_RE.search(body or "")
+        return m.group(0).strip() if m else ""
+
+    @classmethod
     def _strip_ac(cls, body: str) -> str:
         return cls._AC_RE.sub("", body or "").strip()
 
@@ -649,6 +661,74 @@ def enabled() -> bool:
 #: Bounded `gh` lookup for an issue body the ingest path did not persist.
 ISSUE_BODY_FETCH_TIMEOUT_S = 15.0
 
+#: Cap on the *prose* of an issue body persisted into a task's context, so one
+#: enormous issue cannot bloat every queue row. It bounds prose only: the
+#: acceptance criteria are carried across it (see `cap_issue_body`).
+ISSUE_BODY_MAX_CHARS = 20000
+
+#: Truncation is never silent. This marker goes into the stored text itself,
+#: so a reader — human or model — cannot mistake the retained part for the
+#: whole issue.
+ISSUE_BODY_TRUNCATION_MARK = "[... issue body truncated by agent_crew"
+
+
+def _truncation_marker(omitted: int, url: str = "") -> str:
+    where = f"; read the full issue at {url}" if url else ""
+    return (f"{ISSUE_BODY_TRUNCATION_MARK}: {omitted} characters omitted"
+            f"{where} ...]")
+
+
+def cap_issue_body(body: str, *, limit: int = ISSUE_BODY_MAX_CHARS,
+                   url: str = "") -> tuple:
+    """Bound an issue body for storage. Returns ``(text, truncated)``.
+
+    ⛔A blind `body[:limit]` is the defect this replaces (review of PR #241,
+      round 2). An issue whose acceptance criteria sat past the cap was stored
+      as a non-empty body containing no AC — and every downstream check read
+      that as "this issue has no acceptance criteria". The one artifact #239
+      promises never to drop was dropped, and the pack reported itself healthy.
+
+    Two rules, and both are load-bearing:
+
+      1. **The AC crosses the cap.** It outranks prose, so it is carried
+         verbatim even when it sits past the limit. The limit therefore bounds
+         the prose retained, not the criteria — an AC longer than the whole cap
+         is still stored whole, because a truncated bar to be judged against is
+         worse than a large task row.
+      2. **What is dropped is announced in the text.** The marker names the
+         number of characters removed and where to read the original, so the
+         omission is visible to whoever consumes the body next.
+
+    The AC is located with the same regex `IssueProvider` uses to extract it.
+    That sharing is deliberate: two different definitions of "the acceptance
+    criteria section" is exactly how one of them silently loses it.
+    """
+    text = body or ""
+    if len(text) <= limit:
+        return text, False
+    ac = IssueProvider.extract_ac_block(text)
+    # Remove the AC from the prose so carrying it over cannot duplicate it.
+    prose = text.replace(ac, "", 1) if ac else text
+    kept = prose[:max(0, limit - len(ac))].rstrip()
+    omitted = len(text) - len(kept) - len(ac)
+    parts = [kept, _truncation_marker(omitted, url)]
+    if ac:
+        parts.append(ac)
+    return "\n\n".join(p for p in parts if p), True
+
+
+def body_is_truncated(ctx: dict, body: str = "") -> bool:
+    """Whether this task's stored issue body is known to be incomplete.
+
+    The flag written at ingest is authoritative; the marker is the fallback for
+    a row some other producer wrote, since a body that carries the marker is
+    incomplete no matter who capped it.
+    """
+    ctx = ctx or {}
+    if ctx.get("issue_body_truncated"):
+        return True
+    return ISSUE_BODY_TRUNCATION_MARK in (body or ctx.get("issue_body") or "")
+
 
 def fetch_issue_body(repo: str, issue: Optional[int],
                      timeout_s: float = ISSUE_BODY_FETCH_TIMEOUT_S) -> str:
@@ -672,6 +752,18 @@ def fetch_issue_body(repo: str, issue: Optional[int],
         return ""
 
 
+def _lookup_body(ctx: dict, issue, issue_body_fn) -> str:
+    """One bounded attempt at the authoritative body. "" on any failure."""
+    if issue_body_fn is not None:
+        try:
+            return (issue_body_fn(ctx.get("repo", ""), issue) or "").strip()
+        except Exception:  # noqa: BLE001 — a lookup never breaks a dispatch
+            return ""
+    if issue:
+        return fetch_issue_body(ctx.get("repo", ""), issue).strip()
+    return ""
+
+
 def resolve_issue_body(ctx: dict, *, issue_body_fn=None) -> tuple:
     """``(body, source)`` for this task's issue.
 
@@ -684,21 +776,34 @@ def resolve_issue_body(ctx: dict, *, issue_body_fn=None) -> tuple:
     ⛔Returns the source so the caller can tell "no issue" from "issue whose
       body we could not read". Those must not look the same: the second one
       means the acceptance criteria are missing and the pack has to say so.
+
+    A *truncated* stored body is a third case, and it is the one that shipped
+    broken (review of PR #241, round 2). `cap_issue_body` carries the AC across
+    the cap, so a truncated body normally still holds it. When it does not, the
+    text is known-incomplete and its silence about acceptance criteria proves
+    nothing — so we spend one bounded lookup on the full body rather than let
+    "capped past the AC" masquerade as "this issue has no AC".
     """
     ctx = ctx or {}
     stored = (ctx.get("issue_body") or "").strip()
-    if stored:
-        return stored, "ingest"
     issue = ctx.get("issue") if isinstance(ctx.get("issue"), int) else None
-    if issue_body_fn is not None:
-        try:
-            body = (issue_body_fn(ctx.get("repo", ""), issue) or "").strip()
-        except Exception:  # noqa: BLE001
-            return "", "lookup_failed"
-        return (body, "injected") if body else ("", "lookup_failed")
-    if issue:
-        body = fetch_issue_body(ctx.get("repo", ""), issue).strip()
-        return (body, "github") if body else ("", "lookup_failed")
+    if stored:
+        if not body_is_truncated(ctx, stored):
+            return stored, "ingest"
+        if IssueProvider.extract_ac(stored):
+            # Capped, but the part that is judged against survived the cap.
+            return stored, "ingest_truncated"
+        full = _lookup_body(ctx, issue, issue_body_fn)
+        if full:
+            # Authoritative: whatever it says about acceptance criteria now
+            # holds, including that there are none.
+            return full, "refetched_full"
+        return stored, "ingest_truncated_no_ac"
+    body = _lookup_body(ctx, issue, issue_body_fn)
+    if body:
+        return body, "injected" if issue_body_fn is not None else "github"
+    if issue_body_fn is not None or issue:
+        return "", "lookup_failed"
     return "", "no_issue"
 
 
@@ -745,6 +850,18 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
                 pack.degraded_reason,
                 f"issue #{issue} body unavailable — acceptance criteria are "
                 f"NOT in this pack; read the issue before relying on it",
+            ]))
+        elif body_source == "ingest_truncated_no_ac":
+            # Known-incomplete text with no AC in it, and the full body could
+            # not be read. "The issue has no acceptance criteria" is exactly
+            # the conclusion we are NOT entitled to draw here, so the pack says
+            # what it actually knows instead of implying completeness.
+            pack.degraded = True
+            pack.degraded_reason = "; ".join(filter(None, [
+                pack.degraded_reason,
+                f"issue #{issue} body was truncated at ingest and the retained "
+                f"text has no acceptance-criteria section; the AC may exist "
+                f"beyond the cap — read the issue before relying on this pack",
             ]))
         elif issue and body and not any(a.artifact_type == TYPE_AC
                                         for a in pack.items):

@@ -633,10 +633,15 @@ def test_watch_persists_the_issue_body_it_already_fetched():
     task = build_task(issue, "org/repo", "main")
 
     assert task.context["issue_body"] == ISSUE_BODY
-    # ...and one enormous issue cannot bloat the queue row.
+    # A body under the cap is stored byte-identical and not marked truncated.
+    assert task.context["issue_body_truncated"] is False
+    # ...and one enormous issue cannot bloat the queue row: the PROSE retained
+    # is bounded. (The cap deliberately does not bound the AC — see
+    # test_acceptance_criteria_beyond_the_cap_survive_ingest.)
     huge = dict(issue, body="x" * (ISSUE_BODY_MAX_CHARS + 5000))
-    assert len(build_task(huge, "org/repo", "main").context["issue_body"]) \
-        == ISSUE_BODY_MAX_CHARS
+    stored = build_task(huge, "org/repo", "main").context["issue_body"]
+    assert len(stored) <= ISSUE_BODY_MAX_CHARS + 200   # + the marker line
+    assert stored.count("x") <= ISSUE_BODY_MAX_CHARS
 
 
 # ── 12. ENABLED dispatcher-level integration (review of PR #241) ──────
@@ -728,3 +733,257 @@ def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
         "the acceptance criteria are missing from the dispatched Context Pack"
     assert "no duplicate widgets" in pack_block
     assert "DEGRADED" not in pack_block
+
+
+# ── 13. the cap must not silently drop the AC (review of PR #241, round 2) ──
+#
+# The first cap was `body[:ISSUE_BODY_MAX_CHARS]`. For an issue whose
+# acceptance criteria sat past that point it stored a NON-EMPTY body with no
+# AC in it — which every downstream check read as "this issue has no
+# acceptance criteria". `build_pack_for_task` returned degraded=False with no
+# mandatory AC artifact: the one thing #239 promises never to drop, dropped,
+# with the pack reporting itself healthy.
+
+
+def _huge_issue(body, number=999):
+    return {"number": number, "title": "an enormous issue", "labels": ["bug"],
+            "body": body, "url": f"https://github.com/org/repo/issues/{number}"}
+
+
+def _body_with_ac_after(pad_chars, ac="- [ ] the AC beyond the cap survives"):
+    return ("filler prose.\n" * (pad_chars // 13)
+            + f"\n## Acceptance criteria\n{ac}\n")
+
+
+def test_acceptance_criteria_beyond_the_cap_survive_ingest():
+    """★The exact regression: AC past the cap boundary reached nobody."""
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    task = build_task(_huge_issue(_body_with_ac_after(ISSUE_BODY_MAX_CHARS + 5000)),
+                      "org/repo", "main")
+    stored = task.context["issue_body"]
+
+    assert task.context["issue_body_truncated"] is True
+    assert "the AC beyond the cap survives" in stored, \
+        "the acceptance criteria were dropped by the cap — the whole bug"
+    # ...and still findable as a SECTION, not just as loose text, so the
+    # extractor downstream can still identify it.
+    assert IssueProvider.extract_ac(stored)
+
+
+def test_pack_for_a_capped_issue_still_carries_the_mandatory_ac(tmp_path):
+    """★★End to end: ingest → pack, no injected body, AC past the cap."""
+    from agent_crew.context_pack import build_pack_for_task
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    task = build_task(_huge_issue(_body_with_ac_after(ISSUE_BODY_MAX_CHARS + 5000)),
+                      "org/repo", "main")
+
+    pack = build_pack_for_task(
+        task.context, task_id="t-cap", task_type="implement",
+        role="implementer", repo_path=str(tmp_path))
+
+    ac = [a for a in pack.items if a.artifact_type == TYPE_AC]
+    assert ac, "capped issue produced a pack with no acceptance-criteria artifact"
+    assert "the AC beyond the cap survives" in ac[0].excerpt
+    assert pack.degraded is False
+
+
+def test_truncation_is_announced_in_the_stored_text():
+    """Not silent: the omission is visible to whoever reads the body next."""
+    from agent_crew.context_pack import ISSUE_BODY_TRUNCATION_MARK
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    original = _body_with_ac_after(ISSUE_BODY_MAX_CHARS + 5000)
+    stored = build_task(_huge_issue(original), "org/repo", "main").context["issue_body"]
+
+    assert ISSUE_BODY_TRUNCATION_MARK in stored
+    marker = [l for l in stored.splitlines() if ISSUE_BODY_TRUNCATION_MARK in l][0]
+    # It says how much went missing and where the original is.
+    assert "characters omitted" in marker
+    assert "https://github.com/org/repo/issues/999" in marker
+
+
+def test_capped_body_is_not_reported_as_a_complete_read():
+    from agent_crew.context_pack import resolve_issue_body
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    task = build_task(_huge_issue(_body_with_ac_after(ISSUE_BODY_MAX_CHARS + 5000)),
+                      "org/repo", "main")
+
+    assert resolve_issue_body(task.context)[1] == "ingest_truncated"
+    # An uncapped body still reports the cheap, complete path.
+    assert resolve_issue_body({"issue_body": ISSUE_BODY})[1] == "ingest"
+
+
+def test_ac_already_inside_the_kept_head_is_not_duplicated():
+    """The carry-over must not double an AC that was never at risk."""
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    body = ("## Acceptance criteria\n- [ ] exactly once\n\n"
+            + "trailing prose.\n" * ((ISSUE_BODY_MAX_CHARS + 5000) // 15))
+    stored = build_task(_huge_issue(body), "org/repo", "main").context["issue_body"]
+
+    assert stored.count("- [ ] exactly once") == 1
+    assert stored.count("## Acceptance criteria") == 1
+
+
+def test_ac_larger_than_the_whole_cap_is_still_stored_whole():
+    """Rule 1 of the cap: it bounds prose, never the bar being judged against.
+
+    A truncated AC is worse than a large task row — the agent would be held to
+    criteria it was only shown half of.
+    """
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    ac_lines = "\n".join(f"- [ ] criterion {i}" for i in range(2000))
+    body = "intro\n" + "prose\n" * 3000 + f"\n## Acceptance criteria\n{ac_lines}\n"
+    assert len(ac_lines) > ISSUE_BODY_MAX_CHARS
+
+    stored = build_task(_huge_issue(body), "org/repo", "main").context["issue_body"]
+
+    assert "- [ ] criterion 0" in stored
+    assert "- [ ] criterion 1999" in stored
+
+
+def test_truncated_body_with_no_ac_and_a_failed_refetch_degrades(tmp_path):
+    """⛔"Capped past the AC" must never masquerade as "issue has no AC".
+
+    When the retained text is known-incomplete and holds no AC, its silence
+    proves nothing. If the full body cannot be read either, the pack has to say
+    it does not know — an AC-less pack reporting itself healthy is the failure
+    mode this whole change exists to close.
+    """
+    from agent_crew.context_pack import build_pack_for_task
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    # No AC heading anywhere, so nothing survives the cap to be found.
+    task = build_task(_huge_issue("z" * (ISSUE_BODY_MAX_CHARS + 5000)),
+                      "org/repo", "main")
+
+    pack = build_pack_for_task(
+        task.context, task_id="t-noac", task_type="implement",
+        role="implementer", repo_path=str(tmp_path),
+        issue_body_fn=lambda repo, issue: "")      # refetch fails
+
+    assert pack.degraded is True
+    assert "truncated at ingest" in pack.degraded_reason
+    assert "DEGRADED" in pack.to_prompt_block()
+
+
+def test_truncated_body_refetches_the_full_body_when_it_can(tmp_path):
+    """A successful refetch is authoritative — including "there is no AC"."""
+    from agent_crew.context_pack import build_pack_for_task
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    task = build_task(_huge_issue("z" * (ISSUE_BODY_MAX_CHARS + 5000)),
+                      "org/repo", "main")
+    full = "## Acceptance criteria\n- [ ] recovered from the full body\n"
+
+    pack = build_pack_for_task(
+        task.context, task_id="t-refetch", task_type="implement",
+        role="implementer", repo_path=str(tmp_path),
+        issue_body_fn=lambda repo, issue: full)
+
+    ac = [a for a in pack.items if a.artifact_type == TYPE_AC]
+    assert ac and "recovered from the full body" in ac[0].excerpt
+    assert pack.degraded is False
+
+
+def test_an_uncapped_body_costs_no_lookup():
+    """The common path must stay free of network calls."""
+    from agent_crew.context_pack import resolve_issue_body
+
+    def boom(repo, issue):
+        raise AssertionError("a complete stored body must not trigger a lookup")
+
+    body, source = resolve_issue_body({"issue": 42, "issue_body": ISSUE_BODY},
+                                      issue_body_fn=boom)
+    assert (body, source) == (ISSUE_BODY.strip(), "ingest")
+
+
+def test_truncation_marker_alone_marks_a_body_incomplete():
+    """A row written by some other producer is judged by its own text."""
+    from agent_crew.context_pack import ISSUE_BODY_TRUNCATION_MARK, body_is_truncated
+
+    foreign = "some prose\n" + ISSUE_BODY_TRUNCATION_MARK + ": 10 characters omitted ...]"
+    assert body_is_truncated({"issue_body": foreign}) is True
+    assert body_is_truncated({"issue_body": ISSUE_BODY}) is False
+    # The ingest flag is authoritative even if the marker were edited away.
+    assert body_is_truncated({"issue_body": "x", "issue_body_truncated": True}) is True
+
+
+def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch):
+    """★★Dispatcher level, with the pack ENABLED and a real capped issue.
+
+    The unit tests above all go through `build_task`; this one drives
+    `_dispatch_task` end to end, because that is the layer where the previous
+    round of this bug hid while every unit test passed.
+    """
+    import asyncio
+    import json as _json
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)}}))
+    db = str(tmp_path / "t.db")
+
+    spawned = {}
+
+    async def _fake_exec(*cmd, **kwargs):
+        spawned["cmd"] = cmd
+
+        class _P:
+            returncode = 0
+            pid = 4321
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
+                        _fake_exec)
+
+    from fastapi.testclient import TestClient
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+                     watchdog_disabled=True, anomaly_disabled=True)
+
+    ingested = build_task(
+        _huge_issue(_body_with_ac_after(ISSUE_BODY_MAX_CHARS + 5000,
+                                        ac="- [ ] shipped despite the cap")),
+        "org/repo", "main")
+
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(
+            task_id="disp-cap", task_type="implement",
+            description="implement the enormous issue", branch="main",
+            context=dict(ingested.context),   # exactly what the watcher stores
+        ))
+        task = q.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    blob = " ".join(str(c) for c in spawned.get("cmd", ()))
+    start = blob.index("=== CONTEXT PACK")
+    end = blob.index("=== END CONTEXT PACK")
+    pack_block = blob[start:end]
+
+    assert "acceptance_criteria" in pack_block, \
+        f"capped issue dispatched with no AC artifact:\n{pack_block[:600]}"
+    assert "shipped despite the cap" in pack_block
