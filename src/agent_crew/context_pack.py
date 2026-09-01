@@ -830,10 +830,69 @@ def _procedure_triggers(episodes: list, issue: Optional[int]) -> tuple:
     return sig, findings
 
 
+#: A path-looking token inside issue text: at least one directory segment and
+#: a short extension. Deliberately strict — a loose pattern would manufacture
+#: scope out of prose, and a wrong module is worse than no module.
+_PATH_TOKEN_RE = re.compile(r"(?<![\w/.])((?:[\w.-]+/)+[\w-]+\.[A-Za-z0-9]{1,5})\b")
+
+#: Bound on how much scope one task may claim, so a pathological issue body
+#: cannot turn into thousands of comparisons.
+MAX_RESOLVED_SCOPE = 40
+
+
+def resolve_task_scope(ctx: dict) -> tuple:
+    """``(paths, modules)`` this task is about, best-effort and bounded.
+
+    Three sources, most authoritative first:
+
+      1. `ctx["modules"]` / `ctx["paths"]` / `ctx["files"]` — whatever the
+         producer knew explicitly;
+      2. file paths named in the issue title and body, which for an ordinary
+         bug report is the only pre-work signal of where the change goes;
+      3. nothing — and that is a real, common answer.
+
+    ⛔Case 3 is the load-bearing one. It resolves to an empty list, and an empty
+      list makes `Scope.matches` REJECT every module- or path-scoped rule. An
+      unresolvable task must not be treated as matching everything: that is
+      precisely the defect this function was added to close (review of PR #242,
+      round 2), where a module-scoped rule reached every task in the repo.
+    """
+    from agent_crew.procedural_memory import normalise_module
+
+    ctx = ctx or {}
+
+    def _tokens(value) -> list:
+        if isinstance(value, str):
+            return [t.strip() for t in value.replace(",", " ").split() if t.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(t).strip() for t in value if str(t).strip()]
+        return []
+
+    paths = _tokens(ctx.get("paths")) + _tokens(ctx.get("files"))
+    text = " ".join(str(ctx.get(k) or "") for k in ("issue_title", "issue_body"))
+    paths.extend(m.group(1) for m in _PATH_TOKEN_RE.finditer(text))
+
+    modules = [normalise_module(m) for m in _tokens(ctx.get("modules"))]
+    modules.extend(normalise_module(p) for p in paths)
+
+    return (_dedupe(paths)[:MAX_RESOLVED_SCOPE],
+            _dedupe(m for m in modules if m)[:MAX_RESOLVED_SCOPE])
+
+
+def _dedupe(items) -> list:
+    seen, out = set(), []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
 def load_matching_procedures(procedures_path: str, *, repo: str, task_type: str,
                              role: str, episodes: Optional[list] = None,
                              issue: Optional[int] = None,
-                             paths: Optional[list] = None) -> list:
+                             paths: Optional[list] = None,
+                             modules: Optional[list] = None) -> list:
     """Active, in-scope, triggered procedures for this task (#240 §4).
 
     ⛔Imported lazily and wrapped: procedural memory is derived governance and
@@ -849,7 +908,8 @@ def load_matching_procedures(procedures_path: str, *, repo: str, task_type: str,
         return _pm.match_procedures(
             _pm.load_procedures(procedures_path),
             repo=repo, task_type=task_type, role=role,
-            paths=paths or [""], outcome_signature=sig, findings=findings)
+            paths=paths or [""], modules=modules or [],
+            outcome_signature=sig, findings=findings)
     except Exception as exc:  # noqa: BLE001
         logger.warning("context_pack: procedure matching failed: %s", exc)
         return []
@@ -910,9 +970,16 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
     # the feature existed only in tests that instantiated the provider by
     # hand — no active procedure could reach a real dispatch and no shadow
     # telemetry ever accrued.
+    # #240 (review-1d2e7467): resolve what this task is ABOUT before matching.
+    # `modules` is a declared scope dimension; leaving it unresolved meant a
+    # module-scoped rule was in scope for every task in the repo. Resolving
+    # `paths` from the same signals fixes the mirror-image defect on that
+    # dimension, which was dead rather than over-broad.
+    _scope_paths, _scope_modules = resolve_task_scope(ctx)
     matched = load_matching_procedures(
         procedures_path, repo=ctx.get("repo", "") or "", task_type=task_type,
-        role=role, episodes=episodes, issue=issue)
+        role=role, episodes=episodes, issue=issue,
+        paths=_scope_paths, modules=_scope_modules)
     if matched:
         providers.append(ProcedureProvider(matched))
     providers.extend(extra_providers or [])

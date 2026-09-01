@@ -71,6 +71,48 @@ def _now() -> float:
     return time.time()
 
 
+#: A module is a dotted name (`agent_crew.watch`). Operators write scopes both
+#: ways — as an import path and as a file path — so both normalise to one form
+#: and comparisons never depend on which spelling was used.
+_MODULE_SUFFIX_RE = re.compile(r"\.(py|pyi)$", re.IGNORECASE)
+_FILE_EXT_RE = re.compile(r"\.[A-Za-z0-9]{1,5}$")
+#: Directory prefixes that are packaging, not identity.
+_MODULE_PREFIXES = ("src", "lib", "./")
+
+
+def normalise_module(token: str) -> str:
+    """`src/agent_crew/watch.py`, `agent_crew/watch`, `agent_crew.watch` -> one form."""
+    t = (token or "").strip().strip("/")
+    if not t:
+        return ""
+    if "/" in t or _MODULE_SUFFIX_RE.search(t):
+        # Only a token that already looks like a PATH gets its extension
+        # stripped. Doing it by extension alone would eat the last segment of
+        # a dotted module name (`agent_crew.watch` -> `agent_crew`), quietly
+        # widening every scope it touched.
+        t = _FILE_EXT_RE.sub("", t)
+        parts = [p for p in t.split("/") if p and p not in (".", *_MODULE_PREFIXES)]
+        if parts and parts[-1] == "__init__":
+            parts.pop()
+        t = ".".join(parts)
+    return t.strip(".").lower()
+
+
+def module_matches(declared: str, actual: str) -> bool:
+    """Does a task module fall under a declared scope module?
+
+    Containment runs one way only: declaring the package `agent_crew` covers
+    `agent_crew.watch`, but declaring `agent_crew.watch` does NOT cover a task
+    that is merely about `agent_crew`. The narrow spelling is a deliberate
+    narrowing and widening it back would defeat the point of scoping.
+    """
+    d = normalise_module(declared)
+    a = normalise_module(actual)
+    if not d or not a:
+        return False
+    return a == d or a.startswith(d + ".")
+
+
 @dataclass
 class Evidence:
     """A pointer to durable proof, never a copy of it."""
@@ -99,7 +141,21 @@ class Scope:
         return not any(getattr(self, k) for k in _BROAD_SCOPE_KEYS)
 
     def matches(self, *, repo: str = "", path: str = "", task_type: str = "",
-                role: str = "") -> bool:
+                role: str = "", modules: Optional[list] = None) -> bool:
+        """Whether this rule applies to the task described by the arguments.
+
+        ⛔Every dimension the scope DECLARES must be evaluated here. A declared
+          dimension that is silently skipped is worse than no scope at all:
+          `_BROAD_SCOPE_KEYS` counts `modules` when deciding a rule is narrow
+          enough to promote on one incident, so an unevaluated `modules` let a
+          rule buy a lower evidence bar and then apply everywhere anyway
+          (review of PR #242, round 2).
+
+        ⛔"We do not know" is not "it matches". For `paths` and `modules` — the
+          two dimensions the caller may be unable to resolve — an unknown task
+          value EXCLUDES the rule. Governance that leaks into unrelated tasks
+          teaches agents to ignore it.
+        """
         if self.repos and repo and repo not in self.repos:
             return False
         if self.task_types and task_type and task_type not in self.task_types:
@@ -110,6 +166,13 @@ class Scope:
             if not path:
                 return False
             if not any(path.startswith(p) or re.search(p, path) for p in self.paths):
+                return False
+        if self.modules:
+            actual = [m for m in (modules or []) if m]
+            if not actual:
+                return False
+            if not any(module_matches(declared, m)
+                       for declared in self.modules for m in actual):
                 return False
         return True
 
@@ -520,19 +583,24 @@ def mark_stale_by_source_change(procedures: list, changed_paths: list) -> list:
 
 def match_procedures(procedures: list, *, repo: str = "", task_type: str = "",
                      role: str = "", paths: Optional[list] = None,
+                     modules: Optional[list] = None,
                      outcome_signature: str = "", findings: Optional[list] = None,
                      now: Optional[float] = None) -> list:
     """Active procedures whose scope AND trigger match this task.
 
     Returns `(procedure, reason)` pairs — an inclusion without a stated reason
     is not allowed into a Context Pack (#240 §4).
+
+    `modules` is what the task is about in module terms, resolved by the caller
+    (`context_pack.resolve_task_scope`). Passing none means "unknown", which
+    excludes every module-scoped rule rather than admitting all of them.
     """
     out = []
     for p in procedures:
         if not p.is_active(now):
             continue
         if not any(p.scope.matches(repo=repo, path=path, task_type=task_type,
-                                   role=role)
+                                   role=role, modules=modules)
                    for path in (paths or [""])):
             continue
         reason = _trigger_reason(p, outcome_signature, findings or [])
