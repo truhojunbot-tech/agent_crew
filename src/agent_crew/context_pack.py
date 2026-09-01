@@ -646,6 +646,62 @@ def enabled() -> bool:
     return os.getenv("AGENT_CREW_CONTEXT_PACK", "").lower() in ("1", "true", "yes", "on")
 
 
+#: Bounded `gh` lookup for an issue body the ingest path did not persist.
+ISSUE_BODY_FETCH_TIMEOUT_S = 15.0
+
+
+def fetch_issue_body(repo: str, issue: Optional[int],
+                     timeout_s: float = ISSUE_BODY_FETCH_TIMEOUT_S) -> str:
+    """Fetch an issue body via `gh`. Returns "" on any failure.
+
+    Only used when the body was not persisted at ingest — `crew run` and
+    manual enqueues never went through the watcher, so they have no stored
+    body. Bounded by `timeout_s`; the caller treats "" as a degradation when
+    an issue number exists, never as "the issue has no criteria".
+    """
+    if not repo or not issue:
+        return ""
+    try:
+        r = subprocess.run(
+            ["gh", "issue", "view", str(issue), "--repo", repo, "--json", "body"],
+            capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            return ""
+        return (json.loads(r.stdout or "{}").get("body") or "")
+    except Exception:  # noqa: BLE001 — never break a dispatch on a lookup
+        return ""
+
+
+def resolve_issue_body(ctx: dict, *, issue_body_fn=None) -> tuple:
+    """``(body, source)`` for this task's issue.
+
+    Order matters and is deliberate:
+      1. `ctx["issue_body"]` — persisted by the watcher at discovery, so the
+         common path costs no network call and survives a GitHub outage;
+      2. an injected `issue_body_fn` (tests, or a caller with its own source);
+      3. a bounded `gh` lookup, for tasks that never went through ingest.
+
+    ⛔Returns the source so the caller can tell "no issue" from "issue whose
+      body we could not read". Those must not look the same: the second one
+      means the acceptance criteria are missing and the pack has to say so.
+    """
+    ctx = ctx or {}
+    stored = (ctx.get("issue_body") or "").strip()
+    if stored:
+        return stored, "ingest"
+    issue = ctx.get("issue") if isinstance(ctx.get("issue"), int) else None
+    if issue_body_fn is not None:
+        try:
+            body = (issue_body_fn(ctx.get("repo", ""), issue) or "").strip()
+        except Exception:  # noqa: BLE001
+            return "", "lookup_failed"
+        return (body, "injected") if body else ("", "lookup_failed")
+    if issue:
+        body = fetch_issue_body(ctx.get("repo", ""), issue).strip()
+        return (body, "github") if body else ("", "lookup_failed")
+    return "", "no_issue"
+
+
 def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
                         role: str, repo_path: str = "", branch: str = "",
                         episodes_path: str = "", issue_body_fn=None,
@@ -661,12 +717,7 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
     """
     ctx = task_context or {}
     issue = ctx.get("issue") if isinstance(ctx.get("issue"), int) else None
-    body = ""
-    if issue_body_fn is not None:
-        try:
-            body = issue_body_fn(ctx.get("repo", ""), issue) or ""
-        except Exception:  # noqa: BLE001
-            body = ""
+    body, body_source = resolve_issue_body(ctx, issue_body_fn=issue_body_fn)
     title = ctx.get("issue_title", "") or ""
     query = RetrievalQuery(
         task_id=task_id, task_type=task_type, role=role,
@@ -680,9 +731,28 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         providers.append(EpisodicProvider(load_episodes(episodes_path)))
     providers.extend(extra_providers or [])
     try:
-        return plan_pack(query, providers,
+        pack = plan_pack(query, providers,
                          budget=budget or budget_for(role), mode=mode,
                          timeout_s=timeout_s)
+        # ⛔The acceptance criteria are the one thing #239 promises never to
+        #   drop. If this task HAS an issue but we could not read its body, the
+        #   AC is missing and the pack must say so — a silently AC-less pack
+        #   that reports itself healthy is exactly the failure this guard
+        #   exists to prevent (review of PR #241).
+        if issue and body_source == "lookup_failed":
+            pack.degraded = True
+            pack.degraded_reason = "; ".join(filter(None, [
+                pack.degraded_reason,
+                f"issue #{issue} body unavailable — acceptance criteria are "
+                f"NOT in this pack; read the issue before relying on it",
+            ]))
+        elif issue and body and not any(a.artifact_type == TYPE_AC
+                                        for a in pack.items):
+            # Body present but no AC heading found. Not a failure — many
+            # issues have none — so it is stated, not flagged as degraded.
+            logger.info("context_pack: issue #%s has no acceptance-criteria "
+                        "section", issue)
+        return pack
     except Exception as exc:  # noqa: BLE001
         pack = ContextPack(task_id=task_id, role=role, mode=mode,
                            budget=budget or budget_for(role))

@@ -2306,6 +2306,8 @@ def create_app(
     # Same rationale as watchdog_tick/anomaly_tick above: expose the dispatch
     # path so a test can drive one real dispatch deterministically, rather
     # than asserting against a helper the dispatcher may not actually call.
+    # Its absence is why PR #241 shipped a Context Pack that silently omitted
+    # the acceptance criteria on every live dispatch while unit tests passed.
     app.state.dispatch_task = _dispatch_task
     # ── End headless dispatcher ───────────────────────────────────────────────
 
