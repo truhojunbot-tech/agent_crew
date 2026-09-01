@@ -794,3 +794,308 @@ def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
     # ...and shadow telemetry accrued from the real dispatch.
     shadow = tmp_path / "procedure_shadow.jsonl"
     assert shadow.exists() and shadow.read_text().strip()
+
+
+# ── 12. module scope is ENFORCED, not merely declared ─────────────────
+#
+# `Scope.modules` was a declared dimension that nothing evaluated. Two
+# consequences, and the second is the worse one:
+#
+#   1. a rule constrained only by modules applied to every task in the repo;
+#   2. `_BROAD_SCOPE_KEYS` counts `modules`, so declaring one made the rule
+#      "narrow" for validation and bought it a lower evidence bar — a rule
+#      could therefore be promoted on one incident *and* apply everywhere.
+#
+# (review of PR #242, round 2)
+
+
+def _module_proc(modules, **kw):
+    return promote(_candidate(scope=Scope(modules=modules), trigger={}, **kw),
+                   approved_by="operator", validation=_valid(), now=NOW)
+
+
+def _match(proc, **kw):
+    return [p.procedure_id for p, _ in match_procedures(
+        [proc], repo="org/repo", task_type="implement", role="implementer",
+        now=NOW, **kw)]
+
+
+def test_module_scoped_procedure_matches_a_task_in_that_module():
+    proc = _module_proc(["agent_crew.watch"])
+
+    assert _match(proc, modules=["agent_crew.watch"]) == [proc.procedure_id]
+
+
+def test_module_scoped_procedure_does_not_reach_an_unrelated_module():
+    """★The finding: a watcher rule was in scope for a server task."""
+    proc = _module_proc(["agent_crew.watch"])
+
+    assert _match(proc, modules=["agent_crew.server"]) == []
+
+
+def test_module_scoped_procedure_is_excluded_when_the_module_is_unknown():
+    """⛔"We could not resolve a module" is not "every rule applies".
+
+    This is the case the production dispatcher hit before the fix: no module
+    input at all, so an unevaluated `modules` admitted the rule everywhere.
+    """
+    proc = _module_proc(["agent_crew.watch"])
+
+    assert _match(proc) == []
+    assert _match(proc, modules=[]) == []
+    assert _match(proc, modules=[""]) == []
+
+
+def test_a_package_scope_covers_its_submodules():
+    proc = _module_proc(["agent_crew"])
+
+    assert _match(proc, modules=["agent_crew.watch"]) == [proc.procedure_id]
+
+
+def test_a_submodule_scope_does_not_widen_back_to_its_package():
+    """Containment runs one way. Declaring the narrow name means the narrow
+    name — widening it back would defeat the point of writing it."""
+    proc = _module_proc(["agent_crew.watch"])
+
+    assert _match(proc, modules=["agent_crew"]) == []
+
+
+def test_one_matching_module_among_several_is_enough():
+    """A task usually touches more than one module; scope is a filter, not a
+    requirement that every module match."""
+    proc = _module_proc(["agent_crew.watch"])
+
+    assert _match(proc, modules=["agent_crew.server", "agent_crew.watch"]) \
+        == [proc.procedure_id]
+
+
+def test_module_scope_composes_with_the_other_dimensions():
+    """Matching the module does not excuse the rest of the scope."""
+    proc = promote(_candidate(scope=Scope(modules=["agent_crew.watch"],
+                                          roles=["reviewer"]), trigger={}),
+                   approved_by="operator", validation=_valid(), now=NOW)
+
+    assert [p.procedure_id for p, _ in match_procedures(
+        [proc], repo="org/repo", task_type="implement", role="implementer",
+        modules=["agent_crew.watch"], now=NOW)] == []
+    assert [p.procedure_id for p, _ in match_procedures(
+        [proc], repo="org/repo", task_type="review", role="reviewer",
+        modules=["agent_crew.watch"], now=NOW)] == [proc.procedure_id]
+
+
+def test_module_spelling_does_not_change_the_match():
+    """Operators write scopes as import paths and as file paths; both are the
+    same module, and a rule must not silently miss because of the spelling."""
+    from agent_crew.procedural_memory import normalise_module
+
+    assert normalise_module("src/agent_crew/watch.py") == "agent_crew.watch"
+    assert normalise_module("agent_crew/watch") == "agent_crew.watch"
+    assert normalise_module("agent_crew.watch") == "agent_crew.watch"
+    assert normalise_module("src/agent_crew/__init__.py") == "agent_crew"
+    assert normalise_module("") == ""
+
+    proc = _module_proc(["src/agent_crew/watch.py"])
+    assert _match(proc, modules=["agent_crew/watch"]) == [proc.procedure_id]
+
+
+def test_normalisation_never_eats_the_last_segment_of_a_dotted_name():
+    """⛔`agent_crew.watch` must not be read as "file `watch` with extension".
+
+    Stripping by extension alone would turn it into `agent_crew` — quietly
+    widening the scope into the very over-match this section exists to stop.
+    """
+    from agent_crew.procedural_memory import normalise_module
+
+    assert normalise_module("agent_crew.watch") == "agent_crew.watch"
+    assert normalise_module("agent_crew.queue") == "agent_crew.queue"
+
+
+# ── 13. resolving what a task is ABOUT ────────────────────────────────
+
+
+def test_scope_resolution_reads_explicit_producer_fields():
+    from agent_crew.context_pack import resolve_task_scope
+
+    paths, modules = resolve_task_scope(
+        {"paths": ["src/agent_crew/watch.py"], "modules": "agent_crew.server"})
+
+    assert "src/agent_crew/watch.py" in paths
+    assert set(modules) == {"agent_crew.server", "agent_crew.watch"}
+
+
+def test_scope_resolution_reads_paths_named_in_the_issue():
+    """For an ordinary bug report this is the only pre-work signal there is."""
+    from agent_crew.context_pack import resolve_task_scope
+
+    paths, modules = resolve_task_scope({
+        "issue_title": "watcher drops the claim",
+        "issue_body": "The bug is in src/agent_crew/watch.py, see "
+                      "tests/unit/test_issue_224_watch.py",
+    })
+
+    assert paths == ["src/agent_crew/watch.py", "tests/unit/test_issue_224_watch.py"]
+    assert "agent_crew.watch" in modules
+
+
+def test_scope_resolution_does_not_manufacture_scope_from_prose():
+    """⛔A loose pattern would invent modules out of ordinary sentences, and a
+    WRONG module is worse than no module — it routes a rule to the wrong task
+    while looking precise."""
+    from agent_crew.context_pack import resolve_task_scope
+
+    assert resolve_task_scope({}) == ([], [])
+    assert resolve_task_scope(
+        {"issue_title": "the ratio 1.5 is wrong, e.g. in prod"}) == ([], [])
+    assert resolve_task_scope({"issue_body": "see the docs. it is broken."}) == ([], [])
+
+
+def test_scope_resolution_is_bounded():
+    from agent_crew.context_pack import MAX_RESOLVED_SCOPE, resolve_task_scope
+
+    body = " ".join(f"src/pkg/mod{i}.py" for i in range(500))
+    paths, modules = resolve_task_scope({"issue_body": body})
+
+    assert len(paths) == MAX_RESOLVED_SCOPE
+    assert len(modules) == MAX_RESOLVED_SCOPE
+
+
+def test_pack_excludes_a_module_scoped_procedure_for_an_unrelated_task(tmp_path):
+    """★★End to end, exclusion: the shape of the bug as it actually shipped."""
+    from agent_crew.context_pack import build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    _persist(procs, trigger={}, scope=Scope(modules=["agent_crew.watch"]))
+
+    pack = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "server timeout",
+         "issue_body": "the dispatcher in src/agent_crew/server.py hangs"},
+        task_id="t-out", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs))
+
+    assert not [a for a in pack.items if a.artifact_type == TYPE_PROCEDURE], \
+        "a watcher-scoped procedure reached a server task"
+
+
+def test_pack_includes_a_module_scoped_procedure_for_a_task_in_that_module(tmp_path):
+    """★★End to end, inclusion: scoping must not have killed the feature."""
+    from agent_crew.context_pack import build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    _persist(procs, trigger={}, scope=Scope(modules=["agent_crew.watch"]))
+
+    pack = build_pack_for_task(
+        {"issue": 43, "repo": "org/repo", "issue_title": "watcher drops claims",
+         "issue_body": "reconcile in src/agent_crew/watch.py is wrong"},
+        task_id="t-in", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs))
+
+    procedures = [a for a in pack.items if a.artifact_type == TYPE_PROCEDURE]
+    assert procedures, "the module-scoped procedure never reached an in-module task"
+    assert "check the data layer first" in procedures[0].excerpt
+
+
+def test_shadow_telemetry_is_not_written_for_an_out_of_scope_procedure(tmp_path):
+    """A rule that did not apply must not accrue evidence that it did — that
+    is the data `ready_for_hard_enforcement` will later be judged on."""
+    import json as _json
+
+    from agent_crew.context_pack import build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    shadow = tmp_path / "shadow.jsonl"
+    _persist(procs, trigger={}, scope=Scope(modules=["agent_crew.watch"]))
+
+    build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "server timeout",
+         "issue_body": "src/agent_crew/server.py hangs"},
+        task_id="t-out", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs),
+        shadow_path=str(shadow))
+
+    assert not shadow.exists() or not shadow.read_text().strip()
+
+    build_pack_for_task(
+        {"issue": 43, "repo": "org/repo", "issue_title": "watcher",
+         "issue_body": "src/agent_crew/watch.py"},
+        task_id="t-in", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs),
+        shadow_path=str(shadow))
+
+    recs = [_json.loads(l) for l in open(shadow)]
+    assert [r["task_id"] for r in recs] == ["t-in"]
+
+
+def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch):
+    """★★Dispatcher level: the same two tasks, through the real dispatch path.
+
+    The unit tests above call `build_pack_for_task` directly; this drives
+    `_dispatch_task`, because a scope that is only enforced in a helper the
+    dispatcher does not reach is exactly the class of gap that produced the
+    previous two rounds of review on this PR.
+    """
+    import asyncio
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)}}))
+    db = str(tmp_path / "t.db")
+    _persist(tmp_path / "procedures.jsonl", trigger={},
+             scope=Scope(modules=["agent_crew.watch"]))
+
+    spawned = {}
+
+    async def _fake_exec(*cmd, **kwargs):
+        spawned.setdefault("cmds", []).append(cmd)
+
+        class _P:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
+                        _fake_exec)
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        for tid, body in (("disp-out", "src/agent_crew/server.py hangs"),
+                          ("disp-in", "src/agent_crew/watch.py drops claims")):
+            q.enqueue(TaskRequest(
+                task_id=tid, task_type="implement", description="do it",
+                branch="main",
+                context={"issue": 42, "repo": "org/repo", "issue_title": "t",
+                         "issue_body": body}))
+            task = q.dequeue(role="implementer")
+            assert task is not None
+            asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    def _pack_block(cmd):
+        blob = " ".join(str(c) for c in cmd)
+        return blob[blob.index("=== CONTEXT PACK"):blob.index("=== END CONTEXT PACK")]
+
+    out_block, in_block = (_pack_block(c) for c in spawned["cmds"])
+
+    assert "check the data layer first" not in out_block, \
+        "a watcher-scoped procedure was dispatched to a server task"
+    assert "check the data layer first" in in_block, \
+        "the module-scoped procedure never reached the in-module dispatch"
