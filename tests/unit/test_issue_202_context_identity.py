@@ -644,25 +644,45 @@ def test_u_i235_retry_completion_finalizes_outcome_and_keeps_original_start(
             q = TaskQueue(tmp_db)
             q.enqueue(TaskRequest(task_id="retry-1", task_type="implement",
                                   description="d", context={}))
+            assert q.get_task_status("retry-1") == "pending"
+
+            # ── attempt 1: real dispatch ──────────────────────────────
+            # ⛔The task must actually be dequeued. `requeue()` only rolls
+            #   back rows whose status is 'in_progress', so a test that
+            #   requeues a 'failed' row is a silent no-op and never exercises
+            #   the retry path at all (review-ad60deae).
+            first = q.dequeue(role="implementer")
+            assert first is not None and first.task_id == "retry-1"
+            assert q.get_task_status("retry-1") == "in_progress"
             _dispatch_snapshot(q, attr_jsonl_path, "retry-1",
                                worktree_path=str(wt_paths["claude"]),
                                context_id="ctx-retry-1")
             first_start = q.get_attribution("retry-1")["started_at"]
             assert first_start > 0
 
-            # Attempt 1 fails transiently, task is requeued and re-dispatched.
-            client.post("/tasks/retry-1/result", json={
-                "task_id": "retry-1", "status": "failed", "summary": "boom",
-                "error_info": {"reason": "agy_timeout"}})
+            # ── transient failure: exactly what the dispatcher does ────
+            # `_dispatch_task` calls requeue() on a still-in_progress task and
+            # returns WITHOUT submitting a result — a transient retry is not a
+            # terminal outcome. Posting a failed result here (as this test
+            # used to) both skips the real transition and makes the later
+            # requeue a no-op.
             q.requeue("retry-1")
+            assert q.get_task_status("retry-1") == "pending", \
+                "requeue must really roll the task back, not silently no-op"
+
+            # ── attempt 2: dispatched again, then succeeds ─────────────
+            second = q.dequeue(role="implementer")
+            assert second is not None and second.task_id == "retry-1", \
+                "the requeued task must be dequeueable again"
+            assert q.get_task_status("retry-1") == "in_progress"
             _dispatch_snapshot(q, attr_jsonl_path, "retry-1",
                                worktree_path=str(wt_paths["claude"]),
                                context_id="ctx-retry-1")
 
-            # Attempt 2 succeeds.
             resp = client.post("/tasks/retry-1/result", json={
                 "task_id": "retry-1", "status": "completed", "summary": "ok"})
             assert resp.status_code == 200
+            assert q.get_task_status("retry-1") == "completed"
 
     row = TaskQueue(tmp_db).get_attribution("retry-1")
     assert row["outcome"] == "completed", row
