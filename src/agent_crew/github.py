@@ -158,6 +158,31 @@ def post_review_comment(
         return False
 
 
+def post_pr_comment(pr_number: int, body: str, repo: Optional[str] = None) -> bool:
+    """Post an arbitrary comment on a PR. Returns True on success.
+
+    `post_review_comment` renders a review verdict; this is the plain channel
+    for the automation itself to speak — e.g. saying that the automated fix
+    budget is spent and the PR is now waiting on a human (#244).
+    """
+    if not check_gh_installed():
+        return False
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return False
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "comment", str(pr_number), "--repo", repo, "--body", body],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
 def post_discussion_comment(
     issue_number: int,
     topic: str,
