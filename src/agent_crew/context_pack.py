@@ -812,9 +812,75 @@ def resolve_issue_body(ctx: dict, *, issue_body_fn=None) -> tuple:
     return "", "no_issue"
 
 
+def _procedure_triggers(episodes: list, issue: Optional[int]) -> tuple:
+    """`(outcome_signature, findings)` from prior work on this issue.
+
+    These are exactly the signals #240's procedures trigger on: a recurring
+    terminal outcome, and review findings that keep coming back. Taking them
+    from persisted episodes means a procedure fires on evidence rather than on
+    a guess about what this task might do.
+    """
+    sig, findings = "", []
+    for ep in episodes or []:
+        if issue and ep.get("issue") != issue:
+            continue
+        if not sig and (ep.get("outcome") or "").startswith("failed"):
+            sig = ep["outcome"]
+        findings.extend(str(f) for f in (ep.get("findings") or []))
+    return sig, findings
+
+
+def load_matching_procedures(procedures_path: str, *, repo: str, task_type: str,
+                             role: str, episodes: Optional[list] = None,
+                             issue: Optional[int] = None,
+                             paths: Optional[list] = None) -> list:
+    """Active, in-scope, triggered procedures for this task (#240 §4).
+
+    ⛔Imported lazily and wrapped: procedural memory is derived governance and
+      must never be able to break a dispatch. A failure here yields no
+      procedures, not an exception.
+    """
+    if not procedures_path or not os.path.exists(procedures_path):
+        return []
+    try:
+        from agent_crew import procedural_memory as _pm
+
+        sig, findings = _procedure_triggers(episodes or [], issue)
+        return _pm.match_procedures(
+            _pm.load_procedures(procedures_path),
+            repo=repo, task_type=task_type, role=role,
+            paths=paths or [""], outcome_signature=sig, findings=findings)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context_pack: procedure matching failed: %s", exc)
+        return []
+
+
+def _record_shadow(shadow_path: str, matched: list, task_id: str) -> None:
+    """Append one shadow record per matched procedure. Never raises.
+
+    ⛔Recorded, never applied. Hard enforcement is only justifiable once these
+      show an acceptable false-positive rate (#240 §5).
+    """
+    try:
+        from agent_crew import procedural_memory as _pm
+
+        os.makedirs(os.path.dirname(shadow_path) or ".", exist_ok=True)
+        with open(shadow_path, "a") as f:
+            for proc, reason in matched:
+                rec = _pm.shadow_record(
+                    proc, task_id=task_id, triggered=True,
+                    would=proc.required_action or proc.prohibited_action
+                    or proc.rule)
+                rec["reason"] = reason
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context_pack: shadow record failed: %s", exc)
+
+
 def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
                         role: str, repo_path: str = "", branch: str = "",
-                        episodes_path: str = "", issue_body_fn=None,
+                        episodes_path: str = "", procedures_path: str = "",
+                        shadow_path: str = "", issue_body_fn=None,
                         budget: Optional[dict] = None,
                         extra_providers: Optional[list] = None,
                         mode: str = MODE_LEXICAL,
@@ -837,8 +903,18 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         retry_of=str(ctx.get("retry_of") or ""),
     )
     providers = [IssueProvider(), LexicalRepoProvider()]
+    episodes = load_episodes(episodes_path) if episodes_path else []
     if episodes_path:
-        providers.append(EpisodicProvider(load_episodes(episodes_path)))
+        providers.append(EpisodicProvider(episodes))
+    # #240 (review-2016dcf3): actually load persisted procedures. Without this
+    # the feature existed only in tests that instantiated the provider by
+    # hand — no active procedure could reach a real dispatch and no shadow
+    # telemetry ever accrued.
+    matched = load_matching_procedures(
+        procedures_path, repo=ctx.get("repo", "") or "", task_type=task_type,
+        role=role, episodes=episodes, issue=issue)
+    if matched:
+        providers.append(ProcedureProvider(matched))
     providers.extend(extra_providers or [])
     try:
         pack = plan_pack(query, providers,
@@ -874,6 +950,8 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
             # issues have none — so it is stated, not flagged as degraded.
             logger.info("context_pack: issue #%s has no acceptance-criteria "
                         "section", issue)
+        if matched and shadow_path:
+            _record_shadow(shadow_path, matched, task_id)
         return pack
     except Exception as exc:  # noqa: BLE001
         pack = ContextPack(task_id=task_id, role=role, mode=mode,
