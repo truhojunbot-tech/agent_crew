@@ -583,3 +583,214 @@ def test_procedures_rank_below_non_mandatory_authoritative_types():
     kinds = [a.artifact_type for a in pack.items]
 
     assert kinds.index(TYPE_CODE) < kinds.index(TYPE_PROCEDURE), kinds
+
+
+# ── 10. the production path (review-2016dcf3) ─────────────────────────
+#
+# Every test above instantiates ProcedureProvider by hand. The production
+# builder never loaded procedures.jsonl, never called match_procedures and
+# never registered the provider — so no persisted procedure could reach a
+# real dispatch and no shadow telemetry accrued, while the tests all passed.
+# Same shape as the #239 defect: coverage of a path production does not take.
+
+
+def _persist(path, **kw):
+    from agent_crew.procedural_memory import append_procedure
+
+    p = promote(_candidate(**kw), approved_by="operator",
+                validation=_valid(), now=NOW)
+    append_procedure(str(path), p)
+    return p
+
+
+def test_persisted_procedure_reaches_a_production_shaped_pack(tmp_path):
+    """★The regression: an active procedure on disk must reach the pack."""
+    from agent_crew.context_pack import build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    _persist(procs, trigger={}, scope=Scope(repos=["org/repo"]))
+
+    pack = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "t", "issue_body": "b"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs))
+
+    assert any(a.artifact_type == TYPE_PROCEDURE for a in pack.items), \
+        "a persisted active procedure never reached the pack"
+    assert "check the data layer first" in pack.to_prompt_block()
+
+
+def test_out_of_scope_procedure_does_not_reach_the_pack(tmp_path):
+    """⛔Scope still governs — wiring must not mean 'include everything'."""
+    from agent_crew.context_pack import build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    _persist(procs, trigger={}, scope=Scope(repos=["org/other"]))
+
+    pack = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "t", "issue_body": "b"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs))
+
+    assert not [a for a in pack.items if a.artifact_type == TYPE_PROCEDURE]
+
+
+def test_deprecated_procedure_does_not_reach_the_pack(tmp_path):
+    from agent_crew.context_pack import build_pack_for_task
+    from agent_crew.procedural_memory import append_procedure
+
+    procs = tmp_path / "procedures.jsonl"
+    p = _persist(procs, trigger={}, scope=Scope(repos=["org/repo"]))
+    deprecate(p, by="op", reason="superseded", now=NOW)
+    append_procedure(str(procs), p)
+
+    pack = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "t", "issue_body": "b"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs))
+
+    assert not [a for a in pack.items if a.artifact_type == TYPE_PROCEDURE]
+
+
+def test_episode_evidence_drives_the_trigger(tmp_path):
+    """★A triggered procedure fires on evidence, not on a guess."""
+    from agent_crew.context_pack import append_episode, build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    eps = tmp_path / "episodes.jsonl"
+    _persist(procs, trigger={"outcome_signature": "failed:data_loss"},
+             scope=Scope(repos=["org/repo"]))
+    append_episode(str(eps), {"task_id": "t-prev", "issue": 42,
+                              "outcome": "failed:data_loss", "findings": []})
+
+    with_ev = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "t", "issue_body": "b"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs),
+        episodes_path=str(eps))
+    assert [a for a in with_ev.items if a.artifact_type == TYPE_PROCEDURE]
+
+    # Same procedure, no prior failure on record -> trigger does not fire.
+    without = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "t", "issue_body": "b"},
+        task_id="t-2", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs))
+    assert not [a for a in without.items if a.artifact_type == TYPE_PROCEDURE]
+
+
+def test_shadow_telemetry_actually_accrues(tmp_path):
+    """★#240 §5: without accrual there is never evidence for hard mode."""
+    import json as _json
+
+    from agent_crew.context_pack import build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    shadow = tmp_path / "procedure_shadow.jsonl"
+    _persist(procs, trigger={}, scope=Scope(repos=["org/repo"]))
+
+    build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "t", "issue_body": "b"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs),
+        shadow_path=str(shadow))
+
+    recs = [_json.loads(l) for l in open(shadow)]
+    assert len(recs) == 1
+    assert recs[0]["task_id"] == "t-1"
+    assert recs[0]["triggered"] is True
+    assert recs[0]["enforcement"] == SHADOW
+    assert recs[0]["reason"]
+
+
+def test_a_corrupt_procedures_file_does_not_break_dispatch(tmp_path):
+    """⛔Derived governance may never take a dispatch down."""
+    from agent_crew.context_pack import build_pack_for_task
+
+    procs = tmp_path / "procedures.jsonl"
+    procs.write_text("{not json at all\n")
+
+    pack = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "t", "issue_body": "b"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path), procedures_path=str(procs))
+
+    assert isinstance(pack.pack_id, str)
+    assert not [a for a in pack.items if a.artifact_type == TYPE_PROCEDURE]
+
+
+def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
+    tmp_path, monkeypatch,
+):
+    """★★The dispatch-level regression the review asked for.
+
+    Drives the real `_dispatch_task` with the pack ENABLED and a procedure on
+    disk, then inspects the command that would be spawned. Asserts inside the
+    CONTEXT PACK block — a looser check over the whole command would match
+    text arriving by other routes, which is how the #239 version of this test
+    initially passed against a broken build.
+    """
+    import asyncio
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)}}))
+    db = str(tmp_path / "t.db")
+    _persist(tmp_path / "procedures.jsonl", trigger={},
+             scope=Scope(repos=["org/repo"]))
+
+    spawned = {}
+
+    async def _fake_exec(*cmd, **kwargs):
+        spawned["cmd"] = cmd
+
+        class _P:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
+                        _fake_exec)
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(
+            task_id="disp-p1", task_type="implement", description="do it",
+            branch="main",
+            context={"issue": 42, "repo": "org/repo", "issue_title": "t",
+                     "issue_body": "## Acceptance criteria\n- [ ] works\n"},
+        ))
+        task = q.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    blob = " ".join(str(c) for c in spawned.get("cmd", ()))
+    start, end = blob.index("=== CONTEXT PACK"), blob.index("=== END CONTEXT PACK")
+    pack_block = blob[start:end]
+
+    assert "procedure" in pack_block, \
+        f"no procedure artifact in the dispatched pack:\n{pack_block[:600]}"
+    assert "check the data layer first" in pack_block
+    # ...and shadow telemetry accrued from the real dispatch.
+    shadow = tmp_path / "procedure_shadow.jsonl"
+    assert shadow.exists() and shadow.read_text().strip()

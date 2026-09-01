@@ -1685,12 +1685,19 @@ def create_app(
         # rather than a silent empty one, so absence of an artifact is never
         # mistaken for absence of fact.
         _pack = None
+        _state_dir = os.path.dirname(db_path)
         if _cpack.enabled():
             _pack = _cpack.build_pack_for_task(
                 _ctx if isinstance(_ctx, dict) else {},
                 task_id=task.task_id, task_type=task.task_type, role=role,
                 repo_path=wt, branch=task.branch,
-                episodes_path=os.path.join(os.path.dirname(db_path), "episodes.jsonl"),
+                episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
+                # #240: persisted procedures reach the dispatch from here.
+                # Passed explicitly rather than derived inside the builder so
+                # the wiring is visible at the call site — the previous
+                # version's absence is exactly what review-2016dcf3 caught.
+                procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
+                shadow_path=os.path.join(_state_dir, "procedure_shadow.jsonl"),
             )
             _block = _pack.to_prompt_block()
             if _block:
@@ -2067,6 +2074,11 @@ def create_app(
             return
 
     app.state.dispatcher_enabled = _dispatcher_enabled
+    # Same rationale as watchdog_tick/anomaly_tick above: expose the dispatch
+    # path so a test can drive one real dispatch deterministically. Its
+    # absence is why PR #241 shipped a Context Pack that silently omitted the
+    # acceptance criteria on every live dispatch while unit tests passed.
+    app.state.dispatch_task = _dispatch_task
     # ── End headless dispatcher ───────────────────────────────────────────────
 
     def _auto_enqueue_review(

@@ -530,3 +530,201 @@ def test_builder_with_no_issue_still_produces_a_usable_pack(tmp_path):
 
     assert pack.degraded is False
     assert isinstance(pack.to_prompt_block(), str)
+
+
+# ── 11. the production call site (review of PR #241) ──────────────────
+#
+# The original tests all passed `issue_body_fn=lambda ...` — something the
+# server NEVER does. So every unit test saw an acceptance-criteria artifact
+# while every real dispatch shipped a pack without one, and the pack called
+# itself healthy while doing it. These tests exercise the call the server
+# actually makes.
+
+
+def test_production_shaped_call_without_a_body_fn_still_gets_the_ac(tmp_path):
+    """★The exact regression: no `issue_body_fn`, body persisted at ingest."""
+    from agent_crew.context_pack import build_pack_for_task
+
+    pack = build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "fix widget_drop",
+         "issue_body": ISSUE_BODY},          # what watch.py now stores
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path))             # NO issue_body_fn — as in server.py
+
+    assert any(a.artifact_type == TYPE_AC for a in pack.items), \
+        "the acceptance criteria must survive the production call shape"
+    assert "widget survives a restart" in pack.to_prompt_block()
+    assert pack.degraded is False
+
+
+def test_missing_body_for_a_real_issue_is_visible_degradation(tmp_path, monkeypatch):
+    """★A pack without the AC must never report itself healthy."""
+    import agent_crew.context_pack as m
+
+    monkeypatch.setattr(m, "fetch_issue_body", lambda *a, **k: "")
+    pack = m.build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "fix widget_drop"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path))
+
+    assert not any(a.artifact_type == TYPE_AC for a in pack.items)
+    assert pack.degraded is True
+    assert "acceptance criteria are NOT in this pack" in pack.degraded_reason
+    assert "DEGRADED" in pack.to_prompt_block()
+
+
+def test_github_fallback_supplies_the_body_when_ingest_did_not(tmp_path, monkeypatch):
+    """Manual enqueues never went through the watcher, so they have no
+    stored body — a bounded lookup covers them."""
+    import agent_crew.context_pack as m
+
+    monkeypatch.setattr(m, "fetch_issue_body", lambda repo, issue, **k: ISSUE_BODY)
+    pack = m.build_pack_for_task(
+        {"issue": 42, "repo": "org/repo", "issue_title": "fix widget_drop"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path))
+
+    assert any(a.artifact_type == TYPE_AC for a in pack.items)
+    assert pack.degraded is False
+
+
+def test_a_task_with_no_issue_is_not_degraded(tmp_path, monkeypatch):
+    """⛔`crew run` tasks legitimately have no issue. That is not a failure,
+    and must stay distinguishable from 'issue whose body we could not read'."""
+    import agent_crew.context_pack as m
+
+    monkeypatch.setattr(m, "fetch_issue_body", lambda *a, **k: "")
+    pack = m.build_pack_for_task(
+        {"issue_title": "refactor the widget"},
+        task_id="t-1", task_type="implement", role="implementer",
+        repo_path=str(tmp_path))
+
+    assert pack.degraded is False
+
+
+def test_body_resolution_order_and_source():
+    from agent_crew.context_pack import resolve_issue_body
+
+    assert resolve_issue_body({"issue_body": "stored"}) == ("stored", "ingest")
+    assert resolve_issue_body(
+        {"issue": 1, "repo": "o/r"},
+        issue_body_fn=lambda r, i: "injected") == ("injected", "injected")
+    assert resolve_issue_body(
+        {"issue": 1}, issue_body_fn=lambda r, i: "") == ("", "lookup_failed")
+    assert resolve_issue_body({}) == ("", "no_issue")
+
+
+def test_body_fetch_failure_does_not_raise(monkeypatch):
+    import agent_crew.context_pack as m
+
+    def boom(*a, **k):
+        raise RuntimeError("gh exploded")
+
+    monkeypatch.setattr(m.subprocess, "run", boom)
+    assert m.fetch_issue_body("o/r", 1) == ""
+
+
+def test_watch_persists_the_issue_body_it_already_fetched():
+    """★Fix at the source: the watcher fetched the body and threw it away."""
+    from agent_crew.watch import ISSUE_BODY_MAX_CHARS, build_task
+
+    issue = {"number": 42, "title": "fix widget_drop", "labels": ["bug"],
+             "body": ISSUE_BODY, "url": "https://github.com/org/repo/issues/42"}
+    task = build_task(issue, "org/repo", "main")
+
+    assert task.context["issue_body"] == ISSUE_BODY
+    # ...and one enormous issue cannot bloat the queue row.
+    huge = dict(issue, body="x" * (ISSUE_BODY_MAX_CHARS + 5000))
+    assert len(build_task(huge, "org/repo", "main").context["issue_body"]) \
+        == ISSUE_BODY_MAX_CHARS
+
+
+# ── 12. ENABLED dispatcher-level integration (review of PR #241) ──────
+
+
+def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
+    tmp_path, monkeypatch,
+):
+    """★★The test whose absence let this ship broken.
+
+    Drives the actual `_dispatch_task` path with the pack ENABLED and captures
+    the command the dispatcher would spawn. Nothing is stubbed between the
+    task context and the prompt, so a call site that forgets to supply the
+    issue body fails here — which is exactly what happened on PR #241 while
+    every unit test passed.
+    """
+    import asyncio
+    import json as _json
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)}}))
+    db = str(tmp_path / "t.db")
+
+    spawned = {}
+
+    async def _fake_exec(*cmd, **kwargs):
+        spawned["cmd"] = cmd
+
+        class _P:
+            returncode = 0
+            pid = 1234
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
+                        _fake_exec)
+
+    from fastapi.testclient import TestClient
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+                     watchdog_disabled=True, anomaly_disabled=True)
+
+    # The queue is bound during lifespan startup, so the dispatch has to run
+    # with the app actually started — same shape as production.
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(
+            task_id="disp-1", task_type="implement", description="fix the widget",
+            branch="main",
+            context={"issue": 42, "repo": "org/repo",
+                     "issue_title": "fix widget_drop",
+                     "issue_body": ISSUE_BODY,    # as watch.py now persists it
+                     "source": "watch"},
+        ))
+        task = q.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    blob = " ".join(str(c) for c in spawned.get("cmd", ()))
+    assert "CONTEXT PACK" in blob, "the pack never reached the dispatched prompt"
+
+    # ⛔Assert against the PACK BLOCK, not the whole command. `_format_task_message`
+    #   serialises task.context — which now holds issue_body — into the prompt,
+    #   so a naive substring check over the command passes even when the pack
+    #   omits the AC entirely. That looseness is what let the original bug hide.
+    start = blob.index("=== CONTEXT PACK")
+    end = blob.index("=== END CONTEXT PACK")
+    pack_block = blob[start:end]
+
+    assert "acceptance_criteria" in pack_block, \
+        f"no acceptance-criteria artifact in the dispatched pack:\n{pack_block[:600]}"
+    assert "widget survives a restart" in pack_block, \
+        "the acceptance criteria are missing from the dispatched Context Pack"
+    assert "no duplicate widgets" in pack_block
+    assert "DEGRADED" not in pack_block

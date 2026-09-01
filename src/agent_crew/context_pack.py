@@ -651,9 +651,131 @@ def enabled() -> bool:
     return os.getenv("AGENT_CREW_CONTEXT_PACK", "").lower() in ("1", "true", "yes", "on")
 
 
+#: Bounded `gh` lookup for an issue body the ingest path did not persist.
+ISSUE_BODY_FETCH_TIMEOUT_S = 15.0
+
+
+def fetch_issue_body(repo: str, issue: Optional[int],
+                     timeout_s: float = ISSUE_BODY_FETCH_TIMEOUT_S) -> str:
+    """Fetch an issue body via `gh`. Returns "" on any failure.
+
+    Only used when the body was not persisted at ingest — `crew run` and
+    manual enqueues never went through the watcher, so they have no stored
+    body. Bounded by `timeout_s`; the caller treats "" as a degradation when
+    an issue number exists, never as "the issue has no criteria".
+    """
+    if not repo or not issue:
+        return ""
+    try:
+        r = subprocess.run(
+            ["gh", "issue", "view", str(issue), "--repo", repo, "--json", "body"],
+            capture_output=True, text=True, timeout=timeout_s)
+        if r.returncode != 0:
+            return ""
+        return (json.loads(r.stdout or "{}").get("body") or "")
+    except Exception:  # noqa: BLE001 — never break a dispatch on a lookup
+        return ""
+
+
+def resolve_issue_body(ctx: dict, *, issue_body_fn=None) -> tuple:
+    """``(body, source)`` for this task's issue.
+
+    Order matters and is deliberate:
+      1. `ctx["issue_body"]` — persisted by the watcher at discovery, so the
+         common path costs no network call and survives a GitHub outage;
+      2. an injected `issue_body_fn` (tests, or a caller with its own source);
+      3. a bounded `gh` lookup, for tasks that never went through ingest.
+
+    ⛔Returns the source so the caller can tell "no issue" from "issue whose
+      body we could not read". Those must not look the same: the second one
+      means the acceptance criteria are missing and the pack has to say so.
+    """
+    ctx = ctx or {}
+    stored = (ctx.get("issue_body") or "").strip()
+    if stored:
+        return stored, "ingest"
+    issue = ctx.get("issue") if isinstance(ctx.get("issue"), int) else None
+    if issue_body_fn is not None:
+        try:
+            body = (issue_body_fn(ctx.get("repo", ""), issue) or "").strip()
+        except Exception:  # noqa: BLE001
+            return "", "lookup_failed"
+        return (body, "injected") if body else ("", "lookup_failed")
+    if issue:
+        body = fetch_issue_body(ctx.get("repo", ""), issue).strip()
+        return (body, "github") if body else ("", "lookup_failed")
+    return "", "no_issue"
+
+
+def _procedure_triggers(episodes: list, issue: Optional[int]) -> tuple:
+    """`(outcome_signature, findings)` from prior work on this issue.
+
+    These are exactly the signals #240's procedures trigger on: a recurring
+    terminal outcome, and review findings that keep coming back. Taking them
+    from persisted episodes means a procedure fires on evidence rather than on
+    a guess about what this task might do.
+    """
+    sig, findings = "", []
+    for ep in episodes or []:
+        if issue and ep.get("issue") != issue:
+            continue
+        if not sig and (ep.get("outcome") or "").startswith("failed"):
+            sig = ep["outcome"]
+        findings.extend(str(f) for f in (ep.get("findings") or []))
+    return sig, findings
+
+
+def load_matching_procedures(procedures_path: str, *, repo: str, task_type: str,
+                             role: str, episodes: Optional[list] = None,
+                             issue: Optional[int] = None,
+                             paths: Optional[list] = None) -> list:
+    """Active, in-scope, triggered procedures for this task (#240 §4).
+
+    ⛔Imported lazily and wrapped: procedural memory is derived governance and
+      must never be able to break a dispatch. A failure here yields no
+      procedures, not an exception.
+    """
+    if not procedures_path or not os.path.exists(procedures_path):
+        return []
+    try:
+        from agent_crew import procedural_memory as _pm
+
+        sig, findings = _procedure_triggers(episodes or [], issue)
+        return _pm.match_procedures(
+            _pm.load_procedures(procedures_path),
+            repo=repo, task_type=task_type, role=role,
+            paths=paths or [""], outcome_signature=sig, findings=findings)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context_pack: procedure matching failed: %s", exc)
+        return []
+
+
+def _record_shadow(shadow_path: str, matched: list, task_id: str) -> None:
+    """Append one shadow record per matched procedure. Never raises.
+
+    ⛔Recorded, never applied. Hard enforcement is only justifiable once these
+      show an acceptable false-positive rate (#240 §5).
+    """
+    try:
+        from agent_crew import procedural_memory as _pm
+
+        os.makedirs(os.path.dirname(shadow_path) or ".", exist_ok=True)
+        with open(shadow_path, "a") as f:
+            for proc, reason in matched:
+                rec = _pm.shadow_record(
+                    proc, task_id=task_id, triggered=True,
+                    would=proc.required_action or proc.prohibited_action
+                    or proc.rule)
+                rec["reason"] = reason
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context_pack: shadow record failed: %s", exc)
+
+
 def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
                         role: str, repo_path: str = "", branch: str = "",
-                        episodes_path: str = "", issue_body_fn=None,
+                        episodes_path: str = "", procedures_path: str = "",
+                        shadow_path: str = "", issue_body_fn=None,
                         budget: Optional[dict] = None,
                         extra_providers: Optional[list] = None,
                         mode: str = MODE_LEXICAL,
@@ -666,12 +788,7 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
     """
     ctx = task_context or {}
     issue = ctx.get("issue") if isinstance(ctx.get("issue"), int) else None
-    body = ""
-    if issue_body_fn is not None:
-        try:
-            body = issue_body_fn(ctx.get("repo", ""), issue) or ""
-        except Exception:  # noqa: BLE001
-            body = ""
+    body, body_source = resolve_issue_body(ctx, issue_body_fn=issue_body_fn)
     title = ctx.get("issue_title", "") or ""
     query = RetrievalQuery(
         task_id=task_id, task_type=task_type, role=role,
@@ -681,13 +798,44 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         retry_of=str(ctx.get("retry_of") or ""),
     )
     providers = [IssueProvider(), LexicalRepoProvider()]
+    episodes = load_episodes(episodes_path) if episodes_path else []
     if episodes_path:
-        providers.append(EpisodicProvider(load_episodes(episodes_path)))
+        providers.append(EpisodicProvider(episodes))
+    # #240 (review-2016dcf3): actually load persisted procedures. Without this
+    # the feature existed only in tests that instantiated the provider by
+    # hand — no active procedure could reach a real dispatch and no shadow
+    # telemetry ever accrued.
+    matched = load_matching_procedures(
+        procedures_path, repo=ctx.get("repo", "") or "", task_type=task_type,
+        role=role, episodes=episodes, issue=issue)
+    if matched:
+        providers.append(ProcedureProvider(matched))
     providers.extend(extra_providers or [])
     try:
-        return plan_pack(query, providers,
+        pack = plan_pack(query, providers,
                          budget=budget or budget_for(role), mode=mode,
                          timeout_s=timeout_s)
+        # ⛔The acceptance criteria are the one thing #239 promises never to
+        #   drop. If this task HAS an issue but we could not read its body, the
+        #   AC is missing and the pack must say so — a silently AC-less pack
+        #   that reports itself healthy is exactly the failure this guard
+        #   exists to prevent (review of PR #241).
+        if issue and body_source == "lookup_failed":
+            pack.degraded = True
+            pack.degraded_reason = "; ".join(filter(None, [
+                pack.degraded_reason,
+                f"issue #{issue} body unavailable — acceptance criteria are "
+                f"NOT in this pack; read the issue before relying on it",
+            ]))
+        elif issue and body and not any(a.artifact_type == TYPE_AC
+                                        for a in pack.items):
+            # Body present but no AC heading found. Not a failure — many
+            # issues have none — so it is stated, not flagged as degraded.
+            logger.info("context_pack: issue #%s has no acceptance-criteria "
+                        "section", issue)
+        if matched and shadow_path:
+            _record_shadow(shadow_path, matched, task_id)
+        return pack
     except Exception as exc:  # noqa: BLE001
         pack = ContextPack(task_id=task_id, role=role, mode=mode,
                            budget=budget or budget_for(role))

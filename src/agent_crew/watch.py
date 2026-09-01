@@ -81,6 +81,11 @@ DEFAULT_INTERVAL_SECONDS = 300.0
 #:   exists to prevent.
 CLAIM_STALE_AFTER_SECONDS = 300.0
 
+#: Cap on the issue body persisted into a task's context. Large enough for a
+#: full issue with acceptance criteria, small enough that the queue row stays
+#: sane.
+ISSUE_BODY_MAX_CHARS = 20000
+
 DEFAULT_BACKOFF_BASE = 30.0
 DEFAULT_BACKOFF_CAP = 900.0
 
@@ -747,6 +752,11 @@ def build_task(issue: dict, repo: str, branch: str, project: str = "",
         context={
             "issue": number,
             "issue_title": title,
+            # #239 review: persist the body we ALREADY fetched at discovery.
+            # Without it the dispatcher had no source for the acceptance
+            # criteria and the Context Pack silently shipped without them.
+            # Bounded so one enormous issue cannot bloat every task row.
+            "issue_body": (issue.get("body") or "")[:ISSUE_BODY_MAX_CHARS],
             "issue_url": issue.get("url") or f"https://github.com/{repo}/issues/{number}",
             "repo": repo,
             "labels": list(issue.get("labels") or []),
