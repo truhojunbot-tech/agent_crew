@@ -1,0 +1,28 @@
+{
+  "current": {
+    "n": 14,
+    "n_with_required_artifacts": 1,
+    "required_recall": 0.0,
+    "ac_present_rate": 0.286,
+    "mean_tokens": 462.4,
+    "irrelevant_ratio": 0.0,
+    "duplicate_ratio": 0.0,
+    "stale_conflict_rate": 0.0,
+    "p50_ms": 0.0,
+    "p95_ms": 0.0
+  },
+  "lexical": {
+    "n": 14,
+    "n_with_required_artifacts": 1,
+    "required_recall": 1.0,
+    "ac_present_rate": 0.286,
+    "mean_tokens": 1790.9,
+    "irrelevant_ratio": 0.761,
+    "duplicate_ratio": 0.0,
+    "stale_conflict_rate": 0.0,
+    "p50_ms": 37.5,
+    "p95_ms": 68.7
+  },
+  "_note": "semantic/hybrid not implemented \u2014 the provider contract admits it without a dispatcher change, but no embedding backend ships, so no semantic row is reported rather than a fabricated one",
+  "_sample": "14 issues from truhojunbot-tech/agent_crew"
+}
