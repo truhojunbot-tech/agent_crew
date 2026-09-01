@@ -338,6 +338,119 @@ def _dispatch_timeout_for_role(role: str) -> float:
     return float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", default))
 
 
+#: Cap on the agy/Antigravity conversation the tester resumes with
+#: `--continue` (#236). 0 disables.
+#:
+#: ⛔`_cap_gemini_session_size` below guards `~/.gemini/tmp/<proj>/chats`,
+#:   which is the **gemini-cli** store. The tester runs `agy`, which keeps
+#:   conversations in `~/.gemini/antigravity-cli/conversations/<id>.db`, so
+#:   that guard never covered this path. #232 measured the consequence:
+#:   alpha_engine's resumed conversation reached ~30k steps / 137 MB, every
+#:   dispatch re-sent it, quota hit 429, and agy surfaced only the
+#:   downstream `subscriber fell behind updates` mask.
+AGY_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_AGY_CONTEXT_MAX_MB", "64"))
+
+
+def _agy_home(home=None):
+    import pathlib as _p
+    return _p.Path(home) if home is not None else _p.Path.home() / ".gemini"
+
+
+def agy_conversation_size(cwd: str, *, home=None) -> tuple:
+    """``(bytes, conversation_id)`` for the agy conversation bound to ``cwd``.
+
+    agy keeps a plain ``{cwd: conversation_id}`` map in
+    ``antigravity-cli/cache/last_conversations.json``; that is the join key
+    between a worktree and the conversation `--continue` would resume.
+
+    Sums the ``.db`` plus its ``-wal``/``-shm`` siblings — a conversation
+    being actively written holds real bytes in the WAL, and ignoring it
+    under-reports exactly the case we care about. ``(0, "")`` when anything
+    is missing or unreadable; this must never break dispatch.
+    """
+    import json as _json
+    try:
+        cache = _agy_home(home) / "antigravity-cli" / "cache" / "last_conversations.json"
+        if not cache.exists():
+            return (0, "")
+        conv = (_json.loads(cache.read_text()) or {}).get(cwd) or ""
+        if not conv:
+            return (0, "")
+        d = _agy_home(home) / "antigravity-cli" / "conversations"
+        total = 0
+        for suffix in ("", "-wal", "-shm"):
+            f = d / f"{conv}.db{suffix}"
+            if f.exists():
+                total += f.stat().st_size
+        return (total, conv)
+    except Exception:  # noqa: BLE001 — sizing must never break a dispatch
+        return (0, "")
+
+
+def agy_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
+    """Is the conversation `--continue` would resume past the cap (#236)?
+
+    Returns ``(exceeded, info)``. ⛔Fail-soft in the *resume* direction: if
+    the size cannot be read we report False. Wrongly forcing a reset throws
+    away a healthy conversation; wrongly resuming is merely the status quo
+    that this cap exists to bound.
+    """
+    cap = AGY_CONTEXT_MAX_MB if max_mb is None else float(max_mb)
+    info = {"bytes": 0, "conversation_id": "", "cap_mb": cap}
+    if cap <= 0:
+        return (False, info)
+    try:
+        size, conv = agy_conversation_size(cwd, home=home)
+    except Exception:  # noqa: BLE001
+        return (False, info)
+    info["bytes"], info["conversation_id"] = size, conv
+    return (size > cap * 1024 * 1024, info)
+
+
+#: agy surfaces only the downstream symptom; the 429 stays in its own log.
+_AGY_QUOTA_RE = re.compile(r"RESOURCE_EXHAUSTED|Individual quota reached", re.I)
+_AGY_LAG_RE = re.compile(r"subscriber fell behind updates", re.I)
+
+
+def agy_quota_correlated(since: float, until: float, *, home=None) -> bool:
+    """Did a 429 precede a subscriber-lag kill inside this task's window?
+
+    #232 measured that where both signals appear, the quota error comes
+    first in 1,412 of 1,442 cases (98%) — the lag is the mask, not the
+    cause. agent_crew never sees the 429 because it lives only in agy's own
+    ``antigravity-cli/log/cli-*.log``.
+
+    ⚠️Deliberately conservative on three axes, because a false "quota"
+      verdict would silently strip a genuinely retriable failure of its
+      retries:
+      - only logs modified inside ``[since, until]`` are considered, so
+        another task's quota failure is never attributed to this one;
+      - the 429 must appear *before* the lag line in the same file;
+      - anything unreadable returns False, preserving today's behaviour.
+    """
+    try:
+        d = _agy_home(home) / "antigravity-cli" / "log"
+        if not d.is_dir():
+            return False
+        for f in d.glob("cli-*.log"):
+            try:
+                mtime = f.stat().st_mtime
+                if not (since <= mtime <= until):
+                    continue
+                text = f.read_text(errors="replace")
+            except Exception:  # noqa: BLE001
+                continue
+            lag = _AGY_LAG_RE.search(text)
+            if not lag:
+                continue
+            quota = _AGY_QUOTA_RE.search(text)
+            if quota and quota.start() < lag.start():
+                return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _cap_gemini_session_size(cwd: str, max_mb: int = 50) -> None:
     """Archive gemini-cli session files larger than ``max_mb`` for ``cwd``.
 
@@ -1561,6 +1674,25 @@ def create_app(
         # worktree) triple is automatically "fresh" and every later one
         # "resume"s it.
         _force_context_reset = bool(_ctx.get("context_reset")) if isinstance(_ctx, dict) else False
+        # #236: an agy conversation resumed by `--continue` grows without
+        # bound; alpha_engine's reached ~30k steps / 137 MB and every
+        # dispatch re-sent it until quota 429'd. Trip a context reset at the
+        # cap so the next dispatch starts a fresh provider conversation.
+        # ⛔Nothing in agy's store is deleted or mutated — the oversized
+        #   conversation is simply not resumed, so an in-flight context is
+        #   never disturbed and the decision is reversible.
+        _agy_cap_info = {}
+        if agent == "gemini":
+            _agy_over, _agy_cap_info = agy_context_exceeds_cap(wt)
+            if _agy_over:
+                _force_context_reset = True
+                logger.warning(
+                    "dispatcher: agy context %s for %s is %.1f MB (cap %.0f MB) — "
+                    "forcing a fresh provider conversation (#236)",
+                    _agy_cap_info.get("conversation_id", "?"), wt,
+                    _agy_cap_info.get("bytes", 0) / 1048576.0,
+                    _agy_cap_info.get("cap_mb", 0),
+                )
         _ctx_info = q().get_or_create_context(
             project=_project, agent=agent, worktree_path=wt, role=role,
             task_id=task.task_id, force_reset=_force_context_reset,
@@ -1593,6 +1725,20 @@ def create_app(
             # agent means retry/fallback routing redirected this dispatch —
             # surface it as its own event so that lineage doesn't have to
             # be re-derived from task.context on every read.
+            # #236: the generic context_reset event does not say WHY. Emit
+            # the measured cause so a reset forced by the size cap is
+            # distinguishable from an operator-requested one.
+            if _agy_cap_info.get("bytes", 0) and _force_context_reset:
+                record_context_event(
+                    _context_events_path, "provider_context_capped",
+                    task_id=task.task_id, project=_project, role=role, agent=agent,
+                    context_id=_ctx_info["context_id"],
+                    context_generation=_ctx_info["context_generation"],
+                    provider="agy",
+                    conversation_id=_agy_cap_info.get("conversation_id", ""),
+                    bytes=_agy_cap_info.get("bytes", 0),
+                    cap_mb=_agy_cap_info.get("cap_mb", 0),
+                )
             _role_default_agent = _DISPATCH_ROLE_TO_AGENT.get(role)
             if _role_default_agent and agent != _role_default_agent:
                 record_context_event(
@@ -1704,11 +1850,15 @@ def create_app(
             # AGENT_CREW_GEMINI_MODEL. (_known_model resolved earlier,
             # before dispatch, so the attribution record and this cmd can't
             # drift apart — #202.)
-            cmd = [
-                "agy", "-p", message,
-                "--continue", "--dangerously-skip-permissions",
-                "--model", _known_model,
-            ]
+            # #236: resume only when Agent Crew's own context policy says
+            # "resume". Previously `--continue` was unconditional, so a
+            # freshly-minted context (generation 1, or an explicit
+            # context_reset) still resumed the provider's old conversation —
+            # identity and provider state could disagree. Now they cannot.
+            cmd = ["agy", "-p", message]
+            if _ctx_info["context_policy"] == "resume":
+                cmd.append("--continue")
+            cmd += ["--dangerously-skip-permissions", "--model", _known_model]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
             cmd = [
                 "codex", "exec", "resume", "--last",
@@ -1736,6 +1886,8 @@ def create_app(
             # Captured after the marker so the transient-error scan below
             # never reads into a prior task's leftover output (#200).
             _task_log_start_offset = os.path.getsize(log_path)
+            # #236: window for correlating agy's own log with this task.
+            _task_started_wall = time.time()
             with open(log_path, "ab") as log_f:
                 # Override TELEGRAM_STATE_DIR to worktree's .telegram so the
                 # subagent doesn't inherit the crew server's state dir and steal
@@ -1776,6 +1928,27 @@ def create_app(
             _transient = _detect_transient_error_in_log(
                 log_path, since_offset=_task_log_start_offset
             )
+            # #236: `subscriber fell behind updates` is usually a MASK. agy
+            # hits 429, its internal retry stalls the agent_state pubsub
+            # subscriber, agy kills the subscriber, and only that downstream
+            # line reaches us. #232 measured 0/414 recoveries for this tag —
+            # retrying it 3 more times cost 1,375 wasted attempts and ~225s
+            # median added time-to-fail, while `agy_quota_exhausted` is
+            # already correctly classified non-retriable.
+            #
+            # ⚠️Only reclassify when a 429 is actually correlated in agy's own
+            #   log inside this task's window. #232 could not attribute ~25%
+            #   of lag events, and those keep the retriable tag — we do not
+            #   get to claim every lag event is a quota event.
+            if _transient == "agy_subscriber_lag" and agy_quota_correlated(
+                _task_started_wall, time.time() + 1.0
+            ):
+                logger.warning(
+                    "dispatcher: task=%s reported agy_subscriber_lag but agy's "
+                    "own log shows a preceding 429 — reclassifying as "
+                    "agy_quota_exhausted (non-retriable) (#236)", task.task_id,
+                )
+                _transient = "agy_quota_exhausted"
             # #202: best-effort provider_session_id capture + compaction
             # detection, scoped to just this task's own output (same
             # since_offset technique as #200, so a previous task's leftover
