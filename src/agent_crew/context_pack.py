@@ -56,6 +56,10 @@ TYPE_CODE = "code"
 TYPE_TEST = "test"
 TYPE_REVIEW = "pr_review"
 TYPE_EPISODE = "episode"
+#: #240 derived governance. Ranked below every authoritative type on
+#: purpose: a procedure may require a check, never overrule current code
+#: or the acceptance criteria.
+TYPE_PROCEDURE = "procedure"
 TYPE_EVIDENCE = "evidence"
 
 MANDATORY_TYPES = frozenset({TYPE_ISSUE, TYPE_AC})
@@ -82,7 +86,7 @@ DEFAULT_BUDGET = {"max_tokens": 4000, "max_items": 16, "type_caps": {}}
 _TYPE_RANK = {
     TYPE_ISSUE: 0, TYPE_AC: 1, TYPE_ADR: 2, TYPE_SPEC: 3,
     TYPE_TEST: 4, TYPE_CODE: 5, TYPE_REVIEW: 6,
-    TYPE_EVIDENCE: 7, TYPE_EPISODE: 8,
+    TYPE_EVIDENCE: 7, TYPE_PROCEDURE: 8, TYPE_EPISODE: 9,
 }
 
 
@@ -170,6 +174,7 @@ class ContextPack:
         out: dict = {}
         for a in self.items:
             key = "mandatory" if a.mandatory else (
+                "procedural" if a.artifact_type == TYPE_PROCEDURE else
                 "episodic" if a.artifact_type == TYPE_EPISODE else "authoritative")
             out[key] = out.get(key, 0) + a.est_tokens
         return out
@@ -807,9 +812,135 @@ def resolve_issue_body(ctx: dict, *, issue_body_fn=None) -> tuple:
     return "", "no_issue"
 
 
+def _procedure_triggers(episodes: list, issue: Optional[int]) -> tuple:
+    """`(outcome_signature, findings)` from prior work on this issue.
+
+    These are exactly the signals #240's procedures trigger on: a recurring
+    terminal outcome, and review findings that keep coming back. Taking them
+    from persisted episodes means a procedure fires on evidence rather than on
+    a guess about what this task might do.
+    """
+    sig, findings = "", []
+    for ep in episodes or []:
+        if issue and ep.get("issue") != issue:
+            continue
+        if not sig and (ep.get("outcome") or "").startswith("failed"):
+            sig = ep["outcome"]
+        findings.extend(str(f) for f in (ep.get("findings") or []))
+    return sig, findings
+
+
+#: A path-looking token inside issue text: at least one directory segment and
+#: a short extension. Deliberately strict — a loose pattern would manufacture
+#: scope out of prose, and a wrong module is worse than no module.
+_PATH_TOKEN_RE = re.compile(r"(?<![\w/.])((?:[\w.-]+/)+[\w-]+\.[A-Za-z0-9]{1,5})\b")
+
+#: Bound on how much scope one task may claim, so a pathological issue body
+#: cannot turn into thousands of comparisons.
+MAX_RESOLVED_SCOPE = 40
+
+
+def resolve_task_scope(ctx: dict) -> tuple:
+    """``(paths, modules)`` this task is about, best-effort and bounded.
+
+    Three sources, most authoritative first:
+
+      1. `ctx["modules"]` / `ctx["paths"]` / `ctx["files"]` — whatever the
+         producer knew explicitly;
+      2. file paths named in the issue title and body, which for an ordinary
+         bug report is the only pre-work signal of where the change goes;
+      3. nothing — and that is a real, common answer.
+
+    ⛔Case 3 is the load-bearing one. It resolves to an empty list, and an empty
+      list makes `Scope.matches` REJECT every module- or path-scoped rule. An
+      unresolvable task must not be treated as matching everything: that is
+      precisely the defect this function was added to close (review of PR #242,
+      round 2), where a module-scoped rule reached every task in the repo.
+    """
+    from agent_crew.procedural_memory import normalise_module
+
+    ctx = ctx or {}
+
+    def _tokens(value) -> list:
+        if isinstance(value, str):
+            return [t.strip() for t in value.replace(",", " ").split() if t.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(t).strip() for t in value if str(t).strip()]
+        return []
+
+    paths = _tokens(ctx.get("paths")) + _tokens(ctx.get("files"))
+    text = " ".join(str(ctx.get(k) or "") for k in ("issue_title", "issue_body"))
+    paths.extend(m.group(1) for m in _PATH_TOKEN_RE.finditer(text))
+
+    modules = [normalise_module(m) for m in _tokens(ctx.get("modules"))]
+    modules.extend(normalise_module(p) for p in paths)
+
+    return (_dedupe(paths)[:MAX_RESOLVED_SCOPE],
+            _dedupe(m for m in modules if m)[:MAX_RESOLVED_SCOPE])
+
+
+def _dedupe(items) -> list:
+    seen, out = set(), []
+    for item in items:
+        if item not in seen:
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def load_matching_procedures(procedures_path: str, *, repo: str, task_type: str,
+                             role: str, episodes: Optional[list] = None,
+                             issue: Optional[int] = None,
+                             paths: Optional[list] = None,
+                             modules: Optional[list] = None) -> list:
+    """Active, in-scope, triggered procedures for this task (#240 §4).
+
+    ⛔Imported lazily and wrapped: procedural memory is derived governance and
+      must never be able to break a dispatch. A failure here yields no
+      procedures, not an exception.
+    """
+    if not procedures_path or not os.path.exists(procedures_path):
+        return []
+    try:
+        from agent_crew import procedural_memory as _pm
+
+        sig, findings = _procedure_triggers(episodes or [], issue)
+        return _pm.match_procedures(
+            _pm.load_procedures(procedures_path),
+            repo=repo, task_type=task_type, role=role,
+            paths=paths or [""], modules=modules or [],
+            outcome_signature=sig, findings=findings)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context_pack: procedure matching failed: %s", exc)
+        return []
+
+
+def _record_shadow(shadow_path: str, matched: list, task_id: str) -> None:
+    """Append one shadow record per matched procedure. Never raises.
+
+    ⛔Recorded, never applied. Hard enforcement is only justifiable once these
+      show an acceptable false-positive rate (#240 §5).
+    """
+    try:
+        from agent_crew import procedural_memory as _pm
+
+        os.makedirs(os.path.dirname(shadow_path) or ".", exist_ok=True)
+        with open(shadow_path, "a") as f:
+            for proc, reason in matched:
+                rec = _pm.shadow_record(
+                    proc, task_id=task_id, triggered=True,
+                    would=proc.required_action or proc.prohibited_action
+                    or proc.rule)
+                rec["reason"] = reason
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("context_pack: shadow record failed: %s", exc)
+
+
 def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
                         role: str, repo_path: str = "", branch: str = "",
-                        episodes_path: str = "", issue_body_fn=None,
+                        episodes_path: str = "", procedures_path: str = "",
+                        shadow_path: str = "", issue_body_fn=None,
                         budget: Optional[dict] = None,
                         extra_providers: Optional[list] = None,
                         mode: str = MODE_LEXICAL,
@@ -832,8 +963,25 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         retry_of=str(ctx.get("retry_of") or ""),
     )
     providers = [IssueProvider(), LexicalRepoProvider()]
+    episodes = load_episodes(episodes_path) if episodes_path else []
     if episodes_path:
-        providers.append(EpisodicProvider(load_episodes(episodes_path)))
+        providers.append(EpisodicProvider(episodes))
+    # #240 (review-2016dcf3): actually load persisted procedures. Without this
+    # the feature existed only in tests that instantiated the provider by
+    # hand — no active procedure could reach a real dispatch and no shadow
+    # telemetry ever accrued.
+    # #240 (review-1d2e7467): resolve what this task is ABOUT before matching.
+    # `modules` is a declared scope dimension; leaving it unresolved meant a
+    # module-scoped rule was in scope for every task in the repo. Resolving
+    # `paths` from the same signals fixes the mirror-image defect on that
+    # dimension, which was dead rather than over-broad.
+    _scope_paths, _scope_modules = resolve_task_scope(ctx)
+    matched = load_matching_procedures(
+        procedures_path, repo=ctx.get("repo", "") or "", task_type=task_type,
+        role=role, episodes=episodes, issue=issue,
+        paths=_scope_paths, modules=_scope_modules)
+    if matched:
+        providers.append(ProcedureProvider(matched))
     providers.extend(extra_providers or [])
     try:
         pack = plan_pack(query, providers,
@@ -869,6 +1017,8 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
             # issues have none — so it is stated, not flagged as degraded.
             logger.info("context_pack: issue #%s has no acceptance-criteria "
                         "section", issue)
+        if matched and shadow_path:
+            _record_shadow(shadow_path, matched, task_id)
         return pack
     except Exception as exc:  # noqa: BLE001
         pack = ContextPack(task_id=task_id, role=role, mode=mode,
@@ -877,3 +1027,44 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         pack.degraded_reason = f"pack build failed: {exc}"
         logger.warning("context_pack: build failed for %s: %s", task_id, exc)
         return pack
+
+
+class ProcedureProvider(RetrievalProvider):
+    """Active procedures from #240, matched to this task.
+
+    Two separate mechanisms keep a rule from overruling the truth, and they
+    are worth not confusing:
+      - the issue and its AC are **mandatory**, and mandatory items sort ahead
+        of everything else regardless of type rank;
+      - `_TYPE_RANK` is what puts procedures below the *non-mandatory*
+        authoritative types (ADR, spec, code, test).
+    Together they deliver #240's non-goal: derived governance never outranks
+    current code or the acceptance criteria. Each item states why it matched;
+    an inclusion without a stated reason is not allowed in.
+    """
+
+    name = "procedural"
+    version = 1
+
+    def __init__(self, matched: Optional[list] = None):
+        # (procedure, reason) pairs, already scoped and triggered by
+        # procedural_memory.match_procedures().
+        self._matched = matched or []
+
+    def retrieve(self, query: RetrievalQuery) -> list:
+        out = []
+        for proc, reason in self._matched:
+            hard = proc.enforcement == "hard"
+            out.append(Artifact(
+                artifact_id=f"procedure:{proc.key}",
+                uri=f"procedure://{proc.procedure_id}/v{proc.version}",
+                artifact_type=TYPE_PROCEDURE,
+                revision=str(proc.version),
+                score=1.0 + (1.0 if hard else 0.0),
+                score_components={"matched": 1.0, "hard": 1.0 if hard else 0.0},
+                provenance=f"procedure {proc.key}: {reason}",
+                freshness=FRESH,
+                subject_key=f"procedure:{proc.procedure_id}",
+                excerpt=proc.render(),
+            ))
+        return out
