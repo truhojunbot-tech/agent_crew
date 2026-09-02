@@ -1059,7 +1059,8 @@ def _fetch_provenance(port: int, expect: str, timeout: float = 5.0) -> dict:
                     "_reason": "server is up but has no /provenance — it predates #248"}
         return {"_unavailable": "http_error", "_reason": f"HTTP {e.code}"}
     except Exception as e:  # noqa: BLE001
-        return {"_unavailable": "unreachable", "_reason": str(e)[:80]}
+        return {"_unavailable": "unreachable",
+                "_reason": f"unreachable on port {port}: {str(e)[:70]}"}
 
 
 @crew.command()
@@ -1067,7 +1068,9 @@ def _fetch_provenance(port: int, expect: str, timeout: float = 5.0) -> dict:
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--expect", default="", help="Ref/SHA the live build must contain, e.g. a merge commit or 'origin/main'")
 @click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
-def provenance(project: str, base: str, expect: str, as_json: bool):
+@click.option("--allow-unreachable", is_flag=True,
+              help="Do not fail the gate for servers that are down (they are still listed)")
+def provenance(project: str, base: str, expect: str, as_json: bool, allow_unreachable: bool):
     """Report the build each live dispatcher is actually running (#248).
 
     \b
@@ -1075,8 +1078,18 @@ def provenance(project: str, base: str, expect: str, as_json: bool):
       crew provenance --expect 98d869d     # ...and grade it against a ref
       crew provenance alpha_engine --json
 
-    Exits non-zero when any server is STALE or UNKNOWN, so it works as a hard
-    gate in front of a production measurement or a deploy check.
+    Exits non-zero when any target cannot be confirmed current — STALE, UNKNOWN
+    or unreachable alike — so it works as a hard gate in front of a production
+    measurement or a deploy check.
+
+    \b
+    ⛔A server that cannot be ASKED fails the gate. "I could not reach it" is
+      not evidence that it is running the right build; treating it as a pass
+      would let a validation claim a build boundary for a target that might be
+      on any build, or absent. This mirrors `provenance.compare`, where
+      `unknown` is never folded into `current`. Use --allow-unreachable when a
+      down project is expected (e.g. listing a host where old projects linger);
+      it is deliberately explicit rather than the default.
 
     #247 lost a week of tester economics to a build gap that was invisible
     without SSHing to the host and reading `git HEAD`. This asks the running
@@ -1092,23 +1105,29 @@ def provenance(project: str, base: str, expect: str, as_json: bool):
     if project and not targets[0][1]:
         raise click.ClickException(f"project {project!r} has no state.json/port — run setup first.")
 
-    rows, bad = [], 0
+    rows, failures = [], []
     for name, port in targets:
         snap = _fetch_provenance(int(port), expect)
         if snap.get("_unavailable"):
             kind = snap["_unavailable"]
-            # "up but too old to answer" is a staleness verdict; "down" is not.
-            if kind == "pre-provenance":
-                bad += 1
+            # Both are gate failures, for different reasons, and the output
+            # keeps them apart: "up but too old to answer" is a staleness
+            # VERDICT, while "down" is the absence of one. Neither is evidence
+            # that the target is running the expected build (review of PR #249).
+            if kind != "unreachable" or not allow_unreachable:
+                failures.append(f"{name}: {snap.get('_reason', kind)}")
             rows.append({"project": name, "port": port, "reachable": False,
                          "status": kind, "reason": snap.get("_reason", "")})
             continue
         cmp = snap.get("expected") or {}
         status = cmp.get("status", "" if not expect else "unknown")
+        drifted = bool(snap.get("source_changed_since_start")
+                       or snap.get("checkout_moved_since_start"))
         if expect and status != "current":
-            bad += 1
-        if snap.get("source_changed_since_start") or snap.get("checkout_moved_since_start"):
-            bad += 1 if not (expect and status != "current") else 0
+            failures.append(f"{name}: {cmp.get('reason') or status}")
+        elif drifted:
+            failures.append(f"{name}: the checkout moved or the loaded source "
+                            f"changed since this process started")
         rows.append({
             "project": name, "port": port, "reachable": True,
             "commit": snap.get("commit", ""), "commit_short": snap.get("commit_short", ""),
@@ -1149,7 +1168,12 @@ def provenance(project: str, base: str, expect: str, as_json: bool):
             if r["source_changed_since_start"]:
                 click.echo(f"{'':16} ↳ the .py files this process loaded are no longer the "
                            f"files on disk — restart it to adopt the checkout")
-    if bad:
+    if failures:
+        if not as_json:
+            click.echo("")
+            click.echo(f"NOT CONFIRMED CURRENT ({len(failures)}):")
+            for f in failures:
+                click.echo(f"  - {f}")
         raise SystemExit(1)
 
 

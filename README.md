@@ -207,7 +207,14 @@ behaviour it never produced. `build_provenance` is also written to
 `context_events.jsonl` at startup, so a production cohort can be cut on the
 process boundary rather than on a merge time.
 
-`crew provenance` is read-only: it never pulls, restarts, or repairs anything.
+`crew provenance` exits non-zero when any target cannot be confirmed current —
+stale, ungradeable, **or unreachable**. A server that cannot be asked is no
+evidence that it runs the expected build, so a provenance-gated validation must
+not go green while one target could be on any build or absent. Pass
+`--allow-unreachable` when a down project is expected; it mutes the gate for
+that case only, never for a server that answered and turned out to be stale.
+
+It is read-only: it never pulls, restarts, or repairs anything.
 
 ## Architecture
 

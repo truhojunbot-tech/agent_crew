@@ -356,24 +356,144 @@ def test_a_server_too_old_to_answer_is_stale_not_unreachable(monkeypatch, tmp_pa
     assert res.exit_code == 1, "a stale runtime must fail the gate"
 
 
-def test_a_down_server_is_reported_but_is_not_called_stale(monkeypatch, tmp_path):
-    """⛔"I could not ask" is not "it is old" — the same distinction `compare`
-    keeps between unknown and stale."""
-    from click.testing import CliRunner
-
-    from agent_crew import cli as crew_cli
-
+def _down_project(tmp_path, monkeypatch, port=8199):
     (tmp_path / "p").mkdir()
-    (tmp_path / "p" / "state.json").write_text(json.dumps({"port": 8199}))
+    (tmp_path / "p" / "state.json").write_text(json.dumps({"port": port}))
 
     def refused(*a, **k):
         raise ConnectionRefusedError("nope")
 
     monkeypatch.setattr("urllib.request.urlopen", refused)
-    res = CliRunner().invoke(crew_cli.crew, ["provenance", "--base", str(tmp_path)])
+
+
+def test_a_down_server_is_reported_distinctly_but_still_fails_the_gate(
+    monkeypatch, tmp_path,
+):
+    """★"I could not ask" is not "it is old" — but it is also not a pass.
+
+    The label stays distinct from STALE, because the two are different facts
+    and an operator acts on them differently. The EXIT CODE does not: a server
+    that cannot be asked is no evidence that it runs the expected build, so a
+    validation gated on provenance must not go green while one target could be
+    on any build or absent entirely (review of PR #249). Same principle as
+    `compare`, where `unknown` is never folded into `current`.
+    """
+    from click.testing import CliRunner
+
+    from agent_crew import cli as crew_cli
+
+    _down_project(tmp_path, monkeypatch)
+    res = CliRunner().invoke(crew_cli.crew,
+                             ["provenance", "--base", str(tmp_path), "--expect", "98d869d"])
 
     assert "UNREACHABLE" in res.output
-    assert "STALE" not in res.output
+    assert "STALE" not in res.output, "a down server must not be mislabelled stale"
+    assert "NOT CONFIRMED CURRENT" in res.output
+    assert res.exit_code == 1
+
+
+def test_a_down_server_fails_the_gate_even_without_expect(monkeypatch, tmp_path):
+    """The listing form makes the same claim about what it verified."""
+    from click.testing import CliRunner
+
+    from agent_crew import cli as crew_cli
+
+    _down_project(tmp_path, monkeypatch)
+    res = CliRunner().invoke(crew_cli.crew, ["provenance", "--base", str(tmp_path)])
+
+    assert res.exit_code == 1
+
+
+def test_allow_unreachable_is_an_explicit_opt_out(monkeypatch, tmp_path):
+    """⛔The escape hatch for hosts where old projects linger is a FLAG, not the
+    default. Silently tolerating an unaskable server is the failure being
+    fixed; asking for that tolerance out loud is fine."""
+    from click.testing import CliRunner
+
+    from agent_crew import cli as crew_cli
+
+    _down_project(tmp_path, monkeypatch)
+    res = CliRunner().invoke(crew_cli.crew,
+                             ["provenance", "--base", str(tmp_path),
+                              "--expect", "98d869d", "--allow-unreachable"])
+
+    assert "UNREACHABLE" in res.output, "still listed — the flag mutes the gate, not the report"
+    assert res.exit_code == 0
+
+
+def test_allow_unreachable_does_not_excuse_a_stale_server(monkeypatch, tmp_path):
+    """⛔The opt-out is scoped to "could not ask", never to "asked and it is old"."""
+    import urllib.error
+
+    from click.testing import CliRunner
+
+    from agent_crew import cli as crew_cli
+
+    (tmp_path / "p").mkdir()
+    (tmp_path / "p" / "state.json").write_text(json.dumps({"port": 8101}))
+
+    def not_found(*a, **k):
+        raise urllib.error.HTTPError("u", 404, "Not Found", {}, None)
+
+    monkeypatch.setattr("urllib.request.urlopen", not_found)
+    res = CliRunner().invoke(crew_cli.crew,
+                             ["provenance", "--base", str(tmp_path), "--allow-unreachable"])
+
+    assert "STALE" in res.output
+    assert res.exit_code == 1
+
+
+def test_a_confirmed_current_server_passes_the_gate(monkeypatch, tmp_path):
+    """The gate has to be passable, or it teaches people to ignore it."""
+    from click.testing import CliRunner
+
+    from agent_crew import cli as crew_cli
+
+    (tmp_path / "p").mkdir()
+    (tmp_path / "p" / "state.json").write_text(json.dumps({"port": 8101}))
+
+    body = {"commit": "aaa", "commit_short": "aaa", "ref": "main", "dirty": False,
+            "uptime_s": 10, "checkout_moved_since_start": False,
+            "source_changed_since_start": False,
+            "expected": {"status": "current", "reason": "ok"}}
+
+    class _R:
+        def read(self): return json.dumps(body).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _R())
+    res = CliRunner().invoke(crew_cli.crew,
+                             ["provenance", "--base", str(tmp_path), "--expect", "aaa"])
+
+    assert res.exit_code == 0
+    assert "NOT CONFIRMED CURRENT" not in res.output
+
+
+def test_drift_alone_fails_the_gate(monkeypatch, tmp_path):
+    """A server on the right SHA whose loaded files changed under it is not
+    confirmed current either."""
+    from click.testing import CliRunner
+
+    from agent_crew import cli as crew_cli
+
+    (tmp_path / "p").mkdir()
+    (tmp_path / "p" / "state.json").write_text(json.dumps({"port": 8101}))
+
+    body = {"commit": "aaa", "commit_short": "aaa", "ref": "main", "dirty": False,
+            "uptime_s": 10, "checkout_moved_since_start": True,
+            "source_changed_since_start": True}
+
+    class _R:
+        def read(self): return json.dumps(body).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _R())
+    res = CliRunner().invoke(crew_cli.crew, ["provenance", "--base", str(tmp_path)])
+
+    assert res.exit_code == 1
+    assert "SOURCE-CHANGED" in res.output
 
 
 def test_the_gate_passes_only_when_every_server_is_current(monkeypatch, tmp_path):
