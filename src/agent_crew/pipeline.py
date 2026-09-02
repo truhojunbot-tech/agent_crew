@@ -53,6 +53,8 @@ MAX_FINDING_CHARS = 1000
 #: Marker every automated-exhaustion comment carries, so the cascade can
 #: recognise its own prior announcement instead of repeating it (#250).
 FIX_EXHAUSTED_MARKER = "[agent_crew] Automated fix rounds exhausted"
+#: Announcement kind for the durable one-shot claim (see TaskQueue).
+FIX_EXHAUSTED_KIND = "fix_exhausted"
 
 
 def pr_is_actionable(pr_number, *, pr_state_fn=None) -> tuple:
@@ -300,7 +302,8 @@ def auto_enqueue_fix(
             _announce_fix_budget_exhausted(
                 pr_number=pr_number, review_task_id=review_task_id,
                 max_rounds=max_rounds, findings=review_result.findings or [],
-                comment_fn=comment_fn, already_announced_fn=already_announced_fn)
+                comment_fn=comment_fn, already_announced_fn=already_announced_fn,
+                queue=queue)
             return None
 
         findings_text = _findings_block(review_result.findings or [], review_task_id)
@@ -387,7 +390,8 @@ def auto_enqueue_fix(
 
 def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
                                    max_rounds: int, findings: list,
-                                   comment_fn=None, already_announced_fn=None) -> None:
+                                   comment_fn=None, already_announced_fn=None,
+                                   queue=None) -> None:
     """Say on the PR that automation has stopped. Best-effort, never raises.
 
     ⛔A silent stop is the worst outcome available here: the PR would simply go
@@ -403,20 +407,57 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
     """
     if not pr_number:
         return
-    if already_announced_fn is not None:
-        seen = already_announced_fn(int(pr_number), FIX_EXHAUSTED_MARKER)
-    else:
+    pr_number = int(pr_number)
+
+    # ⛔The claim comes FIRST, and it is a row, not a question. Asking GitHub
+    #   "is the notice already there?" and then posting is check-then-act: two
+    #   results completing together both read "no" and both post. Reproduced
+    #   before fixing — two notices for one PR. This is the same reasoning that
+    #   made the fix task id derived rather than checked in #244, applied to the
+    #   thing #250 added right next to it.
+    claimed = True
+    if queue is not None:
         try:
+            claimed = queue.claim_pr_announcement(
+                pr_number, FIX_EXHAUSTED_KIND, claimed_by=review_task_id)
+        except Exception as e:  # noqa: BLE001 — telemetry never breaks a cascade
+            logger.warning(f"auto_enqueue_fix: announcement claim failed: {e}")
+            claimed = True          # fall back to best-effort, never go silent
+    if not claimed:
+        logger.info(
+            f"auto_enqueue_fix: another result already owns the exhaustion notice "
+            f"for PR #{pr_number} — not repeating it for {review_task_id} (#250)"
+        )
+        return
+
+    # Second line of defence, and the only one that sees OTHER crews: the claim
+    # table is per-database, so a separate crew sharing this PR would not be in
+    # it. Best-effort by nature — `None` means "could not tell", and we post.
+    try:
+        if already_announced_fn is not None:
+            seen = already_announced_fn(pr_number, FIX_EXHAUSTED_MARKER)
+        else:
             from agent_crew.github import pr_has_comment_containing
 
-            seen = pr_has_comment_containing(int(pr_number), FIX_EXHAUSTED_MARKER)
-        except Exception:  # noqa: BLE001
-            seen = None
+            seen = pr_has_comment_containing(pr_number, FIX_EXHAUSTED_MARKER)
+    except Exception as e:  # noqa: BLE001
+        # ⛔A failing best-effort check must not swallow the escalation. It is
+        #   the same rule as `None`: when we cannot tell, we post.
+        logger.warning(f"auto_enqueue_fix: prior-notice check failed for PR "
+                       f"#{pr_number}: {e}")
+        seen = None
     if seen is True:
         logger.info(
             f"auto_enqueue_fix: PR #{pr_number} already carries an exhaustion notice "
             f"— not repeating it for {review_task_id} (#250)"
         )
+        # Keep the claim and mark it done: someone posted, so nobody should
+        # post again, and releasing here would re-open the race on the next result.
+        if queue is not None:
+            try:
+                queue.mark_pr_announcement_posted(pr_number, FIX_EXHAUSTED_KIND)
+            except Exception:  # noqa: BLE001
+                pass
         return
     body = (
         f"{FIX_EXHAUSTED_MARKER} "
@@ -431,13 +472,27 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
     )
     try:
         if comment_fn is not None:
-            comment_fn(int(pr_number), body)
-            return
-        from agent_crew.github import post_pr_comment
+            comment_fn(pr_number, body)
+        else:
+            from agent_crew.github import post_pr_comment
 
-        post_pr_comment(int(pr_number), body)
+            post_pr_comment(pr_number, body)
     except Exception as e:  # noqa: BLE001
+        # ⛔Give the claim back. A failed post that kept its claim would
+        #   suppress the escalation forever — the PR would go quiet, which is
+        #   the outcome this notice exists to prevent.
         logger.warning(f"auto_enqueue_fix: could not comment on PR #{pr_number}: {e}")
+        if queue is not None:
+            try:
+                queue.release_pr_announcement(pr_number, FIX_EXHAUSTED_KIND)
+            except Exception:  # noqa: BLE001
+                pass
+        return
+    if queue is not None:
+        try:
+            queue.mark_pr_announcement_posted(pr_number, FIX_EXHAUSTED_KIND)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def auto_enqueue_review(

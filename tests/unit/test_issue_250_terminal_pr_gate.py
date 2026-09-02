@@ -517,3 +517,153 @@ def test_an_unresolvable_pr_head_is_logged_as_an_error(monkeypatch, tmp_path, ca
     errors = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
     assert any("could not resolve PR #251" in m for m in errors)
     assert any("MAY NOT BE THE PR'S CODE" in m for m in errors)
+
+
+# ── 8. the exhaustion notice needs an atomic claim, not a check ───────
+#
+# The once-per-PR notice asked GitHub "is it already there?" and then posted.
+# That is check-then-act: two results completing together both read "no" and
+# both post. Reproduced before fixing — two notices for one PR — and the
+# original sequential test could not see it, because it mutated an in-memory
+# flag between calls (review of PR #251, round 2).
+#
+# The same reasoning made the fix task id derived rather than checked in #244.
+# The arbiter is a row with a PRIMARY KEY, so exactly one caller wins across
+# threads and processes sharing the database.
+
+
+def _exhausted_review(q, pr=PR):
+    return _review(q, context={"fix_round": 3}, pr_number=pr)
+
+
+def test_concurrent_exhausted_results_post_one_notice(tmp_db, monkeypatch):
+    """★The race. Four results finish together; the PR gets one notice."""
+    import threading
+
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
+    seed = TaskQueue(tmp_db)
+    ids = [_exhausted_review(seed) for _ in range(4)]
+
+    posted, lock, start = [], threading.Lock(), threading.Barrier(len(ids))
+    # ⛔The check has to happen for every caller that reaches it BEFORE any of
+    #   them posts — that is the interleaving, and a test that lets the first
+    #   caller post before the others look is the toothless shape the review
+    #   rejected. The timeout is what keeps this honest in both directions:
+    #   with the claim in place only one caller gets here and simply proceeds.
+    checked = threading.Barrier(len(ids))
+
+    def announced(pr, marker):
+        with lock:
+            seen = any(marker in b for b in posted)
+        try:
+            checked.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return seen
+
+    def comment(pr, body):
+        with lock:
+            posted.append(body)
+
+    def go(rid):
+        start.wait()
+        auto_enqueue_fix(TaskQueue(tmp_db), rid,      # own connection, as in prod
+                         pr_state_fn=_state("open"),
+                         already_announced_fn=announced, comment_fn=comment)
+
+    threads = [threading.Thread(target=go, args=(r,)) for r in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(posted) == 1, f"{len(posted)} notices published for one PR"
+
+
+def test_the_claim_is_durable_across_connections(tmp_db, monkeypatch):
+    """A restarted process must not re-announce: the claim is on disk, not in
+    memory, which is the other half of what the in-memory flag could not do."""
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
+    posted = []
+
+    auto_enqueue_fix(TaskQueue(tmp_db), _exhausted_review(TaskQueue(tmp_db)),
+                     pr_state_fn=_state("open"),
+                     already_announced_fn=lambda pr, m: False,
+                     comment_fn=lambda pr, body: posted.append(body))
+    # ...a fresh TaskQueue, as a restarted server would build:
+    auto_enqueue_fix(TaskQueue(tmp_db), _exhausted_review(TaskQueue(tmp_db)),
+                     pr_state_fn=_state("open"),
+                     already_announced_fn=lambda pr, m: False,
+                     comment_fn=lambda pr, body: posted.append(body))
+
+    assert len(posted) == 1
+
+
+def test_a_failed_post_gives_the_claim_back(tmp_db, monkeypatch):
+    """⛔A claim held after a failed post would suppress the escalation
+    permanently — the PR goes quiet, which is what the notice exists to
+    prevent. The retry must be able to win the claim again."""
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
+    q = TaskQueue(tmp_db)
+    posted = []
+
+    def boom(pr, body):
+        raise RuntimeError("gh is down")
+
+    auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
+                     already_announced_fn=lambda pr, m: False, comment_fn=boom)
+    assert q.pr_announcement_state(PR, "fix_exhausted") is None, "claim not released"
+
+    auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
+                     already_announced_fn=lambda pr, m: False,
+                     comment_fn=lambda pr, body: posted.append(body))
+    assert len(posted) == 1, "the retry could not reclaim the announcement"
+
+
+def test_a_posted_claim_is_never_released(tmp_db):
+    """Releasing a posted claim would re-open the very race it closed."""
+    q = TaskQueue(tmp_db)
+    assert q.claim_pr_announcement(PR, "fix_exhausted") is True
+    q.mark_pr_announcement_posted(PR, "fix_exhausted")
+
+    q.release_pr_announcement(PR, "fix_exhausted")
+
+    assert q.pr_announcement_state(PR, "fix_exhausted")["posted_at"] is not None
+    assert q.claim_pr_announcement(PR, "fix_exhausted") is False
+
+
+def test_a_claim_abandoned_mid_post_is_reclaimable(tmp_db):
+    """⛔A process killed between claiming and posting must not silence the
+    notice for good. An unposted claim ages out; a posted one never does."""
+    q = TaskQueue(tmp_db)
+    assert q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="dead-task") is True
+
+    assert q.claim_pr_announcement(PR, "fix_exhausted", stale_after=0.0) is True
+    assert q.pr_announcement_state(PR, "fix_exhausted")["claimed_by"] == ""
+
+    q.mark_pr_announcement_posted(PR, "fix_exhausted")
+    assert q.claim_pr_announcement(PR, "fix_exhausted", stale_after=0.0) is False
+
+
+def test_distinct_prs_do_not_share_a_claim(tmp_db):
+    q = TaskQueue(tmp_db)
+    assert q.claim_pr_announcement(251, "fix_exhausted") is True
+    assert q.claim_pr_announcement(252, "fix_exhausted") is True
+    assert q.claim_pr_announcement(251, "fix_exhausted") is False
+
+
+def test_a_broken_prior_notice_check_still_posts(tmp_db, monkeypatch):
+    """The best-effort GitHub scan may fail; the escalation may not be lost
+    because of it. Same rule as `None`: when we cannot tell, we post."""
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
+    q = TaskQueue(tmp_db)
+    posted = []
+
+    def boom(pr, marker):
+        raise RuntimeError("gh pr view exploded")
+
+    auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
+                     already_announced_fn=boom,
+                     comment_fn=lambda pr, body: posted.append(body))
+
+    assert len(posted) == 1

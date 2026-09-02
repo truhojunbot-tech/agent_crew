@@ -163,6 +163,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 )
 """
 
+_DDL_PR_ANNOUNCEMENTS = """
+CREATE TABLE IF NOT EXISTS pr_announcements (
+    pr_number  INTEGER NOT NULL,
+    kind       TEXT NOT NULL,
+    claimed_at REAL NOT NULL,
+    claimed_by TEXT NOT NULL DEFAULT '',
+    posted_at  REAL,
+    PRIMARY KEY (pr_number, kind)
+)
+"""
+
 # Performance indexes for common queries
 _DDL_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -182,6 +193,7 @@ class TaskQueue:
         conn.execute(_DDL_ATTRIBUTION)
         conn.execute(_DDL_CHECKPOINTS)
         conn.execute(_DDL_CONTEXT_STATE)
+        conn.execute(_DDL_PR_ANNOUNCEMENTS)
         # Migrate existing DBs: add project column if absent
         try:
             conn.execute(_DDL_MIGRATE_PROJECT)
@@ -240,6 +252,102 @@ class TaskQueue:
         finally:
             conn.close()
         return task.task_id
+
+    # ── one-shot PR announcements (#250 review) ───────────────────────
+    #
+    # ⛔The claim is a ROW, not a check. The exhaustion notice used to do
+    #   "does the PR already have this comment?" then post, and two results
+    #   completing together both read "no" and both posted — the same
+    #   check-then-act that could not be used for the fix task id in #244, for
+    #   the same reason. The PRIMARY KEY below is the arbiter: exactly one
+    #   caller wins the insert, across threads AND processes sharing this file.
+
+    #: An unposted claim older than this is assumed to belong to a process that
+    #: died between claiming and posting, and may be taken over. Without it a
+    #: crash in that window would suppress the escalation permanently.
+    PR_ANNOUNCEMENT_STALE_AFTER = 300.0
+
+    def claim_pr_announcement(self, pr_number: int, kind: str, *,
+                              claimed_by: str = "",
+                              stale_after: float = PR_ANNOUNCEMENT_STALE_AFTER) -> bool:
+        """Win the right to post `kind` on `pr_number` exactly once.
+
+        Returns True to exactly one caller. A claim that was won but never
+        marked posted, and is older than `stale_after`, is taken over — the
+        alternative is losing the escalation entirely when a process dies mid-post.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT claimed_at, posted_at FROM pr_announcements "
+                "WHERE pr_number=? AND kind=?", (int(pr_number), kind)).fetchone()
+            now = time.time()
+            if row is not None:
+                if row["posted_at"] is not None:
+                    conn.rollback()
+                    return False
+                if now - (row["claimed_at"] or 0) < stale_after:
+                    conn.rollback()
+                    return False
+                conn.execute(
+                    "UPDATE pr_announcements SET claimed_at=?, claimed_by=? "
+                    "WHERE pr_number=? AND kind=? AND posted_at IS NULL",
+                    (now, claimed_by, int(pr_number), kind))
+            else:
+                conn.execute(
+                    "INSERT INTO pr_announcements (pr_number, kind, claimed_at, claimed_by) "
+                    "VALUES (?, ?, ?, ?)", (int(pr_number), kind, now, claimed_by))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # A concurrent writer won the insert. That is the mechanism working.
+            return False
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def mark_pr_announcement_posted(self, pr_number: int, kind: str) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE pr_announcements SET posted_at=? WHERE pr_number=? AND kind=?",
+                (time.time(), int(pr_number), kind))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def release_pr_announcement(self, pr_number: int, kind: str) -> None:
+        """Give the claim back after a failed post, so a later result retries.
+
+        ⛔Only releases an UNPOSTED claim. Clearing a posted one would let the
+          same notice be published twice, which is the defect this table exists
+          to prevent.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "DELETE FROM pr_announcements WHERE pr_number=? AND kind=? "
+                "AND posted_at IS NULL", (int(pr_number), kind))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def pr_announcement_state(self, pr_number: int, kind: str):
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT pr_number, kind, claimed_at, claimed_by, posted_at "
+                "FROM pr_announcements WHERE pr_number=? AND kind=?",
+                (int(pr_number), kind)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
 
     def patch_context(self, task_id: str, extra: dict) -> None:
         """Merge ``extra`` into the existing context of a pending task."""
