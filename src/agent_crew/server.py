@@ -27,6 +27,7 @@ from agent_crew.context_identity import (
 from agent_crew.fallback import is_rate_limit_error
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
+    auto_enqueue_fix as _pipeline_auto_enqueue_fix,
     auto_enqueue_review as _pipeline_auto_enqueue_review,
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
@@ -2350,6 +2351,29 @@ def create_app(
         if test_id:
             _try_push_next("tester")
 
+    def _auto_enqueue_fix(review_task_id: str) -> None:
+        """HTTP-side wrapper: run the transport-agnostic cascade then push.
+        See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
+        # The cascade swallows its own errors, but the invariant it is
+        # protecting belongs here: a result submission must never 500 because
+        # a FOLLOW-UP failed. The agent has already done the work, and an
+        # agent that cannot POST its result is a task the dispatcher marks
+        # failed on timeout.
+        try:
+            fix_id = _pipeline_auto_enqueue_fix(
+                q(),
+                review_task_id,
+                pane_map=pane_map,
+                server_project=project,
+            )
+            if fix_id:
+                _try_push_next("implementer")
+        except Exception:
+            logger.exception(
+                f"_auto_enqueue_fix: cascade failed for {review_task_id} — "
+                f"the review result stands, the fix was not enqueued"
+            )
+
     def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> None:
         """Auto-retry a failed task if it hasn't exceeded max retries.
         This provides resilience against transient failures."""
@@ -2665,6 +2689,18 @@ def create_app(
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id)
+            # #244: review requested changes → auto-enqueue the fix. The
+            # rejection path used to just end here, so every extra review round
+            # needed an operator to hand-enqueue the fix with the findings
+            # pasted in. Bounded by AGENT_CREW_REVIEW_FIX_MAX_ROUNDS inside the
+            # cascade, so a reviewer that keeps rejecting cannot spin the loop.
+            elif task_type == "review" and _resolve_verdict(result) == "request_changes":
+                review_ctx = ctx if isinstance(ctx, dict) else {}
+                if review_ctx.get("coordinator_managed"):
+                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto fix enqueue")
+                else:
+                    logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
+                    _auto_enqueue_fix(task_id)
             # #171: test passed → merge the PR. pr_number carried via test context.
             if task_type == "test" and result.status == "completed":
                 if not _task_ctx.get("coordinator_managed"):

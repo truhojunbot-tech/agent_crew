@@ -158,6 +158,25 @@ releases it is marked `abandoned` rather than re-claimed forever. Inspect with
 
 Workers are unaffected: they remain push-driven and never poll GitHub.
 
+## Review round-trip
+
+A result submission cascades into the next stage, so a normal task walks the
+whole pipeline without an operator in the middle:
+
+```
+implement ✓ → review → approve      → test → merge
+                     → request_changes → fix (same branch) → review → ...
+```
+
+The rejection arm is bounded. `AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` (default 3)
+caps how many automated fix rounds one review lineage may spend; the counter
+rides the task context, so it survives a server restart and keeps counting
+across the new task ids each round mints. When the budget is spent the loop
+stops and says so in a PR comment rather than going quiet — a reviewer that
+keeps rejecting is a disagreement another round will not settle, and the next
+move is a human's. `crew run` sets `coordinator_managed`, which skips the
+cascade entirely because that loop drives its own transitions.
+
 ## Architecture
 
 - **Push model**: server delivers tasks to agent panes via `tmux send-keys`. Agents do not poll — they receive tasks and POST results back to `POST /tasks/{id}/result`.
@@ -188,6 +207,7 @@ observe (task↔context attribution, retry/fallback lineage, restart recovery).
 | `AGENT_CREW_PORT` | auto (8100+) | Server port |
 | `AGENT_CREW_STATE` | auto | State file path |
 | `AGENT_CREW_DELIVERY` | `tmux` | Task delivery mode (`tmux` or `mcp`) |
+| `AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` | `3` | Automated fix rounds per review lineage (`0` disables auto-fix) |
 | `AGENT_CREW_MAIN_BRANCH` | `main` | Default main branch name |
 | `GH_TOKEN` / `GITHUB_TOKEN` | — | GitHub API token (for triage/PR features) |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token (for notifications) |

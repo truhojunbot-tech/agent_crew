@@ -36,6 +36,7 @@ except ImportError:  # pragma: no cover — surfaced loud at import time
 
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
+    auto_enqueue_fix,
     auto_enqueue_review,
     auto_enqueue_test,
     auto_fallback_failed_task,
@@ -177,6 +178,10 @@ def build_mcp_server(
             auto_enqueue_review(queue, task_id, pr_number=result.pr_number)
         elif task_type == "review" and _resolve_verdict(result) == "approve":
             auto_enqueue_test(queue, task_id)
+        elif task_type == "review" and _resolve_verdict(result) == "request_changes":
+            # #244: the rejection path must cascade on this transport too,
+            # otherwise an MCP-only crew stalls on every request_changes.
+            auto_enqueue_fix(queue, task_id)
         if result.status == "failed":
             auto_fallback_failed_task(queue, task_id, result, task_type)
 

@@ -4,7 +4,8 @@ When a task gets a result submitted, three follow-up flows may fire:
 
   1. ``auto_enqueue_review``           impl ✓  → enqueue a review task
   2. ``auto_enqueue_test``             review approve → enqueue a test task
-  3. ``auto_fallback_failed_task``     rate-limit ✗ → reroute to next agent
+  3. ``auto_enqueue_fix``              review request_changes → enqueue a fix
+  4. ``auto_fallback_failed_task``     rate-limit ✗ → reroute to next agent
 
 Both transports — HTTP ``submit_result`` and MCP ``submit_result`` — must
 trigger these so the pipeline doesn't stall after the first stage when an
@@ -18,6 +19,8 @@ functions, run them first, and *then* call ``_try_push_next``.
 from __future__ import annotations
 
 import logging
+import os
+import sqlite3
 import uuid
 from typing import Optional
 
@@ -35,6 +38,305 @@ from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE
 logger = logging.getLogger(__name__)
 
 MAX_FALLBACK_CHAIN_DEPTH = 3
+
+#: Automated fix rounds allowed per review lineage (#244). The cap is the
+#: whole reason this transition is safe to automate: a reviewer that keeps
+#: rejecting would otherwise drive review→fix→review forever, burning quota on
+#: a disagreement no additional round will settle. After the cap the loop stops
+#: and says so on the PR, because the next move is a human's.
+DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
+#: Bounds on how much review text is copied into the fix task description.
+MAX_EMBEDDED_FINDINGS = 20
+MAX_FINDING_CHARS = 1000
+
+
+def review_fix_max_rounds() -> int:
+    """Cap on automated fix rounds. ``0`` disables the transition entirely.
+
+    Read at call time rather than import time so an operator can change the
+    limit (or switch the whole feature off) without restarting the server.
+    """
+    raw = (os.getenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS") or "").strip()
+    if not raw:
+        return DEFAULT_REVIEW_FIX_MAX_ROUNDS
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        logger.warning(
+            f"AGENT_CREW_REVIEW_FIX_MAX_ROUNDS={raw!r} is not an integer — "
+            f"using default {DEFAULT_REVIEW_FIX_MAX_ROUNDS}"
+        )
+        return DEFAULT_REVIEW_FIX_MAX_ROUNDS
+
+
+def fix_task_id(review_task_id: str, fix_round: int) -> str:
+    """The task id a given review round's fix MUST have.
+
+    ⛔Derived, not random, and that is the entire idempotency mechanism. A
+      result POST can arrive twice — a retried submission, a duplicate delivery,
+      an operator re-posting — and the cascade runs again in full each time. A
+      random id made every replay a NEW task, so two implementers could be
+      handed the same branch and the same findings concurrently (review of
+      PR #245).
+
+    Deriving the id puts the guard on the `tasks` PRIMARY KEY, where a race
+    cannot slip through it. A "does one already exist?" check cannot do that
+    job: two concurrent submissions both read "no" and both insert. Same
+    reasoning as the #224 claim ledger, where the GitHub label could not be the
+    mutex because `--add-label` is idempotent.
+
+    ⛔The review id goes in VERBATIM, not as a truncated hash. The first
+      version used `sha256(review_task_id)[:8]`, and 32 bits collide by
+      birthday at roughly 65k reviews — at which point two unrelated reviews
+      share a key and the second one's fix is silently skipped as "already
+      exists". That is strictly worse than the duplicate this key was added to
+      prevent: a duplicate is visible, a dropped fix is not (review of PR #245,
+      round 2).
+
+      Verbatim makes the mapping injective rather than merely improbable.
+      `int()` renders the round as digits only, so the trailing `-r<digits>` is
+      unambiguous and no two (review, round) pairs can produce the same string
+      — `"-"` and `"r"` are not digits, so a shorter round cannot be misread as
+      part of a longer one. Nothing constrains `task_id` length (TEXT PRIMARY
+      KEY), and a longer id that is always correct beats a short one that is
+      usually correct. It also reads: `fix-review-4be7401c-r1` says which
+      review it came from without a lookup.
+    """
+    return f"fix-{review_task_id}-r{int(fix_round)}"
+
+
+def _findings_block(findings: list, review_task_id: str) -> str:
+    """Render review findings for the fix task description.
+
+    Bounded — but never silently. A dropped finding is a defect the fix task
+    would not know to address, so what was omitted is stated along with where
+    to read the rest.
+    """
+    items = [str(f).strip() for f in (findings or []) if str(f).strip()]
+    shown = items[:MAX_EMBEDDED_FINDINGS]
+    lines = []
+    for f in shown:
+        if len(f) > MAX_FINDING_CHARS:
+            f = (f[:MAX_FINDING_CHARS]
+                 + f" [... truncated; full text in review task {review_task_id}]")
+        lines.append(f"- {f}")
+    if len(items) > len(shown):
+        lines.append(
+            f"- [... {len(items) - len(shown)} further findings omitted here — "
+            f"read them all via GET /tasks/{review_task_id}]"
+        )
+    return "\n".join(lines)
+
+
+def auto_enqueue_fix(
+    queue: TaskQueue,
+    review_task_id: str,
+    *,
+    pane_map: Optional[dict] = None,
+    server_project: Optional[str] = None,
+    comment_fn=None,
+) -> Optional[str]:
+    """Create the fix task that follows a ``request_changes`` review (#244).
+
+    The cascade had transitions for `implement completed → review` and
+    `review approve → test`, but the rejection path just ended. Every
+    multi-round review therefore needed an operator to hand-enqueue the fix
+    with the findings pasted in — `crew triage --watch` automated the first
+    claim and nothing after it.
+
+    Returns the new implement task_id, or ``None`` when no fix is created.
+    The ``None`` cases are deliberate and each closes a different way this
+    transition could misbehave:
+
+      * the review task itself failed — `_resolve_verdict` maps a crashed or
+        timed-out review to `request_changes` so a broken review can never
+        silently approve (#100), but that is not a fix request: there are no
+        findings, and the failure path already retries or falls back. Spawning
+        a fix here would double-handle it AND hand an agent nothing to do;
+      * the reviewer requested changes without stating anything actionable;
+      * `coordinator_managed` — `crew run` drives its own loop;
+      * cross-project, as in `auto_enqueue_review`;
+      * the round cap is reached;
+      * a fix task for this review round already exists. The transition is
+        idempotent per review round: a replayed result POST produces no second
+        task, and the caller gets ``None`` because nothing NEW was created.
+        Note this holds regardless of the existing task's state — including a
+        cancelled one, so an operator's explicit cancel is not quietly undone
+        by a duplicate delivery.
+
+    Callers swallow the ``None`` — auto-enqueue must never crash a result
+    submission.
+    """
+    try:
+        review_tasks = [t for t in queue.list_tasks() if t.task_id == review_task_id]
+        if not review_tasks:
+            return None
+        review_task = review_tasks[0]
+
+        review_result = queue.get_result(review_task_id)
+        if not review_result:
+            return None
+        if getattr(review_result, "status", None) != "completed":
+            logger.info(
+                f"auto_enqueue_fix: review {review_task_id} did not complete "
+                f"(status={getattr(review_result, 'status', None)!r}) — leaving it "
+                f"to the retry/fallback path, not enqueueing a fix"
+            )
+            return None
+        if _resolve_verdict(review_result) != "request_changes":
+            return None
+
+        review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
+        # Same guard as the other two transitions: `crew run`'s foreground loop
+        # enqueues its own follow-ups, and a second one here would race it.
+        # Checked here rather than only in the caller so the MCP transport gets
+        # the guard too (#123 — both transports run the same cascade).
+        if review_ctx.get("coordinator_managed"):
+            logger.info(
+                f"auto_enqueue_fix: review {review_task_id} is coordinator_managed "
+                f"— skipping"
+            )
+            return None
+
+        review_project = review_task.project
+        if review_project and server_project and review_project != server_project:
+            logger.warning(
+                f"auto_enqueue_fix: skipping cross-project fix — review "
+                f"project={review_project!r}, server project={server_project!r}"
+            )
+            return None
+
+        pr_number = review_result.pr_number or review_ctx.get("pr_number")
+        max_rounds = review_fix_max_rounds()
+        # The lineage counter rides in the task context, so it survives a
+        # server restart and counts ROUNDS rather than tasks. An in-memory
+        # per-task_id counter (the transient-retry shape) could not work here:
+        # every round mints new task ids, so it would always read zero.
+        fix_round = int(review_ctx.get("fix_round") or 0) + 1
+        if max_rounds <= 0 or fix_round > max_rounds:
+            logger.warning(
+                f"auto_enqueue_fix: review {review_task_id} requested changes but "
+                f"the automated fix budget is spent (round {fix_round} > "
+                f"max {max_rounds}) — stopping, this needs a human"
+            )
+            _announce_fix_budget_exhausted(
+                pr_number=pr_number, review_task_id=review_task_id,
+                max_rounds=max_rounds, findings=review_result.findings or [],
+                comment_fn=comment_fn)
+            return None
+
+        findings_text = _findings_block(review_result.findings or [], review_task_id)
+        summary = (review_result.summary or "").strip()
+        if not findings_text and not summary:
+            logger.warning(
+                f"auto_enqueue_fix: review {review_task_id} requested changes with "
+                f"neither findings nor a summary — nothing to act on, skipping"
+            )
+            return None
+
+        where = (f"PR #{pr_number}" if pr_number
+                 else f"branch {review_task.branch!r}")
+        parts = [
+            f"Fix {where} per {review_task_id} request_changes "
+            f"(automated fix round {fix_round}/{max_rounds}).",
+        ]
+        if summary:
+            parts.append(f"\nReviewer summary: {summary}")
+        if findings_text:
+            parts.append(f"\nFindings to address:\n{findings_text}")
+        parts.append(
+            f"\nCommit to the SAME branch {review_task.branch!r} — do not open a "
+            f"new PR. Reproduce each finding before fixing it, and say so if one "
+            f"does not reproduce."
+        )
+
+        fix_context: dict = {
+            "prev_task_id": review_task_id,
+            "fix_round": fix_round,
+            "review_findings": list(review_result.findings or []),
+        }
+        if pr_number is not None:
+            # #186: lets the dispatcher check out the PR head for this task.
+            fix_context["pr_number"] = pr_number
+        for key in ("no_tester", "issue", "issue_title", "issue_body",
+                    "issue_url", "repo"):
+            if review_ctx.get(key) is not None:
+                fix_context[key] = review_ctx[key]
+        implementer_agent = (
+            review_ctx.get("implementer_agent")
+            or (default_agent_for_role("implementer", pane_map) if pane_map else None)
+        )
+        if implementer_agent:
+            fix_context["implementer_agent"] = implementer_agent
+
+        fix_id = fix_task_id(review_task_id, fix_round)
+        # Cheap early-out with a legible log. It is NOT the guard — the
+        # `enqueue` below is, because only the PRIMARY KEY is atomic.
+        existing = next((t for t in queue.list_tasks() if t.task_id == fix_id), None)
+        if existing is not None:
+            logger.info(
+                f"auto_enqueue_fix: {fix_id} already exists for {review_task_id} "
+                f"(status={existing.status!r}) — this review round already has "
+                f"its fix task, not enqueueing another"
+            )
+            return None
+        try:
+            queue.enqueue(TaskRequest(
+                task_id=fix_id,
+                task_type="implement",  # type: ignore[arg-type]
+                description="\n".join(parts),
+                branch=review_task.branch,
+                context=fix_context,
+                project=review_project,
+            ))
+        except sqlite3.IntegrityError:
+            # A concurrent submission won the insert. That is the mechanism
+            # working, not an error: exactly one fix task exists.
+            logger.info(
+                f"auto_enqueue_fix: {fix_id} was created concurrently for "
+                f"{review_task_id} — leaving the winner in place"
+            )
+            return None
+        logger.info(
+            f"auto_enqueue_fix: enqueued {fix_id} for {review_task_id} "
+            f"(round {fix_round}/{max_rounds})"
+        )
+        return fix_id
+    except Exception as e:
+        logger.warning(f"auto_enqueue_fix: unexpected error: {e}")
+        return None
+
+
+def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
+                                   max_rounds: int, findings: list,
+                                   comment_fn=None) -> None:
+    """Say on the PR that automation has stopped. Best-effort, never raises.
+
+    ⛔A silent stop is the worst outcome available here: the PR would simply go
+      quiet after a rejection and look like it was still being worked on.
+    """
+    if not pr_number:
+        return
+    body = (
+        f"[agent_crew] Automated fix rounds exhausted "
+        f"(AGENT_CREW_REVIEW_FIX_MAX_ROUNDS={max_rounds}).\n\n"
+        f"The reviewer still requests changes after {max_rounds} automated "
+        f"round(s), so the loop has stopped rather than spend another one. "
+        f"Latest review task: `{review_task_id}`.\n\n"
+        + ("**Outstanding findings:**\n"
+           + "\n".join(f"- {str(f)[:MAX_FINDING_CHARS]}" for f in findings[:MAX_EMBEDDED_FINDINGS])
+           if findings else "")
+        + "\n\nA human needs to decide the next move."
+    )
+    try:
+        if comment_fn is not None:
+            comment_fn(int(pr_number), body)
+            return
+        from agent_crew.github import post_pr_comment
+
+        post_pr_comment(int(pr_number), body)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"auto_enqueue_fix: could not comment on PR #{pr_number}: {e}")
 
 
 def auto_enqueue_review(
@@ -127,6 +429,13 @@ def auto_enqueue_review(
             review_context["implementer_agent"] = implementer_agent
         if impl_ctx.get("no_tester"):
             review_context["no_tester"] = True
+        # #244: carry the fix-round counter along the lineage. Without this the
+        # counter resets every time a fix task produces a fresh review, and the
+        # cap that makes review→fix safe to automate would never be reached.
+        for key in ("fix_round", "issue", "issue_title", "issue_body",
+                    "issue_url", "repo"):
+            if impl_ctx.get(key) is not None:
+                review_context[key] = impl_ctx[key]
 
         # #164: compact review description — avoid re-injecting the full
         # original spec into the reviewer's context. The reviewer should
