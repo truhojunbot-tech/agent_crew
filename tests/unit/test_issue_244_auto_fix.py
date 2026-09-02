@@ -306,12 +306,12 @@ def test_a_long_finding_is_truncated_visibly(q):
 def test_excess_findings_are_counted_not_dropped(q):
     review_id = _review(q, findings=[f"finding {i}" for i in range(30)])
 
-    desc = _task(q, auto_enqueue_fix(q, review_id)).description
+    fix = _task(q, auto_enqueue_fix(q, review_id))
 
-    assert "finding 0" in desc
-    assert "10 further findings omitted" in desc
+    assert "finding 0" in fix.description
+    assert "10 further findings omitted" in fix.description
     # ...and nothing is lost: the full list is still in the context.
-    assert len(_task(q, auto_enqueue_fix(q, review_id)).context["review_findings"]) == 30
+    assert len(fix.context["review_findings"]) == 30
 
 
 # ── 6. the HTTP result handler (where the branch has to actually fire) ─
@@ -411,3 +411,111 @@ def test_http_result_submission_survives_a_broken_cascade(tmp_db, monkeypatch):
     with TestClient(_server(tmp_db, push)) as client:
         _enqueue_review(client, "review-http-4")
         assert _post_review_result(client, "review-http-4").status_code == 200
+
+
+# ── 7. idempotency: a replayed result must not fork the work ──────────
+#
+# `submit_result` has no "already done" guard, so a retried or duplicated
+# result POST re-runs the whole cascade. With a random fix task id every
+# replay minted a NEW task: two implementers, same branch, same findings,
+# concurrently — and both recorded as round 1, so the round cap could not
+# even see them as separate rounds (review of PR #245).
+
+
+def test_a_replayed_review_result_does_not_fork_a_second_fix(q):
+    """★The regression."""
+    review_id = _review(q, pr_number=245)
+
+    first = auto_enqueue_fix(q, review_id)
+    second = auto_enqueue_fix(q, review_id)
+
+    assert first is not None
+    assert second is None, "a replay must not create a second fix task"
+    assert [t.task_id for t in q.list_tasks() if t.task_type == "implement"] == [first]
+
+
+def test_the_fix_id_is_derived_from_the_review_round(q):
+    """The id IS the guard, so it has to be a pure function of the round."""
+    from agent_crew.pipeline import fix_task_id
+
+    assert fix_task_id("review-abc", 1) == fix_task_id("review-abc", 1)
+    assert fix_task_id("review-abc", 1) != fix_task_id("review-abc", 2)
+    assert fix_task_id("review-abc", 1) != fix_task_id("review-def", 1)
+
+    review_id = _review(q)
+    assert auto_enqueue_fix(q, review_id) == fix_task_id(review_id, 1)
+
+
+def test_idempotency_holds_however_far_the_fix_has_progressed(q):
+    """Keyed on the round, not on the task's state.
+
+    A completed fix followed by a replayed POST must not re-open the work, and
+    an operator's explicit cancel must not be quietly undone by a duplicate
+    delivery either.
+    """
+    review_id = _review(q)
+    fix_id = auto_enqueue_fix(q, review_id)
+    q.submit_result(fix_id, TaskResult(task_id=fix_id, status="completed",
+                                       summary="fixed"))
+
+    assert auto_enqueue_fix(q, review_id) is None
+    assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 1
+
+
+def test_distinct_reviews_still_get_their_own_fix(q):
+    """⛔Idempotency must not collapse two genuinely different rejections."""
+    first = auto_enqueue_fix(q, _review(q))
+    second = auto_enqueue_fix(q, _review(q))
+
+    assert first is not None and second is not None and first != second
+    assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 2
+
+
+def test_concurrent_submissions_produce_exactly_one_fix(q, tmp_db):
+    """★★The race a check-then-act cannot close.
+
+    Two threads both read "no fix exists" and both insert. The guard is the
+    `tasks` PRIMARY KEY, so the loser's INSERT fails and it reports creating
+    nothing — same shape as #224, where the label could not be the mutex.
+    """
+    import threading
+
+    review_id = _review(q, pr_number=245)
+    start = threading.Barrier(4)
+    results = []
+    lock = threading.Lock()
+
+    def _submit():
+        own_queue = TaskQueue(tmp_db)      # a separate connection, as in prod
+        start.wait()
+        got = auto_enqueue_fix(own_queue, review_id)
+        with lock:
+            results.append(got)
+
+    threads = [threading.Thread(target=_submit) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    created = [r for r in results if r]
+    assert len(created) == 1, f"{len(created)} threads each believed they created a fix"
+    assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 1
+
+
+def test_http_duplicate_result_post_enqueues_one_fix(tmp_db):
+    """★★End to end: the same POST twice, as the reporter described it.
+
+    `submit_result` has no already-done guard, so the second POST really does
+    re-run the cascade — the idempotency has to live below it.
+    """
+    from fastapi.testclient import TestClient
+
+    push = _RecordingPush()
+    with TestClient(_server(tmp_db, push)) as client:
+        _enqueue_review(client, "review-http-dup")
+        assert _post_review_result(client, "review-http-dup").status_code == 200
+        assert _post_review_result(client, "review-http-dup").status_code == 200
+
+    fixes = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "implement"]
+    assert len(fixes) == 1, f"duplicate POST produced {len(fixes)} fix tasks"

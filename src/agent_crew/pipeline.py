@@ -18,8 +18,10 @@ functions, run them first, and *then* call ``_try_push_next``.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import sqlite3
 import uuid
 from typing import Optional
 
@@ -66,6 +68,26 @@ def review_fix_max_rounds() -> int:
             f"using default {DEFAULT_REVIEW_FIX_MAX_ROUNDS}"
         )
         return DEFAULT_REVIEW_FIX_MAX_ROUNDS
+
+
+def fix_task_id(review_task_id: str, fix_round: int) -> str:
+    """The task id a given review round's fix MUST have.
+
+    ⛔Derived, not random, and that is the entire idempotency mechanism. A
+      result POST can arrive twice — a retried submission, a duplicate delivery,
+      an operator re-posting — and the cascade runs again in full each time. A
+      random id made every replay a NEW task, so two implementers could be
+      handed the same branch and the same findings concurrently (review of
+      PR #245).
+
+    Deriving the id puts the guard on the `tasks` PRIMARY KEY, where a race
+    cannot slip through it. A "does one already exist?" check cannot do that
+    job: two concurrent submissions both read "no" and both insert. Same
+    reasoning as the #224 claim ledger, where the GitHub label could not be the
+    mutex because `--add-label` is idempotent.
+    """
+    digest = hashlib.sha256(review_task_id.encode()).hexdigest()[:8]
+    return f"fix-{digest}-r{int(fix_round)}"
 
 
 def _findings_block(findings: list, review_task_id: str) -> str:
@@ -119,7 +141,13 @@ def auto_enqueue_fix(
       * the reviewer requested changes without stating anything actionable;
       * `coordinator_managed` — `crew run` drives its own loop;
       * cross-project, as in `auto_enqueue_review`;
-      * the round cap is reached.
+      * the round cap is reached;
+      * a fix task for this review round already exists. The transition is
+        idempotent per review round: a replayed result POST produces no second
+        task, and the caller gets ``None`` because nothing NEW was created.
+        Note this holds regardless of the existing task's state — including a
+        cancelled one, so an operator's explicit cancel is not quietly undone
+        by a duplicate delivery.
 
     Callers swallow the ``None`` — auto-enqueue must never crash a result
     submission.
@@ -226,15 +254,34 @@ def auto_enqueue_fix(
         if implementer_agent:
             fix_context["implementer_agent"] = implementer_agent
 
-        fix_id = f"fix-{uuid.uuid4().hex[:8]}"
-        queue.enqueue(TaskRequest(
-            task_id=fix_id,
-            task_type="implement",  # type: ignore[arg-type]
-            description="\n".join(parts),
-            branch=review_task.branch,
-            context=fix_context,
-            project=review_project,
-        ))
+        fix_id = fix_task_id(review_task_id, fix_round)
+        # Cheap early-out with a legible log. It is NOT the guard — the
+        # `enqueue` below is, because only the PRIMARY KEY is atomic.
+        existing = next((t for t in queue.list_tasks() if t.task_id == fix_id), None)
+        if existing is not None:
+            logger.info(
+                f"auto_enqueue_fix: {fix_id} already exists for {review_task_id} "
+                f"(status={existing.status!r}) — this review round already has "
+                f"its fix task, not enqueueing another"
+            )
+            return None
+        try:
+            queue.enqueue(TaskRequest(
+                task_id=fix_id,
+                task_type="implement",  # type: ignore[arg-type]
+                description="\n".join(parts),
+                branch=review_task.branch,
+                context=fix_context,
+                project=review_project,
+            ))
+        except sqlite3.IntegrityError:
+            # A concurrent submission won the insert. That is the mechanism
+            # working, not an error: exactly one fix task exists.
+            logger.info(
+                f"auto_enqueue_fix: {fix_id} was created concurrently for "
+                f"{review_task_id} — leaving the winner in place"
+            )
+            return None
         logger.info(
             f"auto_enqueue_fix: enqueued {fix_id} for {review_task_id} "
             f"(round {fix_round}/{max_rounds})"
