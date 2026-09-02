@@ -18,7 +18,6 @@ functions, run them first, and *then* call ``_try_push_next``.
 """
 from __future__ import annotations
 
-import hashlib
 import logging
 import os
 import sqlite3
@@ -85,9 +84,25 @@ def fix_task_id(review_task_id: str, fix_round: int) -> str:
     job: two concurrent submissions both read "no" and both insert. Same
     reasoning as the #224 claim ledger, where the GitHub label could not be the
     mutex because `--add-label` is idempotent.
+
+    ⛔The review id goes in VERBATIM, not as a truncated hash. The first
+      version used `sha256(review_task_id)[:8]`, and 32 bits collide by
+      birthday at roughly 65k reviews — at which point two unrelated reviews
+      share a key and the second one's fix is silently skipped as "already
+      exists". That is strictly worse than the duplicate this key was added to
+      prevent: a duplicate is visible, a dropped fix is not (review of PR #245,
+      round 2).
+
+      Verbatim makes the mapping injective rather than merely improbable.
+      `int()` renders the round as digits only, so the trailing `-r<digits>` is
+      unambiguous and no two (review, round) pairs can produce the same string
+      — `"-"` and `"r"` are not digits, so a shorter round cannot be misread as
+      part of a longer one. Nothing constrains `task_id` length (TEXT PRIMARY
+      KEY), and a longer id that is always correct beats a short one that is
+      usually correct. It also reads: `fix-review-4be7401c-r1` says which
+      review it came from without a lookup.
     """
-    digest = hashlib.sha256(review_task_id.encode()).hexdigest()[:8]
-    return f"fix-{digest}-r{int(fix_round)}"
+    return f"fix-{review_task_id}-r{int(fix_round)}"
 
 
 def _findings_block(findings: list, review_task_id: str) -> str:

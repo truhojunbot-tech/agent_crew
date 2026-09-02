@@ -446,6 +446,66 @@ def test_the_fix_id_is_derived_from_the_review_round(q):
     assert auto_enqueue_fix(q, review_id) == fix_task_id(review_id, 1)
 
 
+def test_two_reviews_never_share_a_key(q):
+    """★A key collision drops a fix instead of duplicating one.
+
+    The first version of this key was `sha256(review_task_id)[:8]` — 32 bits,
+    which collide by birthday at roughly 65k reviews. These two ids are a real
+    colliding pair for that scheme. Sharing a key means the second review's
+    `request_changes` is silently swallowed as "already exists": no fix task,
+    no error, nothing to notice. That is strictly worse than the duplicate the
+    key exists to prevent, because a duplicate is at least visible.
+    """
+    from agent_crew.pipeline import fix_task_id
+
+    a, b = "review-000252f9", "review-00034f12"
+    assert fix_task_id(a, 1) != fix_task_id(b, 1)
+
+    first = _review(q, context={}, findings=["finding for A"])
+    second = _review(q, context={}, findings=["finding for B"])
+    # ...and through the real path, with those exact ids:
+    for rid in (a, b):
+        q.enqueue(TaskRequest(task_id=rid, task_type="review", description="r",
+                              branch=BRANCH, context={}))
+        q.submit_result(rid, TaskResult(
+            task_id=rid, status="completed", summary="fix it",
+            verdict="request_changes", findings=[f"finding for {rid}"]))
+
+    assert auto_enqueue_fix(q, a) is not None
+    assert auto_enqueue_fix(q, b) is not None, \
+        "the second review's fix was swallowed by a key collision"
+    assert first and second      # the fixture reviews are untouched by this
+
+
+def test_the_key_is_injective_not_merely_improbable():
+    """⛔Exhaustive over the shapes that could alias, not a spot check.
+
+    `-r<digits>` has to be unambiguous from the right: a review id that itself
+    ends in `-r2` must not collide with a different review at another round.
+    """
+    from agent_crew.pipeline import fix_task_id
+
+    review_ids = ["review-abc", "review-abc-r2", "review-abc-r", "review-ab",
+                  "review-abc-r22", "r", "", "review-abc-",
+                  # ids ending in digits: the shape that aliases if the round
+                  # is appended without a delimiter.
+                  "review-abc1", "review-abc12", "review-abc1-r1", "review-1"]
+    pairs = [(rid, n) for rid in review_ids for n in range(1, 13)]
+    keys = [fix_task_id(rid, n) for rid, n in pairs]
+
+    assert len(set(keys)) == len(pairs), "two distinct (review, round) pairs share a key"
+
+
+def test_the_key_names_the_review_it_belongs_to(q):
+    """An operator reading the queue should not need a lookup to tell which
+    review a fix task came from."""
+    review_id = _review(q)
+
+    fix_id = auto_enqueue_fix(q, review_id)
+
+    assert review_id in fix_id and fix_id.endswith("-r1")
+
+
 def test_idempotency_holds_however_far_the_fix_has_progressed(q):
     """Keyed on the round, not on the task's state.
 
