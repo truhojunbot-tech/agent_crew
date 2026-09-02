@@ -50,6 +50,54 @@ MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
 
 
+def review_is_current(review_ctx: dict, pr_number, *, head_sha_fn=None) -> tuple:
+    """``(current, reason)`` — is this review's finding still about the PR head?
+
+    A review examines a commit. By the time its result comes back, someone may
+    have pushed — including the very fix the finding asks for. #253 measured
+    this on PR #251: of seven review rounds, five produced fix tasks for work
+    that already existed, each costing a reviewer and an implementer invocation
+    to conclude "does not reproduce".
+
+    ⛔The round cap cannot catch it. `AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` counts
+      rounds within ONE lineage, and every new review starts a fresh lineage at
+      round 1 — two of those duplicates arrived labelled `3/3`, a spent budget,
+      while the next review opened a new one. Only comparing the reviewed
+      commit against the current head closes it.
+
+    Three answers:
+
+      * no `reviewed_sha` recorded — treated as current. Older tasks and
+        producers that never went through worktree prep have none, and refusing
+        to act on every one of them would break the pipeline to fix a subset;
+      * head matches, or cannot be distinguished — see below;
+      * head has moved — stale, and no work is created.
+    """
+    reviewed = (review_ctx or {}).get("reviewed_sha") or ""
+    if not reviewed:
+        return (True, "no reviewed_sha recorded")
+    if not pr_number:
+        return (True, "no pr_number to compare against")
+    try:
+        if head_sha_fn is not None:
+            head = head_sha_fn(int(pr_number)) or ""
+        else:
+            from agent_crew.github import pr_head_sha
+
+            head = pr_head_sha(int(pr_number)) or ""
+    except Exception as e:  # noqa: BLE001 — a lookup never breaks a cascade
+        logger.warning(f"review_is_current: head lookup failed for PR #{pr_number}: {e}")
+        return (False, "current head unknown")
+    if not head:
+        # ⛔Defer rather than guess, the same rule the terminal-PR gate uses:
+        #   a skipped cascade is recoverable, a fix task written against a state
+        #   that no longer exists is spend that cannot be recovered.
+        return (False, "current head unknown")
+    if head == reviewed:
+        return (True, f"reviewed {reviewed[:9]} is still the head")
+    return (False, f"reviewed {reviewed[:9]} but the head is now {head[:9]}")
+
+
 def review_fix_max_rounds() -> int:
     """Cap on automated fix rounds. ``0`` disables the transition entirely.
 
@@ -135,6 +183,7 @@ def auto_enqueue_fix(
     pane_map: Optional[dict] = None,
     server_project: Optional[str] = None,
     comment_fn=None,
+    head_sha_fn=None,
 ) -> Optional[str]:
     """Create the fix task that follows a ``request_changes`` review (#244).
 
@@ -207,6 +256,19 @@ def auto_enqueue_fix(
             return None
 
         pr_number = review_result.pr_number or review_ctx.get("pr_number")
+
+        # #253: the finding has to be about the CURRENT code, not about a state
+        # that has already been fixed. Checked before the round budget so a
+        # stale review neither spends a round nor announces anything.
+        current, why = review_is_current(review_ctx, pr_number, head_sha_fn=head_sha_fn)
+        if not current:
+            logger.info(
+                f"auto_enqueue_fix: {review_task_id} reviewed a state that is no longer "
+                f"current ({why}) — not creating follow-up work. The review result is "
+                f"still recorded; only the cascade stops (#253)."
+            )
+            return None
+
         max_rounds = review_fix_max_rounds()
         # The lineage counter rides in the task context, so it survives a
         # server restart and counts ROUNDS rather than tasks. An in-memory

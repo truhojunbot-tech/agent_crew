@@ -183,6 +183,31 @@ def post_pr_comment(pr_number: int, body: str, repo: Optional[str] = None) -> bo
         return False
 
 
+def pr_head_sha(pr_number: int, repo: Optional[str] = None,
+                timeout: float = 20.0) -> str:
+    """The commit a PR currently points at, or ``""`` when it cannot be read.
+
+    Uses the last entry of `--json commits`: this `gh` build has no
+    `headRefOid` field, and asking for one fails the whole call.
+    """
+    if not pr_number or not check_gh_installed():
+        return ""
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return ""
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "commits"],
+            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return ""
+        commits = (json.loads(r.stdout or "{}") or {}).get("commits") or []
+        return (commits[-1].get("oid") or "") if commits else ""
+    except Exception:
+        return ""
+
+
 def post_discussion_comment(
     issue_number: int,
     topic: str,
