@@ -137,6 +137,18 @@ row is left alone — it belongs to another manager, and that label is the only
 cross-database signal between crews that do not share this SQLite file.
 `crew claims --release` clears the label too, and says so if it cannot.
 
+**Issue body capping.** The body fetched at discovery is persisted into the
+task context, so the Context Pack has a source for the acceptance criteria
+without a second GitHub call. It is capped so one enormous issue cannot bloat
+every queue row — but the cap bounds *prose only*: the acceptance-criteria
+section is carried across the limit verbatim, and whatever is dropped is
+announced in the stored text (`[... issue body truncated by agent_crew: N
+characters omitted ...]`). A capped body that still has no AC in it triggers one
+bounded re-fetch of the full issue; if that fails too, the pack is marked
+degraded rather than presenting itself as a complete read. "Truncated past the
+acceptance criteria" must never be indistinguishable from "this issue has no
+acceptance criteria".
+
 **Failure handling.** A GitHub error backs off exponentially (30s → 15m cap);
 because discovery runs before any claim, an error cycle cannot strand a claim.
 If enqueue fails after a claim, the claim is released and the label removed, so

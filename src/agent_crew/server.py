@@ -17,6 +17,7 @@ from pydantic import BaseModel
 
 from agent_crew import instructions
 from agent_crew.anomaly import check_wrong_repo
+from agent_crew import context_pack as _cpack
 from agent_crew.context_identity import (
     append_attribution_jsonl,
     detect_context_compaction,
@@ -1887,6 +1888,41 @@ def create_app(
                 )
 
         message = _format_task_message(task, port)
+        # #239: assemble a bounded, provenance-linked Context Pack from durable
+        # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
+        # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
+        # rather than a silent empty one, so absence of an artifact is never
+        # mistaken for absence of fact.
+        _pack = None
+        if _cpack.enabled():
+            _pack = _cpack.build_pack_for_task(
+                _ctx if isinstance(_ctx, dict) else {},
+                task_id=task.task_id, task_type=task.task_type, role=role,
+                repo_path=wt, branch=task.branch,
+                episodes_path=os.path.join(os.path.dirname(db_path), "episodes.jsonl"),
+            )
+            _block = _pack.to_prompt_block()
+            if _block:
+                message = _block + "\n\n" + message
+            try:
+                record_context_event(
+                    _context_events_path, "context_pack_built",
+                    task_id=task.task_id, project=_project, role=role, agent=agent,
+                    context_id=_ctx_info["context_id"],
+                    context_generation=_ctx_info["context_generation"],
+                    **_pack.telemetry(),
+                )
+                # Durable linkage: the pack that produced this dispatch is
+                # recorded on the task, so a terminal outcome can be attributed
+                # back to the exact context it was given.
+                q().patch_context(task.task_id, {
+                    "context_pack_id": _pack.pack_id,
+                    "context_pack_hash": _pack.pack_hash,
+                    "context_pack_degraded": _pack.degraded,
+                })
+            except Exception:
+                logger.exception(
+                    f"dispatcher: context pack telemetry failed for {task.task_id}")
         # Per-role log file so `tail -f dispatch_{role}.log` in the pane
         # shows a continuous stream across all tasks for that role.
         log_path = os.path.join(os.path.dirname(db_path), f"dispatch_{role}.log")
@@ -2270,6 +2306,8 @@ def create_app(
     # Same rationale as watchdog_tick/anomaly_tick above: expose the dispatch
     # path so a test can drive one real dispatch deterministically, rather
     # than asserting against a helper the dispatcher may not actually call.
+    # Its absence is why PR #241 shipped a Context Pack that silently omitted
+    # the acceptance criteria on every live dispatch while unit tests passed.
     app.state.dispatch_task = _dispatch_task
     # ── End headless dispatcher ───────────────────────────────────────────────
 
@@ -2533,6 +2571,23 @@ def create_app(
             # status/outcome/completed_at on this row before we read it).
             if _attr:
                 append_attribution_jsonl(_attr_jsonl_path, _attr)
+                # #239: emit a compact episode at this safe boundary — the
+                # task is terminal, so nothing is in flight. References and
+                # metadata only; no prompt or source content is stored.
+                try:
+                    _ep_ctx = q().get_task_context(task_id) or {}
+                    _cpack.append_episode(
+                        os.path.join(os.path.dirname(db_path), "episodes.jsonl"),
+                        _cpack.build_episode(
+                            _attr,
+                            {"summary": result.summary, "findings": result.findings,
+                             "pr_number": result.pr_number},
+                            issue=_ep_ctx.get("issue"),
+                        ),
+                    )
+                except Exception:
+                    logger.exception(
+                        f"POST /tasks/{task_id}/result: episode emission failed")
         except Exception:
             logger.exception(f"POST /tasks/{task_id}/result: context event emission failed")
         if task_type == "discuss":
