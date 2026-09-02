@@ -415,13 +415,16 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
     #   before fixing — two notices for one PR. This is the same reasoning that
     #   made the fix task id derived rather than checked in #244, applied to the
     #   thing #250 added right next to it.
+    claim_token = ""
     claimed = True
     if queue is not None:
         try:
-            claimed = queue.claim_pr_announcement(
-                pr_number, FIX_EXHAUSTED_KIND, claimed_by=review_task_id)
+            claim_token = queue.claim_pr_announcement(
+                pr_number, FIX_EXHAUSTED_KIND, claimed_by=review_task_id) or ""
+            claimed = bool(claim_token)
         except Exception as e:  # noqa: BLE001 — telemetry never breaks a cascade
             logger.warning(f"auto_enqueue_fix: announcement claim failed: {e}")
+            claim_token = ""
             claimed = True          # fall back to best-effort, never go silent
     if not claimed:
         logger.info(
@@ -453,9 +456,10 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
         )
         # Keep the claim and mark it done: someone posted, so nobody should
         # post again, and releasing here would re-open the race on the next result.
-        if queue is not None:
+        if queue is not None and claim_token:
             try:
-                queue.mark_pr_announcement_posted(pr_number, FIX_EXHAUSTED_KIND)
+                queue.mark_pr_announcement_posted(
+                    pr_number, FIX_EXHAUSTED_KIND, claim_token)
             except Exception:  # noqa: BLE001
                 pass
         return
@@ -470,6 +474,23 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
            if findings else "")
         + "\n\nA human needs to decide the next move."
     )
+    # ⛔Last check before the external side effect. Everything above may have
+    #   taken time — a GitHub read, a large findings render — and a lease that
+    #   expired in the meantime means someone else now owns this notice. A
+    #   comment cannot be un-posted, so a worker that has lost the claim must
+    #   not post at all, rather than post and discover the loss afterwards.
+    if queue is not None and claim_token:
+        try:
+            if not queue.owns_pr_announcement(pr_number, FIX_EXHAUSTED_KIND, claim_token):
+                logger.warning(
+                    f"auto_enqueue_fix: lost the exhaustion-notice claim for PR "
+                    f"#{pr_number} before posting (lease taken over) — not posting "
+                    f"for {review_task_id}"
+                )
+                return
+        except Exception:  # noqa: BLE001
+            pass            # cannot verify ownership → fall through and post
+
     try:
         if comment_fn is not None:
             comment_fn(pr_number, body)
@@ -482,15 +503,25 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
         #   suppress the escalation forever — the PR would go quiet, which is
         #   the outcome this notice exists to prevent.
         logger.warning(f"auto_enqueue_fix: could not comment on PR #{pr_number}: {e}")
-        if queue is not None:
+        if queue is not None and claim_token:
             try:
-                queue.release_pr_announcement(pr_number, FIX_EXHAUSTED_KIND)
+                queue.release_pr_announcement(
+                    pr_number, FIX_EXHAUSTED_KIND, claim_token)
             except Exception:  # noqa: BLE001
                 pass
         return
-    if queue is not None:
+    if queue is not None and claim_token:
         try:
-            queue.mark_pr_announcement_posted(pr_number, FIX_EXHAUSTED_KIND)
+            if not queue.mark_pr_announcement_posted(
+                    pr_number, FIX_EXHAUSTED_KIND, claim_token):
+                # We posted, but the row is no longer ours. Say so: this is the
+                # one case where a duplicate notice can still reach the PR, and
+                # a silent log would hide it from whoever investigates.
+                logger.warning(
+                    f"auto_enqueue_fix: posted the exhaustion notice for PR "
+                    f"#{pr_number} but the claim had already been taken over — "
+                    f"a duplicate notice is possible"
+                )
         except Exception:  # noqa: BLE001
             pass
 

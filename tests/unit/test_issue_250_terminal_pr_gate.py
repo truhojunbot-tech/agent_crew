@@ -623,33 +623,36 @@ def test_a_failed_post_gives_the_claim_back(tmp_db, monkeypatch):
 def test_a_posted_claim_is_never_released(tmp_db):
     """Releasing a posted claim would re-open the very race it closed."""
     q = TaskQueue(tmp_db)
-    assert q.claim_pr_announcement(PR, "fix_exhausted") is True
-    q.mark_pr_announcement_posted(PR, "fix_exhausted")
+    token = q.claim_pr_announcement(PR, "fix_exhausted")
+    assert token
+    q.mark_pr_announcement_posted(PR, "fix_exhausted", token)
 
-    q.release_pr_announcement(PR, "fix_exhausted")
+    assert q.release_pr_announcement(PR, "fix_exhausted", token) is False
 
     assert q.pr_announcement_state(PR, "fix_exhausted")["posted_at"] is not None
-    assert q.claim_pr_announcement(PR, "fix_exhausted") is False
+    assert q.claim_pr_announcement(PR, "fix_exhausted") is None
 
 
 def test_a_claim_abandoned_mid_post_is_reclaimable(tmp_db):
     """⛔A process killed between claiming and posting must not silence the
     notice for good. An unposted claim ages out; a posted one never does."""
     q = TaskQueue(tmp_db)
-    assert q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="dead-task") is True
+    first = q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="dead-task")
+    assert first
 
-    assert q.claim_pr_announcement(PR, "fix_exhausted", stale_after=0.0) is True
+    second = q.claim_pr_announcement(PR, "fix_exhausted", stale_after=0.0)
+    assert second and second != first
     assert q.pr_announcement_state(PR, "fix_exhausted")["claimed_by"] == ""
 
-    q.mark_pr_announcement_posted(PR, "fix_exhausted")
-    assert q.claim_pr_announcement(PR, "fix_exhausted", stale_after=0.0) is False
+    q.mark_pr_announcement_posted(PR, "fix_exhausted", second)
+    assert q.claim_pr_announcement(PR, "fix_exhausted", stale_after=0.0) is None
 
 
 def test_distinct_prs_do_not_share_a_claim(tmp_db):
     q = TaskQueue(tmp_db)
-    assert q.claim_pr_announcement(251, "fix_exhausted") is True
-    assert q.claim_pr_announcement(252, "fix_exhausted") is True
-    assert q.claim_pr_announcement(251, "fix_exhausted") is False
+    assert q.claim_pr_announcement(251, "fix_exhausted")
+    assert q.claim_pr_announcement(252, "fix_exhausted")
+    assert q.claim_pr_announcement(251, "fix_exhausted") is None
 
 
 def test_a_broken_prior_notice_check_still_posts(tmp_db, monkeypatch):
@@ -667,3 +670,77 @@ def test_a_broken_prior_notice_check_still_posts(tmp_db, monkeypatch):
                      comment_fn=lambda pr, body: posted.append(body))
 
     assert len(posted) == 1
+
+
+
+# ── 9. the lease needs a fence, not just an expiry ────────────────────
+#
+# Taking a stale claim over does not stop the previous owner from still
+# running. If A is merely SLOW rather than dead, B reclaims, and then A — which
+# knows nothing about B — marks B's claim posted, or releases it. Both put a
+# second notice on the PR, which is the defect the claim exists to prevent.
+# Reproduced before fixing; the earlier test only modelled a DEAD owner, which
+# is the case that happens to be safe (review of PR #251, round 3).
+
+
+def test_a_superseded_owner_cannot_mark_the_new_owners_claim_posted(tmp_db):
+    """★Scenario 1: slow A finishes after B took over."""
+    q = TaskQueue(tmp_db)
+    a = q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="A")
+    b = q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="B", stale_after=0.0)
+    assert a and b and a != b
+
+    assert q.mark_pr_announcement_posted(PR, "fix_exhausted", a) is False
+
+    state = q.pr_announcement_state(PR, "fix_exhausted")
+    assert state["claimed_by"] == "B" and state["posted_at"] is None, \
+        "the superseded owner silenced the live one"
+    assert q.owns_pr_announcement(PR, "fix_exhausted", b) is True
+
+
+def test_a_superseded_owner_cannot_delete_the_new_owners_claim(tmp_db):
+    """★Scenario 2: A's post fails after B took over. An unconditional release
+    would hand a third worker the right to post alongside B."""
+    q = TaskQueue(tmp_db)
+    a = q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="A")
+    b = q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="B", stale_after=0.0)
+
+    assert q.release_pr_announcement(PR, "fix_exhausted", a) is False
+
+    assert q.pr_announcement_state(PR, "fix_exhausted")["claimed_by"] == "B"
+    assert q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="C") is None, \
+        "a third worker could claim while B still holds it"
+    assert q.owns_pr_announcement(PR, "fix_exhausted", b) is True
+
+
+def test_a_worker_that_lost_the_lease_does_not_post(tmp_db, monkeypatch):
+    """⛔Ownership is validated immediately before the side effect. A comment
+    cannot be un-posted, so losing the claim must prevent the post, not merely
+    be discovered afterwards."""
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
+    q = TaskQueue(tmp_db)
+    posted = []
+
+    def steal_then_report(pr, marker):
+        # Between claiming and posting, another worker takes the stale lease.
+        q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="B", stale_after=0.0)
+        return False
+
+    auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
+                     already_announced_fn=steal_then_report,
+                     comment_fn=lambda pr, body: posted.append(body))
+
+    assert posted == [], "posted after the lease was taken over"
+    assert q.pr_announcement_state(PR, "fix_exhausted")["claimed_by"] == "B"
+
+
+def test_the_token_is_opaque_and_unguessable(tmp_db):
+    """The fence must not be derivable from the row — otherwise a superseded
+    worker could reconstruct it."""
+    q = TaskQueue(tmp_db)
+    token = q.claim_pr_announcement(PR, "fix_exhausted", claimed_by="review-abc")
+
+    assert isinstance(token, str) and len(token) >= 16
+    assert "review-abc" not in token and str(PR) not in token
+    assert q.owns_pr_announcement(PR, "fix_exhausted", "") is False
+    assert q.owns_pr_announcement(PR, "fix_exhausted", "not-the-token") is False
