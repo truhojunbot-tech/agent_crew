@@ -32,6 +32,7 @@ from agent_crew.pipeline import (
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
 )
+from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
 
@@ -1105,6 +1106,27 @@ def create_app(
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         state["queue"] = TaskQueue(db_path)
+        # #248: stamp the build into the durable event stream at startup, so a
+        # production before/after cohort can be cut on the PROCESS boundary
+        # instead of on a GitHub merge time. #247 showed those are not the same
+        # boundary and that assuming they are attributes pre-fix behaviour to a
+        # fix that never ran.
+        try:
+            _ident = _server_identity()
+            _snap = _prov.snapshot(project=_ident["project"], port=_ident["port"])
+            logger.info("build provenance: %s", _prov.summary_line(_snap))
+            record_context_event(
+                _context_events_path, "build_provenance",
+                project=_ident["project"], db_path=_ident["db_path"],
+                commit=_snap["commit"],
+                ref=_snap["ref"], dirty=_snap["dirty"],
+                code_fingerprint=_snap["code_fingerprint"],
+                package_version=_snap["package_version"],
+                started_at=_snap["started_at"], pid=_snap["pid"],
+                source_root=_snap["source_root"], port=_ident["port"],
+            )
+        except Exception:
+            logger.exception("build provenance record failed — continuing")
         background_tasks: list[asyncio.Task] = []
         if _dispatcher_enabled:
             _requeue_orphans()
@@ -2497,9 +2519,77 @@ def create_app(
                 _try_push_next(role)
         return handled
 
+    def _server_identity() -> dict:
+        """Which dispatcher is this? (#248 AC1)
+
+        ⛔`project` cannot be taken from the `create_app` argument alone: the
+          module-level `app` every live server is launched from never passes it,
+          so all four dispatchers would report `project=""` and the provenance
+          gate could not tell them apart. The state directory is the identity
+          that actually exists in production — `~/.agent_crew/<project>/tasks.db`
+          — so fall back to it, and report the paths alongside so identity is
+          unambiguous even when an inherited AGENT_CREW_PORT is misleading.
+        """
+        name = project or ""
+        if not name and db_path:
+            parent = os.path.basename(os.path.dirname(os.path.abspath(db_path)))
+            if parent and parent != ".agent_crew":
+                name = parent
+        return {"project": name, "db_path": db_path, "port": port or 0,
+                "state_path": state_path or ""}
+
     @app.get("/health")
     def health():
-        return {"status": "ok"}
+        """Liveness plus the build this process is actually running (#248).
+
+        The provenance rides on /health deliberately: the thing that polls a
+        server to see whether it is up is the thing that should notice it is up
+        on the wrong code. #247's gap survived because "the server is running"
+        and "the server is running the merged fix" were separate questions and
+        only the first one had an answer.
+        """
+        ident = _server_identity()
+        snap = _prov.snapshot(project=ident["project"], port=ident["port"])
+        return {
+            "status": "ok",
+            "project": ident["project"],
+            "identity": ident,
+            "build": {
+                "commit": snap["commit"],
+                "commit_short": snap["commit_short"],
+                "ref": snap["ref"],
+                "dirty": snap["dirty"],
+                "code_fingerprint": snap["code_fingerprint"],
+                "package_version": snap["package_version"],
+                "started_at": snap["started_at"],
+                "uptime_s": snap["uptime_s"],
+                "pid": snap["pid"],
+                "source_root": snap["source_root"],
+                "checkout_commit": snap["checkout_commit"],
+                "checkout_moved_since_start": snap["checkout_moved_since_start"],
+                "source_changed_since_start": snap["source_changed_since_start"],
+            },
+        }
+
+    @app.get("/provenance")
+    def provenance(expect: str = ""):
+        """Full build provenance, optionally graded against an expected ref.
+
+        `GET /provenance?expect=98d869d` answers "is this dispatcher running a
+        build that contains #238?" — the question #247 had to answer by SSHing
+        to the host and reading `git HEAD`, which is also the question a
+        before/after measurement must gate on before labelling a cohort.
+
+        ⛔Read-only by contract. It never pulls, restarts, or repairs anything;
+          a safe-boundary deployment stays an operator action (#248).
+        """
+        ident = _server_identity()
+        snap = _prov.snapshot(project=ident["project"], port=ident["port"])
+        out = dict(snap)
+        out["identity"] = ident
+        if expect:
+            out["expected"] = _prov.compare(expect, snap=snap)
+        return out
 
     @app.post("/pane_map/reload")
     def reload_pane_map():
