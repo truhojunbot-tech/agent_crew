@@ -158,6 +158,66 @@ def post_review_comment(
         return False
 
 
+def pr_state(pr_number: int, repo: Optional[str] = None,
+             timeout: float = 20.0) -> str:
+    """``"open" | "merged" | "closed" | "unknown"`` for a PR (#250).
+
+    ``unknown`` is a real answer, not a failure to report: `gh` missing, no
+    repo, a network blip or a malformed response all mean *we could not
+    establish the PR's state*, which callers must not treat as "open".
+    """
+    if not pr_number or not check_gh_installed():
+        return "unknown"
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return "unknown"
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo,
+             "--json", "state,mergedAt,closedAt"],
+            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return "unknown"
+        data = json.loads(r.stdout or "{}")
+    except Exception:
+        return "unknown"
+    if data.get("mergedAt"):
+        return "merged"
+    state = (data.get("state") or "").upper()
+    if state == "OPEN":
+        return "open"
+    if state in ("MERGED", "CLOSED"):
+        return "merged" if state == "MERGED" else "closed"
+    return "unknown"
+
+
+def pr_has_comment_containing(pr_number: int, needle: str,
+                              repo: Optional[str] = None,
+                              timeout: float = 20.0) -> Optional[bool]:
+    """Does this PR already carry a comment containing `needle`?
+
+    ``None`` when it cannot be determined — the caller decides what to do with
+    that, and must not read it as "no".
+    """
+    if not pr_number or not needle or not check_gh_installed():
+        return None
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return None
+    try:
+        r = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "comments"],
+            capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None
+        comments = (json.loads(r.stdout or "{}") or {}).get("comments") or []
+    except Exception:
+        return None
+    return any(needle in (c.get("body") or "") for c in comments)
+
+
 def post_pr_comment(pr_number: int, body: str, repo: Optional[str] = None) -> bool:
     """Post an arbitrary comment on a PR. Returns True on success.
 
