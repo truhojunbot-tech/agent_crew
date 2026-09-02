@@ -1,5 +1,6 @@
 """Reviewer must be told to read the live PR head, not stale line numbers
 from earlier rounds (Issue #86)."""
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
@@ -16,6 +17,21 @@ def _impl_payload(task_id="impl-1"):
         "context": {},
         "project": "",
     }
+
+
+@pytest.fixture(autouse=True)
+def _pr_is_open(monkeypatch):
+    """#250 gated the cascade on live PR state. These tests are about the review
+    handoff, not about GitHub, so they assert the PR is open — the gate has its
+    own coverage in test_issue_250_terminal_pr_gate.py."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+
+
+@pytest.fixture(autouse=True)
+def _pr_is_open(monkeypatch):
+    """#250 gated the cascade on live PR state. These tests are about the
+    review handoff, not about GitHub, so they assert the PR is open."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
 
 
 def _completed_result(task_id, pr_number=None):

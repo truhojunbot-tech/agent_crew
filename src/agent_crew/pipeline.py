@@ -50,6 +50,76 @@ MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
 
 
+#: Marker every automated-exhaustion comment carries, so the cascade can
+#: recognise its own prior announcement instead of repeating it (#250).
+FIX_EXHAUSTED_MARKER = "[agent_crew] Automated fix rounds exhausted"
+
+
+def pr_is_actionable(pr_number, *, pr_state_fn=None) -> tuple:
+    """``(actionable, state)`` — may the cascade still create work for this PR?
+
+    A round budget bounds ONE lineage; it does not make the work useful. #250
+    caught the difference: PR #241 merged at 01:42Z and the cascade kept
+    completing reviews and posting "a human needs to decide" for another 13.8
+    hours. Nothing produced after the merge could reach the artifact, but it
+    still burned provider invocations and polluted the review-outcome metrics.
+
+    Three answers, and the third is the one that needs stating:
+
+      * no `pr_number` — actionable. A task can legitimately precede its PR
+        (the first implement → review hop), and "no PR" is not "terminal PR".
+      * `open` — actionable, unchanged behaviour.
+      * `merged`/`closed`/**`unknown`** — not actionable.
+
+    ⛔`unknown` blocks NEW work on purpose. When GitHub cannot be reached we do
+      not know whether the PR is terminal, and #250 asks for deferral over
+      speculative work in exactly that case: a skipped cascade is recoverable
+      (the result is still persisted, and a human or a later task can resume
+      it), whereas work spawned against a merged PR is unrecoverable spend. The
+      asymmetry is the whole argument — this is not a general fail-closed rule.
+    """
+    if not pr_number:
+        return (True, "no_pr")
+    try:
+        if pr_state_fn is not None:
+            state = pr_state_fn(int(pr_number))
+        else:
+            from agent_crew.github import pr_state as _pr_state
+
+            state = _pr_state(int(pr_number))
+    except Exception as e:  # noqa: BLE001 — a lookup never breaks a cascade
+        logger.warning(f"pr_is_actionable: lookup failed for PR #{pr_number}: {e}")
+        return (False, "unknown")
+    return (state == "open", state or "unknown")
+
+
+def _skip_terminal_pr(what: str, task_id: str, pr_number, *, pr_state_fn=None) -> Optional[str]:
+    """Shared guard for the cascade entry points.
+
+    Returns the blocking state, or ``None`` when the cascade may proceed.
+    """
+    actionable, state = pr_is_actionable(pr_number, pr_state_fn=pr_state_fn)
+    if actionable:
+        return None
+    if state == "unknown":
+        # ⛔Louder than the terminal case, deliberately. "The PR is merged" is a
+        #   correct, permanent stop; "we could not ask GitHub" is a stop that
+        #   nothing retries, so it must be visible rather than look like normal
+        #   cascade completion. #250 asks for deferral here, not for silence.
+        logger.warning(
+            f"{what}: could not determine the state of PR #{pr_number} — deferring "
+            f"follow-up work for {task_id} rather than spending it on a "
+            f"possibly-terminal PR. The task result is recorded; re-run the cascade "
+            f"once GitHub is reachable (#250)."
+        )
+    else:
+        logger.info(
+            f"{what}: PR #{pr_number} is {state} — not creating follow-up work for "
+            f"{task_id}. The task result is still recorded; only the cascade stops (#250)."
+        )
+    return state
+
+
 def review_fix_max_rounds() -> int:
     """Cap on automated fix rounds. ``0`` disables the transition entirely.
 
@@ -135,6 +205,8 @@ def auto_enqueue_fix(
     pane_map: Optional[dict] = None,
     server_project: Optional[str] = None,
     comment_fn=None,
+    pr_state_fn=None,
+    already_announced_fn=None,
 ) -> Optional[str]:
     """Create the fix task that follows a ``request_changes`` review (#244).
 
@@ -207,6 +279,12 @@ def auto_enqueue_fix(
             return None
 
         pr_number = review_result.pr_number or review_ctx.get("pr_number")
+        # #250: a terminal PR ends the cascade regardless of the round budget.
+        # Checked BEFORE the budget so an exhausted lineage on a merged PR stays
+        # silent instead of announcing itself to an already-decided artifact.
+        if _skip_terminal_pr("auto_enqueue_fix", review_task_id, pr_number,
+                             pr_state_fn=pr_state_fn):
+            return None
         max_rounds = review_fix_max_rounds()
         # The lineage counter rides in the task context, so it survives a
         # server restart and counts ROUNDS rather than tasks. An in-memory
@@ -222,7 +300,7 @@ def auto_enqueue_fix(
             _announce_fix_budget_exhausted(
                 pr_number=pr_number, review_task_id=review_task_id,
                 max_rounds=max_rounds, findings=review_result.findings or [],
-                comment_fn=comment_fn)
+                comment_fn=comment_fn, already_announced_fn=already_announced_fn)
             return None
 
         findings_text = _findings_block(review_result.findings or [], review_task_id)
@@ -309,16 +387,39 @@ def auto_enqueue_fix(
 
 def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
                                    max_rounds: int, findings: list,
-                                   comment_fn=None) -> None:
+                                   comment_fn=None, already_announced_fn=None) -> None:
     """Say on the PR that automation has stopped. Best-effort, never raises.
 
     ⛔A silent stop is the worst outcome available here: the PR would simply go
       quiet after a rejection and look like it was still being worked on.
+
+    ⛔Said ONCE per PR. #250 found 25 of these on PR #241, seven inside three
+      minutes: every late or duplicate review result whose lineage was already
+      over budget announced the same exhaustion again. The message is about the
+      PR, not about the individual review task, so repeating it adds nothing and
+      buries the one that mattered. When we cannot check (GitHub unreachable) we
+      post — a missing escalation is worse than a duplicate one, and unlike
+      spawning work a comment costs no provider invocation.
     """
     if not pr_number:
         return
+    if already_announced_fn is not None:
+        seen = already_announced_fn(int(pr_number), FIX_EXHAUSTED_MARKER)
+    else:
+        try:
+            from agent_crew.github import pr_has_comment_containing
+
+            seen = pr_has_comment_containing(int(pr_number), FIX_EXHAUSTED_MARKER)
+        except Exception:  # noqa: BLE001
+            seen = None
+    if seen is True:
+        logger.info(
+            f"auto_enqueue_fix: PR #{pr_number} already carries an exhaustion notice "
+            f"— not repeating it for {review_task_id} (#250)"
+        )
+        return
     body = (
-        f"[agent_crew] Automated fix rounds exhausted "
+        f"{FIX_EXHAUSTED_MARKER} "
         f"(AGENT_CREW_REVIEW_FIX_MAX_ROUNDS={max_rounds}).\n\n"
         f"The reviewer still requests changes after {max_rounds} automated "
         f"round(s), so the loop has stopped rather than spend another one. "
@@ -346,6 +447,7 @@ def auto_enqueue_review(
     *,
     pane_map: Optional[dict] = None,
     server_project: Optional[str] = None,
+    pr_state_fn=None,
 ) -> Optional[str]:
     """Create the review task that follows a completed impl task.
 
@@ -358,6 +460,11 @@ def auto_enqueue_review(
         if not impl_tasks:
             return None
         impl_task = impl_tasks[0]
+
+        # #250: reviewing a merged/closed PR cannot change the artifact.
+        if _skip_terminal_pr("auto_enqueue_review", impl_task_id, pr_number,
+                             pr_state_fn=pr_state_fn):
+            return None
 
         # #161: no-PR guard — if the impl task has neither a branch nor a
         # pr_number, there is nothing for the reviewer to locate. Retrying
@@ -468,6 +575,7 @@ def auto_enqueue_test(
     review_task_id: str,
     *,
     pane_map: Optional[dict] = None,
+    pr_state_fn=None,
 ) -> Optional[str]:
     """Create the test task that follows an approved review.
 
@@ -499,6 +607,10 @@ def auto_enqueue_test(
         )
 
         pr_number = review_ctx.get("pr_number")
+        # #250: same gate — a merged PR does not need testing on our account.
+        if _skip_terminal_pr("auto_enqueue_test", review_task_id, pr_number,
+                             pr_state_fn=pr_state_fn):
+            return None
         test_context: dict = {"prev_task_id": review_task_id}
         if pr_number is not None:
             test_context["pr_number"] = pr_number  # #171: propagate for post-test merge

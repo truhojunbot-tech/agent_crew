@@ -168,6 +168,22 @@ implement ✓ → review → approve      → test → merge
                      → request_changes → fix (same branch) → review → ...
 ```
 
+The cascade also stops at a **terminal PR**. A merged or closed PR ends
+review/fix/test follow-ups regardless of the round budget — #250 caught Agent
+Crew still reviewing and escalating on PR #241 for 13.8 hours after it merged.
+If the PR's state cannot be established (GitHub unreachable), no new work is
+created either: the submitted result is still persisted, and deferring costs a
+retry while spawning work against a merged PR costs provider spend that cannot
+be recovered.
+
+The cascade also stops at a **terminal PR**. A merged or closed PR ends
+review/fix/test follow-ups regardless of the round budget — #250 caught Agent
+Crew still reviewing and escalating on PR #241 for 13.8 hours after it merged.
+If the PR's state cannot be established (GitHub unreachable), no new work is
+created either: the submitted result is still persisted, and deferring costs a
+retry while spawning work against a merged PR costs provider spend that cannot
+be recovered.
+
 The rejection arm is bounded. `AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` (default 3)
 caps how many automated fix rounds one review lineage may spend; the counter
 rides the task context, so it survives a server restart and keeps counting
@@ -176,6 +192,48 @@ stops and says so in a PR comment rather than going quiet — a reviewer that
 keeps rejecting is a disagreement another round will not settle, and the next
 move is a human's. `crew run` sets `coordinator_managed`, which skips the
 cascade entirely because that loop drives its own transitions.
+
+## Review round-trip and the terminal-PR gate
+
+A result submission cascades into the next stage — `implement ✓ → review →
+approve → test → merge`, or `request_changes → fix → review → …` — bounded by
+`AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` (default 3).
+
+The round budget bounds one lineage; it does not decide whether the lineage is
+still worth anything. Before creating any follow-up work the cascade checks the
+PR's live state, and stops when it is **merged, closed, or unverifiable**:
+
+- a merged/closed PR gets no new review/fix/test task and no "automated fix
+  rounds exhausted" comment;
+- an unverifiable state (GitHub unreachable) also creates nothing — a skipped
+  cascade is recoverable, work spawned against a merged PR is not;
+- **the submitted task result is always persisted either way.** Only the
+  cascade stops, never the audit trail.
+
+This exists because PR #241 merged at 01:42Z and kept receiving automated
+review/fix work for another 13.8 hours; see
+[docs/pr241_post_merge_waste.md](docs/pr241_post_merge_waste.md).
+
+## Review round-trip and the terminal-PR gate
+
+A result submission cascades into the next stage — `implement ✓ → review →
+approve → test → merge`, or `request_changes → fix → review → …` — bounded by
+`AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` (default 3).
+
+The round budget bounds one lineage; it does not decide whether the lineage is
+still worth anything. Before creating any follow-up work the cascade checks the
+PR's live state, and stops when it is **merged, closed, or unverifiable**:
+
+- a merged/closed PR gets no new review/fix/test task and no "automated fix
+  rounds exhausted" comment;
+- an unverifiable state (GitHub unreachable) also creates nothing — a skipped
+  cascade is recoverable, work spawned against a merged PR is not;
+- **the submitted task result is always persisted either way.** Only the
+  cascade stops, never the audit trail.
+
+This exists because PR #241 merged at 01:42Z and kept receiving automated
+review/fix work for another 13.8 hours; see
+[docs/pr241_post_merge_waste.md](docs/pr241_post_merge_waste.md).
 
 ## Build provenance
 

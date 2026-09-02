@@ -162,7 +162,7 @@ class TestCompactHandoffDescriptions:
         from agent_crew.pipeline import auto_enqueue_review
         _, q = _make_db()
         impl_id = self._enqueue_impl(q, pr_number=7)
-        review_id = auto_enqueue_review(q, impl_id, pr_number=7)
+        review_id = auto_enqueue_review(q, impl_id, pr_number=7, pr_state_fn=lambda pr: "open")
         assert review_id is not None
         tasks = {t.task_id: t for t in q.list_tasks()}
         review_task = tasks[review_id]
@@ -176,13 +176,13 @@ class TestCompactHandoffDescriptions:
         from agent_crew.pipeline import auto_enqueue_review, auto_enqueue_test
         _, q = _make_db()
         impl_id = self._enqueue_impl(q, pr_number=7)
-        review_id = auto_enqueue_review(q, impl_id, pr_number=7)
+        review_id = auto_enqueue_review(q, impl_id, pr_number=7, pr_state_fn=lambda pr: "open")
         assert review_id is not None
         q.submit_result(review_id, TaskResult(
             task_id=review_id, status="completed", summary="lgtm",
             verdict="approve", findings=[], pr_number=7,
         ))
-        test_id = auto_enqueue_test(q, review_id)
+        test_id = auto_enqueue_test(q, review_id, pr_state_fn=lambda pr: "open")
         assert test_id is not None
         tasks = {t.task_id: t for t in q.list_tasks()}
         test_task = tasks[test_id]

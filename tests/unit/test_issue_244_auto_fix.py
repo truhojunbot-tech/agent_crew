@@ -31,6 +31,20 @@ from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
 BRANCH = "agent/claude/244-x"
+
+
+def _open(pr):
+    """#250 gated every cascade entry point on live PR state. These tests are
+    about the cascade's own logic, so they inject "the PR is open"; the gate has
+    its own coverage in test_issue_250_terminal_pr_gate.py."""
+    return "open"
+
+
+def _open(pr):
+    """#250 gated every cascade entry point on live PR state. These tests are
+    about the cascade's own logic, so they inject "the PR is open"; the gate has
+    its own coverage in test_issue_250_terminal_pr_gate.py."""
+    return "open"
 FINDING = "HIGH src/agent_crew/watch.py:759 - the cap drops the AC"
 
 
@@ -67,7 +81,7 @@ def test_request_changes_enqueues_a_fix_task(q):
     """★The whole point of #244 — a rejection produces queued work."""
     review_id = _review(q, pr_number=241)
 
-    fix_id = auto_enqueue_fix(q, review_id)
+    fix_id = auto_enqueue_fix(q, review_id, pr_state_fn=_open)
 
     assert fix_id is not None
     fix = _task(q, fix_id)
@@ -81,7 +95,7 @@ def test_the_findings_are_in_the_description(q):
     review_id = _review(q, findings=[FINDING, "MED: no test for the boundary"],
                         summary="two things", pr_number=241)
 
-    fix = _task(q, auto_enqueue_fix(q, review_id))
+    fix = _task(q, auto_enqueue_fix(q, review_id, pr_state_fn=_open))
 
     assert FINDING in fix.description
     assert "no test for the boundary" in fix.description
@@ -96,7 +110,7 @@ def test_findings_also_ride_in_the_context(q):
     re-parse a description to know what was raised."""
     review_id = _review(q, findings=[FINDING])
 
-    fix = _task(q, auto_enqueue_fix(q, review_id))
+    fix = _task(q, auto_enqueue_fix(q, review_id, pr_state_fn=_open))
 
     assert fix.context["review_findings"] == [FINDING]
 
@@ -106,7 +120,7 @@ def test_pr_number_is_propagated_for_worktree_checkout(q):
     PR head for this task."""
     review_id = _review(q, pr_number=241)
 
-    fix = _task(q, auto_enqueue_fix(q, review_id))
+    fix = _task(q, auto_enqueue_fix(q, review_id, pr_state_fn=_open))
 
     assert fix.context["pr_number"] == 241
 
@@ -115,7 +129,7 @@ def test_no_tester_and_issue_identity_survive_the_round_trip(q):
     review_id = _review(q, context={"no_tester": True, "issue": 244,
                                     "issue_title": "auto-fix", "repo": "org/repo"})
 
-    fix = _task(q, auto_enqueue_fix(q, review_id))
+    fix = _task(q, auto_enqueue_fix(q, review_id, pr_state_fn=_open))
 
     assert fix.context["no_tester"] is True
     assert fix.context["issue"] == 244
@@ -125,7 +139,7 @@ def test_no_tester_and_issue_identity_survive_the_round_trip(q):
 def test_project_is_inherited(q):
     review_id = _review(q, project="agent_crew")
 
-    assert _task(q, auto_enqueue_fix(q, review_id)).project == "agent_crew"
+    assert _task(q, auto_enqueue_fix(q, review_id, pr_state_fn=_open)).project == "agent_crew"
 
 
 # ── 2. the refusals ───────────────────────────────────────────────────
@@ -134,7 +148,7 @@ def test_project_is_inherited(q):
 def test_an_approved_review_enqueues_no_fix(q):
     review_id = _review(q, verdict="approve", findings=[], summary="lgtm")
 
-    assert auto_enqueue_fix(q, review_id) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
 
 
 def test_a_crashed_review_is_not_a_fix_request(q):
@@ -146,7 +160,7 @@ def test_a_crashed_review_is_not_a_fix_request(q):
     review_id = _review(q, status="failed", verdict=None, findings=[],
                         summary="dispatcher timeout")
 
-    assert auto_enqueue_fix(q, review_id) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
     assert not [t for t in q.list_tasks() if t.task_type == "implement"]
 
 
@@ -155,14 +169,14 @@ def test_request_changes_with_nothing_actionable_enqueues_nothing(q):
     worse than no task — the agent has nothing to reproduce."""
     review_id = _review(q, verdict="request_changes", findings=[], summary="")
 
-    assert auto_enqueue_fix(q, review_id) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
 
 
 def test_coordinator_managed_review_is_skipped(q):
     """`crew run` drives its own loop; a second enqueue here races it."""
     review_id = _review(q, context={"coordinator_managed": True})
 
-    assert auto_enqueue_fix(q, review_id) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
 
 
 def test_cross_project_review_is_skipped(q):
@@ -180,14 +194,14 @@ def test_a_review_with_no_result_yet_enqueues_nothing(q):
     q.enqueue(TaskRequest(task_id=review_id, task_type="review",
                           description="review", branch=BRANCH))
 
-    assert auto_enqueue_fix(q, review_id) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
 
 
 # ── 3. the round cap ──────────────────────────────────────────────────
 
 
 def test_round_counter_starts_at_one_and_is_recorded(q):
-    fix = _task(q, auto_enqueue_fix(q, _review(q)))
+    fix = _task(q, auto_enqueue_fix(q, _review(q), pr_state_fn=_open))
 
     assert fix.context["fix_round"] == 1
     assert f"round 1/{DEFAULT_REVIEW_FIX_MAX_ROUNDS}" in fix.description
@@ -197,7 +211,7 @@ def test_the_round_past_the_cap_does_not_enqueue(q, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
     at_cap = _review(q, context={"fix_round": 3})
 
-    assert auto_enqueue_fix(q, at_cap) is None
+    assert auto_enqueue_fix(q, at_cap, pr_state_fn=_open) is None
     assert not [t for t in q.list_tasks() if t.task_type == "implement"]
 
 
@@ -205,7 +219,7 @@ def test_the_last_allowed_round_still_enqueues(q, monkeypatch):
     """The cap is a limit, not an off-by-one."""
     monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
 
-    fix = _task(q, auto_enqueue_fix(q, _review(q, context={"fix_round": 2})))
+    fix = _task(q, auto_enqueue_fix(q, _review(q, context={"fix_round": 2}), pr_state_fn=_open))
 
     assert fix.context["fix_round"] == 3
 
@@ -217,7 +231,8 @@ def test_exhausting_the_budget_says_so_on_the_pr(q, monkeypatch):
     posted = []
     review_id = _review(q, pr_number=241, context={"fix_round": 2})
 
-    auto_enqueue_fix(q, review_id,
+    auto_enqueue_fix(q, review_id, pr_state_fn=_open,
+                     already_announced_fn=lambda pr, marker: False,
                      comment_fn=lambda pr, body: posted.append((pr, body)))
 
     assert len(posted) == 1
@@ -236,6 +251,8 @@ def test_a_failure_to_comment_does_not_raise(q, monkeypatch):
 
     assert auto_enqueue_fix(q, _review(q, pr_number=241,
                                        context={"fix_round": 1}),
+                            pr_state_fn=_open,
+                            already_announced_fn=lambda pr, marker: False,
                             comment_fn=boom) is None
 
 
@@ -243,7 +260,7 @@ def test_zero_rounds_disables_the_transition(q, monkeypatch):
     """The kill switch: an operator who does not want this automation at all."""
     monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "0")
 
-    assert auto_enqueue_fix(q, _review(q)) is None
+    assert auto_enqueue_fix(q, _review(q), pr_state_fn=_open) is None
 
 
 def test_the_cap_is_read_at_call_time_and_survives_garbage(monkeypatch):
@@ -273,14 +290,14 @@ def test_the_counter_survives_the_round_trip_through_a_new_review(q):
     rounds = []
 
     for _ in range(6):                      # more attempts than the cap allows
-        fix_id = auto_enqueue_fix(q, review_id)
+        fix_id = auto_enqueue_fix(q, review_id, pr_state_fn=_open)
         if fix_id is None:
             break
         rounds.append(_task(q, fix_id).context["fix_round"])
         # the fix completes → the cascade raises a fresh review task
         q.submit_result(fix_id, TaskResult(
             task_id=fix_id, status="completed", summary="fixed", pr_number=241))
-        review_id = auto_enqueue_review(q, fix_id, 241)
+        review_id = auto_enqueue_review(q, fix_id, 241, pr_state_fn=_open)
         assert review_id is not None
         q.submit_result(review_id, TaskResult(
             task_id=review_id, status="completed", summary="still no",
@@ -297,7 +314,7 @@ def test_the_counter_survives_the_round_trip_through_a_new_review(q):
 def test_a_long_finding_is_truncated_visibly(q):
     review_id = _review(q, findings=["X" * 5000])
 
-    desc = _task(q, auto_enqueue_fix(q, review_id)).description
+    desc = _task(q, auto_enqueue_fix(q, review_id, pr_state_fn=_open)).description
 
     assert "truncated" in desc
     assert review_id in desc, "it must say where the full text lives"
@@ -306,7 +323,7 @@ def test_a_long_finding_is_truncated_visibly(q):
 def test_excess_findings_are_counted_not_dropped(q):
     review_id = _review(q, findings=[f"finding {i}" for i in range(30)])
 
-    fix = _task(q, auto_enqueue_fix(q, review_id))
+    fix = _task(q, auto_enqueue_fix(q, review_id, pr_state_fn=_open))
 
     assert "finding 0" in fix.description
     assert "10 further findings omitted" in fix.description
@@ -426,8 +443,8 @@ def test_a_replayed_review_result_does_not_fork_a_second_fix(q):
     """★The regression."""
     review_id = _review(q, pr_number=245)
 
-    first = auto_enqueue_fix(q, review_id)
-    second = auto_enqueue_fix(q, review_id)
+    first = auto_enqueue_fix(q, review_id, pr_state_fn=_open)
+    second = auto_enqueue_fix(q, review_id, pr_state_fn=_open)
 
     assert first is not None
     assert second is None, "a replay must not create a second fix task"
@@ -443,7 +460,7 @@ def test_the_fix_id_is_derived_from_the_review_round(q):
     assert fix_task_id("review-abc", 1) != fix_task_id("review-def", 1)
 
     review_id = _review(q)
-    assert auto_enqueue_fix(q, review_id) == fix_task_id(review_id, 1)
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) == fix_task_id(review_id, 1)
 
 
 def test_two_reviews_never_share_a_key(q):
@@ -501,7 +518,7 @@ def test_the_key_names_the_review_it_belongs_to(q):
     review a fix task came from."""
     review_id = _review(q)
 
-    fix_id = auto_enqueue_fix(q, review_id)
+    fix_id = auto_enqueue_fix(q, review_id, pr_state_fn=_open)
 
     assert review_id in fix_id and fix_id.endswith("-r1")
 
@@ -514,18 +531,18 @@ def test_idempotency_holds_however_far_the_fix_has_progressed(q):
     delivery either.
     """
     review_id = _review(q)
-    fix_id = auto_enqueue_fix(q, review_id)
+    fix_id = auto_enqueue_fix(q, review_id, pr_state_fn=_open)
     q.submit_result(fix_id, TaskResult(task_id=fix_id, status="completed",
                                        summary="fixed"))
 
-    assert auto_enqueue_fix(q, review_id) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
     assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 1
 
 
 def test_distinct_reviews_still_get_their_own_fix(q):
     """⛔Idempotency must not collapse two genuinely different rejections."""
-    first = auto_enqueue_fix(q, _review(q))
-    second = auto_enqueue_fix(q, _review(q))
+    first = auto_enqueue_fix(q, _review(q), pr_state_fn=_open)
+    second = auto_enqueue_fix(q, _review(q), pr_state_fn=_open)
 
     assert first is not None and second is not None and first != second
     assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 2
@@ -548,7 +565,7 @@ def test_concurrent_submissions_produce_exactly_one_fix(q, tmp_db):
     def _submit():
         own_queue = TaskQueue(tmp_db)      # a separate connection, as in prod
         start.wait()
-        got = auto_enqueue_fix(own_queue, review_id)
+        got = auto_enqueue_fix(own_queue, review_id, pr_state_fn=_open)
         with lock:
             results.append(got)
 

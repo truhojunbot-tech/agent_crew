@@ -104,7 +104,7 @@ class TestAutoEnqueueReviewNoPRGuard:
     def test_u161_creates_review_when_pr_number_present_but_no_branch(self):
         """If pr_number is set (even with empty branch), review IS created."""
         q, impl_id = _make_queue_with_impl(branch="")
-        review_id = auto_enqueue_review(q, impl_id, pr_number=42)
+        review_id = auto_enqueue_review(q, impl_id, pr_number=42, pr_state_fn=lambda pr: "open")
         assert review_id is not None
 
 
@@ -228,7 +228,7 @@ class TestAutoEnqueueTestPropagatesPrNumber:
     def test_u171_test_context_has_pr_number_when_review_has_it(self):
         """auto_enqueue_test must carry pr_number from the review context to the test task."""
         q, review_id = _make_queue_with_approved_review(pr_number=99)
-        test_id = auto_enqueue_test(q, review_id)
+        test_id = auto_enqueue_test(q, review_id, pr_state_fn=lambda pr: "open")
         assert test_id is not None
 
         tasks = {t.task_id: t for t in q.list_tasks()}
@@ -241,7 +241,7 @@ class TestAutoEnqueueTestPropagatesPrNumber:
     def test_u171_test_context_has_no_pr_number_when_review_missing(self):
         """auto_enqueue_test must not inject pr_number when the review has none."""
         q, review_id = _make_queue_with_approved_review(pr_number=None)
-        test_id = auto_enqueue_test(q, review_id)
+        test_id = auto_enqueue_test(q, review_id, pr_state_fn=lambda pr: "open")
         assert test_id is not None
 
         tasks = {t.task_id: t for t in q.list_tasks()}
