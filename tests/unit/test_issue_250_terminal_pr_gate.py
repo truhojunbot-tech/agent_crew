@@ -620,6 +620,22 @@ def test_a_failed_post_gives_the_claim_back(tmp_db, monkeypatch):
     assert len(posted) == 1, "the retry could not reclaim the announcement"
 
 
+def test_a_false_return_from_post_pr_comment_gives_the_claim_back(tmp_db, monkeypatch):
+    """⛔`post_pr_comment` reports failure by returning False, not by
+    raising (gh missing, repo unresolved, non-zero exit all return False).
+    The default path — no comment_fn override — must treat a False return
+    exactly like an exception: release the claim rather than mark it
+    posted for a comment that never reached the PR."""
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "3")
+    monkeypatch.setattr("agent_crew.github.post_pr_comment", lambda *a, **k: False)
+    q = TaskQueue(tmp_db)
+
+    auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
+                     already_announced_fn=lambda pr, m: False)
+    assert q.pr_announcement_state(PR, "fix_exhausted") is None, \
+        "a False return was treated as success -- claim was not released"
+
+
 def test_a_posted_claim_is_never_released(tmp_db):
     """Releasing a posted claim would re-open the very race it closed."""
     q = TaskQueue(tmp_db)

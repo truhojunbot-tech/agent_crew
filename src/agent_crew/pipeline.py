@@ -497,7 +497,11 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
         else:
             from agent_crew.github import post_pr_comment
 
-            post_pr_comment(pr_number, body)
+            if not post_pr_comment(pr_number, body):
+                raise RuntimeError(
+                    f"post_pr_comment returned False for PR #{pr_number} "
+                    f"(gh not installed, repo unresolved, or gh exited non-zero)"
+                )
     except Exception as e:  # noqa: BLE001
         # ⛔Give the claim back. A failed post that kept its claim would
         #   suppress the escalation forever — the PR would go quiet, which is
