@@ -3,6 +3,7 @@ import os
 import shutil
 import signal
 import socket
+import urllib.parse
 import subprocess
 import sys
 import time
@@ -1016,6 +1017,164 @@ def setup(project: str, agents: str, base: str):
 
     click.echo(f"Setup complete: {project} on port {port}")
     click.echo("Tip: use --agents <name> to spawn only specific agents (e.g. --agents claude)")
+
+
+def _known_projects(base: str) -> list:
+    """Every project under `base` that has a state.json with a port."""
+    root = os.path.expanduser(base)
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for entry in sorted(os.listdir(root)):
+        st = _read_state(base, entry)
+        if st and st.get("port"):
+            out.append((entry, int(st["port"])))
+    return out
+
+
+def _fetch_provenance(port: int, expect: str, timeout: float = 5.0) -> dict:
+    """GET /provenance from a live server.
+
+    Returns the snapshot, or a marker dict describing why there isn't one.
+
+    ⛔A 404 is NOT "unreachable". A server that answers but has no
+      `/provenance` is running a build from before #248 — which is a definite,
+      reportable staleness verdict, and the single most likely thing this tool
+      meets on its first run. Folding that into "unreachable" would understate
+      exactly the condition it was built to surface.
+    """
+    import urllib.error
+    import urllib.parse
+    import urllib.request
+
+    url = f"http://127.0.0.1:{port}/provenance"
+    if expect:
+        url += f"?expect={urllib.parse.quote(expect)}"
+    try:
+        with urllib.request.urlopen(url, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return {"_unavailable": "pre-provenance",
+                    "_reason": "server is up but has no /provenance — it predates #248"}
+        return {"_unavailable": "http_error", "_reason": f"HTTP {e.code}"}
+    except Exception as e:  # noqa: BLE001
+        return {"_unavailable": "unreachable",
+                "_reason": f"unreachable on port {port}: {str(e)[:70]}"}
+
+
+@crew.command()
+@click.argument("project", default="", required=False)
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--expect", default="", help="Ref/SHA the live build must contain, e.g. a merge commit or 'origin/main'")
+@click.option("--json", "as_json", is_flag=True, help="Machine-readable output")
+@click.option("--allow-unreachable", is_flag=True,
+              help="Do not fail the gate for servers that are down (they are still listed)")
+def provenance(project: str, base: str, expect: str, as_json: bool, allow_unreachable: bool):
+    """Report the build each live dispatcher is actually running (#248).
+
+    \b
+      crew provenance                      # every project
+      crew provenance --expect 98d869d     # ...and grade it against a ref
+      crew provenance alpha_engine --json
+
+    Exits non-zero when any target cannot be confirmed current — STALE, UNKNOWN
+    or unreachable alike — so it works as a hard gate in front of a production
+    measurement or a deploy check.
+
+    \b
+    ⛔A server that cannot be ASKED fails the gate. "I could not reach it" is
+      not evidence that it is running the right build; treating it as a pass
+      would let a validation claim a build boundary for a target that might be
+      on any build, or absent. This mirrors `provenance.compare`, where
+      `unknown` is never folded into `current`. Use --allow-unreachable when a
+      down project is expected (e.g. listing a host where old projects linger);
+      it is deliberately explicit rather than the default.
+
+    #247 lost a week of tester economics to a build gap that was invisible
+    without SSHing to the host and reading `git HEAD`. This asks the running
+    process instead — and the answer describes the code it LOADED, so a later
+    `git pull` cannot make a stale server look current.
+
+    \b
+    ⛔Read-only. It never pulls, restarts or repairs anything; deploying stays
+      an operator action with its own safe boundary.
+    """
+    targets = ([(project, (_read_state(base, project) or {}).get("port"))]
+               if project else _known_projects(base))
+    if project and not targets[0][1]:
+        raise click.ClickException(f"project {project!r} has no state.json/port — run setup first.")
+
+    rows, failures = [], []
+    for name, port in targets:
+        snap = _fetch_provenance(int(port), expect)
+        if snap.get("_unavailable"):
+            kind = snap["_unavailable"]
+            # Both are gate failures, for different reasons, and the output
+            # keeps them apart: "up but too old to answer" is a staleness
+            # VERDICT, while "down" is the absence of one. Neither is evidence
+            # that the target is running the expected build (review of PR #249).
+            if kind != "unreachable" or not allow_unreachable:
+                failures.append(f"{name}: {snap.get('_reason', kind)}")
+            rows.append({"project": name, "port": port, "reachable": False,
+                         "status": kind, "reason": snap.get("_reason", "")})
+            continue
+        cmp = snap.get("expected") or {}
+        status = cmp.get("status", "" if not expect else "unknown")
+        drifted = bool(snap.get("source_changed_since_start")
+                       or snap.get("checkout_moved_since_start"))
+        if expect and status != "current":
+            failures.append(f"{name}: {cmp.get('reason') or status}")
+        elif drifted:
+            failures.append(f"{name}: the checkout moved or the loaded source "
+                            f"changed since this process started")
+        rows.append({
+            "project": name, "port": port, "reachable": True,
+            "commit": snap.get("commit", ""), "commit_short": snap.get("commit_short", ""),
+            "ref": snap.get("ref", ""), "dirty": snap.get("dirty"),
+            "code_fingerprint": snap.get("code_fingerprint", ""),
+            "source_root": snap.get("source_root", ""),
+            "started_at": snap.get("started_at"), "uptime_s": snap.get("uptime_s"),
+            "pid": snap.get("pid"),
+            "checkout_commit": snap.get("checkout_commit", ""),
+            "checkout_moved_since_start": snap.get("checkout_moved_since_start"),
+            "source_changed_since_start": snap.get("source_changed_since_start"),
+            "status": status, "reason": cmp.get("reason", ""),
+        })
+
+    if as_json:
+        click.echo(json.dumps(rows, indent=2))
+    else:
+        click.echo(f"{'project':16} {'port':>5} {'commit':10} {'ref':14} {'up(s)':>9}  state")
+        for r in rows:
+            if not r["reachable"]:
+                label = ("STALE (pre-#248 build: no /provenance)"
+                         if r["status"] == "pre-provenance" else r["status"].upper())
+                click.echo(f"{r['project']:16} {str(r['port']):>5} {'-':10} {'-':14} {'-':>9}  {label}")
+                continue
+            flags = []
+            if r["dirty"]:
+                flags.append("dirty")
+            if r["checkout_moved_since_start"]:
+                flags.append("CHECKOUT-MOVED")
+            if r["source_changed_since_start"]:
+                flags.append("SOURCE-CHANGED")
+            if r["status"]:
+                flags.append(r["status"].upper())
+            click.echo(f"{r['project']:16} {str(r['port']):>5} {r['commit_short']:10} "
+                       f"{(r['ref'] or '?'):14} {str(r['uptime_s']):>9}  {' '.join(flags) or 'ok'}")
+            if r["status"] and r["status"] != "current" and r["reason"]:
+                click.echo(f"{'':16} ↳ {r['reason']}")
+            if r["source_changed_since_start"]:
+                click.echo(f"{'':16} ↳ the .py files this process loaded are no longer the "
+                           f"files on disk — restart it to adopt the checkout")
+    if failures:
+        if not as_json:
+            click.echo("")
+            click.echo(f"NOT CONFIRMED CURRENT ({len(failures)}):")
+            for f in failures:
+                click.echo(f"  - {f}")
+        raise SystemExit(1)
 
 
 @crew.command()

@@ -177,6 +177,45 @@ keeps rejecting is a disagreement another round will not settle, and the next
 move is a human's. `crew run` sets `coordinator_managed`, which skips the
 cascade entirely because that loop drives its own transitions.
 
+## Build provenance
+
+Every server reports the build it is **actually running**:
+
+```bash
+crew provenance                        # every project
+crew provenance --expect 98d869d       # ...graded against a ref; exit 1 if any is stale
+curl -s localhost:8105/provenance | jq
+```
+
+```
+project           port commit     ref              up(s)  state
+alpha_engine      8101 6583599    main            12043.2  ok
+quota-core        8106 -          -                     -  STALE (pre-#248 build: no /provenance)
+```
+
+The reported SHA is captured **at process start and frozen**, together with a
+content hash of the `.py` files that were loaded. That distinction is the point:
+a later `git pull` moves the checkout but not the running process, so a
+request-time `git rev-parse HEAD` would report the new SHA and call a stale
+server current. `/provenance` instead reports both, plus
+`checkout_moved_since_start` and `source_changed_since_start`.
+
+This exists because #247 found all four live dispatchers importing an older
+checkout while GitHub `main` already carried the merged context fix — so the fix
+had never executed, and a before/after measurement was about to credit it with
+behaviour it never produced. `build_provenance` is also written to
+`context_events.jsonl` at startup, so a production cohort can be cut on the
+process boundary rather than on a merge time.
+
+`crew provenance` exits non-zero when any target cannot be confirmed current —
+stale, ungradeable, **or unreachable**. A server that cannot be asked is no
+evidence that it runs the expected build, so a provenance-gated validation must
+not go green while one target could be on any build or absent. Pass
+`--allow-unreachable` when a down project is expected; it mutes the gate for
+that case only, never for a server that answered and turned out to be stale.
+
+It is read-only: it never pulls, restarts, or repairs anything.
+
 ## Architecture
 
 - **Push model**: server delivers tasks to agent panes via `tmux send-keys`. Agents do not poll — they receive tasks and POST results back to `POST /tasks/{id}/result`.
