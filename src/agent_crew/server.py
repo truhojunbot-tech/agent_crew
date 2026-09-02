@@ -102,7 +102,7 @@ def _prepare_worktree_for_task(
     task_branch: str,
     role: str,
     task_context: Optional[dict] = None,
-) -> None:
+) -> str:
     """Sync worktree to origin and checkout the right branch before task dispatch.
 
     - All roles: stash local changes, fetch origin (catches stale worktrees that
@@ -119,13 +119,25 @@ def _prepare_worktree_for_task(
     the git prep encounters a transient error (e.g. merge conflict on stash pop).
     """
     try:
-        _prepare_worktree_for_task_inner(worktree_path, task_id, task_branch, role,
-                                         task_context=task_context or {})
+        return _prepare_worktree_for_task_inner(
+            worktree_path, task_id, task_branch, role,
+            task_context=task_context or {}) or ""
     except Exception:
         logger.exception(
             f"_prepare_worktree_for_task: unexpected error for {role} "
             f"task_id={task_id} — continuing"
         )
+        return ""
+
+
+def _worktree_head(worktree_path: str) -> str:
+    """The commit a worktree currently sits on, or "" if it cannot be read."""
+    try:
+        r = subprocess.run(["git", "-C", worktree_path, "rev-parse", "HEAD"],
+                           capture_output=True, text=True, timeout=15)
+        return r.stdout.strip() if r.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def _prepare_worktree_for_task_inner(
@@ -217,6 +229,12 @@ def _prepare_worktree_for_task_inner(
                  f"origin/{main_branch}"],
                 capture_output=True, text=True, timeout=30,
             )
+    # #253: report the commit this worktree was actually prepared at, so a
+    # finding can be attributed to a STATE rather than to a wall-clock moment.
+    # Without it nothing downstream can tell "this review is about the current
+    # head" from "this review is about three commits ago", and a fix task gets
+    # created for work that already exists.
+    return _worktree_head(worktree_path)
 
 
 _DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}
@@ -1210,10 +1228,25 @@ def create_app(
             wt_path = worktree_map.get(role)
             if wt_path:
                 try:
-                    _prepare_worktree_for_task(
+                    _reviewed_sha = _prepare_worktree_for_task(
                         wt_path, task.task_id, task.branch or "", role,
                         task_context=task.context if isinstance(task.context, dict) else {},
                     )
+                    # #253: persist it on the task BEFORE the push, so it also
+                    # reaches the agent in the task block — a reviewer that can
+                    # see which commit it was given can say so in its result,
+                    # and a reviewer that cannot has no way to notice the head
+                    # moved under it.
+                    if _reviewed_sha:
+                        try:
+                            q().patch_context(task.task_id, {"reviewed_sha": _reviewed_sha})
+                            task.context = {**(task.context or {}),
+                                            "reviewed_sha": _reviewed_sha}
+                        except Exception:
+                            logger.exception(
+                                f"_try_push_next: could not record reviewed_sha for "
+                                f"{task.task_id}"
+                            )
                     logger.info(
                         f"_try_push_next: worktree prepared for {role} "
                         f"task_id={task.task_id} branch={task.branch or '(none)'}"
@@ -1897,13 +1930,25 @@ def create_app(
         # Prepare worktree: stash local changes, fetch origin, checkout right branch.
         if not _WORKTREE_SYNC_DISABLED:
             try:
-                _prepare_worktree_for_task(
+                _reviewed_sha = _prepare_worktree_for_task(
                     wt, task.task_id, task.branch or "", role,
                     task_context=task.context if isinstance(task.context, dict) else {},
                 )
+                if _reviewed_sha:
+                    # #253: same record on the headless path, and before the
+                    # prompt is built so the agent is told which commit it got.
+                    try:
+                        q().patch_context(task.task_id, {"reviewed_sha": _reviewed_sha})
+                        task.context = {**(task.context or {}),
+                                        "reviewed_sha": _reviewed_sha}
+                    except Exception:
+                        logger.exception(
+                            f"dispatcher: could not record reviewed_sha for {task.task_id}"
+                        )
                 logger.info(
                     f"dispatcher: worktree prepared for {role} "
-                    f"task_id={task.task_id} branch={task.branch or '(none)'}"
+                    f"task_id={task.task_id} branch={task.branch or '(none)'} "
+                    f"at {(_reviewed_sha or '?')[:9]}"
                 )
             except Exception:
                 logger.exception(
