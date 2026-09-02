@@ -436,3 +436,84 @@ def test_http_result_omitting_the_pr_still_reviews_an_open_pr(tmp_db, monkeypatc
     assert len(reviews) == 1
     assert reviews[0].context["pr_number"] == PR, \
         "the review must carry the resolved PR so the next hop is gated too"
+
+
+# ── 7. the reviewer must read the PR, not whatever `gh` guesses ───────
+#
+# Found while investigating why three consecutive reviews of PR #251 reported
+# "the PR is unchanged" against a branch whose fix was already pushed. The
+# server log said it every time:
+#
+#   WARNING: could not resolve PR #251 head for reviewer review-65d3a728
+#            — falling back to task.branch='main'
+#
+# `_resolve_pr_head_branch` shelled out to `gh` with no cwd, so `gh` resolved
+# the repository from the SERVER process's working directory — the instance
+# directory, which is not a checkout. Resolution failed, prep fell back to the
+# task's base branch, and the reviewer read `main`: code the PR does not
+# contain. A review of the wrong tree looks exactly like a review.
+
+
+def test_pr_head_resolution_runs_inside_the_worktree(monkeypatch):
+    """★The fix: `gh` must be asked from a checkout of the right repository."""
+    import subprocess as sp
+
+    from agent_crew import server as sv
+
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = argv
+        seen["cwd"] = kw.get("cwd")
+
+        class R:
+            returncode = 0
+            stdout = "fix/250-terminal-pr-gate\n"
+            stderr = ""
+
+        return R()
+
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+
+    assert sv._resolve_pr_head_branch(251, cwd="/wt/codex") == "fix/250-terminal-pr-gate"
+    assert seen["cwd"] == "/wt/codex", \
+        "gh was asked from the server's cwd, so it resolves the wrong repository"
+    assert "251" in seen["argv"]
+
+
+def test_worktree_prep_asks_from_the_worktree_being_prepared(monkeypatch, tmp_path):
+    """The seam only helps if the caller actually passes the worktree."""
+    from agent_crew import server as sv
+
+    calls = []
+    monkeypatch.setattr(sv, "_resolve_pr_head_branch",
+                        lambda pr, cwd=None: calls.append((pr, cwd)) or "feat/x")
+    monkeypatch.setattr(sv.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "",
+                                                       "stderr": ""})())
+
+    sv._prepare_worktree_for_task_inner(
+        str(tmp_path), "review-abc", "main", "reviewer", {"pr_number": 251})
+
+    assert calls == [(251, str(tmp_path))]
+
+
+def test_an_unresolvable_pr_head_is_logged_as_an_error(monkeypatch, tmp_path, caplog):
+    """⛔The fallback reviews a ref that is NOT the PR. Nothing downstream says
+    so, so the log has to — at ERROR, not tucked into a warning stream."""
+    import logging
+
+    from agent_crew import server as sv
+
+    monkeypatch.setattr(sv, "_resolve_pr_head_branch", lambda pr, cwd=None: None)
+    monkeypatch.setattr(sv.subprocess, "run",
+                        lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "",
+                                                       "stderr": ""})())
+
+    with caplog.at_level(logging.ERROR, logger="agent_crew.server"):
+        sv._prepare_worktree_for_task_inner(
+            str(tmp_path), "review-abc", "main", "reviewer", {"pr_number": 251})
+
+    errors = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("could not resolve PR #251" in m for m in errors)
+    assert any("MAY NOT BE THE PR'S CODE" in m for m in errors)

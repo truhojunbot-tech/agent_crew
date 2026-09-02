@@ -79,20 +79,35 @@ _WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").low
 _WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
 
 
-def _resolve_pr_head_branch(pr_number: int) -> Optional[str]:
-    """Return the head ref name for a GitHub PR, or None on failure."""
+def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Optional[str]:
+    """Return the head ref name for a GitHub PR, or None on failure.
+
+    ⛔Runs `gh` inside `cwd` — normally the worktree being prepared. Without
+      it, `gh` resolves the repository from the SERVER process's working
+      directory, which is the instance directory and not a checkout at all.
+      It then answers about some other repository (or nothing), this function
+      returns None, and the caller silently falls back to the task's base
+      branch — so a reviewer asked to review a PR reads `main` instead and
+      reports findings about code the PR does not contain. That is not
+      hypothetical: it produced three consecutive "PR #251 is unchanged"
+      reviews of a branch whose fix was already pushed.
+    """
     try:
         r = subprocess.run(
             ["gh", "pr", "view", str(pr_number), "--json", "headRefName",
              "-q", ".headRefName"],
-            capture_output=True, text=True, timeout=15,
+            capture_output=True, text=True, timeout=15, cwd=cwd or None,
         )
         if r.returncode == 0:
             branch = r.stdout.strip()
             if branch:
                 return branch
-    except Exception:
-        pass
+        logger.warning(
+            f"_resolve_pr_head_branch: gh could not resolve PR #{pr_number} "
+            f"(cwd={cwd or os.getcwd()!r}): {(r.stderr or r.stdout).strip()[:200]}"
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"_resolve_pr_head_branch: PR #{pr_number} lookup failed: {e}")
     return None
 
 
@@ -188,7 +203,7 @@ def _prepare_worktree_for_task_inner(
         pr_branch = task_branch  # fallback: base branch from task.branch
         pr_number = task_context.get("pr_number")
         if pr_number:
-            resolved = _resolve_pr_head_branch(int(pr_number))
+            resolved = _resolve_pr_head_branch(int(pr_number), cwd=worktree_path)
             if resolved:
                 pr_branch = resolved
                 logger.info(
@@ -196,9 +211,15 @@ def _prepare_worktree_for_task_inner(
                     f"head → {pr_branch!r} for {role} {task_id}"
                 )
             else:
-                logger.warning(
+                # ⛔ERROR, not warning: the reviewer is about to read a ref that
+                #   is NOT the PR head, and nothing downstream will say so. A
+                #   review of the wrong tree looks exactly like a review.
+                logger.error(
                     f"_prepare_worktree_for_task: could not resolve PR #{pr_number} "
-                    f"head for {role} {task_id} — falling back to task.branch={task_branch!r}"
+                    f"head for {role} {task_id} — falling back to "
+                    f"task.branch={task_branch!r}. THIS MAY NOT BE THE PR'S CODE; "
+                    f"treat any finding from this task as suspect until the ref is "
+                    f"confirmed."
                 )
 
         target_ref = f"origin/{pr_branch}" if pr_branch else f"origin/{main_branch}"
