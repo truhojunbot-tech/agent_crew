@@ -309,3 +309,130 @@ def test_a_github_outage_during_the_handler_loses_nothing(tmp_db, monkeypatch):
         assert c.get("/tasks/review-outage").json()["status"] == "completed"
 
     assert not [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "implement"]
+
+
+# ── 6. the PR a task is ABOUT vs the PR its result names ──────────────
+#
+# Both transports gate on `result.pr_number`, and an agent may simply omit it —
+# while the task context has carried the PR since the task was created. Gating
+# on the reported value alone read "no PR" for a task whose PR was merged and
+# queued a review of a closed artifact (review of PR #251).
+
+
+def _impl_with_context_pr(q, task_id="impl-ctx", pr=PR, reported=None, branch=BRANCH):
+    q.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="impl",
+                          branch=branch, context={"pr_number": pr} if pr else {}))
+    q.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
+                                        summary="done", pr_number=reported))
+    return task_id
+
+
+def test_a_result_that_omits_the_pr_still_hits_the_gate(q):
+    """★The bypass: the PR is merged, the result is silent, the context knows."""
+    impl_id = _impl_with_context_pr(q)
+
+    assert auto_enqueue_review(q, impl_id, None, pr_state_fn=_state("merged")) is None
+    assert not [t for t in q.list_tasks() if t.task_type == "review"]
+
+
+def test_the_resolved_pr_reaches_the_review_context(q):
+    """⛔Not just the gate. A review created with `pr_number: None` leaves the
+    NEXT hop blind for the same reason, so the resolved value has to be written
+    into the context the cascade will read later."""
+    impl_id = _impl_with_context_pr(q)
+
+    review_id = auto_enqueue_review(q, impl_id, None, pr_state_fn=_state("open"))
+
+    review = {t.task_id: t for t in q.list_tasks()}[review_id]
+    assert review.context["pr_number"] == PR
+    assert f"PR #{PR}" in review.context["instructions"]
+
+
+def test_an_explicitly_reported_pr_wins_over_the_context(q):
+    """The result is the fresher fact when it has one."""
+    impl_id = _impl_with_context_pr(q, pr=PR, reported=999)
+
+    review_id = auto_enqueue_review(q, impl_id, 999, pr_state_fn=_state("open"))
+
+    assert {t.task_id: t for t in q.list_tasks()}[review_id].context["pr_number"] == 999
+
+
+def test_a_string_pr_number_in_context_is_still_resolved(q):
+    """Contexts are JSON round-tripped by several producers; "241" is a PR."""
+    q.enqueue(TaskRequest(task_id="impl-str", task_type="implement", description="impl",
+                          branch=BRANCH, context={"pr_number": "241"}))
+    q.submit_result("impl-str", TaskResult(task_id="impl-str", status="completed",
+                                           summary="done"))
+
+    assert auto_enqueue_review(q, "impl-str", None, pr_state_fn=_state("merged")) is None
+
+
+def test_a_task_with_no_pr_anywhere_still_cascades(q):
+    """⛔The resolution must not invent a PR. A task that genuinely has none is
+    still actionable — that is the pre-PR implement→review hop."""
+    impl_id = _impl_with_context_pr(q, task_id="impl-nopr", pr=None)
+
+    assert auto_enqueue_review(q, impl_id, None, pr_state_fn=_state("merged")) is not None
+
+
+def test_http_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeypatch):
+    """★★The regression through the real handler: `POST /tasks/{id}/result`
+    passes `result.pr_number`, which is exactly what an agent may omit."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "merged")
+    push = _Push()
+    with TestClient(_server(tmp_db, push)) as c:
+        c.post("/tasks", json={"task_id": "impl-http", "task_type": "implement",
+                               "description": "impl", "branch": BRANCH, "priority": 3,
+                               "context": {"pr_number": PR}, "project": ""})
+        r = c.post("/tasks/impl-http/result",
+                   json={"task_id": "impl-http", "status": "completed",
+                         "summary": "done", "verdict": None, "findings": [],
+                         "pr_number": None})            # the agent omits it
+        assert r.status_code == 200
+        assert c.get("/tasks/impl-http").json()["status"] == "completed"
+
+    assert not [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"], \
+        "a review was queued for a merged PR because the result omitted pr_number"
+
+
+def test_mcp_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeypatch):
+    """★★Same regression on the MCP transport, which passes the same value."""
+    import asyncio
+
+    from agent_crew.mcp_server import build_mcp_server
+
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "merged")
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="impl-mcp", task_type="implement", description="impl",
+                          branch=BRANCH, context={"pr_number": PR}))
+    q.dequeue(role="implementer")
+
+    mcp = build_mcp_server(tmp_db)
+    fn = mcp._tool_manager._tools["submit_result"].fn
+    kwargs = dict(task_id="impl-mcp", status="completed", summary="done")
+    out = asyncio.run(fn(**kwargs)) if asyncio.iscoroutinefunction(fn) else fn(**kwargs)
+
+    assert out.get("acknowledged") is True, out
+    assert not [t for t in q.list_tasks() if t.task_type == "review"]
+
+
+def test_http_result_omitting_the_pr_still_reviews_an_open_pr(tmp_db, monkeypatch):
+    """⛔And the resolution must not brake the normal path."""
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    push = _Push()
+    with TestClient(_server(tmp_db, push)) as c:
+        c.post("/tasks", json={"task_id": "impl-open", "task_type": "implement",
+                               "description": "impl", "branch": BRANCH, "priority": 3,
+                               "context": {"pr_number": PR}, "project": ""})
+        c.post("/tasks/impl-open/result",
+               json={"task_id": "impl-open", "status": "completed", "summary": "done",
+                     "verdict": None, "findings": [], "pr_number": None})
+
+    reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
+    assert len(reviews) == 1
+    assert reviews[0].context["pr_number"] == PR, \
+        "the review must carry the resolved PR so the next hop is gated too"

@@ -460,6 +460,24 @@ def auto_enqueue_review(
         if not impl_tasks:
             return None
         impl_task = impl_tasks[0]
+        impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
+
+        # ⛔The PR this task is about is not necessarily the one the RESULT
+        #   names. Both transports pass `result.pr_number`, and an agent may
+        #   simply omit it — while the task context has carried the PR since it
+        #   was created. Gating on the argument alone therefore read "no PR"
+        #   for a task whose PR was merged, and cheerfully queued a review of
+        #   a closed artifact (review of PR #251). Resolve the effective PR
+        #   once, and use that everywhere below: the gate, the freshness
+        #   directive, and the review context the next hop is gated on.
+        if pr_number is None:
+            ctx_pr = impl_ctx.get("pr_number")
+            if isinstance(ctx_pr, int) or (isinstance(ctx_pr, str) and ctx_pr.isdigit()):
+                pr_number = int(ctx_pr)
+                logger.info(
+                    f"auto_enqueue_review: {impl_task_id} reported no pr_number; "
+                    f"using #{pr_number} from the task context"
+                )
 
         # #250: reviewing a merged/closed PR cannot change the artifact.
         if _skip_terminal_pr("auto_enqueue_review", impl_task_id, pr_number,
@@ -513,7 +531,6 @@ def auto_enqueue_review(
         # the role's default mapping. Recorded so the rate-limit fallback
         # handler can skip it during reviewer selection (#117 — self-review
         # prevention).
-        impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
         implementer_agent = (
             impl_ctx.get("agent_override")
             or (default_agent_for_role("implementer", pane_map) if pane_map else None)
