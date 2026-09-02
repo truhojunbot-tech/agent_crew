@@ -590,3 +590,191 @@ def test_u_i202_attribution_terminal_state_on_internal_dispatcher_failure(tmp_db
     matching_lines = [e for e in _read_jsonl(os.path.join(str(tmp_path), "attribution.jsonl")) if e.get("task_id") == task_id]
     assert len(matching_lines) >= 2, f"expected dispatch-time + terminal lines, got {matching_lines}"
     assert matching_lines[-1]["status"] == "failed"
+
+
+# ── #235: terminal-outcome durability, the cases #202 left uncovered ──
+#
+# Live audit for #235 found many attribution rows with no terminal outcome
+# on quota-core/quota-ops. Root cause turned out to be process/version
+# skew, not a producer defect: outcome writing arrived in #202/#203
+# (2026-08-21) and a running server only gains it on restart. quota-ops
+# splits perfectly on its own restart boundary — 0/33 of the tasks created
+# before it have an outcome, 13/13 of those after do.
+#
+# The producer is therefore correct, and these are characterization tests
+# that lock that in. #202 already covered plain completion and internal
+# dispatcher failure; the three cases below (retry/recovery, append
+# reconciliation, restart persistence) were the ones with no coverage, so
+# a future regression in them would have been silent.
+
+
+def _dispatch_snapshot(q, attr_jsonl_path, task_id, **kw):
+    """Mirror what _dispatch_task does: in_progress row + JSONL snapshot."""
+    from agent_crew.context_identity import append_attribution_jsonl
+
+    defaults = dict(project="p", agent="claude", role="implementer",
+                    task_type="implement", status="in_progress")
+    defaults.update(kw)
+    q.record_attribution(task_id=task_id, **defaults)
+    append_attribution_jsonl(attr_jsonl_path, q.get_attribution(task_id))
+
+
+def test_u_i235_retry_completion_finalizes_outcome_and_keeps_original_start(
+    tmp_db, tmp_path,
+):
+    """★Case 3 — a task that fails, is requeued, then completes must end with
+    the terminal outcome AND its original started_at (#204's guarantee).
+
+    The retry path re-dispatches, so it is the most plausible way a terminal
+    write could be skipped or a start timestamp clobbered.
+    """
+    from agent_crew.protocol import TaskRequest
+
+    state, wt_paths = _worktree_state(tmp_path)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+    attr_jsonl_path = os.path.join(str(tmp_path), "attribution.jsonl")
+
+    with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1",
+                                 "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
+        app = create_app(db_path=tmp_db, pane_map={}, port=0,
+                         state_path=str(state_file), watchdog_disabled=True,
+                         anomaly_disabled=True)
+        with TestClient(app) as client:
+            q = TaskQueue(tmp_db)
+            q.enqueue(TaskRequest(task_id="retry-1", task_type="implement",
+                                  description="d", context={}))
+            assert q.get_task_status("retry-1") == "pending"
+
+            # ── attempt 1: real dispatch ──────────────────────────────
+            # ⛔The task must actually be dequeued. `requeue()` only rolls
+            #   back rows whose status is 'in_progress', so a test that
+            #   requeues a 'failed' row is a silent no-op and never exercises
+            #   the retry path at all (review-ad60deae).
+            first = q.dequeue(role="implementer")
+            assert first is not None and first.task_id == "retry-1"
+            assert q.get_task_status("retry-1") == "in_progress"
+            _dispatch_snapshot(q, attr_jsonl_path, "retry-1",
+                               worktree_path=str(wt_paths["claude"]),
+                               context_id="ctx-retry-1")
+            first_start = q.get_attribution("retry-1")["started_at"]
+            assert first_start > 0
+
+            # ── transient failure: exactly what the dispatcher does ────
+            # `_dispatch_task` calls requeue() on a still-in_progress task and
+            # returns WITHOUT submitting a result — a transient retry is not a
+            # terminal outcome. Posting a failed result here (as this test
+            # used to) both skips the real transition and makes the later
+            # requeue a no-op.
+            q.requeue("retry-1")
+            assert q.get_task_status("retry-1") == "pending", \
+                "requeue must really roll the task back, not silently no-op"
+
+            # ── attempt 2: dispatched again, then succeeds ─────────────
+            second = q.dequeue(role="implementer")
+            assert second is not None and second.task_id == "retry-1", \
+                "the requeued task must be dequeueable again"
+            assert q.get_task_status("retry-1") == "in_progress"
+            _dispatch_snapshot(q, attr_jsonl_path, "retry-1",
+                               worktree_path=str(wt_paths["claude"]),
+                               context_id="ctx-retry-1")
+
+            resp = client.post("/tasks/retry-1/result", json={
+                "task_id": "retry-1", "status": "completed", "summary": "ok"})
+            assert resp.status_code == 200
+            assert q.get_task_status("retry-1") == "completed"
+
+    row = TaskQueue(tmp_db).get_attribution("retry-1")
+    assert row["outcome"] == "completed", row
+    assert row["status"] == "completed"
+    assert row["completed_at"] >= row["started_at"] > 0
+    # ⛔#204: re-dispatch must not rewrite the original start.
+    assert row["started_at"] == first_start, "retry clobbered the original started_at"
+    assert row["context_id"] == "ctx-retry-1", "retry lost context identity"
+
+
+def test_u_i235_jsonl_reconciles_to_one_task_without_double_counting(
+    tmp_db, tmp_path,
+):
+    """★Case 4 — attribution.jsonl is append-only, so a task legitimately has
+    several lines. A consumer folding by task_id must land on exactly one
+    economic record whose final state is terminal.
+
+    ⛔This is the contract #235 warns about: adding terminal state must not
+      become duplicate attribution for quota-core's consumers.
+    """
+    from agent_crew.protocol import TaskRequest
+
+    state, wt_paths = _worktree_state(tmp_path)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+    attr_jsonl_path = os.path.join(str(tmp_path), "attribution.jsonl")
+
+    with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1",
+                                 "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
+        app = create_app(db_path=tmp_db, pane_map={}, port=0,
+                         state_path=str(state_file), watchdog_disabled=True,
+                         anomaly_disabled=True)
+        with TestClient(app) as client:
+            q = TaskQueue(tmp_db)
+            q.enqueue(TaskRequest(task_id="fold-1", task_type="implement",
+                                  description="d", context={}))
+            _dispatch_snapshot(q, attr_jsonl_path, "fold-1",
+                               worktree_path=str(wt_paths["claude"]),
+                               context_id="ctx-fold-1")
+            client.post("/tasks/fold-1/result", json={
+                "task_id": "fold-1", "status": "completed", "summary": "ok"})
+
+    lines = [e for e in _read_jsonl(attr_jsonl_path) if e.get("task_id") == "fold-1"]
+    assert len(lines) >= 2, "expected append-only start + terminal lines"
+
+    # The documented reconciliation: last line per task_id wins.
+    folded = {}
+    for e in _read_jsonl(attr_jsonl_path):
+        folded[e["task_id"]] = e
+    assert len(folded) == 1, "folding by task_id must yield ONE economic record"
+    assert folded["fold-1"]["outcome"] == "completed"
+    assert folded["fold-1"]["status"] == "completed"
+    # Every line describes the same task/context — no split identity.
+    assert {e["context_id"] for e in lines} == {"ctx-fold-1"}
+    assert {e["started_at"] for e in lines} == {lines[0]["started_at"]}, \
+        "started_at must be stable across appended lines"
+
+
+def test_u_i235_terminal_outcome_survives_a_restart(tmp_db, tmp_path):
+    """★Case 5 — the outcome is durable in SQLite, not just in the process
+    that wrote it. A fresh TaskQueue over the same file must still see it.
+
+    This is the property the #234 audit actually depended on: attribution
+    read back after a dispatcher restart.
+    """
+    from agent_crew.protocol import TaskRequest
+
+    state, wt_paths = _worktree_state(tmp_path)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(state))
+    attr_jsonl_path = os.path.join(str(tmp_path), "attribution.jsonl")
+
+    with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1",
+                                 "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
+        app = create_app(db_path=tmp_db, pane_map={}, port=0,
+                         state_path=str(state_file), watchdog_disabled=True,
+                         anomaly_disabled=True)
+        with TestClient(app) as client:
+            q = TaskQueue(tmp_db)
+            q.enqueue(TaskRequest(task_id="durable-1", task_type="implement",
+                                  description="d", context={}))
+            _dispatch_snapshot(q, attr_jsonl_path, "durable-1",
+                               worktree_path=str(wt_paths["claude"]),
+                               context_id="ctx-durable-1")
+            client.post("/tasks/durable-1/result", json={
+                "task_id": "durable-1", "status": "failed", "summary": "nope",
+                "error_info": {"reason": "agy_quota_exhausted"}})
+
+    # Brand-new objects over the same DB file — the restart.
+    reborn = TaskQueue(tmp_db).get_attribution("durable-1")
+    assert reborn["outcome"] == "failed:agy_quota_exhausted", reborn
+    assert reborn["status"] == "failed"
+    assert reborn["completed_at"] > 0
+    assert reborn["context_id"] == "ctx-durable-1"
+    assert reborn["started_at"] > 0
