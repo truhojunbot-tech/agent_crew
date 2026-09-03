@@ -258,6 +258,22 @@ request-time `git rev-parse HEAD` would report the new SHA and call a stale
 server current. `/provenance` instead reports both, plus
 `checkout_moved_since_start` and `source_changed_since_start`.
 
+A build whose checkout was **dirty at process start** is only confirmed when the
+loaded `.py` files are proven identical to the commit's own tree; otherwise it
+grades `unknown` and fails the gate. Commit ancestry alone would let a process
+executing uncommitted edits claim to be a canonical merge (#256). Dirt that
+cannot reach the loaded code — an edited README, an untracked scratch file —
+still confirms, so the gate does not go permanently red for reasons that cannot
+affect the running bytes.
+
+A build whose checkout was **dirty at process start** is only confirmed when the
+loaded `.py` files are proven identical to the commit's own tree; otherwise it
+grades `unknown` and fails the gate. Commit ancestry alone would let a process
+executing uncommitted edits claim to be a canonical merge (#256). Dirt that
+cannot reach the loaded code — an edited README, an untracked scratch file —
+still confirms, so the gate does not go permanently red for reasons that cannot
+affect the running bytes.
+
 This exists because #247 found all four live dispatchers importing an older
 checkout while GitHub `main` already carried the merged context fix — so the fix
 had never executed, and a before/after measurement was about to credit it with
