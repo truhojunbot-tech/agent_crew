@@ -374,6 +374,73 @@ def _dispatch_timeout_for_role(role: str) -> float:
 #:   downstream `subscriber fell behind updates` mask.
 AGY_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_AGY_CONTEXT_MAX_MB", "64"))
 
+#: Cap on the Claude Code session the worker resumes with `--continue` (#260).
+#: 0 disables.
+#:
+#: ⛔#236/#238 bounded the agy store and nothing else, but `--continue` was
+#:   unconditional for claude and `resume --last` unconditional for codex, so
+#:   those sessions never rotated at all. Measured 2026-09-03: every crew
+#:   worktree had exactly ONE session file since 2026-08-21, alpha_engine's at
+#:   290 MB, and quota-ops sat above 900k cached tokens on 81 of 1095 turns.
+#:   The file size is the store, not the context window — Claude Code compacts
+#:   internally — but a store that never rotates is the thing that keeps the
+#:   window pinned near its ceiling, and it is the signal we can actually see
+#:   from outside the CLI.
+CLAUDE_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CLAUDE_CONTEXT_MAX_MB", "64"))
+
+
+def _claude_home(home=None):
+    import pathlib
+
+    return pathlib.Path(home) if home else pathlib.Path.home() / ".claude"
+
+
+def claude_session_size(cwd: str, *, home=None) -> tuple:
+    """``(bytes, session_id)`` for the Claude Code session bound to ``cwd``.
+
+    Claude Code keys its transcripts by working directory, with `/`, `.` and
+    `_` all folded to `-`:
+
+        /home/u/.agent_crew/worktrees/quota-ops/claude
+        → ~/.claude/projects/-home-u--agent-crew-worktrees-quota-ops-claude/
+
+    The session `--continue` resumes is the most recently written `.jsonl` in
+    that directory. ``(0, "")`` when anything is missing or unreadable —
+    sizing must never break a dispatch.
+    """
+    import re as _re
+
+    try:
+        if not cwd:
+            return (0, "")
+        mangled = _re.sub(r"[/._]", "-", cwd)
+        d = _claude_home(home) / "projects" / mangled
+        if not d.is_dir():
+            return (0, "")
+        sessions = sorted(d.glob("*.jsonl"), key=lambda f: f.stat().st_mtime,
+                          reverse=True)
+        if not sessions:
+            return (0, "")
+        return (sessions[0].stat().st_size, sessions[0].stem)
+    except Exception:  # noqa: BLE001 — sizing must never break a dispatch
+        return (0, "")
+
+
+def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
+    """Is the Claude Code session `--continue` would resume past the cap (#260)?
+
+    Returns ``(over, info)``. Mirrors `agy_context_exceeds_cap` so both
+    providers trip the same downstream path — a forced fresh context, with
+    nothing on disk deleted or mutated.
+    """
+    cap = CLAUDE_CONTEXT_MAX_MB if max_mb is None else max_mb
+    size, session = claude_session_size(cwd, home=home)
+    info = {"bytes": size, "conversation_id": session, "cap_mb": cap,
+            "provider": "claude"}
+    if not cap or cap <= 0 or not size:
+        return (False, info)
+    return (size > cap * 1048576, info)
+
 
 def _agy_home(home=None):
     import pathlib as _p
@@ -1309,6 +1376,10 @@ def create_app(
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id)
 
+    #: How many times a push path found no pane to deliver to. Keyed by path so
+    #: a persistent misconfiguration is loud once and then periodic (#260).
+    _no_pane_warnings: dict = {}
+
     def _try_push_discuss(agent: Optional[str]) -> None:
         """Discuss tasks fan out per agent, not per role. pane_map is expected
         to hold agent-name keys (e.g. 'claude', 'codex', 'gemini') alongside
@@ -1322,7 +1393,21 @@ def create_app(
             )
             return
         if not pane_map or not agent:
-            logger.debug(f"_try_push_discuss: no pane_map or agent")
+            # #260: this was DEBUG, and it repeated forever while tasks kept
+            # completing by other means — so a deployment with an empty
+            # pane_map looked healthy from the logs. Still cheap: warn on the
+            # first occurrence and then every 50th, so a persistent gap is
+            # visible without flooding.
+            _no_pane_warnings["discuss"] = _no_pane_warnings.get("discuss", 0) + 1
+            n = _no_pane_warnings["discuss"]
+            if n == 1 or n % 50 == 0:
+                logger.warning(
+                    f"_try_push_discuss: no pane_map or agent (agent={agent!r}, "
+                    f"pane_map entries={len(pane_map or {})}) — discuss tasks "
+                    f"cannot be pushed; occurrence {n}"
+                )
+            else:
+                logger.debug("_try_push_discuss: no pane_map or agent")
             return
         pane_id = pane_map.get(agent)
         if not pane_id:
@@ -1345,6 +1430,17 @@ def create_app(
             return
 
         logger.info(f"_try_push_discuss: dequeued task_id={task.task_id} for agent={agent}, calling push_fn")
+        # #260: the same oversized-context guard `_try_push_next` has had since
+        # #133. `crew discuss` is the path these panels actually run on, and it
+        # was the one without a check — so the panes that accumulated the most
+        # context were exactly the ones nothing was watching.
+        tok = _pane_token_count(pane_id)
+        if _push_enabled and tok >= _TOKEN_CLEAR_THRESHOLD:
+            logger.info(
+                f"_try_push_discuss: pane {pane_id} has {tok} tokens "
+                f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
+            )
+            _pane_clear_context(pane_id)
         push_fn(pane_id, _format_task_message(task, port))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id)
@@ -1788,15 +1884,22 @@ def create_app(
         _agy_cap_info = {}
         if agent == "gemini":
             _agy_over, _agy_cap_info = agy_context_exceeds_cap(wt)
-            if _agy_over:
-                _force_context_reset = True
-                logger.warning(
-                    "dispatcher: agy context %s for %s is %.1f MB (cap %.0f MB) — "
-                    "forcing a fresh provider conversation (#236)",
-                    _agy_cap_info.get("conversation_id", "?"), wt,
-                    _agy_cap_info.get("bytes", 0) / 1048576.0,
-                    _agy_cap_info.get("cap_mb", 0),
-                )
+        elif agent == "claude":
+            # #260: the same defect on the other provider. `--continue` was
+            # unconditional here, so the session never rotated — one file per
+            # worktree since 2026-08-21, alpha_engine's at 290 MB. Sizing is
+            # provider-specific; everything after this line is not.
+            _agy_over, _agy_cap_info = claude_context_exceeds_cap(wt)
+        if _agy_over:
+            _force_context_reset = True
+            logger.warning(
+                "dispatcher: %s context %s for %s is %.1f MB (cap %.0f MB) — "
+                "forcing a fresh provider conversation (#236, #260)",
+                _agy_cap_info.get("provider", agent),
+                _agy_cap_info.get("conversation_id", "?"), wt,
+                _agy_cap_info.get("bytes", 0) / 1048576.0,
+                _agy_cap_info.get("cap_mb", 0),
+            )
         _ctx_info = q().get_or_create_context(
             project=_project, agent=agent, worktree_path=wt, role=role,
             task_id=task.task_id, force_reset=_force_context_reset,
@@ -1979,11 +2082,17 @@ def create_app(
         log_path = os.path.join(os.path.dirname(db_path), f"dispatch_{role}.log")
 
         if agent == "claude":
-            cmd = [
-                "claude", "-p", message,
-                "--continue", "--dangerously-skip-permissions",
-                "--verbose", "--output-format", "stream-json",
-            ]
+            # #260: resume only when Agent Crew's own context policy says so —
+            # the treatment #236 gave gemini and never gave claude. While
+            # `--continue` was unconditional, a freshly minted context
+            # (generation 1, an operator reset, or a cap trip) still resumed
+            # the provider's old session, so identity and provider state
+            # disagreed and the session could never rotate.
+            cmd = ["claude", "-p", message]
+            if _ctx_info["context_policy"] == "resume":
+                cmd.append("--continue")
+            cmd += ["--dangerously-skip-permissions",
+                    "--verbose", "--output-format", "stream-json"]
         elif agent == "gemini":
             # gemini-cli + oauth-personal stopped serving on 2026-06-18
             # (IneligibleTierError) and the replacement, Antigravity CLI
@@ -2010,11 +2119,19 @@ def create_app(
                 cmd.append("--continue")
             cmd += ["--dangerously-skip-permissions", "--model", _known_model]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
-            cmd = [
-                "codex", "exec", "resume", "--last",
-                "--dangerously-bypass-approvals-and-sandbox",
-                message,
-            ]
+            # #260: policy-aware for the same reason as claude above. Codex has
+            # no per-worktree store to size — `~/.codex/sessions` is partitioned
+            # by date, not by cwd, and `resume --last` means the last session
+            # globally — so there is no cap to apply here, only the reset that
+            # an explicit context_reset or a first-generation context implies.
+            # Sizing codex would need a signal the CLI does not currently expose;
+            # not inventing one.
+            if _ctx_info["context_policy"] == "resume":
+                cmd = ["codex", "exec", "resume", "--last",
+                       "--dangerously-bypass-approvals-and-sandbox", message]
+            else:
+                cmd = ["codex", "exec",
+                       "--dangerously-bypass-approvals-and-sandbox", message]
 
         timeout_secs = _dispatch_timeout_for_role(role)
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")

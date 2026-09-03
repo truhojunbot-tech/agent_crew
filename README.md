@@ -305,6 +305,8 @@ observe (task↔context attribution, retry/fallback lineage, restart recovery).
 | `AGENT_CREW_STATE` | auto | State file path |
 | `AGENT_CREW_DELIVERY` | `tmux` | Task delivery mode (`tmux` or `mcp`) |
 | `AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` | `3` | Automated fix rounds per review lineage (`0` disables auto-fix) |
+| `AGENT_CREW_AGY_CONTEXT_MAX_MB` | `64` | Cap on the agy conversation a tester resumes (`0` disables) |
+| `AGENT_CREW_CLAUDE_CONTEXT_MAX_MB` | `64` | Cap on the Claude Code session a worker resumes (`0` disables) |
 | `AGENT_CREW_MAIN_BRANCH` | `main` | Default main branch name |
 | `GH_TOKEN` / `GITHUB_TOKEN` | — | GitHub API token (for triage/PR features) |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token (for notifications) |
