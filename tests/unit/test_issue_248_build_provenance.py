@@ -286,8 +286,16 @@ def test_provenance_endpoint_grades_against_an_expected_ref(tmp_db):
         stale = c.get("/provenance", params={"expect": "refs/heads/nope"}).json()
 
     assert snap["project"] == "agent_crew" and snap["port"] == 8105
-    assert graded["expected"]["status"] == prov.CURRENT
     assert stale["expected"]["status"] == prov.UNKNOWN
+    # ⛔Keyed off the REAL process, which during development is usually dirty.
+    #   #256 made that unconfirmable on purpose: a working tree with
+    #   uncommitted edits is not the commit it names, and asserting CURRENT
+    #   unconditionally here would re-assert exactly the thing that was wrong.
+    if snap["dirty"]:
+        assert graded["expected"]["status"] == prov.UNKNOWN
+        assert "dirty" in graded["expected"]["reason"]
+    else:
+        assert graded["expected"]["status"] == prov.CURRENT
 
 
 def test_startup_records_the_build_in_the_durable_event_stream(tmp_path):
@@ -553,3 +561,194 @@ def test_identity_falls_back_to_the_state_directory(tmp_path):
     assert snap["identity"]["project"] == "alpha_engine"
     rec = [json.loads(l) for l in open(proj / "context_events.jsonl")]
     assert [e for e in rec if e["event_type"] == "build_provenance"][0]["project"] == "alpha_engine"
+
+
+# ── 7. a dirty build must not be confirmed on ancestry alone (#256) ───
+#
+# #248 captured `dirty` at process start and then never used it when grading.
+# So this state passed:
+#
+#     loaded commit == expected (or a descendant)
+#     dirty == true at process start
+#     checkout_moved_since_start == false
+#     source_changed_since_start == false
+#
+# The process can be executing bytes that never existed in any commit while
+# reporting a SHA that says otherwise — a build that cannot honestly anchor a
+# production A/B cohort, which is the entire purpose of this gate.
+
+
+def _dirty_repo(tmp_path, where):
+    """A checkout that is dirty in a specific place."""
+    repo, pkg = _repo(tmp_path)
+    (repo / "README.md").write_text("hi\n")
+    _run("git", "add", "-A", cwd=repo)
+    _run("git", "commit", "-qm", "readme", cwd=repo)
+    if where == "outside":
+        (repo / "README.md").write_text("edited outside the package\n")
+    elif where == "untracked":
+        (repo / "scratch.txt").write_text("notes\n")
+    elif where == "inside":
+        (pkg / "__init__.py").write_text("VERSION = 999  # local hack\n")
+    return repo, pkg
+
+
+def test_a_build_dirty_in_its_own_source_is_not_confirmed(tmp_path):
+    """★The reported state: matching SHA, no drift after start, still not ours."""
+    repo, pkg = _dirty_repo(tmp_path, "inside")
+    snap = prov.snapshot(build_info=prov.capture(str(pkg)))
+
+    assert snap["dirty"] is True
+    assert snap["checkout_moved_since_start"] is False
+    assert snap["source_changed_since_start"] is False
+
+    result = prov.compare(snap["commit"], snap=snap)
+
+    assert result["status"] == prov.UNKNOWN
+    assert "does not match the commit's tree" in result["reason"]
+
+
+@pytest.mark.parametrize("where", ["outside", "untracked"])
+def test_dirt_that_cannot_reach_the_loaded_code_still_confirms(tmp_path, where):
+    """⛔Not a blanket failure on `dirty`. A checkout is dirty for an edited
+    README or a stray scratch file, and refusing to confirm those would leave
+    the gate permanently red for reasons that cannot affect the running bytes —
+    which teaches operators to ignore it."""
+    repo, pkg = _dirty_repo(tmp_path, where)
+    snap = prov.snapshot(build_info=prov.capture(str(pkg)))
+
+    assert snap["dirty"] is True
+    result = prov.compare(snap["commit"], snap=snap)
+
+    assert result["status"] == prov.CURRENT
+    assert "loaded files match its tree" in result["reason"]
+
+
+def test_a_clean_build_is_unaffected(tmp_path):
+    repo, pkg = _dirty_repo(tmp_path, "clean")
+    snap = prov.snapshot(build_info=prov.capture(str(pkg)))
+
+    assert snap["dirty"] is False
+    assert prov.compare(snap["commit"], snap=snap)["status"] == prov.CURRENT
+
+
+def test_an_unprovable_tree_comparison_is_unknown_not_current(tmp_path, monkeypatch):
+    """⛔When the proof cannot be computed we say so. Falling back to ancestry
+    would restore exactly the false assurance being removed."""
+    repo, pkg = _dirty_repo(tmp_path, "inside")
+    snap = prov.snapshot(build_info=prov.capture(str(pkg)))
+    monkeypatch.setattr(prov, "fingerprint_commit_tree", lambda *a, **k: ("", 0))
+
+    result = prov.compare(snap["commit"], snap=snap)
+
+    assert result["status"] == prov.UNKNOWN
+    assert "could not be compared" in result["reason"]
+
+
+def test_the_tree_fingerprint_matches_the_disk_for_a_clean_checkout(tmp_path):
+    """The two fingerprints must be computed the same way, or the proof is
+    meaningless — it would report every dirty build as unprovable.
+
+    ⛔Several files across nested directories on purpose. `os.walk` and
+      `git ls-tree` do not enumerate in the same order, so a fold that depends
+      on insertion order agrees only by luck — and with a single file it
+      agrees always, which is how a first version of this test passed while
+      the fold was order-dependent.
+    """
+    repo, pkg = _repo(tmp_path)
+    (pkg / "zeta.py").write_text("Z = 26\n")
+    (pkg / "alpha.py").write_text("A = 1\n")
+    (pkg / "sub").mkdir()
+    (pkg / "sub" / "__init__.py").write_text("")
+    (pkg / "sub" / "mid.py").write_text("M = 13\n")
+    (pkg / "sub" / "deep").mkdir()
+    (pkg / "sub" / "deep" / "leaf.py").write_text("L = 12\n")
+    (pkg / "notes.md").write_text("not python\n")
+    _run("git", "add", "-A", cwd=repo)
+    _run("git", "commit", "-qm", "more files", cwd=repo)
+
+    disk, n = prov.fingerprint_source(str(pkg))
+    tree, m = prov.fingerprint_commit_tree(str(repo), _head(repo), "src/agent_crew")
+
+    assert n == 6, "the .py files should be counted, and only those"
+    assert (tree, m) == (disk, n), "disk and tree fingerprints disagree"
+
+
+def test_dirty_stays_visible_in_the_raw_provenance(tmp_path):
+    """#256 asks that the fact keeps being exposed, not hidden by the grading."""
+    repo, pkg = _dirty_repo(tmp_path, "inside")
+
+    snap = prov.snapshot(build_info=prov.capture(str(pkg)))
+
+    assert snap["dirty"] is True
+    assert prov.summary_line(snap).count("+dirty") == 1
+
+
+# ── 8. and the CLI gate must fail on it, end to end ───────────────────
+
+
+def _graded_body(tmp_db, snap, expect):
+    """Run the real `/provenance?expect=` endpoint over `snap`."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    with TestClient(create_app(db_path=tmp_db, pane_map={}, port=8105,
+                               project="agent_crew", watchdog_disabled=True,
+                               anomaly_disabled=True)) as c:
+        import agent_crew.server as sv
+
+        original = sv._prov.snapshot
+        sv._prov.snapshot = lambda **kw: dict(snap, project="agent_crew", port=8105)
+        try:
+            return c.get("/provenance", params={"expect": expect}).json()
+        finally:
+            sv._prov.snapshot = original
+
+
+def _cli_exit(monkeypatch, tmp_path, body):
+    import json as _json
+
+    from click.testing import CliRunner
+
+    from agent_crew import cli as crew_cli
+
+    (tmp_path / "agent_crew").mkdir(exist_ok=True)
+    (tmp_path / "agent_crew" / "state.json").write_text(_json.dumps({"port": 8105}))
+
+    class _R:
+        def read(self): return _json.dumps(body).encode()
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+
+    monkeypatch.setattr("urllib.request.urlopen", lambda *a, **k: _R())
+    return CliRunner().invoke(crew_cli.crew,
+                              ["provenance", "--base", str(tmp_path),
+                               "--expect", body.get("commit", "")])
+
+
+def test_cli_gate_fails_for_a_dirty_build_with_a_matching_sha(tmp_db, tmp_path, monkeypatch):
+    """★★End to end: snapshot → real /provenance grading → CLI exit code."""
+    repo, pkg = _dirty_repo(tmp_path, "inside")
+    snap = prov.snapshot(build_info=prov.capture(str(pkg)))
+    body = _graded_body(tmp_db, snap, snap["commit"])
+
+    assert body["expected"]["status"] == prov.UNKNOWN
+
+    res = _cli_exit(monkeypatch, tmp_path, body)
+
+    assert res.exit_code == 1, "a dirty build passed the provenance gate"
+    assert "NOT CONFIRMED CURRENT" in res.output
+
+
+def test_cli_gate_passes_for_the_clean_counterpart(tmp_db, tmp_path, monkeypatch):
+    """The identical process, clean, must still grade CURRENT and exit 0."""
+    repo, pkg = _dirty_repo(tmp_path, "clean")
+    snap = prov.snapshot(build_info=prov.capture(str(pkg)))
+    body = _graded_body(tmp_db, snap, snap["commit"])
+
+    assert body["expected"]["status"] == prov.CURRENT
+
+    res = _cli_exit(monkeypatch, tmp_path, body)
+
+    assert res.exit_code == 0, res.output
