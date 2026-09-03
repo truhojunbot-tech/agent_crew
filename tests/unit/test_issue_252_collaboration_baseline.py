@@ -35,17 +35,61 @@ def test_the_headless_dispatcher_protocol_carries_it_too(monkeypatch):
     assert BASELINE_HEADING in generate("implementer", "agent_crew", 8105)
 
 
-@pytest.mark.parametrize("rule", [
-    "may already be terminal",      # do not spawn work for a merged/closed PR
-    "cannot verify",                # unverifiable → create nothing
-    "Escalate rather than act",     # irreversible / outward-facing
-    "does not reproduce",           # report, do not re-implement
-])
+#: Every rule the issue makes binding, with the phrases that must survive an
+#: edit. Pinned by CONTENT and per ROLE: the review of PR #254 caught that the
+#: first version asserted only a heading and four phrases, so it missed that
+#: reviewer and tester never received most of the baseline at all.
+BINDING_RULES = {
+    "role boundary": ["Alfred", "quota layer"],
+    "reversibility": ["irreversible", "restarting live dispatchers"],
+    "discovery/proposal/blocker/result": ["discovery", "proposal", "blocker", "result"],
+    "no estimate as measurement": ["estimate as a measurement"],
+    "cross-bot delegation": ["traceable GitHub issue"],
+    "HOLD/VETO/STOP": ["HOLD", "VETO", "STOP"],
+    "quota limits": ["quota"],
+    "no runaway work": ["recursive delegation", "task explosion"],
+    "terminal target": ["already be terminal"],
+    "unverifiable -> create nothing": ["cannot verify"],
+    "non-reproducing finding": ["does not reproduce"],
+    "close with evidence": ["Close with evidence"],
+}
+
+
+@pytest.mark.parametrize("rule,needles", sorted(BINDING_RULES.items()))
 @pytest.mark.parametrize("delivery", ["tmux", "mcp"])
-def test_the_load_bearing_rules_are_present_verbatim(rule, delivery):
-    """⛔Pinned by content, not just by heading. A heading with the rules edited
-    out would pass a presence check and fail the agents."""
-    assert rule in generate("implementer", "agent_crew", 8105, delivery=delivery)
+@pytest.mark.parametrize("role", ["implementer", "reviewer", "tester"])
+def test_every_role_receives_every_binding_rule(role, delivery, rule, needles):
+    """★⛔Per role, because the roles do not read the same file.
+
+    Claude Code merges the repo-root `CLAUDE.md` for the implementer, but codex
+    reads `AGENTS.md` and gemini reads `GEMINI.md` — neither loads the root
+    file. A baseline that lives only there silently binds one role out of
+    three, which is what shipped and what the review caught.
+    """
+    text = generate(role, "agent_crew", 8105, delivery=delivery).lower()
+
+    for needle in needles:
+        assert needle.lower() in text, (
+            f"{role} ({delivery}) never receives the {rule!r} rule — missing {needle!r}"
+        )
+
+
+@pytest.mark.parametrize("rule,needles", sorted(BINDING_RULES.items()))
+def test_the_headless_dispatcher_receives_every_binding_rule(rule, needles, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    text = generate("implementer", "agent_crew", 8105).lower()
+
+    for needle in needles:
+        assert needle.lower() in text, f"dispatcher protocol missing {rule!r}: {needle!r}"
+
+
+def test_the_block_does_not_delegate_authority_to_a_file_two_roles_cannot_read():
+    """⛔The first version said "the full baseline is in the repo-root
+    CLAUDE.md". For codex and gemini that sentence pointed at nothing."""
+    for role in ("reviewer", "tester"):
+        text = generate(role, "agent_crew", 8105)
+        assert "BINDING on its own" in text
+        assert "The full baseline is in the repo-root" not in text
 
 
 def test_the_repo_root_instructions_carry_the_full_baseline():

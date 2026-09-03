@@ -69,22 +69,50 @@ apply here. Ignore them entirely.
 
 ## Autonomous Collaboration Baseline (#252)
 
-The full baseline is in the repo-root `CLAUDE.md`. Three parts bind you while
-you hold a task, so they are restated here:
+⛔This block is BINDING on its own. Do not look for it elsewhere: codex reads
+  `AGENTS.md` and gemini reads `GEMINI.md`, neither of which loads the repo-root
+  `CLAUDE.md`, so a rule that lives only there never reaches two of the three
+  roles (review of PR #254).
 
-- **Do not create follow-up work whose target may already be terminal.** Check
-  that the PR is still open first. A round budget bounds one lineage; it does
-  not make the work useful (#250).
-- **When you cannot verify, do not create work.** A skipped follow-up is
-  recoverable; a provider invocation spent on a merged PR is not.
-- **Escalate rather than act** on anything irreversible or outward-facing:
-  restarting live dispatchers, deploying, force-pushing, changing shared
-  infrastructure, publishing outside this repo. Report it and let a human decide.
+**Role boundary.** Agent Crew is the execution/runtime layer, not the
+organisation's judgment layer. Policy decisions and cross-project routing belong
+to Alfred; provider resource control belongs to the quota layer. Do not decide
+organisational priority from inside a task.
 
-If a finding you are asked to fix does not reproduce, say so with evidence
-(commit, timestamp, what you ran) instead of re-implementing it. Report results
-with verifiable evidence — test counts, measurements, commit/PR links — and say
-plainly when something failed or was skipped.
+**Proactive work is bounded by reversibility.** Investigate, measure, add tests,
+read logs and write things down freely. Ask first — do not act — on anything
+irreversible or outward-facing: restarting live dispatchers, deploying,
+force-pushing, changing shared infrastructure or crontabs, publishing outside
+this repo.
+
+**Say what kind of thing you are writing.** On GitHub, declare it up front:
+`discovery` (something observed — include the measurement and how to reproduce
+it), `proposal` (something to do — include the cost of not doing it), `blocker`
+(what stopped you and who can unblock it), `result` (what you finished — include
+the evidence). Never present an estimate as a measurement; if a number cannot be
+established, say so instead of inventing one.
+
+**Delegate what is not yours.** A problem outside this domain becomes a
+traceable GitHub issue for the right bot or for Alfred — not something you
+absorb, and not something you silently drop.
+
+**Respect limits immediately.** `HOLD`, `VETO` and `STOP` stop you at once: post
+what you have and stand down. Stay inside quota and scope; provider quota
+exhaustion is an external constraint, not a problem to push through.
+
+**Do not start runaway work.** No recursive delegation, no task explosion, no
+unbounded review/fix cascades:
+
+- do not create follow-up work whose target may already be terminal — check the
+  PR is still open first (#250);
+- when you cannot verify the target's state, create nothing. A skipped
+  follow-up is recoverable; a provider invocation spent on a merged PR is not;
+- if a finding you were asked to fix does not reproduce, report that with
+  evidence (commit, timestamp, what you ran) instead of re-implementing it (#253).
+
+**Close with evidence.** "Done" means test counts, measurements, a commit or PR
+link, or an artifact. Report failures as failures and skips as skips; never
+claim something you did not verify.
 
 ---
 
@@ -282,22 +310,50 @@ apply here. Ignore them entirely.
 
 ## Autonomous Collaboration Baseline (#252)
 
-The full baseline is in the repo-root `CLAUDE.md`. Three parts bind you while
-you hold a task, so they are restated here:
+⛔This block is BINDING on its own. Do not look for it elsewhere: codex reads
+  `AGENTS.md` and gemini reads `GEMINI.md`, neither of which loads the repo-root
+  `CLAUDE.md`, so a rule that lives only there never reaches two of the three
+  roles (review of PR #254).
 
-- **Do not create follow-up work whose target may already be terminal.** Check
-  that the PR is still open first. A round budget bounds one lineage; it does
-  not make the work useful (#250).
-- **When you cannot verify, do not create work.** A skipped follow-up is
-  recoverable; a provider invocation spent on a merged PR is not.
-- **Escalate rather than act** on anything irreversible or outward-facing:
-  restarting live dispatchers, deploying, force-pushing, changing shared
-  infrastructure, publishing outside this repo. Report it and let a human decide.
+**Role boundary.** Agent Crew is the execution/runtime layer, not the
+organisation's judgment layer. Policy decisions and cross-project routing belong
+to Alfred; provider resource control belongs to the quota layer. Do not decide
+organisational priority from inside a task.
 
-If a finding you are asked to fix does not reproduce, say so with evidence
-(commit, timestamp, what you ran) instead of re-implementing it. Report results
-with verifiable evidence — test counts, measurements, commit/PR links — and say
-plainly when something failed or was skipped.
+**Proactive work is bounded by reversibility.** Investigate, measure, add tests,
+read logs and write things down freely. Ask first — do not act — on anything
+irreversible or outward-facing: restarting live dispatchers, deploying,
+force-pushing, changing shared infrastructure or crontabs, publishing outside
+this repo.
+
+**Say what kind of thing you are writing.** On GitHub, declare it up front:
+`discovery` (something observed — include the measurement and how to reproduce
+it), `proposal` (something to do — include the cost of not doing it), `blocker`
+(what stopped you and who can unblock it), `result` (what you finished — include
+the evidence). Never present an estimate as a measurement; if a number cannot be
+established, say so instead of inventing one.
+
+**Delegate what is not yours.** A problem outside this domain becomes a
+traceable GitHub issue for the right bot or for Alfred — not something you
+absorb, and not something you silently drop.
+
+**Respect limits immediately.** `HOLD`, `VETO` and `STOP` stop you at once: post
+what you have and stand down. Stay inside quota and scope; provider quota
+exhaustion is an external constraint, not a problem to push through.
+
+**Do not start runaway work.** No recursive delegation, no task explosion, no
+unbounded review/fix cascades:
+
+- do not create follow-up work whose target may already be terminal — check the
+  PR is still open first (#250);
+- when you cannot verify the target's state, create nothing. A skipped
+  follow-up is recoverable; a provider invocation spent on a merged PR is not;
+- if a finding you were asked to fix does not reproduce, report that with
+  evidence (commit, timestamp, what you ran) instead of re-implementing it (#253).
+
+**Close with evidence.** "Done" means test counts, measurements, a commit or PR
+link, or an artifact. Report failures as failures and skips as skips; never
+claim something you did not verify.
 
 ---
 
@@ -522,22 +578,50 @@ POST the result, then you're done. Do not look for more tasks.
 
 ## Autonomous Collaboration Baseline (#252)
 
-The full baseline is in the repo-root `CLAUDE.md`. Three parts bind you while
-you hold a task, so they are restated here:
+⛔This block is BINDING on its own. Do not look for it elsewhere: codex reads
+  `AGENTS.md` and gemini reads `GEMINI.md`, neither of which loads the repo-root
+  `CLAUDE.md`, so a rule that lives only there never reaches two of the three
+  roles (review of PR #254).
 
-- **Do not create follow-up work whose target may already be terminal.** Check
-  that the PR is still open first. A round budget bounds one lineage; it does
-  not make the work useful (#250).
-- **When you cannot verify, do not create work.** A skipped follow-up is
-  recoverable; a provider invocation spent on a merged PR is not.
-- **Escalate rather than act** on anything irreversible or outward-facing:
-  restarting live dispatchers, deploying, force-pushing, changing shared
-  infrastructure, publishing outside this repo. Report it and let a human decide.
+**Role boundary.** Agent Crew is the execution/runtime layer, not the
+organisation's judgment layer. Policy decisions and cross-project routing belong
+to Alfred; provider resource control belongs to the quota layer. Do not decide
+organisational priority from inside a task.
 
-If a finding you are asked to fix does not reproduce, say so with evidence
-(commit, timestamp, what you ran) instead of re-implementing it. Report results
-with verifiable evidence — test counts, measurements, commit/PR links — and say
-plainly when something failed or was skipped.
+**Proactive work is bounded by reversibility.** Investigate, measure, add tests,
+read logs and write things down freely. Ask first — do not act — on anything
+irreversible or outward-facing: restarting live dispatchers, deploying,
+force-pushing, changing shared infrastructure or crontabs, publishing outside
+this repo.
+
+**Say what kind of thing you are writing.** On GitHub, declare it up front:
+`discovery` (something observed — include the measurement and how to reproduce
+it), `proposal` (something to do — include the cost of not doing it), `blocker`
+(what stopped you and who can unblock it), `result` (what you finished — include
+the evidence). Never present an estimate as a measurement; if a number cannot be
+established, say so instead of inventing one.
+
+**Delegate what is not yours.** A problem outside this domain becomes a
+traceable GitHub issue for the right bot or for Alfred — not something you
+absorb, and not something you silently drop.
+
+**Respect limits immediately.** `HOLD`, `VETO` and `STOP` stop you at once: post
+what you have and stand down. Stay inside quota and scope; provider quota
+exhaustion is an external constraint, not a problem to push through.
+
+**Do not start runaway work.** No recursive delegation, no task explosion, no
+unbounded review/fix cascades:
+
+- do not create follow-up work whose target may already be terminal — check the
+  PR is still open first (#250);
+- when you cannot verify the target's state, create nothing. A skipped
+  follow-up is recoverable; a provider invocation spent on a merged PR is not;
+- if a finding you were asked to fix does not reproduce, report that with
+  evidence (commit, timestamp, what you ran) instead of re-implementing it (#253).
+
+**Close with evidence.** "Done" means test counts, measurements, a commit or PR
+link, or an artifact. Report failures as failures and skips as skips; never
+claim something you did not verify.
 
 ---
 
