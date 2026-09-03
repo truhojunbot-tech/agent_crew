@@ -2418,6 +2418,24 @@ def create_app(
         if test_id:
             _try_push_next("tester")
 
+    def _any_worktree_path() -> str:
+        """A worktree that is a checkout of THIS project's repository.
+
+        Used only to resolve the repo slug for `gh`. Any role's worktree will
+        do — they are all checkouts of the same repository — and "" is returned
+        when none is configured, which callers treat as "repository unknown".
+        """
+        try:
+            for role in ("implementer", "reviewer", "tester"):
+                path = (worktree_map or {}).get(role) or ""
+                if path and os.path.isdir(os.path.join(path, ".git")):
+                    return path
+                if path and os.path.exists(os.path.join(path, ".git")):
+                    return path            # linked worktree: .git is a file
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
     def _auto_enqueue_fix(review_task_id: str) -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
@@ -2432,6 +2450,13 @@ def create_app(
                 review_task_id,
                 pane_map=pane_map,
                 server_project=project,
+                # #253 review: name the repository. This process's cwd is the
+                # instance directory, which belongs to a DIFFERENT repo, so any
+                # `gh` call that infers from it asks the wrong one. An agent
+                # worktree is a checkout of the right repository, so it is the
+                # correct place to resolve from when the task context carries
+                # no explicit `repo`.
+                repo_cwd=_any_worktree_path(),
             )
             if fix_id:
                 _try_push_next("implementer")

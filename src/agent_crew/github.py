@@ -18,14 +18,24 @@ def check_gh_installed() -> bool:
         return False
 
 
-def get_repo() -> Optional[str]:
-    """Auto-detect repo from git remote origin."""
+def get_repo(cwd: Optional[str] = None) -> Optional[str]:
+    """Auto-detect repo from git remote origin, inside `cwd`.
+
+    ⛔Pass `cwd` whenever the caller knows which checkout it means. Without it
+      this reads the SERVER process's working directory, which is the instance
+      directory — and that is not merely empty, it is a DIFFERENT repository:
+      from `~/alfred/instances/agent_crew` this returns
+      `truhojunbot-tech/alfred`. A caller that then asks about "PR 251" is
+      asking the wrong repo, which answers nothing, or worse answers about an
+      unrelated PR of the same number (review of PR #255).
+    """
     try:
         result = subprocess.run(
             ["git", "remote", "get-url", "origin"],
             capture_output=True,
             text=True,
             timeout=5,
+            cwd=cwd or None,
         )
         if result.returncode != 0:
             return None
@@ -184,16 +194,20 @@ def post_pr_comment(pr_number: int, body: str, repo: Optional[str] = None) -> bo
 
 
 def pr_head_sha(pr_number: int, repo: Optional[str] = None,
-                timeout: float = 20.0) -> str:
+                timeout: float = 20.0, cwd: Optional[str] = None) -> str:
     """The commit a PR currently points at, or ``""`` when it cannot be read.
 
     Uses the last entry of `--json commits`: this `gh` build has no
     `headRefOid` field, and asking for one fails the whole call.
+
+    `repo` should be supplied by the caller. The `cwd` fallback exists for
+    callers that know a checkout but not its slug; falling through to neither
+    means asking whatever repository the process happens to be standing in.
     """
     if not pr_number or not check_gh_installed():
         return ""
     if not repo:
-        repo = get_repo()
+        repo = get_repo(cwd=cwd)
     if not repo:
         return ""
     try:

@@ -219,3 +219,101 @@ def test_a_prep_failure_yields_no_sha_rather_than_a_wrong_one(monkeypatch, tmp_p
     monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", boom)
 
     assert sv._prepare_worktree_for_task(str(tmp_path), "t", "main", "reviewer") == ""
+
+
+# ── 5. the lookup must name the repository ────────────────────────────
+#
+# The gate is fail-closed, so a lookup that structurally cannot work does not
+# degrade it — it disables the entire review→fix loop. `pr_head_sha` fell back
+# to `get_repo()`, which reads the process's working directory; the server runs
+# in the instance directory, which belongs to a DIFFERENT repository. From
+# there `get_repo()` answers `truhojunbot-tech/alfred`, so "PR 251" was asked of
+# the wrong repo (review of PR #255).
+#
+# These exercise the DEFAULT path — no injected `head_sha_fn` — because
+# injecting one skips exactly the code that was broken.
+
+
+def _fake_gh(recorder, stdout):
+    def run(argv, **kw):
+        recorder.append({"argv": list(argv), "cwd": kw.get("cwd")})
+
+        class R:
+            returncode = 0
+        R.stdout = stdout
+        R.stderr = ""
+        return R()
+    return run
+
+
+def test_the_head_lookup_names_the_repo_from_the_review_context(monkeypatch, q):
+    """★No `head_sha_fn`: the real `gh` argv is inspected."""
+    import agent_crew.github as gh
+
+    calls = []
+    monkeypatch.setattr(gh, "check_gh_installed", lambda: True)
+    monkeypatch.setattr(gh.subprocess, "run",
+                        _fake_gh(calls, '{"commits":[{"oid":"%s"}]}' % NEW))
+
+    rid = f"review-{uuid.uuid4().hex[:8]}"
+    q.enqueue(TaskRequest(task_id=rid, task_type="review", description="review",
+                          branch=BRANCH,
+                          context={"pr_number": PR, "reviewed_sha": OLD,
+                                   "repo": "truhojunbot-tech/agent_crew"}))
+    q.submit_result(rid, TaskResult(task_id=rid, status="completed", summary="s",
+                                    verdict="request_changes", findings=[FINDING],
+                                    pr_number=PR))
+
+    assert auto_enqueue_fix(q, rid) is None, "a superseded review still created work"
+
+    assert calls, "no gh call was made — the default lookup path was skipped"
+    argv = calls[0]["argv"]
+    assert "--repo" in argv and "truhojunbot-tech/agent_crew" in argv, \
+        f"gh was not told which repository to ask: {argv}"
+
+
+def test_a_worktree_supplies_the_repo_when_the_context_does_not(monkeypatch, q):
+    """The server passes a checkout; `gh` must be asked from inside it."""
+    import agent_crew.github as gh
+
+    calls = []
+    monkeypatch.setattr(gh, "check_gh_installed", lambda: True)
+    monkeypatch.setattr(gh.subprocess, "run",
+                        _fake_gh(calls, "git@github.com:org/repo.git\n"))
+
+    from agent_crew.pipeline import review_is_current
+
+    review_is_current({"reviewed_sha": OLD}, PR, repo_cwd="/wt/claude")
+
+    assert calls[0]["cwd"] == "/wt/claude", \
+        "repo detection ran in the process cwd instead of the given checkout"
+
+
+def test_no_known_repo_lets_the_cascade_proceed(q, caplog):
+    """⛔The one place this gate must NOT be fail-closed.
+
+    "We could not reach GitHub" is a transient state worth deferring on. "No
+    repository is configured" is not a state at all — it never resolves, and
+    deferring on it would silently disable every review→fix cascade, which is a
+    far worse failure than the duplicate work the gate prevents.
+    """
+    import logging
+
+    from agent_crew.pipeline import review_is_current
+
+    with caplog.at_level(logging.WARNING, logger="agent_crew.pipeline"):
+        current, why = review_is_current({"reviewed_sha": OLD}, PR)
+
+    assert current is True and "no repo" in why
+    assert any("no repo known" in r.message for r in caplog.records), \
+        "the cascade proceeded without saying why"
+
+
+def test_a_reachable_repo_with_an_unreadable_head_still_defers(q):
+    """Transient failure keeps the conservative behaviour."""
+    from agent_crew.pipeline import review_is_current
+
+    current, why = review_is_current(
+        {"reviewed_sha": OLD, "repo": "org/repo"}, PR, head_sha_fn=lambda pr: "")
+
+    assert current is False and "unknown" in why

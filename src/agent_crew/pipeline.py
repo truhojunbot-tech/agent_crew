@@ -50,7 +50,8 @@ MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
 
 
-def review_is_current(review_ctx: dict, pr_number, *, head_sha_fn=None) -> tuple:
+def review_is_current(review_ctx: dict, pr_number, *, head_sha_fn=None,
+                      repo: str = "", repo_cwd: str = "") -> tuple:
     """``(current, reason)`` — is this review's finding still about the PR head?
 
     A review examines a commit. By the time its result comes back, someone may
@@ -78,13 +79,37 @@ def review_is_current(review_ctx: dict, pr_number, *, head_sha_fn=None) -> tuple
         return (True, "no reviewed_sha recorded")
     if not pr_number:
         return (True, "no pr_number to compare against")
+
+    # ⛔The repository must be named, not inferred from the process's working
+    #   directory. The server runs in the instance directory, which belongs to
+    #   a DIFFERENT repository — `get_repo()` there answers
+    #   `truhojunbot-tech/alfred`, so the head lookup asks the wrong repo about
+    #   this PR number. It returns nothing, this gate reads "unknown", and
+    #   being fail-closed it would then skip EVERY fix cascade for every review
+    #   that recorded a SHA (review of PR #255). Same root cause as the
+    #   reviewer-branch resolution fixed in PR #251: `gh` inheriting a cwd
+    #   nobody chose.
+    repo = repo or (review_ctx or {}).get("repo") or ""
+    if head_sha_fn is None and not repo and not repo_cwd:
+        # ⛔"We have no way to look this up" is NOT the same as "the lookup
+        #   failed". Deferring on a transient GitHub problem is right; deferring
+        #   because the repository was never configured would disable the whole
+        #   review→fix loop silently, which is a far worse failure than the
+        #   duplicate work this gate exists to prevent. Proceed, and say so.
+        logger.warning(
+            f"review_is_current: no repo known for PR #{pr_number} (review context "
+            f"has no 'repo') — cannot compare the reviewed commit, letting the "
+            f"cascade proceed rather than blocking it on a configuration gap"
+        )
+        return (True, "no repo to compare against")
     try:
         if head_sha_fn is not None:
             head = head_sha_fn(int(pr_number)) or ""
         else:
             from agent_crew.github import pr_head_sha
 
-            head = pr_head_sha(int(pr_number)) or ""
+            head = pr_head_sha(int(pr_number), repo=repo or None,
+                               cwd=repo_cwd or None) or ""
     except Exception as e:  # noqa: BLE001 — a lookup never breaks a cascade
         logger.warning(f"review_is_current: head lookup failed for PR #{pr_number}: {e}")
         return (False, "current head unknown")
@@ -184,6 +209,8 @@ def auto_enqueue_fix(
     server_project: Optional[str] = None,
     comment_fn=None,
     head_sha_fn=None,
+    repo: str = "",
+    repo_cwd: str = "",
 ) -> Optional[str]:
     """Create the fix task that follows a ``request_changes`` review (#244).
 
@@ -260,7 +287,9 @@ def auto_enqueue_fix(
         # #253: the finding has to be about the CURRENT code, not about a state
         # that has already been fixed. Checked before the round budget so a
         # stale review neither spends a round nor announces anything.
-        current, why = review_is_current(review_ctx, pr_number, head_sha_fn=head_sha_fn)
+        current, why = review_is_current(
+            review_ctx, pr_number, head_sha_fn=head_sha_fn,
+            repo=repo or "", repo_cwd=repo_cwd or "")
         if not current:
             logger.info(
                 f"auto_enqueue_fix: {review_task_id} reviewed a state that is no longer "
