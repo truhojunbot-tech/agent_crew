@@ -1956,12 +1956,26 @@ def create_app(
             if _block:
                 message = _block + "\n\n" + message
             try:
+                # ⛔Merged, not splatted alongside explicit kwargs. `telemetry()`
+                #   already carries `role`, so passing `role=role` here raised
+                #   `TypeError: got multiple values for keyword argument 'role'`
+                #   on EVERY dispatch — swallowed by the except below, so the
+                #   feature recorded nothing at all and said nothing about it
+                #   (#258, found by quota-core while building the consumer).
+                #   Building one dict makes the collision impossible rather than
+                #   merely absent: the next key added to telemetry() cannot
+                #   silently switch this off again.
+                _event_fields = {
+                    "task_id": task.task_id,
+                    "project": _project,
+                    "role": role,
+                    "agent": agent,
+                    "context_id": _ctx_info["context_id"],
+                    "context_generation": _ctx_info["context_generation"],
+                }
+                _event_fields.update(_pack.telemetry())
                 record_context_event(
-                    _context_events_path, "context_pack_built",
-                    task_id=task.task_id, project=_project, role=role, agent=agent,
-                    context_id=_ctx_info["context_id"],
-                    context_generation=_ctx_info["context_generation"],
-                    **_pack.telemetry(),
+                    _context_events_path, "context_pack_built", **_event_fields,
                 )
                 # Durable linkage: the pack that produced this dispatch is
                 # recorded on the task, so a terminal outcome can be attributed
