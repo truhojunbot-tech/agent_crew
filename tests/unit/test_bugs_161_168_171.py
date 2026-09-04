@@ -429,7 +429,7 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
         queue = TaskQueue(tmp_db)
         assert len(_retry_ids_for(queue, "review-216c")) == 1
 
-    def test_u216_branch_has_pr_not_called_when_pr_number_already_known(self, tmp_db):
+    def test_u216_branch_has_pr_not_called_when_pr_number_already_known(self, tmp_db, github_writes):
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         payload = _review_task_payload("review-216d", "agent/claude/known-pr")
         payload["context"] = {"pr_number": 42}
