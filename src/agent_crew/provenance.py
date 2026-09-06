@@ -78,16 +78,9 @@ def source_root() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def fingerprint_source(root: str) -> tuple:
-    """``(hex, file_count)`` over the package's ``.py`` files.
-
-    Content-addressed rather than mtime-based: a `git pull` that restores a
-    file to identical bytes is genuinely not a change, and a checkout with
-    uncommitted edits is genuinely not its HEAD. The path is hashed with the
-    content so a moved or deleted file registers.
-    """
-    h = hashlib.sha256()
-    n = 0
+def _digest_map(root: str) -> Optional[dict]:
+    """``{relative path: sha256}`` for the package's ``.py`` files on disk."""
+    out = {}
     try:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
@@ -100,13 +93,72 @@ def fingerprint_source(root: str) -> tuple:
                         data = f.read()
                 except OSError:
                     continue
-                h.update(os.path.relpath(path, root).encode())
-                h.update(b"\0")
-                h.update(hashlib.sha256(data).digest())
-                n += 1
+                out[os.path.relpath(path, root)] = hashlib.sha256(data).hexdigest()
     except Exception:  # noqa: BLE001
+        return None
+    return out
+
+
+def _fold(digests: Optional[dict]) -> tuple:
+    """``(hex, file_count)`` over a digest map, order-independent.
+
+    Folded from a SORTED map rather than from traversal order so that a
+    fingerprint taken from the filesystem and one taken from a git tree are
+    comparable — which is what lets a dirty checkout prove its loaded bytes
+    still match the commit it claims (#256).
+    """
+    if digests is None:
         return ("", 0)
-    return (h.hexdigest(), n)
+    h = hashlib.sha256()
+    for rel in sorted(digests):
+        h.update(rel.encode())
+        h.update(b"\0")
+        h.update(digests[rel].encode())
+        h.update(b"\0")
+    return (h.hexdigest(), len(digests))
+
+
+def fingerprint_source(root: str) -> tuple:
+    """``(hex, file_count)`` over the package's ``.py`` files.
+
+    Content-addressed rather than mtime-based: a `git pull` that restores a
+    file to identical bytes is genuinely not a change, and a checkout with
+    uncommitted edits is genuinely not its HEAD. The path is hashed with the
+    content so a moved or deleted file registers.
+    """
+    return _fold(_digest_map(root))
+
+
+def fingerprint_commit_tree(repo: str, commit: str, rel_root: str) -> tuple:
+    """The same fingerprint, computed over `commit`'s tree instead of the disk.
+
+    ⛔This is what "content-equivalence proven" means in `compare()`. A
+      checkout is marked dirty by ANY uncommitted change — an edited README, a
+      stray notebook — and refusing to confirm such a build would leave the
+      gate permanently red for reasons that cannot affect the running code.
+      Comparing the loaded `.py` files against the commit's own tree separates
+      "dirty somewhere" from "dirty in the bytes this process is executing".
+    """
+    if not repo or not commit or not rel_root:
+        return ("", 0)
+    listing = _git(["ls-tree", "-r", "--name-only", commit, "--", rel_root], repo)
+    if not listing:
+        return ("", 0)
+    digests = {}
+    for path in listing.splitlines():
+        path = path.strip()
+        if not path.endswith(".py"):
+            continue
+        try:
+            r = subprocess.run(["git", "-C", repo, "show", f"{commit}:{path}"],
+                               capture_output=True, timeout=GIT_TIMEOUT_S)
+        except Exception:  # noqa: BLE001
+            return ("", 0)
+        if r.returncode != 0:
+            return ("", 0)
+        rel = os.path.relpath(path, rel_root)
+        digests[rel] = hashlib.sha256(r.stdout).hexdigest()
+    return _fold(digests)
 
 
 def _package_version() -> str:
@@ -249,6 +301,31 @@ def compare(expected_ref: str, *, snap: Optional[dict] = None) -> dict:
                 "loaded": loaded, "expected": expected}
     if r.returncode == 0:
         status, reason = CURRENT, f"loaded build contains {expected_ref}"
+        # ⛔Commit ancestry is not enough when the checkout was dirty at start.
+        #   The process may be executing bytes that never existed in any
+        #   commit, while the SHA it reports says otherwise — a build that
+        #   cannot honestly anchor a production A/B cohort, which is the whole
+        #   purpose of this gate (#256). Confirm it only if the loaded `.py`
+        #   files actually match the commit's own tree; otherwise say we cannot
+        #   tell, which the CLI treats as a failure rather than a pass.
+        if snap.get("dirty"):
+            rel = os.path.relpath(snap.get("source_root") or "",
+                                  snap.get("repo_root") or "") or "."
+            tree_fp, _ = fingerprint_commit_tree(repo, loaded, rel)
+            loaded_fp = snap.get("code_fingerprint") or ""
+            if tree_fp and loaded_fp and tree_fp == loaded_fp:
+                reason += " (checkout dirty, but the loaded files match its tree)"
+            elif tree_fp and loaded_fp:
+                return {"status": UNKNOWN, "loaded": loaded, "expected": expected,
+                        "reason": "the checkout was dirty at process start and the "
+                                  "loaded source does not match the commit's tree — "
+                                  "this process is running bytes that are not "
+                                  f"{loaded[:9]}"}
+            else:
+                return {"status": UNKNOWN, "loaded": loaded, "expected": expected,
+                        "reason": "the checkout was dirty at process start and the "
+                                  "loaded source could not be compared with the "
+                                  "commit's tree"}
     elif r.returncode == 1:
         status, reason = STALE, f"loaded build predates {expected_ref}"
     else:
