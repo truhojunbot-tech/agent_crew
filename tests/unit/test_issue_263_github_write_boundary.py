@@ -125,3 +125,116 @@ def test_the_fixture_pr_number_is_not_a_real_pr():
         "the terminal-PR fixtures name a plausible real PR again; use a number "
         "that cannot exist in this repo"
     )
+
+
+# ── the live_github marker is a request, not permission (review of PR #264) ──
+#
+# The first version yielded immediately for any test carrying the marker: no
+# stubs, no env gate, no target check. A normal `pytest` run would therefore
+# write to the production repo as soon as one test opted itself out — the same
+# hole, self-service.
+
+
+from tests.conftest import (  # noqa: E402
+    DISPOSABLE_REPO_PATTERN,
+    LIVE_GITHUB_ENV,
+    LIVE_GITHUB_REPO_ENV,
+    live_github_approval,
+)
+
+PROD = "truhojunbot-tech/agent_crew"
+
+
+@pytest.mark.parametrize("env,expected_reason", [
+    ({}, "not set"),
+    ({LIVE_GITHUB_ENV: "1"}, "LIVE_GITHUB_REPO"),
+    ({LIVE_GITHUB_ENV: "0", LIVE_GITHUB_REPO_ENV: "org/sandbox"}, "not set"),
+    ({LIVE_GITHUB_ENV: "1", LIVE_GITHUB_REPO_ENV: PROD}, "own repository"),
+    ({LIVE_GITHUB_ENV: "1", LIVE_GITHUB_REPO_ENV: "org/prod"}, "does not look disposable"),
+])
+def test_live_writes_are_refused_without_explicit_approval(env, expected_reason):
+    """★Absence is refusal. Each condition is separately required."""
+    approved, why = live_github_approval(env=env, production_repo=PROD)
+
+    assert approved is False
+    assert expected_reason in why
+
+
+def test_a_named_disposable_target_is_approved():
+    """⛔The gate has to be passable, or the escape hatch is a lie and someone
+    will delete it rather than use it."""
+    approved, why = live_github_approval(
+        env={LIVE_GITHUB_ENV: "1", LIVE_GITHUB_REPO_ENV: "org/crew-sandbox"},
+        production_repo=PROD)
+
+    assert approved is True and "crew-sandbox" in why
+
+
+def test_the_production_repo_never_matches_the_disposable_pattern():
+    """⛔The name check is mechanical, so it is worth asserting it actually
+    excludes the repository this suite runs against."""
+    assert not DISPOSABLE_REPO_PATTERN.search(PROD)
+
+
+def test_an_unapproved_live_github_test_is_skipped_and_still_blocked(tmp_path):
+    """★★End to end: a marked test on a normal run must neither write nor pass
+    quietly. Run in-process as a throwaway file, because what matters is what
+    pytest actually does with the marker — not what the fixture source says.
+    """
+    import pathlib
+    import subprocess
+    import sys
+    import textwrap
+
+    probe = pathlib.Path("tests/unit/test_tmp_live_probe.py")
+    probe.write_text(textwrap.dedent('''
+        import pytest
+
+        @pytest.mark.live_github
+        def test_wants_to_write_for_real():
+            import agent_crew.github as gh
+            gh.post_pr_comment(241, "this must never reach GitHub")
+    '''))
+    env = {k: v for k, v in __import__("os").environ.items()
+           if k not in (LIVE_GITHUB_ENV, LIVE_GITHUB_REPO_ENV)}
+    try:
+        r = subprocess.run([sys.executable, "-m", "pytest", str(probe), "-q", "-rs"],
+                           capture_output=True, text=True, timeout=180, env=env)
+        assert r.returncode == 0, r.stdout + r.stderr      # skipped, not failed
+        combined = r.stdout + r.stderr
+        assert "skipped" in combined
+        assert "not approved" in combined, (
+            "an unapproved live_github test ran instead of being skipped"
+        )
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_the_unapproved_stub_refuses_and_explains():
+    """The belt behind the brace.
+
+    An unapproved `live_github` test is SKIPPED, which is the control that
+    actually runs — the test above proves it. The fixture additionally installs
+    a refusing stub for that case, which no skipped test can reach, so it is
+    covered here directly rather than left as an untested line. It exists for
+    the day a plugin or refactor makes a skipped test's body run anyway.
+    """
+    from tests.conftest import _blocked_live
+
+    with pytest.raises(GitHubWriteFromTest, match="UNAPPROVED"):
+        _blocked_live("post_pr_comment", "AGENT_CREW_ALLOW_LIVE_GITHUB is not set")(1, "x")
+
+
+def test_the_unapproved_stub_refuses_and_explains():
+    """The belt behind the brace.
+
+    An unapproved `live_github` test is SKIPPED, which is the control that
+    actually runs — the test above proves it. The fixture additionally installs
+    a refusing stub for that case, which no skipped test can reach, so it is
+    covered here directly rather than left as an untested line. It exists for
+    the day a plugin or refactor makes a skipped test's body run anyway.
+    """
+    from tests.conftest import _blocked_live
+
+    with pytest.raises(GitHubWriteFromTest, match="UNAPPROVED"):
+        _blocked_live("post_pr_comment", "AGENT_CREW_ALLOW_LIVE_GITHUB is not set")(1, "x")

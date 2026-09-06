@@ -1,3 +1,5 @@
+import os
+import re
 import shutil
 import subprocess
 from unittest.mock import patch
@@ -25,6 +27,70 @@ GITHUB_WRITE_FUNCTIONS = (
 
 class GitHubWriteFromTest(AssertionError):
     """Raised when the suite tries to mutate a real GitHub object."""
+
+
+#: Environment gate for tests that genuinely need the live write path. Default
+#: off: absence is refusal, not permission.
+LIVE_GITHUB_ENV = "AGENT_CREW_ALLOW_LIVE_GITHUB"
+#: The repository such a test is allowed to write to. Must be named explicitly;
+#: "whatever repo the checkout points at" is exactly the wrong default.
+LIVE_GITHUB_REPO_ENV = "AGENT_CREW_LIVE_GITHUB_REPO"
+#: A disposable target has to look disposable. This is a mechanical check, not
+#: a guarantee — but it stops the most likely accident, which is pointing the
+#: opt-in at the production repo because that is what is already configured.
+DISPOSABLE_REPO_PATTERN = re.compile(
+    r"(sandbox|scratch|disposable|throwaway|fixture|-test$|_test$)", re.IGNORECASE)
+
+
+def _gh():
+    import agent_crew.github as gh
+
+    return gh
+
+
+def live_github_approval(env=None, production_repo=None) -> tuple:
+    """``(approved, reason)`` for running a `live_github` test.
+
+    Three conditions, all required:
+
+      * `AGENT_CREW_ALLOW_LIVE_GITHUB` is truthy — an operator said yes, on
+        this run, out loud;
+      * `AGENT_CREW_LIVE_GITHUB_REPO` names the target — never inferred;
+      * that target is not the repository this checkout points at, and its name
+        marks it as disposable.
+
+    The second and third exist because the first is easy to leave switched on.
+    """
+    env = os.environ if env is None else env
+    if str(env.get(LIVE_GITHUB_ENV, "")).strip().lower() not in ("1", "true", "yes", "on"):
+        return (False, f"{LIVE_GITHUB_ENV} is not set")
+    target = str(env.get(LIVE_GITHUB_REPO_ENV, "")).strip()
+    if not target:
+        return (False, f"{LIVE_GITHUB_REPO_ENV} is not set — a live test must "
+                       f"name its disposable target")
+    if production_repo is None:
+        try:
+            production_repo = _gh().get_repo(
+                cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        except Exception:  # noqa: BLE001
+            production_repo = None
+    if production_repo and target == production_repo:
+        return (False, f"{LIVE_GITHUB_REPO_ENV}={target!r} is this checkout's own "
+                       f"repository, not a disposable target")
+    if not DISPOSABLE_REPO_PATTERN.search(target):
+        return (False, f"{LIVE_GITHUB_REPO_ENV}={target!r} does not look disposable "
+                       f"(expected one of sandbox/scratch/disposable/throwaway/"
+                       f"fixture/-test)")
+    return (True, f"approved for {target}")
+
+
+def _blocked_live(name, why):
+    def _raise(*args, **kwargs):
+        raise GitHubWriteFromTest(
+            f"agent_crew.github.{name}() was called from an UNAPPROVED "
+            f"live_github test: {why}"
+        )
+    return _raise
 
 
 @pytest.fixture
@@ -59,6 +125,18 @@ def _no_github_writes(request, github_writes_recorder, monkeypatch):
         smoke test that must point at a disposable target.
     """
     if "live_github" in request.keywords:
+        approved, why = live_github_approval()
+        if not approved:
+            # ⛔The marker is a REQUEST, not permission. Left as a bare escape,
+            #   any test could opt itself out of the boundary and a normal
+            #   `pytest` run would write to the production repo again — the
+            #   exact hole this whole guard exists to close (review of PR #264).
+            #   Unapproved means skipped AND still stubbed: if some future
+            #   collection path runs it anyway, it still cannot write.
+            for name in GITHUB_WRITE_FUNCTIONS:
+                if hasattr(_gh(), name):
+                    monkeypatch.setattr(_gh(), name, _blocked_live(name, why))
+            pytest.skip(f"live_github test not approved: {why}")
         yield
         return
 

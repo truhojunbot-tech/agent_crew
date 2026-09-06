@@ -42,3 +42,21 @@ distinguishable by task id; the organic automation on the same PR uses
 They have **not** been deleted. Removing 228 comments from a real PR is an
 irreversible edit to project history, and it is an operator's call rather than
 something this repository's automation should do to itself.
+
+## The opt-in, and why it is gated (review of PR #264)
+
+`@pytest.mark.live_github` was originally a bare escape: a marked test got no
+stubbing, on a normal run, with no target check. That is the same hole in
+self-service form — any test could opt itself out and write to the production
+repo.
+
+A marked test now runs only when all three hold:
+
+| condition | why |
+|---|---|
+| `AGENT_CREW_ALLOW_LIVE_GITHUB=1` | an operator said yes on this run, out loud |
+| `AGENT_CREW_LIVE_GITHUB_REPO=<owner/name>` | the target is named, never inferred |
+| that target is not this checkout's repo, and its name marks it disposable | the likely accident is pointing the opt-in at whatever is already configured |
+
+Otherwise the test is **skipped** with the reason, and the write functions stay
+stubbed for it regardless.
