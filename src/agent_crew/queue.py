@@ -548,11 +548,22 @@ class TaskQueue:
             error_info_json = None
             if result.status in ("failed", "timed_out") and result.error_info:
                 error_info_json = json.dumps(result.error_info)
+            # ⛔`status_changed_at` moves only when the status actually moves.
+            #   Stamping it on every submission made a duplicate same-status
+            #   POST look like a revision, and the whole point of the field is
+            #   that a consumer can read it as "the verdict I saw was revised"
+            #   (#265). A field that fires when nothing changed is worse than no
+            #   field: it manufactures exactly the false signal it was added to
+            #   remove. The CASE compares against the stored value inside the
+            #   same statement, so a concurrent writer cannot slip between a
+            #   read and a write.
             conn.execute(
                 """
                 UPDATE tasks
                 SET status = ?, summary = ?, verdict = ?, findings = ?, pr_number = ?,
-                    error_info = ?, status_changed_at = ?
+                    error_info = ?,
+                    status_changed_at = CASE WHEN status = ? THEN status_changed_at
+                                             ELSE ? END
                 WHERE task_id = ?
                 """,
                 (
@@ -562,6 +573,7 @@ class TaskQueue:
                     json.dumps(result.findings),
                     result.pr_number,
                     error_info_json,
+                    result.status,
                     time.time(),
                     task_id,
                 ),

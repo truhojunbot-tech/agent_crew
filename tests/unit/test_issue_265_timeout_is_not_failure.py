@@ -237,6 +237,48 @@ def test_status_changed_at_moves_when_the_verdict_is_revised(tmp_db):
     assert first > 0 and second > first
 
 
+def test_a_duplicate_same_status_result_does_not_look_like_a_revision(tmp_db):
+    """★⛔The field's whole purpose is "the verdict you saw was revised".
+
+    Stamping it on every submission made a duplicate same-status POST — a
+    retried delivery, a worker POSTing twice — indistinguishable from a real
+    revision. A signal that fires when nothing changed is worse than no signal:
+    it manufactures exactly the false reading it was added to remove.
+    """
+    q = TaskQueue(tmp_db)
+    tid = _in_progress(q)
+
+    def _stamp():
+        return next(t for t in q.list_tasks() if t.task_id == tid).status_changed_at
+
+    q.submit_result(tid, TaskResult(task_id=tid, status="timed_out",
+                                    summary="dispatcher_timeout",
+                                    error_info={"reason": "dispatcher_timeout"}))
+    first = _stamp()
+    assert first > 0
+
+    time.sleep(0.02)
+    q.submit_result(tid, TaskResult(task_id=tid, status="timed_out",
+                                    summary="dispatcher_timeout",
+                                    error_info={"reason": "dispatcher_timeout"}))
+
+    assert _stamp() == first, "a repeated same-status result moved the clock"
+
+
+def test_the_other_fields_still_update_on_a_repeat(tmp_db):
+    """⛔Freezing the timestamp must not freeze the row. A worker that POSTs
+    again with a fuller summary should still have it recorded."""
+    q = TaskQueue(tmp_db)
+    tid = _in_progress(q)
+
+    q.submit_result(tid, TaskResult(task_id=tid, status="completed", summary="first"))
+    q.submit_result(tid, TaskResult(task_id=tid, status="completed", summary="fuller",
+                                    pr_number=5517))
+
+    task = next(t for t in q.list_tasks() if t.task_id == tid)
+    assert task.summary == "fuller" and task.pr_number == 5517
+
+
 def test_the_late_result_is_still_accepted_and_durable(tmp_db, tmp_path):
     """⛔Announcing the revision must not mean rejecting it. The work was real;
     the record has to reflect it."""
