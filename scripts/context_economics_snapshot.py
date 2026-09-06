@@ -25,6 +25,20 @@ So this reports four things together, and refuses to report any of them alone:
   forbid manufacturing a sample — do not "help" this script by lowering a cap
   or inflating a session; a bounded-growth window is a real result.
 
+⛔"Refuses" is load-bearing and has to hold when the environment is broken, not
+  only when it is healthy. If the cap functions cannot be imported *from this
+  checkout*, the script raises `SnapshotUnavailable`, prints nothing and exits
+  non-zero. It used to catch that ImportError, return no sizes and still emit a
+  complete-looking snapshot with exit 0 (review of PR #271) — so a stale
+  install could pass a post-deploy verification with no cap data at all, and
+  the only signal was one stderr line that a `2>/dev/null` redirect eats. The
+  run that produced this repo's own baseline artifact used exactly that
+  redirect.
+
+  Per-project degradations are different and are *recorded* rather than
+  refused: a project predating the context-identity schema appears in the
+  output with its `error`, because that is a fact about the fleet.
+
 Usage:  python3 scripts/context_economics_snapshot.py [--json] [--days N]
 """
 from __future__ import annotations
@@ -99,22 +113,77 @@ def running_dispatchers() -> list[dict]:
     return out
 
 
-def provider_sizes() -> list[dict]:
-    """Store/rollout size per worktree, via the dispatcher's own cap functions."""
-    logging.disable(logging.CRITICAL)
+class SnapshotUnavailable(RuntimeError):
+    """The snapshot cannot be produced truthfully, so it will not be produced.
+
+    Distinct from a partial result on purpose. Missing cap data is not a
+    smaller answer to #269's criteria 3 and 4 — it is no answer, and an
+    artifact that omits it while looking complete is worse than no artifact.
+    """
+
+
+def expected_package_dir() -> str:
+    """``src/agent_crew`` next to this script — the checkout being verified."""
+    return os.path.realpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), os.pardir, "src", "agent_crew"))
+
+
+def cap_functions() -> dict:
+    """The dispatcher's own cap functions, or refuse to run.
+
+    ⛔Two failures, one refusal. The import can fail outright, and it can
+      *succeed against the wrong tree* — a bare `python3` inside an agent
+      worktree here resolves `agent_crew` to a stale editable install elsewhere
+      on the box, which is the more dangerous case because it yields numbers
+      that look right. Measuring with code other than the checkout under
+      verification is the #248 mistake in miniature, so both are hard failures.
+    """
+    hint = (f"Run `PYTHONPATH=src python3 scripts/{os.path.basename(__file__)}` "
+            f"from the checkout you mean to measure.")
     try:
-        from agent_crew.server import (  # noqa: PLC0415 — import cost is the point
+        import agent_crew  # noqa: PLC0415 — resolution is what we are checking
+        from agent_crew.server import (  # noqa: PLC0415
             AGY_CONTEXT_MAX_MB, CLAUDE_CONTEXT_MAX_MB, CODEX_CONTEXT_MAX_MB,
             agy_context_exceeds_cap, claude_context_exceeds_cap,
             codex_context_exceeds_cap, codex_session_for_cwd,
         )
     except ImportError as e:
-        print(f"cannot import agent_crew.server ({e}); run from a checkout that "
-              f"has #261, since the point is to measure what #261 measures",
-              file=sys.stderr)
-        return []
-    caps = {"claude": CLAUDE_CONTEXT_MAX_MB, "codex": CODEX_CONTEXT_MAX_MB,
-            "gemini": AGY_CONTEXT_MAX_MB}
+        raise SnapshotUnavailable(
+            f"cannot import the cap functions from agent_crew.server ({e}). They "
+            f"are what decides a cap trip, so without them there is no cap "
+            f"evidence and no snapshot. {hint}") from e
+    resolved = os.path.realpath(os.path.dirname(getattr(agent_crew, "__file__", "") or ""))
+    expected = expected_package_dir()
+    if resolved != expected:
+        raise SnapshotUnavailable(
+            f"agent_crew resolved to {resolved!r}, not this checkout's "
+            f"{expected!r}. Measuring with a different tree than the one being "
+            f"verified is how #248 happened, so this is a refusal and not a "
+            f"warning. {hint}")
+    return {
+        "caps": {"claude": CLAUDE_CONTEXT_MAX_MB, "codex": CODEX_CONTEXT_MAX_MB,
+                 "gemini": AGY_CONTEXT_MAX_MB},
+        "claude": claude_context_exceeds_cap,
+        "codex": codex_context_exceeds_cap,
+        "gemini": agy_context_exceeds_cap,
+        "codex_session_for_cwd": codex_session_for_cwd,
+        "measured_with": resolved,
+    }
+
+
+def provider_sizes() -> list[dict]:
+    """Store/rollout size per worktree, via the dispatcher's own cap functions.
+
+    Raises ``SnapshotUnavailable`` rather than returning ``[]`` — an empty list
+    here is not a smaller answer, it is no answer wearing one's clothes.
+    """
+    logging.disable(logging.CRITICAL)
+    fns = cap_functions()
+    claude_context_exceeds_cap = fns["claude"]
+    codex_context_exceeds_cap = fns["codex"]
+    agy_context_exceeds_cap = fns["gemini"]
+    codex_session_for_cwd = fns["codex_session_for_cwd"]
+    caps = fns["caps"]
     rows = []
     for state_path in sorted(glob.glob(os.path.join(BASE, "*", "state.json"))):
         project = os.path.basename(os.path.dirname(state_path))
@@ -204,11 +273,25 @@ def main() -> int:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
+    # ⛔Cap functions FIRST, and outside the snapshot dict. Nothing is printed
+    #   until they resolve, so a broken or foreign environment produces a
+    #   non-zero exit and an empty stdout rather than a complete-looking
+    #   artifact with the cap evidence quietly missing (review of PR #271).
+    try:
+        fns = cap_functions()
+        sizes = provider_sizes()
+    except SnapshotUnavailable as e:
+        print(f"REFUSING TO REPORT: {e}", file=sys.stderr)
+        return 2
+
     snapshot = {
         "captured_at": datetime.now(timezone.utc).isoformat(),
         "window_days": args.days,
+        # Which code did the measuring, recorded in the artifact itself —
+        # the #248 lesson applied to the output rather than only to the input.
+        "measured_with": fns["measured_with"],
         "dispatchers": running_dispatchers(),
-        "provider_sizes": provider_sizes(),
+        "provider_sizes": sizes,
     }
     snapshot["attribution"], snapshot["session_id_coverage"] = attribution(args.days)
     snapshot["cap_events"] = cap_events(args.days)
@@ -219,6 +302,7 @@ def main() -> int:
 
     print(f"# context economics snapshot — {snapshot['captured_at']} "
           f"(window {args.days}d)\n")
+    print(f"measured with: {snapshot['measured_with']}\n")
     print("## running dispatchers (what the process imported, not what is on disk)")
     for d in snapshot["dispatchers"]:
         extra = (f"fp={d['fingerprint']} uptime={d['uptime_h']}h "

@@ -3,7 +3,14 @@
 **Measured:** 2026-09-06 09:32–09:37 UTC · **Verdict: BLOCKED — #261 is not
 running anywhere on the fleet.** Raw capture:
 [`issue_269_snapshot_2026-09-06.json`](issue_269_snapshot_2026-09-06.json),
-reproducible with `python3 scripts/context_economics_snapshot.py`.
+reproducible with `PYTHONPATH=src python3 scripts/context_economics_snapshot.py`.
+
+That capture was taken with `PYTHONPATH=src` from this worktree, before the
+script recorded the measuring tree itself. It now emits `measured_with`, and it
+**refuses to report at all** — non-zero exit, empty stdout — if the cap
+functions cannot be imported from the checkout it ships in (review of PR #271).
+The capture above is left byte-for-byte as taken; it is evidence from a moment,
+not a file to refresh.
 
 #269's first acceptance criterion is a gate on all the others: *"Running
 dispatchers are proven on `1db0c64c` or later before measurement."* They are
@@ -165,8 +172,10 @@ it. The same gap blocks #247.
 
 After `git pull` to `1db0c64c`+ and a restart of ports 8101/8105/8106/8107:
 
-1. re-run `scripts/context_economics_snapshot.py` and confirm every dispatcher
-   reports a commit containing `1db0c64c`;
+1. re-run `PYTHONPATH=src python3 scripts/context_economics_snapshot.py` and
+   confirm every dispatcher reports a commit containing `1db0c64c`. A non-zero
+   exit means the environment could not be trusted to measure and the run
+   produced nothing — that is the intended behaviour, not a script bug;
 2. confirm Codex `provider_session_id` coverage moves off 0 %;
 3. watch `alpha_engine/claude` — at 365 MB it should trip on the first
    dispatch, giving criterion 4 its end-to-end join for free and without
