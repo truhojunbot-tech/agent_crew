@@ -149,7 +149,9 @@ def build_mcp_server(
         # `int | str` for the same reason as the HTTP body: agents write PR
         # numbers as `#268`, and a transport that 422s on the spelling throws
         # the whole result away (review of PR #270).
-        pr_number: Optional[Union[int, str]] = None,
+        # `bool` is listed so pydantic cannot coerce `true` to `1` behind the
+        # dataclass's back — the same hole the HTTP body had (review of PR #270).
+        pr_number: Optional[Union[bool, int, str]] = None,
     ) -> dict[str, Any]:
         """Mark a task done and store its result.
 

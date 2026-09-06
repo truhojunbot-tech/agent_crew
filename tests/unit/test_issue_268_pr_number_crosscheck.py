@@ -420,15 +420,114 @@ def test_mcp_accepts_the_same_spellings(tmp_db, monkeypatch):
     assert {t.task_id: t for t in q.list_tasks()}["review-mcp-hash"].pr_number == REQUESTED
 
 
-def test_the_mcp_tool_schema_actually_advertises_the_string_form(tmp_db):
-    """⛔The behavioural test above calls the tool function directly, so it
-    passes even with the annotation narrowed back to `Optional[int]` —
-    normalisation lives in the dataclass and fires either way. A real MCP
-    client is validated against the PUBLISHED schema before the function is
-    reached, so the declaration needs its own assertion or widening it is
-    untested. (Found by mutation: narrowing the signature killed nothing.)"""
+def test_the_mcp_tool_schema_advertises_every_form_the_type_handles(tmp_db):
+    """⛔Every behavioural MCP test here calls the tool function DIRECTLY, so
+    none of them touches the published schema — normalisation and refusal both
+    live in the dataclass and fire whatever the annotation says. A real MCP
+    client is validated against the schema first, and that is where pydantic
+    would coerce `"268"` away or turn `true` into `1`. So the declaration needs
+    its own assertion.
+
+    Found by mutation twice, once per widening: narrowing the signature back
+    killed nothing either time. If a future change adds a third accepted form,
+    it belongs in this set — a behavioural test will not cover it."""
     from agent_crew.mcp_server import build_mcp_server
 
     tool = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"]
     types = {t.get("type") for t in tool.parameters["properties"]["pr_number"]["anyOf"]}
-    assert {"integer", "string", "null"} <= types, types
+    # `boolean` is advertised so it can be REFUSED explicitly rather than
+    # silently coerced to integer 1 — see TaskResult.pr_number.
+    assert {"integer", "string", "boolean", "null"} <= types, types
+
+
+# ── 6. `true` is not PR #1, over HTTP as well as in the type ──────────
+#
+# Review of PR #270, P2. Widening `pr_number` to `Optional[Union[int, str]]`
+# handed pydantic a union with `int` in it and no `bool`, and lax-mode
+# validation happily made JSON `true` into `1` — BEFORE `__post_init__` could
+# see a bool at all. So the guard that exists precisely to stop `True` becoming
+# "PR #1" was intact in the dataclass and defeated at the endpoint.
+#
+# ⛔The damage is that `1` is a PLAUSIBLE PR number. `"not-a-pr"` is obviously
+#   wrong to anyone reading the row; `pr_number: 1` reads as a considered claim
+#   about PR #1, and the cascade calls `int()` on it. That is #268's own
+#   failure mode — acting on a PR nobody named — reintroduced by the fix for
+#   #268.
+
+
+BOOLS = [True, False]
+
+
+@pytest.mark.parametrize("value", BOOLS)
+def test_a_bool_is_rejected_by_the_result_type(value):
+    """Same class as `"not-a-pr"`: a type error, not a spelling. The caller has
+    a bug and needs to hear about it rather than have `0`/`1` stored for it."""
+    with pytest.raises(ValueError, match="pr_number"):
+        TaskResult(task_id="t", status="completed", summary="s", pr_number=value)
+
+
+@pytest.mark.parametrize("value", BOOLS)
+def test_http_a_bool_pr_number_is_never_stored_as_a_pr(tmp_db, monkeypatch, value, github_writes):
+    """★★The regression the review asked for, end to end.
+
+    Reproduced before the fix, with `context.pr_number = 268`:
+
+        HTTP true        : 200 {'held': 'pr_number_mismatch', 'reported_pr': 1}
+        stored pr_number : 1
+    """
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    with TestClient(_server(tmp_db, _Push())) as c:
+        _enqueue(c, "review-bool", "review", {"pr_number": REQUESTED})
+        assert _submit(c, "review-bool", pr_number=value).status_code == 422
+        stored = c.get("/tasks/review-bool").json()
+
+    assert stored["pr_number"] in (None, 0, ""), \
+        f"a bool was recorded as PR #{stored['pr_number']}"
+    assert stored["pr_number"] != 1, "`true` was stored as PR #1"
+    assert stored["status"] == "in_progress", "a rejected request still wrote a result"
+
+
+def test_http_a_bool_is_not_silently_turned_into_a_mismatch(tmp_db, monkeypatch, github_writes):
+    """⛔Being *held* is not good enough. Pre-fix the hold fired with
+    `reported_pr: 1` — the right instinct off an invented number, which would
+    have sent a human to compare PR #268 against a PR #1 nobody mentioned."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    with TestClient(_server(tmp_db, _Push())) as c:
+        _enqueue(c, "review-bool-mm", "review", {"pr_number": REQUESTED})
+        body = _submit(c, "review-bool-mm", pr_number=True).json()
+
+    assert body.get("reported_pr") != 1
+    assert body.get("held") is None, "a type error was reported as a PR disagreement"
+
+
+def test_mcp_rejects_a_bool_too(tmp_db, monkeypatch):
+    """⛔Parity again: the MCP tool takes the same union, so lax validation had
+    the same hole. It reports the refusal rather than raising, because that
+    transport answers with an ack dict."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="review-mcp-bool", task_type="review", description="review",
+                          branch=BRANCH, context={"pr_number": REQUESTED}))
+    q.dequeue(role="reviewer")
+
+    out = _mcp_submit(tmp_db, task_id="review-mcp-bool", status="completed",
+                      summary="s", verdict="approve", findings=[], pr_number=True)
+
+    assert out.get("acknowledged") is False, out
+    assert "pr_number" in (out.get("error") or "")
+    assert {t.task_id: t for t in q.list_tasks()}["review-mcp-bool"].pr_number != 1
+
+
+def test_the_context_side_still_only_interprets(tmp_db, monkeypatch, github_writes):
+    """⛔Asymmetric on purpose, and the asymmetry is the same one junk strings
+    already have. A result is a request we may refuse; a context is a stored
+    blob we can only read. `True` in a context therefore means "names no PR" —
+    it does not reject the task, and it does not become PR #1 either."""
+    from agent_crew.pipeline import pr_number_mismatch
+
+    assert pr_number_mismatch(REQUESTED, True) is None
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    monkeypatch.setattr("agent_crew.github.post_review_comment", lambda *a, **k: True)
+    with TestClient(_server(tmp_db, _Push())) as c:
+        _enqueue(c, "review-ctx-bool", "review", {"pr_number": True})
+        assert _submit(c, "review-ctx-bool", pr_number=REQUESTED).json().get("held") is None

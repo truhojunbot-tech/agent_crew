@@ -80,7 +80,14 @@ class TaskResult:
     #: with a 422 before any normalisation could run (review of PR #270), so
     #: the one spelling the guard was written to tolerate was the one the
     #: endpoint threw the entire result away over.
-    pr_number: Optional[Union[int, str]] = None
+    #: ⛔`bool` is in the union so that pydantic CANNOT quietly remove it. With
+    #: `Union[int, str]` alone, lax validation turned JSON `true` into `1`
+    #: before `__post_init__` ran, so the "True is not PR #1" guard was intact
+    #: in the type and defeated at the endpoint (review of PR #270). Listing
+    #: `bool` does advertise it in the schema — the trade is deliberate: we
+    #: accept it syntactically so we can refuse it explicitly, instead of
+    #: coercing it into a plausible PR number nobody named.
+    pr_number: Optional[Union[bool, int, str]] = None
     retry_count: int = 0  # Track number of retry attempts
     error_info: Optional[dict] = None  # Structured error payload for debugging (#167)
 
@@ -96,6 +103,15 @@ class TaskResult:
         # has to hear about — silently storing `None` there would drop exactly
         # the signal #268 exists to preserve. Non-strings are left untouched,
         # so nothing that already worked behaves differently.
+        if isinstance(self.pr_number, bool):
+            # A type error, not a spelling — same class as "not-a-pr", and
+            # refused the same way. `1` is the dangerous outcome precisely
+            # because it is PLAUSIBLE: `"not-a-pr"` is obviously wrong to
+            # anyone reading the row, whereas `pr_number: 1` reads as a
+            # considered claim about PR #1 and the cascade calls `int()` on it.
+            raise ValueError(
+                f"Invalid pr_number: {self.pr_number!r}. A boolean does not name "
+                f"a PR — omit the field if there is no PR.")
         if isinstance(self.pr_number, str):
             raw = self.pr_number.strip()
             if not raw:
