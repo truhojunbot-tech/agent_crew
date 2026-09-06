@@ -22,6 +22,7 @@ import logging
 import os
 import sqlite3
 import uuid
+from dataclasses import replace
 from typing import Optional
 
 from agent_crew.fallback import (
@@ -55,6 +56,96 @@ MAX_FINDING_CHARS = 1000
 FIX_EXHAUSTED_MARKER = "[agent_crew] Automated fix rounds exhausted"
 #: Announcement kind for the durable one-shot claim (see TaskQueue).
 FIX_EXHAUSTED_KIND = "fix_exhausted"
+
+#: Prefix on the stored summary of a result whose PR number disagreed with the
+#: one its task was dispatched for (#268). Grep-able on purpose: it is the only
+#: trace a human has that the reviewer answered a different question.
+PR_MISMATCH_MARKER = "[agent_crew] PR MISMATCH"
+
+
+def _as_pr_number(value) -> Optional[int]:
+    """``value`` as a PR number, or ``None`` when it does not name one.
+
+    Both sides of the #268 cross-check arrive untyped — one out of a JSON
+    context column, one off an agent-authored result — so `268`, `"268"` and
+    `"#268"` all have to compare equal or the guard fires on spelling instead
+    of on substance.
+
+    ⛔`bool` is short-circuited before `int()`: in Python `True` is `1`, and a
+      `pr_number=True` silently becoming "PR #1" would invent a disagreement
+      with whatever PR the task was really about.
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip().lstrip("#").strip()
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def pr_number_mismatch(reported, requested) -> Optional[tuple]:
+    """``(requested, reported)`` when the two name different PRs, else ``None``.
+
+    #268 / alpha_engine#5288: a reviewer read PR #N+1, reviewed it honestly, and
+    reported `pr_number=N+1` for a task dispatched against PR #N. `submit_result`
+    resolved the pair with ``result.pr_number or ctx["pr_number"]`` — the
+    result won outright, so the one moment the server could have caught the
+    misread produced no signal at all.
+
+    ⛔Silence on either side is *not* disagreement, and this is the load-bearing
+      case: an implement task is dispatched with no PR and its result reports
+      the PR it just opened. Requiring both sides would hold the most common
+      hop in the crew. We only claim a mismatch when both sides actually named
+      a PR and named different ones — an unparseable value means we could not
+      cross-check, not that we found a conflict.
+    """
+    a = _as_pr_number(requested)
+    b = _as_pr_number(reported)
+    if a is None or b is None:
+        return None
+    return None if a == b else (a, b)
+
+
+def hold_mismatched_pr_result(task_id: str, result: TaskResult,
+                              ctx: Optional[dict]) -> tuple:
+    """``(result, mismatch)`` — swap in a held result when the PRs disagree.
+
+    The result is **stored, never rejected**. A 4xx would leave the row to time
+    out and throw away the agent's own account of what it read — which is the
+    single most useful artifact for diagnosing the misread. What stops is the
+    cascade, not the audit trail: the caller sees a non-``None`` mismatch and
+    skips the GitHub comment, the fix, the test and the merge.
+
+    The status becomes ``needs_human`` for every reported status, `failed`
+    included — rerouting a failure whose result named the wrong PR just spends
+    another agent on the same confusion.
+    """
+    mismatch = pr_number_mismatch(result.pr_number,
+                                  (ctx or {}).get("pr_number") if isinstance(ctx, dict) else None)
+    if mismatch is None:
+        return (result, None)
+    requested, reported = mismatch
+    logger.error(
+        f"{PR_MISMATCH_MARKER}: task {task_id} was dispatched for PR #{requested} "
+        f"but its result reports PR #{reported}. Holding the result for a human "
+        f"and stopping the cascade — no comment, no fix, no test, no merge (#268). "
+        f"requested_pr=#{requested} reported_pr=#{reported} "
+        f"reported_status={result.status!r}"
+    )
+    note = (
+        f"{PR_MISMATCH_MARKER}: this task was dispatched for PR #{requested}, "
+        f"but the result reports PR #{reported}. The reported status was "
+        f"{result.status!r}; held for a human because the two disagree and the "
+        f"server cannot tell which PR the findings below are about (#268)."
+    )
+    return (
+        replace(result, status="needs_human",
+                summary=f"{note}\n\n{result.summary or ''}".rstrip()),
+        mismatch,
+    )
 
 
 def pr_is_actionable(pr_number, *, pr_state_fn=None) -> tuple:
