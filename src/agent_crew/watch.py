@@ -45,6 +45,7 @@ from typing import Optional
 
 from agent_crew.context_pack import ISSUE_BODY_MAX_CHARS, cap_issue_body
 from agent_crew.protocol import TaskRequest
+from agent_crew.queue import issue_from_description
 from agent_crew.triage import parse_issues
 
 logger = logging.getLogger(__name__)
@@ -507,6 +508,24 @@ class GhCli:
 # ──────────────────────────────────────────────────────────────────────
 
 
+def _issue_of(row) -> Optional[int]:
+    """The issue a task row is about — structured field first, description second.
+
+    #276: dedup read only `context["issue"]`, so a task that named its issue in
+    the description was invisible and #272 was implemented twice. The parse is
+    a fallback, never an arbiter: when both are present the structured field
+    wins, because a description is free text and a context key is a claim.
+
+    Old rows are covered too — this reads at query time, so tasks enqueued
+    before the write-side backfill in `TaskQueue.enqueue` still resolve.
+    """
+    context = row.get("context") or {}
+    number = context.get("issue")
+    if isinstance(number, int) and not isinstance(number, bool):
+        return number
+    return issue_from_description(row.get("description"))
+
+
 def active_issue_numbers(queue, repo: str = "") -> set:
     """Issues that already have a non-terminal task in the queue.
 
@@ -520,8 +539,8 @@ def active_issue_numbers(queue, repo: str = "") -> set:
         return out
     for row in rows or []:
         context = row.get("context") or {}
-        number = context.get("issue")
-        if not isinstance(number, int):
+        number = _issue_of(row)
+        if number is None:
             continue
         row_repo = context.get("repo") or ""
         if repo and row_repo and row_repo != repo:
@@ -552,8 +571,11 @@ def tasks_by_issue(queue, repo: str = "") -> Optional[dict]:
     out: dict = {}
     for row in rows or []:
         context = row.get("context") or {}
-        number = context.get("issue")
-        if not isinstance(number, int):
+        # #276: same blind spot, one function over. Reconciliation asking "was
+        # a task ever created for this issue?" would answer no for exactly the
+        # row that proves it was.
+        number = _issue_of(row)
+        if number is None:
             continue
         row_repo = context.get("repo") or ""
         if repo and row_repo and row_repo != repo:
