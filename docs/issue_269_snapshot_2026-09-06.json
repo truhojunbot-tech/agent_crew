@@ -1,0 +1,357 @@
+{
+  "captured_at": "2026-09-06T09:37:29.349864+00:00",
+  "window_days": 7.0,
+  "dispatchers": [
+    {
+      "project": "agent_council",
+      "port": 8102,
+      "commit": "not running"
+    },
+    {
+      "project": "agent_crew",
+      "port": 8105,
+      "commit": "694be98",
+      "fingerprint": "e33dd4529bfd2e36",
+      "dirty": true,
+      "moved": false,
+      "source_changed": false,
+      "uptime_h": 81.7
+    },
+    {
+      "project": "alpha_engine",
+      "port": 8101,
+      "commit": "694be98",
+      "fingerprint": "e33dd4529bfd2e36",
+      "dirty": true,
+      "moved": false,
+      "source_changed": false,
+      "uptime_h": 81.7
+    },
+    {
+      "project": "crypto-trade-pilot",
+      "port": 8103,
+      "commit": "not running"
+    },
+    {
+      "project": "halla",
+      "port": 8104,
+      "commit": "not running"
+    },
+    {
+      "project": "mcp-x402-gateway",
+      "port": 8100,
+      "commit": "not running"
+    },
+    {
+      "project": "quota-core",
+      "port": 8106,
+      "commit": "pre-#248 (no /provenance)"
+    },
+    {
+      "project": "quota-ops",
+      "port": 8107,
+      "commit": "pre-#248 (no /provenance)"
+    }
+  ],
+  "provider_sizes": [
+    {
+      "project": "agent_council",
+      "agent": "claude",
+      "mb": 0.13,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "c12b3e91-a31a-4d3e-8df0-5d80404c3f9a"
+    },
+    {
+      "project": "agent_council",
+      "agent": "codex",
+      "mb": 0.0,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": ""
+    },
+    {
+      "project": "agent_council",
+      "agent": "gemini",
+      "mb": 0.0,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": ""
+    },
+    {
+      "project": "agent_crew",
+      "agent": "claude",
+      "mb": 14.41,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "e9274cf5-0b45-47ed-9932-63a4d666ca7d"
+    },
+    {
+      "project": "agent_crew",
+      "agent": "codex",
+      "mb": 0.0,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": ""
+    },
+    {
+      "project": "agent_crew",
+      "agent": "gemini",
+      "mb": 6.92,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "6be58d86-d280-4cc9-8fa4-5036a2ad3b0a"
+    },
+    {
+      "project": "alpha_engine",
+      "agent": "claude",
+      "mb": 365.18,
+      "cap_mb": 64.0,
+      "over": true,
+      "session": "ab2cf40c-d459-443b-8435-39e002fbb6e5"
+    },
+    {
+      "project": "alpha_engine",
+      "agent": "codex",
+      "mb": 0.09,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "01a02def-ac75-7093-8eb1-ea5458566698"
+    },
+    {
+      "project": "alpha_engine",
+      "agent": "gemini",
+      "mb": 19.9,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "531fad81-dc96-4682-bedb-83e6ea47ef98"
+    },
+    {
+      "project": "crypto-trade-pilot",
+      "agent": "claude",
+      "mb": 0.5,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "310aa878-e2e6-484a-8ef7-6bfaec8d993f"
+    },
+    {
+      "project": "crypto-trade-pilot",
+      "agent": "codex",
+      "mb": 0.0,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": ""
+    },
+    {
+      "project": "crypto-trade-pilot",
+      "agent": "gemini",
+      "mb": 0.0,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": ""
+    },
+    {
+      "project": "halla",
+      "agent": "claude",
+      "mb": 0.97,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "f68f32db-13c5-4e89-bad2-0eb08d3312d6"
+    },
+    {
+      "project": "halla",
+      "agent": "codex",
+      "mb": 0.43,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "019ffa43-b77d-7263-ac26-57188ec2e99e"
+    },
+    {
+      "project": "halla",
+      "agent": "gemini",
+      "mb": 6.86,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "3ece6ec5-5d82-467e-be44-5c33f865e62e"
+    },
+    {
+      "project": "mcp-x402-gateway",
+      "agent": "codex",
+      "mb": 0.0,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": ""
+    },
+    {
+      "project": "quota-core",
+      "agent": "claude",
+      "mb": 2.94,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "a9950645-d6d3-4c8f-807f-ba4acb5401a1"
+    },
+    {
+      "project": "quota-core",
+      "agent": "codex",
+      "mb": 6.31,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "01a02294-4160-7bc2-8396-f19579a5bd2b"
+    },
+    {
+      "project": "quota-core",
+      "agent": "gemini",
+      "mb": 3.96,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "4de1eb5c-acde-4fbb-924a-1981e768a6c2"
+    },
+    {
+      "project": "quota-ops",
+      "agent": "claude",
+      "mb": 7.44,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "627091a5-c533-4d12-b77a-3c7650c81723"
+    },
+    {
+      "project": "quota-ops",
+      "agent": "codex",
+      "mb": 24.22,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "01a02297-b523-7cf2-a19b-57b60090d613"
+    },
+    {
+      "project": "quota-ops",
+      "agent": "gemini",
+      "mb": 14.65,
+      "cap_mb": 64.0,
+      "over": false,
+      "session": "94d6fed6-0d3e-4a99-b6e2-f95af2561b7c"
+    }
+  ],
+  "attribution": [
+    {
+      "project": "agent_council",
+      "policy": {},
+      "error": "no such column: context_policy"
+    },
+    {
+      "project": "agent_crew",
+      "policy": {
+        "resume": 180
+      },
+      "contexts_past_gen1": 0
+    },
+    {
+      "project": "alpha_engine",
+      "policy": {
+        "fresh": 2,
+        "resume": 1127
+      },
+      "contexts_past_gen1": 2
+    },
+    {
+      "project": "crypto-trade-pilot",
+      "policy": {},
+      "error": "no such column: context_policy"
+    },
+    {
+      "project": "halla",
+      "policy": {},
+      "error": "no such column: context_policy"
+    },
+    {
+      "project": "mcp-x402-gateway",
+      "policy": {},
+      "error": "no such column: context_policy"
+    },
+    {
+      "project": "quota-core",
+      "policy": {
+        "fresh": 2,
+        "resume": 19
+      },
+      "contexts_past_gen1": 0
+    },
+    {
+      "project": "quota-ops",
+      "policy": {
+        "resume": 90
+      },
+      "contexts_past_gen1": 0
+    }
+  ],
+  "session_id_coverage": {
+    "claude": {
+      "dispatches": 383,
+      "with_session_id": 383,
+      "pct": 100.0
+    },
+    "codex": {
+      "dispatches": 747,
+      "with_session_id": 0,
+      "pct": 0.0
+    },
+    "gemini": {
+      "dispatches": 290,
+      "with_session_id": 0,
+      "pct": 0.0
+    }
+  },
+  "cap_events": [
+    {
+      "ts": "2026-09-02T11:56:35.760211",
+      "event_type": "context_reset",
+      "project": "alpha_engine",
+      "agent": "gemini",
+      "provider": null,
+      "context_id": "89772d69-dd34-4ee7-8856-a5d25644ff4f",
+      "context_generation": 2,
+      "conversation_id": null,
+      "bytes": null,
+      "cap_mb": null,
+      "task_id": "test-f7248a3e"
+    },
+    {
+      "ts": "2026-09-02T11:56:35.760784",
+      "event_type": "provider_context_capped",
+      "project": "alpha_engine",
+      "agent": "gemini",
+      "provider": "agy",
+      "context_id": "89772d69-dd34-4ee7-8856-a5d25644ff4f",
+      "context_generation": 2,
+      "conversation_id": "0aff70cb-dd90-46d8-a8c3-06936db28a97",
+      "bytes": 147435520,
+      "cap_mb": 64.0,
+      "task_id": "test-f7248a3e"
+    },
+    {
+      "ts": "2026-09-02T12:03:59.377507",
+      "event_type": "context_reset",
+      "project": "alpha_engine",
+      "agent": "gemini",
+      "provider": null,
+      "context_id": "ed473def-d14c-47ae-909c-8ca6f8c30b52",
+      "context_generation": 3,
+      "conversation_id": null,
+      "bytes": null,
+      "cap_mb": null,
+      "task_id": "test-68315ed8"
+    },
+    {
+      "ts": "2026-09-02T12:03:59.377876",
+      "event_type": "provider_context_capped",
+      "project": "alpha_engine",
+      "agent": "gemini",
+      "provider": "agy",
+      "context_id": "ed473def-d14c-47ae-909c-8ca6f8c30b52",
+      "context_generation": 3,
+      "conversation_id": "0aff70cb-dd90-46d8-a8c3-06936db28a97",
+      "bytes": 147435520,
+      "cap_mb": 64.0,
+      "task_id": "test-68315ed8"
+    }
+  ]
+}
