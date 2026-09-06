@@ -196,3 +196,128 @@ def test_the_dispatch_records_nothing_when_the_pack_is_disabled(tmp_path, monkey
     events_path = os.path.join(os.path.dirname(db), "context_events.jsonl")
     events = [json.loads(line) for line in open(events_path)]
     assert not [e for e in events if e["event_type"] == "context_pack_built"]
+
+
+# ── identity is the dispatcher's to state (#258 review) ───────────────
+#
+# The first fix merged telemetry LAST, which cured the crash and handed the
+# pack the power to relabel the event. A future telemetry key called `task_id`
+# or `context_id` would then attribute this pack to a different task — and an
+# attribution record that lies is worse than one that is missing.
+
+
+def _dispatch_with_pack_telemetry(tmp_path, monkeypatch, extra_telemetry):
+    """Run a real dispatch whose pack reports `extra_telemetry`."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew import context_pack as cpack
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    db = str(tmp_path / "t.db")
+
+    async def _fake_exec(*cmd, **kwargs):
+        class _P:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    real_telemetry = cpack.ContextPack.telemetry
+
+    def _telemetry(self):
+        out = real_telemetry(self)
+        out.update(extra_telemetry)
+        return out
+
+    monkeypatch.setattr(cpack.ContextPack, "telemetry", _telemetry)
+    monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+                     project="the-real-project", watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(task_id="disp-identity", task_type="implement",
+                              description="do it", branch="main",
+                              context={"issue": 42, "repo": "org/repo",
+                                       "issue_title": "t", "issue_body": "b"}))
+        task = q.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    events = [json.loads(l) for l in open(os.path.join(os.path.dirname(db),
+                                                       "context_events.jsonl"))]
+    built = [e for e in events if e["event_type"] == "context_pack_built"]
+    assert built, "no context_pack_built event was recorded"
+    return built[0]
+
+
+def test_pack_telemetry_cannot_relabel_the_event(tmp_path, monkeypatch):
+    """★A pack claiming another task's identity must not win."""
+    event = _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {
+        "task_id": "some-other-task",
+        "project": "some-other-project",
+        "agent": "gemini",
+        "context_id": "not-this-context",
+        "context_generation": 99,
+    })
+
+    assert event["task_id"] == "disp-identity"
+    # `project` is the dispatcher's own resolution (from the state directory,
+    # #248), not the `create_app` argument — what matters is that the PACK
+    # cannot supply it.
+    assert event["project"] != "some-other-project"
+    assert event["agent"] == "claude"
+    assert event["context_id"] != "not-this-context"
+    assert event["context_generation"] != 99
+
+
+def test_the_pack_schema_still_reaches_the_event(tmp_path, monkeypatch):
+    """⛔Identity winning must not mean telemetry losing. Everything the
+    consumer reads is still the pack's own."""
+    event = _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {})
+
+    for key in ("context_pack_id", "context_pack_hash", "mode", "total_tokens",
+                "selected_count", "candidate_count", "degraded", "budget"):
+        assert key in event, f"pack schema field lost from telemetry: {key}"
+    assert event["role"] == "implementer"
+
+
+def test_a_shadowed_identity_key_is_reported(tmp_path, monkeypatch, caplog):
+    """Dropping a telemetry field silently is a smaller harm than mislabelling
+    the event, but it is still a harm — the collision has to be visible."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="agent_crew.server"):
+        _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {"task_id": "other"})
+
+    assert any("dispatch identity keys" in r.message for r in caplog.records)
+
+
+def test_role_alone_is_not_reported_as_a_collision(tmp_path, monkeypatch, caplog):
+    """⛔`role` is the known, benign overlap — warning on it every dispatch
+    would train everyone to ignore the warning."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="agent_crew.server"):
+        _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {})
+
+    assert not [r for r in caplog.records if "dispatch identity keys" in r.message]

@@ -1965,7 +1965,15 @@ def create_app(
                 #   Building one dict makes the collision impossible rather than
                 #   merely absent: the next key added to telemetry() cannot
                 #   silently switch this off again.
-                _event_fields = {
+                # ⛔Identity is applied LAST and therefore wins. Merging the
+                #   other way round fixed the crash but handed the pack the
+                #   power to relabel the event: a future telemetry key called
+                #   `task_id` or `context_id` would silently attribute this
+                #   pack to a different task, and an attribution record that
+                #   lies is worse than one that is missing (#258 review).
+                #   `role` is the one known overlap and carries the same value
+                #   from both sides.
+                _identity = {
                     "task_id": task.task_id,
                     "project": _project,
                     "role": role,
@@ -1973,7 +1981,19 @@ def create_app(
                     "context_id": _ctx_info["context_id"],
                     "context_generation": _ctx_info["context_generation"],
                 }
-                _event_fields.update(_pack.telemetry())
+                _telemetry = _pack.telemetry()
+                _shadowed = (set(_telemetry) & set(_identity)) - {"role"}
+                if _shadowed:
+                    # Dropping a telemetry field silently is a smaller harm than
+                    # mislabelling the event, but it is still a harm — say it,
+                    # so the collision is fixed rather than absorbed.
+                    logger.warning(
+                        "dispatcher: context pack telemetry carries dispatch "
+                        "identity keys %s for task=%s; the dispatcher's values "
+                        "win and the pack's are dropped (#258)",
+                        sorted(_shadowed), task.task_id,
+                    )
+                _event_fields = {**_telemetry, **_identity}
                 record_context_event(
                     _context_events_path, "context_pack_built", **_event_fields,
                 )
