@@ -389,6 +389,66 @@ AGY_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_AGY_CONTEXT_MAX_MB", "64"))
 CLAUDE_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CLAUDE_CONTEXT_MAX_MB", "64"))
 
 
+#: How many rollout files `codex_session_for_cwd` will read before giving up.
+#: Codex's store is date-partitioned and unbounded — 9,894 sessions on this
+#: host — so the search walks newest-first and stops early. A miss returns "",
+#: which the dispatcher treats as "no binding" and therefore as fresh.
+CODEX_SESSION_SCAN_LIMIT = int(os.getenv("AGENT_CREW_CODEX_SESSION_SCAN", "400"))
+
+
+def _codex_home(home=None):
+    import pathlib
+
+    return pathlib.Path(home) if home else pathlib.Path.home() / ".codex"
+
+
+def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
+    """The newest Codex session id recorded for ``cwd``, or ``""``.
+
+    ⛔`codex exec resume --last` is GLOBAL. Codex keys its rollout store by
+      date, not by working directory, so "the most recent recorded session" is
+      whatever ran last anywhere on the host. Measured 2026-09-04: 9,894
+      sessions across many directories, the newest belonging to
+      `worktrees/alpha_engine/codex` while this project's newest was two days
+      older — so a resume dispatched for agent_crew would have attached
+      alpha_engine's provider state while telemetry still reported agent_crew's
+      logical context (#262). The task would still have succeeded, which is what
+      made it invisible.
+
+      Each rollout's first record is a `session_meta` carrying `cwd` and `id` —
+      the per-worktree binding the CLI does not expose directly — and
+      `codex exec resume <SESSION_ID>` targets it exactly.
+    """
+    import json as _json
+
+    budget = CODEX_SESSION_SCAN_LIMIT if limit is None else limit
+    try:
+        root = _codex_home(home) / "sessions"
+        if not root.is_dir() or not cwd:
+            return ""
+        # Filenames embed an ISO timestamp and the tree is YYYY/MM/DD, so
+        # sorting names descending walks newest-first without stat()ing 9k files.
+        files = []
+        for day in sorted(root.rglob("*"), reverse=True):
+            if not day.is_dir():
+                continue
+            files.extend(sorted(day.glob("rollout-*.jsonl"), reverse=True))
+            if len(files) >= budget:
+                break
+        for path in files[:budget]:
+            try:
+                with open(path, errors="replace") as fh:
+                    first = fh.readline()
+                meta = (_json.loads(first) or {}).get("payload") or {}
+            except Exception:  # noqa: BLE001
+                continue
+            if meta.get("cwd") == cwd and meta.get("id"):
+                return str(meta["id"])
+    except Exception:  # noqa: BLE001 — resolution must never break a dispatch
+        return ""
+    return ""
+
+
 def _claude_home(home=None):
     import pathlib
 
@@ -1984,6 +2044,26 @@ def create_app(
                 ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True, text=True, timeout=5,
             ).stdout.strip()
+            # #262: bind codex to a session that belongs to THIS worktree.
+            # `resume --last` is global, so the binding has to be ours: prefer
+            # the provider_session_id already recorded for this context, then a
+            # bounded search of codex's own store, then nothing — and "nothing"
+            # means fresh, never a guess.
+            _codex_session = ""
+            if agent == "codex" and _ctx_info["context_policy"] == "resume":
+                _codex_session = (_ctx_info.get("provider_session_id") or "").strip()
+                if not _codex_session:
+                    _codex_session = codex_session_for_cwd(wt)
+                    if _codex_session:
+                        logger.info(
+                            "dispatcher: bound codex session %s to %s from its own "
+                            "rollout store (#262)", _codex_session[:8], wt)
+                if not _codex_session:
+                    logger.info(
+                        "dispatcher: no codex session recorded for %s — starting a "
+                        "fresh one rather than resuming whatever ran last on this "
+                        "host (#262)", wt)
+
             q().record_attribution(
                 task_id=task.task_id,
                 project=_project,
@@ -1996,7 +2076,8 @@ def create_app(
                 status="in_progress",
                 model=_known_model,
                 context_id=_ctx_info["context_id"],
-                provider_session_id=_ctx_info.get("provider_session_id") or "",
+                provider_session_id=(_codex_session
+                                     or _ctx_info.get("provider_session_id") or ""),
                 context_policy=_ctx_info["context_policy"],
                 context_generation=_ctx_info["context_generation"],
                 session_task_index=_ctx_info["session_task_index"],
@@ -2126,8 +2207,14 @@ def create_app(
             # an explicit context_reset or a first-generation context implies.
             # Sizing codex would need a signal the CLI does not currently expose;
             # not inventing one.
-            if _ctx_info["context_policy"] == "resume":
-                cmd = ["codex", "exec", "resume", "--last",
+            # #262: resume the session BOUND TO THIS WORKTREE, by id.
+            # ⛔Never `--last`. It selects the newest session anywhere on the
+            #   host, so a resume here could attach another project's provider
+            #   state while telemetry still reported this project's logical
+            #   context — an identity and economics mismatch, and a
+            #   cross-project content leak.
+            if _codex_session:
+                cmd = ["codex", "exec", "resume", _codex_session,
                        "--dangerously-bypass-approvals-and-sandbox", message]
             else:
                 cmd = ["codex", "exec",
@@ -2230,6 +2317,18 @@ def create_app(
                     _discovered_session_id = extract_claude_session_id(_task_log_tail)
                     if _discovered_session_id and _discovered_session_id != _ctx_info.get("provider_session_id"):
                         q().update_context_provider_session_id(_context_key, _discovered_session_id)
+                elif agent == "codex":
+                    # #262: close the loop. The run just now wrote a rollout for
+                    # THIS worktree, so it is at the top of codex's newest day —
+                    # cheap to find, and once recorded the next resume needs no
+                    # search at all. Without this a fresh codex task would never
+                    # acquire a binding and every dispatch would start over.
+                    _codex_after = codex_session_for_cwd(wt)
+                    if _codex_after and _codex_after != _ctx_info.get("provider_session_id"):
+                        q().update_context_provider_session_id(_context_key, _codex_after)
+                        logger.info(
+                            "dispatcher: recorded codex session %s for %s (#262)",
+                            _codex_after[:8], wt)
                 if detect_context_compaction(_task_log_tail):
                     record_context_event(
                         _context_events_path, "context_compacted",
