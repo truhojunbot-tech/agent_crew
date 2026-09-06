@@ -228,6 +228,33 @@ def issue_from_description(description) -> Optional[int]:
     return number if number > 0 else None
 
 
+def _is_duplicate_task_id(error: Exception) -> bool:
+    """Is this IntegrityError the `tasks.task_id` primary-key conflict?
+
+    Matches the constraint KIND and the COLUMN, not the whole message. Exact
+    string equality would break on any SQLite wording change; matching only
+    "unique constraint failed" would misreport a UNIQUE violation on some
+    future column as a duplicate task — which is the same shape of mistake as
+    catching every IntegrityError, one column later.
+    """
+    message = str(error).lower()
+    return "unique constraint failed" in message and "tasks.task_id" in message
+
+
+class TaskAlreadyExistsError(Exception):
+    """Raised by :meth:`TaskQueue.enqueue` when ``task_id`` already exists.
+
+    Carries the existing row's status so a caller (e.g. the ``/tasks`` HTTP
+    handler) can report a 409 with enough detail to react, instead of the
+    duplicate insert surfacing as a bare 500 (#273).
+    """
+
+    def __init__(self, task_id: str, status: str):
+        self.task_id = task_id
+        self.status = status
+        super().__init__(f"task_id {task_id!r} already exists with status={status!r}")
+
+
 class TaskQueue:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -315,6 +342,27 @@ class TaskQueue:
                 ),
             )
             conn.commit()
+        except sqlite3.IntegrityError as e:
+            # #273: task_id is the primary key, so a duplicate insert raises
+            # here. Report the existing row's status rather than letting the
+            # bare IntegrityError surface as an opaque 500 with no detail.
+            conn.rollback()
+            if not _is_duplicate_task_id(e):
+                # ⛔Only the task_id conflict is a duplicate. `tasks` has six
+                #   NOT NULL columns, and the first version of this catch
+                #   reported a NOT NULL violation as "already exists" with
+                #   status='unknown' (the follow-up SELECT found nothing,
+                #   because nothing was there). That is worse than the 500 it
+                #   replaced: a caller told "already exists" stops and treats
+                #   the work as in flight, where a caller told "the insert
+                #   failed" retries or escalates. A write bug turned into a
+                #   false duplicate loses the task silently (review of PR #274).
+                raise
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (task.task_id,)
+            ).fetchone()
+            existing_status = row["status"] if row is not None else "unknown"
+            raise TaskAlreadyExistsError(task.task_id, existing_status) from None
         finally:
             conn.close()
         return task.task_id
