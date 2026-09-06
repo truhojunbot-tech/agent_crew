@@ -1936,29 +1936,32 @@ def create_app(
         # ⛔Nothing in agy's store is deleted or mutated — the oversized
         #   conversation is simply not resumed, so an in-flight context is
         #   never disturbed and the decision is reversible.
-        # ⛔Initialised before the gemini branch so the event gate below can
-        #   read it for ANY agent. This boolean is the cap decision itself —
+        # ⛔Initialised before the provider branches so the event gate below can
+        #   read it for ANY agent, and named for the CONTEXT rather than for agy:
+        #   it carries claude's cap decision too, and a name that says otherwise
+        #   is how the event came to report every claude trip as `provider=agy`
+        #   (#260 review). This boolean is the cap decision itself —
         #   `_force_context_reset` is not, because an operator's explicit
         #   task.context.context_reset sets it too (review-99ad8ad0).
-        _agy_over = False
-        _agy_cap_info = {}
+        _ctx_over = False
+        _ctx_cap_info = {}
         if agent == "gemini":
-            _agy_over, _agy_cap_info = agy_context_exceeds_cap(wt)
+            _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
         elif agent == "claude":
             # #260: the same defect on the other provider. `--continue` was
             # unconditional here, so the session never rotated — one file per
             # worktree since 2026-08-21, alpha_engine's at 290 MB. Sizing is
             # provider-specific; everything after this line is not.
-            _agy_over, _agy_cap_info = claude_context_exceeds_cap(wt)
-        if _agy_over:
+            _ctx_over, _ctx_cap_info = claude_context_exceeds_cap(wt)
+        if _ctx_over:
             _force_context_reset = True
             logger.warning(
                 "dispatcher: %s context %s for %s is %.1f MB (cap %.0f MB) — "
                 "forcing a fresh provider conversation (#236, #260)",
-                _agy_cap_info.get("provider", agent),
-                _agy_cap_info.get("conversation_id", "?"), wt,
-                _agy_cap_info.get("bytes", 0) / 1048576.0,
-                _agy_cap_info.get("cap_mb", 0),
+                _ctx_cap_info.get("provider", agent),
+                _ctx_cap_info.get("conversation_id", "?"), wt,
+                _ctx_cap_info.get("bytes", 0) / 1048576.0,
+                _ctx_cap_info.get("cap_mb", 0),
             )
         _ctx_info = q().get_or_create_context(
             project=_project, agent=agent, worktree_path=wt, role=role,
@@ -1999,16 +2002,20 @@ def create_app(
             # conversation has some bytes" — every conversation has bytes, and
             # an operator reset would then be mislabelled as a cap trip,
             # corrupting exactly the signal #236 added this event to measure.
-            if _agy_over:
+            if _ctx_over:
                 record_context_event(
                     _context_events_path, "provider_context_capped",
                     task_id=task.task_id, project=_project, role=role, agent=agent,
                     context_id=_ctx_info["context_id"],
                     context_generation=_ctx_info["context_generation"],
-                    provider="agy",
-                    conversation_id=_agy_cap_info.get("conversation_id", ""),
-                    bytes=_agy_cap_info.get("bytes", 0),
-                    cap_mb=_agy_cap_info.get("cap_mb", 0),
+                    # #260 review: the provider that actually tripped the cap.
+                    # Hardcoding "agy" here predated claude having a cap at all,
+                    # and once it did, every claude trip was telemetered as agy —
+                    # corrupting the one field that says which store overflowed.
+                    provider=_ctx_cap_info.get("provider", agent),
+                    conversation_id=_ctx_cap_info.get("conversation_id", ""),
+                    bytes=_ctx_cap_info.get("bytes", 0),
+                    cap_mb=_ctx_cap_info.get("cap_mb", 0),
                 )
             _role_default_agent = _DISPATCH_ROLE_TO_AGENT.get(role)
             if _role_default_agent and agent != _role_default_agent:

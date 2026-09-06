@@ -219,3 +219,90 @@ def test_the_capped_session_is_never_deleted(tmp_path, monkeypatch):
     sv.claude_context_exceeds_cap(CWD, home=tmp_path / "home")
 
     assert f.exists() and f.stat().st_size == 4096
+
+
+# ── the cap event must name the provider that tripped it (#260 review) ──
+
+
+def _capped_event(tmp_path, monkeypatch, agent, cap_info):
+    """Drive a real dispatch whose cap trips, and return the recorded event."""
+    import asyncio
+    import json as _json
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew import server as sv
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / agent
+    wt.mkdir(exist_ok=True)
+    (wt / ".git").mkdir(exist_ok=True)
+    state = tmp_path / "state.json"
+    state.write_text(_json.dumps({"worktrees": {agent: str(wt)}}))
+    db = str(tmp_path / "t.db")
+
+    async def _fake_exec(*cmd, **kwargs):
+        class _P:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(sv, "claude_context_exceeds_cap",
+                        lambda cwd, *a, **k: (agent == "claude", cap_info))
+    monkeypatch.setattr(sv, "agy_context_exceeds_cap",
+                        lambda cwd, *a, **k: (agent == "gemini", cap_info))
+    monkeypatch.setattr(sv, "_known_gemini_model", lambda *a, **k: "m") \
+        if hasattr(sv, "_known_gemini_model") else None
+
+    role = {"claude": "implementer", "gemini": "tester"}[agent]
+    ttype = {"claude": "implement", "gemini": "test"}[agent]
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+                     project="p", watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(task_id=f"t-{agent}", task_type=ttype,
+                              description="do it", branch="main", context={}))
+        task = q.dequeue(role=role)
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, role))
+
+    events = [_json.loads(l) for l in open(tmp_path / "context_events.jsonl")]
+    capped = [e for e in events if e["event_type"] == "provider_context_capped"]
+    return capped[0] if capped else None
+
+
+def test_a_claude_cap_trip_is_attributed_to_claude(tmp_path, monkeypatch):
+    """★The corrupted field: `provider` was hardcoded to "agy", so every claude
+    trip was telemetered as a gemini one — the single field that says which
+    store overflowed said the wrong store."""
+    event = _capped_event(tmp_path, monkeypatch, "claude",
+                          {"bytes": 99 * 1048576, "conversation_id": "sess-c",
+                           "cap_mb": 64, "provider": "claude"})
+
+    assert event is not None, "no cap event was recorded"
+    assert event["provider"] == "claude"
+    assert event["conversation_id"] == "sess-c"
+    assert event["bytes"] == 99 * 1048576
+
+
+def test_an_agy_cap_trip_is_still_attributed_to_agy(tmp_path, monkeypatch):
+    """⛔The fix must not swing the other way: gemini trips keep their label."""
+    event = _capped_event(tmp_path, monkeypatch, "gemini",
+                          {"bytes": 200 * 1048576, "conversation_id": "conv-g",
+                           "cap_mb": 64, "provider": "agy"})
+
+    assert event is not None
+    assert event["provider"] == "agy"
+    assert event["conversation_id"] == "conv-g"
