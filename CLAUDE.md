@@ -67,6 +67,7 @@ post-merge 낭비의 토큰 비용은 attribution이 남아있지 않아 "코멘
 | terminal-PR gate | merge/close된 PR에 대한 후속 작업 | ⏳ PR #251 (#250) |
 | announcement atomic claim | 동시 result의 중복 escalation | ⏳ PR #251 |
 | reviewed-SHA pinning | 이미 고쳐진 finding의 fix task 재생성 | ❌ 미구현 (#253) |
+| result↔task PR 대조 | 다른 PR을 보고 온 결과가 cascade를 구동하는 것 | ⏳ PR #270 (#268) |
 
 원칙:
 1. **round cap은 lineage를 제한할 뿐, 그 작업이 여전히 유효한지는 말해주지 않는다.**
