@@ -134,6 +134,21 @@ _DDL_MIGRATE_ATTR_FALLBACK_OF = "ALTER TABLE task_attribution ADD COLUMN fallbac
 _DDL_MIGRATE_ATTR_STARTED_AT = "ALTER TABLE task_attribution ADD COLUMN started_at REAL DEFAULT 0"
 _DDL_MIGRATE_ATTR_COMPLETED_AT = "ALTER TABLE task_attribution ADD COLUMN completed_at REAL DEFAULT 0"
 _DDL_MIGRATE_ATTR_OUTCOME = "ALTER TABLE task_attribution ADD COLUMN outcome TEXT DEFAULT ''"
+# #278: tester economics. ⛔All five default to NULL, not '' / 0, which departs
+#   from this table's convention on purpose. A historical row has no treatment,
+#   and `effective_test_scope=''` or `lock_wait_seconds=0` would both read as
+#   claims nobody made — "targeted" is not the default and "no lock wait" is
+#   not the same as "never measured". NULL is the only value that says unknown.
+_DDL_MIGRATE_ATTR_TEST_SCOPE = (
+    "ALTER TABLE task_attribution ADD COLUMN effective_test_scope TEXT DEFAULT NULL")
+_DDL_MIGRATE_ATTR_TEST_SCOPE_SOURCE = (
+    "ALTER TABLE task_attribution ADD COLUMN test_scope_source TEXT DEFAULT NULL")
+_DDL_MIGRATE_ATTR_TEST_SCOPE_HASH = (
+    "ALTER TABLE task_attribution ADD COLUMN test_scope_hash TEXT DEFAULT NULL")
+_DDL_MIGRATE_ATTR_LOCK_WAIT = (
+    "ALTER TABLE task_attribution ADD COLUMN lock_wait_seconds REAL DEFAULT NULL")
+_DDL_MIGRATE_ATTR_LOCK_DEFERS = (
+    "ALTER TABLE task_attribution ADD COLUMN lock_defer_count INTEGER DEFAULT NULL")
 
 _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
@@ -149,6 +164,11 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_STARTED_AT,
     _DDL_MIGRATE_ATTR_COMPLETED_AT,
     _DDL_MIGRATE_ATTR_OUTCOME,
+    _DDL_MIGRATE_ATTR_TEST_SCOPE,
+    _DDL_MIGRATE_ATTR_TEST_SCOPE_SOURCE,
+    _DDL_MIGRATE_ATTR_TEST_SCOPE_HASH,
+    _DDL_MIGRATE_ATTR_LOCK_WAIT,
+    _DDL_MIGRATE_ATTR_LOCK_DEFERS,
 )
 
 _DDL_CHECKPOINTS = """
@@ -1262,6 +1282,90 @@ class TaskQueue:
                  previous_task_id, retry_of, fallback_of, started_at or now),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def record_test_economics(
+        self,
+        task_id: str,
+        *,
+        effective_test_scope: str = "",
+        test_scope_source: str = "",
+        test_scope_hash: str = "",
+        lock_wait_seconds: float = 0.0,
+        lock_defer_count: int = 0,
+    ) -> None:
+        """Attach the tester treatment and scheduler delay to an attribution row (#278).
+
+        After PR #275 two tasks with the same task_type, role, provider, project
+        and context can cost radically different amounts depending on the
+        resolved scope. Without this, quota-core cannot tell a real saving from
+        a change in the diff mix, and the only alternative — parsing the
+        tester's free-text summary — would make a measurement contract depend
+        on agent prose.
+
+        ⛔Written only for dispatches that actually resolved a scope. A row this
+          was never called for keeps NULL in all five columns, which is the
+          honest reading: unknown treatment, not "targeted".
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                """
+                UPDATE task_attribution
+                SET effective_test_scope=?, test_scope_source=?, test_scope_hash=?,
+                    lock_wait_seconds=?, lock_defer_count=?, updated_at=?
+                WHERE task_id=?
+                """,
+                (effective_test_scope, test_scope_source, test_scope_hash,
+                 float(lock_wait_seconds), int(lock_defer_count), time.time(), task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def note_test_lock_defer(self, task_id: str) -> tuple:
+        """Count one lock deferral for ``task_id``; return ``(count, first_at)``.
+
+        The lock is non-blocking, so a contended test task is requeued and
+        retried on the next tick — the wait is spread across N separate
+        dispatch attempts rather than spent inside one. Reconstructing it later
+        therefore needs the FIRST deferral's timestamp, which has to outlive the
+        attempt that observed it: it lives in the task's own context so it
+        survives a dispatcher restart and joins by task_id like everything else.
+
+        ⛔Read-modify-write under BEGIN IMMEDIATE. Two dispatchers can contend
+          for the same worktree — that is the situation being measured — and a
+          check-then-act increment would lose one of their counts.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT context FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if row is None:
+                conn.rollback()
+                return (0, 0.0)
+            try:
+                context = json.loads(row["context"] or "{}")
+            except Exception:
+                context = {}
+            if not isinstance(context, dict):
+                context = {}
+            count = context.get("test_lock_defer_count")
+            count = (count if isinstance(count, int) else 0) + 1
+            first = context.get("test_lock_first_deferred_at")
+            if not isinstance(first, (int, float)) or first <= 0:
+                first = time.time()
+            context["test_lock_defer_count"] = count
+            context["test_lock_first_deferred_at"] = first
+            conn.execute("UPDATE tasks SET context = ? WHERE task_id = ?",
+                         (json.dumps(context), task_id))
+            conn.commit()
+            return (count, float(first))
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 
