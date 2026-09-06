@@ -193,11 +193,21 @@ def test_a_capped_claude_session_forces_a_fresh_one(tmp_path, monkeypatch):
 
 
 def test_codex_resume_is_policy_aware_too(tmp_path, monkeypatch):
+    """⛔Updated by #262: `resume --last` is gone entirely.
+
+    #260 made codex policy-aware and still used the global `--last` selector.
+    #262 showed that selector can attach another project's session, so a resume
+    now targets a bound session id and an unbound worktree starts fresh. Both
+    dispatches below are unbound, so both are fresh — and neither may contain
+    `--last`, which is what #260 asserted and #262 removed.
+    """
     resumed = _dispatch_cmd(tmp_path, monkeypatch, "codex")
     fresh = _dispatch_cmd(tmp_path, monkeypatch, "codex", policy="fresh")
 
-    assert resumed[:4] == ["codex", "exec", "resume", "--last"]
-    assert "resume" not in fresh and fresh[:2] == ["codex", "exec"]
+    for cmd in (resumed, fresh):
+        assert cmd[:2] == ["codex", "exec"]
+        assert "--last" not in cmd
+    assert "resume" not in fresh
 
 
 def test_the_capped_session_is_never_deleted(tmp_path, monkeypatch):
