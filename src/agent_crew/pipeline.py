@@ -163,17 +163,26 @@ def review_is_current(review_ctx: dict, pr_number, *, head_sha_fn=None,
     #   nobody chose.
     repo = repo or (review_ctx or {}).get("repo") or ""
     if head_sha_fn is None and not repo and not repo_cwd:
-        # ⛔"We have no way to look this up" is NOT the same as "the lookup
-        #   failed". Deferring on a transient GitHub problem is right; deferring
-        #   because the repository was never configured would disable the whole
-        #   review→fix loop silently, which is a far worse failure than the
-        #   duplicate work this gate exists to prevent. Proceed, and say so.
+        # ⛔Fail closed, like every other unverifiable case here. An earlier
+        #   version let this through, reasoning that a configuration gap should
+        #   not disable the cascade — but #253's acceptance criterion is that an
+        #   unverifiable comparison DEFERS, and the asymmetry it rests on holds
+        #   just as well here: a skipped cascade is recoverable, a fix task
+        #   written against a state that may already be fixed is not. "We never
+        #   learned the repository" is not evidence that the finding is current.
+        #
+        #   The risk that motivated the earlier choice is real and is answered
+        #   by making this loud rather than by proceeding: in production the
+        #   repo is supplied twice over — watch-ingested tasks carry `repo`, and
+        #   the server passes a worktree — so reaching this branch at all means
+        #   something is misconfigured, and that is worth stopping for.
         logger.warning(
             f"review_is_current: no repo known for PR #{pr_number} (review context "
-            f"has no 'repo') — cannot compare the reviewed commit, letting the "
-            f"cascade proceed rather than blocking it on a configuration gap"
+            f"has no 'repo' and no worktree was supplied) — cannot compare the "
+            f"reviewed commit, so NOT creating follow-up work. Fix the task "
+            f"context or pass repo_cwd; the review result itself is unaffected."
         )
-        return (True, "no repo to compare against")
+        return (False, "no repo to compare against — cannot verify")
     try:
         if head_sha_fn is not None:
             head = head_sha_fn(int(pr_number)) or ""

@@ -36,6 +36,15 @@ def q(tmp_db):
     return TaskQueue(tmp_db)
 
 
+@pytest.fixture(autouse=True)
+def _pr_is_open(monkeypatch):
+    """#250's terminal-PR gate runs in the same cascade and asks GitHub for the
+    PR's state. These tests are about the reviewed-commit gate, so the PR is
+    held open — otherwise every one of them would stop at the earlier gate and
+    prove nothing about this one."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+
+
 def _review(q, *, reviewed_sha=OLD, pr_number=PR, verdict="request_changes",
             findings=(FINDING,)):
     rid = f"review-{uuid.uuid4().hex[:8]}"
@@ -267,7 +276,12 @@ def test_the_head_lookup_names_the_repo_from_the_review_context(monkeypatch, q):
     assert auto_enqueue_fix(q, rid) is None, "a superseded review still created work"
 
     assert calls, "no gh call was made — the default lookup path was skipped"
-    argv = calls[0]["argv"]
+    # Several subprocesses run in this path (#250's state gate too); find the
+    # PR-head lookup rather than assuming it is first.
+    gh_calls = [c["argv"] for c in calls
+                if c["argv"][:1] == ["gh"] and "commits" in c["argv"]]
+    assert gh_calls, f"no `gh pr view --json commits` call: {[c['argv'] for c in calls]}"
+    argv = gh_calls[0]
     assert "--repo" in argv and "truhojunbot-tech/agent_crew" in argv, \
         f"gh was not told which repository to ask: {argv}"
 
@@ -289,13 +303,21 @@ def test_a_worktree_supplies_the_repo_when_the_context_does_not(monkeypatch, q):
         "repo detection ran in the process cwd instead of the given checkout"
 
 
-def test_no_known_repo_lets_the_cascade_proceed(q, caplog):
-    """⛔The one place this gate must NOT be fail-closed.
+def test_no_known_repo_defers_like_every_other_unverifiable_case(q, caplog):
+    """★⛔Fail closed here too.
 
-    "We could not reach GitHub" is a transient state worth deferring on. "No
-    repository is configured" is not a state at all — it never resolves, and
-    deferring on it would silently disable every review→fix cascade, which is a
-    far worse failure than the duplicate work the gate prevents.
+    An earlier version let this through, reasoning that a configuration gap
+    should not disable the cascade. #253's acceptance criterion is that an
+    unverifiable comparison DEFERS, and the asymmetry it rests on holds here:
+    a skipped cascade is recoverable, a fix task written against a state that
+    may already be fixed is not. "We never learned the repository" is not
+    evidence that the finding is current.
+
+    The concern behind the earlier choice is answered by volume, not by
+    proceeding: in production the repo arrives twice over — ingested tasks
+    carry it and the server passes a worktree — so reaching this branch means
+    something is misconfigured, which is worth stopping for and worth logging
+    loudly enough to find.
     """
     import logging
 
@@ -304,9 +326,24 @@ def test_no_known_repo_lets_the_cascade_proceed(q, caplog):
     with caplog.at_level(logging.WARNING, logger="agent_crew.pipeline"):
         current, why = review_is_current({"reviewed_sha": OLD}, PR)
 
-    assert current is True and "no repo" in why
+    assert current is False, "an unverifiable comparison still created work"
+    assert "cannot verify" in why
     assert any("no repo known" in r.message for r in caplog.records), \
-        "the cascade proceeded without saying why"
+        "the cascade stopped without saying why — undiagnosable"
+
+
+def test_no_known_repo_creates_no_fix_task(q):
+    """The gate's decision has to reach the cascade, not just the helper."""
+    rid = f"review-{uuid.uuid4().hex[:8]}"
+    q.enqueue(TaskRequest(task_id=rid, task_type="review", description="review",
+                          branch=BRANCH,
+                          context={"pr_number": PR, "reviewed_sha": OLD}))
+    q.submit_result(rid, TaskResult(task_id=rid, status="completed", summary="s",
+                                    verdict="request_changes", findings=[FINDING],
+                                    pr_number=PR))
+
+    assert auto_enqueue_fix(q, rid) is None
+    assert not [t for t in q.list_tasks() if t.task_type == "implement"]
 
 
 def test_a_reachable_repo_with_an_unreadable_head_still_defers(q):
