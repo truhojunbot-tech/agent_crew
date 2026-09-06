@@ -54,6 +54,37 @@ GH_READ_ONLY_COMMANDS = frozenset({
 })
 
 
+#: gh global flags that take a VALUE. Skipping the flag without its value would
+#: read that value as the command — `gh --repo o/r pr comment` would look like
+#: the command `o/r pr`.
+GH_VALUE_FLAGS = frozenset({"--repo", "-R", "--hostname"})
+
+
+def _gh_command(parts) -> tuple:
+    """The (group, verb) of a gh argv, ignoring global flags.
+
+    ⛔Global flags come BEFORE the command: `gh --repo o/r pr comment 1` is a
+      valid mutation, and treating any leading flag as "not a command" let it
+      through both the block and the approved-target pin (review of PR #264).
+      `gh --repo <owner/repo> pr comment --help` exits 0, so this is a form gh
+      really accepts, not a theoretical one.
+    """
+    words = []
+    i = 1
+    while i < len(parts) and len(words) < 2:
+        token = parts[i]
+        if token.startswith("-"):
+            # Always advances: a value flag consumes its value, anything else
+            # consumes itself. Written as one expression because a branchy
+            # version can fail to advance and spin — mine did, under a mutation
+            # that removed the value-flag case.
+            i += 2 if token in GH_VALUE_FLAGS else 1
+            continue
+        words.append(token)
+        i += 1
+    return tuple(words)
+
+
 def _gh_write_argv(argv) -> bool:
     """Is this subprocess argv a GitHub MUTATION?"""
     try:
@@ -62,19 +93,27 @@ def _gh_write_argv(argv) -> bool:
         return False
     if not parts or os.path.basename(parts[0]) != "gh":
         return False
-    verbs = tuple(p for p in parts[1:3] if not p.startswith("-"))
-    if len(parts) > 1 and parts[1].startswith("-"):
-        return False                      # `gh --version` and friends
-    return tuple(verbs[:2]) not in GH_READ_ONLY_COMMANDS
+    command = _gh_command(parts)
+    if not command:
+        return False                      # `gh --version`, `gh --help`
+    return command not in GH_READ_ONLY_COMMANDS
 
 
 def _gh_argv_repo(argv):
-    """The `--repo` value in a gh argv, or None."""
+    """The repository named anywhere in a gh argv, or None.
+
+    Handles the global form (`gh --repo o/r pr comment`), the per-command form
+    (`gh pr comment --repo o/r`), the short flag and the `=` spelling — a pin
+    that only understood one of them would be a pin with a hole in it.
+    """
     parts = [str(a) for a in argv]
-    if "--repo" in parts:
-        i = parts.index("--repo")
-        if i + 1 < len(parts):
+    for i, token in enumerate(parts):
+        if token in ("--repo", "-R") and i + 1 < len(parts):
             return parts[i + 1]
+        if token.startswith("--repo="):
+            return token.split("=", 1)[1]
+        if token.startswith("-R=") :
+            return token.split("=", 1)[1]
     return None
 
 

@@ -411,6 +411,17 @@ from tests.conftest import _gh_argv_repo, _gh_write_argv  # noqa: E402
     (["gh", "issue", "edit", "1", "--add-label", "x"], True),
     (["gh", "api", "graphql", "-f", "query=mutation{...}"], True),
     (["gh", "some-future-verb", "thing"], True),
+    # ⛔Global flags come BEFORE the command. Treating any leading flag as
+    #   "not a command" let this exact form through both the block and the
+    #   approved-target pin — and `gh --repo <owner/repo> pr comment --help`
+    #   exits 0, so gh really accepts it (review of PR #264).
+    (["gh", "--repo", "o/r", "pr", "comment", "1", "--body", "x"], True),
+    (["gh", "-R", "o/r", "pr", "comment", "1"], True),
+    (["gh", "--repo=o/r", "pr", "comment", "1"], True),
+    (["gh", "--repo", "o/r", "issue", "create", "--title", "t"], True),
+    (["gh", "--repo", "o/r", "pr", "view", "1"], False),
+    (["gh", "-R", "o/r", "issue", "list"], False),
+    (["gh", "--help"], False),
 ])
 def test_writes_are_recognised_at_the_transport(argv, is_write):
     """⛔An allowlist of reads, so an unknown verb fails CLOSED. The cost of
@@ -419,9 +430,17 @@ def test_writes_are_recognised_at_the_transport(argv, is_write):
     assert _gh_write_argv(argv) is is_write
 
 
-def test_the_repo_is_read_out_of_the_argv():
-    assert _gh_argv_repo(["gh", "pr", "comment", "1", "--repo", "o/r"]) == "o/r"
-    assert _gh_argv_repo(["gh", "pr", "comment", "1"]) is None
+@pytest.mark.parametrize("argv,expected", [
+    (["gh", "pr", "comment", "1", "--repo", "o/r"], "o/r"),
+    (["gh", "--repo", "o/r", "pr", "comment", "1"], "o/r"),
+    (["gh", "-R", "o/r", "pr", "comment", "1"], "o/r"),
+    (["gh", "--repo=o/r", "pr", "comment", "1"], "o/r"),
+    (["gh", "pr", "comment", "1"], None),
+])
+def test_the_repo_is_read_out_of_the_argv(argv, expected):
+    """⛔Every spelling gh accepts. A pin that understood only one of them
+    would be a pin with a hole in it."""
+    assert _gh_argv_repo(argv) == expected
 
 
 #: ⛔Probes must target a PR that CANNOT exist. These tests are run with the
@@ -497,3 +516,43 @@ def test_reads_still_pass_through_the_guard():
     r = gh.subprocess.run(["gh", "--version"], capture_output=True, text=True)
 
     assert r.returncode == 0
+
+
+GLOBAL_FLAG_PROBE = """
+    def test_writes_with_a_global_repo_flag(monkeypatch):
+        import agent_crew.github as gh
+        gh.subprocess.run(
+            ["gh", "--repo", "truhojunbot-tech/agent_crew", "pr", "comment",
+             "999241", "--body", "global flag bypass"],
+            capture_output=True, text=True)
+"""
+
+APPROVED_GLOBAL_FLAG_PROBE = """
+    import pytest
+
+    @pytest.mark.live_github
+    def test_writes_with_a_global_repo_flag_to_the_wrong_repo(monkeypatch):
+        import agent_crew.github as gh
+        gh.subprocess.run(
+            ["gh", "--repo", "truhojunbot-tech/agent_crew", "pr", "comment",
+             "999241", "--body", "global flag bypass"],
+            capture_output=True, text=True)
+"""
+
+
+def test_a_global_repo_flag_mutation_is_blocked_by_default(tmp_path):
+    """★★The reported bypass, end to end and at the transport."""
+    r = _run_probe(tmp_path, GLOBAL_FLAG_PROBE, approved=False)
+
+    combined = _flat(r.stdout + r.stderr)
+    assert r.returncode != 0, "a global --repo mutation went through unguarded"
+    assert "GitHubWriteFromTest" in combined
+
+
+def test_a_global_repo_flag_cannot_dodge_the_approved_target(tmp_path):
+    """★★Approved for a sandbox, aimed at production via the global flag."""
+    r = _run_probe(tmp_path, APPROVED_GLOBAL_FLAG_PROBE, approved=True)
+
+    combined = _flat(r.stdout + r.stderr)
+    assert r.returncode != 0
+    assert "GitHubWriteFromTest" in combined
