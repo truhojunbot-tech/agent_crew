@@ -322,3 +322,113 @@ def test_mcp_an_agreeing_result_still_cascades(tmp_db, monkeypatch):
 
     assert out.get("held") is None
     assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 1
+
+
+# ── 5. the spellings have to survive the API boundary ─────────────────
+#
+# Review of PR #270, P2: `pr_number` was typed `Optional[int]`, so FastAPI
+# rejected `"#268"` with a 422 *before* `_as_pr_number` ever ran. The helper
+# accepted three spellings and the endpoint accepted two — and the one it threw
+# away it threw away completely, which is the same 4xx-discards-the-result
+# behaviour this PR argued against everywhere else. Normalisation belongs at
+# the boundary, not behind it.
+
+
+@pytest.mark.parametrize("submitted", [REQUESTED, str(REQUESTED), f"#{REQUESTED}", f" {REQUESTED} "])
+def test_the_result_type_normalises_every_spelling_to_an_int(submitted):
+    """⛔An `int` on the way out, whatever came in. The queue writes this to an
+    INTEGER column and the cascade calls `int()` on it — a `str` that survived
+    this far would be a second bug wearing the first one's clothes."""
+    r = TaskResult(task_id="t", status="completed", summary="s", pr_number=submitted)
+    assert r.pr_number == REQUESTED and isinstance(r.pr_number, int)
+
+
+def test_an_empty_pr_number_string_means_no_pr_rather_than_an_error():
+    """`""` used to be a 422, which threw away a whole result over a field the
+    agent was telling us it had nothing to put in."""
+    assert TaskResult(task_id="t", status="completed", summary="s", pr_number="").pr_number is None
+
+
+@pytest.mark.parametrize("junk", ["not-a-pr", "#", "12x", "-3"])
+def test_a_string_that_names_no_pr_is_still_rejected(junk):
+    """⛔The relaxation is for *spelling*, not for junk. A value that cannot
+    name a PR is a malformed request, not a mismatch, and the caller has to
+    hear about it — silently storing `None` would drop the very signal #268
+    exists to preserve."""
+    with pytest.raises(ValueError, match="pr_number"):
+        TaskResult(task_id="t", status="completed", summary="s", pr_number=junk)
+
+
+@pytest.mark.parametrize("value", [None, 0, REQUESTED])
+def test_non_string_values_are_left_exactly_as_they_were(value):
+    """⛔No behaviour change for anything that already worked. `0` in
+    particular stays `0` — falsy, so the cascade reads it as "no PR", which is
+    what it did before this normalisation existed."""
+    r = TaskResult(task_id="t", status="completed", summary="s", pr_number=value)
+    assert r.pr_number == value
+
+
+def test_http_a_hash_prefixed_pr_number_agrees_and_cascades(tmp_db, monkeypatch, github_writes):
+    """★★The regression the review asked for: `#268` end-to-end through the
+    endpoint, agreeing with the dispatched PR."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    monkeypatch.setattr("agent_crew.github.post_review_comment", lambda *a, **k: True)
+    with TestClient(_server(tmp_db, _Push())) as c:
+        _enqueue(c, "review-hash", "review", {"pr_number": REQUESTED})
+        r = _submit(c, "review-hash", pr_number=f"#{REQUESTED}")
+        assert r.status_code == 200, r.text
+        assert r.json().get("held") is None
+        assert c.get("/tasks/review-hash").json()["pr_number"] == REQUESTED
+
+    assert len([t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "implement"]) == 1
+
+
+def test_http_a_hash_prefixed_pr_number_can_still_mismatch(tmp_db, monkeypatch, github_writes):
+    """⛔Accepting the spelling must not accept the disagreement with it."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    with TestClient(_server(tmp_db, _Push())) as c:
+        _enqueue(c, "review-hash-mm", "review", {"pr_number": REQUESTED})
+        body = _submit(c, "review-hash-mm", pr_number=f"#{REPORTED}").json()
+
+    assert body.get("held") == "pr_number_mismatch"
+    assert (body.get("requested_pr"), body.get("reported_pr")) == (REQUESTED, REPORTED)
+
+
+def test_http_a_malformed_pr_number_is_still_a_request_error(tmp_db, monkeypatch, github_writes):
+    """The 422 stays where it belongs — on requests that are actually malformed."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    with TestClient(_server(tmp_db, _Push())) as c:
+        _enqueue(c, "review-junk", "review", {"pr_number": REQUESTED})
+        assert _submit(c, "review-junk", pr_number="not-a-pr").status_code == 422
+
+
+def test_mcp_accepts_the_same_spellings(tmp_db, monkeypatch):
+    """⛔Parity, for the same reason the hold itself has parity: a boundary that
+    normalises on one transport and not the other is a boundary an agent
+    crosses by changing how it reports."""
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="review-mcp-hash", task_type="review", description="review",
+                          branch=BRANCH, context={"pr_number": REQUESTED}))
+    q.dequeue(role="reviewer")
+
+    out = _mcp_submit(tmp_db, task_id="review-mcp-hash", status="completed",
+                      summary="request_changes: broken", verdict="request_changes",
+                      findings=[FINDING], pr_number=f"#{REQUESTED}")
+
+    assert out.get("acknowledged") is True and out.get("held") is None, out
+    assert {t.task_id: t for t in q.list_tasks()}["review-mcp-hash"].pr_number == REQUESTED
+
+
+def test_the_mcp_tool_schema_actually_advertises_the_string_form(tmp_db):
+    """⛔The behavioural test above calls the tool function directly, so it
+    passes even with the annotation narrowed back to `Optional[int]` —
+    normalisation lives in the dataclass and fires either way. A real MCP
+    client is validated against the PUBLISHED schema before the function is
+    reached, so the declaration needs its own assertion or widening it is
+    untested. (Found by mutation: narrowing the signature killed nothing.)"""
+    from agent_crew.mcp_server import build_mcp_server
+
+    tool = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"]
+    types = {t.get("type") for t in tool.parameters["properties"]["pr_number"]["anyOf"]}
+    assert {"integer", "string", "null"} <= types, types

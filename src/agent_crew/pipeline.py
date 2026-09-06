@@ -33,7 +33,12 @@ from agent_crew.fallback import (
 )
 from agent_crew.loop import _resolve_verdict
 from agent_crew.notify import notify_telegram
-from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+from agent_crew.protocol import (
+    GateRequest,
+    TaskRequest,
+    TaskResult,
+    normalize_pr_number,
+)
 from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE
 
 logger = logging.getLogger(__name__)
@@ -63,27 +68,11 @@ FIX_EXHAUSTED_KIND = "fix_exhausted"
 PR_MISMATCH_MARKER = "[agent_crew] PR MISMATCH"
 
 
-def _as_pr_number(value) -> Optional[int]:
-    """``value`` as a PR number, or ``None`` when it does not name one.
-
-    Both sides of the #268 cross-check arrive untyped — one out of a JSON
-    context column, one off an agent-authored result — so `268`, `"268"` and
-    `"#268"` all have to compare equal or the guard fires on spelling instead
-    of on substance.
-
-    ⛔`bool` is short-circuited before `int()`: in Python `True` is `1`, and a
-      `pr_number=True` silently becoming "PR #1" would invent a disagreement
-      with whatever PR the task was really about.
-    """
-    if value is None or isinstance(value, bool):
-        return None
-    if isinstance(value, str):
-        value = value.strip().lstrip("#").strip()
-    try:
-        n = int(value)
-    except (TypeError, ValueError):
-        return None
-    return n if n > 0 else None
+#: The spelling normaliser lives on the protocol type, because FastAPI has to
+#: apply it at the boundary — a helper only this module could reach was one a
+#: 422 fired before (review of PR #270). Aliased rather than re-implemented so
+#: the endpoint and the cross-check can never drift apart on what "#268" means.
+_as_pr_number = normalize_pr_number
 
 
 def pr_number_mismatch(reported, requested) -> Optional[tuple]:

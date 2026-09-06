@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import asdict
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -146,7 +146,10 @@ def build_mcp_server(
         summary: str = "",
         verdict: Optional[str] = None,
         findings: Optional[list[str]] = None,
-        pr_number: Optional[int] = None,
+        # `int | str` for the same reason as the HTTP body: agents write PR
+        # numbers as `#268`, and a transport that 422s on the spelling throws
+        # the whole result away (review of PR #270).
+        pr_number: Optional[Union[int, str]] = None,
     ) -> dict[str, Any]:
         """Mark a task done and store its result.
 
