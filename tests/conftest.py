@@ -42,6 +42,42 @@ DISPOSABLE_REPO_PATTERN = re.compile(
     r"(sandbox|scratch|disposable|throwaway|fixture|-test$|_test$)", re.IGNORECASE)
 
 
+#: `gh` invocations that only READ. Everything else is treated as a write.
+#:
+#: ⛔An allowlist, not a blocklist. A `gh` verb nobody thought about should fail
+#:   closed at a write boundary; the cost of getting that wrong is a test that
+#:   says so, and the cost of the reverse is a production mutation.
+GH_READ_ONLY_COMMANDS = frozenset({
+    ("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "status"),
+    ("pr", "checks"), ("issue", "view"), ("issue", "list"),
+    ("repo", "view"), ("auth", "status"),
+})
+
+
+def _gh_write_argv(argv) -> bool:
+    """Is this subprocess argv a GitHub MUTATION?"""
+    try:
+        parts = [str(a) for a in argv]
+    except Exception:  # noqa: BLE001
+        return False
+    if not parts or os.path.basename(parts[0]) != "gh":
+        return False
+    verbs = tuple(p for p in parts[1:3] if not p.startswith("-"))
+    if len(parts) > 1 and parts[1].startswith("-"):
+        return False                      # `gh --version` and friends
+    return tuple(verbs[:2]) not in GH_READ_ONLY_COMMANDS
+
+
+def _gh_argv_repo(argv):
+    """The `--repo` value in a gh argv, or None."""
+    parts = [str(a) for a in argv]
+    if "--repo" in parts:
+        i = parts.index("--repo")
+        if i + 1 < len(parts):
+            return parts[i + 1]
+    return None
+
+
 def _gh():
     import agent_crew.github as gh
 
@@ -82,6 +118,51 @@ def live_github_approval(env=None, production_repo=None) -> tuple:
                        f"(expected one of sandbox/scratch/disposable/throwaway/"
                        f"fixture/-test)")
     return (True, f"approved for {target}")
+
+
+def _install_gh_transport_guard(monkeypatch, gh, sink, observing, target=None):
+    """Guard `gh` mutations at the subprocess boundary.
+
+    Below every import alias, because that is the level a test cannot capture
+    early. Reads pass through untouched — the suite depends on `pr_state` and
+    `pr_head_sha`, and blocking those would push tests toward mocking the whole
+    module and lose coverage of the real call shapes.
+
+    `target` is set only for an approved live test: then a mutation is allowed
+    if and only if it names that repository on the command line.
+    """
+    real_run = gh.subprocess.run
+
+    def guarded_run(argv, *args, **kwargs):
+        if not _gh_write_argv(argv):
+            return real_run(argv, *args, **kwargs)
+        parts = [str(a) for a in argv]
+        if target is not None:
+            repo = _gh_argv_repo(parts)
+            if repo == target:
+                return real_run(argv, *args, **kwargs)
+            msg = (f"a gh mutation reached the transport layer targeting "
+                   f"{repo!r}, but the approved disposable target is "
+                   f"{target!r}: {' '.join(parts[:4])}")
+            # ⛔Recorded as well as raised, on the SAME sink the default path
+            #   uses. The helpers swallow exceptions, so a refusal that is only
+            #   raised is invisible to the test that caused it.
+            sink.append({"fn": "gh", "args": tuple(parts[:4]), "kwargs": {},
+                         "refused": msg})
+            raise GitHubWriteFromTest(msg)
+        sink.append({"fn": "gh", "args": tuple(parts[:4]), "kwargs": {}})
+        if observing:
+            class _R:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+            return _R()
+        msg = (f"a gh MUTATION was issued from a test: {' '.join(parts[:4])}. "
+               f"This was caught below the import alias, which means something "
+               f"called a writer the fixture could not patch by name.")
+        raise GitHubWriteFromTest(msg)
+
+    monkeypatch.setattr(gh.subprocess, "run", guarded_run)
 
 
 def _pinned_to_repo(name, fn, target):
@@ -185,7 +266,19 @@ def _no_github_writes(request, github_writes_recorder, monkeypatch):
                 fn = getattr(_gh(), name, None)
                 if fn is not None:
                     monkeypatch.setattr(_gh(), name, _pinned_to_repo(name, fn, target))
+            # ...and below the aliases, where a module-level import cannot dodge it.
+            _install_gh_transport_guard(monkeypatch, _gh(), github_writes_recorder,
+                                        False, target=target)
             yield
+            refusals = [c["refused"] for c in github_writes_recorder
+                        if isinstance(c, dict) and c.get("refused")]
+            if refusals:
+                # ⛔The helpers wrap their `gh` calls in `except Exception`, so a
+                #   refusal that is merely raised is swallowed and the offending
+                #   test still passes. The attempt is the defect.
+                raise GitHubWriteFromTest(
+                    "an approved live test tried to write outside its target:\n  "
+                    + "\n  ".join(refusals))
             return
         if not approved:
             # ⛔The marker is a REQUEST, not permission. Left as a bare escape,
@@ -197,6 +290,8 @@ def _no_github_writes(request, github_writes_recorder, monkeypatch):
             for name in GITHUB_WRITE_FUNCTIONS:
                 if hasattr(_gh(), name):
                     monkeypatch.setattr(_gh(), name, _blocked_live(name, why))
+            _install_gh_transport_guard(monkeypatch, _gh(), github_writes_recorder,
+                                        False, target=None)
             pytest.skip(f"live_github test not approved: {why}")
         yield
         return
@@ -228,6 +323,15 @@ def _no_github_writes(request, github_writes_recorder, monkeypatch):
     for name in GITHUB_WRITE_FUNCTIONS:
         if hasattr(gh, name):
             monkeypatch.setattr(gh, name, _stub(name))
+    # ⛔The function stubs are the readable half; this is the load-bearing one.
+    #   Patching `agent_crew.github.post_pr_comment` does nothing to a name a
+    #   test module already bound with `from agent_crew.github import
+    #   post_pr_comment` at collection time — that alias is captured before any
+    #   fixture runs and calls the ORIGINAL (review of PR #264). Every helper
+    #   ultimately reaches `subprocess.run(["gh", ...])`, and `subprocess.run`
+    #   is resolved through the module at call time, so guarding it there is
+    #   below every alias.
+    _install_gh_transport_guard(monkeypatch, gh, sink, observing, target=None)
     yield
     if not observing and github_writes_recorder:
         calls = "\n  ".join(f"{c['fn']}(kwargs={c['kwargs']})"

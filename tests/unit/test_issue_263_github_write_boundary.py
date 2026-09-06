@@ -84,7 +84,7 @@ def test_a_swallowed_write_attempt_still_fails_the_test(testdir_factory=None):
         def test_swallows_the_write():
             import agent_crew.github as gh
             try:
-                gh.post_pr_comment(241, "synthetic")
+                gh.post_pr_comment(999241, "synthetic")
             except Exception:
                 pass          # exactly what the dispatcher does
     ''')
@@ -193,7 +193,7 @@ def test_an_unapproved_live_github_test_is_skipped_and_still_blocked(tmp_path):
         @pytest.mark.live_github
         def test_wants_to_write_for_real():
             import agent_crew.github as gh
-            gh.post_pr_comment(241, "this must never reach GitHub")
+            gh.post_pr_comment(999241, "this must never reach GitHub")
     '''))
     env = {k: v for k, v in __import__("os").environ.items()
            if k not in (LIVE_GITHUB_ENV, LIVE_GITHUB_REPO_ENV)}
@@ -251,6 +251,18 @@ def test_the_unapproved_stub_refuses_and_explains():
 APPROVED_TARGET = "truhojunbot-tech/crew-sandbox"
 
 
+def _flat(text):
+    """Collapse whitespace before matching.
+
+    pytest wraps long assertion output, so a message can be split mid-sentence
+    across lines — a substring check against the raw capture fails for a
+    message that is plainly there.
+    """
+    import re as _re
+
+    return _re.sub(r"\s+", " ", text)
+
+
 def _run_probe(tmp_path, body, *, approved=True, target=APPROVED_TARGET):
     """Run a `live_github`-marked test in a subprocess and return the result."""
     import os as _os
@@ -287,7 +299,7 @@ def test_an_approved_test_cannot_write_with_the_default_repo(tmp_path):
         @pytest.mark.live_github
         def test_writes_with_the_default_repo():
             import agent_crew.github as gh
-            gh.post_pr_comment(241, "this must not reach production")
+            gh.post_pr_comment(999241, "this must not reach production")
     ''')
 
     assert r.returncode != 0, "an approved test wrote with the default repo"
@@ -303,7 +315,7 @@ def test_an_approved_test_cannot_write_to_another_repo(tmp_path):
         @pytest.mark.live_github
         def test_writes_to_production_explicitly():
             import agent_crew.github as gh
-            gh.post_pr_comment(241, "nope", repo="truhojunbot-tech/agent_crew")
+            gh.post_pr_comment(999241, "nope", repo="truhojunbot-tech/agent_crew")
     ''')
 
     assert r.returncode != 0
@@ -369,3 +381,119 @@ def test_a_write_function_without_a_repo_parameter_is_refused():
 
     with pytest.raises(GitHubWriteFromTest, match="no `repo` parameter"):
         guarded(1, "x")
+
+
+# ── the alias hole: patching by name is patched too late ─────────────
+#
+# `monkeypatch.setattr(agent_crew.github, "post_pr_comment", ...)` does nothing
+# to a name a test module already bound at COLLECTION time with
+# `from agent_crew.github import post_pr_comment`. That alias points at the
+# original function and the fixture never sees the call (review of PR #264).
+#
+# Every helper reaches `subprocess.run(["gh", ...])`, and `subprocess.run` is
+# resolved through the module at CALL time — so the guard sits there, below
+# every alias.
+
+from tests.conftest import _gh_argv_repo, _gh_write_argv  # noqa: E402
+
+
+@pytest.mark.parametrize("argv,is_write", [
+    (["gh", "pr", "view", "1", "--json", "comments"], False),
+    (["gh", "pr", "list", "--repo", "o/r"], False),
+    (["gh", "issue", "view", "1"], False),
+    (["gh", "issue", "list"], False),
+    (["gh", "--version"], False),
+    (["git", "remote", "get-url", "origin"], False),
+    (["gh", "pr", "comment", "241", "--body", "x"], True),
+    (["gh", "issue", "comment", "1", "--body", "x"], True),
+    (["gh", "pr", "merge", "1"], True),
+    (["gh", "issue", "create", "--title", "t"], True),
+    (["gh", "issue", "edit", "1", "--add-label", "x"], True),
+    (["gh", "api", "graphql", "-f", "query=mutation{...}"], True),
+    (["gh", "some-future-verb", "thing"], True),
+])
+def test_writes_are_recognised_at_the_transport(argv, is_write):
+    """⛔An allowlist of reads, so an unknown verb fails CLOSED. The cost of
+    being wrong that way is a test that says so; the cost of the reverse is a
+    production mutation."""
+    assert _gh_write_argv(argv) is is_write
+
+
+def test_the_repo_is_read_out_of_the_argv():
+    assert _gh_argv_repo(["gh", "pr", "comment", "1", "--repo", "o/r"]) == "o/r"
+    assert _gh_argv_repo(["gh", "pr", "comment", "1"]) is None
+
+
+#: ⛔Probes must target a PR that CANNOT exist. These tests are run with the
+#: guard deliberately disabled during mutation testing, and on 2026-09-06 an
+#: earlier version of them — which used the real PR #241 — posted "this must
+#: not reach production" and "nope" to it four times while I was mutating the
+#: guard away. Testing a safety guard means running the dangerous thing with
+#: the safety off; the payload therefore has to be harmless on its own.
+UNREACHABLE_PR = 999241
+
+ALIAS_PROBE = """
+    from agent_crew.github import post_pr_comment      # bound at collection
+
+    def test_writes_through_a_captured_alias(monkeypatch):
+        import agent_crew.github as gh
+        monkeypatch.setattr(gh, "check_gh_installed", lambda: True)
+        monkeypatch.setattr(gh, "get_repo", lambda cwd=None: "truhojunbot-tech/agent_crew")
+        post_pr_comment(999241, "this must not reach production")
+"""
+
+APPROVED_ALIAS_PROBE = """
+    import pytest
+    from agent_crew.github import post_pr_comment      # bound at collection
+
+    @pytest.mark.live_github
+    def test_writes_to_production_through_an_alias(monkeypatch):
+        import agent_crew.github as gh
+        monkeypatch.setattr(gh, "check_gh_installed", lambda: True)
+        post_pr_comment(999241, "nope", repo="truhojunbot-tech/agent_crew")
+"""
+
+
+def test_a_module_level_alias_cannot_dodge_the_block(tmp_path):
+    """★★The reported hole: the writer is imported before any fixture runs."""
+    r = _run_probe(tmp_path, ALIAS_PROBE, approved=False)
+
+    combined = _flat(r.stdout + r.stderr)
+    assert r.returncode != 0, "a module-level alias wrote unguarded"
+    # ⛔The helper swallows the refusal (`except Exception: return False`), so
+    #   the probe's own test body passes and the block surfaces at TEARDOWN.
+    #   That is the design — the attempt is the defect even when the caller
+    #   ignores the exception — so the markers asserted here are the ones
+    #   pytest actually prints for a teardown error, not the message text,
+    #   which `-q` truncates.
+    assert "GitHubWriteFromTest" in combined
+    assert "ERROR at teardown" in combined
+    assert "tried to mutate" in combined
+
+
+def test_an_approved_alias_with_a_mismatched_repo_is_blocked(tmp_path):
+    """★★Approved, imported early, aimed at production: still refused — and
+    refused at the transport, which is the layer the alias dodged.
+
+    ⛔The probe carries the marker. Without it this exercised the DEFAULT path
+      and said nothing about the approved one — which is how a mutation
+      removing the approved-target check survived a green run of this very
+      test.
+    """
+    r = _run_probe(tmp_path, APPROVED_ALIAS_PROBE, approved=True)
+
+    combined = _flat(r.stdout + r.stderr)
+    assert r.returncode != 0
+    assert "GitHubWriteFromTest" in combined
+    assert "ERROR at teardown" in combined
+
+
+def test_reads_still_pass_through_the_guard():
+    """⛔The suite depends on `pr_state` and `pr_head_sha`. Blocking reads would
+    push tests toward mocking the whole module and lose coverage of the real
+    call shapes — which is how #255's repo-resolution bug was caught."""
+    import agent_crew.github as gh
+
+    r = gh.subprocess.run(["gh", "--version"], capture_output=True, text=True)
+
+    assert r.returncode == 0

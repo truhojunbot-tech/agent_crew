@@ -68,3 +68,21 @@ fall back to this checkout's origin), a mismatched one, or a helper with no
 `repo` parameter at all is refused. Without that, an approved test calling
 `post_pr_comment(241, "x")` would have written to production from inside the
 exception granted to avoid exactly that.
+
+## A second incident, 2026-09-06 (#263 review round 4)
+
+Four more synthetic comments reached PR #241 — `"this must not reach
+production"` ×2 and `"nope"` ×2, at 05:31–05:32Z — bringing its total from 263
+to 304 (41 of today's are these plus ordinary review automation).
+
+They were mine, and the cause is worth recording because it is not the original
+bug. The write-boundary tests run probe files with the guard **deliberately
+disabled**, which is how mutation testing a safety mechanism works: you remove
+the safety and check that something notices. Those probes used the real PR
+#241, so when the mutation removed the guard, the probe did exactly what it was
+written to do.
+
+The fix is that a probe payload must be harmless on its own: every probe now
+targets PR **999241**, which cannot exist. Testing a guard means running the
+dangerous thing with the safety off, so the dangerous thing has to be aimed
+somewhere that does not matter.
