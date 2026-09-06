@@ -36,7 +36,12 @@ from agent_crew.pipeline import (
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
-from agent_crew.testing_policy import test_stage_lock
+from agent_crew.testing_policy import (
+    effective_scope as _effective_scope,
+    load_scope as _load_test_scope,
+    scope_fingerprint as _scope_fingerprint,
+    test_stage_lock,
+)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -2099,6 +2104,66 @@ def create_app(
             return
 
         _project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
+
+        # #272: a test stage runs alone in its worktree. The dispatcher's
+        # `active_worktrees` set already refuses two concurrent tasks per
+        # worktree, but it is one process's memory: it does not survive a
+        # restart while a `start_new_session=True` child keeps running, and it
+        # cannot see a second dispatcher at all. alpha_engine#5541 saw two
+        # `make test` runs start 69s apart in one worktree. An flock outside
+        # the process closes both gaps.
+        #
+        # ⛔Non-blocking, then requeue — the same shape as the worktree-collision
+        #   branch in `_dispatcher_loop`. Parking a role slot on a blocking
+        #   acquire would trade a concurrency bug for a stall.
+        #
+        # ⛔Taken HERE, ahead of the attribution row and `task_started`, not
+        #   just before the subprocess. #204 pins `started_at` on first write
+        #   and never overwrites it, so a deferred attempt used to stamp
+        #   dispatch time and then hand the lock wait back as provider runtime
+        #   — the exact conflation #278 exists to remove. A deferred attempt now
+        #   writes no attribution, claims no context generation, and emits no
+        #   `task_started`; it emits a deferral event instead.
+        _lock_stack = contextlib.ExitStack()
+        _lock_wait_seconds, _lock_defer_count = 0.0, 0
+        if task.task_type == "test":
+            if not _lock_stack.enter_context(test_stage_lock(wt)):
+                _lock_stack.close()
+                try:
+                    _defers, _first_at = q().note_test_lock_defer(task.task_id)
+                except Exception:
+                    logger.exception(
+                        f"dispatcher: could not count the lock deferral for {task.task_id}")
+                    _defers, _first_at = 0, 0.0
+                logger.info(
+                    f"dispatcher: deferring test task={task.task_id} — another "
+                    f"test stage already holds the lock for {wt} "
+                    f"(defer #{_defers}, #272/#278)")
+                try:
+                    record_context_event(
+                        _context_events_path, "test_stage_deferred",
+                        task_id=task.task_id, project=_project, role=role, agent=agent,
+                        task_type=task.task_type, defer_count=_defers,
+                        waiting_since=_first_at,
+                        lock_wait_seconds=round(max(0.0, time.time() - _first_at), 3)
+                        if _first_at else 0.0,
+                    )
+                except Exception:
+                    logger.exception(
+                        f"dispatcher: deferral event failed for {task.task_id}")
+                q().requeue(task.task_id)
+                return
+            # Acquired. Any earlier deferrals on this task are scheduler delay,
+            # and this is the moment their total is finally knowable.
+            try:
+                _prior = q().get_task_context(task.task_id) or {}
+                _lock_defer_count = _prior.get("test_lock_defer_count") or 0
+                _first_at = _prior.get("test_lock_first_deferred_at") or 0.0
+                if _lock_defer_count and _first_at:
+                    _lock_wait_seconds = round(max(0.0, time.time() - float(_first_at)), 3)
+            except Exception:
+                logger.exception(
+                    f"dispatcher: could not read lock-wait for {task.task_id}")
         # #202: capture the model in use where it's actually known. Only
         # gemini passes an explicit --model flag today; claude/codex rely on
         # their own CLI/config defaults with no reliable flag here, so their
@@ -2305,6 +2370,37 @@ def create_app(
                 retry_of=_retry_of,
                 fallback_of=_fallback_of,
             )
+            # #278: the tester treatment, as a structured field rather than a
+            # sentence in the agent's summary. Resolved on the dispatch path so
+            # it reflects the config in force for THIS task — an operator can
+            # change the scope between two tasks of one run, and a cohort built
+            # from setup-time state would silently mix the two.
+            if task.task_type == "test":
+                _scope = _load_test_scope(wt, _project)
+                _scope_name = _effective_scope(_scope)
+                _scope_hash = _scope_fingerprint(_scope)
+                q().record_test_economics(
+                    task.task_id,
+                    effective_test_scope=_scope_name,
+                    test_scope_source=_scope.get("source_kind", "builtin"),
+                    test_scope_hash=_scope_hash,
+                    lock_wait_seconds=_lock_wait_seconds,
+                    lock_defer_count=_lock_defer_count,
+                )
+                record_context_event(
+                    _context_events_path, "test_scope_resolved",
+                    task_id=task.task_id, project=_project, role=role, agent=agent,
+                    context_id=_ctx_info["context_id"],
+                    effective_test_scope=_scope_name,
+                    # ⛔The categorical kind, never `scope["source"]` — that is
+                    #   a filesystem path, and this stream is published to the
+                    #   quota systems.
+                    test_scope_source=_scope.get("source_kind", "builtin"),
+                    test_scope_hash=_scope_hash,
+                    lock_wait_seconds=_lock_wait_seconds,
+                    lock_defer_count=_lock_defer_count,
+                )
+
             # Append-only JSONL for external quota scanners that outlive the
             # DB. Written from the DB row itself (not a hand-built dict) so
             # the two representations can't drift apart (#202 review of PR
@@ -2493,26 +2589,6 @@ def create_app(
         # `return` still runs `finally`, so without this flag the counter
         # was erased every attempt and _MAX_TRANSIENT_RETRY never actually
         # capped anything (#201).
-        # #272: a test stage runs alone in its worktree. The dispatcher's
-        # `active_worktrees` set already refuses two concurrent tasks per
-        # worktree, but it is one process's memory: it does not survive a
-        # restart while a `start_new_session=True` child keeps running, and it
-        # cannot see a second dispatcher at all. alpha_engine#5541 saw two
-        # `make test` runs start 69s apart in one worktree. An flock outside
-        # the process closes both gaps.
-        #
-        # ⛔Non-blocking, then requeue — the same shape as the worktree-collision
-        #   branch in `_dispatcher_loop`. Parking a role slot on a blocking
-        #   acquire would trade a concurrency bug for a stall.
-        _lock_stack = contextlib.ExitStack()
-        if task.task_type == "test":
-            if not _lock_stack.enter_context(test_stage_lock(wt)):
-                _lock_stack.close()
-                logger.info(
-                    f"dispatcher: deferring test task={task.task_id} — another "
-                    f"test stage already holds the lock for {wt} (#272)")
-                q().requeue(task.task_id)
-                return
         _terminal = True
         try:
             import datetime as _dt

@@ -57,6 +57,47 @@ that, a targeted pass and a full pass produce the same result shape and nobody
 can tell whether any of this took effect. The tester may still decide a diff
 needs the full suite and run it — but not silently.
 
+## 1b. What gets recorded about it (#278)
+
+The scope the tester ran under is durable structured telemetry, not only a
+sentence in its `summary`. After #272 two tasks with the same `task_type`,
+role, provider, project and context can cost very differently, so the treatment
+has to be machine-joinable or a cohort cannot be built at all.
+
+On `task_attribution`, joining by `task_id` alongside `context_id`:
+
+| column | values |
+|---|---|
+| `effective_test_scope` | `targeted` \| `full_suite` — what was **used**, never what was requested |
+| `test_scope_source` | `builtin` \| `env` \| `operator` \| `repo` |
+| `test_scope_hash` | 16-hex digest of the effective config |
+| `lock_wait_seconds` | scheduler delay from test-stage lock contention |
+| `lock_defer_count` | how many dispatch attempts were deferred |
+
+And two lifecycle events in `context_events.jsonl`: `test_scope_resolved` on a
+dispatch that took the lock, `test_stage_deferred` on one that could not.
+
+Three properties worth stating, because each is a decision rather than a
+detail:
+
+- **The hash covers behaviour, not provenance.** Two projects that reached the
+  same policy through different files are the same treatment; folding the
+  source into the digest would split one cohort in two. It also means the raw
+  commands never leave the host — they can carry absolute worktree paths, and
+  a digest still answers "are these two tasks running the same policy?".
+- **The categorical `source_kind` is what is published, never `scope["source"]`**,
+  which is a filesystem path under the user's home.
+- **Absent means unknown.** All five columns default to `NULL`, not `''`/`0`,
+  which departs from the rest of that table on purpose: a row that predates
+  #278 has no treatment, and `targeted` or `lock_wait_seconds = 0` would both
+  be claims nobody made.
+
+The lock is taken *before* the attribution row is written, so a deferred
+attempt records nothing at all — no `started_at`, no `task_started`. `#204`
+pins `started_at` on first write and never overwrites it, so a deferred attempt
+that wrote a row would hand the entire lock wait back as provider runtime,
+which is exactly the conflation #278 exists to remove.
+
 ## 2. One test stage per worktree, enforced outside the process
 
 The dispatcher already refused two concurrent tasks per worktree, but that

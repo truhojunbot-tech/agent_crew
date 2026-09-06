@@ -52,14 +52,27 @@ DEFAULT_SCOPE: dict = {
     "guards": [],
     "full": [],
     "source": "default",
+    "source_kind": "builtin",
 }
+
+#: Categorical provenance, safe to put in telemetry. `source` carries the
+#: literal path or env name for humans reading a log; a filesystem path is not
+#: something to publish into an economics stream (#278), so cohorts join on
+#: this instead.
+SOURCE_KINDS = ("builtin", "env", "operator", "repo")
+
+#: Treatment names for the telemetry contract. Deliberately NOT booleans — a
+#: missing field must read as "unknown", and `full_suite=False` on a row that
+#: predates #278 would be a treatment claim nobody made (#278 criterion 5).
+SCOPE_TARGETED = "targeted"
+SCOPE_FULL = "full_suite"
 
 
 def _base() -> str:
     return os.environ.get("AGENT_CREW_BASE", os.path.expanduser("~/.agent_crew"))
 
 
-def _coerce(raw, source: str) -> dict:
+def _coerce(raw, source: str, source_kind: str = "builtin") -> dict:
     """A parsed config into the shape the renderer expects.
 
     Tolerant on purpose: a malformed scope must not break dispatch, and a
@@ -76,6 +89,7 @@ def _coerce(raw, source: str) -> dict:
         scope[key] = [str(v) for v in value if str(v).strip()] if isinstance(value, list) else []
     scope["full_suite"] = bool(raw.get("full_suite", False))
     scope["source"] = source
+    scope["source_kind"] = source_kind if source_kind in SOURCE_KINDS else "builtin"
     return scope
 
 
@@ -104,27 +118,64 @@ def load_scope(worktree: str = "", project: str = "", *, base: str | None = None
     if raw_env:
         if raw_env.startswith("{"):
             try:
-                return _coerce(json.loads(raw_env), f"env:{ENV_SCOPE}")
+                return _coerce(json.loads(raw_env), f"env:{ENV_SCOPE}", "env")
             except ValueError as e:
                 logger.warning(f"{ENV_SCOPE} is not valid JSON ({e}); ignoring it")
         else:
             data = _read(os.path.expanduser(raw_env))
             if data is not None:
-                return _coerce(data, f"env:{raw_env}")
+                return _coerce(data, f"env:{raw_env}", "env")
 
     if project:
         path = os.path.join(base or _base(), project, STATE_SCOPE_FILE)
         data = _read(path)
         if data is not None:
-            return _coerce(data, path)
+            return _coerce(data, path, "operator")
 
     if worktree:
         path = os.path.join(worktree, REPO_SCOPE_FILE)
         data = _read(path)
         if data is not None:
-            return _coerce(data, path)
+            return _coerce(data, path, "repo")
 
     return dict(DEFAULT_SCOPE)
+
+
+def effective_scope(scope: dict) -> str:
+    """``"targeted"`` or ``"full_suite"`` — the treatment actually applied.
+
+    "Effective" is the whole point of #278. A malformed override falls back to
+    the built-in default, and what belongs in the economics stream is the
+    scope that was USED, never the one that was requested-but-invalid: a cohort
+    built on intent rather than effect measures nothing.
+    """
+    return SCOPE_FULL if scope.get("full_suite") else SCOPE_TARGETED
+
+
+def scope_fingerprint(scope: dict) -> str:
+    """Stable 16-hex digest of the effective configuration (#278).
+
+    ⛔The commands themselves are NOT telemetry. They can carry absolute
+      worktree paths and project-internal names, and #278 asks for a stable
+      version or hash rather than the raw config for exactly that reason. A
+      digest still answers the question a rollout cohort needs — "are these two
+      tasks running the same policy?" — without publishing anything.
+
+    Covers only the fields that change behaviour. `source`/`source_kind` are
+    excluded on purpose: the same policy reached through the operator file and
+    through the repo file is the same treatment, and folding provenance in
+    would split one cohort in two.
+    """
+    material = json.dumps(
+        {
+            "full_suite": bool(scope.get("full_suite")),
+            "targeted": list(scope.get("targeted") or []),
+            "guards": list(scope.get("guards") or []),
+            "full": list(scope.get("full") or []),
+        },
+        sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:16]
 
 
 def _bullets(commands: list) -> str:
