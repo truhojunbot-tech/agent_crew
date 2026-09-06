@@ -28,4 +28,5 @@ markers = [
   "integration: integration tests",
   "e2e: end-to-end tests",
   "stress: stress tests (50-run simulations)",
+  "live_github: opts out of the GitHub write block; must target a disposable repo/PR (#263)",
 ]

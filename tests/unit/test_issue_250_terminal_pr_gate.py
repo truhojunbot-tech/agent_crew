@@ -30,7 +30,12 @@ from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
 BRANCH = "agent/claude/239-context-pack"
-PR = 241
+#: ⛔Deliberately NOT a real PR. This file used 241 — a real, merged PR — and
+#: drove the result handler, which posts a comment for any review result with a
+#: pr_number. 228 of PR #241's 263 comments turned out to be this file's
+#: fixtures (#263). The number below cannot exist in the repo, and the suite-wide
+#: block in conftest is the belt to this brace.
+PR = 999241
 FINDING = "HIGH src/agent_crew/context_pack.py:759 - the cap drops the AC"
 
 
@@ -251,7 +256,7 @@ def _result(c, task_id):
                         "pr_number": PR})
 
 
-def test_merge_during_an_in_flight_review_creates_no_follow_up(tmp_db, monkeypatch):
+def test_merge_during_an_in_flight_review_creates_no_follow_up(tmp_db, monkeypatch, github_writes):
     """★★The race #250 describes, driven through POST /tasks/{id}/result.
 
     The review was dispatched while the PR was open and reports back after the
@@ -280,7 +285,7 @@ def test_merge_during_an_in_flight_review_creates_no_follow_up(tmp_db, monkeypat
         "work was pushed to an agent for a merged PR"
 
 
-def test_an_open_pr_still_produces_a_fix_through_the_handler(tmp_db, monkeypatch):
+def test_an_open_pr_still_produces_a_fix_through_the_handler(tmp_db, monkeypatch, github_writes):
     """The same path with the PR open — what #244 shipped must survive."""
     from fastapi.testclient import TestClient
 
@@ -294,7 +299,7 @@ def test_an_open_pr_still_produces_a_fix_through_the_handler(tmp_db, monkeypatch
     assert len(fixes) == 1 and FINDING in fixes[0].description
 
 
-def test_a_github_outage_during_the_handler_loses_nothing(tmp_db, monkeypatch):
+def test_a_github_outage_during_the_handler_loses_nothing(tmp_db, monkeypatch, github_writes):
     """Result durable, cascade deferred — the two halves of #250's req 3."""
     from fastapi.testclient import TestClient
 

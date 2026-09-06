@@ -69,7 +69,7 @@ def test_u213_list_tasks_defaults_are_empty_for_pending_task(tmp_db):
     assert task.error_info is None
 
 
-def test_u213_get_task_http_endpoint_returns_result_fields(tmp_db):
+def test_u213_get_task_http_endpoint_returns_result_fields(tmp_db, github_writes):
     """The actual reported symptom: polling GET /tasks/{id} over HTTP after
     completion must surface the result, not just the request shape."""
     app = _make_app(tmp_db)
