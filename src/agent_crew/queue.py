@@ -163,6 +163,10 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 )
 """
 
+_DDL_MIGRATE_STATUS_CHANGED_AT = (
+    "ALTER TABLE tasks ADD COLUMN status_changed_at REAL DEFAULT 0"
+)
+
 _DDL_PR_ANNOUNCEMENTS = """
 CREATE TABLE IF NOT EXISTS pr_announcements (
     pr_number  INTEGER NOT NULL,
@@ -200,6 +204,10 @@ class TaskQueue:
         except Exception:
             pass  # column already exists
         # Migrate existing DBs: add project column if absent
+        try:
+            conn.execute(_DDL_MIGRATE_STATUS_CHANGED_AT)
+        except Exception:
+            pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_PROJECT)
         except Exception:
@@ -525,19 +533,26 @@ class TaskQueue:
         try:
             if result.task_id != task_id:
                 raise ValueError(f"task_id mismatch: argument {task_id!r} != result.task_id {result.task_id!r}")
-            row = conn.execute("SELECT task_type FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            row = conn.execute(
+                "SELECT task_type, status FROM tasks WHERE task_id = ?",
+                (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             task_type = row["task_type"]
+            self._last_previous_status = row["status"]
             # #167: persist structured error_info for failed results so post-mortem
             # debugging has machine-readable data, not just the free-form summary.
+            # #265: `timed_out` too — a consumer that sees "we stopped waiting"
+            # needs the reason as badly as one that sees "it failed", and leaving
+            # the field null there is exactly what made the cause unreadable.
             error_info_json = None
-            if result.status == "failed" and result.error_info:
+            if result.status in ("failed", "timed_out") and result.error_info:
                 error_info_json = json.dumps(result.error_info)
             conn.execute(
                 """
                 UPDATE tasks
-                SET status = ?, summary = ?, verdict = ?, findings = ?, pr_number = ?, error_info = ?
+                SET status = ?, summary = ?, verdict = ?, findings = ?, pr_number = ?,
+                    error_info = ?, status_changed_at = ?
                 WHERE task_id = ?
                 """,
                 (
@@ -547,6 +562,7 @@ class TaskQueue:
                     json.dumps(result.findings),
                     result.pr_number,
                     error_info_json,
+                    time.time(),
                     task_id,
                 ),
             )
@@ -846,6 +862,8 @@ class TaskQueue:
                     findings=json.loads(r["findings"]) if r["findings"] else [],
                     pr_number=r["pr_number"],
                     error_info=json.loads(r["error_info"]) if r["error_info"] else None,
+                    status_changed_at=(r["status_changed_at"]
+                                       if "status_changed_at" in r.keys() else 0.0),
                 )
                 for r in rows
             ]

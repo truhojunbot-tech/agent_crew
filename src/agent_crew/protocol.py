@@ -32,6 +32,10 @@ class TaskRequest:
     findings: list[str] = field(default_factory=list)
     pr_number: Optional[int] = None
     error_info: Optional[dict] = None
+    #: When the status last changed, epoch seconds (#265). A consumer that read
+    #: `failed` at notification time and sees this move afterwards knows the
+    #: verdict was revised — the transition used to be completely silent.
+    status_changed_at: float = 0.0
 
     def __post_init__(self):
         if self.task_type not in _VALID_TASK_TYPES:
