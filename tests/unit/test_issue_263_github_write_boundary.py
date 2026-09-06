@@ -238,3 +238,134 @@ def test_the_unapproved_stub_refuses_and_explains():
 
     with pytest.raises(GitHubWriteFromTest, match="UNAPPROVED"):
         _blocked_live("post_pr_comment", "AGENT_CREW_ALLOW_LIVE_GITHUB is not set")(1, "x")
+
+
+# ── approval names a target; it does not hand over the writes ─────────
+#
+# The gate validated the env var and then let the approved test run with the
+# write functions unwrapped. They all take `repo=None` and fall back to
+# `get_repo()`, which resolves to the real checkout's origin — so an approved
+# test calling `post_pr_comment(241, "x")` wrote to PRODUCTION, from inside the
+# exception granted to avoid exactly that (review of PR #264).
+
+APPROVED_TARGET = "truhojunbot-tech/crew-sandbox"
+
+
+def _run_probe(tmp_path, body, *, approved=True, target=APPROVED_TARGET):
+    """Run a `live_github`-marked test in a subprocess and return the result."""
+    import os as _os
+    import pathlib
+    import subprocess
+    import sys
+    import textwrap
+
+    probe = pathlib.Path("tests/unit/test_tmp_approved_probe.py")
+    probe.write_text(textwrap.dedent(body))
+    env = dict(_os.environ)
+    if approved:
+        env[LIVE_GITHUB_ENV] = "1"
+        env[LIVE_GITHUB_REPO_ENV] = target
+    else:
+        env.pop(LIVE_GITHUB_ENV, None)
+        env.pop(LIVE_GITHUB_REPO_ENV, None)
+    try:
+        return subprocess.run([sys.executable, "-m", "pytest", str(probe), "-q"],
+                              capture_output=True, text=True, timeout=180, env=env)
+    finally:
+        probe.unlink(missing_ok=True)
+
+
+def test_an_approved_test_cannot_write_with_the_default_repo(tmp_path):
+    """★★The reported hole, end to end: approval granted, no `repo` passed.
+
+    Without a repo the helper resolves the checkout's origin — production — so
+    this must fail rather than reach the network.
+    """
+    r = _run_probe(tmp_path, '''
+        import pytest
+
+        @pytest.mark.live_github
+        def test_writes_with_the_default_repo():
+            import agent_crew.github as gh
+            gh.post_pr_comment(241, "this must not reach production")
+    ''')
+
+    assert r.returncode != 0, "an approved test wrote with the default repo"
+    assert "without an explicit `repo`" in (r.stdout + r.stderr)
+
+
+def test_an_approved_test_cannot_write_to_another_repo(tmp_path):
+    """Approval is for ONE target. Naming a different one is still a write to
+    somewhere nobody approved."""
+    r = _run_probe(tmp_path, '''
+        import pytest
+
+        @pytest.mark.live_github
+        def test_writes_to_production_explicitly():
+            import agent_crew.github as gh
+            gh.post_pr_comment(241, "nope", repo="truhojunbot-tech/agent_crew")
+    ''')
+
+    assert r.returncode != 0
+    combined = r.stdout + r.stderr
+    assert "approved disposable target" in combined
+
+
+def test_an_approved_test_may_write_to_its_own_target(tmp_path):
+    """⛔The gate has to be passable at the boundary too, or the approval is
+    decorative and the next person deletes the whole mechanism."""
+    r = _run_probe(tmp_path, '''
+        import pytest
+
+        @pytest.mark.live_github
+        def test_writes_to_the_sandbox(monkeypatch):
+            import agent_crew.github as gh
+            seen = {}
+            # Stand in for the network at the LAST hop, so the guard is what is
+            # being exercised and nothing actually leaves the machine.
+            monkeypatch.setattr(gh, "check_gh_installed", lambda: True)
+
+            def fake_run(argv, **kw):
+                seen["argv"] = argv
+                return type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+            monkeypatch.setattr(gh.subprocess, "run", fake_run)
+            assert gh.post_pr_comment(1, "hello", repo="truhojunbot-tech/crew-sandbox") is True
+            assert "truhojunbot-tech/crew-sandbox" in seen["argv"]
+    ''')
+
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_the_pin_reads_the_repo_from_the_call_not_a_fixed_position():
+    """The helpers put `repo` in different places; the guard binds by signature
+    so a new write function is covered without being special-cased."""
+    from tests.conftest import _pinned_to_repo
+
+    calls = []
+
+    def fake_create_issue(title, body, repo=None):
+        calls.append(repo)
+        return "url"
+
+    guarded = _pinned_to_repo("create_issue", fake_create_issue, APPROVED_TARGET)
+
+    assert guarded("t", "b", repo=APPROVED_TARGET) == "url"
+    assert calls == [APPROVED_TARGET]
+    with pytest.raises(GitHubWriteFromTest, match="without an explicit"):
+        guarded("t", "b")
+    with pytest.raises(GitHubWriteFromTest, match="approved disposable target"):
+        guarded("t", "b", repo="someone/else")
+
+
+def test_a_write_function_without_a_repo_parameter_is_refused():
+    """⛔If we cannot see where it writes, we cannot approve it."""
+    from tests.conftest import _pinned_to_repo
+
+    def no_repo_param(pr_number, body):
+        return True
+
+    guarded = _pinned_to_repo("no_repo_param", no_repo_param, APPROVED_TARGET)
+
+    with pytest.raises(GitHubWriteFromTest, match="no `repo` parameter"):
+        guarded(1, "x")

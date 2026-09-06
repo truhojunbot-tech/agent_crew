@@ -60,3 +60,11 @@ A marked test now runs only when all three hold:
 
 Otherwise the test is **skipped** with the reason, and the write functions stay
 stubbed for it regardless.
+
+Approval names a target; it does not hand over the write functions. Every write
+in an approved test is pinned to that repository at the boundary: the `repo`
+argument is read out of the call by signature, and a missing one (which would
+fall back to this checkout's origin), a mismatched one, or a helper with no
+`repo` parameter at all is refused. Without that, an approved test calling
+`post_pr_comment(241, "x")` would have written to production from inside the
+exception granted to avoid exactly that.

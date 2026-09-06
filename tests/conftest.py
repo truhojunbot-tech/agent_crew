@@ -84,6 +84,52 @@ def live_github_approval(env=None, production_repo=None) -> tuple:
     return (True, f"approved for {target}")
 
 
+def _pinned_to_repo(name, fn, target):
+    """Allow `fn` only when it is explicitly told to write to `target`.
+
+    The repo is read out of the CALL, via the function's own signature, so this
+    holds for every write helper and for any added later. Three refusals:
+
+      * the function has no `repo` parameter — we cannot prove where it writes;
+      * `repo` was not passed, or passed as None — it would fall back to the
+        checkout's origin, i.e. production;
+      * `repo` names something other than the approved disposable target.
+    """
+    import functools
+    import inspect
+
+    @functools.wraps(fn)
+    def _guarded(*args, **kwargs):
+        try:
+            bound = inspect.signature(fn).bind(*args, **kwargs)
+        except TypeError:
+            raise GitHubWriteFromTest(
+                f"agent_crew.github.{name}() called with arguments that do not "
+                f"match its signature; refusing to guess the target"
+            )
+        if "repo" not in bound.signature.parameters:
+            raise GitHubWriteFromTest(
+                f"agent_crew.github.{name}() has no `repo` parameter, so an "
+                f"approved live test cannot prove where it writes"
+            )
+        bound.apply_defaults()
+        repo = bound.arguments.get("repo")
+        if not repo:
+            raise GitHubWriteFromTest(
+                f"agent_crew.github.{name}() was called without an explicit "
+                f"`repo`; it would fall back to this checkout's origin — pass "
+                f"repo={target!r}"
+            )
+        if repo != target:
+            raise GitHubWriteFromTest(
+                f"agent_crew.github.{name}() targets {repo!r}, but the approved "
+                f"disposable target is {target!r}"
+            )
+        return fn(*args, **kwargs)
+
+    return _guarded
+
+
 def _blocked_live(name, why):
     def _raise(*args, **kwargs):
         raise GitHubWriteFromTest(
@@ -126,6 +172,21 @@ def _no_github_writes(request, github_writes_recorder, monkeypatch):
     """
     if "live_github" in request.keywords:
         approved, why = live_github_approval()
+        if approved:
+            # ⛔Approval names a target; it does not hand over the write
+            #   functions. They all take `repo=None` and fall back to
+            #   `get_repo()`, which resolves to the real checkout's origin — so
+            #   an approved test calling `post_pr_comment(241, "x")` with no
+            #   repo would write to PRODUCTION, which is the thing the marker
+            #   was granted an exception from (review of PR #264). Every write
+            #   is therefore pinned to the approved repository at the boundary.
+            target = str(os.environ.get(LIVE_GITHUB_REPO_ENV, "")).strip()
+            for name in GITHUB_WRITE_FUNCTIONS:
+                fn = getattr(_gh(), name, None)
+                if fn is not None:
+                    monkeypatch.setattr(_gh(), name, _pinned_to_repo(name, fn, target))
+            yield
+            return
         if not approved:
             # ⛔The marker is a REQUEST, not permission. Left as a bare escape,
             #   any test could opt itself out of the boundary and a normal
