@@ -28,6 +28,19 @@ A = "/wt/project-a/codex"
 B = "/wt/project-b/codex"
 
 
+def _pad(home, session_id, extra_bytes):
+    """Grow a rollout WITHOUT destroying its `session_meta` first line.
+
+    Overwriting the file removes the cwd binding, so the lookup stops finding
+    it and the cap silently cannot trip — which is how a first version of these
+    tests "proved" the cap did not work.
+    """
+    path = next((home / "sessions").rglob(f"*{session_id}.jsonl"))
+    with open(path, "a") as fh:
+        fh.write("x" * extra_bytes)
+    return path
+
+
 def _rollout(home, day, stamp, cwd, session_id=None):
     """Write a codex rollout file the way the CLI lays them out."""
     sid = session_id or str(uuid.uuid4())
@@ -391,3 +404,129 @@ def test_an_unshaped_store_still_resolves(tmp_path):
         json.dumps({"payload": {"id": sid, "cwd": A}}) + "\n")
 
     assert sv.codex_session_for_cwd(A, home=tmp_path) == sid
+
+
+# ── codex gets a size cap too, now that a resume is bound (#260 review) ──
+#
+# The stated limitation — "codex has no per-worktree size signal" — was true
+# while `resume --last` was global. Binding a resume to ONE session by id made
+# it measurable, and the reviewer caught that the note had gone stale.
+#
+# Measured 2026-09-06 across 9,894 rollouts: median 48 KB, p99 0.4 MB — and
+# alpha_engine's codex worktree holding 356.6 / 180.6 / 130.3 / 114.7 MB files.
+
+
+def test_the_bound_rollout_is_what_gets_measured(tmp_path):
+    """★The size is of the file a resume would actually replay, not the store."""
+    sid = _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A)
+    path = _pad(tmp_path, sid, 5000)
+    _rollout(tmp_path, "2026-09-04", "2026-09-04T09-00-00", A)   # older, unused
+
+    size, session = sv.codex_session_size(A, home=tmp_path)
+    assert session == sid
+    assert size == path.stat().st_size >= 5000
+
+
+def test_a_rollout_over_the_cap_trips(tmp_path):
+    _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A, session_id="big")
+    _pad(tmp_path, "big", 3 * 1024 * 1024)
+
+    over, info = sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path)
+
+    assert over is True
+    assert info["provider"] == "codex" and info["conversation_id"] == "big"
+    assert info["bytes"] > 3 * 1024 * 1024
+
+
+def test_a_rollout_under_the_cap_does_not(tmp_path):
+    _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A)
+
+    assert sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path)[0] is False
+
+
+@pytest.mark.parametrize("cap", [0, -1])
+def test_a_zero_cap_disables_the_codex_check(tmp_path, cap):
+    _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A, session_id="big")
+    _pad(tmp_path, "big", 9 * 1024 * 1024)
+
+    assert sv.codex_context_exceeds_cap(A, max_mb=cap, home=tmp_path)[0] is False
+
+
+def test_an_unbound_worktree_is_not_over_the_cap(tmp_path):
+    """No session means nothing to resume — fresh, not oversized."""
+    assert sv.codex_context_exceeds_cap(A, max_mb=1, home=tmp_path)[0] is False
+
+
+def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a"):
+    """A real codex dispatch with the cap decision stubbed; returns (argv, event)."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "codex"
+    wt.mkdir(exist_ok=True)
+    (wt / ".git").mkdir(exist_ok=True)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"worktrees": {"codex": str(wt)}}))
+    db = str(tmp_path / "t.db")
+    spawned = {}
+
+    async def _fake_exec(*cmd, **kwargs):
+        spawned["cmd"] = list(cmd)
+
+        class _P:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(sv, "codex_session_for_cwd", lambda cwd, **kw: bound)
+    monkeypatch.setattr(sv, "codex_context_exceeds_cap",
+                        lambda cwd, *a, **k: (over, {"bytes": 99 * 1048576,
+                                                     "conversation_id": bound,
+                                                     "cap_mb": 64,
+                                                     "provider": "codex"}))
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+                     project="p", watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        for tid in (f"seed-{uuid.uuid4().hex[:6]}", f"t-{uuid.uuid4().hex[:6]}"):
+            q.enqueue(TaskRequest(task_id=tid, task_type="review", description="r",
+                                  branch="main", context={}))
+            asyncio.run(app.state.dispatch_task(q.dequeue(role="reviewer"), "reviewer"))
+
+    events = [json.loads(l) for l in open(tmp_path / "context_events.jsonl")]
+    capped = [e for e in events if e["event_type"] == "provider_context_capped"]
+    return spawned.get("cmd", []), (capped[-1] if capped else None)
+
+
+def test_an_over_cap_codex_session_is_not_resumed(tmp_path, monkeypatch):
+    """★★End to end: over the cap → fresh, and the event names codex."""
+    cmd, event = _codex_dispatch(tmp_path, monkeypatch, over=True)
+
+    assert "resume" not in cmd, "an oversized rollout was resumed anyway"
+    assert cmd[:2] == ["codex", "exec"]
+    assert event is not None and event["provider"] == "codex"
+    assert event["bytes"] == 99 * 1048576 and event["cap_mb"] == 64
+
+
+def test_an_under_cap_codex_session_still_resumes(tmp_path, monkeypatch):
+    """⛔The cap must not become a blanket refusal to resume."""
+    cmd, event = _codex_dispatch(tmp_path, monkeypatch, over=False)
+
+    assert cmd[:4] == ["codex", "exec", "resume", "sess-a"]
+    assert event is None

@@ -402,6 +402,54 @@ def _codex_home(home=None):
     return pathlib.Path(home) if home else pathlib.Path.home() / ".codex"
 
 
+#: Cap on the codex rollout a worker resumes (#260 review). 0 disables.
+#:
+#: ⛔This became measurable only once #262 bound a resume to ONE session by id.
+#:   While `resume --last` was global there was no per-worktree file to size,
+#:   and that limitation was documented — the reviewer correctly spotted that
+#:   the binding made it stale. Measured 2026-09-06 across 9,894 rollouts:
+#:   median 48 KB, p99 0.4 MB, and alpha_engine's codex worktree holding
+#:   356.6 / 180.6 / 130.3 / 114.7 MB files. 64 MB sits ~160x above p99, so it
+#:   cannot fire on ordinary work and does catch those.
+CODEX_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CODEX_CONTEXT_MAX_MB", "64"))
+
+
+def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
+    """The newest Codex session id recorded for ``cwd``, or ``""``."""
+    return _codex_session_and_path(cwd, home=home, limit=limit)[0]
+
+
+def codex_session_size(cwd: str, *, home=None, limit=None) -> tuple:
+    """``(bytes, session_id)`` for the rollout a codex resume would replay.
+
+    The rollout file IS the conversation `codex exec resume <id>` replays, so
+    its size is the same measurement `agy_conversation_size` and
+    `claude_session_size` make for the other two providers.
+    """
+    session, path = _codex_session_and_path(cwd, home=home, limit=limit)
+    if not session or path is None:
+        return (0, "")
+    try:
+        return (path.stat().st_size, session)
+    except OSError:
+        return (0, session)
+
+
+def codex_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
+    """Is the rollout a codex resume would replay past the cap (#260 review)?
+
+    Mirrors the agy and claude pairs so all three providers trip the same
+    downstream path — a forced fresh context, with nothing on disk deleted.
+    """
+    cap = CODEX_CONTEXT_MAX_MB if max_mb is None else max_mb
+    size, session = codex_session_size(cwd, home=home)
+    info = {"bytes": size, "conversation_id": session, "cap_mb": cap,
+            "provider": "codex"}
+    if not cap or cap <= 0 or not size:
+        return (False, info)
+    return (size > cap * 1048576, info)
+
+
 def _codex_day_dirs(root):
     """Yield codex's day directories newest-first, descending lazily.
 
@@ -438,7 +486,7 @@ def _codex_day_dirs(root):
                 yield day
 
 
-def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
+def _codex_session_and_path(cwd: str, *, home=None, limit=None) -> tuple:
     """The newest Codex session id recorded for ``cwd``, or ``""``.
 
     ⛔`codex exec resume --last` is GLOBAL. Codex keys its rollout store by
@@ -461,7 +509,7 @@ def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
     try:
         root = _codex_home(home) / "sessions"
         if not root.is_dir() or not cwd:
-            return ""
+            return ("", None)
         # ⛔Descend the date hierarchy lazily. `rglob("*")` materialises the
         #   WHOLE store before any budget applies — 9,894 sessions plus their
         #   directories on this host — so an unresolved lookup paid a full-tree
@@ -479,7 +527,7 @@ def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
         for day in _codex_day_dirs(root):
             for path in sorted(day.glob("rollout-*.jsonl"), reverse=True):
                 if read >= budget:
-                    return ""
+                    return ("", None)
                 read += 1
                 try:
                     with open(path, errors="replace") as fh:
@@ -488,10 +536,10 @@ def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
                 except Exception:  # noqa: BLE001
                     continue
                 if meta.get("cwd") == cwd and meta.get("id"):
-                    return str(meta["id"])
+                    return (str(meta["id"]), path)
     except Exception:  # noqa: BLE001 — resolution must never break a dispatch
-        return ""
-    return ""
+        return ("", None)
+    return ("", None)
 
 
 def _claude_home(home=None):
@@ -1992,6 +2040,11 @@ def create_app(
         _ctx_cap_info = {}
         if agent == "gemini":
             _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
+        elif agent == "codex":
+            # #260 review: measurable now that #262 binds a resume to one
+            # session. The rollout file is the conversation that resume
+            # replays, so it is the same measurement as the other two providers.
+            _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(wt)
         elif agent == "claude":
             # #260: the same defect on the other provider. `--continue` was
             # unconditional here, so the session never rotated — one file per
