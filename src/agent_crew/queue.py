@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -189,6 +190,44 @@ CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status);
 """
 
 
+#: A task whose description OPENS with `Implement #<n>` is naming the issue it
+#: implements. Anchored, and deliberately narrow — see `issue_from_description`.
+_ISSUE_IN_DESCRIPTION = re.compile(r"^\s*implement\s+#(\d+)\b", re.IGNORECASE)
+
+
+def issue_from_description(description) -> Optional[int]:
+    """The issue number a task description names, or ``None`` (#276).
+
+    #272 was implemented twice because dedup reads `context["issue"]` and the
+    first task carried the number only here, in free text. This is the safety
+    net for enqueue paths that do not populate the structured field.
+
+    ⛔Anchored to the start, and to `implement` specifically. Measured over all
+      5085 task rows on this host, 4721 of them without `context.issue`:
+
+        ^implement #N          →   4 distinct numbers,    7 rows
+        any #N minus "PR #N"   → 987 distinct numbers, 3829 rows
+        "issue #N" anywhere    → 121 distinct numbers,  426 rows
+
+      The broad rule matches spec section numbers, list markers and prose; at
+      987 numbers it would stop the watcher claiming almost anything. The
+      `issue #N` shape is dominated by *discuss* tasks, and a panel discussion
+      is not work in flight on the issue. The anchored rule matched exactly the
+      seven genuine rows and nothing else.
+
+      The asymmetry is the argument. A miss costs one duplicate provider
+      invocation; a false hit silently makes a real issue unclaimable for as
+      long as the task is non-terminal. Prefer the miss.
+    """
+    if not isinstance(description, str):
+        return None
+    match = _ISSUE_IN_DESCRIPTION.match(description)
+    if not match:
+        return None
+    number = int(match.group(1))
+    return number if number > 0 else None
+
+
 def _is_duplicate_task_id(error: Exception) -> bool:
     """Is this IntegrityError the `tasks.task_id` primary-key conflict?
 
@@ -270,6 +309,20 @@ class TaskQueue:
         return conn
 
     def enqueue(self, task: TaskRequest) -> str:
+        # #276: make the structured field true at the choke point. Every path —
+        # HTTP, MCP, pipeline, cli — arrives here, so backfilling once means
+        # the read-side fallback in `watch.active_issue_numbers` rarely has to
+        # fire, which is the right end state: a parser that is load-bearing on
+        # free text will eventually be wrong.
+        #
+        # ⛔A copy, never the caller's dict. A caller may reuse the TaskRequest,
+        #   and a backfill written through would be found by a later pass as if
+        #   the caller had supplied it.
+        context = dict(task.context or {})
+        if not isinstance(context.get("issue"), int):
+            described = issue_from_description(task.description)
+            if described is not None:
+                context["issue"] = described
         conn = self._connect()
         try:
             conn.execute(
@@ -283,7 +336,7 @@ class TaskQueue:
                     task.description,
                     task.branch,
                     task.priority,
-                    json.dumps(task.context),
+                    json.dumps(context),
                     time.time(),
                     task.project,
                 ),

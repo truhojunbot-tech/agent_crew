@@ -31,10 +31,12 @@ from agent_crew.pipeline import (
     auto_enqueue_review as _pipeline_auto_enqueue_review,
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
+    hold_mismatched_pr_result,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.testing_policy import test_stage_lock
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -2491,6 +2493,26 @@ def create_app(
         # `return` still runs `finally`, so without this flag the counter
         # was erased every attempt and _MAX_TRANSIENT_RETRY never actually
         # capped anything (#201).
+        # #272: a test stage runs alone in its worktree. The dispatcher's
+        # `active_worktrees` set already refuses two concurrent tasks per
+        # worktree, but it is one process's memory: it does not survive a
+        # restart while a `start_new_session=True` child keeps running, and it
+        # cannot see a second dispatcher at all. alpha_engine#5541 saw two
+        # `make test` runs start 69s apart in one worktree. An flock outside
+        # the process closes both gaps.
+        #
+        # ⛔Non-blocking, then requeue — the same shape as the worktree-collision
+        #   branch in `_dispatcher_loop`. Parking a role slot on a blocking
+        #   acquire would trade a concurrency bug for a stall.
+        _lock_stack = contextlib.ExitStack()
+        if task.task_type == "test":
+            if not _lock_stack.enter_context(test_stage_lock(wt)):
+                _lock_stack.close()
+                logger.info(
+                    f"dispatcher: deferring test task={task.task_id} — another "
+                    f"test stage already holds the lock for {wt} (#272)")
+                q().requeue(task.task_id)
+                return
         _terminal = True
         try:
             import datetime as _dt
@@ -2654,6 +2676,10 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
+            # #272: release the test-stage lock before anything else in the
+            # teardown can raise — a leaked flock would block every later test
+            # on this worktree until the process exits.
+            _lock_stack.close()
             # Pop the per-task transient-retry counter once the task reaches
             # a terminal outcome, so the in-memory dict doesn't grow
             # unbounded across long-running servers (#194). Left in place
@@ -3234,6 +3260,13 @@ def create_app(
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
         ctx = q().get_task_context(task_id)
+        # #268: does this result even claim to be about the PR we dispatched
+        # it for? Must happen before the row is written, so what lands in the
+        # DB is the held form — a human reading the row later sees the
+        # disagreement, not a clean `completed` that quietly renamed its
+        # target. Both numbers survive: `requested` in the context, `reported`
+        # on the row.
+        result, _pr_mismatch = hold_mismatched_pr_result(task_id, result, ctx)
         # #265: a result can arrive for a task the dispatcher already ended —
         # it stopped waiting, the worker kept going, and the row silently flips
         # from `timed_out` (previously `failed`) to `completed`. A consumer that
@@ -3308,6 +3341,35 @@ def create_app(
                         f"POST /tasks/{task_id}/result: episode emission failed")
         except Exception:
             logger.exception(f"POST /tasks/{task_id}/result: context event emission failed")
+        if _pr_mismatch:
+            # #268: the result is on the row and stays there. Everything that
+            # would ACT on it stops — posting the verdict to a PR the reviewer
+            # may never have read is the exact shape of alpha_engine#5288, and
+            # enqueueing a fix/test/merge off it spends real work on a target
+            # nobody has confirmed. `_try_push_next` is skipped too: the role
+            # is idle, but the next thing it should get is a human's decision.
+            _requested, _reported = _pr_mismatch
+            logger.warning(
+                f"POST /tasks/{task_id}/result: cascade stopped — dispatched for "
+                f"PR #{_requested}, result reports PR #{_reported}. Result stored "
+                f"as needs_human (#268)."
+            )
+            try:
+                _attr = q().get_attribution(task_id)
+                record_context_event(
+                    _context_events_path, "task_result_pr_mismatch",
+                    task_id=task_id, requested_pr=_requested, reported_pr=_reported,
+                    task_type=task_type,
+                    project=(_attr or {}).get("project"),
+                    role=(_attr or {}).get("role"),
+                    agent=(_attr or {}).get("agent"),
+                    context_id=(_attr or {}).get("context_id"),
+                )
+            except Exception:
+                logger.exception(
+                    f"POST /tasks/{task_id}/result: pr-mismatch event failed")
+            return {"status": "ok", "held": "pr_number_mismatch",
+                    "requested_pr": _requested, "reported_pr": _reported}
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")

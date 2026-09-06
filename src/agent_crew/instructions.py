@@ -1,6 +1,7 @@
 import os
 
 from agent_crew.prompts.task_loop import build_task_loop_prompt
+from agent_crew.testing_policy import load_scope, render_scope
 
 # Per-role instruction file paths inside each worktree (Issue #110 fix).
 #
@@ -510,15 +511,16 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks \\
     "tester": """\
 ## Role: tester
 
-You check out the PR branch and run the full test suite (lint + pytest) in a
-clean environment. Independently review the diff for requirement coverage —
-do not rubber-stamp the reviewer. Report in your `summary` and `findings`.
+You check out the PR branch, run the tests the diff actually needs, and
+independently review the diff for requirement coverage — do not rubber-stamp
+the reviewer. Report in your `summary` and `findings`.
 
+<test_scope>
 ### Result checklist (tester)
 
 Before you POST the result, verify:
-- [ ] `status: completed` if the suite ran to completion (pass or fail), otherwise `failed`
-- [ ] `summary` includes pass/fail counts and lint outcome
+- [ ] `status: completed` if the tests ran to completion (pass or fail), otherwise `failed`
+- [ ] `summary` names the scope you ran and the commands, plus pass/fail counts and lint outcome
 - [ ] `findings` lists failing tests and any independent diff-review concerns
 - [ ] `verdict: null` (only reviewers set verdict)
 """,
@@ -655,7 +657,8 @@ timeout (default 900s). An explicit POST with `status: failed` and a reason in
 """
 
 
-def generate(role: str, project: str, port: int, agent: str = "", delivery: str | None = None) -> str:
+def generate(role: str, project: str, port: int, agent: str = "",
+             delivery: str | None = None, worktree_path: str = "") -> str:
     """Render the role's instruction file.
 
     ``agent`` is the canonical agent identifier (``claude``/``codex``/``gemini``)
@@ -683,6 +686,14 @@ def generate(role: str, project: str, port: int, agent: str = "", delivery: str 
         task_loop = build_task_loop_prompt(resolved_agent, role=role)
         protocol = _MCP_COMMON if delivery == "mcp" else _COMMON
         body = task_loop + "\n---\n\n" + protocol + section
+    if "<test_scope>" in body:
+        # #272: what the tester runs is per-project configuration, not a
+        # constant. Resolved here rather than baked into the section string so
+        # a scope change takes effect on the next instruction write, and so no
+        # project name is ever hardcoded into the prompt.
+        body = body.replace(
+            "<test_scope>",
+            render_scope(load_scope(worktree_path, project)))
     content = body.replace("<project>", project).replace("<port>", str(port))
     return content
 
@@ -725,7 +736,8 @@ def write(
     with open(port_file) as f:
         port = int(f.read().strip())
     filename = ROLE_FILES[role]
-    new_block = generate(role, project, port, agent=agent, delivery=delivery)
+    new_block = generate(role, project, port, agent=agent, delivery=delivery,
+                         worktree_path=worktree_path)
     path = os.path.join(worktree_path, filename)
     parent = os.path.dirname(path)
     if parent:

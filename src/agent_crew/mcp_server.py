@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import os
 from dataclasses import asdict
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -39,7 +39,7 @@ from agent_crew.pipeline import (
     auto_enqueue_fix,
     auto_enqueue_review,
     auto_enqueue_test,
-    auto_fallback_failed_task,
+    auto_fallback_failed_task,    hold_mismatched_pr_result,
 )
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
@@ -146,7 +146,12 @@ def build_mcp_server(
         summary: str = "",
         verdict: Optional[str] = None,
         findings: Optional[list[str]] = None,
-        pr_number: Optional[int] = None,
+        # `int | str` for the same reason as the HTTP body: agents write PR
+        # numbers as `#268`, and a transport that 422s on the spelling throws
+        # the whole result away (review of PR #270).
+        # `bool` is listed so pydantic cannot coerce `true` to `1` behind the
+        # dataclass's back — the same hole the HTTP body had (review of PR #270).
+        pr_number: Optional[Union[bool, int, str]] = None,
     ) -> dict[str, Any]:
         """Mark a task done and store its result.
 
@@ -165,10 +170,21 @@ def build_mcp_server(
             )
         except (ValueError, TypeError) as e:
             return {"acknowledged": False, "error": str(e)}
+        # #268: cross-check the PR this result names against the one its task
+        # was dispatched for, before the row is written — same gate as the HTTP
+        # transport, because a guard on one transport is a guard an agent walks
+        # around by changing how it reports (#123 exists for this reason).
+        result, mismatch = hold_mismatched_pr_result(
+            task_id, result, queue.get_task_context(task_id))
         try:
             task_type = queue.submit_result(task_id, result)
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
+        if mismatch:
+            requested, reported = mismatch
+            return {"acknowledged": True, "task_id": task_id, "task_type": task_type,
+                    "held": "pr_number_mismatch",
+                    "requested_pr": requested, "reported_pr": reported}
 
         # Stage cascade — same hooks as the HTTP path so the pipeline does
         # not stall after the first stage when an agent uses MCP-only
