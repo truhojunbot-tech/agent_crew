@@ -3147,6 +3147,26 @@ def create_app(
 
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
+        """Enqueue a task.
+
+        ``201`` → ``{"task_id": "..."}``.
+
+        ``409`` → the ``task_id`` is already taken, with the existing row's
+        status so a caller can tell "already running" from "already finished"
+        without a second request (#273). ⛔The payload is NESTED under
+        ``detail``, because it is raised as an ``HTTPException`` like every
+        other error this server returns::
+
+            {"detail": {"error": "task_id already exists",
+                        "task_id": "...", "status": "pending"}}
+
+        PR #274 documented a top-level body; that was never what went over the
+        wire, and a client coding to it read ``None`` for every field. The
+        envelope is the contract — a lone ``JSONResponse`` here would make this
+        one endpoint's error shape unique — and
+        ``tests/unit/test_issue_273_duplicate_task_id.py`` asserts the whole
+        body so the description cannot drift from it again.
+        """
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
             task_id = q().enqueue(task)
