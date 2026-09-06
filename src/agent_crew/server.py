@@ -402,6 +402,42 @@ def _codex_home(home=None):
     return pathlib.Path(home) if home else pathlib.Path.home() / ".codex"
 
 
+def _codex_day_dirs(root):
+    """Yield codex's day directories newest-first, descending lazily.
+
+    The store is `sessions/YYYY/MM/DD/`. A generator rather than a list so the
+    caller can stop after the first directory that satisfies it — which is the
+    common case, and the difference between listing three directories and
+    walking the entire store.
+
+    Falls back to yielding a level that has no subdirectories, so a flat or
+    differently-shaped store still resolves rather than silently returning
+    nothing.
+    """
+    def _subdirs(path):
+        try:
+            return sorted((d for d in path.iterdir() if d.is_dir()), reverse=True)
+        except OSError:
+            return []
+
+    years = _subdirs(root)
+    if not years:
+        yield root
+        return
+    for year in years:
+        months = _subdirs(year)
+        if not months:
+            yield year
+            continue
+        for month in months:
+            days = _subdirs(month)
+            if not days:
+                yield month
+                continue
+            for day in days:
+                yield day
+
+
 def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
     """The newest Codex session id recorded for ``cwd``, or ``""``.
 
@@ -426,24 +462,33 @@ def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
         root = _codex_home(home) / "sessions"
         if not root.is_dir() or not cwd:
             return ""
-        # Filenames embed an ISO timestamp and the tree is YYYY/MM/DD, so
-        # sorting names descending walks newest-first without stat()ing 9k files.
-        files = []
-        for day in sorted(root.rglob("*"), reverse=True):
-            if not day.is_dir():
-                continue
-            files.extend(sorted(day.glob("rollout-*.jsonl"), reverse=True))
-            if len(files) >= budget:
-                break
-        for path in files[:budget]:
-            try:
-                with open(path, errors="replace") as fh:
-                    first = fh.readline()
-                meta = (_json.loads(first) or {}).get("payload") or {}
-            except Exception:  # noqa: BLE001
-                continue
-            if meta.get("cwd") == cwd and meta.get("id"):
-                return str(meta["id"])
+        # ⛔Descend the date hierarchy lazily. `rglob("*")` materialises the
+        #   WHOLE store before any budget applies — 9,894 sessions plus their
+        #   directories on this host — so an unresolved lookup paid a full-tree
+        #   traversal on every dispatch and every post-run capture, with the
+        #   read budget bounding only the file reads that followed (review of
+        #   PR #266). Filenames embed an ISO timestamp and the tree is
+        #   YYYY/MM/DD, so sorting each level descending reaches the newest
+        #   sessions after listing three directories.
+        # ⛔Read as we descend, and stop at the first match. Collecting the
+        #   budget's worth of paths BEFORE reading any of them meant a hit still
+        #   walked far enough to gather 400 candidates — so the newest session,
+        #   which is usually the first file in the newest directory, cost a
+        #   descent through months of history anyway.
+        read = 0
+        for day in _codex_day_dirs(root):
+            for path in sorted(day.glob("rollout-*.jsonl"), reverse=True):
+                if read >= budget:
+                    return ""
+                read += 1
+                try:
+                    with open(path, errors="replace") as fh:
+                        first = fh.readline()
+                    meta = (_json.loads(first) or {}).get("payload") or {}
+                except Exception:  # noqa: BLE001
+                    continue
+                if meta.get("cwd") == cwd and meta.get("id"):
+                    return str(meta["id"])
     except Exception:  # noqa: BLE001 — resolution must never break a dispatch
         return ""
     return ""

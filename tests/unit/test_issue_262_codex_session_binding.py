@@ -289,3 +289,105 @@ def test_project_b_cannot_be_attached_to_project_a(tmp_path, monkeypatch):
     assert a != b
     assert cmd[3] == a, "the dispatch resumed another project's session"
     assert attribution.get("provider_session_id") == a
+
+
+# ── the search must not walk the whole store (review of PR #266) ──────
+#
+# `sorted(root.rglob("*"), reverse=True)` materialised the entire tree before
+# the read budget applied. Measured on the real store: 10,028 paths in 167ms,
+# on every unresolved resume AND every post-run capture. The read budget
+# bounded the file reads that followed and nothing else.
+
+
+def _big_store(home, years=("2026", "2025", "2024"), months=12, days=28,
+               match_cwd=None):
+    """A store shaped like the real one: sessions/YYYY/MM/DD/rollout-*.jsonl."""
+    newest = None
+    for y in years:
+        for m in range(months, 0, -1):
+            for d in range(days, 0, -1):
+                day = home / "sessions" / y / f"{m:02d}" / f"{d:02d}"
+                day.mkdir(parents=True, exist_ok=True)
+                sid = f"{y}{m:02d}{d:02d}-session"
+                cwd = match_cwd if (y, m, d) == (years[0], months, days) else B
+                (day / f"rollout-{y}-{m:02d}-{d:02d}T00-00-00-{sid}.jsonl").write_text(
+                    json.dumps({"payload": {"id": sid, "cwd": cwd}}) + "\n")
+                if newest is None:
+                    newest = sid
+    return newest
+
+
+def _count_listings(monkeypatch):
+    """Count directory listings, which is what a full traversal actually costs."""
+    import pathlib
+
+    seen = []
+    real = pathlib.Path.iterdir
+
+    def counting(self):
+        seen.append(str(self))
+        return real(self)
+
+    monkeypatch.setattr(pathlib.Path, "iterdir", counting)
+    return seen
+
+
+def test_a_hit_lists_only_the_newest_path_through_the_tree(tmp_path, monkeypatch):
+    """★★The regression the review asked for: traversal, not reads.
+
+    A store of 3 years × 12 months × 28 days is 1,008 day directories. Reaching
+    the newest session must list the year, month and day levels once each — not
+    enumerate the tree.
+    """
+    newest = _big_store(tmp_path, match_cwd=A)
+    listings = _count_listings(monkeypatch)
+
+    assert sv.codex_session_for_cwd(A, home=tmp_path) == newest
+
+    assert len(listings) <= 4, (
+        f"reaching the newest session listed {len(listings)} directories; the "
+        f"date hierarchy should need one listing per level"
+    )
+
+
+def test_a_miss_does_not_enumerate_the_whole_store(tmp_path, monkeypatch):
+    """⛔A miss is the expensive case and the common one on a worktree that has
+    not run codex recently. It must cost the read budget, not the store."""
+    _big_store(tmp_path, match_cwd=B)          # nothing matches A
+    listings = _count_listings(monkeypatch)
+
+    assert sv.codex_session_for_cwd(A, home=tmp_path, limit=5) == ""
+
+    # One file per day here, so a budget of 5 reaches at most a handful of days
+    # plus the levels above them. The point is the bound, not the exact number.
+    assert len(listings) <= 20, (
+        f"a miss listed {len(listings)} directories for a budget of 5 — the "
+        f"traversal is not bounded by the budget"
+    )
+
+
+def test_the_day_walk_is_lazy(tmp_path):
+    """The generator must not be drained to yield its first item — that is the
+    property the fix rests on, and a list comprehension would pass every other
+    test in this file while restoring the defect."""
+    import itertools
+
+    _big_store(tmp_path, match_cwd=A)
+    root = tmp_path / "sessions"
+
+    first_two = list(itertools.islice(sv._codex_day_dirs(root), 2))
+
+    assert len(first_two) == 2
+    assert first_two[0].name == "28" and first_two[0].parent.name == "12"
+
+
+def test_an_unshaped_store_still_resolves(tmp_path):
+    """⛔The lazy walk assumes YYYY/MM/DD. A store that is flat, or shallower,
+    must still be searched rather than silently yielding nothing."""
+    day = tmp_path / "sessions"
+    day.mkdir(parents=True)
+    sid = "flat-session"
+    (day / f"rollout-2026-09-04T00-00-00-{sid}.jsonl").write_text(
+        json.dumps({"payload": {"id": sid, "cwd": A}}) + "\n")
+
+    assert sv.codex_session_for_cwd(A, home=tmp_path) == sid
