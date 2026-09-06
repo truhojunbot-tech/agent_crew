@@ -530,3 +530,159 @@ def test_an_under_cap_codex_session_still_resumes(tmp_path, monkeypatch):
 
     assert cmd[:4] == ["codex", "exec", "resume", "sess-a"]
     assert event is None
+
+
+# ── the cap must measure the session that will be RESUMED (#260 review) ──
+#
+# The cap measured "newest rollout for this cwd" while the resume preferred the
+# durable `provider_session_id`, which can be an OLDER rollout. Two failures
+# from one mismatch: an oversized stored session resumes uncapped because a
+# small newer file was measured, and a healthy stored session gets reset
+# because an unrelated newer rollout happened to be large.
+
+
+def test_the_size_is_read_for_a_specific_session(tmp_path):
+    old_sid = _rollout(tmp_path, "2026-09-01", "2026-09-01T10-00-00", A, session_id="older")
+    _pad(tmp_path, "older", 3 * 1024 * 1024)
+    _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A, session_id="newer")
+
+    assert sv.codex_session_size_for_id("older", home=tmp_path) > 3 * 1024 * 1024
+    assert sv.codex_session_size_for_id("newer", home=tmp_path) < 1024
+    assert sv.codex_session_size_for_id("nope", home=tmp_path) == 0
+
+
+def test_an_oversized_stored_session_trips_even_when_the_newest_is_small(tmp_path):
+    """★The dangerous half: the resume would replay the big one."""
+    _rollout(tmp_path, "2026-09-01", "2026-09-01T10-00-00", A, session_id="stored")
+    _pad(tmp_path, "stored", 3 * 1024 * 1024)
+    _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A, session_id="newest")
+
+    assert sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path)[0] is False
+    over, info = sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path,
+                                              session_id="stored")
+
+    assert over is True and info["conversation_id"] == "stored"
+
+
+def test_a_healthy_stored_session_is_not_reset_by_an_unrelated_big_rollout(tmp_path):
+    """⛔The other half, and the one that would have looked like the cap
+    working: a large newer rollout for the same cwd is not what a resume would
+    replay, so it must not force a reset of a perfectly good session."""
+    _rollout(tmp_path, "2026-09-01", "2026-09-01T10-00-00", A, session_id="stored")
+    _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A, session_id="huge")
+    _pad(tmp_path, "huge", 5 * 1024 * 1024)
+
+    assert sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path)[0] is True
+    assert sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path,
+                                        session_id="stored")[0] is False
+
+
+def test_the_peek_does_not_mint_a_context(tmp_db):
+    """⛔The cap decision has to ask which session before deciding, and
+    `get_or_create_context` cannot answer a question — it mints an id, bumps
+    the generation and increments the task index."""
+    from agent_crew.queue import TaskQueue
+
+    q = TaskQueue(tmp_db)
+
+    assert q.peek_context_provider_session_id("p", "codex", "/wt") == ""
+    ctx = q.get_or_create_context(project="p", agent="codex", worktree_path="/wt",
+                                  role="reviewer", task_id="t-1")
+    assert ctx["context_generation"] == 1
+    q.update_context_provider_session_id(ctx["context_key"], "stored-id")
+
+    assert q.peek_context_provider_session_id("p", "codex", "/wt") == "stored-id"
+    # ...and asking again did not advance anything.
+    again = q.get_or_create_context(project="p", agent="codex", worktree_path="/wt",
+                                    role="reviewer", task_id="t-2")
+    assert again["context_generation"] == 1
+    assert again["session_task_index"] == 2      # only the real dispatch advanced it
+
+
+def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypatch):
+    """★★The regression the review asked for: an older stored oversized id plus
+    a newer under-cap rollout for the same cwd."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "codex"
+    wt.mkdir(exist_ok=True)
+    (wt / ".git").mkdir(exist_ok=True)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"worktrees": {"codex": str(wt)}}))
+    db = str(tmp_path / "t.db")
+    home = tmp_path / "codexhome"
+
+    _rollout(home, "2026-09-01", "2026-09-01T10-00-00", str(wt), session_id="stored")
+    _pad(home, "stored", 3 * 1024 * 1024)
+    _rollout(home, "2026-09-04", "2026-09-04T10-00-00", str(wt), session_id="newest")
+
+    measured = {}
+    real_cap = sv.codex_context_exceeds_cap
+
+    def cap(cwd, *a, **kw):
+        measured["session_id"] = kw.get("session_id")
+        return real_cap(cwd, max_mb=2, home=home, session_id=kw.get("session_id", ""))
+
+    async def _fake_exec(*cmd, **kwargs):
+        measured["cmd"] = list(cmd)
+
+        class _P:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return (b"", b"")
+
+            async def wait(self):
+                return 0
+
+        return _P()
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr(sv, "codex_context_exceeds_cap", cap)
+    monkeypatch.setattr(sv, "codex_session_for_cwd",
+                        lambda cwd, **kw: sv.codex_session_for_cwd.__wrapped__(cwd)
+                        if hasattr(sv.codex_session_for_cwd, "__wrapped__") else "newest")
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+                     project="p", watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        seed = f"seed-{uuid.uuid4().hex[:6]}"
+        q.enqueue(TaskRequest(task_id=seed, task_type="review", description="r",
+                              branch="main", context={}))
+        asyncio.run(app.state.dispatch_task(q.dequeue(role="reviewer"), "reviewer"))
+        # The durable binding names the OLD oversized rollout. Read the row the
+        # DISPATCHER created rather than minting one: it resolves `project` from
+        # the state directory (#248), so a hand-built key would be a different
+        # context and the peek would miss it — which is exactly what this test
+        # caught on its first run.
+        import sqlite3 as _sqlite
+
+        conn = _sqlite.connect(db)
+        conn.row_factory = _sqlite.Row
+        row = conn.execute(
+            "SELECT context_key FROM context_state WHERE agent='codex' "
+            "AND worktree_path=?", (str(wt),)).fetchone()
+        conn.close()
+        assert row is not None, "the seed dispatch did not create a context row"
+        q.update_context_provider_session_id(row["context_key"], "stored")
+
+        tid = f"t-{uuid.uuid4().hex[:6]}"
+        q.enqueue(TaskRequest(task_id=tid, task_type="review", description="r",
+                              branch="main", context={}))
+        asyncio.run(app.state.dispatch_task(q.dequeue(role="reviewer"), "reviewer"))
+
+    assert measured.get("session_id") == "stored", (
+        f"the cap measured {measured.get('session_id')!r}, not the session the "
+        f"resume would replay"
+    )
+    assert "resume" not in measured["cmd"], "an oversized stored session was resumed"

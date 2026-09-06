@@ -1246,6 +1246,28 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def peek_context_provider_session_id(self, project: str, agent: str,
+                                         worktree_path: str) -> str:
+        """The provider session recorded for this context, WITHOUT minting one.
+
+        `get_or_create_context` has side effects — it mints an id, bumps the
+        generation, increments the task index — so it cannot be used to ask a
+        question before the answer is needed. #260's cap decision has to know
+        which provider session a resume would use BEFORE it decides whether to
+        force a reset, and this is that read.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT provider_session_id FROM context_state "
+                "WHERE project=? AND agent=? AND worktree_path=?",
+                (project, agent, worktree_path)).fetchone()
+            return (row["provider_session_id"] or "") if row else ""
+        except Exception:  # noqa: BLE001 — a peek never breaks a dispatch
+            return ""
+        finally:
+            conn.close()
+
     def update_context_provider_session_id(self, context_key: str, provider_session_id: str) -> None:
         """Record a provider-native session id observed for this context
         (#202) — e.g. parsed from claude's stream-json output. Best-effort;

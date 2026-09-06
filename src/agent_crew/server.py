@@ -435,14 +435,60 @@ def codex_session_size(cwd: str, *, home=None, limit=None) -> tuple:
         return (0, session)
 
 
-def codex_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
+def codex_rollout_path(session_id: str, *, home=None, limit=None):
+    """The rollout file for a specific session id, or ``None``.
+
+    Filenames end in the session id, so this is a bounded newest-first walk of
+    the same date hierarchy — no read of file contents needed.
+    """
+    if not session_id:
+        return None
+    budget = CODEX_SESSION_SCAN_LIMIT if limit is None else limit
+    try:
+        root = _codex_home(home) / "sessions"
+        if not root.is_dir():
+            return None
+        seen = 0
+        for day in _codex_day_dirs(root):
+            for path in sorted(day.glob(f"rollout-*{session_id}.jsonl"), reverse=True):
+                return path
+            seen += 1
+            if seen >= budget:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def codex_session_size_for_id(session_id: str, *, home=None) -> int:
+    """Bytes of the rollout a resume of ``session_id`` would replay."""
+    path = codex_rollout_path(session_id, home=home)
+    if path is None:
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def codex_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
+                              session_id: str = "") -> tuple:
     """Is the rollout a codex resume would replay past the cap (#260 review)?
 
     Mirrors the agy and claude pairs so all three providers trip the same
     downstream path — a forced fresh context, with nothing on disk deleted.
     """
     cap = CODEX_CONTEXT_MAX_MB if max_mb is None else max_mb
-    size, session = codex_session_size(cwd, home=home)
+    if session_id:
+        # ⛔Measure the session that will ACTUALLY be resumed. The dispatcher
+        #   prefers the durable `provider_session_id` over "newest for this
+        #   cwd", so measuring the newest could clear an oversized stored
+        #   session, or reset a perfectly good one because an unrelated newer
+        #   rollout happened to be large (#260 review). The measured file and
+        #   the resumed file have to be the same file.
+        size, session = codex_session_size_for_id(session_id, home=home), session_id
+    else:
+        size, session = codex_session_size(cwd, home=home)
     info = {"bytes": size, "conversation_id": session, "cap_mb": cap,
             "provider": "codex"}
     if not cap or cap <= 0 or not size:
@@ -2038,13 +2084,27 @@ def create_app(
         #   task.context.context_reset sets it too (review-99ad8ad0).
         _ctx_over = False
         _ctx_cap_info = {}
+        _codex_planned = ""      # the session a codex resume would use, if any
         if agent == "gemini":
             _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
         elif agent == "codex":
             # #260 review: measurable now that #262 binds a resume to one
             # session. The rollout file is the conversation that resume
             # replays, so it is the same measurement as the other two providers.
-            _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(wt)
+            #
+            # ⛔Resolve WHICH session first. The resume below prefers the
+            #   durable `provider_session_id`, which can be an older rollout
+            #   than the newest for this cwd — so measuring "newest" could let
+            #   an oversized stored session resume uncapped, or reset a healthy
+            #   one because an unrelated newer rollout was large. Peeked
+            #   without minting a context, since the cap decision feeds the
+            #   `force_reset` that minting depends on.
+            _codex_planned = (q().peek_context_provider_session_id(
+                _project, agent, wt) or "").strip()
+            if not _codex_planned:
+                _codex_planned = codex_session_for_cwd(wt)
+            _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(
+                wt, session_id=_codex_planned)
         elif agent == "claude":
             # #260: the same defect on the other provider. `--continue` was
             # unconditional here, so the session never rotated — one file per
@@ -2156,7 +2216,10 @@ def create_app(
             # means fresh, never a guess.
             _codex_session = ""
             if agent == "codex" and _ctx_info["context_policy"] == "resume":
-                _codex_session = (_ctx_info.get("provider_session_id") or "").strip()
+                # The session the cap already measured — resolved the same way,
+                # once, so the two decisions cannot disagree.
+                _codex_session = (_ctx_info.get("provider_session_id")
+                                  or _codex_planned or "").strip()
                 if not _codex_session:
                     _codex_session = codex_session_for_cwd(wt)
                     if _codex_session:
