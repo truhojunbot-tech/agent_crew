@@ -396,6 +396,272 @@ def _dispatch_timeout_for_role(role: str) -> float:
 #:   downstream `subscriber fell behind updates` mask.
 AGY_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_AGY_CONTEXT_MAX_MB", "64"))
 
+#: Cap on the Claude Code session the worker resumes with `--continue` (#260).
+#: 0 disables.
+#:
+#: ⛔#236/#238 bounded the agy store and nothing else, but `--continue` was
+#:   unconditional for claude and `resume --last` unconditional for codex, so
+#:   those sessions never rotated at all. Measured 2026-09-03: every crew
+#:   worktree had exactly ONE session file since 2026-08-21, alpha_engine's at
+#:   290 MB, and quota-ops sat above 900k cached tokens on 81 of 1095 turns.
+#:   The file size is the store, not the context window — Claude Code compacts
+#:   internally — but a store that never rotates is the thing that keeps the
+#:   window pinned near its ceiling, and it is the signal we can actually see
+#:   from outside the CLI.
+CLAUDE_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CLAUDE_CONTEXT_MAX_MB", "64"))
+
+
+#: How many rollout files `codex_session_for_cwd` will read before giving up.
+#: Codex's store is date-partitioned and unbounded — 9,894 sessions on this
+#: host — so the search walks newest-first and stops early. A miss returns "",
+#: which the dispatcher treats as "no binding" and therefore as fresh.
+CODEX_SESSION_SCAN_LIMIT = int(os.getenv("AGENT_CREW_CODEX_SESSION_SCAN", "400"))
+
+
+def _codex_home(home=None):
+    import pathlib
+
+    return pathlib.Path(home) if home else pathlib.Path.home() / ".codex"
+
+
+#: Cap on the codex rollout a worker resumes (#260 review). 0 disables.
+#:
+#: ⛔This became measurable only once #262 bound a resume to ONE session by id.
+#:   While `resume --last` was global there was no per-worktree file to size,
+#:   and that limitation was documented — the reviewer correctly spotted that
+#:   the binding made it stale. Measured 2026-09-06 across 9,894 rollouts:
+#:   median 48 KB, p99 0.4 MB, and alpha_engine's codex worktree holding
+#:   356.6 / 180.6 / 130.3 / 114.7 MB files. 64 MB sits ~160x above p99, so it
+#:   cannot fire on ordinary work and does catch those.
+CODEX_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CODEX_CONTEXT_MAX_MB", "64"))
+
+
+def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
+    """The newest Codex session id recorded for ``cwd``, or ``""``."""
+    return _codex_session_and_path(cwd, home=home, limit=limit)[0]
+
+
+def codex_session_size(cwd: str, *, home=None, limit=None) -> tuple:
+    """``(bytes, session_id)`` for the rollout a codex resume would replay.
+
+    The rollout file IS the conversation `codex exec resume <id>` replays, so
+    its size is the same measurement `agy_conversation_size` and
+    `claude_session_size` make for the other two providers.
+    """
+    session, path = _codex_session_and_path(cwd, home=home, limit=limit)
+    if not session or path is None:
+        return (0, "")
+    try:
+        return (path.stat().st_size, session)
+    except OSError:
+        return (0, session)
+
+
+def codex_rollout_path(session_id: str, *, home=None, limit=None):
+    """The rollout file for a specific session id, or ``None``.
+
+    Filenames end in the session id, so this is a bounded newest-first walk of
+    the same date hierarchy — no read of file contents needed.
+    """
+    if not session_id:
+        return None
+    budget = CODEX_SESSION_SCAN_LIMIT if limit is None else limit
+    try:
+        root = _codex_home(home) / "sessions"
+        if not root.is_dir():
+            return None
+        seen = 0
+        for day in _codex_day_dirs(root):
+            for path in sorted(day.glob(f"rollout-*{session_id}.jsonl"), reverse=True):
+                return path
+            seen += 1
+            if seen >= budget:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def codex_session_size_for_id(session_id: str, *, home=None) -> int:
+    """Bytes of the rollout a resume of ``session_id`` would replay."""
+    path = codex_rollout_path(session_id, home=home)
+    if path is None:
+        return 0
+    try:
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
+def codex_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
+                              session_id: str = "") -> tuple:
+    """Is the rollout a codex resume would replay past the cap (#260 review)?
+
+    Mirrors the agy and claude pairs so all three providers trip the same
+    downstream path — a forced fresh context, with nothing on disk deleted.
+    """
+    cap = CODEX_CONTEXT_MAX_MB if max_mb is None else max_mb
+    if session_id:
+        # ⛔Measure the session that will ACTUALLY be resumed. The dispatcher
+        #   prefers the durable `provider_session_id` over "newest for this
+        #   cwd", so measuring the newest could clear an oversized stored
+        #   session, or reset a perfectly good one because an unrelated newer
+        #   rollout happened to be large (#260 review). The measured file and
+        #   the resumed file have to be the same file.
+        size, session = codex_session_size_for_id(session_id, home=home), session_id
+    else:
+        size, session = codex_session_size(cwd, home=home)
+    info = {"bytes": size, "conversation_id": session, "cap_mb": cap,
+            "provider": "codex"}
+    if not cap or cap <= 0 or not size:
+        return (False, info)
+    return (size > cap * 1048576, info)
+
+
+def _codex_day_dirs(root):
+    """Yield codex's day directories newest-first, descending lazily.
+
+    The store is `sessions/YYYY/MM/DD/`. A generator rather than a list so the
+    caller can stop after the first directory that satisfies it — which is the
+    common case, and the difference between listing three directories and
+    walking the entire store.
+
+    Falls back to yielding a level that has no subdirectories, so a flat or
+    differently-shaped store still resolves rather than silently returning
+    nothing.
+    """
+    def _subdirs(path):
+        try:
+            return sorted((d for d in path.iterdir() if d.is_dir()), reverse=True)
+        except OSError:
+            return []
+
+    years = _subdirs(root)
+    if not years:
+        yield root
+        return
+    for year in years:
+        months = _subdirs(year)
+        if not months:
+            yield year
+            continue
+        for month in months:
+            days = _subdirs(month)
+            if not days:
+                yield month
+                continue
+            for day in days:
+                yield day
+
+
+def _codex_session_and_path(cwd: str, *, home=None, limit=None) -> tuple:
+    """The newest Codex session id recorded for ``cwd``, or ``""``.
+
+    ⛔`codex exec resume --last` is GLOBAL. Codex keys its rollout store by
+      date, not by working directory, so "the most recent recorded session" is
+      whatever ran last anywhere on the host. Measured 2026-09-04: 9,894
+      sessions across many directories, the newest belonging to
+      `worktrees/alpha_engine/codex` while this project's newest was two days
+      older — so a resume dispatched for agent_crew would have attached
+      alpha_engine's provider state while telemetry still reported agent_crew's
+      logical context (#262). The task would still have succeeded, which is what
+      made it invisible.
+
+      Each rollout's first record is a `session_meta` carrying `cwd` and `id` —
+      the per-worktree binding the CLI does not expose directly — and
+      `codex exec resume <SESSION_ID>` targets it exactly.
+    """
+    import json as _json
+
+    budget = CODEX_SESSION_SCAN_LIMIT if limit is None else limit
+    try:
+        root = _codex_home(home) / "sessions"
+        if not root.is_dir() or not cwd:
+            return ("", None)
+        # ⛔Descend the date hierarchy lazily. `rglob("*")` materialises the
+        #   WHOLE store before any budget applies — 9,894 sessions plus their
+        #   directories on this host — so an unresolved lookup paid a full-tree
+        #   traversal on every dispatch and every post-run capture, with the
+        #   read budget bounding only the file reads that followed (review of
+        #   PR #266). Filenames embed an ISO timestamp and the tree is
+        #   YYYY/MM/DD, so sorting each level descending reaches the newest
+        #   sessions after listing three directories.
+        # ⛔Read as we descend, and stop at the first match. Collecting the
+        #   budget's worth of paths BEFORE reading any of them meant a hit still
+        #   walked far enough to gather 400 candidates — so the newest session,
+        #   which is usually the first file in the newest directory, cost a
+        #   descent through months of history anyway.
+        read = 0
+        for day in _codex_day_dirs(root):
+            for path in sorted(day.glob("rollout-*.jsonl"), reverse=True):
+                if read >= budget:
+                    return ("", None)
+                read += 1
+                try:
+                    with open(path, errors="replace") as fh:
+                        first = fh.readline()
+                    meta = (_json.loads(first) or {}).get("payload") or {}
+                except Exception:  # noqa: BLE001
+                    continue
+                if meta.get("cwd") == cwd and meta.get("id"):
+                    return (str(meta["id"]), path)
+    except Exception:  # noqa: BLE001 — resolution must never break a dispatch
+        return ("", None)
+    return ("", None)
+
+
+def _claude_home(home=None):
+    import pathlib
+
+    return pathlib.Path(home) if home else pathlib.Path.home() / ".claude"
+
+
+def claude_session_size(cwd: str, *, home=None) -> tuple:
+    """``(bytes, session_id)`` for the Claude Code session bound to ``cwd``.
+
+    Claude Code keys its transcripts by working directory, with `/`, `.` and
+    `_` all folded to `-`:
+
+        /home/u/.agent_crew/worktrees/quota-ops/claude
+        → ~/.claude/projects/-home-u--agent-crew-worktrees-quota-ops-claude/
+
+    The session `--continue` resumes is the most recently written `.jsonl` in
+    that directory. ``(0, "")`` when anything is missing or unreadable —
+    sizing must never break a dispatch.
+    """
+    import re as _re
+
+    try:
+        if not cwd:
+            return (0, "")
+        mangled = _re.sub(r"[/._]", "-", cwd)
+        d = _claude_home(home) / "projects" / mangled
+        if not d.is_dir():
+            return (0, "")
+        sessions = sorted(d.glob("*.jsonl"), key=lambda f: f.stat().st_mtime,
+                          reverse=True)
+        if not sessions:
+            return (0, "")
+        return (sessions[0].stat().st_size, sessions[0].stem)
+    except Exception:  # noqa: BLE001 — sizing must never break a dispatch
+        return (0, "")
+
+
+def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
+    """Is the Claude Code session `--continue` would resume past the cap (#260)?
+
+    Returns ``(over, info)``. Mirrors `agy_context_exceeds_cap` so both
+    providers trip the same downstream path — a forced fresh context, with
+    nothing on disk deleted or mutated.
+    """
+    cap = CLAUDE_CONTEXT_MAX_MB if max_mb is None else max_mb
+    size, session = claude_session_size(cwd, home=home)
+    info = {"bytes": size, "conversation_id": session, "cap_mb": cap,
+            "provider": "claude"}
+    if not cap or cap <= 0 or not size:
+        return (False, info)
+    return (size > cap * 1048576, info)
+
 
 def _agy_home(home=None):
     import pathlib as _p
@@ -1346,6 +1612,10 @@ def create_app(
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id)
 
+    #: How many times a push path found no pane to deliver to. Keyed by path so
+    #: a persistent misconfiguration is loud once and then periodic (#260).
+    _no_pane_warnings: dict = {}
+
     def _try_push_discuss(agent: Optional[str]) -> None:
         """Discuss tasks fan out per agent, not per role. pane_map is expected
         to hold agent-name keys (e.g. 'claude', 'codex', 'gemini') alongside
@@ -1359,7 +1629,21 @@ def create_app(
             )
             return
         if not pane_map or not agent:
-            logger.debug(f"_try_push_discuss: no pane_map or agent")
+            # #260: this was DEBUG, and it repeated forever while tasks kept
+            # completing by other means — so a deployment with an empty
+            # pane_map looked healthy from the logs. Still cheap: warn on the
+            # first occurrence and then every 50th, so a persistent gap is
+            # visible without flooding.
+            _no_pane_warnings["discuss"] = _no_pane_warnings.get("discuss", 0) + 1
+            n = _no_pane_warnings["discuss"]
+            if n == 1 or n % 50 == 0:
+                logger.warning(
+                    f"_try_push_discuss: no pane_map or agent (agent={agent!r}, "
+                    f"pane_map entries={len(pane_map or {})}) — discuss tasks "
+                    f"cannot be pushed; occurrence {n}"
+                )
+            else:
+                logger.debug("_try_push_discuss: no pane_map or agent")
             return
         pane_id = pane_map.get(agent)
         if not pane_id:
@@ -1382,6 +1666,17 @@ def create_app(
             return
 
         logger.info(f"_try_push_discuss: dequeued task_id={task.task_id} for agent={agent}, calling push_fn")
+        # #260: the same oversized-context guard `_try_push_next` has had since
+        # #133. `crew discuss` is the path these panels actually run on, and it
+        # was the one without a check — so the panes that accumulated the most
+        # context were exactly the ones nothing was watching.
+        tok = _pane_token_count(pane_id)
+        if _push_enabled and tok >= _TOKEN_CLEAR_THRESHOLD:
+            logger.info(
+                f"_try_push_discuss: pane {pane_id} has {tok} tokens "
+                f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
+            )
+            _pane_clear_context(pane_id)
         push_fn(pane_id, _format_task_message(task, port))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id)
@@ -1830,23 +2125,52 @@ def create_app(
         # ⛔Nothing in agy's store is deleted or mutated — the oversized
         #   conversation is simply not resumed, so an in-flight context is
         #   never disturbed and the decision is reversible.
-        # ⛔Initialised before the gemini branch so the event gate below can
-        #   read it for ANY agent. This boolean is the cap decision itself —
+        # ⛔Initialised before the provider branches so the event gate below can
+        #   read it for ANY agent, and named for the CONTEXT rather than for agy:
+        #   it carries claude's cap decision too, and a name that says otherwise
+        #   is how the event came to report every claude trip as `provider=agy`
+        #   (#260 review). This boolean is the cap decision itself —
         #   `_force_context_reset` is not, because an operator's explicit
         #   task.context.context_reset sets it too (review-99ad8ad0).
-        _agy_over = False
-        _agy_cap_info = {}
+        _ctx_over = False
+        _ctx_cap_info = {}
+        _codex_planned = ""      # the session a codex resume would use, if any
         if agent == "gemini":
-            _agy_over, _agy_cap_info = agy_context_exceeds_cap(wt)
-            if _agy_over:
-                _force_context_reset = True
-                logger.warning(
-                    "dispatcher: agy context %s for %s is %.1f MB (cap %.0f MB) — "
-                    "forcing a fresh provider conversation (#236)",
-                    _agy_cap_info.get("conversation_id", "?"), wt,
-                    _agy_cap_info.get("bytes", 0) / 1048576.0,
-                    _agy_cap_info.get("cap_mb", 0),
-                )
+            _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
+        elif agent == "codex":
+            # #260 review: measurable now that #262 binds a resume to one
+            # session. The rollout file is the conversation that resume
+            # replays, so it is the same measurement as the other two providers.
+            #
+            # ⛔Resolve WHICH session first. The resume below prefers the
+            #   durable `provider_session_id`, which can be an older rollout
+            #   than the newest for this cwd — so measuring "newest" could let
+            #   an oversized stored session resume uncapped, or reset a healthy
+            #   one because an unrelated newer rollout was large. Peeked
+            #   without minting a context, since the cap decision feeds the
+            #   `force_reset` that minting depends on.
+            _codex_planned = (q().peek_context_provider_session_id(
+                _project, agent, wt) or "").strip()
+            if not _codex_planned:
+                _codex_planned = codex_session_for_cwd(wt)
+            _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(
+                wt, session_id=_codex_planned)
+        elif agent == "claude":
+            # #260: the same defect on the other provider. `--continue` was
+            # unconditional here, so the session never rotated — one file per
+            # worktree since 2026-08-21, alpha_engine's at 290 MB. Sizing is
+            # provider-specific; everything after this line is not.
+            _ctx_over, _ctx_cap_info = claude_context_exceeds_cap(wt)
+        if _ctx_over:
+            _force_context_reset = True
+            logger.warning(
+                "dispatcher: %s context %s for %s is %.1f MB (cap %.0f MB) — "
+                "forcing a fresh provider conversation (#236, #260)",
+                _ctx_cap_info.get("provider", agent),
+                _ctx_cap_info.get("conversation_id", "?"), wt,
+                _ctx_cap_info.get("bytes", 0) / 1048576.0,
+                _ctx_cap_info.get("cap_mb", 0),
+            )
         _ctx_info = q().get_or_create_context(
             project=_project, agent=agent, worktree_path=wt, role=role,
             task_id=task.task_id, force_reset=_force_context_reset,
@@ -1886,16 +2210,20 @@ def create_app(
             # conversation has some bytes" — every conversation has bytes, and
             # an operator reset would then be mislabelled as a cap trip,
             # corrupting exactly the signal #236 added this event to measure.
-            if _agy_over:
+            if _ctx_over:
                 record_context_event(
                     _context_events_path, "provider_context_capped",
                     task_id=task.task_id, project=_project, role=role, agent=agent,
                     context_id=_ctx_info["context_id"],
                     context_generation=_ctx_info["context_generation"],
-                    provider="agy",
-                    conversation_id=_agy_cap_info.get("conversation_id", ""),
-                    bytes=_agy_cap_info.get("bytes", 0),
-                    cap_mb=_agy_cap_info.get("cap_mb", 0),
+                    # #260 review: the provider that actually tripped the cap.
+                    # Hardcoding "agy" here predated claude having a cap at all,
+                    # and once it did, every claude trip was telemetered as agy —
+                    # corrupting the one field that says which store overflowed.
+                    provider=_ctx_cap_info.get("provider", agent),
+                    conversation_id=_ctx_cap_info.get("conversation_id", ""),
+                    bytes=_ctx_cap_info.get("bytes", 0),
+                    cap_mb=_ctx_cap_info.get("cap_mb", 0),
                 )
             _role_default_agent = _DISPATCH_ROLE_TO_AGENT.get(role)
             if _role_default_agent and agent != _role_default_agent:
@@ -1931,6 +2259,29 @@ def create_app(
                 ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True, text=True, timeout=5,
             ).stdout.strip()
+            # #262: bind codex to a session that belongs to THIS worktree.
+            # `resume --last` is global, so the binding has to be ours: prefer
+            # the provider_session_id already recorded for this context, then a
+            # bounded search of codex's own store, then nothing — and "nothing"
+            # means fresh, never a guess.
+            _codex_session = ""
+            if agent == "codex" and _ctx_info["context_policy"] == "resume":
+                # The session the cap already measured — resolved the same way,
+                # once, so the two decisions cannot disagree.
+                _codex_session = (_ctx_info.get("provider_session_id")
+                                  or _codex_planned or "").strip()
+                if not _codex_session:
+                    _codex_session = codex_session_for_cwd(wt)
+                    if _codex_session:
+                        logger.info(
+                            "dispatcher: bound codex session %s to %s from its own "
+                            "rollout store (#262)", _codex_session[:8], wt)
+                if not _codex_session:
+                    logger.info(
+                        "dispatcher: no codex session recorded for %s — starting a "
+                        "fresh one rather than resuming whatever ran last on this "
+                        "host (#262)", wt)
+
             q().record_attribution(
                 task_id=task.task_id,
                 project=_project,
@@ -1943,7 +2294,8 @@ def create_app(
                 status="in_progress",
                 model=_known_model,
                 context_id=_ctx_info["context_id"],
-                provider_session_id=_ctx_info.get("provider_session_id") or "",
+                provider_session_id=(_codex_session
+                                     or _ctx_info.get("provider_session_id") or ""),
                 context_policy=_ctx_info["context_policy"],
                 context_generation=_ctx_info["context_generation"],
                 session_task_index=_ctx_info["session_task_index"],
@@ -2075,11 +2427,17 @@ def create_app(
         log_path = os.path.join(os.path.dirname(db_path), f"dispatch_{role}.log")
 
         if agent == "claude":
-            cmd = [
-                "claude", "-p", message,
-                "--continue", "--dangerously-skip-permissions",
-                "--verbose", "--output-format", "stream-json",
-            ]
+            # #260: resume only when Agent Crew's own context policy says so —
+            # the treatment #236 gave gemini and never gave claude. While
+            # `--continue` was unconditional, a freshly minted context
+            # (generation 1, an operator reset, or a cap trip) still resumed
+            # the provider's old session, so identity and provider state
+            # disagreed and the session could never rotate.
+            cmd = ["claude", "-p", message]
+            if _ctx_info["context_policy"] == "resume":
+                cmd.append("--continue")
+            cmd += ["--dangerously-skip-permissions",
+                    "--verbose", "--output-format", "stream-json"]
         elif agent == "gemini":
             # gemini-cli + oauth-personal stopped serving on 2026-06-18
             # (IneligibleTierError) and the replacement, Antigravity CLI
@@ -2106,11 +2464,25 @@ def create_app(
                 cmd.append("--continue")
             cmd += ["--dangerously-skip-permissions", "--model", _known_model]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
-            cmd = [
-                "codex", "exec", "resume", "--last",
-                "--dangerously-bypass-approvals-and-sandbox",
-                message,
-            ]
+            # #260: policy-aware for the same reason as claude above. Codex has
+            # no per-worktree store to size — `~/.codex/sessions` is partitioned
+            # by date, not by cwd, and `resume --last` means the last session
+            # globally — so there is no cap to apply here, only the reset that
+            # an explicit context_reset or a first-generation context implies.
+            # Sizing codex would need a signal the CLI does not currently expose;
+            # not inventing one.
+            # #262: resume the session BOUND TO THIS WORKTREE, by id.
+            # ⛔Never `--last`. It selects the newest session anywhere on the
+            #   host, so a resume here could attach another project's provider
+            #   state while telemetry still reported this project's logical
+            #   context — an identity and economics mismatch, and a
+            #   cross-project content leak.
+            if _codex_session:
+                cmd = ["codex", "exec", "resume", _codex_session,
+                       "--dangerously-bypass-approvals-and-sandbox", message]
+            else:
+                cmd = ["codex", "exec",
+                       "--dangerously-bypass-approvals-and-sandbox", message]
 
         timeout_secs = _dispatch_timeout_for_role(role)
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
@@ -2209,6 +2581,18 @@ def create_app(
                     _discovered_session_id = extract_claude_session_id(_task_log_tail)
                     if _discovered_session_id and _discovered_session_id != _ctx_info.get("provider_session_id"):
                         q().update_context_provider_session_id(_context_key, _discovered_session_id)
+                elif agent == "codex":
+                    # #262: close the loop. The run just now wrote a rollout for
+                    # THIS worktree, so it is at the top of codex's newest day —
+                    # cheap to find, and once recorded the next resume needs no
+                    # search at all. Without this a fresh codex task would never
+                    # acquire a binding and every dispatch would start over.
+                    _codex_after = codex_session_for_cwd(wt)
+                    if _codex_after and _codex_after != _ctx_info.get("provider_session_id"):
+                        q().update_context_provider_session_id(_context_key, _codex_after)
+                        logger.info(
+                            "dispatcher: recorded codex session %s for %s (#262)",
+                            _codex_after[:8], wt)
                 if detect_context_compaction(_task_log_tail):
                     record_context_event(
                         _context_events_path, "context_compacted",
