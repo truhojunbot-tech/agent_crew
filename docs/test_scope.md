@@ -90,7 +90,10 @@ detail:
 - **Absent means unknown.** All five columns default to `NULL`, not `''`/`0`,
   which departs from the rest of that table on purpose: a row that predates
   #278 has no treatment, and `targeted` or `lock_wait_seconds = 0` would both
-  be claims nobody made.
+  be claims nobody made. For a consumer this is the difference between two
+  facts: on a row written after #278, `lock_wait_seconds = 0` means measured
+  and there was no wait; `NULL` means never measured. Cohorts must **exclude**
+  NULL rather than coerce it to a treatment.
 
 The lock is taken *before* the attribution row is written, so a deferred
 attempt records nothing at all — no `started_at`, no `task_started`. `#204`
