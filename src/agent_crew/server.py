@@ -263,6 +263,10 @@ _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 
 
 # Tags that mean "retryable in the next few minutes" (server-side load-shed).
+#: Statuses a task can hold when a result still arrives afterwards. Both mean
+#: "the dispatcher stopped watching", not "the work is over" (#265).
+_LATE_RESULT_STATUSES = frozenset({"failed", "timed_out"})
+
 _TRANSIENT_RETRIABLE_TAGS = frozenset({
     "claude_429",
     "claude_throttle",
@@ -1703,19 +1707,32 @@ def create_app(
     # instead of just inferrable (#202 acceptance criterion).
     _seen_context_keys_this_process: set[str] = set()
 
-    def _fail_if_active(task_id: str, reason: str) -> None:
-        """Fail a task only when it is still in_progress (agent may have submitted first)."""
+    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed") -> None:
+        """End a task only when it is still in_progress (agent may have submitted first).
+
+        `status` distinguishes two things the dispatcher used to conflate (#265):
+
+          * `failed` — the work is known to have gone wrong (non-zero exit,
+            exhausted quota, retries spent);
+          * `timed_out` — we stopped waiting and do not know. The worker may
+            still be running and may still POST a result, which is exactly what
+            happened six times in one day on alpha_engine.
+
+        Both are terminal for scheduling. Only the first is a failure, and a
+        consumer deciding whether to re-issue work needs to tell them apart.
+        """
         tasks = q().list_tasks(status="in_progress")
         if any(t.task_id == task_id for t in tasks):
             try:
                 q().submit_result(
                     task_id,
-                    TaskResult(task_id=task_id, status="failed", summary=reason,
-                               error_info={"reason": reason}),
+                    TaskResult(task_id=task_id, status=status, summary=reason,
+                               error_info={"reason": reason, "final": status == "failed"}),
                 )
                 _attr = q().get_attribution(task_id)
                 record_context_event(
-                    _context_events_path, "task_failed",
+                    _context_events_path,
+                    "task_failed" if status == "failed" else "task_timed_out",
                     task_id=task_id, reason=reason,
                     project=(_attr or {}).get("project"),
                     role=(_attr or {}).get("role"),
@@ -2234,11 +2251,21 @@ def create_app(
                 )
                 _fail_if_active(task.task_id, _transient)
             elif _timed_out:
-                _fail_if_active(task.task_id, "dispatcher_timeout")
+                # #265: NOT `failed`. The dispatcher stopped waiting; the worker
+                # may still be running and may still POST — measured on
+                # alpha_engine, six tasks in one day were marked failed and later
+                # turned completed, with their commits already pushed. A consumer
+                # reading status at notification time saw a false failure and
+                # would have re-issued work that was already done (including one
+                # task that had already opened a PR).
+                _fail_if_active(task.task_id, "dispatcher_timeout", status="timed_out")
             elif proc.returncode != 0:
                 _fail_if_active(task.task_id, f"exit_{proc.returncode}")
             else:
-                _fail_if_active(task.task_id, "no_result_submitted")
+                # Same reasoning: the process is gone without a result, but the
+                # POST can still be in flight. "We did not observe a result" is
+                # not "the work failed".
+                _fail_if_active(task.task_id, "no_result_submitted", status="timed_out")
         except Exception:
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
@@ -2439,6 +2466,10 @@ def create_app(
     # Its absence is why PR #241 shipped a Context Pack that silently omitted
     # the acceptance criteria on every live dispatch while unit tests passed.
     app.state.dispatch_task = _dispatch_task
+    # Same rationale (#248, #265): expose the terminal-marking helper so a test
+    # can drive the real timeout path instead of asserting against a
+    # reimplementation of it.
+    app.state.fail_if_active = _fail_if_active
     # ── End headless dispatcher ───────────────────────────────────────────────
 
     def _auto_enqueue_review(
@@ -2789,9 +2820,36 @@ def create_app(
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
         ctx = q().get_task_context(task_id)
+        # #265: a result can arrive for a task the dispatcher already ended —
+        # it stopped waiting, the worker kept going, and the row silently flips
+        # from `timed_out` (previously `failed`) to `completed`. A consumer that
+        # read the status when the notification fired sees only the first value
+        # and never learns it was revised. Capture the prior status so the
+        # revision can be announced.
+        _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
         try:
             task_type = q().submit_result(task_id, result)
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
+            if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
+                logger.warning(
+                    f"POST /tasks/{task_id}/result: LATE RESULT — this task was "
+                    f"already {_prior!r} and is now {result.status!r}. Anything that "
+                    f"read the earlier status has a stale verdict (#265)."
+                )
+                try:
+                    _attr = q().get_attribution(task_id)
+                    record_context_event(
+                        _context_events_path, "task_result_late",
+                        task_id=task_id, previous_status=_prior,
+                        new_status=result.status,
+                        project=(_attr or {}).get("project"),
+                        role=(_attr or {}).get("role"),
+                        agent=(_attr or {}).get("agent"),
+                        context_id=(_attr or {}).get("context_id"),
+                    )
+                except Exception:
+                    logger.exception(
+                        f"POST /tasks/{task_id}/result: late-result event failed")
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
