@@ -5,7 +5,7 @@ import threading
 import pytest
 
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
-from agent_crew.queue import TaskQueue
+from agent_crew.queue import TaskAlreadyExistsError, TaskQueue
 
 
 @pytest.fixture
@@ -344,3 +344,31 @@ def test_u_q20_list_orphaned(q):
     orphaned = q.list_orphaned()
     assert len(orphaned) == 1
     assert orphaned[0].task_id == "review-orphan-test"
+
+
+# #273: a duplicate task_id must not surface as an opaque IntegrityError/500 —
+# the caller needs the existing task's status to react (reuse it / pick a new id).
+def test_u_q21_enqueue_duplicate_task_id_raises_with_existing_status(q):
+    q.enqueue(make_task("dup-001"))
+
+    with pytest.raises(TaskAlreadyExistsError) as exc_info:
+        q.enqueue(make_task("dup-001"))
+
+    assert exc_info.value.task_id == "dup-001"
+    assert exc_info.value.status == "pending"
+
+    # the original row must be untouched — no partial/duplicate write
+    tasks = q.list_tasks()
+    assert len(tasks) == 1
+
+
+def test_u_q22_enqueue_duplicate_task_id_reports_current_status(q):
+    q.enqueue(make_task("dup-002"))
+    q.submit_result(
+        "dup-002", TaskResult(task_id="dup-002", status="completed", summary="done")
+    )
+
+    with pytest.raises(TaskAlreadyExistsError) as exc_info:
+        q.enqueue(make_task("dup-002"))
+
+    assert exc_info.value.status == "completed"

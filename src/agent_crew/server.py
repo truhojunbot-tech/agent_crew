@@ -34,7 +34,7 @@ from agent_crew.pipeline import (
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
-from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -3148,7 +3148,17 @@ def create_app(
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest):
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
-        task_id = q().enqueue(task)
+        try:
+            task_id = q().enqueue(task)
+        except TaskAlreadyExistsError as e:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "task_id already exists",
+                    "task_id": e.task_id,
+                    "status": e.status,
+                },
+            )
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
         if not _push_enabled:
             logger.warning(

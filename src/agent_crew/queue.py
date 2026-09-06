@@ -189,6 +189,20 @@ CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status);
 """
 
 
+class TaskAlreadyExistsError(Exception):
+    """Raised by :meth:`TaskQueue.enqueue` when ``task_id`` already exists.
+
+    Carries the existing row's status so a caller (e.g. the ``/tasks`` HTTP
+    handler) can report a 409 with enough detail to react, instead of the
+    duplicate insert surfacing as a bare 500 (#273).
+    """
+
+    def __init__(self, task_id: str, status: str):
+        self.task_id = task_id
+        self.status = status
+        super().__init__(f"task_id {task_id!r} already exists with status={status!r}")
+
+
 class TaskQueue:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -262,6 +276,16 @@ class TaskQueue:
                 ),
             )
             conn.commit()
+        except sqlite3.IntegrityError:
+            # #273: task_id is the primary key, so a duplicate insert raises
+            # here. Report the existing row's status rather than letting the
+            # bare IntegrityError surface as an opaque 500 with no detail.
+            conn.rollback()
+            row = conn.execute(
+                "SELECT status FROM tasks WHERE task_id = ?", (task.task_id,)
+            ).fetchone()
+            existing_status = row["status"] if row is not None else "unknown"
+            raise TaskAlreadyExistsError(task.task_id, existing_status) from None
         finally:
             conn.close()
         return task.task_id
