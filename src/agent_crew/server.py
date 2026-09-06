@@ -36,6 +36,7 @@ from agent_crew.pipeline import (
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.testing_policy import test_stage_lock
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -2492,6 +2493,26 @@ def create_app(
         # `return` still runs `finally`, so without this flag the counter
         # was erased every attempt and _MAX_TRANSIENT_RETRY never actually
         # capped anything (#201).
+        # #272: a test stage runs alone in its worktree. The dispatcher's
+        # `active_worktrees` set already refuses two concurrent tasks per
+        # worktree, but it is one process's memory: it does not survive a
+        # restart while a `start_new_session=True` child keeps running, and it
+        # cannot see a second dispatcher at all. alpha_engine#5541 saw two
+        # `make test` runs start 69s apart in one worktree. An flock outside
+        # the process closes both gaps.
+        #
+        # ⛔Non-blocking, then requeue — the same shape as the worktree-collision
+        #   branch in `_dispatcher_loop`. Parking a role slot on a blocking
+        #   acquire would trade a concurrency bug for a stall.
+        _lock_stack = contextlib.ExitStack()
+        if task.task_type == "test":
+            if not _lock_stack.enter_context(test_stage_lock(wt)):
+                _lock_stack.close()
+                logger.info(
+                    f"dispatcher: deferring test task={task.task_id} — another "
+                    f"test stage already holds the lock for {wt} (#272)")
+                q().requeue(task.task_id)
+                return
         _terminal = True
         try:
             import datetime as _dt
@@ -2655,6 +2676,10 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
+            # #272: release the test-stage lock before anything else in the
+            # teardown can raise — a leaked flock would block every later test
+            # on this worktree until the process exits.
+            _lock_stack.close()
             # Pop the per-task transient-retry counter once the task reaches
             # a terminal outcome, so the in-memory dict doesn't grow
             # unbounded across long-running servers (#194). Left in place
