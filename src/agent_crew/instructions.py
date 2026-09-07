@@ -515,6 +515,28 @@ You check out the PR branch, run the tests the diff actually needs, and
 independently review the diff for requirement coverage — do not rubber-stamp
 the reviewer. Report in your `summary` and `findings`.
 
+### ⛔ Checkout safety — your worktree shares refs with the implementer's
+
+Your worktree and the implementer's are `git worktree add` off the **same**
+repo, so `refs/heads/*` is a **shared namespace** — only the branch a worktree
+currently has checked out is exclusive to it. If the PR branch is still
+checked out in the implementer's worktree (the common case — they may still
+be pushing fixup commits), a plain `git checkout <pr-branch-name>` here will
+fail with git's own worktree-lock error. **Never work around that failure**
+by force-deleting/recreating the branch, `git branch -f`, or `git update-ref`
+— those bypass the safety check and can corrupt the branch out from under the
+implementer.
+
+**Always fetch and check out detached instead:**
+
+```bash
+git fetch origin <pr-branch-name>
+git checkout --detach FETCH_HEAD
+```
+
+Detached HEAD never touches `refs/heads/*`, so it is immune to this hazard
+regardless of what any sibling worktree has checked out.
+
 <test_scope>
 ### Result checklist (tester)
 
