@@ -417,6 +417,37 @@ AGY_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_AGY_CONTEXT_MAX_MB", "64"))
 #:   from outside the CLI.
 CLAUDE_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CLAUDE_CONTEXT_MAX_MB", "64"))
 
+#: Cap on the CONTEXT WINDOW a resumed Claude session re-reads each turn, in
+#: tokens. **0 = off, and that default is deliberate** (#284).
+#:
+#: ⛔File size and window size are close to uncorrelated. Measured across every
+#:   claude worktree on this host, 2026-09-10:
+#:
+#:       project              MB      window
+#:       agent_council      0.13      62,025
+#:       halla              0.97     231,590
+#:       quota-core         3.61     575,398
+#:       quota-ops          9.33     606,702
+#:       agent_crew        17.18     517,710
+#:       alpha_engine      32.53     363,824
+#:
+#:   quota-ops carries a LARGER window than alpha_engine from a file a third
+#:   the size, and not one of the seven is near the 64 MB byte cap while four
+#:   re-bill over 350k tokens every turn. Claude Code compacts the store
+#:   internally, so bytes stop tracking the window that actually gets billed.
+#:
+#: ⛔Off by default because choosing the number is provider-economics policy,
+#:   which belongs to the quota layer, not to the dispatcher. A 400k default
+#:   would reset three of seven worktrees on their next dispatch, and
+#:   alpha_engine was already back at 363k shortly after a rotation — so a low
+#:   cap would thrash rather than protect. The measurement is recorded either
+#:   way (see `claude_context_exceeds_cap`), so the decision has data.
+CLAUDE_CONTEXT_MAX_TOKENS = int(os.getenv("AGENT_CREW_CLAUDE_CONTEXT_MAX_TOKENS", "0"))
+
+#: How far back from EOF to look for the last turn carrying a usage block.
+_CLAUDE_TAIL_CHUNK = 1 << 20
+_CLAUDE_TAIL_CHUNKS = 16
+
 
 #: How many rollout files `codex_session_for_cwd` will read before giving up.
 #: Codex's store is date-partitioned and unbounded — 9,894 sessions on this
@@ -654,7 +685,80 @@ def claude_session_size(cwd: str, *, home=None) -> tuple:
         return (0, "")
 
 
-def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
+def _usage_context_tokens(usage) -> int:
+    """The window a turn re-read: cached + freshly cached + new input.
+
+    ⛔`output_tokens` is excluded. It is what the turn produced, not what it
+      re-reads on the next one, and including it would inflate the number the
+      cap is compared against.
+    """
+    if not isinstance(usage, dict):
+        return 0
+    total = 0
+    for key in ("cache_read_input_tokens", "cache_creation_input_tokens",
+                "input_tokens"):
+        value = usage.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            total += int(value)
+    return total
+
+
+def claude_context_tokens(cwd: str, *, home=None) -> tuple:
+    """``(tokens, session_id)`` for the window `--continue` would resume (#284).
+
+    Reads the LAST turn that carries a `message.usage` block. That number —
+    `cache_read_input_tokens` plus the rest of the input side — is what gets
+    re-billed on every subsequent turn, and it is the cost #260's byte cap
+    cannot see: quota-ops sat at 601,674 tokens from a 9.33 MB file.
+
+    ⛔Walks backwards from EOF in chunks rather than scanning the file. This
+      runs on every dispatch, against stores that reached 365 MB on this host
+      (#269); a full scan would move that cost into the dispatch path.
+
+    ``(0, "")`` when anything is missing or unreadable — sizing must never
+    break a dispatch, and 0 means "no measurement", never "a small session".
+    """
+    try:
+        _, session = claude_session_size(cwd, home=home)
+        if not session:
+            return (0, "")
+        import re as _re
+
+        mangled = _re.sub(r"[/._]", "-", cwd)
+        path = _claude_home(home) / "projects" / mangled / f"{session}.jsonl"
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            end, buf = size, b""
+            for _ in range(_CLAUDE_TAIL_CHUNKS):
+                start = max(0, end - _CLAUDE_TAIL_CHUNK)
+                f.seek(start)
+                buf = f.read(end - start) + buf
+                end = start
+                # At a non-zero offset the first element is a partial line.
+                # It needs no special case: truncated JSONL never parses, so it
+                # is skipped here and re-read whole once the previous chunk is
+                # prepended. Dropping it explicitly was dead code — a mutation
+                # removing that guard killed no test, which is how it was found.
+                for line in reversed(buf.split(b"\n")):
+                    if not line.strip():
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except Exception:
+                        continue
+                    tokens = _usage_context_tokens(
+                        (entry.get("message") or {}).get("usage"))
+                    if tokens:
+                        return (tokens, session)
+                if start == 0:
+                    break
+        return (0, session)
+    except Exception:
+        return (0, "")
+
+
+def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
+                               max_tokens=None) -> tuple:
     """Is the Claude Code session `--continue` would resume past the cap (#260)?
 
     Returns ``(over, info)``. Mirrors `agy_context_exceeds_cap` so both
@@ -662,12 +766,24 @@ def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None) -> tuple:
     nothing on disk deleted or mutated.
     """
     cap = CLAUDE_CONTEXT_MAX_MB if max_mb is None else max_mb
+    token_cap = CLAUDE_CONTEXT_MAX_TOKENS if max_tokens is None else max_tokens
     size, session = claude_session_size(cwd, home=home)
+    tokens, _ = claude_context_tokens(cwd, home=home)
+    # ⛔The window is recorded whether or not a token cap is set. #284 exists
+    #   because nobody could see this number; shipping the cap without the
+    #   measurement would leave the same blind spot for whoever has to choose
+    #   the threshold.
     info = {"bytes": size, "conversation_id": session, "cap_mb": cap,
-            "provider": "claude"}
-    if not cap or cap <= 0 or not size:
-        return (False, info)
-    return (size > cap * 1048576, info)
+            "context_tokens": tokens, "cap_tokens": token_cap,
+            "tripped_by": "", "provider": "claude"}
+    over_bytes = bool(cap and cap > 0 and size and size > cap * 1048576)
+    over_tokens = bool(token_cap and token_cap > 0 and tokens
+                       and tokens > token_cap)
+    if over_bytes:
+        info["tripped_by"] = "bytes"
+    elif over_tokens:
+        info["tripped_by"] = "tokens"
+    return (over_bytes or over_tokens, info)
 
 
 def _agy_home(home=None):
@@ -2291,6 +2407,14 @@ def create_app(
                     conversation_id=_ctx_cap_info.get("conversation_id", ""),
                     bytes=_ctx_cap_info.get("bytes", 0),
                     cap_mb=_ctx_cap_info.get("cap_mb", 0),
+                    # #284: bytes alone cannot say WHY a claude session tripped,
+                    # and on this fleet the two signals barely correlate — a
+                    # 9.33 MB store carried a larger window than a 32.53 MB one.
+                    # `tripped_by` makes a reset attributable to a cause; the
+                    # window is reported whether or not a token cap is set.
+                    context_tokens=_ctx_cap_info.get("context_tokens", 0),
+                    cap_tokens=_ctx_cap_info.get("cap_tokens", 0),
+                    tripped_by=_ctx_cap_info.get("tripped_by", ""),
                 )
             _role_default_agent = _DISPATCH_ROLE_TO_AGENT.get(role)
             if _role_default_agent and agent != _role_default_agent:
