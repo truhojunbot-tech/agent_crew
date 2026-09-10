@@ -395,6 +395,28 @@ You write production code following TDD where practical:
 3. Refactor, commit (with tests + impl together), and open a PR if the task
    requests one.
 
+### ⛔You may start on a DETACHED HEAD — check before you push
+
+Your worktree shares `refs/heads/*` with the caller's clone and with every
+sibling worktree (`git worktree add`, same repo). agent_crew therefore creates
+and moves branches only in its own namespaces — `agent/`, `review/`, `test/`.
+When a task names a branch outside those (a feature branch, `main`), the
+dispatcher checks it out **detached** rather than force-moving a ref somebody
+else may be committing to. #280: doing otherwise reset a developer's branch to
+`main`'s tip three times in one session, in a clone nobody had pointed us at.
+
+So `git branch --show-current` may be empty. That is not an error:
+
+```bash
+git checkout -b agent/<something-specific>   # your own branch, then work normally
+# or push a detached HEAD straight at the branch you were dispatched for:
+git push origin HEAD:<branch-name>
+```
+
+⛔Never "fix" a detached HEAD with `git branch -f`, `git update-ref`, or
+`checkout -B` on a branch you did not create. Those move the shared ref for
+everyone, which is the bug this avoids.
+
 ### Result checklist (implementer)
 
 Before you POST the result, verify:
