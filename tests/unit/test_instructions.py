@@ -124,3 +124,28 @@ def test_u_i10_common_post_result_strengthened():
     # Both modes must carry "never skip" or equivalent mandatory language
     assert "never skip" in _COMMON.lower() or "mandatory" in _COMMON.lower()
     assert "never skip" in _MCP_COMMON.lower() or "mandatory" in _MCP_COMMON.lower()
+
+
+def test_u_i11_tester_warns_against_shared_worktree_branch_ref_corruption():
+    """#281: the tester's worktree shares refs/heads/* with the implementer's
+    (same repo, git worktree add) — a plain `git checkout <pr-branch>` can
+    fail because that exact branch may already be checked out elsewhere, and
+    an agent "fixing" that failure with `git branch -f`/`update-ref` can
+    corrupt the branch the implementer is actively working on. The tester
+    role must instruct a detached checkout instead, which never touches
+    refs/heads/* and is therefore immune regardless of sibling worktrees."""
+    content = generate("tester", "myproject", 8123)
+    lowered = content.lower()
+
+    # Names the concrete hazard, not just a vague warning
+    assert "shared" in lowered
+    assert "refs/heads" in content
+    assert "worktree" in lowered
+
+    # Explicitly forbids the unsafe workaround
+    assert "git branch -f" in content or "update-ref" in content
+
+    # Prescribes the safe, concrete alternative
+    assert "git fetch origin" in content
+    assert "checkout --detach" in content
+    assert "FETCH_HEAD" in content
