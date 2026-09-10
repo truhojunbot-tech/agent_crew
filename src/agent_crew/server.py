@@ -216,9 +216,6 @@ def _prepare_worktree_for_task_inner(
         # task.branch holds the base branch (e.g. main), not the PR head.
         # Resolve the actual PR head ref from pr_number when available so
         # the worktree always mirrors the real PR, not a stale base branch.
-        prefix = "review" if role == "reviewer" else "test"
-        local_branch = f"{prefix}/{task_id[:8]}"
-
         pr_branch = task_branch  # fallback: base branch from task.branch
         pr_number = task_context.get("pr_number")
         if pr_number:
@@ -242,21 +239,55 @@ def _prepare_worktree_for_task_inner(
                 )
 
         target_ref = f"origin/{pr_branch}" if pr_branch else f"origin/{main_branch}"
-        r = subprocess.run(
-            ["git", "-C", worktree_path, "checkout", "-B", local_branch, target_ref],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            logger.warning(
-                f"_prepare_worktree_for_task: {role} checkout {local_branch} "
-                f"from {target_ref} failed, falling back to origin/{main_branch}: "
-                f"{r.stderr.strip()}"
-            )
-            subprocess.run(
-                ["git", "-C", worktree_path, "checkout", "-B", local_branch,
-                 f"origin/{main_branch}"],
+        # #286: resolve to an exact object FIRST, then detach at it. Two
+        # reasons, and the second is the one #286 is about:
+        #
+        #   * a symbolic ref keeps moving. `reviewed_sha` is read from this
+        #     worktree straight after and becomes the revision key every
+        #     downstream guard and cost record uses (#253), so what we check out
+        #     has to be immutable at the moment we name it;
+        #   * detached rather than `-B <local_branch>`: reviewer and tester
+        #     never commit, so a branch buys them nothing and costs the
+        #     guarantee. It also removes the last reviewer/tester write to the
+        #     shared `refs/heads/*` namespace (#280) — the two constraints point
+        #     the same way.
+        _resolved = ""
+        for _ref in (target_ref, f"origin/{main_branch}"):
+            probe = subprocess.run(
+                ["git", "-C", worktree_path, "rev-parse", "--verify", f"{_ref}^{{commit}}"],
                 capture_output=True, text=True, timeout=30,
             )
+            if probe.returncode == 0 and probe.stdout.strip():
+                _resolved = probe.stdout.strip()
+                if _ref != target_ref:
+                    logger.warning(
+                        f"_prepare_worktree_for_task: {role} could not resolve "
+                        f"{target_ref}, fell back to {_ref} ({_resolved[:12]})"
+                    )
+                break
+        if not _resolved:
+            logger.error(
+                f"_prepare_worktree_for_task: {role} {task_id} could not resolve "
+                f"{target_ref} or origin/{main_branch} to a commit — the worktree "
+                f"is left where it was and reviewed_sha will describe THAT, not "
+                f"the PR (#286)."
+            )
+        else:
+            r = subprocess.run(
+                ["git", "-C", worktree_path, "checkout", "--detach", _resolved],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode != 0:
+                logger.error(
+                    f"_prepare_worktree_for_task: {role} detach at {_resolved[:12]} "
+                    f"failed: {r.stderr.strip()}"
+                )
+            else:
+                logger.info(
+                    f"_prepare_worktree_for_task: {role} {task_id} detached at "
+                    f"{_resolved[:12]} from {target_ref} — pinned, so the agent "
+                    f"must not re-fetch (#286)."
+                )
     # #253: report the commit this worktree was actually prepared at, so a
     # finding can be attributed to a STATE rather than to a wall-clock moment.
     # Without it nothing downstream can tell "this review is about the current
