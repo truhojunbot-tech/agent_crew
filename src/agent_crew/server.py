@@ -892,17 +892,17 @@ def claude_context_tokens(cwd: str, *, home=None) -> tuple:
       runs on every dispatch, against stores that reached 365 MB on this host
       (#269); a full scan would move that cost into the dispatch path.
 
-    ``(0, "")`` when anything is missing or unreadable — sizing must never
-    break a dispatch. ⛔A `0` here is NOT self-describing: it is returned both
-    for "the last turn re-read nothing" and for "no usage block was found in
-    the tail". Both mean the same thing to the cap (not over), which is why one
-    value is enough; a consumer that needs to tell them apart cannot, and
-    should not infer a healthy session from it.
+    ⛔``None`` means UNKNOWN — no store, nothing readable, or no usage block in
+      the tail. ``0`` means measured and genuinely empty. #288 needs these
+      apart: they are different facts, and a cohort that cannot tell an
+      unmeasurable session from an empty one is wrong in a way nobody can
+      detect afterwards. Sizing still never breaks a dispatch; it just says so
+      now instead of returning a number it never took.
     """
     try:
         _, session = claude_session_size(cwd, home=home)
         if not session:
-            return (0, "")
+            return (None, "")
         import re as _re
 
         mangled = _re.sub(r"[/._]", "-", cwd)
@@ -936,9 +936,9 @@ def claude_context_tokens(cwd: str, *, home=None) -> tuple:
                         return (tokens, session)
                 if start == 0:
                     break
-        return (0, session)
+        return (None, session)
     except Exception:
-        return (0, "")
+        return (None, "")
 
 
 def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
@@ -961,7 +961,13 @@ def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
             "context_tokens": tokens, "cap_tokens": token_cap,
             "tripped_by": "", "provider": "claude"}
     over_bytes = bool(cap and cap > 0 and size and size > cap * 1048576)
-    over_tokens = bool(token_cap and token_cap > 0 and tokens
+    # `tokens is not None` states the intent; it is NOT load-bearing here, and
+    # mutation testing says so — swapping it for truthiness kills no test,
+    # because `None` and `0` are both falsy and both correctly mean "not over".
+    # Kept because the guard becomes real the moment the comparison gains a
+    # lower bound or an `>=`, and because the distinction is the whole point of
+    # #288 one line away in `info`. Recorded rather than dressed up as a fix.
+    over_tokens = bool(token_cap and token_cap > 0 and tokens is not None
                        and tokens > token_cap)
     if over_bytes:
         info["tripped_by"] = "bytes"
@@ -2596,9 +2602,44 @@ def create_app(
                     # 9.33 MB store carried a larger window than a 32.53 MB one.
                     # `tripped_by` makes a reset attributable to a cause; the
                     # window is reported whether or not a token cap is set.
-                    context_tokens=_ctx_cap_info.get("context_tokens", 0),
+                    context_tokens=_ctx_cap_info.get("context_tokens"),
                     cap_tokens=_ctx_cap_info.get("cap_tokens", 0),
                     tripped_by=_ctx_cap_info.get("tripped_by", ""),
+                )
+            elif _ctx_cap_info:
+                # #288: the normal-traffic row. #285 computed the window on
+                # every dispatch and then dropped it — the only durable sink was
+                # the cap event above, which fires under `if _ctx_over:`, and
+                # with the token cap off by default (#284) that is never. So the
+                # fleet's measured 500k–600k windows produced no rows at all and
+                # the threshold decision #284 deferred to the quota layer had
+                # nothing to stand on.
+                #
+                # ⛔A DISTINCT event. `provider_context_capped` means "a reset
+                #   was forced"; overloading it to also mean "here is a number"
+                #   would corrupt the one signal that already works. And exactly
+                #   one row per dispatch — this is the `elif` of the cap, so an
+                #   observation and a cap can never both be counted.
+                #
+                # ⛔Guarded on `_ctx_cap_info` being non-empty, which means a
+                #   measurement was ATTEMPTED. "Not measured" and "measured,
+                #   unknown" are different: the first leaves no row, the second
+                #   leaves one with `context_tokens: null`. Dropping unknowns
+                #   instead would bias the sample toward readable sessions.
+                record_context_event(
+                    _context_events_path, "provider_context_observed",
+                    task_id=task.task_id, project=_project, role=role, agent=agent,
+                    task_type=task.task_type,
+                    context_id=_ctx_info["context_id"],
+                    context_generation=_ctx_info["context_generation"],
+                    provider=_ctx_cap_info.get("provider", agent),
+                    provider_session_id=_ctx_cap_info.get("conversation_id", ""),
+                    # `.get(key)` without a default on purpose: absent stays
+                    # None, so unknown is null and a measured zero is 0.
+                    context_tokens=_ctx_cap_info.get("context_tokens"),
+                    context_bytes=_ctx_cap_info.get("bytes"),
+                    cap_mb=_ctx_cap_info.get("cap_mb", 0),
+                    cap_tokens=_ctx_cap_info.get("cap_tokens", 0),
                 )
             _role_default_agent = _DISPATCH_ROLE_TO_AGENT.get(role)
             if _role_default_agent and agent != _role_default_agent:

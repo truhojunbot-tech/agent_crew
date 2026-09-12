@@ -148,17 +148,22 @@ def test_a_turn_without_usage_is_skipped(tmp_path):
 
 @pytest.mark.parametrize("body", ["", "not json\n", '{"message":{}}\n'])
 def test_an_unreadable_session_reports_unknown_not_zero_pretending(tmp_path, body):
-    """⛔Sizing must never break a dispatch, and it must not invent a small
-    number either — 0 here means "no measurement", and the caller treats a
-    0 as not-over rather than as a healthy session."""
+    """⛔Sizing must never break a dispatch, and it must not invent a number it
+    never took.
+
+    This asserted `== 0` until #288, with a docstring explaining that 0 meant
+    "no measurement". It did not: a genuinely empty window is also 0, so the two
+    were indistinguishable downstream. #288 needs them apart to build a cohort,
+    so unknown is now `None` and this test finally says what its name always
+    claimed."""
     d = tmp_path / "projects" / re.sub(r"[/._]", "-", CWD)
     d.mkdir(parents=True)
     (d / "s.jsonl").write_text(body)
-    assert sv.claude_context_tokens(CWD, home=tmp_path)[0] == 0
+    assert sv.claude_context_tokens(CWD, home=tmp_path)[0] is None
 
 
 def test_a_missing_worktree_is_not_an_error(tmp_path):
-    assert sv.claude_context_tokens("/nope/nothing", home=tmp_path) == (0, "")
+    assert sv.claude_context_tokens("/nope/nothing", home=tmp_path) == (None, "")
 
 
 def test_the_last_turn_is_found_without_reading_the_whole_file(tmp_path):

@@ -204,6 +204,11 @@ point). Event types:
 - `context_reset` — a `context_reset`-flagged dispatch that bumped the generation (`context_generation > 1`).
 - `context_compacted` — **best-effort, observational only.** None of claude/codex/agy currently emit a structured "conversation compacted" signal Agent Crew can rely on; this fires only when a plain-text marker (e.g. "conversation compacted") happens to appear in that task's own dispatch log output. A miss does not mean a compaction didn't happen.
 - `provider_fallback` — this task's actual `agent` differs from its role's *configured default* agent (`from_agent`, `to_agent`). Fires for both explicit `--reviewer gemini`-style overrides and automatic post-failure fallback routing.
+- `provider_context_capped` — a store or window crossed its cap and a fresh provider conversation was **forced**. Carries `provider`, `conversation_id`, `bytes`, `cap_mb`, `context_tokens`, `cap_tokens`, `tripped_by` (`bytes` | `tokens`). ⛔This event means *a reset happened*; it is not a measurement channel.
+- `provider_context_observed` — the normal-traffic counterpart (#288): the same measurement on a dispatch that did **not** trip a cap. Carries `provider`, `provider_session_id`, `context_tokens`, `context_bytes`, `cap_mb`, `cap_tokens` alongside `context_id`/`context_generation`.
+  - ⛔**Exactly one of `observed` / `capped` per dispatch**, never both — they are the two arms of one branch, so a per-dispatch aggregate cannot double-count.
+  - ⛔`context_tokens: null` means **unknown** (no store, unreadable, or no usage block in the tail); `0` means measured and genuinely empty. They are different facts. Tokens are a Claude-only measurement today, so agy and codex rows carry `null` — the honest value, and they are still emitted so a cohort can compare providers.
+  - No row at all means no measurement was *attempted* (an agent with no sizing support), which is distinct from an attempted-but-unknown one.
 - `task_started` — emitted right before the provider subprocess is spawned.
 - `task_completed` — a task reached `status="completed"` via `POST /tasks/{id}/result`.
 - `task_failed` — a task reached a failed/terminal-non-success state, from either `POST /tasks/{id}/result` (agent self-reported) or an internal dispatcher failure path (timeout, quota, exit code, no worktree, etc. — `_fail_if_active`).
