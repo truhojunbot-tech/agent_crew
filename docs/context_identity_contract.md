@@ -231,3 +231,61 @@ and unknown `event_type` values as forward-compatible and ignorable.
 - No adaptive context optimizer — Agent Crew exposes the data; deciding
   what to do with it (compact earlier, switch providers, cap spend) is an
   external tool's job.
+
+## 11. Claude context cap: two signals, and they disagree (#284)
+
+#260/#261 capped the Claude session by **file size**. quota-ops reported the
+gap: its review worker's session had run unrotated since 2026-08-21 and its last
+turn re-billed **601,674** `cache_read_input_tokens` — from a **9.33 MB** file,
+comfortably under the 64 MB cap, so `over=False` forever.
+
+Measured across every claude worktree on this host, 2026-09-10:
+
+| project | store MB | window (tokens) |
+|---|---:|---:|
+| agent_council | 0.13 | 62,025 |
+| halla | 0.97 | 231,590 |
+| quota-core | 3.61 | 575,398 |
+| quota-ops | 9.33 | 606,702 |
+| agent_crew | 17.23 | 529,725 |
+| alpha_engine | 32.53 | 363,824 |
+
+⛔The two signals are close to uncorrelated. quota-ops carries a **larger**
+window than alpha_engine from a file a third the size. Not one of the seven is
+near the 64 MB byte cap, yet four re-bill over 350k tokens on **every** turn.
+Claude Code compacts the store internally, so bytes stop tracking the window
+that actually gets billed.
+
+`claude_context_exceeds_cap()` now reports both, and trips on either:
+
+| env | meaning | default |
+|---|---|---|
+| `AGENT_CREW_CLAUDE_CONTEXT_MAX_MB` | store size on disk | 64 |
+| `AGENT_CREW_CLAUDE_CONTEXT_MAX_TOKENS` | window re-read per turn | **0 (off)** |
+
+The window is the last turn's `cache_read_input_tokens +
+cache_creation_input_tokens + input_tokens`. `output_tokens` is excluded — it is
+what the turn produced, not what it re-reads next time.
+
+### Why the token cap ships off
+
+Choosing a fleet-wide reset threshold is provider-economics policy, which
+belongs to the quota layer rather than the dispatcher. The numbers say why it
+should not be guessed here:
+
+- a 400k default would reset **three of seven** worktrees on their next
+  dispatch;
+- alpha_engine was back at 363,824 shortly after a rotation, so the window
+  climbs fast and a low cap would thrash rather than protect.
+
+The **measurement ships on regardless**: `context_tokens` is recorded in the cap
+info and in the `provider_context_capped` event whether or not a cap is set, so
+whoever picks the number has data instead of an estimate. `tripped_by`
+(`bytes` | `tokens`) makes any reset attributable to a cause.
+
+### Reading it
+
+The window is read from the last turn carrying a `message.usage` block, walking
+backwards from EOF in 1 MB chunks (16 MB max). This runs on every dispatch
+against stores that reached 365 MB on this host (#269), so a full scan would put
+that cost in the dispatch path.
