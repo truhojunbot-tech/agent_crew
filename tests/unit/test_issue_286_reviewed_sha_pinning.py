@@ -156,6 +156,102 @@ def test_an_unresolvable_ref_falls_back_to_main(pr_repo):
     assert reviewed == _sha(clone, "origin/main")
 
 
+# ── 1b. an existing pin outranks the current ref ──────────────────────
+#
+# Review of PR #287, P1. Pinning the *dispatch-time* resolution was not enough:
+# prep is run more than once for a task — `_try_push_next` prepares and records
+# `reviewed_sha`, and `_dispatch_task` prepares again — and the second run
+# re-resolved the PR ref and overwrote the pin. A review queued at A and
+# dispatched after the head moved to B silently reviewed and recorded B.
+#
+# ⛔The property is idempotence: preparing the same task twice must land on the
+#   same commit both times, whatever the remote did in between.
+
+
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
+def test_an_existing_pin_survives_the_head_moving(pr_repo, role):
+    """★★The reviewer's scenario: queued at A, remote advances to B, prepared."""
+    clone, wt, sha_a, advance = pr_repo
+    sha_b = advance()
+    assert sha_b != sha_a
+
+    reviewed = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, role,
+        task_context={"pr_number": None, "reviewed_sha": sha_a},
+    )
+    assert reviewed == sha_a, "prep followed the branch instead of the pin"
+    assert _sha(wt) == sha_a
+    assert (wt / "a.txt").read_text() == "commit A\n"
+
+
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
+def test_preparing_twice_lands_on_the_same_commit(pr_repo, role):
+    """★★Idempotence, which is the property the double-prep needs.
+
+    The first run records the pin; the second must honour it. This is the exact
+    shape of `_try_push_next` preparing and then `_dispatch_task` preparing
+    again after the PR moved."""
+    clone, wt, sha_a, advance = pr_repo
+    first = _prepare_worktree_for_task(str(wt), "task-287abc", PR_BRANCH, role)
+    assert first == sha_a
+
+    advance()
+    second = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, role,
+        task_context={"reviewed_sha": first},      # what patch_context stored
+    )
+    assert second == first, "the second prep re-resolved and moved the task"
+    assert _sha(wt) == sha_a
+
+
+def test_the_retained_context_still_names_A(pr_repo):
+    """The identity the #253 stale-review gate reads must not be rewritten to B
+    by the very act of preparing."""
+    clone, wt, sha_a, advance = pr_repo
+    advance()
+    context = {"reviewed_sha": sha_a}
+    reviewed = _prepare_worktree_for_task(str(wt), "task-287abc", PR_BRANCH,
+                                          "reviewer", task_context=context)
+    # what the caller would then patch back onto the task
+    assert {**context, "reviewed_sha": reviewed}["reviewed_sha"] == sha_a
+
+
+def test_an_unresolvable_pin_falls_back_rather_than_failing(pr_repo):
+    """⛔A pin can name a commit this repo does not have — a force-push, or a
+    SHA copied from elsewhere. Refusing to prepare would strand the task, so
+    fall back to the PR ref and let the caller record what was really used."""
+    clone, wt, sha_a, _ = pr_repo
+    reviewed = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, "reviewer",
+        task_context={"reviewed_sha": "0" * 40},
+    )
+    assert reviewed == sha_a
+
+
+@pytest.mark.parametrize("junk", ["", None, "not-a-sha", 12345, True])
+def test_a_junk_pin_is_ignored(pr_repo, junk):
+    clone, wt, sha_a, _ = pr_repo
+    reviewed = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, "reviewer",
+        task_context={"reviewed_sha": junk},
+    )
+    assert reviewed == sha_a
+
+
+def test_the_implementer_is_not_pinned(pr_repo):
+    """⛔Scope. A fix task carries the `reviewed_sha` of the review it answers;
+    pinning the implementer to it would check out the code being fixed instead
+    of the branch to fix it on."""
+    clone, wt, sha_a, advance = pr_repo
+    advance()
+    _prepare_worktree_for_task(str(wt), "task-287abc", PR_BRANCH, "implementer",
+                               task_context={"reviewed_sha": sha_a})
+    # Asserted as "not the pin" rather than as an exact SHA: what the
+    # implementer path starts from is #140's business and differs by branch
+    # (#280 is still in flight), but it must never be the review's commit.
+    assert _sha(wt) != sha_a, "the implementer was pinned to the review's commit"
+
+
 # ── 2. the argv shape ─────────────────────────────────────────────────
 
 
@@ -221,3 +317,35 @@ def test_the_prompt_still_forbids_shared_ref_writes(role):
     other's rule while rewriting the same paragraph."""
     text = instructions.generate(role, "demo", 8105, delivery="dispatcher")
     assert "branch -f" in text and "update-ref" in text
+
+
+def test_a_pinned_task_does_not_ask_github_for_the_pr_head(pr_repo, monkeypatch):
+    """⛔The PR-head lookup is the only network call in prep, and when the task
+    is pinned its answer is discarded. Worse, a failure logs "THIS MAY NOT BE
+    THE PR'S CODE; treat any finding from this task as suspect" about a task
+    about to be prepared at exactly the commit it names — a misleading error is
+    not free."""
+    clone, wt, sha_a, advance = pr_repo
+    advance()
+    monkeypatch.setattr(
+        "agent_crew.server._resolve_pr_head_branch",
+        lambda *a, **k: pytest.fail("asked GitHub for a PR head while pinned"))
+
+    reviewed = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, "reviewer",
+        task_context={"pr_number": 287, "reviewed_sha": sha_a})
+    assert reviewed == sha_a
+
+
+def test_an_unpinned_task_still_resolves_the_pr_head(pr_repo, monkeypatch):
+    """⛔The control: #186's PR-head resolution must keep working for every task
+    that has no pin yet, which is every task's first preparation."""
+    clone, wt, sha_a, _ = pr_repo
+    asked = []
+    monkeypatch.setattr("agent_crew.server._resolve_pr_head_branch",
+                        lambda pr, **k: asked.append(pr) or PR_BRANCH)
+
+    _prepare_worktree_for_task(str(wt), "task-287abc", "main", "reviewer",
+                               task_context={"pr_number": 287})
+    assert asked == [287]
+    assert _sha(wt) == sha_a
