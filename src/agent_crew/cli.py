@@ -1760,8 +1760,14 @@ def _sync_worktrees_to_main(worktrees: dict) -> None:
                 ["git", "-C", wt_path, "fetch", "origin", "--quiet"],
                 capture_output=True, text=True,
             )
+            # #280: detach rather than `checkout -B <main_branch>`. This
+            # worktree shares `refs/heads/*` with the caller's clone and every
+            # sibling worktree, so force-moving `main` here would move it for
+            # all of them — discarding any local-only commits the developer had
+            # on it. Detaching leaves the worktree at the same commit and owns
+            # no ref; the next dispatch gives it a proper branch anyway.
             subprocess.run(
-                ["git", "-C", wt_path, "checkout", "-B", main_branch, f"origin/{main_branch}"],
+                ["git", "-C", wt_path, "checkout", "--detach", f"origin/{main_branch}"],
                 capture_output=True, text=True,
             )
         except Exception as exc:
