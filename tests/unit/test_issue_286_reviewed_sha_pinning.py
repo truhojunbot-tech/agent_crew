@@ -228,6 +228,71 @@ def test_an_unresolvable_pin_falls_back_rather_than_failing(pr_repo):
     assert reviewed == sha_a
 
 
+# Revision expressions git would happily resolve, none of which is an object id.
+# ⛔`origin/main` is the one that matters: task context is unrestricted, so a
+#   pin of `origin/main` would resolve, short-circuit the PR-head lookup, and
+#   silently prepare AND attribute a PR review to main (review of PR #287).
+RESOLVABLE_NON_SHAS = ["origin/main", "main", "HEAD", "HEAD~1", "@", "origin/HEAD"]
+
+
+@pytest.mark.parametrize("expression", RESOLVABLE_NON_SHAS)
+def test_a_pin_must_be_an_object_id_not_a_revision(pr_repo, expression):
+    """★★`rev-parse --verify <x>^{commit}` resolves any revision expression, so
+    probing alone is not validation. A pin has to LOOK like a commit id before
+    it is worth probing."""
+    clone, wt, sha_a, _ = pr_repo
+    reviewed = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, "reviewer",
+        task_context={"reviewed_sha": expression},
+    )
+    assert reviewed == sha_a, f"{expression!r} was honoured as a pin"
+
+
+def test_the_origin_main_case_end_to_end(pr_repo):
+    """⛔The concrete harm, spelled out: a review prepared and attributed to
+    main instead of the PR. Asserted on content as well as SHA, because the
+    point is that the wrong code would have been reviewed."""
+    clone, wt, sha_a, _ = pr_repo
+    main_tip = _sha(clone, "origin/main")
+    assert main_tip != sha_a
+
+    reviewed = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, "reviewer",
+        task_context={"pr_number": None, "reviewed_sha": "origin/main"},
+    )
+    assert reviewed != main_tip and reviewed == sha_a
+    assert (wt / "a.txt").read_text() == "commit A\n"
+
+
+def test_an_abbreviated_sha_is_not_a_pin(pr_repo):
+    """⛔Abbreviations are ambiguous by construction and no real pin is one:
+    `reviewed_sha` is written from `rev-parse HEAD`, which is always full.
+
+    The remote is advanced FIRST so the two outcomes differ — an accepted
+    abbreviation lands on A, a rejected one falls through to the PR ref at B.
+    Without that the assertion holds either way and pins nothing; mutation
+    caught exactly that in the first version of this test."""
+    clone, wt, sha_a, advance = pr_repo
+    sha_b = advance()
+    reviewed = _prepare_worktree_for_task(
+        str(wt), "task-287abc", PR_BRANCH, "reviewer",
+        task_context={"reviewed_sha": sha_a[:12]},
+    )
+    assert reviewed == sha_b, "an abbreviation was honoured as a pin"
+
+
+def test_a_full_sha_is_still_honoured_in_any_case(pr_repo):
+    """⛔The control. Tightening the shape must not reject real pins — git
+    accepts uppercase hex, so the check has to as well."""
+    clone, wt, sha_a, advance = pr_repo
+    advance()
+    for form in (sha_a, sha_a.upper(), f"  {sha_a}  "):
+        assert _prepare_worktree_for_task(
+            str(wt), "task-287abc", PR_BRANCH, "reviewer",
+            task_context={"reviewed_sha": form},
+        ) == sha_a, f"a real pin was rejected in the form {form!r}"
+
+
 @pytest.mark.parametrize("junk", ["", None, "not-a-sha", 12345, True])
 def test_a_junk_pin_is_ignored(pr_repo, junk):
     clone, wt, sha_a, _ = pr_repo

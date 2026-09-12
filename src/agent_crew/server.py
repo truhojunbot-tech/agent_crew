@@ -176,6 +176,31 @@ def _checkout_detached(worktree_path: str, refs, *, what: str) -> bool:
     return False
 
 
+#: A full git object id — 40 hex for sha1 repos, 64 for sha256. Deliberately not
+#: a prefix match: abbreviations are ambiguous by construction, and no real pin
+#: is one (`reviewed_sha` is written from `rev-parse HEAD`, which is always full).
+_OBJECT_ID_RE = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
+
+
+def _object_id_or_empty(value) -> str:
+    """``value`` as a commit id, or ``""`` if it does not look like one.
+
+    ⛔Shape-check BEFORE probing, because probing is not validation.
+      `git rev-parse --verify <x>^{commit}` resolves any revision expression —
+      `origin/main`, `HEAD~1`, a tag, `@` — so an unrestricted `reviewed_sha` of
+      `origin/main` would resolve, short-circuit the PR-head lookup, and
+      silently prepare AND attribute a PR review to main (review of PR #287).
+
+      Not a security boundary: `rev-parse` is not a shell, so nothing here is
+      injectable. The damage is misattribution, which is precisely what the
+      whole `reviewed_sha` contract exists to prevent.
+    """
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    return candidate if _OBJECT_ID_RE.match(candidate) else ""
+
+
 def _prepare_worktree_for_task(
     worktree_path: str,
     task_id: str,
@@ -292,8 +317,7 @@ def _prepare_worktree_for_task_inner(
         #   — a failure would log "THIS MAY NOT BE THE PR'S CODE" about a task
         #   that is about to be prepared at exactly the commit it names. A
         #   misleading error is not free (#286 review).
-        _pinned_sha = task_context.get("reviewed_sha")
-        _pinned_sha = _pinned_sha.strip() if isinstance(_pinned_sha, str) else ""
+        _pinned_sha = _object_id_or_empty(task_context.get("reviewed_sha"))
         if pr_number and not _pinned_sha:
             resolved = _resolve_pr_head_branch(int(pr_number), cwd=worktree_path)
             if resolved:
