@@ -244,3 +244,113 @@ def test_a_resolvable_head_still_dispatches(tmp_path, monkeypatch, pr_repo):
     assert len(spawned) == 1
     assert _sha(wt) == sha_a
     assert row.status != "needs_human"
+
+
+# ── 3. the tmux push path refuses too ─────────────────────────────────
+#
+# Review of PR #291, P1. `_try_push_next` prepares the worktree independently of
+# `_dispatch_task`, and its broad `except Exception` caught the new
+# `WorktreeTargetUnresolved` and logged "continuing with dispatch". Execution
+# then reached `push_fn`, so under `AGENT_CREW_DELIVERY=push`/`both` a PR task
+# whose head will not resolve was still handed to an agent — the fail-closed
+# existed on one delivery path only.
+
+
+class _Push:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, pane, text):
+        self.calls.append((pane, text))
+
+
+def _push_server(tmp_db, push, wt, state_path):
+    from agent_crew.server import create_app
+
+    return create_app(db_path=tmp_db, state_path=str(state_path),
+                      pane_map={"implementer": "%1", "reviewer": "%2", "tester": "%3"},
+                      port=8105, push_fn=push, watchdog_disabled=True,
+                      anomaly_disabled=True)
+
+
+def _post_review(client, task_id):
+    return client.post("/tasks", json={
+        "task_id": task_id, "task_type": "review", "description": "review the PR",
+        "branch": "main", "priority": 3, "project": "demo",
+        "context": {"pr_number": PR_NUMBER}})
+
+
+def _push_fixture(tmp_path, monkeypatch, pr_repo, *, head=None):
+    from fastapi.testclient import TestClient
+
+    clone, wt, sha_a, main_tip = pr_repo
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 8105, "worktrees": {"codex": str(wt)}}))
+    monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
+    monkeypatch.setattr(sv, "_resolve_pr_head_branch", lambda *a, **k: head)
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **k: False)
+
+    db = str(tmp_path / "push.db")
+    push = _Push()
+    with TestClient(_push_server(db, push, wt, state)) as client:
+        _post_review(client, "review-291")
+        stored = client.get("/tasks/review-291").json()
+    return push, stored, wt, sha_a, main_tip
+
+
+def test_the_push_path_does_not_deliver_an_unresolvable_pr_task(tmp_path, monkeypatch,
+                                                                pr_repo):
+    """★★The finding. The refusal existed only in `_dispatch_task`, so the tmux
+    delivery path handed the task to an agent anyway."""
+    push, stored, wt, sha_a, main_tip = _push_fixture(tmp_path, monkeypatch, pr_repo)
+    assert push.calls == [], f"a task was pushed to a pane: {push.calls[:1]}"
+
+
+def test_the_push_path_marks_it_needs_human(tmp_path, monkeypatch, pr_repo):
+    """⛔Not silently dropped either. The task was already claimed, so leaving it
+    unpushed and unmarked would strand it `in_progress` until the watchdog."""
+    push, stored, wt, sha_a, main_tip = _push_fixture(tmp_path, monkeypatch, pr_repo)
+    assert stored["status"] == "needs_human", stored["status"]
+
+
+def test_the_push_path_leaves_the_worktree_alone(tmp_path, monkeypatch, pr_repo):
+    clone, wt0, sha_a, main_tip = pr_repo
+    before = _sha(wt0)
+    push, stored, wt, _, _ = _push_fixture(tmp_path, monkeypatch, pr_repo)
+    assert _sha(wt) == before != main_tip
+
+
+def test_the_push_path_still_delivers_when_the_head_resolves(tmp_path, monkeypatch,
+                                                             pr_repo):
+    """⛔The control. A refusal that also blocks the normal push path would take
+    the whole delivery model down."""
+    push, stored, wt, sha_a, _ = _push_fixture(tmp_path, monkeypatch, pr_repo,
+                                               head=PR_BRANCH)
+    assert len(push.calls) == 1, push.calls
+    assert _sha(wt) == sha_a
+    assert stored["status"] != "needs_human"
+
+
+def test_an_ordinary_prep_failure_still_continues_on_the_push_path(tmp_path,
+                                                                   monkeypatch,
+                                                                   pr_repo):
+    """⛔Scope: only the unresolved-target case fails closed. A stash conflict or
+    a slow fetch leaves a merely stale worktree, and blocking delivery on those
+    would trade a correctness bug for an availability one."""
+    from fastapi.testclient import TestClient
+
+    clone, wt, sha_a, _ = pr_repo
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 8105, "worktrees": {"codex": str(wt)}}))
+    monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **k: False)
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("git exploded")))
+
+    db = str(tmp_path / "push2.db")
+    push = _Push()
+    with TestClient(_push_server(db, push, wt, state)) as client:
+        _post_review(client, "review-291b")
+        stored = client.get("/tasks/review-291b").json()
+    assert len(push.calls) == 1, "an ordinary prep failure blocked delivery"
+    assert stored["status"] != "needs_human"

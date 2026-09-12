@@ -1870,6 +1870,26 @@ def create_app(
                         f"_try_push_next: worktree prepared for {role} "
                         f"task_id={task.task_id} branch={task.branch or '(none)'}"
                     )
+                except WorktreeTargetUnresolved as exc:
+                    # ⛔The broad handler below caught this and logged
+                    #   "continuing with dispatch", so under
+                    #   AGENT_CREW_DELIVERY=push/both a PR task whose head would
+                    #   not resolve was still handed to an agent — #289's
+                    #   fail-closed existed on the dispatcher path only (review
+                    #   of PR #291). Both delivery paths prepare independently,
+                    #   so both have to refuse.
+                    #
+                    # ⛔Marked, not just unpushed. The task is already claimed;
+                    #   dropping it silently strands it `in_progress` until the
+                    #   watchdog times it out, which reads as an agent that hung
+                    #   rather than a target that could not be resolved.
+                    logger.error(
+                        f"_try_push_next: refusing to push {role} "
+                        f"task_id={task.task_id} — {exc}"
+                    )
+                    _fail_if_active(task.task_id, "pr_head_unresolved",
+                                    status="needs_human")
+                    return
                 except Exception:
                     logger.exception(
                         f"_try_push_next: worktree prep failed for {role} "
