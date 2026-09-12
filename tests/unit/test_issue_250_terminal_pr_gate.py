@@ -503,11 +503,16 @@ def test_worktree_prep_asks_from_the_worktree_being_prepared(monkeypatch, tmp_pa
     assert calls == [(251, str(tmp_path))]
 
 
-def test_an_unresolvable_pr_head_is_logged_as_an_error(monkeypatch, tmp_path, caplog):
-    """⛔The fallback reviews a ref that is NOT the PR. Nothing downstream says
-    so, so the log has to — at ERROR, not tucked into a warning stream."""
-    import logging
+def test_an_unresolvable_pr_head_refuses_rather_than_falling_back(monkeypatch,
+                                                                  tmp_path):
+    """⛔This asserted the ERROR log that accompanied the fallback — "THIS MAY
+    NOT BE THE PR'S CODE; treat any finding from this task as suspect".
 
+    #289 removed the fallback. The guarantee this test protected (the operator
+    must be told the tree is wrong) is superseded by a stronger one: the wrong
+    tree is never checked out, so there is nothing to warn about. Re-pinned to
+    the refusal rather than deleted, because the failure mode it guards —
+    reviewing main and calling it the PR — is the same one."""
     from agent_crew import server as sv
 
     monkeypatch.setattr(sv, "_resolve_pr_head_branch", lambda pr, cwd=None: None)
@@ -515,13 +520,9 @@ def test_an_unresolvable_pr_head_is_logged_as_an_error(monkeypatch, tmp_path, ca
                         lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "",
                                                        "stderr": ""})())
 
-    with caplog.at_level(logging.ERROR, logger="agent_crew.server"):
+    with pytest.raises(sv.WorktreeTargetUnresolved, match="251"):
         sv._prepare_worktree_for_task_inner(
             str(tmp_path), "review-abc", "main", "reviewer", {"pr_number": 251})
-
-    errors = [r.message for r in caplog.records if r.levelno >= logging.ERROR]
-    assert any("could not resolve PR #251" in m for m in errors)
-    assert any("MAY NOT BE THE PR'S CODE" in m for m in errors)
 
 
 # ── 8. the exhaustion notice needs an atomic claim, not a check ───────

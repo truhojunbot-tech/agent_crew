@@ -201,6 +201,21 @@ def _object_id_or_empty(value) -> str:
     return candidate if _OBJECT_ID_RE.match(candidate) else ""
 
 
+class WorktreeTargetUnresolved(RuntimeError):
+    """The task named a PR whose head could not be resolved (#289).
+
+    ⛔Raised instead of falling back to `task.branch`. For a PR task that branch
+      is the BASE branch — usually `main` — so the fallback produced a review of
+      main that satisfied every identity guard: HEAD matched `reviewed_sha`, and
+      `reviewed_sha` was a real commit. Nothing downstream could tell it from a
+      real review, and its cost was attributed to a valid SHA under the wrong
+      artifact. #250/#251 is the same class with production precedent.
+
+      The asymmetry decides it: a deferred review is recoverable, a confident
+      review of the wrong tree is not.
+    """
+
+
 def _prepare_worktree_for_task(
     worktree_path: str,
     task_id: str,
@@ -227,6 +242,12 @@ def _prepare_worktree_for_task(
         return _prepare_worktree_for_task_inner(
             worktree_path, task_id, task_branch, role,
             task_context=task_context or {}) or ""
+    except WorktreeTargetUnresolved:
+        # ⛔Not swallowed. Every other prep failure is survivable — a stash
+        #   conflict, a slow fetch — and dispatch continues on a worktree that
+        #   is merely stale. This one is not: continuing means reviewing the
+        #   wrong artifact and saying nothing (#289).
+        raise
     except Exception:
         logger.exception(
             f"_prepare_worktree_for_task: unexpected error for {role} "
@@ -327,15 +348,15 @@ def _prepare_worktree_for_task_inner(
                     f"head → {pr_branch!r} for {role} {task_id}"
                 )
             else:
-                # ⛔ERROR, not warning: the reviewer is about to read a ref that
-                #   is NOT the PR head, and nothing downstream will say so. A
-                #   review of the wrong tree looks exactly like a review.
-                logger.error(
-                    f"_prepare_worktree_for_task: could not resolve PR #{pr_number} "
-                    f"head for {role} {task_id} — falling back to "
-                    f"task.branch={task_branch!r}. THIS MAY NOT BE THE PR'S CODE; "
-                    f"treat any finding from this task as suspect until the ref is "
-                    f"confirmed."
+                # ⛔REFUSE, not warn. This used to log "THIS MAY NOT BE THE PR'S
+                #   CODE; treat any finding from this task as suspect" and carry
+                #   on — which says plainly that logging was never the fix. The
+                #   worktree is left exactly where it is (#289).
+                raise WorktreeTargetUnresolved(
+                    f"{role} {task_id} names PR #{pr_number} but its head could "
+                    f"not be resolved, and there is no valid reviewed_sha pin. "
+                    f"Refusing to fall back to task.branch={task_branch!r}, which "
+                    f"for a PR task is the base branch (#289)."
                 )
 
         target_ref = f"origin/{pr_branch}" if pr_branch else f"origin/{main_branch}"
@@ -2623,6 +2644,54 @@ def create_app(
         _retry_of = _ctx.get("original_task_id", "") if "retry_attempt" in _ctx else ""
         _fallback_of = _ctx.get("fallback_from_task_id", "") if isinstance(_ctx, dict) else ""
 
+        # Prepare worktree: stash local changes, fetch origin, checkout right branch.
+        #
+        # ⛔Moved AHEAD of the attribution/economics block by #289. Preparing
+        #   after it meant a task whose target could not be resolved had already
+        #   written an attribution row, a `test_scope_resolved` event and its
+        #   #278 treatment fields — economics describing a test run that was
+        #   about to not happen. Refusing early leaves no row to correct.
+        if not _WORKTREE_SYNC_DISABLED:
+            try:
+                _reviewed_sha = _prepare_worktree_for_task(
+                    wt, task.task_id, task.branch or "", role,
+                    task_context=task.context if isinstance(task.context, dict) else {},
+                )
+                if _reviewed_sha:
+                    # #253: same record on the headless path, and before the
+                    # prompt is built so the agent is told which commit it got.
+                    try:
+                        q().patch_context(task.task_id, {"reviewed_sha": _reviewed_sha})
+                        task.context = {**(task.context or {}),
+                                        "reviewed_sha": _reviewed_sha}
+                    except Exception:
+                        logger.exception(
+                            f"dispatcher: could not record reviewed_sha for {task.task_id}"
+                        )
+                logger.info(
+                    f"dispatcher: worktree prepared for {role} "
+                    f"task_id={task.task_id} branch={task.branch or '(none)'} "
+                    f"at {(_reviewed_sha or '?')[:9]}"
+                )
+            except WorktreeTargetUnresolved as exc:
+                # ⛔needs_human, not failed and not a retry. A retry would make
+                #   the same `gh` call again; a `failed` routes into the
+                #   fallback/retry machinery and eventually spends another
+                #   provider on the same unanswerable question. Someone has to
+                #   look at why the PR head cannot be resolved (#289).
+                logger.error(
+                    f"dispatcher: refusing to dispatch {role} task_id={task.task_id} "
+                    f"— {exc}"
+                )
+                _lock_stack.close()
+                _fail_if_active(task.task_id, "pr_head_unresolved",
+                                status="needs_human")
+                return
+            except Exception:
+                logger.exception(
+                    f"dispatcher: worktree prep failed for {role} task_id={task.task_id} — continuing"
+                )
+
         # Record durable attribution before dispatch so quota systems can map
         # token usage back to the project even after worktrees are torn down (#174).
         try:
@@ -2729,33 +2798,6 @@ def create_app(
         except Exception:
             logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
 
-        # Prepare worktree: stash local changes, fetch origin, checkout right branch.
-        if not _WORKTREE_SYNC_DISABLED:
-            try:
-                _reviewed_sha = _prepare_worktree_for_task(
-                    wt, task.task_id, task.branch or "", role,
-                    task_context=task.context if isinstance(task.context, dict) else {},
-                )
-                if _reviewed_sha:
-                    # #253: same record on the headless path, and before the
-                    # prompt is built so the agent is told which commit it got.
-                    try:
-                        q().patch_context(task.task_id, {"reviewed_sha": _reviewed_sha})
-                        task.context = {**(task.context or {}),
-                                        "reviewed_sha": _reviewed_sha}
-                    except Exception:
-                        logger.exception(
-                            f"dispatcher: could not record reviewed_sha for {task.task_id}"
-                        )
-                logger.info(
-                    f"dispatcher: worktree prepared for {role} "
-                    f"task_id={task.task_id} branch={task.branch or '(none)'} "
-                    f"at {(_reviewed_sha or '?')[:9]}"
-                )
-            except Exception:
-                logger.exception(
-                    f"dispatcher: worktree prep failed for {role} task_id={task.task_id} — continuing"
-                )
 
         message = _format_task_message(task, port)
         # #239: assemble a bounded, provenance-linked Context Pack from durable
