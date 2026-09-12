@@ -685,22 +685,33 @@ def claude_session_size(cwd: str, *, home=None) -> tuple:
         return (0, "")
 
 
-def _usage_context_tokens(usage) -> int:
-    """The window a turn re-read: cached + freshly cached + new input.
+def _usage_context_tokens(usage) -> Optional[int]:
+    """The window a turn re-read — cached + freshly cached + new input.
 
-    ⛔`output_tokens` is excluded. It is what the turn produced, not what it
-      re-reads on the next one, and including it would inflate the number the
-      cap is compared against.
+    ``None`` when there was nothing to read, ``0`` when the fields are present
+    and sum to zero. ⛔The distinction is the whole point of the signature
+    (review of PR #285): returning a bare `0` for both let the caller skip a
+    genuine zero-token turn and report an OLDER, larger window as current,
+    which with a token cap configured forces a context reset on the strength of
+    a window that is no longer there.
+
+    ⛔`output_tokens` is excluded, and does not count as "something to read"
+      either. It is what the turn produced, not what it re-reads on the next
+      one; including it would inflate the number the cap is compared against,
+      and treating it as a measurement would make an output-only block look
+      like a zero window.
     """
     if not isinstance(usage, dict):
-        return 0
+        return None
     total = 0
+    measured = False
     for key in ("cache_read_input_tokens", "cache_creation_input_tokens",
                 "input_tokens"):
         value = usage.get(key)
         if isinstance(value, (int, float)) and not isinstance(value, bool):
             total += int(value)
-    return total
+            measured = True
+    return total if measured else None
 
 
 def claude_context_tokens(cwd: str, *, home=None) -> tuple:
@@ -716,7 +727,11 @@ def claude_context_tokens(cwd: str, *, home=None) -> tuple:
       (#269); a full scan would move that cost into the dispatch path.
 
     ``(0, "")`` when anything is missing or unreadable — sizing must never
-    break a dispatch, and 0 means "no measurement", never "a small session".
+    break a dispatch. ⛔A `0` here is NOT self-describing: it is returned both
+    for "the last turn re-read nothing" and for "no usage block was found in
+    the tail". Both mean the same thing to the cap (not over), which is why one
+    value is enough; a consumer that needs to tell them apart cannot, and
+    should not infer a healthy session from it.
     """
     try:
         _, session = claude_session_size(cwd, home=home)
@@ -748,7 +763,10 @@ def claude_context_tokens(cwd: str, *, home=None) -> tuple:
                         continue
                     tokens = _usage_context_tokens(
                         (entry.get("message") or {}).get("usage"))
-                    if tokens:
+                    if tokens is not None:
+                        # `is not None`, not truthiness: a turn that really did
+                        # re-read nothing is the answer, and walking past it
+                        # would report a window the session has already left.
                         return (tokens, session)
                 if start == 0:
                     break

@@ -84,6 +84,55 @@ def test_output_tokens_are_not_part_of_the_window():
                                            input_tokens=1)) == 16
 
 
+def test_a_zero_window_is_the_answer_not_a_reason_to_keep_looking(tmp_path):
+    """★★Review of PR #285. The scan returned only when the sum was TRUTHY, so a
+    latest turn whose input-side fields are all zero was skipped and an older,
+    larger window was reported as current.
+
+    With a token cap configured that is not a cosmetic error: it resets a
+    context on the strength of a window that is no longer there."""
+    _session(tmp_path, CWD, usage_lines=[
+        _usage(cache_read=601_674, cache_creation=5_026, input_tokens=2),
+        _usage(cache_read=0, cache_creation=0, input_tokens=0),
+    ])
+    assert sv.claude_context_tokens(CWD, home=tmp_path)[0] == 0
+
+
+def test_a_zero_window_does_not_trip_a_configured_cap(tmp_path):
+    """⛔The harm, stated as behaviour rather than as a number: an unnecessary
+    forced reset. The stale 601,674 would have cleared a 400k cap; the real
+    window is zero."""
+    _session(tmp_path, CWD, usage_lines=[
+        _usage(cache_read=601_674),
+        _usage(cache_read=0, cache_creation=0, input_tokens=0),
+    ])
+    over, info = sv.claude_context_exceeds_cap(CWD, home=tmp_path,
+                                               max_tokens=400_000)
+    assert over is False and info["context_tokens"] == 0
+
+
+def test_the_helper_separates_no_usage_from_a_zero_usage():
+    """The distinction the fix turns on. `None` means there was nothing to read
+    and the scan should keep walking; `0` is a measurement."""
+    assert sv._usage_context_tokens(None) is None
+    assert sv._usage_context_tokens("not a dict") is None
+    assert sv._usage_context_tokens({}) is None, \
+        "an empty usage block is absence, not a measured zero"
+    assert sv._usage_context_tokens({"output_tokens": 99}) is None, \
+        "output-only carries no input-side field, so nothing was measured"
+    assert sv._usage_context_tokens({"input_tokens": 0}) == 0
+    assert sv._usage_context_tokens(_usage(cache_read=0, cache_creation=0,
+                                           input_tokens=0)) == 0
+
+
+def test_an_empty_usage_block_does_not_hide_the_real_last_window(tmp_path):
+    """⛔The other side of the fix, so it does not over-correct: `{}` is not a
+    zero-token turn, so the scan must walk past it to the last turn that
+    actually reported usage."""
+    _session(tmp_path, CWD, usage_lines=[_usage(cache_read=123_456), {}])
+    assert sv.claude_context_tokens(CWD, home=tmp_path)[0] == 123_456
+
+
 def test_a_turn_without_usage_is_skipped(tmp_path):
     """Tool results and user turns carry no usage block; the last one that does
     is the live window."""
