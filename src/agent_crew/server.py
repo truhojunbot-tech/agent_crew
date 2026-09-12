@@ -118,6 +118,64 @@ def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Option
     return None
 
 
+#: Branch namespaces agent_crew generates itself, and may therefore force-move.
+_OWNED_BRANCH_PREFIXES = ("agent/", "review/", "test/")
+
+
+def _agent_crew_owns_branch(branch: str) -> bool:
+    """May agent_crew force-move this ref?
+
+    ⛔The dispatcher's worktrees are `git worktree add` off the caller's clone,
+      so `refs/heads/*` is ONE namespace shared with every sibling worktree and
+      with the clone itself — only the branch a worktree currently has checked
+      out is exclusive to it. `git checkout -B <name>` moves that shared ref for
+      everybody.
+
+      #280 measured the consequence: a `crew discuss --branch fix/…` round runs
+      as `implementer`, hit `checkout -B fix/… origin/main`, and reset a
+      developer's branch to main's tip three times inside one session — in a
+      clone the dispatcher was never pointed at, while they were committing to
+      it. Nothing was lost only because they had pushed first.
+
+      So: only names agent_crew itself generates are safe to force-move.
+      Anything else — `main`, a feature branch, anything a human named — gets a
+      detached checkout, which touches no ref at all.
+    """
+    name = (branch or "").strip()
+    return any(name.startswith(prefix) for prefix in _OWNED_BRANCH_PREFIXES)
+
+
+def _checkout_detached(worktree_path: str, refs, *, what: str) -> bool:
+    """Detach HEAD at the first of ``refs`` that resolves. True if one did.
+
+    Detached because owning a branch here is the hazard itself: a worktree
+    sitting ON a branch can move that shared ref later, by its own reset or by
+    the agent's. Detached HEAD gives the task the same content with no ref to
+    move.
+    """
+    tried = []
+    for ref in refs:
+        if not ref or ref in tried:
+            continue
+        tried.append(ref)
+        r = subprocess.run(
+            ["git", "-C", worktree_path, "checkout", "--detach", ref],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0:
+            logger.info(
+                f"_prepare_worktree_for_task: {what} detached at {ref} — "
+                f"agent_crew does not own that branch name, so the ref is left "
+                f"where it is (#280). Push with `git push origin HEAD:<branch>`."
+            )
+            return True
+        logger.warning(
+            f"_prepare_worktree_for_task: {what} detach at {ref} failed: "
+            f"{r.stderr.strip()}"
+        )
+    return False
+
+
 def _prepare_worktree_for_task(
     worktree_path: str,
     task_id: str,
@@ -201,16 +259,27 @@ def _prepare_worktree_for_task_inner(
         # Fresh branch per task from origin/main (#140). Use task.branch when
         # set (crew run --branch), otherwise derive from task_id.
         branch = task_branch if task_branch else f"agent/{task_id[:12]}"
-        r = subprocess.run(
-            ["git", "-C", worktree_path, "checkout", "-B", branch,
-             f"origin/{main_branch}"],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            logger.warning(
-                f"_prepare_worktree_for_task: implementer checkout {branch} "
-                f"from origin/{main_branch} failed: {r.stderr.strip()}"
+        if not _agent_crew_owns_branch(branch):
+            # #280: somebody else's branch name. Do not create it, do not move
+            # it — start from its own remote tip so the task still sees the code
+            # it was dispatched for, and fall back to main when there is no such
+            # remote (a name that does not exist yet).
+            _checkout_detached(
+                worktree_path,
+                [f"origin/{branch}", f"origin/{main_branch}"],
+                what=f"implementer {task_id}",
             )
+        else:
+            r = subprocess.run(
+                ["git", "-C", worktree_path, "checkout", "-B", branch,
+                 f"origin/{main_branch}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode != 0:
+                logger.warning(
+                    f"_prepare_worktree_for_task: implementer checkout {branch} "
+                    f"from origin/{main_branch} failed: {r.stderr.strip()}"
+                )
     else:
         # Reviewer/tester: checkout the PR branch from origin (#141, #186).
         # task.branch holds the base branch (e.g. main), not the PR head.
@@ -2399,6 +2468,12 @@ def create_app(
                 ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True, text=True, timeout=5,
             ).stdout.strip()
+            if _git_branch == "HEAD":
+                # #280: a detached worktree reports the literal string "HEAD",
+                # which is not a branch and joins to nothing downstream. Record
+                # what the task was dispatched FOR — the fix that stopped us
+                # owning the ref must not also erase which branch this is about.
+                _git_branch = (task.branch or "").strip() or "HEAD"
             # #262: bind codex to a session that belongs to THIS worktree.
             # `resume --last` is global, so the binding has to be ours: prefer
             # the provider_session_id already recorded for this context, then a
