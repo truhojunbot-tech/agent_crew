@@ -473,6 +473,30 @@ you set `verdict: "approve"`:
 Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
 `findings`.
 
+### ⛔ Review the commit you were given — do not re-fetch
+
+The dispatcher has already checked this worktree out, detached, at an exact
+commit, and recorded it as `context.reviewed_sha` in your task block. Check it
+before you read anything:
+
+```bash
+git rev-parse HEAD            # must equal context.reviewed_sha
+```
+
+⛔Do NOT `git fetch` + `checkout --detach FETCH_HEAD` to "get the latest". A PR
+  head moves; you would review one commit while your verdict, and the stale-
+  review gate that decides whether a fix task is still needed (#253), are
+  attributed to another (#286). On a mismatch, POST `status: needs_human` with
+  both SHAs rather than reviewing anyway — a review of the wrong tree looks
+  exactly like a review.
+
+⛔Never `git branch -f`, `git update-ref`, or `checkout -B` a branch you did not
+  create. Your worktree shares `refs/heads/*` with the implementer's (`git
+  worktree add`, same repo), so those write a ref out from under whoever has it
+  checked out — #280 measured a developer's branch being reset to `main`'s tip
+  three times in one session. #282 gave the tester this warning; the reviewer
+  has the same exposure.
+
 ### Post GitHub PR comment (mandatory)
 
 After completing the review, post your findings directly to GitHub before submitting
@@ -549,15 +573,34 @@ by force-deleting/recreating the branch, `git branch -f`, or `git update-ref`
 — those bypass the safety check and can corrupt the branch out from under the
 implementer.
 
-**Always fetch and check out detached instead:**
+### ⛔ Do NOT re-fetch or re-checkout — verify instead
+
+⛔The dispatcher has **already** checked this worktree out, detached, at an
+  exact commit, and recorded that commit as `context.reviewed_sha` in your task
+  block. Detached HEAD never touches `refs/heads/*`, so the hazard above is
+  already handled for you.
+
+Re-fetching would undo the part that matters. A PR head moves: if you run
+`git fetch origin <pr-branch> && git checkout --detach FETCH_HEAD`, you land on
+whatever the branch points at **now**, while your result, its cost and every
+downstream guard stay attributed to the commit the dispatcher prepared (#253).
+You would then be testing one commit and reporting another, and nothing in the
+output would say so (#286).
+
+**Verify, then work:**
 
 ```bash
-git fetch origin <pr-branch-name>
-git checkout --detach FETCH_HEAD
+git rev-parse HEAD            # must equal context.reviewed_sha
 ```
 
-Detached HEAD never touches `refs/heads/*`, so it is immune to this hazard
-regardless of what any sibling worktree has checked out.
+If it does not match, **stop**: do not fetch, do not reset. POST
+`status: needs_human` with both SHAs in `summary`. A mismatch means the
+worktree is not the revision you were dispatched for, and a result from it
+would be attributed to the wrong commit.
+
+⛔Never `git branch -f`, `git update-ref`, or `checkout -B` a branch you did not
+  create. Those write to the shared namespace and can corrupt a branch out from
+  under the implementer (#280).
 
 <test_scope>
 ### Result checklist (tester)

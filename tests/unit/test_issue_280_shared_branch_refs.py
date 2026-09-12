@@ -130,14 +130,19 @@ def test_an_explicitly_named_agent_branch_is_still_ours(  ):
     assert "agent/feat-xyz" in _forced(_run_prepare("agent/feat-xyz", "implementer"))
 
 
-@pytest.mark.parametrize("role, prefix", [("reviewer", "review/"), ("tester", "test/")])
-def test_reviewer_and_tester_are_unchanged(role, prefix):
-    """They were never the culprit — they already use derived names. Pinned so a
-    later 'consistency' cleanup does not detach them and take away the branch
-    their own tooling expects."""
-    forced = _forced(_run_prepare(CALLER_BRANCH, role))
-    assert any(b.startswith(prefix) for b in forced)
-    assert CALLER_BRANCH not in forced
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
+def test_reviewer_and_tester_never_force_move_a_callers_branch(role):
+    """They were never the culprit — they used derived names (`review/<id>`,
+    `test/<id>`) and never touched the branch under review.
+
+    ⚠️This test used to REQUIRE those derived branches, as a guard against an
+      unmotivated "consistency" cleanup detaching them. #286 supplied a
+      motivated reason and they are now detached at a resolved SHA: reviewer and
+      tester never commit, so a branch bought them nothing and cost the
+      immutability `reviewed_sha` depends on. The invariant this file exists for
+      is unchanged and in fact stronger — they now write NO ref into the shared
+      namespace at all, which is what is asserted here."""
+    assert _forced(_run_prepare(CALLER_BRANCH, role)) == []
 
 
 # ── 4. against a real repository ──────────────────────────────────────

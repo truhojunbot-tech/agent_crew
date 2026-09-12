@@ -103,68 +103,76 @@ def test_prepare_implementer_derives_branch_from_task_id_when_empty():
 # ---------------------------------------------------------------------------
 
 
-def test_prepare_reviewer_checks_out_pr_branch():
-    """Reviewer: stash → fetch → checkout -B review/<id[:8]> origin/<task_branch>."""
-    cmds = []
-
+def _resolving_run(cmds, sha="a" * 40, fail_refs=()):
+    """A fake `git` that resolves refs, so prep reaches its checkout."""
     def fake_run(cmd, **_kw):
         cmds.append(cmd)
-        return MagicMock(returncode=0, stderr="")
+        if "rev-parse" in cmd:
+            ref = cmd[-1]
+            if any(bad in ref for bad in fail_refs):
+                return MagicMock(returncode=1, stdout="", stderr="unknown revision")
+            return MagicMock(returncode=0, stdout=sha + "\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+    return fake_run
 
-    # Use task_id without hyphen prefix so first 8 chars are predictable
-    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
+
+def test_prepare_reviewer_pins_the_pr_branch_to_an_exact_commit():
+    """Reviewer: stash → fetch → rev-parse origin/<task_branch> → detach at it.
+
+    ⛔Was `checkout -B review/<id[:8]>` until #286. Two things changed and both
+      are deliberate: the ref is resolved to an object BEFORE checkout, because
+      `reviewed_sha` is read straight after and a name can move between the two
+      (#286); and no branch is created, because reviewer and tester never commit
+      and a branch is one more shared `refs/heads/*` write (#280).
+    """
+    cmds = []
+    with patch("agent_crew.server.subprocess.run",
+               side_effect=_resolving_run(cmds)):
         _prepare_worktree_for_task(
             "/wt/codex", "aabb11221122", "agent/feat-xyz", "reviewer"
         )
 
     git = _git_calls(cmds)
+    assert any("rev-parse" in c and "origin/agent/feat-xyz" in " ".join(c) for c in git)
     checkout = [c for c in git if "checkout" in c]
-    assert any("review/aabb1122" in " ".join(c) for c in checkout), checkout
-    assert any("origin/agent/feat-xyz" in " ".join(c) for c in checkout), checkout
+    assert checkout and "--detach" in checkout[0], checkout
+    assert checkout[0][-1] == "a" * 40, checkout
+    assert not [c for c in checkout if "-B" in c], "prep created a branch ref"
 
 
-def test_prepare_tester_checks_out_pr_branch():
-    """Tester uses 'test/<id[:8]>' prefix."""
+def test_prepare_tester_pins_the_pr_branch_the_same_way():
     cmds = []
-
-    def fake_run(cmd, **_kw):
-        cmds.append(cmd)
-        return MagicMock(returncode=0, stderr="")
-
-    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
+    with patch("agent_crew.server.subprocess.run",
+               side_effect=_resolving_run(cmds)):
         _prepare_worktree_for_task(
             "/wt/gemini", "ccdd33441122", "agent/feat-xyz", "tester"
         )
 
     git = _git_calls(cmds)
     checkout = [c for c in git if "checkout" in c]
-    assert any("test/ccdd3344" in " ".join(c) for c in checkout), checkout
+    assert checkout and checkout[0][-1] == "a" * 40 and "--detach" in checkout[0]
+    assert not [c for c in checkout if "-B" in c]
 
 
 def test_prepare_reviewer_falls_back_to_main_if_branch_absent():
-    """If origin/<task_branch> doesn't exist, fall back to origin/main."""
+    """If origin/<task_branch> does not resolve, fall back to origin/main.
+
+    ⛔The fallback moved from checkout-time to RESOLVE-time (#286): there is now
+      one checkout, at whichever ref produced a commit. A second checkout would
+      mean the worktree had already been moved once."""
     cmds = []
-    checkout_count = [0]
-
-    def fake_run(cmd, **_kw):
-        cmds.append(cmd)
-        if "checkout" in cmd:
-            checkout_count[0] += 1
-            if checkout_count[0] == 1:
-                # First checkout: target PR branch → fail (branch gone/absent)
-                return MagicMock(returncode=1, stderr="pathspec not found")
-        return MagicMock(returncode=0, stderr="")
-
-    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
+    with patch("agent_crew.server.subprocess.run",
+               side_effect=_resolving_run(cmds, fail_refs=("gone-branch",))):
         _prepare_worktree_for_task(
             "/wt/codex", "review-eeff5566", "agent/gone-branch", "reviewer"
         )
 
     git = _git_calls(cmds)
+    probed = [" ".join(c) for c in git if "rev-parse" in c]
+    assert any("origin/agent/gone-branch" in p for p in probed), probed
+    assert any("origin/main" in p for p in probed), probed
     checkout = [c for c in git if "checkout" in c]
-    # Second checkout should target origin/main as fallback
-    assert len(checkout) == 2, f"expected 2 checkouts, got {len(checkout)}: {checkout}"
-    assert any("origin/main" in " ".join(c) for c in checkout), checkout
+    assert len(checkout) == 1, f"expected one checkout, got {checkout}"
 
 
 def test_prepare_worktree_failure_does_not_raise():
@@ -221,19 +229,22 @@ def test_every_git_call_has_a_timeout_reviewer_path_including_fallback(monkeypat
 
     def fake_run(cmd, **kw):
         calls.append((cmd, kw))
-        if cmd[:2] == ["git", "-C"] and "checkout" in cmd:
-            checkout_count[0] += 1
-            if checkout_count[0] == 1:
-                return MagicMock(returncode=1, stderr="pathspec not found")
-        return MagicMock(returncode=0, stderr="")
+        if "rev-parse" in cmd:
+            if "gone-branch" in cmd[-1]:
+                return MagicMock(returncode=1, stdout="", stderr="unknown revision")
+            return MagicMock(returncode=0, stdout="a" * 40, stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
 
     _prepare_worktree_for_task("/wt/codex", "review-eeff5566", "agent/gone-branch", "reviewer")
 
     git_calls = [(cmd, kw) for cmd, kw in calls if cmd[:2] == ["git", "-C"]]
-    checkouts = [(cmd, kw) for cmd, kw in git_calls if "checkout" in cmd]
-    assert len(checkouts) == 2, f"expected primary + fallback checkout, got {checkouts}"
+    # ⛔The point of this test is the timeout on EVERY call, and #286 added the
+    #   rev-parse probes — a new unbounded git call in the dispatch path is
+    #   exactly what this guards against (a stuck git freezes the event loop).
+    probes = [c for c, _ in git_calls if "rev-parse" in c and "--verify" in c]
+    assert len(probes) == 2, probes
     for cmd, kw in git_calls:
         assert kw.get("timeout") is not None, f"no timeout on: {cmd}"
 

@@ -176,6 +176,31 @@ def _checkout_detached(worktree_path: str, refs, *, what: str) -> bool:
     return False
 
 
+#: A full git object id — 40 hex for sha1 repos, 64 for sha256. Deliberately not
+#: a prefix match: abbreviations are ambiguous by construction, and no real pin
+#: is one (`reviewed_sha` is written from `rev-parse HEAD`, which is always full).
+_OBJECT_ID_RE = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
+
+
+def _object_id_or_empty(value) -> str:
+    """``value`` as a commit id, or ``""`` if it does not look like one.
+
+    ⛔Shape-check BEFORE probing, because probing is not validation.
+      `git rev-parse --verify <x>^{commit}` resolves any revision expression —
+      `origin/main`, `HEAD~1`, a tag, `@` — so an unrestricted `reviewed_sha` of
+      `origin/main` would resolve, short-circuit the PR-head lookup, and
+      silently prepare AND attribute a PR review to main (review of PR #287).
+
+      Not a security boundary: `rev-parse` is not a shell, so nothing here is
+      injectable. The damage is misattribution, which is precisely what the
+      whole `reviewed_sha` contract exists to prevent.
+    """
+    if not isinstance(value, str):
+        return ""
+    candidate = value.strip()
+    return candidate if _OBJECT_ID_RE.match(candidate) else ""
+
+
 def _prepare_worktree_for_task(
     worktree_path: str,
     task_id: str,
@@ -285,12 +310,15 @@ def _prepare_worktree_for_task_inner(
         # task.branch holds the base branch (e.g. main), not the PR head.
         # Resolve the actual PR head ref from pr_number when available so
         # the worktree always mirrors the real PR, not a stale base branch.
-        prefix = "review" if role == "reviewer" else "test"
-        local_branch = f"{prefix}/{task_id[:8]}"
-
         pr_branch = task_branch  # fallback: base branch from task.branch
         pr_number = task_context.get("pr_number")
-        if pr_number:
+        # ⛔Skip the PR-head lookup when the task is already pinned. It is the
+        #   only network call in prep, its answer would be discarded, and — worse
+        #   — a failure would log "THIS MAY NOT BE THE PR'S CODE" about a task
+        #   that is about to be prepared at exactly the commit it names. A
+        #   misleading error is not free (#286 review).
+        _pinned_sha = _object_id_or_empty(task_context.get("reviewed_sha"))
+        if pr_number and not _pinned_sha:
             resolved = _resolve_pr_head_branch(int(pr_number), cwd=worktree_path)
             if resolved:
                 pr_branch = resolved
@@ -311,21 +339,90 @@ def _prepare_worktree_for_task_inner(
                 )
 
         target_ref = f"origin/{pr_branch}" if pr_branch else f"origin/{main_branch}"
-        r = subprocess.run(
-            ["git", "-C", worktree_path, "checkout", "-B", local_branch, target_ref],
-            capture_output=True, text=True, timeout=30,
-        )
-        if r.returncode != 0:
-            logger.warning(
-                f"_prepare_worktree_for_task: {role} checkout {local_branch} "
-                f"from {target_ref} failed, falling back to origin/{main_branch}: "
-                f"{r.stderr.strip()}"
-            )
-            subprocess.run(
-                ["git", "-C", worktree_path, "checkout", "-B", local_branch,
-                 f"origin/{main_branch}"],
+        # #286: resolve to an exact object FIRST, then detach at it. Two
+        # reasons, and the second is the one #286 is about:
+        #
+        #   * a symbolic ref keeps moving. `reviewed_sha` is read from this
+        #     worktree straight after and becomes the revision key every
+        #     downstream guard and cost record uses (#253), so what we check out
+        #     has to be immutable at the moment we name it;
+        #   * detached rather than `-B <local_branch>`: reviewer and tester
+        #     never commit, so a branch buys them nothing and costs the
+        #     guarantee. It also removes the last reviewer/tester write to the
+        #     shared `refs/heads/*` namespace (#280) — the two constraints point
+        #     the same way.
+        # #286 review (P1): an existing `reviewed_sha` on the task outranks the
+        # current PR ref, and is tried first.
+        #
+        # ⛔Prep runs more than once for a task — `_try_push_next` prepares and
+        #   records the pin, then `_dispatch_task` prepares again — and without
+        #   this the second run re-resolved the branch and overwrote the pin. A
+        #   review queued at A and dispatched after the head moved to B silently
+        #   reviewed and recorded B, destroying the durable commit identity the
+        #   stale-review gate reads (#253). The property is idempotence:
+        #   preparing the same task twice lands on the same commit, whatever the
+        #   remote did in between.
+        #
+        # ⛔Reviewer/tester only. A fix task carries the `reviewed_sha` of the
+        #   review it answers, so pinning the implementer to it would check out
+        #   the code being fixed instead of the branch to fix it on.
+        _pin = _pinned_sha
+        _candidates = ([_pin] if _pin else []) + [target_ref, f"origin/{main_branch}"]
+        _resolved = ""
+        for _ref in _candidates:
+            probe = subprocess.run(
+                ["git", "-C", worktree_path, "rev-parse", "--verify", f"{_ref}^{{commit}}"],
                 capture_output=True, text=True, timeout=30,
             )
+            if probe.returncode == 0 and probe.stdout.strip():
+                _resolved = probe.stdout.strip()
+                if _pin and _ref == _pin:
+                    logger.info(
+                        f"_prepare_worktree_for_task: {role} {task_id} honouring "
+                        f"the recorded pin {_resolved[:12]} rather than re-resolving "
+                        f"{target_ref} — preparing twice must not move the task (#286)."
+                    )
+                elif _ref != target_ref:
+                    logger.warning(
+                        f"_prepare_worktree_for_task: {role} could not resolve "
+                        f"{target_ref}, fell back to {_ref} ({_resolved[:12]})"
+                    )
+                elif _pin:
+                    # ⛔Loud: the task said it was about a commit this repo
+                    #   cannot resolve (a force-push, or a SHA from elsewhere).
+                    #   Preparing anyway is right — stranding the task helps
+                    #   nobody — but the recorded identity is about to change,
+                    #   and that must not happen quietly.
+                    logger.warning(
+                        f"_prepare_worktree_for_task: {role} {task_id} was pinned to "
+                        f"{_pin[:12]}, which does not resolve here; prepared at "
+                        f"{_resolved[:12]} from {target_ref} instead. The task's "
+                        f"reviewed_sha will change (#286)."
+                    )
+                break
+        if not _resolved:
+            logger.error(
+                f"_prepare_worktree_for_task: {role} {task_id} could not resolve "
+                f"{target_ref} or origin/{main_branch} to a commit — the worktree "
+                f"is left where it was and reviewed_sha will describe THAT, not "
+                f"the PR (#286)."
+            )
+        else:
+            r = subprocess.run(
+                ["git", "-C", worktree_path, "checkout", "--detach", _resolved],
+                capture_output=True, text=True, timeout=30,
+            )
+            if r.returncode != 0:
+                logger.error(
+                    f"_prepare_worktree_for_task: {role} detach at {_resolved[:12]} "
+                    f"failed: {r.stderr.strip()}"
+                )
+            else:
+                logger.info(
+                    f"_prepare_worktree_for_task: {role} {task_id} detached at "
+                    f"{_resolved[:12]} from {target_ref} — pinned, so the agent "
+                    f"must not re-fetch (#286)."
+                )
     # #253: report the commit this worktree was actually prepared at, so a
     # finding can be attributed to a STATE rather than to a wall-clock moment.
     # Without it nothing downstream can tell "this review is about the current
