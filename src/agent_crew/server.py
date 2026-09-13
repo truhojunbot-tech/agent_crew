@@ -201,7 +201,30 @@ def _object_id_or_empty(value) -> str:
     return candidate if _OBJECT_ID_RE.match(candidate) else ""
 
 
-class WorktreeTargetUnresolved(RuntimeError):
+class WorktreePrepRefused(RuntimeError):
+    #: Reason recorded on the task when this refusal stops a dispatch. It lives
+    #: on the class so it travels with the category — both handlers used to
+    #: hardcode `pr_head_unresolved`, so an unhealable worktree sent an operator
+    #: looking for a PR that was never the problem, and a third refusal reason
+    #: would have inherited the wrong label by default (review of PR #298).
+    reason = "worktree_prep_refused"
+
+    """Prep refused to hand this worktree to an agent.
+
+    The shared base both push paths catch. A refusal means the worktree is not
+    in a state where a dispatch could be trusted — the agent would produce work
+    about something other than what it was asked about, and nothing downstream
+    would say so.
+    """
+
+
+class WorktreeUnhealthy(WorktreePrepRefused):
+    """The worktree's own HEAD does not resolve and could not be healed (#296)."""
+
+    reason = "worktree_unhealthy"
+
+
+class WorktreeTargetUnresolved(WorktreePrepRefused):
     """The task named a PR whose head could not be resolved (#289).
 
     ⛔Raised instead of falling back to `task.branch`. For a PR task that branch
@@ -214,6 +237,169 @@ class WorktreeTargetUnresolved(RuntimeError):
       The asymmetry decides it: a deferred review is recoverable, a confident
       review of the wrong tree is not.
     """
+
+    reason = "pr_head_unresolved"
+
+
+def _unborn_head_ref(worktree_path: str) -> str:
+    """The branch HEAD points at when that branch does not exist yet (#296).
+
+    ``""`` unless the worktree is in exactly the reported shape: `rev-parse
+    HEAD` fails, HEAD *is* a symbolic ref, and the branch it names does not
+    resolve. That conjunction is what an interrupted ref update leaves behind.
+
+    ⛔Deliberately narrow. "HEAD does not resolve" alone covers a directory that
+      is not a repository, a git that is not installed, a transient failure —
+      none of which this heals, and treating them as the same condition would
+      make prep refuse in situations it has always survived. Precision about
+      the failure mode is what lets the repair be safe.
+    """
+    def _git(*args, timeout=15):
+        try:
+            return subprocess.run(["git", "-C", worktree_path, *args],
+                                  capture_output=True, text=True, timeout=timeout)
+        except Exception:  # noqa: BLE001
+            return None
+
+    head = _git("rev-parse", "HEAD")
+    if head is None or head.returncode == 0:
+        return ""
+    symbolic = _git("symbolic-ref", "-q", "HEAD")
+    ref = symbolic.stdout.strip() if symbolic is not None and symbolic.returncode == 0 else ""
+    if not ref:
+        return ""
+    existing = _git("rev-parse", "--verify", "-q", ref)
+    if existing is not None and existing.returncode == 0 and existing.stdout.strip():
+        # The ref resolves, so HEAD is broken for some other reason — a dangling
+        # object, say. Not the unborn shape, and `update-ref` here would
+        # force-move a live ref in the shared namespace (#280).
+        return ""
+    return ref
+
+
+def _worktree_is_healthy(worktree_path: str) -> bool:
+    """Does this worktree's HEAD resolve? (#296)
+
+    The cheapest possible question, asked before anything else touches the
+    directory. An interrupted ref update can leave HEAD pointing at a branch
+    that was never created — an "unborn HEAD" — with the whole tree staged, and
+    `stash`/`fetch`/`checkout` all behave differently against that.
+    """
+    try:
+        r = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except Exception:  # noqa: BLE001
+        return False
+    return r.returncode == 0 and bool(r.stdout.strip())
+
+
+def _heal_unborn_head(worktree_path: str, main_branch: str, ref: str = "",
+                      *, what: str) -> bool:
+    """Bring an unborn HEAD back into existence. True if the worktree is usable.
+
+    The recipe is `update-ref` then `reset --mixed`, validated on the live
+    worktrees before #296 was filed:
+
+    ⛔NEVER `checkout -B` or `reset --hard`. On an unborn HEAD with everything
+      staged those are precisely the two commands that discard the staged
+      content, and in a worktree broken by an interrupted task that content may
+      be the only record of what it had done. `--mixed` unstages and leaves
+      every file where it is.
+
+    ⛔`update-ref` only ever CREATES here. The ref is read first and the heal is
+      abandoned if it already resolves: writing a ref that exists would be a
+      force-move in the namespace shared with the caller's clone and every
+      sibling worktree, which is the thing #280 exists to stop.
+    """
+    if not ref:
+        head_ref = subprocess.run(
+            ["git", "-C", worktree_path, "symbolic-ref", "-q", "HEAD"],
+            capture_output=True, text=True, timeout=15,
+        )
+        ref = head_ref.stdout.strip() if head_ref.returncode == 0 else ""
+    if not ref:
+        logger.error(
+            f"{what}: HEAD does not resolve and is not a symbolic ref either — "
+            f"this is not the unborn-HEAD shape #296 heals, and guessing at a "
+            f"repair could destroy state. Refusing."
+        )
+        return False
+
+    existing = subprocess.run(
+        ["git", "-C", worktree_path, "rev-parse", "--verify", "-q", ref],
+        capture_output=True, text=True, timeout=15,
+    )
+    if existing.returncode == 0 and existing.stdout.strip():
+        logger.error(
+            f"{what}: {ref} already resolves, so HEAD is broken for some other "
+            f"reason. Refusing rather than force-moving a live ref (#280)."
+        )
+        return False
+
+    target = subprocess.run(
+        ["git", "-C", worktree_path, "rev-parse", "--verify",
+         f"origin/{main_branch}^{{commit}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    sha = target.stdout.strip() if target.returncode == 0 else ""
+    if not sha:
+        logger.error(
+            f"{what}: cannot resolve origin/{main_branch} to heal {ref}. Refusing."
+        )
+        return False
+
+    # Forensics BEFORE the repair: an interrupted task's staged content is the
+    # only trace of what it had done, and #296 asks that it never be discarded
+    # without a record of what it was.
+    staged = subprocess.run(
+        ["git", "-C", worktree_path, "diff", "--cached", "--name-only"],
+        capture_output=True, text=True, timeout=30,
+    )
+    names = [n for n in (staged.stdout or "").splitlines() if n.strip()]
+    logger.warning(
+        f"{what}: HEAD does not resolve — {ref} is unborn, with {len(names)} "
+        f"staged path(s). This is the interrupted-ref-update shape from #296. "
+        f"Healing by creating {ref} at origin/{main_branch} ({sha[:12]}) and "
+        f"unstaging with `reset --mixed`; no file is deleted. First staged "
+        f"paths: {names[:5]}"
+    )
+
+    # ⛔Compare-and-swap, not check-then-write. The pre-check above is a fast,
+    #   clearer diagnostic; it is NOT what makes this safe. `update-ref --stdin`
+    #   with `create` verifies non-existence as part of the same operation, so a
+    #   sibling worktree creating this branch between the check and the write
+    #   loses nothing — the create fails and we refuse. A plain
+    #   `update-ref <ref> <sha>` would overwrite whatever landed in that window,
+    #   which is the shared-namespace force-move #280 forbids, reached by a race
+    #   instead of by intent (review of PR #298).
+    create = subprocess.run(
+        ["git", "-C", worktree_path, "update-ref", "--stdin", "-z"],
+        input=f"create {ref}\x00{sha}\x00", capture_output=True, text=True,
+        timeout=60,
+    )
+    if create.returncode != 0:
+        logger.error(
+            f"{what}: could not create {ref} atomically — another worktree may "
+            f"have created it first. Refusing rather than overwriting it (#280): "
+            f"{create.stderr.strip()}"
+        )
+        return False
+    reset = subprocess.run(
+        ["git", "-C", worktree_path, "reset", "--mixed"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if reset.returncode != 0:
+        logger.error(f"{what}: heal step 'reset' failed: {reset.stderr.strip()}")
+        return False
+
+    healed = _worktree_is_healthy(worktree_path)
+    logger.warning(
+        f"{what}: heal {'succeeded' if healed else 'FAILED'} — HEAD now "
+        f"{'resolves' if healed else 'still does not resolve'} (#296)."
+    )
+    return healed
 
 
 def _prepare_worktree_for_task(
@@ -242,7 +428,7 @@ def _prepare_worktree_for_task(
         return _prepare_worktree_for_task_inner(
             worktree_path, task_id, task_branch, role,
             task_context=task_context or {}) or ""
-    except WorktreeTargetUnresolved:
+    except WorktreePrepRefused:
         # ⛔Not swallowed. Every other prep failure is survivable — a stash
         #   conflict, a slow fetch — and dispatch continues on a worktree that
         #   is merely stale. This one is not: continuing means reviewing the
@@ -277,6 +463,21 @@ def _prepare_worktree_for_task_inner(
     main_branch = _WORKTREE_MAIN_BRANCH
     if task_context is None:
         task_context = {}
+    # #296: is this worktree even usable? Asked BEFORE any other git call,
+    # because an interrupted ref update can leave HEAD pointing at a branch that
+    # was never created, and `stash`/`fetch`/`checkout` all behave differently
+    # against an unborn HEAD. Reported live: three role worktrees in that state
+    # with 4,000+ files staged each, and nothing detected it.
+    _unborn = _unborn_head_ref(worktree_path)
+    if _unborn:
+        _what = f"_prepare_worktree_for_task: {role} {task_id}"
+        if not _heal_unborn_head(worktree_path, main_branch, _unborn, what=_what):
+            raise WorktreeUnhealthy(
+                f"{role} {task_id}: worktree {worktree_path} has no resolvable "
+                f"HEAD and could not be healed. Refusing to dispatch into it "
+                f"(#296)."
+            )
+
     # Stash any leftover uncommitted changes so checkout doesn't fail.
     # timeout=30: git commands here are plain local operations that should
     # be near-instant. Without a timeout, a stuck git process (e.g. one
@@ -2084,7 +2285,7 @@ def create_app(
                         f"_try_push_next: worktree prepared for {role} "
                         f"task_id={task.task_id} branch={task.branch or '(none)'}"
                     )
-                except WorktreeTargetUnresolved as exc:
+                except WorktreePrepRefused as exc:
                     # ⛔The broad handler below caught this and logged
                     #   "continuing with dispatch", so under
                     #   AGENT_CREW_DELIVERY=push/both a PR task whose head would
@@ -2101,7 +2302,7 @@ def create_app(
                         f"_try_push_next: refusing to push {role} "
                         f"task_id={task.task_id} — {exc}"
                     )
-                    _fail_if_active(task.task_id, "pr_head_unresolved",
+                    _fail_if_active(task.task_id, getattr(exc, "reason", "worktree_prep_refused"),
                                     status="needs_human")
                     return
                 except Exception:
@@ -3008,7 +3209,7 @@ def create_app(
                     f"task_id={task.task_id} branch={task.branch or '(none)'} "
                     f"at {(_reviewed_sha or '?')[:9]}"
                 )
-            except WorktreeTargetUnresolved as exc:
+            except WorktreePrepRefused as exc:
                 # ⛔needs_human, not failed and not a retry. A retry would make
                 #   the same `gh` call again; a `failed` routes into the
                 #   fallback/retry machinery and eventually spends another
@@ -3019,7 +3220,7 @@ def create_app(
                     f"— {exc}"
                 )
                 _lock_stack.close()
-                _fail_if_active(task.task_id, "pr_head_unresolved",
+                _fail_if_active(task.task_id, getattr(exc, "reason", "worktree_prep_refused"),
                                 status="needs_human")
                 return
             except Exception:
