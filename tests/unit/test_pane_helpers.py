@@ -53,17 +53,26 @@ def test_pane_token_count_plain_integer():
 
 
 def test_pane_token_count_no_hint():
-    """No token hint → 0"""
+    """No token hint → None (unknown), not 0.
+
+    ⛔This asserted `== 0` until #292, and that zero was the bug: the hint is
+    usually NOT on screen (`capture-pane` without `-S` sees only the visible
+    rows, and the footer renders only in some UI states), so callers
+    thresholding on the result read "well under 200,000" for panes measured at
+    786,552. Unknown now says unknown; the caller decides what to do with it."""
     with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
         "claude is thinking..."
     )):
-        assert _pane_token_count("%1") == 0
+        assert _pane_token_count("%1") is None
 
 
 def test_pane_token_count_subprocess_failure():
-    """subprocess.run raises → returns 0 without crashing"""
+    """subprocess.run raises → None without crashing.
+
+    Still never raises — the guarantee this test was written for is intact. It
+    just no longer reports a failed read as a small measurement (#292)."""
     with patch("agent_crew.server.subprocess.run", side_effect=OSError("no tmux")):
-        assert _pane_token_count("%1") == 0
+        assert _pane_token_count("%1") is None
 
 
 # ---------------------------------------------------------------------------
