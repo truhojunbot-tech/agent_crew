@@ -275,6 +275,28 @@ class TaskAlreadyExistsError(Exception):
         super().__init__(f"task_id {task_id!r} already exists with status={status!r}")
 
 
+def task_issue_number(task) -> Optional[int]:
+    """The issue a task is about — structured field first, description second.
+
+    ⛔One resolver, because there are two call sites and they must agree.
+      `TaskQueue.enqueue` backfills `context["issue"]` from an opening
+      `Implement #N` description (#276), and `POST /tasks`'s in-flight advisory
+      (#294) has to answer the same question BEFORE that write happens. Reading
+      `context.issue` alone there meant a direct enqueue whose issue lived only
+      in its description reported no collision and was then stored under that
+      very issue — the advisory and the row it produced disagreeing about one
+      task, and missing precisely the shape #276 exists for (review of PR #295).
+
+    Structured precedence is unchanged: a description is free text, a context
+    key is a claim, and when both are present the claim answers.
+    """
+    context = task.context if isinstance(getattr(task, "context", None), dict) else {}
+    number = context.get("issue")
+    if isinstance(number, int) and not isinstance(number, bool):
+        return number
+    return issue_from_description(getattr(task, "description", None))
+
+
 class TaskQueue:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -340,9 +362,9 @@ class TaskQueue:
         #   the caller had supplied it.
         context = dict(task.context or {})
         if not isinstance(context.get("issue"), int):
-            described = issue_from_description(task.description)
-            if described is not None:
-                context["issue"] = described
+            resolved = task_issue_number(task)
+            if resolved is not None:
+                context["issue"] = resolved
         conn = self._connect()
         try:
             conn.execute(

@@ -205,3 +205,100 @@ def test_a_bookkeeping_failure_does_not_break_the_enqueue(tmp_db, monkeypatch):
         response = _post(client, "impl-a", issue=292)
     assert response.status_code == 201
     assert response.json()["in_flight_for_issue"] == []
+
+
+# ── 3. the advisory must resolve the issue the way the queue will ─────
+
+
+def test_a_description_only_enqueue_still_sees_the_collision(tmp_db):
+    """★★The review's finding. `POST /tasks` read `context.issue` and nothing
+    else, while `enqueue` backfilled that same field from the description
+    moments later — so this task reported no collision and was then stored as
+    the very issue it collided with. Exactly the shape #276 exists for."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
+                          description="Implement #292: go", branch="main",
+                          context={"issue": 292}))
+    with TestClient(_server(tmp_db)) as client:
+        body = _post(client, "impl-b",
+                     description="Implement #292: the same thing again").json()
+    assert body["in_flight_for_issue"] == ["impl-a"]
+
+
+def test_both_sides_may_be_description_only(tmp_db):
+    """The in-flight task's own issue is backfilled by `enqueue`, so neither
+    side needs the structured field for the advisory to work."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
+                          description="Implement #292: go", branch="main",
+                          context={}))
+    with TestClient(_server(tmp_db)) as client:
+        body = _post(client, "impl-b", description="Implement #292: again").json()
+    assert body["in_flight_for_issue"] == ["impl-a"]
+
+
+def test_one_resolver_answers_for_both_call_sites():
+    """⛔Two copies of "which issue is this task about" would drift, and the
+    drift would be invisible until it produced a wrong advisory."""
+    from agent_crew.queue import task_issue_number
+
+    task = TaskRequest(task_id="t", task_type="implement",
+                       description="Implement #292: go", branch="main", context={})
+    assert task_issue_number(task) == 292
+
+    task.context = {"issue": 900}
+    assert task_issue_number(task) == 900, "the structured field must win"
+
+    task.context = {}
+    task.description = "Fix PR #292"
+    assert task_issue_number(task) is None, \
+        "#276's parser is anchored on purpose — a PR number is not an issue"
+
+
+def test_the_structured_field_still_wins(tmp_db):
+    """Precedence is unchanged: a description is free text, a context key is a
+    claim. A task that says one thing and claims another is the claim."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
+                          description="go", branch="main", context={"issue": 900}))
+    with TestClient(_server(tmp_db)) as client:
+        body = _post(client, "impl-b", issue=900,
+                     description="Implement #292: misleading").json()
+    assert body["in_flight_for_issue"] == ["impl-a"]
+
+
+def test_the_advisory_and_the_stored_row_agree(tmp_db):
+    """★★The invariant behind the fix: whatever the advisory decided this task's
+    issue was, that is the issue the row is stored under. These disagreeing is
+    the bug — the advisory looked for nothing while the row joined issue 292."""
+    with TestClient(_server(tmp_db)) as client:
+        _post(client, "impl-b", description="Implement #292: go")
+    assert TaskQueue(tmp_db).get_task_context("impl-b").get("issue") == 292
+
+
+def test_a_description_that_names_nothing_resolves_to_nothing(tmp_db):
+    """No issue means no lookup — not a lookup for issue 0 or for everything."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
+                          description="go", branch="main", context={"issue": 292}))
+    with TestClient(_server(tmp_db)) as client:
+        body = _post(client, "impl-b", description="just do the thing").json()
+    assert body["in_flight_for_issue"] == []
+
+
+def test_a_boolean_is_not_an_issue_number():
+    """`True` is an `int` in Python, and issue #1 is a real issue.
+
+    ⛔Without the `bool` rejection `context={"issue": True}` resolves to 1 and
+      the advisory reports collisions with whatever is in flight for issue #1 —
+      a task it has nothing to do with. The same confusion already cost #270 a
+      round. Fall through to the description instead."""
+    from agent_crew.queue import task_issue_number
+
+    task = TaskRequest(task_id="t", task_type="implement",
+                       description="Implement #294: go", branch="main",
+                       context={"issue": True})
+    assert task_issue_number(task) == 294, "a bool is not a claim about an issue"
+
+    task.description = "no issue named here"
+    assert task_issue_number(task) is None

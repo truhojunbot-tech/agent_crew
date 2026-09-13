@@ -35,7 +35,7 @@ from agent_crew.pipeline import (
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
-from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
 from agent_crew.watch import active_tasks_for_issue
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
@@ -3690,7 +3690,11 @@ def create_app(
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         # #294: gathered BEFORE the enqueue, so the task being created can
         # never appear in its own collision list.
-        _issue_number = (task.context or {}).get("issue") if isinstance(task.context, dict) else None
+        # ⛔Resolved the same way `enqueue` will resolve it moments later.
+        #   Reading `context.issue` alone here meant a direct enqueue whose
+        #   issue lives only in its description reported no collision and was
+        #   then stored under that very issue (review of PR #295).
+        _issue_number = task_issue_number(task)
         _in_flight: list = []
         if isinstance(_issue_number, int) and not isinstance(_issue_number, bool):
             try:
