@@ -1384,11 +1384,22 @@ _TOKEN_CLEAR_THRESHOLD = int(os.getenv("AGENT_CREW_TOKEN_CLEAR_THRESHOLD", "2000
 _TOKEN_COUNT_RE = re.compile(r"save\s+([\d,]+(?:\.\d+)?[kKmM]?)\s+tokens", re.IGNORECASE)
 
 
-def _pane_token_count(pane_id: str) -> int:
-    """Return the token count hinted in the pane status bar, or 0.
+def _pane_token_count(pane_id: str) -> Optional[int]:
+    """The token count hinted in the pane status bar, or ``None`` if absent.
 
-    Claude Code shows "new task? /clear to save 544.1k tokens" when context
-    is large. We parse that hint to detect saturation (#133).
+    Claude Code shows "new task? /clear to save 544.1k tokens" when context is
+    large, and #133 parsed that hint to detect saturation.
+
+    ⛔Returns ``None``, not ``0``, when the hint is not on screen. It returned
+      ``0`` until #292, which every caller read as "well under threshold" — and
+      the hint is usually NOT on screen: `capture-pane` without `-S` sees only
+      the visible rows, and the footer renders only in some UI states. Measured
+      2026-09-13 with the threshold at 200,000, five of seven worktrees were
+      over the ceiling this mechanism exists to enforce (786,552 / 664,792 /
+      606,702 / 575,398 / 231,590) while neither readable pane showed a hint.
+
+      This is now a FALLBACK for providers with no transcript to read. Prefer
+      `_context_token_count`.
     """
     try:
         r = subprocess.run(
@@ -1396,16 +1407,57 @@ def _pane_token_count(pane_id: str) -> int:
             capture_output=True, text=True,
         )
     except Exception:
-        return 0
-    m = _TOKEN_COUNT_RE.search(r.stdout)
+        return None
+    m = _TOKEN_COUNT_RE.search(r.stdout or "")
     if not m:
-        return 0
+        return None
     raw = m.group(1).replace(",", "")
     if raw.lower().endswith("k"):
         return int(float(raw[:-1]) * 1_000)
     if raw.lower().endswith("m"):
         return int(float(raw[:-1]) * 1_000_000)
     return int(float(raw))
+
+
+def _context_token_count(pane_id: str, worktree_path: str = "",
+                         *, home=None) -> tuple:
+    """``(tokens, source)`` for the context a pane is carrying (#292).
+
+    ``tokens`` is ``None`` when nothing could be measured — never ``0``, which
+    is a measured empty window.
+
+    Source order, and why:
+
+      * ``"transcript"`` — the pane's own session store, the same ground truth
+        #284 reads. Exact, independent of whatever the terminal happens to be
+        rendering, and it cannot be silently broken by a footer redesign;
+      * ``"pane_hint"`` — the #133 screen scrape, kept only for providers with
+        no transcript to read;
+      * ``"unknown"`` — neither. Reported as such rather than as a number,
+        because a caller thresholding on a fabricated 0 is exactly the failure
+        #292 describes.
+    """
+    if worktree_path:
+        tokens, _ = claude_context_tokens(worktree_path, home=home)
+        if tokens is not None:
+            return (tokens, "transcript")
+    hinted = _pane_token_count(pane_id)
+    if hinted is not None:
+        return (hinted, "pane_hint")
+    return (None, "unknown")
+
+
+def _should_clear_context(tokens: Optional[int], *, threshold: int) -> bool:
+    """Should the pane be cleared before the next push?
+
+    ⛔``None`` does NOT clear. A forced reset on a reading nobody took throws
+      away a working context, and the asymmetry runs the other way from the cap
+      logic elsewhere: here the cost of acting on unknown is immediate and
+      certain, while the cost of not acting is bounded by the next dispatch that
+      CAN measure. The caller logs the unknown rather than letting it look like
+      a small number, which is the part that was missing (#292).
+    """
+    return tokens is not None and tokens >= threshold
 
 
 def _pane_clear_context(pane_id: str) -> None:
@@ -1952,13 +2004,30 @@ def create_app(
         # #163: skip auto-clear in MCP mode — long-lived sessions benefit from
         # cache hits; clearing can turn cache-hit patterns into cache-create
         # spikes. Auto-clear only applies to push (tmux-paste) delivery.
-        tok = _pane_token_count(pane_id)
-        if _push_enabled and tok >= _TOKEN_CLEAR_THRESHOLD:
+        # #292: measure the pane's own transcript, not a footer that is usually
+        # not on screen.
+        #
+        # ⛔Resolved independently of the prep block above rather than reusing
+        #   its local: that block is skipped entirely when worktree sync is
+        #   disabled, so borrowing its variable made this line unreachable-safe
+        #   only by accident and raised UnboundLocalError on every push in that
+        #   configuration. The measurement must not depend on whether prep ran.
+        _tok_wt = (worktree_map or {}).get(role) or ""
+        tok, _tok_source = _context_token_count(pane_id, _tok_wt)
+        if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
             logger.info(
-                f"_try_push_next: pane {pane_id} has {tok} tokens "
+                f"_try_push_next: pane {pane_id} has {tok} tokens via {_tok_source} "
                 f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
             )
             _pane_clear_context(pane_id)
+        elif _push_enabled and tok is None:
+            # ⛔Visible, because this is the state that hid the bug for so long:
+            #   it used to read as 0 and look like a healthy small context.
+            logger.warning(
+                f"_try_push_next: pane {pane_id} context size is UNKNOWN — no "
+                f"transcript and no on-screen hint. Not clearing; this pane is "
+                f"unguarded until something can measure it (#292)."
+            )
         # #134: auto-dismiss gemini permission prompt if present.
         _pane_dismiss_permission_prompt(pane_id)
         push_fn(pane_id, _format_task_message(task, port))
@@ -2024,13 +2093,27 @@ def create_app(
         # #133. `crew discuss` is the path these panels actually run on, and it
         # was the one without a check — so the panes that accumulated the most
         # context were exactly the ones nothing was watching.
-        tok = _pane_token_count(pane_id)
-        if _push_enabled and tok >= _TOKEN_CLEAR_THRESHOLD:
+        # #292: same transcript-first measurement. The discuss path knows the
+        # agent rather than the role, so the worktree is resolved through the
+        # role map — panels are exactly the panes that accumulate the most
+        # context, which is why #260 added a guard here at all.
+        _discuss_wt = ""
+        if worktree_map:
+            _discuss_wt = (worktree_map.get(_DEFAULT_AGENT_TO_ROLE.get(agent, ""))
+                           or worktree_map.get(agent) or "")
+        tok, _tok_source = _context_token_count(pane_id, _discuss_wt)
+        if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
             logger.info(
-                f"_try_push_discuss: pane {pane_id} has {tok} tokens "
-                f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
+                f"_try_push_discuss: pane {pane_id} has {tok} tokens via "
+                f"{_tok_source} (>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear "
+                f"before push"
             )
             _pane_clear_context(pane_id)
+        elif _push_enabled and tok is None:
+            logger.warning(
+                f"_try_push_discuss: pane {pane_id} context size is UNKNOWN — no "
+                f"transcript and no on-screen hint. Not clearing (#292)."
+            )
         push_fn(pane_id, _format_task_message(task, port))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id)
