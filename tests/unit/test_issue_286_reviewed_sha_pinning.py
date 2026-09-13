@@ -149,11 +149,24 @@ def test_reviewed_sha_is_what_the_worktree_actually_holds(pr_repo):
     assert reviewed == _sha(wt) == sha_a
 
 
-def test_an_unresolvable_ref_falls_back_to_main(pr_repo):
-    clone, wt, _, _ = pr_repo
-    reviewed = _prepare_worktree_for_task(str(wt), "task-286abc", "no/such/branch",
-                                          "tester")
-    assert reviewed == _sha(clone, "origin/main")
+def test_an_unresolvable_ref_is_refused(pr_repo):
+    """⚠️Inverted by #301. This used to assert the fallback to `origin/main`.
+
+      That fallback is how a task naming a branch this repo does not have got
+      prepared at main and reviewed anyway, reported under the task's own name.
+      Measured 2026-09-13: a quota-ops branch dispatched on the agent_crew queue
+      produced four `exit_1` reviews and five implement dispatches in fifteen
+      minutes against a deliverable that never changed.
+
+      The pinning contract this file exists for is untouched — a resolved
+      `reviewed_sha` still wins, which the tests below assert. What changed is
+      the case where nothing identifies the target at all, and #289's rule
+      already covered its twin: a reviewer that cannot find its target stops."""
+    from agent_crew.server import WorktreeTargetUnresolved
+
+    _, wt, _, _ = pr_repo
+    with pytest.raises(WorktreeTargetUnresolved):
+        _prepare_worktree_for_task(str(wt), "task-286abc", "no/such/branch", "tester")
 
 
 # ── 1b. an existing pin outranks the current ref ──────────────────────

@@ -1835,6 +1835,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
         enqueue_review,
         enqueue_test,
         handle_review_result,
+        next_review_action,
+        REVIEW_RETRY_MAX,
         handle_test_result,
     )
     from agent_crew.queue import TaskQueue
@@ -2201,23 +2203,54 @@ def run_cmd(task: str, db: str, project: str, base: str,
             review_context["no_tester"] = True
         if _loop_pr_number:
             review_context["pr_number"] = _loop_pr_number
-        review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, context=review_context, port=_run_port)
-        click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
-        review_start = time.time()
-        review_result = _wait(review_id)
-        review_elapsed = int(time.time() - review_start)
+        # #302: a review that fails to RUN is a dispatch failure, not a
+        # verdict — retry it, bounded, the way any transient failure is retried.
+        # #301 stopped outright here; retrying covers the transient case, and
+        # the cap keeps the structural case (a branch this repo does not have)
+        # from spinning the same loop with review tasks.
+        _review_attempts = 0
+        while True:
+            review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, context=review_context, port=_run_port)
+            click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
+            review_start = time.time()
+            review_result = _wait(review_id)
+            review_elapsed = int(time.time() - review_start)
 
-        # pass no_tester=True here — test enqueue is handled manually below
-        outcome = handle_review_result(
-            review_result,
-            iteration=iteration,
-            max_iter=max_iter,
-            no_tester=True,
-            queue=queue,
-        )
+            # pass no_tester=True here — test enqueue is handled manually below
+            outcome = handle_review_result(
+                review_result,
+                iteration=iteration,
+                max_iter=max_iter,
+                no_tester=True,
+                queue=queue,
+            )
+            _action = next_review_action(outcome, _review_attempts)
+            if _action != "retry":
+                break
+            _review_attempts += 1
+            click.echo(
+                f"[{iteration}/{max_iter}] ⚠️ Review task did not run "
+                f"(status={getattr(review_result, 'status', '?')}) — retrying "
+                f"({_review_attempts}/{REVIEW_RETRY_MAX})."
+            )
 
         if outcome == "escalate":
             click.echo(f"[{iteration}/{max_iter}] ❌ Escalated after {max_iter} iterations.")
+            return
+
+        # #301/#302: the retry budget is spent and the reviewer still never ran,
+        # so it has asked for nothing. Enqueueing an implement round here spends
+        # a full invocation on feedback that is an empty header — the loop this
+        # stops was measured at five dispatches in fifteen minutes against an
+        # unchanged deliverable.
+        if outcome == "review_failed":
+            click.echo(
+                f"[{iteration}/{max_iter}] ❌ Review task did not run after "
+                f"{REVIEW_RETRY_MAX} retries (status="
+                f"{getattr(review_result, 'status', '?')}). Stopping: a review "
+                f"that did not run has not requested changes. Fix the cause and "
+                f"re-dispatch the review."
+            )
             return
 
         if outcome == "approved":
@@ -2620,6 +2653,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             build_feedback,
             enqueue_review,
             handle_review_result,
+            next_review_action,
+            REVIEW_RETRY_MAX,
         )
 
         max_iter = DEFAULT_MAX_ITER
@@ -2637,26 +2672,47 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             if _wait_result is None:
                 raise click.ClickException(f"task {impl_id!r} timed out after {wait_timeout}s")
 
-            review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id, port=_run_port)
-            review_result = None
-            deadline = time.time() + wait_timeout
-            while time.time() < deadline:
-                review_result = queue.get_result(review_id)
-                if review_result is not None:
-                    break
-                time.sleep(0.1)
-            if review_result is None:
-                raise click.ClickException(f"task {review_id!r} timed out after {wait_timeout}s")
+            # #302: retry a review that failed to RUN, bounded — same rule as
+            # the main loop above.
+            _review_attempts = 0
+            while True:
+                review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id, port=_run_port)
+                review_result = None
+                deadline = time.time() + wait_timeout
+                while time.time() < deadline:
+                    review_result = queue.get_result(review_id)
+                    if review_result is not None:
+                        break
+                    time.sleep(0.1)
+                if review_result is None:
+                    raise click.ClickException(f"task {review_id!r} timed out after {wait_timeout}s")
 
-            outcome = handle_review_result(
-                review_result, iteration=iteration, max_iter=max_iter,
-                no_tester=True, queue=queue,
-            )
+                outcome = handle_review_result(
+                    review_result, iteration=iteration, max_iter=max_iter,
+                    no_tester=True, queue=queue,
+                )
+                if next_review_action(outcome, _review_attempts) != "retry":
+                    break
+                _review_attempts += 1
+                click.echo(
+                    f"Review task did not run "
+                    f"(status={getattr(review_result, 'status', '?')}) — retrying "
+                    f"({_review_attempts}/{REVIEW_RETRY_MAX})."
+                )
             if outcome == "escalate":
                 click.echo(f"Escalated after {max_iter} iterations.")
                 return
             if outcome == "approved":
                 click.echo("Loop complete: approved.")
+                return
+
+            # #301/#302: retries exhausted and it still never ran.
+            if outcome == "review_failed":
+                click.echo(
+                    f"Review task did not run after {REVIEW_RETRY_MAX} retries "
+                    f"(status={getattr(review_result, 'status', '?')}). Stopping "
+                    f"rather than re-implementing against empty feedback."
+                )
                 return
 
             feedback = build_feedback(review_result)

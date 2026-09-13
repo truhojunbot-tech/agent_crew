@@ -3,6 +3,7 @@
 - _prepare_worktree_for_task: stash → fetch → checkout per role
 - _load_worktree_map: reads {role: path} from state.json
 """
+import pytest
 import json
 from unittest.mock import call, patch, MagicMock
 
@@ -154,25 +155,32 @@ def test_prepare_tester_pins_the_pr_branch_the_same_way():
     assert not [c for c in checkout if "-B" in c]
 
 
-def test_prepare_reviewer_falls_back_to_main_if_branch_absent():
-    """If origin/<task_branch> does not resolve, fall back to origin/main.
+def test_prepare_reviewer_refuses_if_the_branch_is_absent():
+    """⚠️Inverted by #301: this asserted the fallback to `origin/main`.
 
-    ⛔The fallback moved from checkout-time to RESOLVE-time (#286): there is now
-      one checkout, at whichever ref produced a commit. A second checkout would
-      mean the worktree had already been moved once."""
+      Falling back means the reviewer is prepared at main and reports findings
+      about main under a task that named something else. #289 already refused
+      the same thing for an unresolvable PR head; a branch that resolves nowhere
+      in this repo is that hazard by a shorter route.
+
+      What this test still guards is unchanged: both refs are probed, and the
+      worktree is never checked out at the wrong one."""
+    from agent_crew.server import WorktreeTargetUnresolved
+
     cmds = []
     with patch("agent_crew.server.subprocess.run",
                side_effect=_resolving_run(cmds, fail_refs=("gone-branch",))):
-        _prepare_worktree_for_task(
-            "/wt/codex", "review-eeff5566", "agent/gone-branch", "reviewer"
-        )
+        with pytest.raises(WorktreeTargetUnresolved):
+            _prepare_worktree_for_task(
+                "/wt/codex", "review-eeff5566", "agent/gone-branch", "reviewer"
+            )
 
     git = _git_calls(cmds)
     probed = [" ".join(c) for c in git if "rev-parse" in c]
     assert any("origin/agent/gone-branch" in p for p in probed), probed
     assert any("origin/main" in p for p in probed), probed
-    checkout = [c for c in git if "checkout" in c]
-    assert len(checkout) == 1, f"expected one checkout, got {checkout}"
+    assert [c for c in git if "checkout" in c] == [], \
+        "refused, so the worktree must not have been moved at all"
 
 
 def test_prepare_worktree_failure_does_not_raise():
@@ -237,7 +245,11 @@ def test_every_git_call_has_a_timeout_reviewer_path_including_fallback(monkeypat
 
     monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
 
-    _prepare_worktree_for_task("/wt/codex", "review-eeff5566", "agent/gone-branch", "reviewer")
+    # #301: this branch does not resolve, so prep now refuses. The timeout
+    # invariant is asserted over the calls it made before refusing — an
+    # unbounded git call is just as dangerous on the path that ends in a raise.
+    with pytest.raises(Exception):
+        _prepare_worktree_for_task("/wt/codex", "review-eeff5566", "agent/gone-branch", "reviewer")
 
     git_calls = [(cmd, kw) for cmd, kw in calls if cmd[:2] == ["git", "-C"]]
     # ⛔The point of this test is the timeout on EVERY call, and #286 added the
