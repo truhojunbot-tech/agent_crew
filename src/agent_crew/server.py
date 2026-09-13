@@ -202,6 +202,13 @@ def _object_id_or_empty(value) -> str:
 
 
 class WorktreePrepRefused(RuntimeError):
+    #: Reason recorded on the task when this refusal stops a dispatch. It lives
+    #: on the class so it travels with the category — both handlers used to
+    #: hardcode `pr_head_unresolved`, so an unhealable worktree sent an operator
+    #: looking for a PR that was never the problem, and a third refusal reason
+    #: would have inherited the wrong label by default (review of PR #298).
+    reason = "worktree_prep_refused"
+
     """Prep refused to hand this worktree to an agent.
 
     The shared base both push paths catch. A refusal means the worktree is not
@@ -213,6 +220,8 @@ class WorktreePrepRefused(RuntimeError):
 
 class WorktreeUnhealthy(WorktreePrepRefused):
     """The worktree's own HEAD does not resolve and could not be healed (#296)."""
+
+    reason = "worktree_unhealthy"
 
 
 class WorktreeTargetUnresolved(WorktreePrepRefused):
@@ -228,6 +237,8 @@ class WorktreeTargetUnresolved(WorktreePrepRefused):
       The asymmetry decides it: a deferred review is recoverable, a confident
       review of the wrong tree is not.
     """
+
+    reason = "pr_head_unresolved"
 
 
 def _unborn_head_ref(worktree_path: str) -> str:
@@ -355,14 +366,33 @@ def _heal_unborn_head(worktree_path: str, main_branch: str, ref: str = "",
         f"paths: {names[:5]}"
     )
 
-    for cmd in (["update-ref", ref, sha], ["reset", "--mixed"]):
-        r = subprocess.run(
-            ["git", "-C", worktree_path, *cmd],
-            capture_output=True, text=True, timeout=60,
+    # ⛔Compare-and-swap, not check-then-write. The pre-check above is a fast,
+    #   clearer diagnostic; it is NOT what makes this safe. `update-ref --stdin`
+    #   with `create` verifies non-existence as part of the same operation, so a
+    #   sibling worktree creating this branch between the check and the write
+    #   loses nothing — the create fails and we refuse. A plain
+    #   `update-ref <ref> <sha>` would overwrite whatever landed in that window,
+    #   which is the shared-namespace force-move #280 forbids, reached by a race
+    #   instead of by intent (review of PR #298).
+    create = subprocess.run(
+        ["git", "-C", worktree_path, "update-ref", "--stdin", "-z"],
+        input=f"create {ref}\x00{sha}\x00", capture_output=True, text=True,
+        timeout=60,
+    )
+    if create.returncode != 0:
+        logger.error(
+            f"{what}: could not create {ref} atomically — another worktree may "
+            f"have created it first. Refusing rather than overwriting it (#280): "
+            f"{create.stderr.strip()}"
         )
-        if r.returncode != 0:
-            logger.error(f"{what}: heal step {cmd[0]!r} failed: {r.stderr.strip()}")
-            return False
+        return False
+    reset = subprocess.run(
+        ["git", "-C", worktree_path, "reset", "--mixed"],
+        capture_output=True, text=True, timeout=60,
+    )
+    if reset.returncode != 0:
+        logger.error(f"{what}: heal step 'reset' failed: {reset.stderr.strip()}")
+        return False
 
     healed = _worktree_is_healthy(worktree_path)
     logger.warning(
@@ -2064,7 +2094,7 @@ def create_app(
                         f"_try_push_next: refusing to push {role} "
                         f"task_id={task.task_id} — {exc}"
                     )
-                    _fail_if_active(task.task_id, "pr_head_unresolved",
+                    _fail_if_active(task.task_id, getattr(exc, "reason", "worktree_prep_refused"),
                                     status="needs_human")
                     return
                 except Exception:
@@ -2916,7 +2946,7 @@ def create_app(
                     f"— {exc}"
                 )
                 _lock_stack.close()
-                _fail_if_active(task.task_id, "pr_head_unresolved",
+                _fail_if_active(task.task_id, getattr(exc, "reason", "worktree_prep_refused"),
                                 status="needs_human")
                 return
             except Exception:

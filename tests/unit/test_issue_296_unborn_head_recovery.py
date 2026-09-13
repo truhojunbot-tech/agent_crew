@@ -286,3 +286,148 @@ def test_the_dispatcher_does_not_launch_into_a_broken_worktree(tmp_path, monkeyp
 
     assert spawned == [], "an agent was dispatched into an unusable worktree"
     assert status == "needs_human", status
+
+
+def test_a_clean_creation_still_succeeds(repo):
+    """⛔The control. Atomicity must not cost the heal its normal path."""
+    clone, wt = repo
+    ref = f"refs/heads/{_break(wt)}"
+    assert sv._heal_unborn_head(str(wt), "main", ref, what="test") is True
+    assert _git("rev-parse", "HEAD", cwd=wt).returncode == 0
+
+
+def test_creation_is_a_compare_and_swap(repo):
+    """★★The argv, because the guarantee lives in it. `update-ref` must carry an
+    expected-old value; without one the write is unconditional however careful
+    the code around it looks."""
+    clone, wt = repo
+    _break(wt)
+    seen = []
+    real_run = sv.subprocess.run
+
+    def spy(cmd, **kw):
+        if isinstance(cmd, list) and "update-ref" in cmd:
+            seen.append((cmd, kw))
+        return real_run(cmd, **kw)
+
+    import unittest.mock as mock
+    with mock.patch.object(sv.subprocess, "run", spy):
+        assert sv._heal_unborn_head(str(wt), "main", what="test") is True
+
+    assert len(seen) == 1, seen
+    cmd, kwargs = seen[0]
+    args = cmd[cmd.index("update-ref"):]
+    # Either spelling of compare-and-swap is fine; an unconditional
+    # `update-ref <ref> <sha>` is not. `--stdin` + `create` says "verify it does
+    # not exist" outright and needs no hash-algorithm-specific zero sentinel,
+    # so it is accepted alongside the expected-old argv form.
+    stdin_create = "--stdin" in args and "create " in (kwargs.get("input") or "")
+    expected_old = len(args) == 4 and set(args[3]) in ({"0"}, set())
+    assert stdin_create or expected_old, f"unconditional write: {args} {kwargs.get('input')!r}"
+
+
+def test_a_branch_created_between_check_and_write_is_not_overwritten(repo):
+    """★★The race itself. Another worktree creates the branch after the heal has
+    looked and before it writes; the write must lose rather than clobber."""
+    clone, wt = repo
+    branch = _break(wt)
+    intruder = _git("rev-parse", "origin/main", cwd=wt).stdout.strip()
+    real_run = sv.subprocess.run
+    raced = {"done": False}
+
+    def spy(cmd, **kw):
+        # The heal's existence probe is the moment the window opens: answer
+        # "absent" (as it truly is), then let the other worktree win.
+        if (isinstance(cmd, list) and "rev-parse" in cmd and "--verify" in cmd
+                and branch in " ".join(cmd) and not raced["done"]):
+            result = real_run(cmd, **kw)
+            raced["done"] = True
+            real_run(["git", "-C", str(clone), "branch", branch, intruder],
+                     capture_output=True, text=True)
+            return result
+        return real_run(cmd, **kw)
+
+    import unittest.mock as mock
+    with mock.patch.object(sv.subprocess, "run", spy):
+        healed = sv._heal_unborn_head(str(wt), "main", what="test")
+
+    assert raced["done"], "the race never happened — this test proves nothing"
+    assert healed is False, "the heal reported success after losing the race"
+    assert _git("rev-parse", branch, cwd=clone).stdout.strip() == intruder, \
+        "the other worktree's ref was overwritten"
+
+
+def test_losing_the_race_is_reported_loudly(repo, caplog):
+    """⛔A heal that quietly gives up leaves an unusable worktree and an
+    operator with no idea why. The refusal downstream is only actionable if the
+    reason reached the log."""
+    import logging
+
+    clone, wt = repo
+    branch = _break(wt)
+    _git("branch", branch, _git("rev-parse", "origin/main", cwd=wt).stdout.strip(),
+         cwd=clone)
+    with caplog.at_level(logging.ERROR, logger="agent_crew.server"):
+        assert sv._heal_unborn_head(str(wt), "main", what="test") is False
+    assert branch in caplog.text
+
+
+# ── 5. the refusal names the right cause ──────────────────────────────
+
+
+def test_an_unhealthy_worktree_is_not_reported_as_a_pr_problem(tmp_path,
+                                                               monkeypatch, repo):
+    """★★Review of PR #298, P2. Both handlers hardcoded `pr_head_unresolved`, so
+    an operator reading the failure of a worktree whose HEAD does not resolve
+    was sent to look at a PR that is perfectly fine."""
+    import asyncio
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    wt = _unhealable(repo)
+    spawned = []
+
+    async def _fake_exec(*cmd, **kwargs):
+        spawned.append(list(cmd))
+
+        class _P:
+            returncode, pid = 0, 1
+
+            async def wait(self):
+                return 0
+        return _P()
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+                     project="demo", watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(task_id="t-298", task_type="implement",
+                              description="go", branch="main", context={}))
+        task = q.dequeue(role="implementer")
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+        row = {t.task_id: t for t in q.list_tasks()}["t-298"]
+
+    assert spawned == []
+    assert row.status == "needs_human"
+    assert "worktree_unhealthy" in (row.summary or ""), row.summary
+    assert "pr_head_unresolved" not in (row.summary or ""), row.summary
+
+
+def test_each_refusal_carries_its_own_reason():
+    """⛔The reason travels with the exception category rather than being
+    written at the call site, so a third refusal cannot inherit the wrong one
+    by being caught in the same handler."""
+    assert sv.WorktreeUnhealthy.reason == "worktree_unhealthy"
+    assert sv.WorktreeTargetUnresolved.reason == "pr_head_unresolved"
+    assert sv.WorktreePrepRefused.reason  # a usable default for any future one
