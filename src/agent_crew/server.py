@@ -1508,12 +1508,93 @@ def _should_clear_context(tokens: Optional[int], *, threshold: int) -> bool:
     return tokens is not None and tokens >= threshold
 
 
-def _pane_clear_context(pane_id: str) -> None:
-    """Send /clear to a Claude pane to reset context (#133)."""
-    subprocess.run(["tmux", "send-keys", "-t", pane_id, "/clear", "Enter"],
-                   capture_output=True)
+def _pane_clear_context(pane_id: str, *, task_id: str = "", project: str = "",
+                        role: str = "", agent: str = "", worktree_path: str = "",
+                        context_tokens=None, token_source: str = "",
+                        threshold=None, events_path: str = "",
+                        queue=None) -> bool:
+    """Send /clear to a pane and RECORD that it happened (#133, #297).
+
+    #293 made the 200k actuator reliable — five of seven worktrees were over
+    threshold when it was measured — and this function emitted nothing at all.
+    An unrecorded clear contaminates the resume-vs-fresh benchmark directly: the
+    provider runs with cleared state while the economics stay attached to a
+    context whose recorded policy still says `resume`.
+
+    ⛔The outcome is ``attempted``, never ``completed``. `send-keys` returning 0
+      proves the keystrokes were delivered to the pane, not that the provider
+      acted on them; there is no confirmation channel here, and claiming one
+      would invent a fact. A non-zero return IS informative and is recorded as
+      ``send_failed``.
+
+    Returns whether the keystrokes were sent.
+    """
+    r = subprocess.run(["tmux", "send-keys", "-t", pane_id, "/clear", "Enter"],
+                       capture_output=True, text=True)
+    sent = getattr(r, "returncode", 1) == 0
+    if events_path:
+        # Identity is READ, never minted: the push path has not resolved a
+        # context yet, and asking `get_or_create_context` here would bump a
+        # generation as a side effect of describing one. `task_id` is the join
+        # key regardless; this is the audit detail (#297).
+        identity = {}
+        if queue is not None and project and agent and worktree_path:
+            try:
+                identity = queue.peek_context_identity(project, agent, worktree_path)
+            except Exception:  # noqa: BLE001 — telemetry never breaks a push
+                identity = {}
+        try:
+            record_context_event(
+                events_path, "provider_context_cleared",
+                task_id=task_id, project=project, role=role, agent=agent,
+                provider=agent, pane_id=pane_id,
+                context_id=identity.get("context_id"),
+                context_generation=identity.get("context_generation"),
+                provider_session_id=identity.get("provider_session_id"),
+                context_tokens=context_tokens,
+                token_source=token_source or None,
+                cap_tokens=threshold,
+                reason="auto_clear_token_threshold",
+                outcome="attempted" if sent else "send_failed",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"_pane_clear_context: could not record the clear of {pane_id}")
     import time as _time
     _time.sleep(2.0)
+    return sent
+
+
+def _mark_auto_cleared(queue, task, *, context_tokens=None,
+                       token_source: str = "") -> None:
+    """Record on the task that its pane was cleared right before the push (#297).
+
+    ⛔`context_reset` is the correction, not a new concept. It is what an
+      operator sets to force a fresh context, and after a real `/clear` it is
+      simply true — so the next resolution bumps the generation and records
+      `fresh`. A cohort keyed on the recorded policy then cannot pick this task
+      up as an ordinary resume, which is the contamination #297 describes.
+
+    ⛔The `auto_clear_*` fields are additive and separate so a consumer can
+      EXCLUDE or stratify auto-cleared rows specifically, rather than seeing
+      `fresh` and having to guess which of several reasons produced it.
+
+    An operator's explicit `context_reset` is left alone: their intent must not
+    be relabelled as an auto-clear.
+    """
+    try:
+        existing = task.context if isinstance(task.context, dict) else {}
+        extra = {
+            "context_reset": True,
+            "auto_cleared_before_push": True,
+            "auto_clear_context_tokens": context_tokens,
+            "auto_clear_token_source": token_source or None,
+        }
+        queue.patch_context(task.task_id, extra)
+        task.context = {**existing, **extra}
+    except Exception:  # noqa: BLE001 — never let bookkeeping block a push
+        logger.exception(
+            f"_mark_auto_cleared: could not mark {task.task_id} as auto-cleared")
 
 
 _GEMINI_PERMISSION_RE = re.compile(r"Allow execution of .+\?", re.IGNORECASE)
@@ -2073,7 +2154,16 @@ def create_app(
                 f"_try_push_next: pane {pane_id} has {tok} tokens via {_tok_source} "
                 f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
             )
-            _pane_clear_context(pane_id)
+            _pane_clear_context(
+                pane_id, task_id=task.task_id, project=task.project or "",
+                role=role, agent=_target_agent, worktree_path=_tok_wt,
+                context_tokens=tok, token_source=_tok_source,
+                threshold=_TOKEN_CLEAR_THRESHOLD,
+                events_path=_context_events_path, queue=q())
+            # #297: the provider is about to run with cleared state, so the
+            # task must not be reported as an ordinary resume.
+            _mark_auto_cleared(q(), task, context_tokens=tok,
+                               token_source=_tok_source)
         elif _push_enabled and tok is None:
             # ⛔Visible, because this is the state that hid the bug for so long:
             #   it used to read as 0 and look like a healthy small context.
@@ -2160,7 +2250,14 @@ def create_app(
                 f"{_tok_source} (>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear "
                 f"before push"
             )
-            _pane_clear_context(pane_id)
+            _pane_clear_context(
+                pane_id, task_id=task.task_id, project=task.project or "",
+                role=_DEFAULT_AGENT_TO_ROLE.get(agent, ""), agent=agent,
+                worktree_path=_discuss_wt, context_tokens=tok,
+                token_source=_tok_source, threshold=_TOKEN_CLEAR_THRESHOLD,
+                events_path=_context_events_path, queue=q())
+            _mark_auto_cleared(q(), task, context_tokens=tok,
+                               token_source=_tok_source)
         elif _push_enabled and tok is None:
             logger.warning(
                 f"_try_push_discuss: pane {pane_id} context size is UNKNOWN — no "

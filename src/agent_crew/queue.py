@@ -1481,6 +1481,34 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def peek_context_identity(self, project: str, agent: str,
+                              worktree_path: str) -> dict:
+        """The recorded context identity for this triple, or ``{}`` (#297).
+
+        A read with no side effects, like its `provider_session_id` sibling
+        below and for the same reason: `get_or_create_context` mints an id,
+        bumps the generation and increments the task index, so it cannot be
+        used to ASK a question. An auto-clear needs to name the context it is
+        clearing before anything has decided what the next one will be.
+
+        ``{}`` when no context has been recorded yet — never a fabricated id.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT context_id, context_generation, provider_session_id "
+                "FROM context_state WHERE project=? AND agent=? AND worktree_path=?",
+                (project, agent, worktree_path)).fetchone()
+            if row is None:
+                return {}
+            return {
+                "context_id": row["context_id"] or "",
+                "context_generation": row["context_generation"] or 0,
+                "provider_session_id": row["provider_session_id"] or "",
+            }
+        finally:
+            conn.close()
+
     def peek_context_provider_session_id(self, project: str, agent: str,
                                          worktree_path: str) -> str:
         """The provider session recorded for this context, WITHOUT minting one.

@@ -174,7 +174,7 @@ def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch):
 
     cleared = []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
@@ -213,7 +213,7 @@ def test_the_push_path_does_not_clear_a_small_session(tmp_path, monkeypatch):
 
     cleared = []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
@@ -326,7 +326,7 @@ def _override_push(tmp_path, monkeypatch, *, override, role_worktrees, claude_to
 
     cleared, pushed = [], []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
@@ -398,7 +398,7 @@ def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
 
     cleared, pushed = [], []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
@@ -438,7 +438,7 @@ def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch):
 
     cleared, pushed = [], []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
     monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
@@ -545,7 +545,7 @@ def test_a_configured_claude_reviewer_is_not_sized_by_the_implementer(tmp_path,
 
     cleared, pushed = [], []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
@@ -590,7 +590,7 @@ def test_the_configured_implementer_is_still_cleared_when_saturated(tmp_path,
 
     cleared, pushed = [], []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
@@ -640,7 +640,7 @@ def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch):
 
     cleared, pushed = [], []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
-    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
     monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
