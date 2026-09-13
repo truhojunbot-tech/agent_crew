@@ -328,3 +328,27 @@ def test_the_failed_review_never_reaches_enqueue_implement_with_feedback():
     assert handle_review_result(result, iteration=1, max_iter=3) == "review_failed"
     assert build_feedback(result) == "Review feedback (task review-f20ceaf8):", \
         "the vacuous feedback still exists — it just must never be enqueued"
+
+
+def test_the_feedback_enqueue_is_guarded_where_production_actually_calls_it():
+    """⚠️#302 words the regression as "must not reach
+      `enqueue_implement_with_feedback`". That helper has no production caller —
+      only `tests/integration/test_loop_integration.py` uses it. The live path
+      is `cli.py` calling `enqueue_implement(..., context={"feedback": ...})`
+      with `build_feedback`'s output.
+
+      So the regression is enforced where the call actually happens: the outcome
+      is `review_failed`, and both loops check it before they can fall through.
+      Asserted here so a later reader does not "fix" the unused helper and
+      believe the path is closed."""
+    import inspect
+
+    from agent_crew import cli, loop
+
+    assert "enqueue_implement_with_feedback" not in inspect.getsource(cli), \
+        "production now calls the helper — guard it there too"
+    # the helper still exists and still builds vacuous feedback; that is fine,
+    # because nothing in production reaches it with a failed review.
+    assert callable(loop.enqueue_implement_with_feedback)
+    assert inspect.getsource(cli).count('context={"feedback": feedback}') == 1, \
+        "a second unguarded feedback enqueue appeared"
