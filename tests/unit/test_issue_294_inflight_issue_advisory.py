@@ -302,3 +302,90 @@ def test_a_boolean_is_not_an_issue_number():
 
     task.description = "no issue named here"
     assert task_issue_number(task) is None
+
+
+# ── 4. the row the queue writes must be the resolver's answer ─────────
+
+
+def _enqueued_issue(tmp_db, *, description, context, task_id="impl-a"):
+    """What `enqueue` actually persisted as this task's issue."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                          description=description, branch="main", context=context))
+    return q.get_task_context(task_id)
+
+
+def test_enqueue_stores_the_parsed_number_when_the_context_says_nothing(tmp_db):
+    assert _enqueued_issue(tmp_db, description="Implement #294: go",
+                           context={})["issue"] == 294
+
+
+def test_enqueue_stores_the_parsed_number_over_a_boolean(tmp_db):
+    """★★The review's finding. `bool` is a subclass of `int`, so the gate
+    `not isinstance(context.get("issue"), int)` is False for `True` — the
+    backfill never ran and the row kept `issue: true`, while
+    `task_issue_number()` (which does reject bool) told the advisory 294.
+
+    That is the one-resolver invariant broken at the only place it is observable:
+    the advisory and the stored row disagreeing about the same task, which is the
+    entire defect PR #295 exists to close."""
+    assert _enqueued_issue(tmp_db, description="Implement #294: go",
+                           context={"issue": True})["issue"] == 294
+
+
+def test_a_boolean_with_no_issue_in_the_description_is_not_stored(tmp_db):
+    """⛔`True` must not survive as the issue either. Left in place it joins as
+    issue #1 on every `WHERE issue = ?` path — #276's watcher guard and #294's
+    advisory both — attributing this task to a real, unrelated issue."""
+    stored = _enqueued_issue(tmp_db, description="no issue named here",
+                             context={"issue": True})
+    assert "issue" not in stored, f"stored a bool as an issue number: {stored!r}"
+
+
+def test_a_real_structured_issue_is_never_overwritten(tmp_db):
+    """⛔The control. Precedence must survive the fix: a valid claim wins over
+    the description, and nothing here may rewrite it."""
+    assert _enqueued_issue(tmp_db, description="Implement #294: misleading",
+                           context={"issue": 900})["issue"] == 900
+
+
+def test_the_row_and_the_resolver_never_disagree(tmp_db):
+    """The invariant itself, stated once over the cases that differ.
+
+    ⛔Asserted against `task_issue_number` rather than against literals, so this
+      keeps biting if the resolver's own rules change."""
+    from agent_crew.queue import task_issue_number
+
+    for n, (description, context) in enumerate((
+        ("Implement #294: go", {}),
+        ("Implement #294: go", {"issue": True}),
+        ("Implement #294: go", {"issue": 900}),
+        ("no issue named here", {"issue": True}),
+        ("no issue named here", {}),
+    )):
+        expected = task_issue_number(TaskRequest(
+            task_id="probe", task_type="implement", description=description,
+            branch="main", context=dict(context)))
+        stored = _enqueued_issue(tmp_db, description=description,
+                                 context=dict(context),
+                                 task_id=f"impl-{n}").get("issue")
+        assert stored == expected, (
+            f"{description!r} + {context!r}: row says {stored!r}, "
+            f"resolver says {expected!r}")
+
+
+def test_a_context_only_enqueue_can_read_is_not_discarded(tmp_db):
+    """⛔The drop must remove non-numbers, not everything the resolver missed.
+
+    `TaskRequest` is a plain dataclass — `context: dict` is a annotation, not a
+    coercion — so the two sites can genuinely see different things. Given a
+    sequence of pairs, `task_issue_number()` reads it as no context at all
+    (`isinstance(..., dict)` is False) while `enqueue` coerces it with
+    `dict(...)` and sees issue 292. Dropping on `resolved is None` alone would
+    throw that 292 away, which is the same class of bug as the one this PR
+    closes: two readings of one task's issue, and the row losing the argument.
+    """
+    stored = _enqueued_issue(tmp_db, description="no issue named here",
+                             context=[("issue", 292)])
+    assert stored.get("issue") == 292, \
+        f"discarded an issue number enqueue could read: {stored!r}"
