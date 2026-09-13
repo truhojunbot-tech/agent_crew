@@ -2220,6 +2220,19 @@ def run_cmd(task: str, db: str, project: str, base: str,
             click.echo(f"[{iteration}/{max_iter}] ❌ Escalated after {max_iter} iterations.")
             return
 
+        # #301: the reviewer never ran, so it asked for nothing. Enqueueing an
+        # implement round here spends a full invocation on feedback that is an
+        # empty header — the loop this stops was measured at five dispatches in
+        # fifteen minutes against an unchanged deliverable.
+        if outcome == "review_failed":
+            click.echo(
+                f"[{iteration}/{max_iter}] ⚠️ Review task did not complete "
+                f"(status={getattr(review_result, 'status', '?')}). Stopping: a "
+                f"review that did not run has not requested changes. Re-dispatch "
+                f"the review once the cause is fixed."
+            )
+            return
+
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] ✅ Review approved ({review_elapsed}s)")
             # Auto-resolve any pending gates before proceeding
@@ -2657,6 +2670,15 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
                 return
             if outcome == "approved":
                 click.echo("Loop complete: approved.")
+                return
+
+            # #301: same guard on the discuss/topic loop.
+            if outcome == "review_failed":
+                click.echo(
+                    f"Review task did not complete "
+                    f"(status={getattr(review_result, 'status', '?')}). Stopping "
+                    f"rather than re-implementing against empty feedback."
+                )
                 return
 
             feedback = build_feedback(review_result)

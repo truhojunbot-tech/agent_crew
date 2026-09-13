@@ -158,6 +158,20 @@ def handle_review_result(
     branch: str = "",
     port: int = 0,
 ) -> str:
+    # #301: a review that did not finish has not said anything about the work.
+    # ⛔`_resolve_verdict` maps every non-completed status to `request_changes`,
+    #   which reads "the reviewer rejected this" — so a reviewer that crashed
+    #   produced a fix round carrying `build_feedback`'s bare header and no
+    #   findings. Measured 2026-09-13: five implement dispatches against four
+    #   `exit_1` reviews in fifteen minutes, zero changes requested, the
+    #   deliverable byte-identical throughout. The round cap did not help,
+    #   because those were never `fix` rounds.
+    #
+    #   It must not consume an escalation round either: `iteration >= max_iter`
+    #   would turn an infrastructure fault into a verdict about the work.
+    if getattr(result, "status", None) not in (None, "completed"):
+        return "review_failed"
+
     verdict = _resolve_verdict(result)
     if iteration >= max_iter and verdict != "approve":
         if queue is not None:

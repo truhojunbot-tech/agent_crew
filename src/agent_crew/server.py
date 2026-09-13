@@ -591,6 +591,7 @@ def _prepare_worktree_for_task_inner(
         _pin = _pinned_sha
         _candidates = ([_pin] if _pin else []) + [target_ref, f"origin/{main_branch}"]
         _resolved = ""
+        _resolved_from = ""
         for _ref in _candidates:
             probe = subprocess.run(
                 ["git", "-C", worktree_path, "rev-parse", "--verify", f"{_ref}^{{commit}}"],
@@ -598,6 +599,7 @@ def _prepare_worktree_for_task_inner(
             )
             if probe.returncode == 0 and probe.stdout.strip():
                 _resolved = probe.stdout.strip()
+                _resolved_from = _ref
                 if _pin and _ref == _pin:
                     logger.info(
                         f"_prepare_worktree_for_task: {role} {task_id} honouring "
@@ -622,6 +624,26 @@ def _prepare_worktree_for_task_inner(
                         f"reviewed_sha will change (#286)."
                     )
                 break
+        # #301: REFUSE rather than review main under another branch's name.
+        # ⛔The fallback below is `origin/<main>`, which always resolves — so a
+        #   task naming a branch this repo does not have was silently prepared
+        #   at main and reviewed. Measured 2026-09-13: a quota-ops branch
+        #   dispatched on the agent_crew queue produced four `exit_1` reviews and
+        #   five implement dispatches in fifteen minutes, against a deliverable
+        #   that never changed. The warning above said so and nothing read it.
+        #
+        #   This is #289's rule reaching the case it did not name: a reviewer
+        #   that cannot find its target must stop, not review something else.
+        #   A resolved pin still wins (#286) — it IS the target, already known.
+        _main_ref = f"origin/{main_branch}"
+        if _resolved and _resolved_from == _main_ref and target_ref != _main_ref:
+            raise WorktreeTargetUnresolved(
+                f"{role} {task_id} names branch {target_ref!r}, which does not "
+                f"resolve in this repository. Refusing to fall back to "
+                f"{_main_ref} — a review prepared at main is a review of the "
+                f"wrong code, reported under this task's name (#301). If the "
+                f"branch lives in another repo, the task is on the wrong queue."
+            )
         if not _resolved:
             logger.error(
                 f"_prepare_worktree_for_task: {role} {task_id} could not resolve "
@@ -651,6 +673,22 @@ def _prepare_worktree_for_task_inner(
     # head" from "this review is about three commits ago", and a fix task gets
     # created for work that already exists.
     return _worktree_head(worktree_path)
+
+
+def _review_result_is_actionable(result) -> bool:
+    """Did this review actually review anything?
+
+    ⛔`_resolve_verdict` maps every non-completed status to `request_changes`,
+      so a reviewer that crashed asks for changes nobody requested — and
+      `build_feedback` fills the fix task with its bare header, because a review
+      that did not run has no findings. Measured 2026-09-13 (#301): four `exit_1`
+      reviews drove five implement dispatches in fifteen minutes against a
+      deliverable that never changed.
+
+      A skipped cascade is recoverable; the provider invocations those rounds
+      spent are not. That asymmetry is the whole argument (#250).
+    """
+    return getattr(result, "status", None) in (None, "completed")
 
 
 _DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}
@@ -4411,7 +4449,8 @@ def create_app(
             # needed an operator to hand-enqueue the fix with the findings
             # pasted in. Bounded by AGENT_CREW_REVIEW_FIX_MAX_ROUNDS inside the
             # cascade, so a reviewer that keeps rejecting cannot spin the loop.
-            elif task_type == "review" and _resolve_verdict(result) == "request_changes":
+            elif (task_type == "review" and _resolve_verdict(result) == "request_changes"
+                    and _review_result_is_actionable(result)):
                 review_ctx = ctx if isinstance(ctx, dict) else {}
                 if review_ctx.get("coordinator_managed"):
                     logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto fix enqueue")
