@@ -57,7 +57,14 @@ def _git_calls(cmds_list):
 
 
 def test_prepare_implementer_checks_out_task_branch():
-    """Implementer: stash → fetch → checkout -B <task_branch> origin/main."""
+    """Implementer: stash → fetch → checkout the task branch.
+
+    ⚠️This used to pass `agent/feat-xyz` and require `checkout -B`. #300 narrowed
+      force-move rights to the name agent_crew generates for THIS task, because
+      a shared `agent/` prefix was never proof it created the branch — so the
+      same call now correctly detaches. The task id's own branch keeps the
+      `-B`, which is what this test is actually about.
+    """
     cmds = []
 
     def fake_run(cmd, **_kw):
@@ -66,7 +73,7 @@ def test_prepare_implementer_checks_out_task_branch():
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
         _prepare_worktree_for_task(
-            "/wt/claude", "task-abc123", "agent/feat-xyz", "implementer"
+            "/wt/claude", "task-abc123", "agent/task-abc123", "implementer"
         )
 
     git = _git_calls(cmds)
@@ -77,7 +84,7 @@ def test_prepare_implementer_checks_out_task_branch():
     # checkout -B agent/feat-xyz origin/main
     checkout = [c for c in git if "checkout" in c]
     assert checkout, "no checkout call"
-    assert any("agent/feat-xyz" in " ".join(c) for c in checkout)
+    assert any("agent/task-abc123" in " ".join(c) for c in checkout)
     assert any("origin/main" in " ".join(c) for c in checkout)
 
 

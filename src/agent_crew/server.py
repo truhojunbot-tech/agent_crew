@@ -118,12 +118,14 @@ def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Option
     return None
 
 
-#: Branch namespaces agent_crew generates itself, and may therefore force-move.
-_OWNED_BRANCH_PREFIXES = ("agent/", "review/", "test/")
+def _generated_branch_name(task_id: str) -> str:
+    """The one branch name the implementer path invents for a task (#140)."""
+    tid = (task_id or "").strip()
+    return f"agent/{tid[:12]}" if tid else ""
 
 
-def _agent_crew_owns_branch(branch: str) -> bool:
-    """May agent_crew force-move this ref?
+def _agent_crew_owns_branch(branch: str, task_id: str = "") -> bool:
+    """May agent_crew force-move this ref? Only if it created it, for this task.
 
     ⛔The dispatcher's worktrees are `git worktree add` off the caller's clone,
       so `refs/heads/*` is ONE namespace shared with every sibling worktree and
@@ -137,12 +139,30 @@ def _agent_crew_owns_branch(branch: str) -> bool:
       clone the dispatcher was never pointed at, while they were committing to
       it. Nothing was lost only because they had pushed first.
 
-      So: only names agent_crew itself generates are safe to force-move.
-      Anything else — `main`, a feature branch, anything a human named — gets a
-      detached checkout, which touches no ref at all.
+    ⚠️#283 drew this line at the NAMESPACE — `agent/`, `review/`, `test/` are
+      ours — and that was too generous by exactly the amount that mattered.
+      A prefix is not proof of authorship. Measured on alpha_engine
+      2026-09-13: all 24 of its local `agent/…` branches were made by its own
+      CLI tooling (`agent/claude-cli/…`, `agent/codex/…`, `agent/diag-…`), none
+      by agent_crew, and `agent/claude-cli/4270-durable-id-backlog` was found
+      sitting on a commit from `main`'s history, 18 behind its own remote tip —
+      #280's signature, after #280 was closed. agent_crew's own `--help`
+      documents `--branch agent/claude-cli/1665-feature`, so this was the
+      advertised path (#300).
+
+      It is also the instructed path: the implementer protocol tells agents to
+      `git checkout -b agent/<something-specific>`, which means a #244 fix round
+      dispatched at that branch was resetting the implementation it existed to
+      fix.
+
+    So ownership is proof, not resemblance: the only name we may force-move is
+    the one we would have generated for THIS task. Anything else — including
+    `agent/<another task id>` — gets a detached checkout, which touches no ref.
+    Without a task_id we cannot prove authorship, so we fail closed.
     """
     name = (branch or "").strip()
-    return any(name.startswith(prefix) for prefix in _OWNED_BRANCH_PREFIXES)
+    generated = _generated_branch_name(task_id)
+    return bool(generated) and name == generated
 
 
 def _checkout_detached(worktree_path: str, refs, *, what: str) -> bool:
@@ -505,15 +525,22 @@ def _prepare_worktree_for_task_inner(
     if role == "implementer":
         # Fresh branch per task from origin/main (#140). Use task.branch when
         # set (crew run --branch), otherwise derive from task_id.
-        branch = task_branch if task_branch else f"agent/{task_id[:12]}"
-        if not _agent_crew_owns_branch(branch):
+        branch = task_branch if task_branch else _generated_branch_name(task_id)
+        if not _agent_crew_owns_branch(branch, task_id):
             # #280: somebody else's branch name. Do not create it, do not move
             # it — start from its own remote tip so the task still sees the code
-            # it was dispatched for, and fall back to main when there is no such
-            # remote (a name that does not exist yet).
+            # it was dispatched for.
+            #
+            # ⛔The local ref is tried BEFORE falling back to main. Dropping
+            #   straight to `origin/main` when `origin/<branch>` misses is how a
+            #   fix round silently starts from main and "fixes" the previous
+            #   implementation by discarding it — alpha_engine reported exactly
+            #   that ("local PR branch ref points to origin/main while remote PR
+            #   head and prior fix are elsewhere"). Reading a ref moves nothing,
+            #   and unpushed work exists nowhere else (#300).
             _checkout_detached(
                 worktree_path,
-                [f"origin/{branch}", f"origin/{main_branch}"],
+                [f"origin/{branch}", branch, f"origin/{main_branch}"],
                 what=f"implementer {task_id}",
             )
         else:

@@ -63,12 +63,26 @@ def _forced(git_calls):
 # ── 1. who owns which namespace ───────────────────────────────────────
 
 
+def test_agent_crew_owns_the_name_it_generates():
+    """⚠️This used to assert the whole `agent/`, `review/`, `test/` NAMESPACE was
+      ours. #300 measured what that cost: alpha_engine's own tooling names
+      branches `agent/claude-cli/…`, and one of them was found reset onto
+      `main`'s history, 18 commits behind its remote tip — #280's signature,
+      after #280 was closed. A prefix is not proof of authorship.
+
+      The invariant this file exists for is unchanged and now stronger: ours is
+      exactly the name we generate for this task, and every other ref in the
+      shared namespace is left alone. See
+      tests/unit/test_issue_300_branch_namespace_ownership.py."""
+    assert _agent_crew_owns_branch("agent/task-abc123", "task-abc123") is True
+
+
 @pytest.mark.parametrize("branch", [
-    "agent/task-abc123", "agent/quota-ops/claude", "agent/claude/280-fix",
+    "agent/quota-ops/claude", "agent/claude/280-fix", "agent/claude-cli/4270-x",
     "review/ab12cd34", "test/ff00ff00",
 ])
-def test_agent_crew_owns_its_own_namespaces(branch):
-    assert _agent_crew_owns_branch(branch) is True
+def test_the_rest_of_the_namespace_is_not_ours(branch):
+    assert _agent_crew_owns_branch(branch, "task-abc123") is False
 
 
 @pytest.mark.parametrize("branch", [
@@ -77,7 +91,7 @@ def test_agent_crew_owns_its_own_namespaces(branch):
     "agents/x", "myagent/x", "", "   ",
 ])
 def test_everything_else_belongs_to_somebody_else(branch):
-    assert _agent_crew_owns_branch(branch) is False
+    assert _agent_crew_owns_branch(branch, "task-abc123") is False
 
 
 # ── 2. the incident, at the argv level ────────────────────────────────
@@ -110,8 +124,10 @@ def test_the_detach_falls_back_to_main_when_the_branch_has_no_remote(  ):
     the task runnable without inventing a ref."""
     git = _run_prepare("brand-new-thing", "implementer", rc=1)   # every git call fails
     detach = [c for c in git if "checkout" in c and "--detach" in c]
-    assert len(detach) == 2, "expected a retry at origin/main after the first detach failed"
-    assert "origin/main" in " ".join(detach[-1])
+    # origin/<branch> → <branch> → origin/main. The local ref is tried in
+    # between so unpushed work is not silently replaced by main (#300).
+    assert len(detach) == 3, f"tried {[c[-1] for c in detach]}"
+    assert "origin/main" in " ".join(detach[-1]), "main must remain the last resort"
 
 
 # ── 3. what must NOT change ───────────────────────────────────────────
@@ -126,8 +142,13 @@ def test_the_derived_implementer_branch_still_gets_a_real_branch(  ):
         "the implementer lost its own working branch"
 
 
-def test_an_explicitly_named_agent_branch_is_still_ours(  ):
-    assert "agent/feat-xyz" in _forced(_run_prepare("agent/feat-xyz", "implementer"))
+def test_an_explicitly_named_foreign_agent_branch_is_not_ours(  ):
+    """⚠️Inverted by #300. `agent/feat-xyz` is a name agent_crew never generated
+      — the implementer protocol tells agents to create exactly such names, so
+      force-moving it to `origin/main` discarded the work it was dispatched to
+      continue. It is detached now, like any other ref we did not make."""
+    assert "agent/feat-xyz" not in _forced(_run_prepare("agent/feat-xyz", "implementer"))
+    assert "agent/task-abc123" in _forced(_run_prepare("agent/task-abc123", "implementer"))
 
 
 @pytest.mark.parametrize("role", ["reviewer", "tester"])
