@@ -1419,8 +1419,27 @@ def _pane_token_count(pane_id: str) -> Optional[int]:
     return int(float(raw))
 
 
+def _agent_worktree(worktree_map, agent: str, role: str = "") -> str:
+    """The worktree ``agent`` actually works in, or ``""`` (#292 review).
+
+    The map is keyed by role in role-based mode and by agent otherwise, so both
+    spellings are tried — but only ever for THIS agent.
+
+    ⛔Never falls back to the task's own role worktree. That fallback is the
+      defect this exists to fix: with `agent_override` the pane belongs to one
+      provider while `worktree_map[role]` belongs to another, and handing back
+      the role's worktree would measure a directory the target agent does not
+      own. Unlocatable is `""`, which reads downstream as unknown.
+    """
+    if not worktree_map or not agent:
+        return ""
+    return (worktree_map.get(agent)
+            or worktree_map.get(_DEFAULT_AGENT_TO_ROLE.get(agent, ""))
+            or "")
+
+
 def _context_token_count(pane_id: str, worktree_path: str = "",
-                         *, home=None) -> tuple:
+                         *, agent: str = "", home=None) -> tuple:
     """``(tokens, source)`` for the context a pane is carrying (#292).
 
     ``tokens`` is ``None`` when nothing could be measured — never ``0``, which
@@ -1437,7 +1456,14 @@ def _context_token_count(pane_id: str, worktree_path: str = "",
         because a caller thresholding on a fabricated 0 is exactly the failure
         #292 describes.
     """
-    if worktree_path:
+    # ⛔Gated on the TARGET agent, not merely on having a path. The transcript
+    #   reader is Claude-specific: pointing it at another provider's worktree
+    #   reads whatever stale Claude session happens to sit there, and pointing
+    #   it at Claude's worktree while the task is routed to another provider's
+    #   pane sizes one pane by another's window. `agent_override` produces both
+    #   (review of PR #293). If we cannot say the pane is Claude's, we cannot
+    #   say the transcript is the one it is carrying.
+    if agent == "claude" and worktree_path:
         tokens, _ = claude_context_tokens(worktree_path, home=home)
         if tokens is not None:
             return (tokens, "transcript")
@@ -1879,6 +1905,7 @@ def create_app(
             return  # nothing pending
 
         # Check if task has an agent_override in context
+        _target_agent = _DISPATCH_ROLE_TO_AGENT.get(role, "")
         task_context = task.context if isinstance(task.context, dict) else {}
         logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
         if "agent_override" in task_context:
@@ -1887,6 +1914,9 @@ def create_app(
             if override_pane_id:
                 logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
                 pane_id = override_pane_id
+                # #292 review: the context measurement follows the pane, so it
+                # has to follow the override too.
+                _target_agent = agent_override
             else:
                 logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
                 return
@@ -2012,8 +2042,9 @@ def create_app(
         #   disabled, so borrowing its variable made this line unreachable-safe
         #   only by accident and raised UnboundLocalError on every push in that
         #   configuration. The measurement must not depend on whether prep ran.
-        _tok_wt = (worktree_map or {}).get(role) or ""
-        tok, _tok_source = _context_token_count(pane_id, _tok_wt)
+        _tok_wt = _agent_worktree(worktree_map, _target_agent, role)
+        tok, _tok_source = _context_token_count(pane_id, _tok_wt,
+                                                agent=_target_agent)
         if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
             logger.info(
                 f"_try_push_next: pane {pane_id} has {tok} tokens via {_tok_source} "
@@ -2097,11 +2128,8 @@ def create_app(
         # agent rather than the role, so the worktree is resolved through the
         # role map — panels are exactly the panes that accumulate the most
         # context, which is why #260 added a guard here at all.
-        _discuss_wt = ""
-        if worktree_map:
-            _discuss_wt = (worktree_map.get(_DEFAULT_AGENT_TO_ROLE.get(agent, ""))
-                           or worktree_map.get(agent) or "")
-        tok, _tok_source = _context_token_count(pane_id, _discuss_wt)
+        _discuss_wt = _agent_worktree(worktree_map, agent)
+        tok, _tok_source = _context_token_count(pane_id, _discuss_wt, agent=agent)
         if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
             logger.info(
                 f"_try_push_discuss: pane {pane_id} has {tok} tokens via "

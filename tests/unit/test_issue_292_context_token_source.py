@@ -83,7 +83,7 @@ def test_the_transcript_is_preferred_over_the_pane(tmp_path):
     situation exactly; the transcript has to win."""
     _session(tmp_path, "/w/claude", {"cache_read_input_tokens": 900_000})
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%1", "/w/claude", agent="claude", home=tmp_path)
     assert tokens == 900_000 and source == "transcript"
 
 
@@ -93,7 +93,7 @@ def test_the_transcript_wins_even_when_the_hint_is_present(tmp_path):
     is the one to threshold against."""
     _session(tmp_path, "/w/claude", {"cache_read_input_tokens": 123_456})
     with patch.object(sv.subprocess, "run", _pane(HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%1", "/w/claude", agent="claude", home=tmp_path)
     assert tokens == 123_456 and source == "transcript"
 
 
@@ -105,7 +105,7 @@ def test_a_measured_zero_from_the_transcript_is_not_unknown(tmp_path):
                                      "cache_creation_input_tokens": 0,
                                      "input_tokens": 0})
     with patch.object(sv.subprocess, "run", _pane(HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%1", "/w/claude", agent="claude", home=tmp_path)
     assert tokens == 0 and source == "transcript"
 
 
@@ -113,13 +113,13 @@ def test_without_a_transcript_the_pane_hint_is_the_fallback(tmp_path):
     """Providers other than Claude have no transcript to read; the old signal
     is still better than nothing for them."""
     with patch.object(sv.subprocess, "run", _pane(HINT)):
-        tokens, source = sv._context_token_count("%1", "", home=tmp_path)
+        tokens, source = sv._context_token_count("%1", "", agent="claude", home=tmp_path)
     assert tokens == 544_100 and source == "pane_hint"
 
 
 def test_neither_source_is_unknown(tmp_path):
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/nothing", home=tmp_path)
+        tokens, source = sv._context_token_count("%1", "/w/nothing", agent="claude", home=tmp_path)
     assert tokens is None and source == "unknown"
 
 
@@ -231,3 +231,229 @@ def test_the_push_path_does_not_clear_a_small_session(tmp_path, monkeypatch):
             "branch": "main", "priority": 3, "context": {}, "project": "demo"})
 
     assert cleared == []
+
+
+# ── 5. the measurement must follow the TARGET AGENT ───────────────────
+#
+# Review of PR #293, P1. `agent_override` repoints `pane_id` at another
+# provider's pane, but the measurement still took `worktree_map[role]` and fed
+# it to `claude_context_tokens()` unconditionally. Two ways that goes wrong:
+#
+#   * an implementer task overridden to codex uses the codex pane while reading
+#     the implementer/Claude transcript — a big Claude window then sends
+#     `/clear` to a codex pane that has nothing to do with it;
+#   * a reviewer task overridden to claude uses the claude pane while pointing
+#     at the reviewer/codex worktree — if a stale Claude transcript happens to
+#     sit there, it is measured instead of the real one.
+#
+# ⛔The transcript reader is Claude-specific. Binding it to a path alone was the
+#   defect; it has to be bound to the agent that path belongs to.
+
+
+def test_a_non_claude_agent_never_reads_a_claude_transcript(tmp_path):
+    """★★A codex pane must not be sized by a Claude transcript that happens to
+    exist in the worktree it was handed."""
+    _session(tmp_path, "/w/codex", {"cache_read_input_tokens": 900_000})
+    with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
+        tokens, source = sv._context_token_count(
+            "%2", "/w/codex", agent="codex", home=tmp_path)
+    assert source != "transcript"
+    assert tokens is None
+
+
+def test_a_non_claude_agent_still_gets_the_pane_hint(tmp_path):
+    """⛔The fallback is what those providers have; gating the transcript must
+    not take the old signal away from them."""
+    _session(tmp_path, "/w/codex", {"cache_read_input_tokens": 900_000})
+    with patch.object(sv.subprocess, "run", _pane(HINT)):
+        tokens, source = sv._context_token_count(
+            "%2", "/w/codex", agent="codex", home=tmp_path)
+    assert (tokens, source) == (544_100, "pane_hint")
+
+
+def test_claude_still_reads_its_transcript(tmp_path):
+    _session(tmp_path, "/w/claude", {"cache_read_input_tokens": 900_000})
+    with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
+        tokens, source = sv._context_token_count(
+            "%1", "/w/claude", agent="claude", home=tmp_path)
+    assert (tokens, source) == (900_000, "transcript")
+
+
+def test_an_unknown_agent_does_not_read_a_transcript(tmp_path):
+    """⛔Fail closed on identity: if we cannot say the pane is Claude's, we
+    cannot say the transcript is the one it is carrying."""
+    _session(tmp_path, "/w/x", {"cache_read_input_tokens": 900_000})
+    with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
+        assert sv._context_token_count("%9", "/w/x", agent="", home=tmp_path) == (None, "unknown")
+
+
+def test_the_worktree_follows_the_agent_not_the_role():
+    """The map is keyed by role in one mode and by agent in the other; either
+    way the answer must be the worktree that AGENT works in."""
+    by_agent = {"claude": "/w/claude", "codex": "/w/codex"}
+    by_role = {"implementer": "/w/claude", "reviewer": "/w/codex"}
+    assert sv._agent_worktree(by_agent, "codex", "implementer") == "/w/codex"
+    assert sv._agent_worktree(by_role, "codex", "implementer") == "/w/codex"
+    assert sv._agent_worktree(by_role, "claude", "reviewer") == "/w/claude"
+
+
+def test_an_unlocatable_agent_worktree_is_empty_not_someone_elses():
+    """⛔Returning the task's own role worktree as a fallback would reintroduce
+    exactly the bug: measuring a worktree the target agent does not own."""
+    assert sv._agent_worktree({"implementer": "/w/claude"}, "gemini", "implementer") == ""
+
+
+def _override_push(tmp_path, monkeypatch, *, override, role_worktrees, claude_tokens):
+    """Push one task with an agent_override; return the panes that got /clear."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    # ⛔state.json's legacy `worktrees` map is keyed by AGENT; the server maps
+    #   it to roles on load. Keying it by role here produced an empty
+    #   worktree_map and the assertion failed for a fixture reason rather than
+    #   a code one.
+    worktrees = {}
+    for agent_name in role_worktrees.values():
+        wt = tmp_path / "worktrees" / agent_name
+        wt.mkdir(parents=True, exist_ok=True)
+        worktrees[agent_name] = str(wt)
+    _session(tmp_path / "claudehome", worktrees["claude"],
+             {"cache_read_input_tokens": claude_tokens})
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "worktrees": worktrees}))
+
+    cleared, pushed = [], []
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
+    monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"implementer": "%1", "reviewer": "%2",
+                               "claude": "%1", "codex": "%2"},
+                     port=0, push_fn=lambda pane, text: pushed.append(pane),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-override", "task_type": "implement", "description": "go",
+            "branch": "main", "priority": 3, "project": "demo",
+            "context": {"agent_override": override}})
+    return cleared, pushed
+
+
+def test_an_override_does_not_clear_the_wrong_pane(tmp_path, monkeypatch):
+    """★★The reported failure. The implementer's Claude transcript is far over
+    the threshold, but the task is routed to the codex pane — which must not be
+    cleared on the strength of a window it is not carrying."""
+    cleared, pushed = _override_push(
+        tmp_path, monkeypatch, override="codex",
+        role_worktrees={"implementer": "claude", "reviewer": "codex"},
+        claude_tokens=900_000)
+    assert pushed == ["%2"], pushed
+    assert cleared == [], f"cleared the wrong pane: {cleared}"
+
+
+def test_without_an_override_the_saturated_pane_is_still_cleared(tmp_path, monkeypatch):
+    """⛔The control. Binding to the agent must not switch the guard off for the
+    ordinary case #292 exists to fix."""
+    cleared, pushed = _override_push(
+        tmp_path, monkeypatch, override="claude",
+        role_worktrees={"implementer": "claude", "reviewer": "codex"},
+        claude_tokens=900_000)
+    assert pushed == ["%1"]
+    assert cleared == ["%1"]
+
+
+def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
+                                                                    monkeypatch):
+    """★★The review's other scenario, and the one the agent gate alone does NOT
+    cover: a reviewer task overridden to claude uses the claude pane, so the
+    gate passes — but if the worktree is still keyed on the task's role it
+    points at codex's directory, and a stale Claude transcript sitting there is
+    measured instead of the real one.
+
+    Found by mutation: reverting the worktree lookup to `worktree_map[role]`
+    killed no test until this one existed."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    claude_wt = tmp_path / "worktrees" / "claude"
+    codex_wt = tmp_path / "worktrees" / "codex"
+    for d in (claude_wt, codex_wt):
+        d.mkdir(parents=True)
+    # Claude's own session is small; a STALE one sits in codex's worktree.
+    _session(tmp_path / "claudehome", str(claude_wt), {"cache_read_input_tokens": 10})
+    _session(tmp_path / "claudehome", str(codex_wt), {"cache_read_input_tokens": 900_000})
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "worktrees": {
+        "claude": str(claude_wt), "codex": str(codex_wt)}}))
+
+    cleared, pushed = [], []
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
+    monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"implementer": "%1", "reviewer": "%2",
+                               "claude": "%1", "codex": "%2"},
+                     port=0, push_fn=lambda pane, text: pushed.append(pane),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-rev-override", "task_type": "review",
+            "description": "review", "branch": "main", "priority": 3,
+            "project": "demo", "context": {"agent_override": "claude"}})
+
+    assert pushed == ["%1"], pushed
+    assert cleared == [], "cleared on a transcript from a worktree claude does not own"
+
+
+def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch):
+    """⛔The discuss path takes the agent directly, so it looked safe — but
+    nothing asserted the gate until mutation forced `agent="claude"` there and
+    killed no test. A codex panel must not be sized by a Claude transcript."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    codex_wt = tmp_path / "worktrees" / "codex"
+    codex_wt.mkdir(parents=True)
+    _session(tmp_path / "claudehome", str(codex_wt), {"cache_read_input_tokens": 900_000})
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "worktrees": {"codex": str(codex_wt)}}))
+
+    cleared, pushed = [], []
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
+    monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"codex": "%2", "reviewer": "%2"}, port=0,
+                     push_fn=lambda pane, text: pushed.append(pane),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-discuss", "task_type": "discuss",
+            "description": "discuss", "branch": "main", "priority": 3,
+            "project": "demo", "context": {"agent": "codex"}})
+
+    assert pushed == ["%2"], pushed
+    assert cleared == [], "a codex panel was cleared on a Claude transcript"
