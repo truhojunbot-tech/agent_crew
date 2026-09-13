@@ -260,3 +260,153 @@ def test_a_known_context_identity_is_attached(tmp_path, monkeypatch):
 def test_an_unknown_context_identity_is_absent_not_invented(tmp_path):
     q = TaskQueue(str(tmp_path / "empty.db"))
     assert q.peek_context_identity("nobody", "nothing", "/nowhere") == {}
+
+
+# ── 5. a clear that did not happen must not be recorded as one ────────
+#
+# Review of PR #299. Two findings:
+#
+#   P1: `_pane_clear_context` returns False when `send-keys` fails and records
+#       `outcome=send_failed` — and both callers discarded that result and
+#       marked the task anyway. `context_reset: true` for a pane that still
+#       holds its whole conversation reverses #297's own guarantee: instead of
+#       a cleared task hiding in the `resume` cohort, an UNcleared one lands in
+#       `fresh`. Same contamination, opposite direction.
+#   P2: the discuss event derived `role` from the static default rather than
+#       the live map, so a configured custom role was misattributed — the same
+#       class of bug as #292's round-2 finding, in the event's role field.
+
+
+def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None):
+    """Same push, but tmux refuses the keystrokes."""
+    wt = tmp_path / "worktrees" / "demo" / "claude"
+    wt.mkdir(parents=True, exist_ok=True)
+    _session(tmp_path / "claudehome", str(wt), BIG)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+
+    def fake_run(cmd, **kw):
+        if isinstance(cmd, list) and "send-keys" in cmd and "/clear" in cmd:
+            class _R:
+                returncode = 1
+                stdout = ""
+                stderr = "can't find pane"
+            return _R()
+        return _pane()
+
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda p: True)
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda p: False)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda p: None)
+    monkeypatch.setattr(sv.subprocess, "run", fake_run)
+    monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"implementer": "%1", "claude": "%1"}, port=0,
+                     push_fn=lambda p, t: None, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-299", "task_type": task_type, "description": "go",
+            "branch": "main", "priority": 3, "project": "demo",
+            "context": context or {}})
+        ctx = TaskQueue(db).get_task_context("t-299")
+    return db, ctx
+
+
+def test_a_failed_send_does_not_claim_a_fresh_context(tmp_path, monkeypatch):
+    """★★The finding. Marking `context_reset` for a pane that was not cleared
+    puts an UNcleared task into the `fresh` cohort — the same contamination
+    #297 exists to prevent, pointing the other way."""
+    _, ctx = _failing_send(tmp_path, monkeypatch)
+    assert "context_reset" not in ctx, ctx
+    assert "auto_cleared_before_push" not in ctx, ctx
+
+
+def test_a_failed_send_on_the_discuss_path_is_also_unmarked(tmp_path, monkeypatch):
+    _, ctx = _failing_send(tmp_path, monkeypatch, task_type="discuss",
+                           context={"agent": "claude"})
+    assert "context_reset" not in ctx
+    assert "auto_cleared_before_push" not in ctx
+
+
+def test_a_failed_send_is_still_recorded(tmp_path, monkeypatch):
+    """⛔The attempt is still a fact, and the one the operator most needs: a
+    pane over threshold that could not be cleared is unguarded. Not marking the
+    task must not mean staying silent about it."""
+    db, _ = _failing_send(tmp_path, monkeypatch)
+    events = _cleared_events(db)
+    assert len(events) == 1
+    assert events[0]["outcome"] == "send_failed"
+
+
+def test_a_successful_send_is_still_marked(tmp_path, monkeypatch):
+    """⛔The control, so the fix is not simply "never mark"."""
+    _, _, ctx = _run(tmp_path, monkeypatch)
+    assert ctx["context_reset"] is True and ctx["auto_cleared_before_push"] is True
+
+
+# ── 6. the event's role comes from the live map ───────────────────────
+
+
+def test_the_discuss_event_uses_the_configured_role(tmp_path, monkeypatch):
+    """★★P2. The static default says claude implements; a config that says
+    otherwise has to win, or the event describes a deployment that does not
+    exist."""
+    wt = tmp_path / "worktrees" / "claude"
+    wt.mkdir(parents=True)
+    _session(tmp_path / "claudehome", str(wt), BIG)
+    state = tmp_path / "state.json"
+    # ⛔All three roles listed. `_load_role_to_agent` starts from the defaults
+    #   and only overrides what is present, so naming reviewer alone would leave
+    #   claude holding implementer TOO — ambiguous, and the lookup would
+    #   correctly refuse to name a role. The config has to actually make claude
+    #   single-roled for this test to be about the live map.
+    state.write_text(json.dumps({"port": 0, "roles": [
+        {"role": "reviewer", "agent": "claude", "worktree": str(wt)},
+        {"role": "implementer", "agent": "codex", "worktree": str(wt.parent / "codex")},
+        {"role": "tester", "agent": "gemini", "worktree": str(wt.parent / "gemini")},
+    ]}))
+    (wt.parent / "codex").mkdir(exist_ok=True)
+    (wt.parent / "gemini").mkdir(exist_ok=True)
+
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda p: True)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda p: None)
+    monkeypatch.setattr(sv.subprocess, "run", lambda *a, **k: _pane())
+    monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"claude": "%2", "reviewer": "%2"}, port=0,
+                     push_fn=lambda p, t: None, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-299r", "task_type": "discuss", "description": "d",
+            "branch": "main", "priority": 3, "project": "demo",
+            "context": {"agent": "claude"}})
+
+    events = _cleared_events(db)
+    assert len(events) == 1, events
+    assert events[0]["role"] == "reviewer", events[0]["role"]
+
+
+def test_an_ambiguous_agent_emits_no_role_rather_than_a_guess():
+    """⛔When one provider holds several roles there is no single answer, and
+    naming one would be a guess in an audit record. Absent is the honest value
+    — the same call this repo already makes for the worktree lookup."""
+    live = {"implementer": "claude", "reviewer": "claude", "tester": "gemini"}
+    assert sv._agent_role("claude", live) == ""
+    assert sv._agent_role("gemini", live) == "tester"
+
+
+def test_the_role_lookup_falls_back_to_the_static_default():
+    assert sv._agent_role("codex", None) == "reviewer"
+
+
+def test_an_unknown_agent_has_no_role():
+    assert sv._agent_role("nobody", {"implementer": "claude"}) == ""

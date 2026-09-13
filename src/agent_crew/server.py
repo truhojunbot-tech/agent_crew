@@ -1419,6 +1419,30 @@ def _pane_token_count(pane_id: str) -> Optional[int]:
     return int(float(raw))
 
 
+def _roles_for_agent(agent: str, role_to_agent=None) -> list:
+    """Every role the live configuration assigns to ``agent`` (#292/#299).
+
+    One lookup, shared by the worktree resolver and the auto-clear event.
+    ⛔Two copies of "which role is this agent" would drift, and the drift would
+      be invisible until one of them described a deployment that does not
+      exist — which is exactly how both of these got the static default wrong.
+    """
+    mapping = role_to_agent or _DEFAULT_ROLE_TO_AGENT
+    return [r for r, a in mapping.items() if a == agent]
+
+
+def _agent_role(agent: str, role_to_agent=None) -> str:
+    """The single role ``agent`` holds, or ``""`` (#299).
+
+    ⛔Ambiguity is reported as absence, not resolved by picking one. When a
+      provider holds several roles there is no single answer, and naming one in
+      an audit record would be a guess dressed as a fact. The worktree resolver
+      makes the same call for the same reason.
+    """
+    roles = _roles_for_agent(agent, role_to_agent)
+    return roles[0] if len(roles) == 1 else ""
+
+
 def _agent_worktree(worktree_map, agent: str, role: str = "",
                     *, role_to_agent=None) -> str:
     """The worktree ``agent`` actually works in, or ``""`` (#292 review).
@@ -1451,8 +1475,7 @@ def _agent_worktree(worktree_map, agent: str, role: str = "",
     direct = worktree_map.get(agent)
     if direct:
         return direct
-    mapping = role_to_agent or _DEFAULT_ROLE_TO_AGENT
-    roles = [r for r, a in mapping.items() if a == agent]
+    roles = _roles_for_agent(agent, role_to_agent)
     if role and role in roles and worktree_map.get(role):
         return worktree_map[role]
     if len(roles) == 1 and worktree_map.get(roles[0]):
@@ -2154,16 +2177,28 @@ def create_app(
                 f"_try_push_next: pane {pane_id} has {tok} tokens via {_tok_source} "
                 f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
             )
-            _pane_clear_context(
+            _sent = _pane_clear_context(
                 pane_id, task_id=task.task_id, project=task.project or "",
                 role=role, agent=_target_agent, worktree_path=_tok_wt,
                 context_tokens=tok, token_source=_tok_source,
                 threshold=_TOKEN_CLEAR_THRESHOLD,
                 events_path=_context_events_path, queue=q())
-            # #297: the provider is about to run with cleared state, so the
-            # task must not be reported as an ordinary resume.
-            _mark_auto_cleared(q(), task, context_tokens=tok,
-                               token_source=_tok_source)
+            if _sent:
+                # #297: the provider is about to run with cleared state, so the
+                # task must not be reported as an ordinary resume.
+                _mark_auto_cleared(q(), task, context_tokens=tok,
+                                   token_source=_tok_source)
+            else:
+                # ⛔Marking here would be worse than the bug #297 fixed: an
+                #   UNcleared task recorded as `fresh` poisons that cohort
+                #   instead of the resume one. The attempt is still recorded as
+                #   `send_failed`, and this pane is now over threshold with
+                #   nothing having cleared it (review of PR #299).
+                logger.error(
+                    f"_try_push_next: /clear could not be sent to {pane_id} — "
+                    f"the pane is over threshold and was NOT cleared. Pushing "
+                    f"anyway, unmarked; its context is unchanged (#297)."
+                )
         elif _push_enabled and tok is None:
             # ⛔Visible, because this is the state that hid the bug for so long:
             #   it used to read as 0 and look like a healthy small context.
@@ -2250,14 +2285,21 @@ def create_app(
                 f"{_tok_source} (>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear "
                 f"before push"
             )
-            _pane_clear_context(
+            _sent = _pane_clear_context(
                 pane_id, task_id=task.task_id, project=task.project or "",
-                role=_DEFAULT_AGENT_TO_ROLE.get(agent, ""), agent=agent,
+                role=_agent_role(agent, _DISPATCH_ROLE_TO_AGENT), agent=agent,
                 worktree_path=_discuss_wt, context_tokens=tok,
                 token_source=_tok_source, threshold=_TOKEN_CLEAR_THRESHOLD,
                 events_path=_context_events_path, queue=q())
-            _mark_auto_cleared(q(), task, context_tokens=tok,
-                               token_source=_tok_source)
+            if _sent:
+                _mark_auto_cleared(q(), task, context_tokens=tok,
+                                   token_source=_tok_source)
+            else:
+                logger.error(
+                    f"_try_push_discuss: /clear could not be sent to {pane_id} "
+                    f"— the pane is over threshold and was NOT cleared. Pushing "
+                    f"anyway, unmarked (#297)."
+                )
         elif _push_enabled and tok is None:
             logger.warning(
                 f"_try_push_discuss: pane {pane_id} context size is UNKNOWN — no "
