@@ -275,6 +275,42 @@ class TaskAlreadyExistsError(Exception):
         super().__init__(f"task_id {task_id!r} already exists with status={status!r}")
 
 
+def _is_issue_number(value) -> bool:
+    """Is this a usable issue number?
+
+    ⛔`bool` is a subclass of `int`, so a bare `isinstance(x, int)` accepts
+      `True` and treats it as issue #1 — a real issue, which every
+      `WHERE issue = ?` path then joins this task to. #270 lost a round to this
+      once, and PR #295's own review found it a second time: the resolver
+      rejected bools while `enqueue`'s gate did not, so a task the advisory
+      resolved to #294 was persisted as `issue: true`. One predicate, so the
+      two sites cannot answer differently again.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def task_issue_number(task) -> Optional[int]:
+    """The issue a task is about — structured field first, description second.
+
+    ⛔One resolver, because there are two call sites and they must agree.
+      `TaskQueue.enqueue` backfills `context["issue"]` from an opening
+      `Implement #N` description (#276), and `POST /tasks`'s in-flight advisory
+      (#294) has to answer the same question BEFORE that write happens. Reading
+      `context.issue` alone there meant a direct enqueue whose issue lived only
+      in its description reported no collision and was then stored under that
+      very issue — the advisory and the row it produced disagreeing about one
+      task, and missing precisely the shape #276 exists for (review of PR #295).
+
+    Structured precedence is unchanged: a description is free text, a context
+    key is a claim, and when both are present the claim answers.
+    """
+    context = task.context if isinstance(getattr(task, "context", None), dict) else {}
+    number = context.get("issue")
+    if _is_issue_number(number):
+        return number
+    return issue_from_description(getattr(task, "description", None))
+
+
 class TaskQueue:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -339,10 +375,18 @@ class TaskQueue:
         #   and a backfill written through would be found by a later pass as if
         #   the caller had supplied it.
         context = dict(task.context or {})
-        if not isinstance(context.get("issue"), int):
-            described = issue_from_description(task.description)
-            if described is not None:
-                context["issue"] = described
+        # ⛔The row stores the resolver's answer, full stop. Gating on
+        #   `isinstance(..., int)` let `True` through — bool is a subclass of
+        #   int — so a task the advisory had already resolved to #294 was
+        #   persisted as `issue: true`, which is the advisory and the row
+        #   disagreeing about one task: precisely the defect this PR closes
+        #   (review of PR #295). A value that is not an issue number is dropped
+        #   rather than left to join as issue #1.
+        resolved = task_issue_number(task)
+        if resolved is not None:
+            context["issue"] = resolved
+        elif "issue" in context and not _is_issue_number(context["issue"]):
+            context.pop("issue")
         conn = self._connect()
         try:
             conn.execute(

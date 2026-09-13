@@ -551,6 +551,50 @@ def active_issue_numbers(queue, repo: str = "") -> set:
     return out
 
 
+def active_tasks_for_issue(queue, number: int, *, task_type: str = "",
+                           repo: str = "") -> list:
+    """Task ids with a non-terminal task for ``number``, newest last (#294).
+
+    The per-issue detail behind :func:`active_issue_numbers`, which answers only
+    "is anything in flight" and is all the watcher needs. A caller deciding
+    whether to warn about a collision needs to name the task it collided with,
+    or the warning is unactionable.
+
+    ⛔Shares :func:`_issue_of`, so the description fallback #276 added applies
+      here too. Two copies of "which issue is this task about" would drift, and
+      the drift would be invisible until it produced exactly the duplicate this
+      exists to surface.
+
+    ``task_type`` narrows to one type. #294's expensive case is a second
+    *implement* for an issue that already has a non-terminal implement; review,
+    fix and test tasks legitimately share an issue with it, and flagging those
+    would make the signal noise.
+
+    Never raises -- this is advisory bookkeeping and must not be able to cost a
+    caller their enqueue.
+    """
+    try:
+        rows = queue.list_all_with_status()
+    except Exception:  # noqa: BLE001 — never let bookkeeping break a caller
+        return []
+    out: list = []
+    for row in rows or []:
+        if _issue_of(row) != number:
+            continue
+        if (row.get("status") or "") in _TERMINAL_TASK_STATUSES:
+            continue
+        if task_type and (row.get("task_type") or "") != task_type:
+            continue
+        context = row.get("context") or {}
+        row_repo = context.get("repo") or ""
+        if repo and row_repo and row_repo != repo:
+            continue
+        task_id = row.get("task_id")
+        if task_id:
+            out.append(task_id)
+    return out
+
+
 def tasks_by_issue(queue, repo: str = "") -> Optional[dict]:
     """`{issue number: task_id}` for **every** task, terminal ones included.
 
