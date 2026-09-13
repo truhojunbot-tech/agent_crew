@@ -1,9 +1,7 @@
 """#301 — a review that never ran is not a review that rejected.
 
-Measured on this host 2026-09-13 12:38–12:53 KST. A quota-ops branch was
-dispatched on the agent_crew queue; the reviewer's worktree has no such branch,
-so every review exited 1 without a verdict. Five implement dispatches and four
-failed reviews in fifteen minutes, zero changes requested, zero changes needed —
+Measured on this host 2026-09-13 12:38–12:53 KST. Five implement dispatches and
+four failed reviews in fifteen minutes, zero changes requested and zero needed —
 the deliverable was byte-identical throughout:
 
     impl-7b107cef    implement  completed    12:38:06
@@ -34,6 +32,26 @@ Three defects, each tested separately below:
 ⛔The round cap does not help. `AGENT_CREW_REVIEW_FIX_MAX_ROUNDS` bounds `fix`
   lineages, and these were never fix rounds — no review ever returned
   `request_changes`, because no review ever returned anything.
+
+⚠️CAUSE, CORRECTED. My first report (#301) blamed the reviewer's worktree for
+  not having the branch — a quota-ops branch was indeed dispatched on the
+  agent_crew queue, and `git ls-remote` confirms it resolves nowhere here. That
+  observation is true and it is NOT what happened. `dispatch_reviewer.log` has
+  the actual answer for all four reviews:
+
+      TASK review-f20ceaf8 | reviewer | 2026-09-13 12:49:05
+      [codex error] You've hit your usage limit. …try again at 3:18 PM.
+      [codex turn.failed] You've hit your usage limit. …
+
+  The reviewer died inside codex on a provider quota limit, before the worktree
+  was ever the question. I inferred causation from a true but unrelated fact
+  instead of reading the log that names the cause. #301 was rightly closed as an
+  inaccurate diagnosis; #302 re-reports the one mechanism it got right, which is
+  what defect 1 below fixes.
+
+  Defect 3 survives on its own merits — silently reviewing main under another
+  branch's name is wrong whatever triggers it, and #289 already settled that
+  argument — but it was latent here, not causal, and is no longer claimed to be.
 """
 
 import pytest
@@ -222,11 +240,12 @@ def test_the_new_outcome_is_not_silently_one_of_the_old_ones():
 # did not do: when the review itself failed to run, RETRY THE REVIEW — as with
 # any other transient dispatch failure — rather than stopping.
 #
-# ⛔Bounded, because the measured cause was not transient. Four consecutive
-#   `exit_1` reviews came from a branch that does not exist in this repo; an
-#   unbounded retry would have spun exactly the loop #301 exists to stop, just
-#   with review tasks instead of implement tasks. Retry covers the transient
-#   case and gives up on the structural one.
+# ⛔Bounded. The measured cause — codex usage-limit exhaustion, quota exhausted
+#   until 3:18 PM — is transient in principle but lasted well past four retries
+#   in practice. An unbounded retry would have spun the same loop with review
+#   tasks instead of implement tasks, against a provider that was going to
+#   refuse every one of them. Retry absorbs a brief blip; the cap stops the rest
+#   and leaves a human to read the reason.
 
 
 def test_a_failed_review_is_retried_then_given_up_on():

@@ -626,11 +626,16 @@ def _prepare_worktree_for_task_inner(
                 break
         # #301: REFUSE rather than review main under another branch's name.
         # ⛔The fallback below is `origin/<main>`, which always resolves — so a
-        #   task naming a branch this repo does not have was silently prepared
-        #   at main and reviewed. Measured 2026-09-13: a quota-ops branch
-        #   dispatched on the agent_crew queue produced four `exit_1` reviews and
-        #   five implement dispatches in fifteen minutes, against a deliverable
-        #   that never changed. The warning above said so and nothing read it.
+        #   task naming a branch this repo does not have is silently prepared at
+        #   main and reviewed, with the findings reported under that task's name.
+        #   The warning above says so and nothing reads it.
+        #
+        # ⚠️Found while investigating #301, NOT the cause of it. That incident's
+        #   four `exit_1` reviews were codex usage-limit exhaustion
+        #   (`dispatch_reviewer.log`), and #301 was closed as an inaccurate
+        #   diagnosis. This remains a real defect on its own merits — #289
+        #   already refused exactly this for an unresolvable PR head — but it was
+        #   latent there, not causal.
         #
         #   This is #289's rule reaching the case it did not name: a reviewer
         #   that cannot find its target must stop, not review something else.
