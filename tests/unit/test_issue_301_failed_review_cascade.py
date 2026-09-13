@@ -204,19 +204,22 @@ def test_both_cli_loops_stop_instead_of_re_implementing():
     from agent_crew import cli
 
     source = inspect.getsource(cli)
-    assert source.count('outcome == "review_failed"') == 2, (
-        "each review loop must stop on a review that did not run; found "
-        f"{source.count('outcome == \"review_failed\"')} guard(s)")
+    # ⛔Counted into locals first. A backslash inside an f-string expression is a
+    #   SyntaxError before Python 3.12, and `pyproject.toml` supports >=3.10 —
+    #   so the escaped quote this used to interpolate aborted the whole file at
+    #   COLLECTION on a supported interpreter, taking every test in it down
+    #   before one could run (review of PR #303).
+    stop_guards = source.count('outcome == "review_failed"')
+    retry_calls = source.count("next_review_action(")
+
+    assert stop_guards == 2, (
+        f"each review loop must stop on a review that did not run; "
+        f"found {stop_guards} guard(s)")
     # #302: and each must RETRY before it stops, or the retry budget is dead
     # code that no loop ever consults.
-    assert source.count("next_review_action(") == 2, (
-        "each review loop must consult the retry decision; found "
-        f"{source.count('next_review_action(')} call(s)")
-    # #302: and each must RETRY before it stops, or the retry budget is dead
-    # code that no loop ever consults.
-    assert source.count("next_review_action(") == 2, (
-        "each review loop must consult the retry decision; found "
-        f"{source.count('next_review_action(')} call(s)")
+    assert retry_calls == 2, (
+        f"each review loop must consult the retry decision; "
+        f"found {retry_calls} call(s)")
 
 
 def test_the_new_outcome_is_not_silently_one_of_the_old_ones():
