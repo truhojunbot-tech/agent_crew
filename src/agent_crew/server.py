@@ -1419,23 +1419,45 @@ def _pane_token_count(pane_id: str) -> Optional[int]:
     return int(float(raw))
 
 
-def _agent_worktree(worktree_map, agent: str, role: str = "") -> str:
+def _agent_worktree(worktree_map, agent: str, role: str = "",
+                    *, role_to_agent=None) -> str:
     """The worktree ``agent`` actually works in, or ``""`` (#292 review).
 
-    The map is keyed by role in role-based mode and by agent otherwise, so both
-    spellings are tried — but only ever for THIS agent.
+    ``worktree_map`` is keyed by role in role-based mode and by agent
+    otherwise, so both spellings are handled — but only ever for THIS agent.
 
-    ⛔Never falls back to the task's own role worktree. That fallback is the
-      defect this exists to fix: with `agent_override` the pane belongs to one
-      provider while `worktree_map[role]` belongs to another, and handing back
-      the role's worktree would measure a directory the target agent does not
-      own. Unlocatable is `""`, which reads downstream as unknown.
+    ⛔Resolved through the LIVE ``role_to_agent`` mapping, not a static default.
+      state.json supports custom assignments and the same provider on several
+      roles, and the first version used the hardcoded
+      `{claude: implementer, ...}` — so `(map, "claude", "reviewer")` returned
+      the IMPLEMENTER worktree and the `role` argument did nothing. A configured
+      Claude reviewer was therefore sized by the implementer's transcript and
+      could be `/clear`ed on it (round-2 review of PR #293).
+
+    ⛔Role identity is preserved when one provider holds several roles: the
+      target role wins if the agent actually holds it. When it does not — an
+      `agent_override` pointing at a provider whose roles are all different —
+      a single role is unambiguous and used, but several is not, and the answer
+      is ``""``. Guessing between two worktrees is how this whole class of bug
+      arises; unknown reads downstream as "do not clear".
+
+    ⛔Never falls back to the task's own role worktree either. With
+      `agent_override` the pane belongs to one provider while
+      `worktree_map[role]` belongs to another, and handing back the role's
+      worktree would measure a directory the target agent does not own.
     """
     if not worktree_map or not agent:
         return ""
-    return (worktree_map.get(agent)
-            or worktree_map.get(_DEFAULT_AGENT_TO_ROLE.get(agent, ""))
-            or "")
+    direct = worktree_map.get(agent)
+    if direct:
+        return direct
+    mapping = role_to_agent or _DEFAULT_ROLE_TO_AGENT
+    roles = [r for r, a in mapping.items() if a == agent]
+    if role and role in roles and worktree_map.get(role):
+        return worktree_map[role]
+    if len(roles) == 1 and worktree_map.get(roles[0]):
+        return worktree_map[roles[0]]
+    return ""
 
 
 def _context_token_count(pane_id: str, worktree_path: str = "",
@@ -2042,7 +2064,8 @@ def create_app(
         #   disabled, so borrowing its variable made this line unreachable-safe
         #   only by accident and raised UnboundLocalError on every push in that
         #   configuration. The measurement must not depend on whether prep ran.
-        _tok_wt = _agent_worktree(worktree_map, _target_agent, role)
+        _tok_wt = _agent_worktree(worktree_map, _target_agent, role,
+                                  role_to_agent=_DISPATCH_ROLE_TO_AGENT)
         tok, _tok_source = _context_token_count(pane_id, _tok_wt,
                                                 agent=_target_agent)
         if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
@@ -2128,7 +2151,8 @@ def create_app(
         # agent rather than the role, so the worktree is resolved through the
         # role map — panels are exactly the panes that accumulate the most
         # context, which is why #260 added a guard here at all.
-        _discuss_wt = _agent_worktree(worktree_map, agent)
+        _discuss_wt = _agent_worktree(worktree_map, agent,
+                                      role_to_agent=_DISPATCH_ROLE_TO_AGENT)
         tok, _tok_source = _context_token_count(pane_id, _discuss_wt, agent=agent)
         if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
             logger.info(

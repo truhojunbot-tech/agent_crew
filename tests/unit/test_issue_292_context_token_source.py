@@ -457,3 +457,205 @@ def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch):
 
     assert pushed == ["%2"], pushed
     assert cleared == [], "a codex panel was cleared on a Claude transcript"
+
+
+# ── 6. the role map is configurable, so the lookup must read the live one ──
+#
+# Review of PR #293, round 2, P1. `_agent_worktree` resolved role-keyed maps
+# through the STATIC `_DEFAULT_AGENT_TO_ROLE`, so `(map, "claude", "reviewer")`
+# always returned the implementer worktree and its `role` argument did nothing.
+# state.json explicitly supports custom assignments and the same provider on
+# several roles, so a configured Claude reviewer read the IMPLEMENTER's
+# transcript and could `/clear` the reviewer pane on it.
+
+
+LIVE = {"implementer": "claude", "reviewer": "claude", "tester": "gemini"}
+ROLE_MAP = {"implementer": "/w/impl", "reviewer": "/w/rev", "tester": "/w/test"}
+
+
+def test_role_identity_is_preserved_when_one_agent_holds_two_roles():
+    """★★The finding. Claude on both roles: a reviewer task must resolve the
+    REVIEWER worktree, not whichever role the static default happens to name."""
+    assert sv._agent_worktree(ROLE_MAP, "claude", "reviewer",
+                              role_to_agent=LIVE) == "/w/rev"
+    assert sv._agent_worktree(ROLE_MAP, "claude", "implementer",
+                              role_to_agent=LIVE) == "/w/impl"
+
+
+def test_a_custom_single_role_assignment_is_followed():
+    """⛔The static map says codex reviews. A config that says otherwise has to
+    win, or the lookup is describing a deployment that does not exist."""
+    live = {"implementer": "codex", "reviewer": "gemini", "tester": "claude"}
+    assert sv._agent_worktree(ROLE_MAP, "claude", "", role_to_agent=live) == "/w/test"
+    assert sv._agent_worktree(ROLE_MAP, "codex", "", role_to_agent=live) == "/w/impl"
+
+
+def test_an_override_to_an_agent_with_one_role_still_resolves():
+    """A reviewer task overridden to claude, where claude only implements: the
+    target role is not claude's, but claude has exactly one worktree and that
+    is unambiguously the one its pane is in."""
+    live = {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}
+    assert sv._agent_worktree(ROLE_MAP, "claude", "reviewer",
+                              role_to_agent=live) == "/w/impl"
+
+
+def test_an_ambiguous_override_resolves_to_nothing():
+    """⛔Claude holds two roles and the task's role is neither. There is no way
+    to say which worktree that pane is in, and guessing is how this whole class
+    of bug happens — unknown is the honest answer and clears nothing."""
+    assert sv._agent_worktree(ROLE_MAP, "claude", "tester", role_to_agent=LIVE) == ""
+
+
+def test_an_agent_keyed_map_is_unaffected():
+    """The other state.json spelling needs no role reasoning at all."""
+    by_agent = {"claude": "/w/claude", "codex": "/w/codex"}
+    assert sv._agent_worktree(by_agent, "claude", "reviewer",
+                              role_to_agent=LIVE) == "/w/claude"
+
+
+def test_the_static_default_is_still_the_fallback():
+    """Legacy setups with no roles list keep working."""
+    assert sv._agent_worktree(ROLE_MAP, "claude", "") == "/w/impl"
+
+
+def test_an_agent_in_no_role_resolves_to_nothing():
+    assert sv._agent_worktree(ROLE_MAP, "nobody", "reviewer", role_to_agent=LIVE) == ""
+
+
+def test_a_configured_claude_reviewer_is_not_sized_by_the_implementer(tmp_path,
+                                                                      monkeypatch):
+    """★★End to end: claude on BOTH roles, a huge implementer transcript and a
+    small reviewer one. Pushing the reviewer task must read the reviewer's."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    impl_wt = tmp_path / "worktrees" / "claude-impl"
+    rev_wt = tmp_path / "worktrees" / "claude-rev"
+    for d in (impl_wt, rev_wt):
+        d.mkdir(parents=True)
+    _session(tmp_path / "claudehome", str(impl_wt), {"cache_read_input_tokens": 900_000})
+    _session(tmp_path / "claudehome", str(rev_wt), {"cache_read_input_tokens": 10})
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "roles": [
+        {"role": "implementer", "agent": "claude", "worktree": str(impl_wt)},
+        {"role": "reviewer", "agent": "claude", "worktree": str(rev_wt)},
+    ]}))
+
+    cleared, pushed = [], []
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
+    monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"implementer": "%1", "reviewer": "%2"}, port=0,
+                     push_fn=lambda pane, text: pushed.append(pane),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-rev-claude", "task_type": "review",
+            "description": "review", "branch": "main", "priority": 3,
+            "project": "demo", "context": {}})
+
+    assert pushed == ["%2"], pushed
+    assert cleared == [], "the reviewer pane was cleared on the implementer's window"
+
+
+def test_the_configured_implementer_is_still_cleared_when_saturated(tmp_path,
+                                                                    monkeypatch):
+    """⛔The control: reading the right worktree must still fire when THAT one
+    is over the threshold."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    impl_wt = tmp_path / "worktrees" / "claude-impl"
+    rev_wt = tmp_path / "worktrees" / "claude-rev"
+    for d in (impl_wt, rev_wt):
+        d.mkdir(parents=True)
+    _session(tmp_path / "claudehome", str(impl_wt), {"cache_read_input_tokens": 900_000})
+    _session(tmp_path / "claudehome", str(rev_wt), {"cache_read_input_tokens": 10})
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "roles": [
+        {"role": "implementer", "agent": "claude", "worktree": str(impl_wt)},
+        {"role": "reviewer", "agent": "claude", "worktree": str(rev_wt)},
+    ]}))
+
+    cleared, pushed = [], []
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
+    monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"implementer": "%1", "reviewer": "%2"}, port=0,
+                     push_fn=lambda pane, text: pushed.append(pane),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-impl-claude", "task_type": "implement",
+            "description": "go", "branch": "main", "priority": 3,
+            "project": "demo", "context": {}})
+
+    assert pushed == ["%1"]
+    assert cleared == ["%1"]
+
+
+def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch):
+    """⛔The discuss call site also has to pass the live mapping, and nothing
+    asserted it: every earlier discuss test used an agent-keyed worktree map,
+    where the role mapping is never consulted. Mutation caught that.
+
+    Claude holds two roles here, so a discuss task for claude cannot say which
+    worktree its pane is in — the honest answer is unknown, and unknown clears
+    nothing. Under the static default it would have resolved to the implementer
+    worktree and `/clear`ed the panel on a window it is not carrying."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    impl_wt = tmp_path / "worktrees" / "claude-impl"
+    rev_wt = tmp_path / "worktrees" / "claude-rev"
+    for d in (impl_wt, rev_wt):
+        d.mkdir(parents=True)
+    _session(tmp_path / "claudehome", str(impl_wt), {"cache_read_input_tokens": 900_000})
+    _session(tmp_path / "claudehome", str(rev_wt), {"cache_read_input_tokens": 10})
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 0, "roles": [
+        {"role": "implementer", "agent": "claude", "worktree": str(impl_wt)},
+        {"role": "reviewer", "agent": "claude", "worktree": str(rev_wt)},
+    ]}))
+
+    cleared, pushed = [], []
+    monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
+    monkeypatch.setattr(sv, "_pane_clear_context", lambda pane: cleared.append(pane))
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
+    monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db, state_path=str(state),
+                     pane_map={"claude": "%1", "implementer": "%1"}, port=0,
+                     push_fn=lambda pane, text: pushed.append(pane),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "t-discuss-live", "task_type": "discuss",
+            "description": "discuss", "branch": "main", "priority": 3,
+            "project": "demo", "context": {"agent": "claude"}})
+
+    assert pushed == ["%1"], pushed
+    assert cleared == [], "cleared on a worktree the panel's role could not be tied to"
