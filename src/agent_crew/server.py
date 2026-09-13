@@ -36,6 +36,7 @@ from agent_crew.pipeline import (
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.watch import active_tasks_for_issue
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
     load_scope as _load_test_scope,
@@ -3687,6 +3688,20 @@ def create_app(
         body so the description cannot drift from it again.
         """
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
+        # #294: gathered BEFORE the enqueue, so the task being created can
+        # never appear in its own collision list.
+        _issue_number = (task.context or {}).get("issue") if isinstance(task.context, dict) else None
+        _in_flight: list = []
+        if isinstance(_issue_number, int) and not isinstance(_issue_number, bool):
+            try:
+                _in_flight = active_tasks_for_issue(
+                    q(), _issue_number, task_type=task.task_type)
+            except Exception:
+                # The whole feature is advisory; it must never cost a task.
+                logger.exception(
+                    f"POST /tasks: in-flight lookup failed for issue "
+                    f"#{_issue_number} — enqueueing anyway")
+                _in_flight = []
         try:
             task_id = q().enqueue(task)
         except TaskAlreadyExistsError as e:
@@ -3699,6 +3714,18 @@ def create_app(
                 },
             )
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
+        if _in_flight:
+            # ⛔Advisory, never a gate. Several tasks legitimately share one
+            #   issue — implement, its review, its fix rounds, its test — so
+            #   refusing by issue would break the cascade. What was missing is
+            #   only that nobody was TOLD: #294 measured a direct enqueue
+            #   duplicating a watch task that was still in flight, 15 minutes
+            #   before the first one's PR existed.
+            logger.warning(
+                f"POST /tasks: {task_id} is a second {task.task_type!r} task for "
+                f"issue #{_issue_number} while {_in_flight} is still in flight. "
+                f"Enqueued anyway — this is a heads-up, not a block (#294)."
+            )
         if not _push_enabled:
             logger.warning(
                 f"POST /tasks: AGENT_CREW_DELIVERY={_delivery_raw!r} — task {task_id} enqueued "
@@ -3716,7 +3743,9 @@ def create_app(
                 _try_push_next(role)
             else:
                 logger.warning(f"POST /tasks: no role found for task_type={task.task_type}")
-        return {"task_id": task_id}
+        # Always a list, never absent: a consumer should not have to tell "no
+        # collision" from "this server does not report collisions".
+        return {"task_id": task_id, "in_flight_for_issue": _in_flight}
 
     @app.get("/tasks/next")
     def get_next_task(role: str = "", agent: str = ""):
