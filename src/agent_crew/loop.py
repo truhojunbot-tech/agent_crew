@@ -61,6 +61,31 @@ def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, po
     return queue.enqueue(req)
 
 
+#: How many times a review that failed to RUN is re-dispatched before the loop
+#: gives up. Bounded on purpose (#302): the measured cause was not transient —
+#: four consecutive `exit_1` reviews came from a branch that does not exist in
+#: this repo (#301) — and an unbounded retry would spin exactly the loop that
+#: fix exists to stop, with review tasks instead of implement tasks. Two covers
+#: a genuinely transient dispatch failure and gives up on a structural one.
+#: Statuses that mean the review stopped without reviewing anything.
+_DEAD_REVIEW_STATUSES = frozenset({"failed", "timed_out", "blocked"})
+
+REVIEW_RETRY_MAX = 2
+
+
+def next_review_action(outcome: str, attempts: int,
+                       max_attempts: int = REVIEW_RETRY_MAX) -> str:
+    """What to do about a review that did not complete: retry, or give up.
+
+    Returns `""` for every other outcome — a real verdict is never retried.
+    Re-reviewing approved work would spin #244's fix cascade a second time for
+    one finding, which is the same waste from the other direction.
+    """
+    if outcome != "review_failed":
+        return ""
+    return "retry" if attempts < max_attempts else "give_up"
+
+
 def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {}, port: int = 0) -> str:
     # Check if a review task already exists for this impl task (auto-transition case).
     # This makes enqueue_review idempotent when the server has auto-created a review.
@@ -70,6 +95,17 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
             if task.task_type == "review":
                 task_ctx = task.context if isinstance(task.context, dict) else {}
                 if task_ctx.get("prev_task_id") == prev_task_id:
+                    # ⛔A review that already FAILED is not a review in flight,
+                    #   and reusing it hands the retry the same dead task id
+                    #   forever — so #302's retry would be a silent no-op. This
+                    #   idempotence exists so the server's auto-created review
+                    #   is not duplicated; that argument covers a pending, live
+                    #   or completed review, not one that died.
+                    try:
+                        if queue.get_task_status(task.task_id) in _DEAD_REVIEW_STATUSES:
+                            continue
+                    except Exception:
+                        pass
                     # Merge caller context (e.g. no_tester) onto the existing task.
                     if context:
                         try:

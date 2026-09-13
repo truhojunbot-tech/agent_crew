@@ -189,6 +189,16 @@ def test_both_cli_loops_stop_instead_of_re_implementing():
     assert source.count('outcome == "review_failed"') == 2, (
         "each review loop must stop on a review that did not run; found "
         f"{source.count('outcome == \"review_failed\"')} guard(s)")
+    # #302: and each must RETRY before it stops, or the retry budget is dead
+    # code that no loop ever consults.
+    assert source.count("next_review_action(") == 2, (
+        "each review loop must consult the retry decision; found "
+        f"{source.count('next_review_action(')} call(s)")
+    # #302: and each must RETRY before it stops, or the retry budget is dead
+    # code that no loop ever consults.
+    assert source.count("next_review_action(") == 2, (
+        "each review loop must consult the retry decision; found "
+        f"{source.count('next_review_action(')} call(s)")
 
 
 def test_the_new_outcome_is_not_silently_one_of_the_old_ones():
@@ -204,3 +214,98 @@ def test_the_new_outcome_is_not_silently_one_of_the_old_ones():
         _review(status="completed", verdict="request_changes",
                 findings=[{"layer": "code_quality", "issue": "x"}]),
         iteration=1, max_iter=3) == "request_changes"
+
+
+# ── 5. #302: retry the review, bounded ────────────────────────────────
+#
+# #302 is the same defect reported independently, and asks for one thing #301
+# did not do: when the review itself failed to run, RETRY THE REVIEW — as with
+# any other transient dispatch failure — rather than stopping.
+#
+# ⛔Bounded, because the measured cause was not transient. Four consecutive
+#   `exit_1` reviews came from a branch that does not exist in this repo; an
+#   unbounded retry would have spun exactly the loop #301 exists to stop, just
+#   with review tasks instead of implement tasks. Retry covers the transient
+#   case and gives up on the structural one.
+
+
+def test_a_failed_review_is_retried_then_given_up_on():
+    from agent_crew.loop import REVIEW_RETRY_MAX, next_review_action
+
+    assert REVIEW_RETRY_MAX >= 1, "a retry budget of zero is just #301's stop"
+    for attempts in range(REVIEW_RETRY_MAX):
+        assert next_review_action("review_failed", attempts) == "retry"
+    assert next_review_action("review_failed", REVIEW_RETRY_MAX) == "give_up"
+
+
+@pytest.mark.parametrize("outcome", ["approved", "request_changes", "escalate"])
+def test_an_outcome_that_is_not_a_failure_is_never_retried(outcome):
+    """⛔The control. Retrying a real verdict would re-review approved work and
+    spin #244's fix cascade a second time for one finding."""
+    from agent_crew.loop import next_review_action
+
+    assert next_review_action(outcome, 0) == ""
+
+
+def test_the_retry_budget_cannot_be_unbounded():
+    from agent_crew.loop import REVIEW_RETRY_MAX, next_review_action
+
+    assert next_review_action("review_failed", REVIEW_RETRY_MAX + 50) == "give_up"
+
+
+def test_a_failed_review_is_not_reused_so_the_retry_can_actually_happen(tmp_db):
+    """★★Without this the retry is a no-op. `enqueue_review` is idempotent on
+    `prev_task_id` so the server's auto-created review is not duplicated — but it
+    matched the FAILED review too, handing the retry back the same dead task id
+    forever. Idempotence is about a review still in flight, not about one that
+    already died."""
+    from agent_crew.loop import enqueue_review
+    from agent_crew.protocol import TaskRequest, TaskResult
+    from agent_crew.queue import TaskQueue
+
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="review-dead", task_type="review", description="d",
+                          branch="main", context={"prev_task_id": "impl-1"}))
+    q.submit_result("review-dead", TaskResult(task_id="review-dead", status="failed",
+                                              summary="exit_1"))
+
+    retry_id = enqueue_review(q, "d", "main", prev_task_id="impl-1")
+    assert retry_id != "review-dead", "the retry reused the review that just died"
+
+
+def test_a_live_review_is_still_reused(tmp_db):
+    """⛔The control for the same line: idempotence must survive. The server
+    auto-creates a review on implement completion, and duplicating it means two
+    reviewers on one commit."""
+    from agent_crew.loop import enqueue_review
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="review-live", task_type="review", description="d",
+                          branch="main", context={"prev_task_id": "impl-1"}))
+    assert enqueue_review(q, "d", "main", prev_task_id="impl-1") == "review-live"
+
+
+def test_a_completed_review_is_still_reused(tmp_db):
+    from agent_crew.loop import enqueue_review
+    from agent_crew.protocol import TaskRequest, TaskResult
+    from agent_crew.queue import TaskQueue
+
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="review-done", task_type="review", description="d",
+                          branch="main", context={"prev_task_id": "impl-1"}))
+    q.submit_result("review-done", TaskResult(task_id="review-done", status="completed",
+                                              summary="ok", verdict="approve"))
+    assert enqueue_review(q, "d", "main", prev_task_id="impl-1") == "review-done"
+
+
+def test_the_failed_review_never_reaches_enqueue_implement_with_feedback():
+    """#302's stated regression, at the decision that guards it: a
+    status=failed / verdict=None / findings=[] review resolves to an outcome
+    that is neither request_changes nor approve, so neither loop can fall
+    through to the feedback enqueue."""
+    result = _review(status="failed", verdict=None, findings=[])
+    assert handle_review_result(result, iteration=1, max_iter=3) == "review_failed"
+    assert build_feedback(result) == "Review feedback (task review-f20ceaf8):", \
+        "the vacuous feedback still exists — it just must never be enqueued"
