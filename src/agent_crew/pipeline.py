@@ -22,7 +22,7 @@ import logging
 import os
 import sqlite3
 import uuid
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from agent_crew.fallback import (
@@ -226,43 +226,66 @@ def review_is_current(review_ctx: dict, pr_number, *, head_sha_fn=None,
       * head matches, or cannot be distinguished — see below;
       * head has moved — stale, and no work is created.
     """
+    status, _head, why = review_head_status(
+        review_ctx, pr_number, head_sha_fn=head_sha_fn, repo=repo, repo_cwd=repo_cwd)
+    return (status in ("current", "unpinned"), why)
+
+
+#: What a review's pin is, relative to the PR's live head.
+#:
+#: ``unpinned``  no pin or no PR to compare against — not staleness
+#: ``current``   the pin IS the head
+#: ``stale``     the head has moved since the review was prepared
+#: ``unknown``   the head could not be read — never assumed to be either
+ReviewHeadStatus = str
+
+
+def review_head_status(
+    review_ctx: dict | None,
+    pr_number,
+    *,
+    head_sha_fn=None,
+    repo: str = "",
+    repo_cwd: str = "",
+) -> tuple[str, str, str]:
+    """Where a review sits relative to its PR's current head (#304).
+
+    Returns ``(status, current_head, why)``. ``current_head`` is ``""`` unless
+    the lookup actually produced one — a caller that wants to requeue against
+    the new head needs to know it, and must not have to ask twice.
+
+    ⛔One primitive, two call sites. :func:`review_is_current` gates the FIX
+      CASCADE and is built on this; :func:`review_publication_decision` gates
+      the VERDICT. #304 happened in the gap between them: the cascade gate
+      existed and worked, and the verdict was published before anything
+      consulted it. Two independent comparisons would drift, and the drift
+      would be invisible until one of them published a verdict the other would
+      have stopped.
+
+    ⛔``unknown`` is a state, not a synonym for ``current``. Publishing a
+      verdict because a head lookup failed is the same error as publishing one
+      against a head that moved.
+    """
     reviewed = (review_ctx or {}).get("reviewed_sha") or ""
     if not reviewed:
-        return (True, "no reviewed_sha recorded")
+        return ("unpinned", "", "no reviewed_sha recorded")
     if not pr_number:
-        return (True, "no pr_number to compare against")
+        return ("unpinned", "", "no pr_number to compare against")
 
     # ⛔The repository must be named, not inferred from the process's working
     #   directory. The server runs in the instance directory, which belongs to
-    #   a DIFFERENT repository — `get_repo()` there answers
-    #   `truhojunbot-tech/alfred`, so the head lookup asks the wrong repo about
-    #   this PR number. It returns nothing, this gate reads "unknown", and
-    #   being fail-closed it would then skip EVERY fix cascade for every review
-    #   that recorded a SHA (review of PR #255). Same root cause as the
-    #   reviewer-branch resolution fixed in PR #251: `gh` inheriting a cwd
-    #   nobody chose.
+    #   a DIFFERENT repository — `get_repo()` there answers a different slug, so
+    #   the head lookup asks the wrong repo about this PR number and returns
+    #   nothing (review of PR #255). Same root cause as the reviewer-branch
+    #   resolution fixed in PR #251: `gh` inheriting a cwd nobody chose.
     repo = repo or (review_ctx or {}).get("repo") or ""
     if head_sha_fn is None and not repo and not repo_cwd:
-        # ⛔Fail closed, like every other unverifiable case here. An earlier
-        #   version let this through, reasoning that a configuration gap should
-        #   not disable the cascade — but #253's acceptance criterion is that an
-        #   unverifiable comparison DEFERS, and the asymmetry it rests on holds
-        #   just as well here: a skipped cascade is recoverable, a fix task
-        #   written against a state that may already be fixed is not. "We never
-        #   learned the repository" is not evidence that the finding is current.
-        #
-        #   The risk that motivated the earlier choice is real and is answered
-        #   by making this loud rather than by proceeding: in production the
-        #   repo is supplied twice over — watch-ingested tasks carry `repo`, and
-        #   the server passes a worktree — so reaching this branch at all means
-        #   something is misconfigured, and that is worth stopping for.
         logger.warning(
-            f"review_is_current: no repo known for PR #{pr_number} (review context "
+            f"review_head_status: no repo known for PR #{pr_number} (review context "
             f"has no 'repo' and no worktree was supplied) — cannot compare the "
-            f"reviewed commit, so NOT creating follow-up work. Fix the task "
-            f"context or pass repo_cwd; the review result itself is unaffected."
+            f"reviewed commit. Fix the task context or pass repo_cwd."
         )
-        return (False, "no repo to compare against — cannot verify")
+        return ("unknown", "", "no repo to compare against — cannot verify")
     try:
         if head_sha_fn is not None:
             head = head_sha_fn(int(pr_number)) or ""
@@ -272,16 +295,79 @@ def review_is_current(review_ctx: dict, pr_number, *, head_sha_fn=None,
             head = pr_head_sha(int(pr_number), repo=repo or None,
                                cwd=repo_cwd or None) or ""
     except Exception as e:  # noqa: BLE001 — a lookup never breaks a cascade
-        logger.warning(f"review_is_current: head lookup failed for PR #{pr_number}: {e}")
-        return (False, "current head unknown")
+        logger.warning(f"review_head_status: head lookup failed for PR #{pr_number}: {e}")
+        return ("unknown", "", "current head unknown")
     if not head:
-        # ⛔Defer rather than guess, the same rule the terminal-PR gate uses:
-        #   a skipped cascade is recoverable, a fix task written against a state
-        #   that no longer exists is spend that cannot be recovered.
-        return (False, "current head unknown")
+        # ⛔Defer rather than guess, the same rule the terminal-PR gate uses: a
+        #   skipped cascade is recoverable, and so is an unpublished verdict —
+        #   the result itself is still recorded either way.
+        return ("unknown", "", "current head unknown")
     if head == reviewed:
-        return (True, f"reviewed {reviewed[:9]} is still the head")
-    return (False, f"reviewed {reviewed[:9]} but the head is now {head[:9]}")
+        return ("current", head, f"reviewed {reviewed[:9]} is still the head")
+    return ("stale", head,
+            f"reviewed {reviewed[:9]} but the head is now {head[:9]}")
+
+
+@dataclass(frozen=True)
+class ReviewPublication:
+    """Whether a review's verdict may be posted, and what to do instead (#304)."""
+
+    publish: bool
+    status: str
+    reason: str
+    #: The head to requeue a review against, or ``""`` for "do not requeue".
+    requeue_head: str = ""
+
+
+def review_publication_decision(
+    review_ctx: dict | None,
+    pr_number,
+    *,
+    head_sha_fn=None,
+    repo: str = "",
+    repo_cwd: str = "",
+) -> ReviewPublication:
+    """May this verdict be posted to the PR, and against what (#304)?
+
+    Reported downstream 2026-09-14: a review prepared at `5b496a9f` published
+    `request_changes` while the PR head was `28419e96`, so a blocker was
+    attributed to code the reviewer never read, and the PR moved on again with
+    no head-anchored review anywhere.
+
+    ⛔A verdict describes the commit that was READ. Posting it against a
+      different one is a false statement about the code, not merely a stale
+      one — which is why `stale` suppresses publication rather than annotating
+      it.
+
+    ⛔`stale` requeues; `unknown` does not. Not publishing is recoverable — the
+      result is still recorded and a later head-anchored round can act on it.
+      Requeueing against a head we failed to READ would spend a reviewer on a
+      commit nobody can name, so the unverifiable case stops instead of
+      guessing. The same asymmetry #253 rests on.
+    """
+    status, head, why = review_head_status(
+        review_ctx, pr_number, head_sha_fn=head_sha_fn, repo=repo, repo_cwd=repo_cwd)
+    if status in ("current", "unpinned"):
+        return ReviewPublication(publish=True, status=status, reason=why)
+    if status == "stale":
+        return ReviewPublication(publish=False, status=status, reason=why,
+                                 requeue_head=head)
+    return ReviewPublication(publish=False, status=status, reason=why)
+
+
+def stale_review_task_id(pr_number, head_sha: str) -> str:
+    """The task id a requeued head-anchored review MUST have.
+
+    ⛔Derived from the PR and the head, never random — the same idempotency
+      mechanism as :func:`fix_task_id`. A result POST can arrive twice, and two
+      random ids would put two reviewers on one commit. Two results observing
+      the SAME new head produce one task; a head that moves again is a genuinely
+      different review and gets its own.
+
+    The head is readable in the id on purpose: an opaque hash cannot be traced
+    back to the commit it was created for.
+    """
+    return f"review-{int(pr_number)}-{(head_sha or '')[:12]}"
 
 
 def review_fix_max_rounds() -> int:

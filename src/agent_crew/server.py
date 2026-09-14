@@ -32,6 +32,8 @@ from agent_crew.pipeline import (
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     hold_mismatched_pr_result,
+    review_publication_decision,
+    stale_review_task_id,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
@@ -3944,6 +3946,44 @@ def create_app(
             pass
         return ""
 
+    def _requeue_review_at_head(review_task_id: str, pr_number, head: str, ctx) -> None:
+        """Enqueue one head-anchored review for a PR whose head moved (#304).
+
+        ⛔The task id is derived from the PR and the new head, so two results
+          observing the same move produce ONE review rather than two reviewers
+          on one commit — the same claim-by-primary-key mechanism as #244's fix
+          ids. A head that moves again is a genuinely different review and gets
+          its own id.
+        """
+        new_id = stale_review_task_id(pr_number, head)
+        base = ctx if isinstance(ctx, dict) else {}
+        context = {k: v for k, v in base.items()
+                   if k in ("pr_number", "repo", "project", "no_tester",
+                            "coordinator_managed", "checklist_layers")}
+        context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
+                        "expected_head_sha": head})
+        try:
+            q().enqueue(TaskRequest(
+                task_id=new_id,
+                task_type="review",
+                description=f"Review PR #{pr_number} at {head[:12]} "
+                            f"(re-dispatched: {review_task_id} reviewed an older head)",
+                branch=base.get("branch") or "main",
+                priority=3,
+                context=context,
+            ))
+            logger.info(
+                f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
+                f"{head[:12]}, superseding {review_task_id} (#304)")
+        except TaskAlreadyExistsError:
+            logger.info(
+                f"_requeue_review_at_head: {new_id} already exists — another result "
+                f"observed the same head; not duplicating it (#304)")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"_requeue_review_at_head: could not requeue a review for PR "
+                f"#{pr_number} at {head[:12]}")
+
     def _auto_enqueue_fix(review_task_id: str) -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
@@ -4444,6 +4484,36 @@ def create_app(
             # #178: post review verdict as GitHub PR comment
             if task_type == "review":
                 _review_pr = result.pr_number or (ctx.get("pr_number") if isinstance(ctx, dict) else None)
+                # #304: a verdict describes the commit that was READ. If the PR
+                # head has moved since this review was prepared, posting it
+                # attributes a judgement to code the reviewer never saw — a
+                # false statement about the PR, not merely a stale one. Measured
+                # downstream 2026-09-14: a review pinned at 5b496a9f published
+                # request_changes while the head was 28419e96, and the PR moved
+                # on again with no head-anchored review anywhere.
+                _pub = review_publication_decision(
+                    ctx if isinstance(ctx, dict) else {}, _review_pr,
+                    repo=(ctx.get("repo") if isinstance(ctx, dict) else "") or "",
+                    repo_cwd=(_load_worktree_map(state_path) or {}).get("reviewer", ""),
+                ) if _review_pr else None
+                if _pub is not None and not _pub.publish:
+                    logger.warning(
+                        f"POST /tasks/{task_id}/result: NOT publishing this verdict to "
+                        f"PR #{_review_pr} — {_pub.reason} (#304). The result itself is "
+                        f"recorded; only the attribution to the wrong commit is stopped."
+                    )
+                    try:
+                        q().patch_context(task_id, {
+                            "review_publication": _pub.status,
+                            "review_publication_reason": _pub.reason,
+                        })
+                    except Exception:  # noqa: BLE001 — telemetry never breaks a result
+                        logger.exception(
+                            f"POST /tasks/{task_id}/result: could not record the "
+                            f"suppressed publication for {task_id}")
+                    if _pub.requeue_head:
+                        _requeue_review_at_head(task_id, _review_pr, _pub.requeue_head, ctx)
+                    _review_pr = None
                 if _review_pr:
                     try:
                         from agent_crew.github import post_review_comment
