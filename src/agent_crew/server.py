@@ -4509,6 +4509,11 @@ def create_app(
             # review counts as approved (#100). Skip when the review task was
             # created with no_tester=True (set by `crew run --no-tester`).
             # #178: post review verdict as GitHub PR comment
+            # ⛔Bound for EVERY task type, not just reviews. The approve gate
+            #   below reads it unconditionally, and assigning it only inside the
+            #   review branch made every non-review result raise
+            #   UnboundLocalError — 59 suites, caught by the full run.
+            _pub = None
             if task_type == "review":
                 _review_pr = result.pr_number or (ctx.get("pr_number") if isinstance(ctx, dict) else None)
                 # #304: a verdict describes the commit that was READ. If the PR

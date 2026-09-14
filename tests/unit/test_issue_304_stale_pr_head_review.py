@@ -463,3 +463,29 @@ def test_the_requeued_task_carries_a_pin_prep_can_actually_use(tmp_db, monkeypat
     detached = _prep_with(requeued.context,
                           resolvable={MOVED_TO: MOVED_TO, "origin/main": PINNED})
     assert detached and detached[0] == MOVED_TO
+
+
+def test_a_non_review_result_still_submits(tmp_db):
+    """⛔The regression that reached a push. The approve gate reads `_pub`
+    unconditionally, and binding it only inside the review branch made EVERY
+    non-review result raise UnboundLocalError — 59 suites' worth, and the
+    targeted tests all passed because they only ever posted review results.
+
+    A gate on one task type must not be able to break the others.
+    """
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="impl-plain", task_type="implement",
+                          description="do a thing", branch="main", context={}))
+    app = create_app(db_path=tmp_db, pane_map={}, port=0, watchdog_disabled=True,
+                     anomaly_disabled=True, push_fn=lambda *a, **k: None)
+    with TestClient(app) as client:
+        response = client.post("/tasks/impl-plain/result", json={
+            "task_id": "impl-plain", "status": "completed", "summary": "done"})
+    assert response.status_code == 200, response.text
+    assert TaskQueue(tmp_db).get_result("impl-plain") is not None
