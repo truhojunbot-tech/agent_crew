@@ -224,3 +224,80 @@ def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db):
     assert reviews[0].branch == "fix/304-stale-pr-head-review", \
         f"the review still targets {reviews[0].branch!r}"
     assert reviews[0].context.get("reviewed_sha") == sha
+
+
+# ── 5. review of PR #307: the MCP transport was left behind ───────────
+#
+# P1. #305 wired the HTTP path and stopped. `mcp_server.submit_result` had no
+# `branch`/`commit` arguments, so an MCP caller could not populate the new
+# fields at all, and its implement cascade called
+# `auto_enqueue_review(queue, task_id, pr_number=...)` with no `result=`.
+#
+# ⛔The MCP path is documented as running the SAME stage cascade as HTTP, for a
+#   reason recorded in that file: "a guard on one transport is a guard an agent
+#   walks around by changing how it reports" (#123). A fix applied to one
+#   transport is the same shape of half-measure. My own #305 test even said "the
+#   MCP path and older callers pass none" — I noticed and filed it under
+#   compatibility instead of under unfinished.
+
+
+def _mcp_call(mcp, tool_name, **kwargs):
+    import asyncio
+
+    func = mcp._tool_manager._tools[tool_name].fn
+    if asyncio.iscoroutinefunction(func):
+        return asyncio.run(func(**kwargs))
+    return func(**kwargs)
+
+
+def _mcp_submit(tmp_db, **result_fields):
+    """Enqueue a watch-shaped implement task and complete it over MCP."""
+    from agent_crew.mcp_server import build_mcp_server
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+
+    TaskQueue(tmp_db).enqueue(TaskRequest(
+        task_id="impl-watch-mcp", task_type="implement",
+        description="Implement #304", branch="main",
+        context={"issue": 304, "reviewed_sha": "990ce86"}))
+    mcp = build_mcp_server(tmp_db)
+    _mcp_call(mcp, "get_next_task", role="implementer")
+    ack = _mcp_call(mcp, "submit_result", task_id="impl-watch-mcp",
+                    status="completed", summary="done", **result_fields)
+    assert ack.get("acknowledged") is True, ack
+    reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
+    return ack, reviews
+
+
+def test_the_mcp_contract_accepts_the_branch_and_commit(tmp_db):
+    """★★An MCP caller could not report where it pushed at all — the arguments
+    did not exist, so the fields could never be populated on that transport."""
+    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review")
+    assert reviews, "no review was enqueued over MCP"
+
+
+def test_an_mcp_submission_routes_the_review_to_the_pushed_branch(tmp_db):
+    """★★The finding. An MCP-delivered watch task still reviewed `main`."""
+    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review")
+    assert reviews[0].branch == "fix/304-stale-pr-head-review"
+
+
+def test_an_mcp_submission_pins_the_reviewed_sha(tmp_db):
+    sha = "9edda6900000000000000000000000000000abcd"
+    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review", commit=sha)
+    assert reviews[0].context.get("reviewed_sha") == sha
+
+
+def test_the_mcp_transport_applies_the_same_commit_guard(tmp_db):
+    """⛔The normalisation lives in `TaskResult`, so both transports inherit it —
+    but only if MCP actually constructs the field. Asserted through MCP so a
+    future hand-rolled construction there cannot skip it."""
+    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review",
+                             commit="HEAD")
+    assert reviews[0].context.get("reviewed_sha") != "HEAD"
+
+
+def test_an_mcp_submission_reporting_nothing_routes_as_before(tmp_db):
+    """⛔The compatibility control, same as the HTTP path's."""
+    _, reviews = _mcp_submit(tmp_db)
+    assert reviews[0].branch == "main"

@@ -152,6 +152,14 @@ def build_mcp_server(
         # `bool` is listed so pydantic cannot coerce `true` to `1` behind the
         # dataclass's back — the same hole the HTTP body had (review of PR #270).
         pr_number: Optional[Union[bool, int, str]] = None,
+        # #305 (review of PR #307): an MCP caller could not report where it
+        # pushed at all — these arguments did not exist, so the fields the
+        # review cascade routes on could never be populated on this transport.
+        # ⛔Both transports or neither: "a guard on one transport is a guard an
+        #   agent walks around by changing how it reports" (#123), and the same
+        #   is true of a capability.
+        branch: str = "",
+        commit: str = "",
     ) -> dict[str, Any]:
         """Mark a task done and store its result.
 
@@ -167,6 +175,11 @@ def build_mcp_server(
                 verdict=verdict,  # type: ignore[arg-type]
                 findings=list(findings or []),
                 pr_number=pr_number,
+                # #305: `commit` is normalised by `TaskResult` itself — a value
+                # that is not a full object id becomes empty rather than a pin
+                # nothing can compare — so both transports inherit one rule.
+                branch=branch,
+                commit=commit,
             )
         except (ValueError, TypeError) as e:
             return {"acknowledged": False, "error": str(e)}
@@ -191,7 +204,12 @@ def build_mcp_server(
         # delivery (#123). Push side-effects are not part of the cascade
         # contract; agents pull tasks themselves on the MCP loop.
         if task_type == "implement" and result.status == "completed":
-            auto_enqueue_review(queue, task_id, pr_number=result.pr_number)
+            # #305 (review of PR #307): forward the result. Without it this
+            # transport routes from the implement TASK's branch — `main` for
+            # every watch-ingested issue — and the review is pointed at a commit
+            # that never contained the work.
+            auto_enqueue_review(queue, task_id, pr_number=result.pr_number,
+                                result=result)
         elif task_type == "review" and _resolve_verdict(result) == "approve":
             auto_enqueue_test(queue, task_id)
         elif task_type == "review" and _resolve_verdict(result) == "request_changes":
