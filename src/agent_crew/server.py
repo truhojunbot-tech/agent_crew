@@ -32,6 +32,8 @@ from agent_crew.pipeline import (
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     hold_mismatched_pr_result,
+    review_publication_decision,
+    stale_review_task_id,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
@@ -540,7 +542,34 @@ def _prepare_worktree_for_task_inner(
         #   — a failure would log "THIS MAY NOT BE THE PR'S CODE" about a task
         #   that is about to be prepared at exactly the commit it names. A
         #   misleading error is not free (#286 review).
-        _pinned_sha = _object_id_or_empty(task_context.get("reviewed_sha"))
+        # #304 review (P1): `expected_head_sha` is the immutable head a requeued
+        # review was CREATED for, and it outranks everything — including the
+        # PR's current branch, which by definition may have moved again between
+        # requeue and dispatch. Before this it had no production reader at all:
+        # it was written onto the requeued task and prep consulted only
+        # `reviewed_sha`, so the requeue resolved the moving branch and could
+        # land on a third commit. That is the very substitution #304 exists to
+        # prevent, reintroduced by its own remedy.
+        _expected_head = _object_id_or_empty(task_context.get("expected_head_sha"))
+        _pinned_sha = _expected_head or _object_id_or_empty(
+            task_context.get("reviewed_sha"))
+        if _expected_head:
+            probe = subprocess.run(
+                ["git", "-C", worktree_path, "rev-parse", "--verify",
+                 f"{_expected_head}^{{commit}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if probe.returncode != 0 or not probe.stdout.strip():
+                # ⛔Refuse, never fall back. #289's rule: a reviewer that cannot
+                #   find its target stops rather than reviewing something else —
+                #   and here "something else" is precisely the moved head this
+                #   task was created to get away from.
+                raise WorktreeTargetUnresolved(
+                    f"{role} {task_id} expects head {_expected_head[:12]}, which "
+                    f"does not resolve in this repository. Refusing to fall back "
+                    f"to the PR's current branch: this review exists because that "
+                    f"head moved (#304). Fetch the commit or requeue."
+                )
         if pr_number and not _pinned_sha:
             resolved = _resolve_pr_head_branch(int(pr_number), cwd=worktree_path)
             if resolved:
@@ -3944,6 +3973,44 @@ def create_app(
             pass
         return ""
 
+    def _requeue_review_at_head(review_task_id: str, pr_number, head: str, ctx) -> None:
+        """Enqueue one head-anchored review for a PR whose head moved (#304).
+
+        ⛔The task id is derived from the PR and the new head, so two results
+          observing the same move produce ONE review rather than two reviewers
+          on one commit — the same claim-by-primary-key mechanism as #244's fix
+          ids. A head that moves again is a genuinely different review and gets
+          its own id.
+        """
+        new_id = stale_review_task_id(pr_number, head)
+        base = ctx if isinstance(ctx, dict) else {}
+        context = {k: v for k, v in base.items()
+                   if k in ("pr_number", "repo", "project", "no_tester",
+                            "coordinator_managed", "checklist_layers")}
+        context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
+                        "expected_head_sha": head})
+        try:
+            q().enqueue(TaskRequest(
+                task_id=new_id,
+                task_type="review",
+                description=f"Review PR #{pr_number} at {head[:12]} "
+                            f"(re-dispatched: {review_task_id} reviewed an older head)",
+                branch=base.get("branch") or "main",
+                priority=3,
+                context=context,
+            ))
+            logger.info(
+                f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
+                f"{head[:12]}, superseding {review_task_id} (#304)")
+        except TaskAlreadyExistsError:
+            logger.info(
+                f"_requeue_review_at_head: {new_id} already exists — another result "
+                f"observed the same head; not duplicating it (#304)")
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"_requeue_review_at_head: could not requeue a review for PR "
+                f"#{pr_number} at {head[:12]}")
+
     def _auto_enqueue_fix(review_task_id: str) -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
@@ -4442,8 +4509,43 @@ def create_app(
             # review counts as approved (#100). Skip when the review task was
             # created with no_tester=True (set by `crew run --no-tester`).
             # #178: post review verdict as GitHub PR comment
+            # ⛔Bound for EVERY task type, not just reviews. The approve gate
+            #   below reads it unconditionally, and assigning it only inside the
+            #   review branch made every non-review result raise
+            #   UnboundLocalError — 59 suites, caught by the full run.
+            _pub = None
             if task_type == "review":
                 _review_pr = result.pr_number or (ctx.get("pr_number") if isinstance(ctx, dict) else None)
+                # #304: a verdict describes the commit that was READ. If the PR
+                # head has moved since this review was prepared, posting it
+                # attributes a judgement to code the reviewer never saw — a
+                # false statement about the PR, not merely a stale one. Measured
+                # downstream 2026-09-14: a review pinned at 5b496a9f published
+                # request_changes while the head was 28419e96, and the PR moved
+                # on again with no head-anchored review anywhere.
+                _pub = review_publication_decision(
+                    ctx if isinstance(ctx, dict) else {}, _review_pr,
+                    repo=(ctx.get("repo") if isinstance(ctx, dict) else "") or "",
+                    repo_cwd=(_load_worktree_map(state_path) or {}).get("reviewer", ""),
+                ) if _review_pr else None
+                if _pub is not None and not _pub.publish:
+                    logger.warning(
+                        f"POST /tasks/{task_id}/result: NOT publishing this verdict to "
+                        f"PR #{_review_pr} — {_pub.reason} (#304). The result itself is "
+                        f"recorded; only the attribution to the wrong commit is stopped."
+                    )
+                    try:
+                        q().patch_context(task_id, {
+                            "review_publication": _pub.status,
+                            "review_publication_reason": _pub.reason,
+                        })
+                    except Exception:  # noqa: BLE001 — telemetry never breaks a result
+                        logger.exception(
+                            f"POST /tasks/{task_id}/result: could not record the "
+                            f"suppressed publication for {task_id}")
+                    if _pub.requeue_head:
+                        _requeue_review_at_head(task_id, _review_pr, _pub.requeue_head, ctx)
+                    _review_pr = None
                 if _review_pr:
                     try:
                         from agent_crew.github import post_review_comment
@@ -4469,7 +4571,25 @@ def create_app(
                     except Exception:
                         logger.exception(f"POST /tasks/{task_id}/result: failed to post review comment on PR #{_review_pr}")
 
-            if task_type == "review" and _resolve_verdict(result) == "approve":
+            # #304 review (P1): suppressing the COMMENT was not enough. The
+            # verdict's CONSEQUENCES ran regardless — an approve with
+            # `no_tester=True` reached `_auto_merge_pr`, otherwise it spent a
+            # tester — so a stale approval of the old commit could merge a PR
+            # whose head had moved. That is strictly worse than the
+            # mis-attributed comment #304 set out to stop, because a merge
+            # cannot be undone by a later head-anchored review.
+            #
+            # ⛔Every review-driven transition is gated on the same decision,
+            #   not just the one that writes to GitHub.
+            _verdict_is_about_this_head = _pub is None or _pub.publish
+            if (task_type == "review" and _resolve_verdict(result) == "approve"
+                    and not _verdict_is_about_this_head):
+                logger.warning(
+                    f"POST /tasks/{task_id}/result: approval NOT acted on — "
+                    f"{_pub.reason} (#304). No tester enqueued and no merge: this "
+                    f"verdict is about a different commit."
+                )
+            elif task_type == "review" and _resolve_verdict(result) == "approve":
                 review_ctx = ctx if isinstance(ctx, dict) else {}
                 pr_number = result.pr_number or review_ctx.get("pr_number")
                 if review_ctx.get("no_tester"):
