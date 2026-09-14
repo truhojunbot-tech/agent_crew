@@ -718,8 +718,13 @@ def auto_enqueue_review(
     pane_map: Optional[dict] = None,
     server_project: Optional[str] = None,
     pr_state_fn=None,
+    result=None,
 ) -> Optional[str]:
     """Create the review task that follows a completed impl task.
+
+    ``result`` is the implementer's own report (#305). When it names a branch
+    that differs from the task's, THAT is where the work is and the review is
+    routed there — see ``_review_target`` below.
 
     Returns the new review task_id, or ``None`` when no review is created
     (cross-project guard, missing impl task, exception). Callers swallow
@@ -731,6 +736,28 @@ def auto_enqueue_review(
             return None
         impl_task = impl_tasks[0]
         impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
+
+        # #305: route to where the implementer actually pushed, not to the
+        # branch the TASK happened to name.
+        # ⛔A watch-ingested issue task carries `branch: main` and no PR,
+        #   because an issue has no branch. The implementer creates one and
+        #   says so; before this the cascade never looked, so the reviewer was
+        #   told to `gh pr list --head main`, found nothing, and returned an
+        #   accurate `request_changes` about routing that then drove a fix
+        #   round against `main` (measured 2026-09-14, review-9aeb0354).
+        #
+        # ⛔Only overrides what the result actually reports. No existing agent
+        #   fills these fields — they did not exist until #305 — so a result
+        #   that says nothing must leave routing byte-for-byte as it was.
+        _pushed_branch = (getattr(result, "branch", "") or "").strip()
+        _pushed_commit = (getattr(result, "commit", "") or "").strip()
+        if _pushed_branch and _pushed_branch != impl_task.branch:
+            logger.info(
+                f"auto_enqueue_review: {impl_task_id} pushed to {_pushed_branch!r} "
+                f"but its task named {impl_task.branch!r} — routing the review to "
+                f"the pushed branch (#305)"
+            )
+            impl_task = replace(impl_task, branch=_pushed_branch)
 
         # ⛔The PR this task is about is not necessarily the one the RESULT
         #   names. Both transports pass `result.pr_number`, and an agent may
@@ -830,6 +857,15 @@ def auto_enqueue_review(
                     "issue_url", "repo"):
             if impl_ctx.get(key) is not None:
                 review_context[key] = impl_ctx[key]
+
+        # #305: pin the review to the commit the implementer actually pushed.
+        # ⛔Only when it is a real object id — `TaskResult` normalises anything
+        #   else away, so a report of `"HEAD"` leaves the task's own pin alone
+        #   rather than replacing it with a string no consumer can compare.
+        #   #304 compares `reviewed_sha` for equality against a live head, and
+        #   a junk pin there would read as "the head moved" forever.
+        if _pushed_commit:
+            review_context["reviewed_sha"] = _pushed_commit
 
         # #164: compact review description — avoid re-injecting the full
         # original spec into the reviewer's context. The reviewer should
