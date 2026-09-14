@@ -1,3 +1,4 @@
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Union
@@ -68,6 +69,12 @@ class TaskRequest:
             raise ValueError(f"Invalid priority: {self.priority!r}. Must be between 1 and 5")
 
 
+#: A full git object id — 40 hex for sha1 repos, 64 for sha256. Deliberately
+#: not a prefix match: abbreviations are ambiguous by construction, and nothing
+#: that consumes this field can use one (#305).
+_OBJECT_ID_RE = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
+
+
 @dataclass
 class TaskResult:
     task_id: str
@@ -88,10 +95,33 @@ class TaskResult:
     #: accept it syntactically so we can refuse it explicitly, instead of
     #: coercing it into a plausible PR number nobody named.
     pr_number: Optional[Union[bool, int, str]] = None
+    #: Where the implementer actually pushed its work (#305).
+    #:
+    #: ⛔The worker protocol has always asked implementers to report these, and
+    #:   until #305 the model had neither field — so every report was accepted
+    #:   by the endpoint and dropped by pydantic. The auto-review cascade
+    #:   therefore routed from the implement TASK's branch, which for a
+    #:   watch-ingested issue is `main`, and sent reviewers to look for a PR
+    #:   that does not exist (measured 2026-09-14, review-9aeb0354).
+    branch: str = ""
+    #: ⛔Normalised to `""` unless it looks like a full object id — see
+    #:   `__post_init__`. A real result reported `commit: "HEAD"`, which is
+    #:   useless to every consumer, and an abbreviation is worse than useless:
+    #:   `reviewed_sha` is compared for equality against a full head SHA (#304),
+    #:   so a 7-char prefix would read as "the head moved" forever.
+    commit: str = ""
     retry_count: int = 0  # Track number of retry attempts
     error_info: Optional[dict] = None  # Structured error payload for debugging (#167)
 
     def __post_init__(self):
+        # #305: keep the SPELLING honest without ever throwing the result away.
+        # ⛔A 422 over one field discarded an entire result once already (#270),
+        #   so a commit that is not an object id is normalised to empty rather
+        #   than raised on. Losing a branch report is recoverable; losing the
+        #   summary, verdict and findings is not.
+        self.branch = (self.branch or "").strip() if isinstance(self.branch, str) else ""
+        _commit = (self.commit or "").strip() if isinstance(self.commit, str) else ""
+        self.commit = _commit if _OBJECT_ID_RE.match(_commit) else ""
         if self.status not in _VALID_RESULT_STATUSES:
             raise ValueError(f"Invalid status: {self.status!r}. Must be one of {_VALID_RESULT_STATUSES}")
         if self.retry_count < 0:
