@@ -305,3 +305,161 @@ def test_the_result_itself_is_still_recorded(tmp_db, monkeypatch):
     rule for every gate in this pipeline."""
     _, q = _submit_review(tmp_db, monkeypatch, MOVED_TO)
     assert q.get_result("review-stale") is not None
+
+
+# ── 7. review of PR #306: suppressing the COMMENT was not enough ──────
+#
+# P1. #304 gated `post_review_comment` and stopped there, so the verdict's
+# CONSEQUENCES still ran: an approve with `no_tester=True` reached
+# `_auto_merge_pr`, and otherwise it enqueued a tester. A stale approval of the
+# old commit therefore merged a PR whose head had moved — strictly worse than
+# the mis-attributed comment #304 set out to prevent, because a merge cannot be
+# taken back by a later head-anchored review.
+
+
+def _submit_approve(tmp_db, monkeypatch, head, *, no_tester=False):
+    """Post an APPROVING review whose pin is PINNED, with the live head stubbed."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    merged, tests, posted = [], [], []
+    monkeypatch.setattr("agent_crew.github.post_review_comment",
+                        lambda **kw: posted.append(kw))
+    monkeypatch.setattr("agent_crew.github.pr_head_sha", lambda *a, **k: head)
+    # ⛔Without an open PR state the terminal-PR gate skips the test enqueue for
+    #   EVERY case, so "no tester was enqueued" would pass for a stale review
+    #   and for a current one alike — the control would prove nothing.
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "open")
+    monkeypatch.setattr("agent_crew.github.get_repo", lambda *a, **k: "owner/repo")
+    monkeypatch.setattr("agent_crew.github.merge_pr",
+                        lambda n, **k: merged.append(n) or True)
+
+    ctx = {"pr_number": 5652, "repo": "owner/repo", "reviewed_sha": PINNED}
+    if no_tester:
+        ctx["no_tester"] = True
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="review-approve", task_type="review",
+                          description="Review PR #5652", branch="main", context=ctx))
+
+    app = create_app(db_path=tmp_db, pane_map={}, port=0, watchdog_disabled=True,
+                     anomaly_disabled=True, push_fn=lambda *a, **k: None)
+    with TestClient(app) as client:
+        response = client.post("/tasks/review-approve/result", json={
+            "task_id": "review-approve", "status": "completed",
+            "summary": "looks good", "verdict": "approve", "pr_number": 5652})
+        assert response.status_code == 200, response.text
+    tests.extend(t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "test")
+    return posted, tests, merged
+
+
+def test_a_stale_approval_does_not_enqueue_a_tester(tmp_db, monkeypatch):
+    """★★P1. The verdict approves `5b496a9f`; the head is `28419e96`. Spending a
+    tester on it treats an approval of the old commit as approval of the PR."""
+    posted, tests, _ = _submit_approve(tmp_db, monkeypatch, MOVED_TO)
+    assert posted == []
+    assert tests == [], f"a stale approval still enqueued a tester: {tests}"
+
+
+def test_a_current_approval_still_enqueues_a_tester(tmp_db, monkeypatch):
+    """⛔The control. Gating everything would stop the pipeline, not fix it."""
+    _, tests, _ = _submit_approve(tmp_db, monkeypatch, PINNED)
+    assert len(tests) == 1
+
+
+def test_a_stale_approval_with_no_tester_does_not_merge(tmp_db, monkeypatch):
+    """★★The worst case in the finding. `no_tester=True` sends an approval
+    straight to merge — so a review of a commit nobody is looking at could land
+    a PR whose head had moved twice."""
+    _, _, merged = _submit_approve(tmp_db, monkeypatch, MOVED_TO, no_tester=True)
+    assert merged == [], f"a stale approval merged a moved PR: {merged}"
+
+
+def test_the_suppressed_approval_is_recorded(tmp_db, monkeypatch):
+    from agent_crew.queue import TaskQueue
+
+    _submit_approve(tmp_db, monkeypatch, MOVED_TO)
+    ctx = TaskQueue(tmp_db).get_task_context("review-approve")
+    assert ctx.get("review_publication") == "stale"
+
+
+# ── 8. review of PR #306: the expected pin had no reader ──────────────
+#
+# P1. `_requeue_review_at_head` wrote `expected_head_sha` onto the requeued
+# task, but worktree prep reads only `reviewed_sha` — so the field had no
+# production reader at all and the requeued review resolved the PR's MOVING
+# branch instead of the head it was created for.
+
+
+def _prep_with(context, *, resolvable):
+    """Run reviewer prep with git stubbed; `resolvable` lists refs that exist."""
+    from unittest.mock import MagicMock, patch
+
+    from agent_crew.server import _prepare_worktree_for_task
+
+    cmds = []
+
+    def fake_run(cmd, **_kw):
+        cmds.append(cmd)
+        if "rev-parse" in cmd and "--verify" in cmd:
+            ref = cmd[-1].replace("^{commit}", "")
+            if ref in resolvable:
+                return MagicMock(returncode=0, stdout=resolvable[ref] + "\n", stderr="")
+            return MagicMock(returncode=1, stdout="", stderr="unknown revision")
+        if "rev-parse" in cmd:
+            return MagicMock(returncode=0, stdout=(PINNED + "\n"), stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
+        _prepare_worktree_for_task("/wt/codex", "review-5652-b", "feat/x", "reviewer",
+                                   task_context=context)
+    return [c[-1] for c in cmds if "checkout" in c and "--detach" in c]
+
+
+def test_the_expected_head_is_the_checkout_pin(tmp_db):
+    """★★The B-to-C advance. The review was requeued for head B; by dispatch the
+    PR is at C. It must be prepared at B — the head it was created for — not at
+    whatever the branch resolves to now."""
+    detached = _prep_with(
+        {"expected_head_sha": MOVED_TO, "pr_number": 5652},
+        resolvable={MOVED_TO: MOVED_TO, "origin/feat/x": MOVED_AGAIN,
+                    "origin/main": PINNED, MOVED_AGAIN: MOVED_AGAIN})
+    assert detached and detached[0] == MOVED_TO, \
+        f"prepared at {detached[:1]} instead of the expected head"
+
+
+def test_an_expected_head_that_does_not_resolve_is_refused(tmp_db):
+    """⛔Fail closed, like #289 and #304. Falling back to the moving branch is
+    exactly the substitution the expected pin exists to prevent — and doing it
+    silently is how #304 happened in the first place."""
+    from agent_crew.server import WorktreeTargetUnresolved
+
+    with pytest.raises(WorktreeTargetUnresolved):
+        _prep_with({"expected_head_sha": MOVED_TO, "pr_number": 5652},
+                   resolvable={"origin/feat/x": MOVED_AGAIN, "origin/main": PINNED})
+
+
+def test_a_task_with_no_expected_head_is_unaffected(tmp_db):
+    """⛔The compatibility control: every review that is not a requeue carries no
+    expected head and must prepare exactly as before."""
+    detached = _prep_with(
+        {},
+        resolvable={"origin/feat/x": MOVED_AGAIN, "origin/main": PINNED})
+    # Prep resolves the ref to a commit and detaches there (#286), so landing on
+    # whatever `origin/feat/x` points at IS the unchanged branch behaviour.
+    assert detached and detached[0] == MOVED_AGAIN
+
+
+def test_the_requeued_task_carries_a_pin_prep_can_actually_use(tmp_db, monkeypatch):
+    """★★The end of the finding: the field must reach a reader. Asserted against
+    prep itself, not against the string being present in the context."""
+    from agent_crew.queue import TaskQueue
+
+    _submit_review(tmp_db, monkeypatch, MOVED_TO)
+    requeued = [t for t in TaskQueue(tmp_db).list_tasks()
+                if t.task_id == stale_review_task_id(5652, MOVED_TO)][0]
+    detached = _prep_with(requeued.context,
+                          resolvable={MOVED_TO: MOVED_TO, "origin/main": PINNED})
+    assert detached and detached[0] == MOVED_TO
