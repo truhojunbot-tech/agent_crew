@@ -16,6 +16,14 @@ def _claude_session(home, cwd, usage, *, model="claude-test"):
     return path
 
 
+def _usage_record(invocation_id, usage, *, model="claude-test"):
+    """Claude replays have distinct line UUIDs but retain message.id."""
+    return json.dumps({
+        "uuid": f"line-{invocation_id}",
+        "message": {"id": invocation_id, "model": model, "usage": usage},
+    }) + "\n"
+
+
 def test_claude_adapter_reads_only_explicit_usage_fields(tmp_path):
     cwd = "/worktrees/claude-317"
     _claude_session(tmp_path, cwd, {
@@ -56,6 +64,141 @@ def test_claude_adapter_keeps_missing_usage_unknown(tmp_path):
     assert observed.context_window_tokens is None
     assert observed.reasoning_tokens is None
     assert observed.output_tokens == 7
+
+
+def test_claude_adapter_sums_and_deduplicates_usage_in_a_task_span(tmp_path):
+    cwd = "/worktrees/claude-317-span"
+    path = _claude_session(tmp_path, cwd, {"input_tokens": 100})
+    start = path.stat().st_size
+    first = {"input_tokens": 2, "cache_creation_input_tokens": 3,
+             "cache_read_input_tokens": 5, "output_tokens": 7,
+             "reasoning_tokens": 11}
+    second = {"input_tokens": 13, "cache_creation_input_tokens": 17,
+              "cache_read_input_tokens": 19, "output_tokens": 23,
+              "reasoning_tokens": 29}
+    with path.open("a") as transcript:
+        transcript.write(_usage_record("invocation-1", first))
+        transcript.write(_usage_record("invocation-1", first))
+        transcript.write(_usage_record("invocation-2", second))
+
+    observed = ClaudeSessionTelemetryAdapter(home=tmp_path).extract(
+        provider="claude", worktree_path=cwd,
+        provider_session_id=_span_session_id(path.stem, start),
+    )
+
+    assert (observed.uncached_input_tokens, observed.cache_write_tokens,
+            observed.cache_read_tokens, observed.output_tokens,
+            observed.reasoning_tokens, observed.context_window_tokens) == (15, 20, 24, 30, 40, 59)
+
+
+def _span_session_id(session_id, offset):
+    """Queue uses this internal carrier without changing adapter's API."""
+    from agent_crew.queue import _TaskProviderSessionId
+    return _TaskProviderSessionId(session_id, {"session_id": session_id, "offset": offset})
+
+
+def test_sequential_tasks_use_only_their_own_transcript_spans(tmp_path):
+    db = tmp_path / "tasks.db"
+    cwd = "/worktrees/claude-317-sequential"
+    path = _claude_session(tmp_path, cwd, {"input_tokens": 999})
+    queue = TaskQueue(str(db), telemetry_adapter=ClaudeSessionTelemetryAdapter(home=tmp_path))
+    for task_id in ("task-a", "task-b"):
+        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="d"))
+        queue.record_attribution(task_id=task_id, agent="claude", worktree_path=cwd,
+                                 provider_session_id=path.stem, status="in_progress")
+
+    a_start = path.stat().st_size
+    with path.open("a") as transcript:
+        transcript.write(_usage_record("a-1", {"input_tokens": 2, "output_tokens": 3}))
+        transcript.write(_usage_record("a-2", {"input_tokens": 5, "output_tokens": 7}))
+    queue.patch_context("task-a", {"claude_transcript_start": {
+        "session_id": path.stem, "offset": a_start}})
+    queue.submit_result("task-a", TaskResult(task_id="task-a", status="completed", summary="a"))
+
+    b_start = path.stat().st_size
+    with path.open("a") as transcript:
+        transcript.write(_usage_record("b-1", {"input_tokens": 11, "output_tokens": 13}))
+    queue.patch_context("task-b", {"claude_transcript_start": {
+        "session_id": path.stem, "offset": b_start}})
+    queue.submit_result("task-b", TaskResult(task_id="task-b", status="completed", summary="b"))
+
+    a, b = queue.get_attribution("task-a"), queue.get_attribution("task-b")
+    assert (a["uncached_input_tokens"], a["output_tokens"]) == (7, 10)
+    assert (b["uncached_input_tokens"], b["output_tokens"]) == (11, 13)
+
+
+def test_task_span_boundary_survives_queue_restart(tmp_path):
+    db = tmp_path / "tasks.db"
+    cwd = "/worktrees/claude-317-restart"
+    path = _claude_session(tmp_path, cwd, {"input_tokens": 999})
+    queue = TaskQueue(str(db), telemetry_adapter=ClaudeSessionTelemetryAdapter(home=tmp_path))
+    queue.enqueue(TaskRequest(task_id="restart-span", task_type="implement", description="d"))
+    queue.record_attribution(task_id="restart-span", agent="claude", worktree_path=cwd,
+                             provider_session_id=path.stem, status="in_progress")
+    start = path.stat().st_size
+    queue.patch_context("restart-span", {"claude_transcript_start": {
+        "session_id": path.stem, "offset": start}})
+    with path.open("a") as transcript:
+        transcript.write(_usage_record("restart-1", {"input_tokens": 31, "output_tokens": 37}))
+
+    restarted = TaskQueue(str(db), telemetry_adapter=ClaudeSessionTelemetryAdapter(home=tmp_path))
+    restarted.submit_result("restart-span", TaskResult(
+        task_id="restart-span", status="completed", summary="done"))
+
+    row = restarted.get_attribution("restart-span")
+    assert (row["uncached_input_tokens"], row["output_tokens"]) == (31, 37)
+
+
+def test_claude_dispatch_persists_the_existing_transcript_byte_boundary(tmp_path, monkeypatch):
+    import asyncio
+    import subprocess
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew import server
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    path = _claude_session(tmp_path, str(wt), {"input_tokens": 101})
+    expected_offset = path.stat().st_size
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    db = str(tmp_path / "tasks.db")
+
+    async def fake_exec(*args, **kwargs):
+        class Process:
+            returncode = 0
+            pid = 1
+
+            async def wait(self):
+                return 0
+
+        return Process()
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr(server, "_claude_home", lambda home=None: tmp_path)
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""))
+
+    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state), project="project",
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        queue = TaskQueue(db)
+        context = queue.get_or_create_context("project", "claude", str(wt),
+                                              role="implementer", task_id="prior")
+        queue.update_context_provider_session_id(context["context_key"], path.stem)
+        queue.enqueue(TaskRequest(task_id="span-dispatch", task_type="implement",
+                                  description="d", project="project"))
+        task = queue.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    persisted = TaskQueue(db).get_task_context("span-dispatch")
+    assert persisted["claude_transcript_start"] == {
+        "session_id": path.stem, "offset": expected_offset}
 
 
 def test_result_submission_persists_adapter_telemetry_and_lifecycle(tmp_path):
