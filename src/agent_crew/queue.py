@@ -190,6 +190,26 @@ _DDL_MIGRATE_STATUS_CHANGED_AT = (
 
 #: #311 — the project's own pause record. One row per scope, in the queue's own
 #: database so it survives a restart exactly as the queue does.
+#: #311 review: a blocked transition must be OBSERVABLE. A `dequeue` that
+#: returns None is indistinguishable from an empty queue, so every refusal is
+#: recorded here with the identities the issue asks for.
+_DDL_BLOCKED_TRANSITIONS = """
+CREATE TABLE IF NOT EXISTS blocked_transitions (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    blocked_at   REAL NOT NULL,
+    transition   TEXT NOT NULL DEFAULT '',
+    scope        TEXT NOT NULL DEFAULT '',
+    reason       TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT '',
+    incident_ref TEXT NOT NULL DEFAULT '',
+    generation   INTEGER NOT NULL DEFAULT 0,
+    task_id      TEXT NOT NULL DEFAULT '',
+    context_id   TEXT NOT NULL DEFAULT '',
+    provider     TEXT NOT NULL DEFAULT '',
+    provider_session_id TEXT NOT NULL DEFAULT ''
+)
+"""
+
 _DDL_RUNTIME_PAUSE = """
 CREATE TABLE IF NOT EXISTS runtime_pause (
     scope        TEXT PRIMARY KEY,
@@ -336,6 +356,7 @@ class TaskQueue:
         conn.execute(_DDL_CONTEXT_STATE)
         conn.execute(_DDL_PR_ANNOUNCEMENTS)
         conn.execute(_DDL_RUNTIME_PAUSE)
+        conn.execute(_DDL_BLOCKED_TRANSITIONS)
         try:
             conn.execute("ALTER TABLE pr_announcements ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
         except Exception:
@@ -678,25 +699,32 @@ class TaskQueue:
         """
         from agent_crew.pause import PauseState, resume_is_stale
 
-        current = self.pause_state(scope)
-        if not current.paused:
-            return (True, current)
-        if resume_is_stale(current, generation):
-            logger.warning(
-                f"release_pause: REFUSED for scope={scope} — resume names "
-                f"generation {generation!r} but generation "
-                f"{current.generation} is in force. A newer STOP has landed "
-                f"since; it is not this resume's to clear (#311)."
-            )
-            return (False, current)
+        # ⛔The compare AND the clear happen in ONE `BEGIN IMMEDIATE`, which
+        #   serializes against `activate_pause`. Reading the generation, then
+        #   clearing in a separate statement, let a resume that had already read
+        #   an older generation overwrite a STOP that landed in between — the
+        #   local comparison cannot see a write it never read (review of PR
+        #   #312; the same read-modify-write existed here).
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._pause_state_on(conn, scope)
+            if not current.paused:
+                conn.execute("ROLLBACK")
+                return (True, current)
+            if resume_is_stale(current, generation):
+                conn.execute("ROLLBACK")
+                logger.warning(
+                    f"release_pause: REFUSED for scope={scope} — resume names "
+                    f"generation {generation!r} but generation "
+                    f"{current.generation} is in force (#311).")
+                return (False, current)
             conn.execute(
                 "UPDATE runtime_pause SET paused = 0, reason = '', source = '', "
                 "incident_ref = '', activated_at = NULL WHERE scope = ?",
                 (scope,),
             )
-            conn.commit()
+            conn.execute("COMMIT")
         finally:
             conn.close()
         logger.info(
@@ -704,6 +732,102 @@ class TaskQueue:
             f"{current.generation} — the queue may claim again (#311)")
         return (True, PauseState(paused=False, scope=scope,
                                  generation=current.generation))
+
+    def _pause_state_on(self, conn, scope: str = "project"):
+        """Read a scope's pause row on an EXISTING connection/transaction (#311).
+
+        ⛔Used from inside the claim's own `BEGIN IMMEDIATE` so the check and the
+          pending->in_progress commit are one serialized unit. Reading it before
+          the transaction left a window where a STOP could be persisted after
+          the check and before the claim committed, letting a pre-STOP item
+          start *after* the safety boundary (review of PR #312 — reproduced
+          against this branch too).
+        """
+        from agent_crew.pause import PauseState
+
+        row = conn.execute(
+            "SELECT * FROM runtime_pause WHERE scope = ?", (scope,)
+        ).fetchone()
+        if row is None:
+            return PauseState(scope=scope)
+        return PauseState(
+            paused=bool(row["paused"]), scope=row["scope"],
+            reason=row["reason"] or "", source=row["source"] or "",
+            incident_ref=row["incident_ref"] or "",
+            generation=int(row["generation"] or 0),
+            activated_at=row["activated_at"],
+        )
+
+    def _claim_pause_decision(self, conn, transition: str = "claim"):
+        """The pause decision for a claim, evaluated inside its transaction.
+
+        ⛔FAILS CLOSED. A P0 STOP contract cannot read "I could not determine the
+          pause state" as "there is no pause" — the same class of error as
+          reading an unreadable global STOP file as running. Every failure path
+          blocks and says why.
+        """
+        from agent_crew.pause import GlobalPauseFile, PauseDecision, decide
+
+        try:
+            scopes = [self._pause_state_on(conn, "project")]
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("_claim_pause_decision: project pause unreadable")
+            return PauseDecision(
+                allowed=False, scope="project",
+                reason=f"pause state unavailable: {exc}",
+                source="agent_crew", transition=transition)
+        try:
+            scopes.append(GlobalPauseFile().read())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("_claim_pause_decision: global pause unreadable")
+            return PauseDecision(
+                allowed=False, scope="global",
+                reason=f"pause state unavailable: {exc}",
+                source="agent_crew", transition=transition)
+        return decide(scopes, transition)
+
+    def _record_blocked_transition(self, decision, *, task_id: str = "",
+                                   context_id: str = "", provider: str = "",
+                                   provider_session_id: str = "") -> None:
+        """Durably record that a transition was refused (#311 review).
+
+        ⛔Telemetry, never a gate: this runs on its own connection and can never
+          raise into the caller. A receipt that could fail a claim would make
+          observability a new way to lose work.
+        """
+        try:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO blocked_transitions
+                        (blocked_at, transition, scope, reason, source,
+                         incident_ref, generation, task_id, context_id,
+                         provider, provider_session_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (time.time(), decision.transition, decision.scope,
+                     decision.reason, decision.source, decision.incident_ref,
+                     decision.generation, task_id, context_id, provider,
+                     provider_session_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:  # noqa: BLE001
+            logger.exception("_record_blocked_transition: could not record a refusal")
+
+    def list_blocked_transitions(self, limit: int = 50) -> list:
+        """Recent refusals, newest first — what the status surface reads (#311)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM blocked_transitions ORDER BY id DESC LIMIT ?",
+                (int(limit),),
+            ).fetchall()
+        finally:
+            conn.close()
+        return [dict(r) for r in rows]
 
     def pause_decision(self, transition: str = "claim", *,
                        global_pause=None) -> "PauseDecision":
@@ -739,26 +863,29 @@ class TaskQueue:
            agent. Stage 2 only runs after stage 1 has no candidate.
         3. Neither given: any pending task, ordered by priority.
         """
-        # #311: the STOP gate, at the one place every transport claims work.
-        # ⛔Inside the claim, not beside it. A feeder-level STOP upstream stopped
-        #   new work being handed to this runtime and the runtime kept draining
-        #   the queue it already had — because the only guard lived in the thing
-        #   that supplies tasks. HTTP, the dispatcher loop, `_try_push_next` and
-        #   MCP all reach work through here, so a guard here cannot be walked
-        #   around by changing how a caller asks.
-        _pause = self.pause_decision("claim")
-        if not _pause.allowed:
-            logger.warning(
-                f"dequeue: BLOCKED by a {_pause.scope} pause "
-                f"(generation {_pause.generation}, source={_pause.source!r}, "
-                f"incident={_pause.incident_ref!r}): {_pause.reason}. Queued work "
-                f"stays queued (#311)."
-            )
-            self._last_pause_decision = _pause
-            return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+
+            # #311: the STOP gate, INSIDE the claim's own transaction.
+            # ⛔`BEGIN IMMEDIATE` here and in `activate_pause` serialize against
+            #   each other, so a STOP cannot land between the check and the
+            #   pending->in_progress commit. Checking before the transaction
+            #   left exactly that window open, and a pre-STOP item could start
+            #   after the safety boundary (review of PR #312 — reproduced here).
+            # ⛔Fails closed: an unreadable pause state blocks.
+            _pause = self._claim_pause_decision(conn)
+            if not _pause.allowed:
+                conn.execute("ROLLBACK")
+                self._last_pause_decision = _pause
+                self._record_blocked_transition(_pause)
+                logger.warning(
+                    f"claim BLOCKED by a {_pause.scope} pause "
+                    f"(generation {_pause.generation}, source={_pause.source!r}, "
+                    f"incident={_pause.incident_ref!r}): {_pause.reason}. "
+                    f"Queued work stays queued (#311)."
+                )
+                return None
             row = None
             if agent:
                 # Stage 1 — explicit override claim for this agent.
@@ -1074,26 +1201,29 @@ class TaskQueue:
         """Atomic pending→in_progress for the oldest pending discuss task whose
         context.agent matches `agent`. Context is stored as JSON, so filtering
         happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
-        # #311: the STOP gate, at the one place every transport claims work.
-        # ⛔Inside the claim, not beside it. A feeder-level STOP upstream stopped
-        #   new work being handed to this runtime and the runtime kept draining
-        #   the queue it already had — because the only guard lived in the thing
-        #   that supplies tasks. HTTP, the dispatcher loop, `_try_push_next` and
-        #   MCP all reach work through here, so a guard here cannot be walked
-        #   around by changing how a caller asks.
-        _pause = self.pause_decision("claim")
-        if not _pause.allowed:
-            logger.warning(
-                f"dequeue_discuss_for_agent: BLOCKED by a {_pause.scope} pause "
-                f"(generation {_pause.generation}, source={_pause.source!r}, "
-                f"incident={_pause.incident_ref!r}): {_pause.reason}. Queued work "
-                f"stays queued (#311)."
-            )
-            self._last_pause_decision = _pause
-            return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+
+            # #311: the STOP gate, INSIDE the claim's own transaction.
+            # ⛔`BEGIN IMMEDIATE` here and in `activate_pause` serialize against
+            #   each other, so a STOP cannot land between the check and the
+            #   pending->in_progress commit. Checking before the transaction
+            #   left exactly that window open, and a pre-STOP item could start
+            #   after the safety boundary (review of PR #312 — reproduced here).
+            # ⛔Fails closed: an unreadable pause state blocks.
+            _pause = self._claim_pause_decision(conn)
+            if not _pause.allowed:
+                conn.execute("ROLLBACK")
+                self._last_pause_decision = _pause
+                self._record_blocked_transition(_pause)
+                logger.warning(
+                    f"claim BLOCKED by a {_pause.scope} pause "
+                    f"(generation {_pause.generation}, source={_pause.source!r}, "
+                    f"incident={_pause.incident_ref!r}): {_pause.reason}. "
+                    f"Queued work stays queued (#311)."
+                )
+                return None
             rows = conn.execute(
                 """
                 SELECT * FROM tasks

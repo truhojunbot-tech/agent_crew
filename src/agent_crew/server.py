@@ -2275,8 +2275,60 @@ def create_app(
     # without the asyncio loop. Production code never reads this attribute.
     app.state.reminded_task_ids = reminded_task_ids
 
+    def _pause_blocks(transition: str, task_id: str = "") -> bool:
+        """May this automatic transition start? (#311 review, P0.)
+
+        ⛔The claim gate alone was not enough. A result arriving for a task that
+          was already in flight when STOP landed still drove fallback, retry,
+          review, test, fix, merge and push-next — so an in-flight task went on
+          creating child and next-stage work after the safety boundary. The
+          issue's requirement 3 is explicit: prevent any NEW child/retry/
+          next-stage transition once the current atomic action returns.
+
+        ⛔Gated inside each transition helper rather than at its call sites, for
+          the same reason the claim gate lives inside `dequeue`: a guard beside
+          the work is one new caller away from being bypassed.
+
+        Never raises — an unreadable pause state blocks (fail closed) and a
+        broken receipt is logged, because a gate that can throw is a new way to
+        lose a result.
+        """
+        try:
+            decision = q().pause_decision(transition)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                f"_pause_blocks: pause state unreadable for {transition!r} — "
+                f"blocking (fail closed, #311)")
+            return True
+        if decision.allowed:
+            return False
+        logger.warning(
+            f"_pause_blocks: {transition} BLOCKED for task_id={task_id!r} by a "
+            f"{decision.scope} pause (generation {decision.generation}, "
+            f"incident={decision.incident_ref!r}): {decision.reason}. The task's "
+            f"own result is still recorded; only new work is refused (#311)."
+        )
+        try:
+            _ctx = q().get_task_context(task_id) if task_id else {}
+        except Exception:  # noqa: BLE001
+            _ctx = {}
+        try:
+            q()._record_blocked_transition(
+                decision, task_id=task_id or "",
+                context_id=str((_ctx or {}).get("context_id") or ""),
+                provider=str((_ctx or {}).get("provider")
+                             or (_ctx or {}).get("agent") or ""),
+                provider_session_id=str((_ctx or {}).get("provider_session_id") or ""),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("_pause_blocks: could not record the refusal")
+        return True
+
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
+        # #311 review (P0): no NEW work after the safety boundary.
+        if _pause_blocks("dispatch", ""):
+            return
         logger.debug(f"_try_push_next: role={role}")
         if not _push_enabled:
             logger.warning(
@@ -3935,6 +3987,9 @@ def create_app(
         only adds the tmux push side-effect, which the MCP path skips —
         agents on the MCP loop pull tasks themselves.
         """
+        # #311 review (P0): no NEW work after the safety boundary.
+        if _pause_blocks("review", impl_task_id):
+            return
         review_id = _pipeline_auto_enqueue_review(
             q(),
             impl_task_id,
@@ -3952,6 +4007,9 @@ def create_app(
     def _auto_enqueue_test(review_task_id: str) -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123)."""
+        # #311 review (P0): no NEW work after the safety boundary.
+        if _pause_blocks("test", review_task_id):
+            return
         test_id = _pipeline_auto_enqueue_test(
             q(),
             review_task_id,
@@ -4019,6 +4077,9 @@ def create_app(
     def _auto_enqueue_fix(review_task_id: str) -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
+        # #311 review (P0): no NEW work after the safety boundary.
+        if _pause_blocks("fix", review_task_id):
+            return
         # The cascade swallows its own errors, but the invariant it is
         # protecting belongs here: a result submission must never 500 because
         # a FOLLOW-UP failed. The agent has already done the work, and an
@@ -4049,6 +4110,9 @@ def create_app(
     def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> None:
         """Auto-retry a failed task if it hasn't exceeded max retries.
         This provides resilience against transient failures."""
+        # #311 review (P0): no NEW work after the safety boundary.
+        if _pause_blocks("retry", task_id):
+            return False
         MAX_RETRIES = 2
         try:
             # Get the original task to extract description, branch, and context
@@ -4131,6 +4195,9 @@ def create_app(
         Failures are logged and swallowed — a merge error must never break
         the result-submission response.
         """
+        # #311 review (P0): no NEW work after the safety boundary.
+        if _pause_blocks("merge", ""):
+            return
         from agent_crew.github import get_repo, merge_pr
         repo = get_repo()
         ok = merge_pr(pr_number, merge_method="squash", repo=repo)
@@ -4153,6 +4220,9 @@ def create_app(
         HTTP-only — when fallback enqueues a successor task, nudge that
         role's pane.
         """
+        # #311 review (P0): no NEW work after the safety boundary.
+        if _pause_blocks("fallback", task_id):
+            return False
         handled = _pipeline_auto_fallback_failed_task(
             q(),
             task_id,

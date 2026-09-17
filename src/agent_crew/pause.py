@@ -31,6 +31,7 @@ Two scopes, both optional and both config-driven:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -230,7 +231,41 @@ class GlobalPauseFile:
             json.dump(state.to_dict(), fh)
         os.replace(tmp, self._path)
 
+    def _locked(self):
+        """Exclusive lock around the file's read-modify-write (#311 review).
+
+        ⛔Without it, activate and release are an unsynchronized read then write:
+          a resume that had already read an older generation could overwrite a
+          STOP written in between, and the generation comparison cannot see a
+          write it never read. The lock is a sibling `.lock` file so the state
+          file itself can still be replaced atomically by `os.replace`.
+        """
+        import contextlib
+
+        @contextlib.contextmanager
+        def _cm():
+            directory = os.path.dirname(self._path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            fd = os.open(f"{self._path}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+
+        return _cm()
+
     def activate(self, *, reason: str, source: str = "", incident_ref: str = "") -> PauseState:
+        with self._locked():
+            return self._activate_locked(reason=reason, source=source,
+                                         incident_ref=incident_ref)
+
+    def _activate_locked(self, *, reason: str, source: str = "",
+                         incident_ref: str = "") -> PauseState:
         current = self.read()
         state = PauseState(
             paused=True, scope="global", reason=reason, source=source,
@@ -241,6 +276,10 @@ class GlobalPauseFile:
         return state
 
     def release(self, generation) -> tuple[bool, PauseState]:
+        with self._locked():
+            return self._release_locked(generation)
+
+    def _release_locked(self, generation) -> tuple[bool, PauseState]:
         current = self.read()
         if not current.paused:
             return (True, current)

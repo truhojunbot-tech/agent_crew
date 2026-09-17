@@ -90,6 +90,31 @@ here imports a fleet — asserted by a test that parses imports across the whole
 package. An external system manager drives the CLI/API above and reads the status
 back; the dependency direction is one-way.
 
+## Fail-closed and serialization (review of PR #312)
+
+Three properties the first version did not have:
+
+- **The claim gate runs inside the claim's own `BEGIN IMMEDIATE`**, which
+  serializes against `activate_pause`. Checking before the transaction left a
+  window where a STOP could be persisted after the check and before the
+  `pending -> in_progress` commit, so a pre-STOP item could start *after* the
+  safety boundary.
+- **Every unreadable pause state blocks.** Project row, global file, and the
+  cascade gate all fail closed. "I could not determine whether we are paused" is
+  not evidence that we are not.
+- **Resume is a compare-and-swap.** The generation comparison and the clear
+  happen in one transaction (and under an exclusive lock for the global file),
+  so a resume that had already read an older generation cannot overwrite a STOP
+  written in between — a comparison cannot see a write it never read.
+
+## Blocked-transition receipts
+
+A `dequeue` returning `None` is indistinguishable from an empty queue, so every
+refusal is now recorded durably in `blocked_transitions` with the transition,
+scope, reason, source, incident, generation, and the task/context/provider/
+session identities. `list_blocked_transitions()` reads them; an empty queue
+leaves no receipt, which is what makes a receipt mean something.
+
 ## What is not proven
 
 1. **No organic canary.** Every test here is synthetic. The acceptance criterion
@@ -100,8 +125,9 @@ back; the dependency direction is one-way.
    *next* claim. Cooperative mid-flight cancellation is not implemented, and the
    issue explicitly allows that as the default safety mode — but it means a STOP
    does not stop an agent mid-turn.
-3. **The cascade is not yet gated.** `auto_enqueue_review`/`test`/`fix` still
-   *create* follow-up tasks while paused. Those tasks cannot be claimed — the
-   gate above holds — so no work starts, but the queue grows during an incident.
-   Gating creation as well as claiming is a deliberate follow-up rather than an
-   unnoticed gap.
+3. ~~The cascade is not yet gated.~~ **Now gated** (review of PR #312).
+   `_try_push_next`, fallback, retry, `auto_enqueue_review`/`test`/`fix` and
+   `auto_merge_pr` each consult the shared decision before starting, so a result
+   arriving for a task that was already in flight when STOP landed creates no
+   child, retry or next-stage work. The result itself is still recorded — only
+   new work is refused.
