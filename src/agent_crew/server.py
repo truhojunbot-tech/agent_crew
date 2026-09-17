@@ -2268,6 +2268,29 @@ def create_app(
 
     app = FastAPI(lifespan=lifespan)
 
+    # #314 P0-1: enqueue가 runtime STOP으로 원자적으로 거부(PausedError)되면 — result cascade의
+    # race 창에서 successor enqueue 시점에 STOP이 authoritative가 된 경우 — 500이 아니라
+    # suppressed 200으로 처리하고 억제를 durable 기록한다(successor는 이미 INSERT 안 됨).
+    from fastapi.responses import JSONResponse as _JSONResponse
+    from agent_crew.queue import PausedError as _PausedError
+
+    @app.exception_handler(_PausedError)
+    async def _paused_error_handler(request, exc):  # noqa: ANN001
+        try:
+            _m = re.search(r"/tasks/([^/]+)/result", str(request.url.path))
+            _parent = _m.group(1) if _m else None
+            from agent_crew import pause as _pm
+            _sd = os.path.dirname(state["queue"]._db_path)
+            if _parent:
+                _pm.record_suppressed(_sd, task_id=_parent, task_type="unknown",
+                                      status=None, pr_number=None, generation=None)
+            logger.warning(f"[PAUSE-SUPPRESSED] enqueue race 차단: {exc} (path={request.url.path})")
+        except Exception:
+            logger.exception("PausedError 핸들러 기록 실패(그래도 억제)")
+        return _JSONResponse(status_code=200, content={
+            "status": "ok", "suppressed_by_pause": True, "cascade_suppressed": True,
+            "detail": "runtime STOP: execution-producing mutation atomically refused"})
+
     def q() -> TaskQueue:
         return state["queue"]
 
@@ -4501,10 +4524,15 @@ def create_app(
             except Exception:
                 _pgen = None
             try:
+                try:
+                    _res_dump = result.model_dump()
+                except Exception:
+                    _res_dump = getattr(result, "__dict__", None)
                 _pausemod.record_suppressed(
                     _sd, task_id=task_id, task_type=task_type,
                     status=getattr(result, "status", None),
-                    pr_number=getattr(result, "pr_number", None), generation=_pgen)
+                    pr_number=getattr(result, "pr_number", None), generation=_pgen,
+                    result=_res_dump)
             except Exception:
                 logger.exception(f"POST /tasks/{task_id}/result: suppression 기록 실패(계속 억제)")
             logger.warning(f"POST /tasks/{task_id}/result: [PAUSE-SUPPRESSED] cascade 억제됨 "
@@ -4659,6 +4687,32 @@ def create_app(
             if role:
                 _try_push_next(role)
         return {"status": "ok"}
+
+    @app.post("/admin/replay-suppressed", status_code=200)
+    def replay_suppressed():
+        """#314 BLOCKER-3: 유효한 재개(unpaused) 후, pause로 억제됐던 result-cascade를 1회 replay.
+        저장된 원 result로 production submit_result를 재실행(cascade 로직 중복 없음). 기존 dedup
+        (fix-task-id, review-exists 등)으로 idempotent. 성공한 것만 replayed 표시(at most once)."""
+        from agent_crew import pause as _pm
+        _sd = os.path.dirname(q()._db_path)
+        if _pm.is_paused(_sd):
+            return {"status": "skipped", "reason": "still paused", "replayed": []}
+        from agent_crew.protocol import TaskResult
+        pending = _pm.list_suppressed(_sd, only_pending=True)
+        done = []
+        for rec in pending:
+            tid, rd = rec.get("task_id"), rec.get("result")
+            if not tid or not rd:
+                continue
+            try:
+                submit_result(tid, TaskResult(**rd))   # unpaused → cascade 재실행, idempotent
+                done.append(tid)
+            except Exception:
+                logger.exception(f"replay-suppressed: {tid} 실패(다음 재개에서 재시도)")
+        if done:
+            _pm.mark_replayed(_sd, done)                # 성공분만 mark → at most once
+        return {"status": "ok", "replayed": done,
+                "pending_remaining": len(_pm.list_suppressed(_sd, only_pending=True))}
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):

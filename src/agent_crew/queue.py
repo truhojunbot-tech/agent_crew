@@ -11,6 +11,12 @@ from typing import List, Optional
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 
+
+class PausedError(Exception):
+    """#314 P0-1: runtime STOP 활성 시 실행생성 mutation(enqueue)이 원자적으로 거부됐음을 알림.
+    호출측(result cascade 등)은 이를 잡아 successor 생성 대신 suppression으로 처리한다."""
+    pass
+
 logger = logging.getLogger(__name__)
 
 _ROLE_TO_TYPE = {
@@ -389,6 +395,18 @@ class TaskQueue:
             context.pop("issue")
         conn = self._connect()
         try:
+            # #313/#314 P0-1: 실행생성 mutation(INSERT) 자체를 pause와 원자적으로 admission.
+            # BEGIN IMMEDIATE로 write-lock을 쥔 뒤 pause를 확인한다 → submit_result의 사전 체크와
+            # commit 사이에 STOP이 authoritative가 됐어도 여기서 잡혀 successor가 생성되지 않는다.
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                from agent_crew import pause as _pausemod
+                _paused_now = _pausemod.is_paused(os.path.dirname(self._db_path))
+            except Exception:
+                _paused_now = True  # fail-closed
+            if _paused_now:
+                conn.execute("ROLLBACK")
+                raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
             conn.execute(
                 """
                 INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project)
@@ -955,6 +973,15 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # #314 P0-2: discuss claim도 dequeue와 동일하게 임계구역 내부에서 pause 재확인(TOCTOU 제거).
+            try:
+                from agent_crew import pause as _pausemod
+                _paused_now = _pausemod.is_paused(os.path.dirname(self._db_path))
+            except Exception:
+                _paused_now = True
+            if _paused_now:
+                conn.execute("ROLLBACK")
+                return None
             rows = conn.execute(
                 """
                 SELECT * FROM tasks

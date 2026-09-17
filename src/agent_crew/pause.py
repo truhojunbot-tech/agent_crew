@@ -129,15 +129,16 @@ def _suppressed_path(state_dir: str) -> str:
 
 def record_suppressed(state_dir: str, *, task_id: str, task_type: str,
                       status: Optional[str], pr_number: Optional[int],
-                      generation: Optional[int]) -> None:
-    """#313: pause로 억제된 result-cascade를 durable 기록(재개 시 1회 replay + dedup용).
+                      generation: Optional[int], result: Optional[Dict[str, Any]] = None) -> None:
+    """#313/#314: pause로 억제된 result-cascade를 durable 기록(재개 시 1회 replay + dedup용).
+    `result`(원 제출 result 직렬화)를 함께 저장해 재개 시 production cascade를 그대로 재실행한다.
     이미 같은 task_id의 미replay 기록이 있으면 중복 append하지 않는다."""
     for r in list_suppressed(state_dir, only_pending=True):
         if r.get("task_id") == task_id:
             return
     rec = {"task_id": task_id, "task_type": task_type, "status": status,
            "pr_number": pr_number, "pause_generation": generation,
-           "suppressed_at": _now(), "replayed": False}
+           "result": result, "suppressed_at": _now(), "replayed": False}
     path = _suppressed_path(state_dir)
     d = os.path.dirname(path)
     if d:
