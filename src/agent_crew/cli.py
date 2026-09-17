@@ -1381,14 +1381,28 @@ def status(project: str, base: str, preview: int):
 @click.option("--incident", default="", help="Incident/reference id, e.g. alfred#39")
 @click.option("--scope", type=click.Choice(["project", "global"]), default="project", show_default=True)
 def pause(project: str, base: str, reason: str, source: str, incident: str, scope: str):
-    """#311 STOP: 런타임 pause 활성화. paused 동안 큐 드레인/claim/dispatch/retry/review 시작이 막힌다.
-    (in-flight task는 현재 원자단위까지만; 완료로 조작하지 않음.)"""
+    """#311/#314 STOP: 런타임 pause 활성화. paused 동안 큐 드레인/claim/dispatch/retry/review 시작이 막힌다.
+    (in-flight task는 현재 원자단위까지만; 완료로 조작하지 않음.)
+
+    #314 §1: project scope는 **DB(runtime_stop)에서 epoch를 먼저 할당·commit**한 뒤 그 epoch로
+    pause.json을 미러링한다 — 원자 STOP 판단의 linearization point는 DB 행이다. global scope는
+    per-project DB가 없으므로 pause.json(GLOBAL_PAUSE)만 기록하고, 각 프로젝트가 부팅 reconcile로 흡수한다."""
     from agent_crew import pause as pausemod
     state_dir = os.path.join(base, project) if scope == "project" else ""
+    db_epoch = None
+    if scope == "project" and state_dir:
+        from agent_crew.queue import TaskQueue
+        db_path = os.path.join(state_dir, "tasks.db")
+        # (1) DB에서 epoch 먼저 할당·commit (권위)
+        db_epoch = TaskQueue(db_path).set_stop_epoch(
+            True, incident=(incident or None), note=f"pause via cli: {reason}")
+    # (2) pause.json은 DB epoch를 미러링(generation=db_epoch). global은 기존 monotonic +1.
     rec = pausemod.set_pause(state_dir, True, scope=scope, reason=reason,
-                             source=source, incident=(incident or None))
+                             source=source, incident=(incident or None),
+                             generation=db_epoch)
     click.echo(json.dumps({"paused": True, "scope": scope, "generation": rec["generation"],
-                           "incident": rec["incident"], "reason": reason}, ensure_ascii=False))
+                           "db_epoch": db_epoch, "incident": rec["incident"], "reason": reason},
+                          ensure_ascii=False))
 
 
 @crew.command()
@@ -1399,9 +1413,27 @@ def pause(project: str, base: str, reason: str, source: str, incident: str, scop
 @click.option("--source", default="cli")
 @click.option("--scope", type=click.Choice(["project", "global"]), default="project", show_default=True)
 def resume(project: str, base: str, generation: int, source: str, scope: str):
-    """#311 generation-aware resume. 오래된(stale) generation resume은 최신 STOP을 덮지 못한다."""
+    """#311/#314 generation-aware resume. 오래된(stale) generation resume은 최신 STOP을 덮지 못한다.
+
+    #314 §1: project scope는 **DB(runtime_stop) CAS가 권위**다 — `--generation`이 현재 DB epoch보다
+    커야 unpause되고(그 사이 새 STOP이 epoch를 올렸으면 거부), 성공 시 그 epoch로 pause.json을 미러링한다.
+    DB가 거부하면 pause.json도 건드리지 않는다(fail-closed). global scope는 기존 pause.json 경로."""
     from agent_crew import pause as pausemod
     state_dir = os.path.join(base, project) if scope == "project" else ""
+    if scope == "project" and state_dir:
+        from agent_crew.queue import TaskQueue
+        db_path = os.path.join(state_dir, "tasks.db")
+        # (1) DB CAS resume (권위). 거부되면 pause.json 미변경.
+        res = TaskQueue(db_path).resume_stop(generation=generation)
+        if res.get("resumed"):
+            # (2) pause.json 미러 — DB가 unpause를 승인한 epoch로만.
+            pausemod.set_pause(state_dir, False, scope=scope, reason="resumed",
+                               source=source, generation=res["epoch"])
+        click.echo(json.dumps(res, ensure_ascii=False))
+        if not res.get("resumed"):
+            raise SystemExit(1)
+        return
+    # global scope: DB 없음 → 기존 pause.json 경로
     res = pausemod.resume(state_dir, scope=scope, generation=generation, source=source)
     click.echo(json.dumps(res, ensure_ascii=False))
     if not res.get("resumed"):

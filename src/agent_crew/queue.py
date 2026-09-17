@@ -11,6 +11,12 @@ from typing import List, Optional
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 
+
+class PausedError(Exception):
+    """#314 P0-1: runtime STOP 활성 시 실행생성 mutation(enqueue)이 원자적으로 거부됐음을 알림.
+    호출측(result cascade 등)은 이를 잡아 successor 생성 대신 suppression으로 처리한다."""
+    pass
+
 logger = logging.getLogger(__name__)
 
 _ROLE_TO_TYPE = {
@@ -200,6 +206,58 @@ CREATE TABLE IF NOT EXISTS pr_announcements (
 )
 """
 
+# #314 §1: DB-backed STOP epoch. 원자적 STOP 판단의 최종 authority는 이 단일행이다.
+# pause.json은 부팅/외부 제어 신호(미러)일 뿐, claim/enqueue 원자결정의 단독 근거가 될 수 없다.
+# epoch는 monotonic — pause/resume 전이마다 +1. STOP의 유일한 linearization point = 이 행의 commit.
+_DDL_RUNTIME_STOP = """
+CREATE TABLE IF NOT EXISTS runtime_stop (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    epoch      INTEGER NOT NULL DEFAULT 0,
+    paused     INTEGER NOT NULL DEFAULT 0,
+    incident   TEXT,
+    note       TEXT,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+"""
+
+# #314 §3/§4: cascade outbox. result 저장과 **항상 같은 txn**에 기록되는 durable continuation
+# 레코드(result_json 전체). pause 여부와 무관하게 submit_result가 원자적으로 넣는다 → result 저장과
+# suppression 기록 사이 crash로 continuation을 잃는 B3-b를 제거. §4: pause-aware executor가 lease
+# (attempt_id/lease_owner/lease_expires_at)로 claim해 successor를 stable transition key로 생성하고
+# state를 pending→replaying→applied로 CAS 전이한다(crash-safe at-most-once).
+_DDL_CASCADE_OUTBOX = """
+CREATE TABLE IF NOT EXISTS cascade_outbox (
+    parent_task_id   TEXT PRIMARY KEY,
+    task_type        TEXT NOT NULL DEFAULT '',
+    result_json      TEXT NOT NULL,
+    stop_epoch       INTEGER NOT NULL DEFAULT 0,
+    state            TEXT NOT NULL DEFAULT 'pending',
+    attempt_id       TEXT,
+    lease_owner      TEXT,
+    lease_expires_at REAL,
+    created_at       REAL NOT NULL DEFAULT 0,
+    updated_at       REAL NOT NULL DEFAULT 0
+)
+"""
+
+# #314 §5: 외부 mutation(merge 등) idempotency receipt. DB txn을 외부 gh 호출과 공유할 수 없으므로
+# exactly-once는 불가 — 대신 reservation(의도 기록) + 실제 GitHub 상태 재확인 + idempotent
+# reconciliation으로 at-most-one-effect를 보장한다. crash(merge 후 done 기록 전)는 재기동 시
+# op_key의 reserved를 보고 pr_state를 재확인해 이미-merged면 done만 기록(재merge 없음).
+_DDL_EXTERNAL_OP = """
+CREATE TABLE IF NOT EXISTS external_op (
+    op_key        TEXT PRIMARY KEY,
+    state         TEXT NOT NULL DEFAULT 'reserved',
+    pr_number     INTEGER,
+    attempt       INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    admitted_epoch INTEGER,
+    reserved_at   REAL NOT NULL DEFAULT 0,
+    done_at       REAL
+)
+"""
+_DDL_MIGRATE_EXTERNAL_OP_ADMITTED = "ALTER TABLE external_op ADD COLUMN admitted_epoch INTEGER"
+
 # Performance indexes for common queries
 _DDL_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -246,6 +304,20 @@ def issue_from_description(description) -> Optional[int]:
         return None
     number = int(match.group(1))
     return number if number > 0 else None
+
+
+def _result_to_json(result) -> str:
+    """TaskResult를 replay 재현 가능한 JSON 문자열로. pydantic model_dump 우선, 실패 시 __dict__.
+    ⛔절대 'unknown' placeholder 금지 — cascade_outbox의 result_json은 executor가 원 제출 result를
+      그대로 재실행하는 근거이므로 손실 없이 보존해야 한다(§3)."""
+    try:
+        data = result.model_dump()
+    except Exception:
+        data = getattr(result, "__dict__", None)
+        if data is None:
+            data = {"task_id": getattr(result, "task_id", None),
+                    "status": getattr(result, "status", None)}
+    return json.dumps(data, ensure_ascii=False, default=str)
 
 
 def _is_duplicate_task_id(error: Exception) -> bool:
@@ -321,6 +393,13 @@ class TaskQueue:
         conn.execute(_DDL_CHECKPOINTS)
         conn.execute(_DDL_CONTEXT_STATE)
         conn.execute(_DDL_PR_ANNOUNCEMENTS)
+        conn.execute(_DDL_RUNTIME_STOP)
+        conn.execute(_DDL_CASCADE_OUTBOX)
+        conn.execute(_DDL_EXTERNAL_OP)
+        try:
+            conn.execute(_DDL_MIGRATE_EXTERNAL_OP_ADMITTED)
+        except Exception:
+            pass  # column already exists
         try:
             conn.execute("ALTER TABLE pr_announcements ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
         except Exception:
@@ -358,11 +437,227 @@ class TaskQueue:
                 conn.execute(idx_stmt)
         conn.commit()
         conn.close()
+        # #314 §1: boot reconciliation. pause.json(외부/부팅 신호)과 runtime_stop(DB 권위)을
+        # 화해시킨다 — 더 높은 epoch가 승자, 같은 epoch인데 상태 불일치면 fail-closed(paused 유지).
+        # restart-while-paused(기존 armed pause.json)가 새 코드에서 첫 요청부터 DB 게이트로 이어진다.
+        self._reconcile_stop_on_boot()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self._db_path, timeout=10, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
+
+    # ── #314 §1: DB-backed STOP epoch (authoritative) ────────────────────
+    #
+    # 원자적 STOP 판단의 최종 권위는 runtime_stop 단일행이다. enqueue/dequeue/discuss는
+    # 자신의 BEGIN IMMEDIATE 트랜잭션 안에서 이 행을 읽어 게이트한다 → STOP writer의
+    # commit이 이 트랜잭션의 SELECT 전에 끝나면 SQLite write 직렬화로 반드시 보인다
+    # (file-read TOCTOU 제거). pause.json은 부팅/외부 신호로만 남고 원자결정 근거가 아니다.
+
+    def _stop_dir(self) -> str:
+        return os.path.dirname(self._db_path)
+
+    def _read_stop_row(self, conn) -> dict:
+        """runtime_stop 단일행을 읽어 정규화. 행 없음=기본 unpaused(부팅 reconcile이 seeding).
+        읽기 예외는 호출측에서 fail-closed 처리."""
+        row = conn.execute(
+            "SELECT epoch, paused, incident, note, updated_at FROM runtime_stop WHERE id=1"
+        ).fetchone()
+        if row is None:
+            return {"epoch": 0, "paused": False, "incident": None, "note": None, "updated_at": 0.0}
+        return {"epoch": int(row["epoch"] or 0), "paused": bool(row["paused"]),
+                "incident": row["incident"], "note": row["note"],
+                "updated_at": row["updated_at"] or 0.0}
+
+    def get_stop_epoch(self) -> dict:
+        """현재 STOP 권위 상태 {epoch, paused, incident, note, updated_at} (관측/미러용)."""
+        conn = self._connect()
+        try:
+            return self._read_stop_row(conn)
+        finally:
+            conn.close()
+
+    def set_stop_epoch(self, paused: bool, incident: Optional[str] = None,
+                       note: Optional[str] = None) -> int:
+        """STOP 권위 전이. **DB에서 epoch를 먼저 +1 할당·commit**한다(§1: DB가 linearization point).
+        cli pause/resume는 이 반환 epoch로 pause.json을 미러링해 두 소스의 generation을 일치시킨다.
+        반환: 새 epoch."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = self._read_stop_row(conn)
+            new_epoch = int(cur["epoch"]) + 1
+            conn.execute(
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=excluded.paused, "
+                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at",
+                (new_epoch, 1 if paused else 0, incident, note, time.time()))
+            conn.execute("COMMIT")
+            return new_epoch
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def resume_stop(self, generation: int, incident: Optional[str] = None) -> dict:
+        """generation-aware resume (DB 권위 CAS). `generation`은 새 epoch 목표이며 **현재 epoch보다
+        커야** 한다 — 그렇지 않으면 stale resume으로 거부(그 사이 새 STOP이 epoch를 올렸을 수 있음).
+        cli는 이 결과 epoch로 pause.json을 미러링한다. 반환: {resumed, epoch, reason}."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = self._read_stop_row(conn)
+            if not cur["paused"]:
+                conn.execute("ROLLBACK")
+                return {"resumed": True, "epoch": cur["epoch"], "reason": "not paused"}
+            if int(generation) <= int(cur["epoch"]):
+                conn.execute("ROLLBACK")
+                return {"resumed": False, "epoch": cur["epoch"],
+                        "reason": f"stale resume gen {generation} <= current epoch {cur['epoch']} — 거부",
+                        "still_paused": True}
+            conn.execute(
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
+                "VALUES (1, ?, 0, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=0, "
+                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at",
+                (int(generation), incident if incident is not None else cur["incident"],
+                 "resumed via cli", time.time()))
+            conn.execute("COMMIT")
+            return {"resumed": True, "epoch": int(generation), "reason": "resumed"}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def _pausejson_active(self) -> bool:
+        """pause.json/global 외부 STOP 신호(additive). runtime_stop과 별개로, 직접 arm되거나
+        global scope로 걸린 pause를 재시작 없이 라이브 큐에도 반영한다.
+
+        ⛔이 신호는 **강화 전용(additive)** 이다 — 차단만 하고 admit은 못 한다. 따라서 원자
+          linearization point는 여전히 runtime_stop(DB) 단독이고(unpause/admit은 DB로만 결정),
+          pause.json을 여기서 읽어도 STOP을 약화시키는 원자성 구멍이 생기지 않는다.
+          (리뷰어 v2 §2는 pause.json in-txn 제거를 요청했으나, 완전 제거 시 global/직접 pause가
+           라이브 서버에 안 먹히는 회귀가 생긴다. DB 권위는 유지하되 이 신호는 additive로 남긴다 — 보고에 명시.)
+        판정 불가는 fail-closed(=차단)."""
+        try:
+            from agent_crew import pause as _p
+            return bool(_p.is_paused(self._stop_dir()))
+        except Exception:
+            return True  # fail-closed
+
+    def _stop_active_in_txn(self, conn) -> bool:
+        """호출자가 BEGIN IMMEDIATE로 write-lock을 쥔 상태에서 STOP을 확인.
+        권위=runtime_stop(원자 linearization point) + additive pause.json 신호.
+        읽기 실패(테이블 손상 등)는 fail-closed(=paused, 차단)."""
+        try:
+            row = conn.execute("SELECT paused FROM runtime_stop WHERE id=1").fetchone()
+            db_paused = bool(row["paused"]) if row is not None else False
+        except Exception:
+            return True  # fail-closed
+        if db_paused:
+            return True
+        return self._pausejson_active()
+
+    def _stop_active_precheck(self) -> bool:
+        """트랜잭션 밖 빠른 사전확인(권위 아님 — in-txn 재확인이 최종). 실패는 fail-closed."""
+        try:
+            if bool(self.get_stop_epoch()["paused"]):
+                return True
+        except Exception:
+            return True
+        return self._pausejson_active()
+
+    def _reconcile_stop_on_boot(self) -> None:
+        """§1 부팅 화해: pause.json(미러/외부신호) vs runtime_stop(DB권위).
+        더 높은 epoch가 승자. 같은 epoch인데 (paused/incident)가 다르면 화해 불가 →
+        fail-closed(paused 유지 + note에 conflict 기록). 손상/판정불가도 fail-closed.
+        결과를 DB에 다시 기록해 수렴시킨다. (pause.json 미러 재기록은 cli 경로 소관.)"""
+        state_dir = self._stop_dir()
+        # pause.json 관측값(generation=epoch 미러). 실패는 fail-closed로 취급.
+        pj_paused, pj_epoch, pj_incident, pj_ok = True, -1, None, False
+        try:
+            from agent_crew import pause as _pausemod
+            st = _pausemod.pause_state(state_dir)
+            pj_paused = bool(st.get("paused"))
+            gens = []
+            for scope_rec in (st.get("global"), st.get("project")):
+                if isinstance(scope_rec, dict):
+                    try:
+                        gens.append(int(scope_rec.get("generation", 0) or 0))
+                    except Exception:
+                        gens.append(0)
+            pj_epoch = max(gens) if gens else 0
+            best = -1
+            for s in st.get("active_scopes", []) or []:
+                try:
+                    g = int(s.get("generation", 0) or 0)
+                except Exception:
+                    g = 0
+                if g >= best:
+                    best, pj_incident = g, s.get("incident")
+            pj_ok = True
+        except Exception:
+            pj_paused, pj_epoch, pj_incident, pj_ok = True, -1, None, False
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            db = self._read_stop_row(conn)
+            db_epoch, db_paused, db_incident = db["epoch"], db["paused"], db["incident"]
+            note = None
+            if not pj_ok:
+                # pause.json 판정 불가 → fail-closed: paused 유지, epoch는 db 유지(+conflict note).
+                win_paused, win_epoch, win_incident = True, max(db_epoch, 0), db_incident
+                note = "boot-reconcile: pause.json 판정불가 → fail-closed paused"
+            elif pj_epoch > db_epoch:
+                win_paused, win_epoch, win_incident = pj_paused, pj_epoch, pj_incident
+            elif db_epoch > pj_epoch:
+                win_paused, win_epoch, win_incident = db_paused, db_epoch, db_incident
+            else:
+                # 같은 epoch — 상태 일치해야 정상. 불일치면 화해 불가 → fail-closed.
+                if (bool(pj_paused) == bool(db_paused)) and (pj_incident == db_incident):
+                    win_paused, win_epoch, win_incident = db_paused, db_epoch, db_incident
+                else:
+                    win_paused, win_epoch, win_incident = True, db_epoch, (db_incident or pj_incident)
+                    note = (f"boot-reconcile CONFLICT: 같은 epoch({db_epoch}) 상태불일치 "
+                            f"pj(paused={pj_paused},inc={pj_incident}) vs db(paused={db_paused},inc={db_incident}) "
+                            f"→ fail-closed paused. 사람 개입 필요.")
+                    logger.critical(note)
+            conn.execute(
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
+                "VALUES (1, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=excluded.paused, "
+                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at",
+                (int(win_epoch), 1 if win_paused else 0, win_incident, note, time.time()))
+            conn.execute("COMMIT")
+        except Exception:
+            # 화해 자체가 실패 → fail-closed로 paused 행을 남기려 시도(최후의 안전장치).
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            try:
+                c2 = self._connect()
+                c2.execute(
+                    "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
+                    "VALUES (1, 0, 1, NULL, 'boot-reconcile 실패 → fail-closed paused', ?) "
+                    "ON CONFLICT(id) DO UPDATE SET paused=1, "
+                    "note='boot-reconcile 실패 → fail-closed paused', updated_at=excluded.updated_at",
+                    (time.time(),))
+                c2.commit()
+                c2.close()
+            except Exception:
+                logger.critical("runtime_stop boot reconcile 및 fail-closed 기록 모두 실패")
+        finally:
+            conn.close()
 
     def enqueue(self, task: TaskRequest) -> str:
         # #276: make the structured field true at the choke point. Every path —
@@ -389,6 +684,15 @@ class TaskQueue:
             context.pop("issue")
         conn = self._connect()
         try:
+            # #313/#314 P0-1: 실행생성 mutation(INSERT) 자체를 pause와 원자적으로 admission.
+            # BEGIN IMMEDIATE로 write-lock을 쥔 뒤 pause를 확인한다 → submit_result의 사전 체크와
+            # commit 사이에 STOP이 authoritative가 됐어도 여기서 잡혀 successor가 생성되지 않는다.
+            conn.execute("BEGIN IMMEDIATE")
+            # #314 §2: 권위는 runtime_stop 행. 같은 write-lock 트랜잭션에서 읽으므로
+            # STOP writer의 commit이 이 INSERT 전에 끝났으면 반드시 보인다(TOCTOU 제거).
+            if self._stop_active_in_txn(conn):
+                conn.execute("ROLLBACK")
+                raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
             conn.execute(
                 """
                 INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project)
@@ -605,20 +909,21 @@ class TaskQueue:
            agent. Stage 2 only runs after stage 1 has no candidate.
         3. Neither given: any pending task, ordered by priority.
         """
-        # #311 STOP 전파: 런타임 pause 활성이면 어떤 task도 claim/start하지 않는다.
+        # #311/#314 STOP 전파: 런타임 STOP 활성이면 어떤 task도 claim/start하지 않는다.
         # 이 한 지점이 tmux push(_try_push_next)와 MCP GET /tasks/next를 모두 덮어
         # 큐 드레인·successor/retry stage 시작을 막는다. in-flight는 자기 원자단위까지만.
-        try:
-            from agent_crew import pause
-            if pause.is_paused(os.path.dirname(self._db_path)):
-                return None
-        except Exception:
-            # fail-closed(#39): pause 판정이 불가능하면 STOP인지 확신할 수 없으므로
-            # 안전하게 dequeue를 막는다. (예전 fail-open은 STOP을 뚫는 안전결함이었음)
+        # 사전확인은 빠른 fail용(권위 아님) — 최종 판단은 아래 in-txn 재확인.
+        if self._stop_active_precheck():
             return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # #314 §2: 권위는 runtime_stop 행. write-lock 임계구역 안에서 재확인한다.
+            # 사전확인과 commit 사이에 STOP이 authoritative가 됐어도 여기서 잡혀
+            # 어떤 task도 pending->in_progress로 커밋되지 않는다(TOCTOU 제거). fail-closed.
+            if self._stop_active_in_txn(conn):
+                conn.execute("ROLLBACK")
+                return None
             row = None
             if agent:
                 # Stage 1 — explicit override claim for this agent.
@@ -709,6 +1014,10 @@ class TaskQueue:
         try:
             if result.task_id != task_id:
                 raise ValueError(f"task_id mismatch: argument {task_id!r} != result.task_id {result.task_id!r}")
+            # #314 §3: result 저장·outbox 기록·pause 판단을 하나의 write-lock 트랜잭션으로 원자화한다.
+            # 이렇게 해야 outbox의 state(pending=억제 / applied=라이브처리)가 결과 저장 시점의 STOP
+            # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT task_type, status FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
@@ -789,8 +1098,205 @@ class TaskQueue:
                         f"task_attribution timing invariant violated for {task_id!r}: "
                         f"completed_at={now} < started_at={started_at}"
                     )
+            # #314 §3: result 저장과 **같은 txn**에 cascade_outbox 원자 insert(같은 write-lock).
+            # state는 이 시점 STOP에 따라 원자적으로 결정된다:
+            #   paused  → 'pending'  (억제됨 — pause-aware executor(§4)가 재개 후 drain)
+            #   unpaused→ 'applied'  (라이브 cascade가 동기 처리 — 부팅 executor가 재실행 안 함)
+            # 이로써 "result 저장→crash→suppression 기록 전 continuation 유실"(B3-b)이 제거되고,
+            # 서버는 outbox state만 보면 되어 pause 재확인 divergence가 사라진다.
+            # INSERT OR IGNORE: 이미 있으면(replay 재호출) 기존 state 보존(pending/applied 안 뒤집음).
+            # ⛔실패를 삼키지 않는다 — insert 실패 시 txn 전체 rollback되어 result도 미저장(원자성).
+            _stop = self._read_stop_row(conn)
+            # 게이트와 동일한 union: runtime_stop(원자 권위) OR pause.json(additive fail-closed).
+            _suppressed = bool(_stop["paused"]) or self._pausejson_active()
+            self._last_cascade_suppressed = _suppressed
+            self._last_stop_epoch = int(_stop["epoch"])
+            conn.execute(
+                "INSERT OR IGNORE INTO cascade_outbox "
+                "(parent_task_id, task_type, result_json, stop_epoch, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, task_type, _result_to_json(result), int(_stop["epoch"]),
+                 "pending" if _suppressed else "applied", now, now))
             conn.commit()
             return task_type
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    # ── #314 §4: cascade outbox executor primitives (lease + CAS) ─────────
+    #
+    # executor는 pending(및 만료된 replaying) 행을 lease로 claim → stored result_json으로
+    # cascade를 재실행(server 측 _run_result_cascade) → applied로 CAS. crash한 replaying은
+    # lease 만료 후 다른 owner가 안전하게 reclaim(at-most-once는 successor stable id로 보장).
+
+    #: replaying lease 유효기간. 이보다 오래된 replaying은 crash한 owner로 간주해 회수한다.
+    CASCADE_LEASE_TTL = 300.0
+
+    def outbox_pending(self, include_replaying: bool = True) -> List[dict]:
+        """처리 대기(pending) + (옵션)회수 대상 replaying 행 목록."""
+        conn = self._connect()
+        try:
+            if include_replaying:
+                rows = conn.execute(
+                    "SELECT * FROM cascade_outbox WHERE state IN ('pending','replaying') "
+                    "ORDER BY created_at ASC").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM cascade_outbox WHERE state='pending' ORDER BY created_at ASC"
+                ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def outbox_get(self, parent_task_id: str) -> Optional[dict]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM cascade_outbox WHERE parent_task_id=?", (parent_task_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def outbox_claim(self, parent_task_id: str, owner: str,
+                     ttl: Optional[float] = None) -> Optional[dict]:
+        """lease CAS로 outbox 행을 claim. pending이거나 **만료된 replaying**(crash 회수)일 때만
+        성공. rowcount=1인 claimer만 진행(동시 replay dedup). 반환: claim한 행 dict 또는 None."""
+        ttl = self.CASCADE_LEASE_TTL if ttl is None else ttl
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            attempt = uuid.uuid4().hex
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state='replaying', lease_owner=?, attempt_id=?, "
+                "lease_expires_at=?, updated_at=? "
+                "WHERE parent_task_id=? AND (state='pending' "
+                "   OR (state='replaying' AND (lease_expires_at IS NULL OR lease_expires_at < ?)))",
+                (owner, attempt, now + ttl, now, parent_task_id, now))
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                return None
+            row = conn.execute(
+                "SELECT * FROM cascade_outbox WHERE parent_task_id=?", (parent_task_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+            return dict(row) if row else None
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def outbox_mark_applied(self, parent_task_id: str, owner: str) -> bool:
+        """cascade 성공 후 replaying→applied CAS. 자기 lease일 때만 적용(회수된 lease는 무효).
+        반환: 적용 여부."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state='applied', updated_at=? "
+                "WHERE parent_task_id=? AND lease_owner=? AND state='replaying'",
+                (time.time(), parent_task_id, owner))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def outbox_reopen(self, parent_task_id: str) -> bool:
+        """라이브 cascade 도중 STOP이 authoritative가 돼 successor enqueue가 PausedError로 거부되면,
+        이미 'applied'로 찍힌 부모 outbox를 'pending'으로 되돌린다 → 재개 후 executor가 저장된
+        result_json으로 전체 cascade를 멱등 재실행(거부된 successor 포함)한다. lease도 초기화.
+        이것이 리뷰어가 지적한 'PausedError가 result 없이 억제 기록 → replay 스킵' 문제의 해법이다:
+        outbox에는 이미 result가 있으므로 reopen만 하면 result-carrying replay가 보장된다."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state='pending', lease_owner=NULL, attempt_id=NULL, "
+                "lease_expires_at=NULL, updated_at=? "
+                "WHERE parent_task_id=? AND state IN ('applied','replaying')",
+                (time.time(), parent_task_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    # ── #314 §5: external mutation receipt (merge idempotency) ────────────
+
+    def external_op_reserve(self, op_key: str, pr_number: Optional[int] = None) -> dict:
+        """외부 GitHub mutation 시작 전 **원자적 STOP admission + reservation**(§5/재리뷰).
+
+        같은 BEGIN IMMEDIATE 트랜잭션에서 runtime_stop을 확인해, unpaused일 때만 reservation과
+        admitted_epoch를 기록하고 COMMIT한다. STOP이 이 reservation보다 먼저 linearize되면(=이미
+        commit되어 있으면) 같은 write-lock 도메인에서 반드시 보여 admitted=False로 차단된다 → merge/
+        comment 같은 remote mutation이 시작되지 않는다. reservation이 먼저 linearize됐다면 그 atomic
+        remote operation만 완료가 허용된다(reviewer 규칙 그대로).
+
+        반환:
+          - paused/판정불가 → {"admitted": False, "state": "stop_blocked"|"error"} (mutation 금지)
+          - unpaused → 기존/신규 행 dict + {"admitted": True, "reserved": 신규여부}. 호출측은
+            state('reserved'/'done'/'failed')로 reconciliation."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            stop = self._read_stop_row(conn)   # 같은 txn: STOP이 먼저 commit됐으면 반드시 보인다
+            if stop["paused"] or self._pausejson_active():
+                conn.execute("ROLLBACK")
+                return {"admitted": False, "state": "stop_blocked", "reserved": False,
+                        "reason": f"runtime STOP epoch={stop['epoch']}"}
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO external_op "
+                "(op_key, state, pr_number, attempt, admitted_epoch, reserved_at) "
+                "VALUES (?, 'reserved', ?, 0, ?, ?)",
+                (op_key, pr_number, int(stop["epoch"]), time.time()))
+            newly = cur.rowcount == 1
+            row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
+            conn.execute("COMMIT")
+            d = dict(row)
+            d["reserved"] = newly
+            d["admitted"] = True
+            return d
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            # fail-closed: 예약 트랜잭션 실패 시 mutation을 admit하지 않는다.
+            logger.exception(f"external_op_reserve({op_key}) 실패 → admitted=False(fail-closed)")
+            return {"admitted": False, "state": "error", "reserved": False}
+        finally:
+            conn.close()
+
+    def external_op_mark(self, op_key: str, state: str, *, last_error: Optional[str] = None,
+                         inc_attempt: bool = False) -> None:
+        """external_op 상태 전이. state='done'이면 done_at 기록. inc_attempt면 attempt+1(재시도 backoff/cap용)."""
+        conn = self._connect()
+        try:
+            done_at = time.time() if state == "done" else None
+            if inc_attempt:
+                conn.execute(
+                    "UPDATE external_op SET state=?, last_error=?, attempt=attempt+1, done_at=? WHERE op_key=?",
+                    (state, last_error, done_at, op_key))
+            else:
+                conn.execute(
+                    "UPDATE external_op SET state=?, last_error=?, done_at=? WHERE op_key=?",
+                    (state, last_error, done_at, op_key))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def external_op_get(self, op_key: str) -> Optional[dict]:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 
@@ -934,16 +1440,16 @@ class TaskQueue:
         """Atomic pending→in_progress for the oldest pending discuss task whose
         context.agent matches `agent`. Context is stored as JSON, so filtering
         happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
-        # #311 STOP 전파: pause 활성이면 discuss task도 시작하지 않는다.
-        try:
-            from agent_crew import pause
-            if pause.is_paused(os.path.dirname(self._db_path)):
-                return None
-        except Exception:
-            return None  # fail-closed(#39): pause 판정 불가 시 discuss도 차단
+        # #311/#314 STOP 전파: STOP 활성이면 discuss task도 시작하지 않는다.
+        if self._stop_active_precheck():
+            return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # #314 §2: discuss claim도 dequeue와 동일하게 임계구역 내부에서 runtime_stop 재확인(TOCTOU 제거).
+            if self._stop_active_in_txn(conn):
+                conn.execute("ROLLBACK")
+                return None
             rows = conn.execute(
                 """
                 SELECT * FROM tasks

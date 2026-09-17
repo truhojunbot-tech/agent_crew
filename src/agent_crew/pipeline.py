@@ -39,7 +39,7 @@ from agent_crew.protocol import (
     TaskResult,
     normalize_pr_number,
 )
-from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE
+from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
 
 logger = logging.getLogger(__name__)
 
@@ -460,8 +460,15 @@ def auto_enqueue_fix(
     head_sha_fn=None,
     repo: str = "",
     repo_cwd: str = "",
+    suppress_side_effects: bool = False,
 ) -> Optional[str]:
     """Create the fix task that follows a ``request_changes`` review (#244).
+
+    #314 §4 P0: ``suppress_side_effects`` (replay 경로) 시 fix-budget 소진 PR comment 게시
+    (_announce_fix_budget_exhausted)를 skip한다. pr_announcements claim이 동시 중복엔 강하나
+    comment 성공→posted_at 기록 전 crash 구간은 exactly-once가 아니므로, GitHub feedback이 root
+    cause에 포함된 이번 사고에서는 replay에서 announcement를 아예 수행하지 않는다. fix task enqueue
+    (결정론 id, 멱등)는 durable transition이므로 계속 수행된다.
 
     The cascade had transitions for `implement completed → review` and
     `review approve → test`, but the rejection path just ended. Every
@@ -565,11 +572,32 @@ def auto_enqueue_fix(
                 f"the automated fix budget is spent (round {fix_round} > "
                 f"max {max_rounds}) — stopping, this needs a human"
             )
-            _announce_fix_budget_exhausted(
-                pr_number=pr_number, review_task_id=review_task_id,
-                max_rounds=max_rounds, findings=review_result.findings or [],
-                comment_fn=comment_fn, already_announced_fn=already_announced_fn,
-                queue=queue)
+            # #314 §4 P0: replay 중에는 exhaustion PR comment를 게시하지 않는다(중복 방지).
+            if suppress_side_effects:
+                logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
+                             f"(review {review_task_id})")
+                return None
+            # #314 재리뷰: fix-budget comment도 GitHub 외부 mutation → merge/review comment와 동일한
+            # 원자 STOP admission. external_op_reserve가 같은 txn에서 runtime_stop 확인 후 admit할 때만
+            # 게시(STOP이 먼저 linearize되면 차단). receipt(done)로 게시→기록 전 crash 중복도 방지.
+            _cop = f"comment:fixbudget:{review_task_id}"
+            _cresv = queue.external_op_reserve(
+                _cop, pr_number=pr_number if isinstance(pr_number, int) else None)
+            if not _cresv.get("admitted"):
+                logger.warning(f"auto_enqueue_fix: fix-budget comment 억제 — STOP admission 거부 "
+                               f"(review {review_task_id}, {_cresv.get('state')})")
+            elif _cresv.get("state") == "done":
+                logger.info(f"auto_enqueue_fix: fix-budget comment 이미 done(receipt) — skip")
+            else:
+                _announce_fix_budget_exhausted(
+                    pr_number=pr_number, review_task_id=review_task_id,
+                    max_rounds=max_rounds, findings=review_result.findings or [],
+                    comment_fn=comment_fn, already_announced_fn=already_announced_fn,
+                    queue=queue)
+                try:
+                    queue.external_op_mark(_cop, "done")
+                except Exception:
+                    logger.exception(f"auto_enqueue_fix: external_op_mark({_cop}) 실패")
             return None
 
         findings_text = _findings_block(review_result.findings or [], review_task_id)
@@ -636,9 +664,9 @@ def auto_enqueue_fix(
                 context=fix_context,
                 project=review_project,
             ))
-        except sqlite3.IntegrityError:
-            # A concurrent submission won the insert. That is the mechanism
-            # working, not an error: exactly one fix task exists.
+        except (sqlite3.IntegrityError, TaskAlreadyExistsError):
+            # A concurrent submission (or replay 재실행) won the insert. That is the
+            # mechanism working, not an error: exactly one fix task exists.
             logger.info(
                 f"auto_enqueue_fix: {fix_id} was created concurrently for "
                 f"{review_task_id} — leaving the winner in place"
@@ -649,6 +677,13 @@ def auto_enqueue_fix(
             f"(round {fix_round}/{max_rounds})"
         )
         return fix_id
+    except PausedError:
+        # #314 §4 P0-2: STOP race — 부모(review) outbox reopen + 전파.
+        try:
+            queue.outbox_reopen(review_task_id)
+        except Exception:
+            logger.exception(f"auto_enqueue_fix: outbox_reopen({review_task_id}) 실패")
+        raise
     except Exception as e:
         logger.warning(f"auto_enqueue_fix: unexpected error: {e}")
         return None
@@ -963,7 +998,10 @@ def auto_enqueue_review(
                 f"Review branch {impl_task.branch!r} for task {impl_task_id}."
             )
 
-        review_id = f"review-{uuid.uuid4().hex[:8]}"
+        # #314 §4 P0-1: 결정론 successor id(stable transition key) — UUID 금지. crash 후 replay가
+        # 같은 (impl parent, review, fix_round)에 대해 동일 id를 만들어 PK dedup으로 at-most-once.
+        _round = int(impl_ctx.get("fix_round", 0) or 0)
+        review_id = f"review-{impl_task_id}-r{_round}"
         review_req = TaskRequest(
             task_id=review_id,
             task_type="review",  # type: ignore[arg-type]
@@ -972,8 +1010,20 @@ def auto_enqueue_review(
             context=review_context,
             project=impl_project,
         )
-        queue.enqueue(review_req)
+        try:
+            queue.enqueue(review_req)
+        except TaskAlreadyExistsError:
+            # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
+            logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
         return review_id
+    except PausedError:
+        # #314 §4 P0-2: STOP race — successor enqueue가 원자 거부됨. 부모(impl) outbox를 reopen해
+        # 재개 후 result-carrying replay로 이 review를 복구하고, PausedError를 전파(handler suppressed 200).
+        try:
+            queue.outbox_reopen(impl_task_id)
+        except Exception:
+            logger.exception(f"auto_enqueue_review: outbox_reopen({impl_task_id}) 실패")
+        raise
     except Exception as e:
         logger.warning(f"auto_enqueue_review: unexpected error: {e}")
         return None
@@ -1037,7 +1087,8 @@ def auto_enqueue_test(
                 f"Test branch {review_task.branch!r} for reviewed task {review_task_id}."
             )
 
-        test_id = f"test-{uuid.uuid4().hex[:8]}"
+        # #314 §4 P0-1: 결정론 successor id — review당 test 1개(review id는 이미 round별 결정론).
+        test_id = f"test-{review_task_id}"
         test_req = TaskRequest(
             task_id=test_id,
             task_type="test",  # type: ignore[arg-type]
@@ -1045,8 +1096,18 @@ def auto_enqueue_test(
             branch=review_task.branch,
             context=test_context,
         )
-        queue.enqueue(test_req)
+        try:
+            queue.enqueue(test_req)
+        except TaskAlreadyExistsError:
+            logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
         return test_id
+    except PausedError:
+        # #314 §4 P0-2: STOP race — 부모(review) outbox reopen + 전파.
+        try:
+            queue.outbox_reopen(review_task_id)
+        except Exception:
+            logger.exception(f"auto_enqueue_test: outbox_reopen({review_task_id}) 실패")
+        raise
     except Exception as e:
         logger.warning(f"auto_enqueue_test: unexpected error: {e}")
         return None
@@ -1061,8 +1122,13 @@ def auto_fallback_failed_task(
     pane_map: Optional[dict] = None,
     state_path: Optional[str] = None,
     fallback_disabled: bool = False,
+    suppress_side_effects: bool = False,
 ) -> bool:
     """Reroute a rate-limit-shaped failure to the next agent in the chain.
+
+    #314 §4 P0: ``suppress_side_effects`` (replay 경로) 시 escalation gate 생성과 telegram
+    notification 같은 non-idempotent side effect를 skip한다. fallback successor enqueue(stable id)와
+    task cancel(idempotent)은 durable transition이므로 계속 수행된다.
 
     Returns ``True`` when fallback handled the task — caller should skip
     auto-retry. ``False`` means caller should fall through to its normal
@@ -1111,21 +1177,24 @@ def auto_fallback_failed_task(
                 f"original_task_id: {original_task_id or '(unknown)'}\n"
                 f"last summary: {(result.summary or '')[:200]}"
             )
-            try:
-                queue.create_gate(
-                    GateRequest(
-                        id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
-                        type="escalation",
-                        message=msg,
-                        status="pending",
+            # #314 §4 P0: escalation gate 생성 + telegram notify는 non-idempotent side effect.
+            # replay(suppress_side_effects)에서는 skip해 중복 gate/notification을 막는다.
+            if not suppress_side_effects:
+                try:
+                    queue.create_gate(
+                        GateRequest(
+                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
+                            type="escalation",
+                            message=msg,
+                            status="pending",
+                        )
                     )
-                )
-            except Exception as e:
-                logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
-            try:
-                notify_telegram(msg)
-            except Exception:
-                pass
+                except Exception as e:
+                    logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
+                try:
+                    notify_telegram(msg)
+                except Exception:
+                    pass
             return True
 
         role = _TYPE_TO_ROLE.get(task_type)
@@ -1160,21 +1229,24 @@ def auto_fallback_failed_task(
                 f"tried agents: {', '.join(excluded) or '(none)'}\n"
                 f"last summary: {(result.summary or '')[:200]}"
             )
-            try:
-                queue.create_gate(
-                    GateRequest(
-                        id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
-                        type="escalation",
-                        message=msg,
-                        status="pending",
+            # #314 §4 P0: escalation gate 생성 + telegram notify는 non-idempotent side effect.
+            # replay(suppress_side_effects)에서는 skip해 중복 gate/notification을 막는다.
+            if not suppress_side_effects:
+                try:
+                    queue.create_gate(
+                        GateRequest(
+                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
+                            type="escalation",
+                            message=msg,
+                            status="pending",
+                        )
                     )
-                )
-            except Exception as e:
-                logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
-            try:
-                notify_telegram(msg)
-            except Exception:
-                pass
+                except Exception as e:
+                    logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
+                try:
+                    notify_telegram(msg)
+                except Exception:
+                    pass
             return True
 
         new_ctx = dict(ctx)
@@ -1186,23 +1258,36 @@ def auto_fallback_failed_task(
         # cancel the original task when the depth limit is reached (#167).
         new_ctx["original_task_id"] = ctx.get("original_task_id") or task_id
         try:
+            # #314 §4 P0-1: 결정론 successor id — chain depth로 구분(replay가 같은 depth→같은 id).
             fallback_req = TaskRequest(
-                task_id=f"fallback-{task_id}-{uuid.uuid4().hex[:4]}",
+                task_id=f"fallback-{task_id}-d{int(new_ctx['fallback_chain_depth'])}",
                 task_type=task_type,  # type: ignore[arg-type]
                 description=original.description,
                 branch=original.branch,
                 priority=original.priority,
                 context=new_ctx,
             )
-            queue.enqueue(fallback_req)
+            try:
+                queue.enqueue(fallback_req)
+            except TaskAlreadyExistsError:
+                logger.info(f"auto_fallback: {fallback_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(
                 f"auto_fallback: rerouted {task_id} -> {successor} "
                 f"(excluded={excluded})"
             )
             return True
+        except PausedError:
+            raise   # 아래 outer에서 reopen+전파
         except Exception as e:
             logger.warning(f"auto_fallback: enqueue failed for {task_id}: {e}")
             return False
+    except PausedError:
+        # #314 §4 P0-2: STOP race — 부모(failed task) outbox reopen + 전파.
+        try:
+            queue.outbox_reopen(task_id)
+        except Exception:
+            logger.exception(f"auto_fallback: outbox_reopen({task_id}) 실패")
+        raise
     except Exception as e:
         logger.warning(f"auto_fallback: unexpected error for {task_id}: {e}")
         return False

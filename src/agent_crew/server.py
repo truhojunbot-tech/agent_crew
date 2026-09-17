@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -733,7 +734,18 @@ _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 # Tags that mean "retryable in the next few minutes" (server-side load-shed).
 #: Statuses a task can hold when a result still arrives afterwards. Both mean
 #: "the dispatcher stopped watching", not "the work is over" (#265).
+# #314 §4 P0(replay side-effect boundary): replay는 **durable cascade transition(successor enqueue)만**
+# 재실행해야 한다. replay가 전체 submit_result를 다시 돌리면 non-idempotent side effect가 중복된다:
+#   · PR review comment(gh, receipt 없음) · fallback escalation gate + telegram · queue push(_try_push_next/
+#     _try_push_discuss가 다른 pending task를 claim/start). successor enqueue는 stable id로 멱등하지만
+# 이 side effect들은 아니다. replay 동안 이 ContextVar를 True로 세우고, 각 side effect가 확인해 skip한다.
+# (억제됐다 replay되는 result의 comment/escalation은 loss 가능하나, 리뷰어 판정상 duplication보다 허용됨.)
+_REPLAYING = contextvars.ContextVar("agent_crew_replaying", default=False)
+
 _LATE_RESULT_STATUSES = frozenset({"failed", "timed_out"})
+# #314 §5: merge 자동 재시도 상한. 이 횟수 이상 실패(conflict/gh 실패 등)면 자동 재시도 중단 →
+# escalation 대상(무한 재시도 금지). 비가역 상태(closed)는 횟수와 무관하게 즉시 재시도 안 함.
+_MAX_MERGE_ATTEMPTS = 3
 
 _TRANSIENT_RETRIABLE_TAGS = frozenset({
     "claude_429",
@@ -2268,6 +2280,31 @@ def create_app(
 
     app = FastAPI(lifespan=lifespan)
 
+    # #314 §3/§4: 라이브 cascade 도중 successor enqueue 시점에 STOP이 authoritative가 돼 enqueue가
+    # PausedError로 원자 거부되면 — 부모 result는 이미 cascade_outbox에 result_json과 함께 원자
+    # 저장돼 있으므로(§3), 부모 outbox를 'pending'으로 reopen한다. 재개 후 executor(replay)가 저장된
+    # result로 전체 cascade를 멱등 재실행 → 거부됐던 successor까지 복구된다. (리뷰어가 지적한
+    # 'PausedError가 result 없이 억제 기록 → replay 스킵'을, result-carrying outbox reopen으로 해결.)
+    from fastapi.responses import JSONResponse as _JSONResponse
+    from agent_crew.queue import PausedError as _PausedError
+
+    @app.exception_handler(_PausedError)
+    async def _paused_error_handler(request, exc):  # noqa: ANN001
+        try:
+            _m = re.search(r"/tasks/([^/]+)/result", str(request.url.path))
+            _parent = _m.group(1) if _m else None
+            if _parent:
+                _reopened = state["queue"].outbox_reopen(_parent)
+                logger.warning(f"[PAUSE-SUPPRESSED] enqueue race 차단: {exc} "
+                               f"(parent={_parent}, outbox_reopened={_reopened}, path={request.url.path})")
+            else:
+                logger.warning(f"[PAUSE-SUPPRESSED] enqueue race 차단(파싱불가): {exc} (path={request.url.path})")
+        except Exception:
+            logger.exception("PausedError 핸들러 outbox reopen 실패(그래도 억제)")
+        return _JSONResponse(status_code=200, content={
+            "status": "ok", "suppressed_by_pause": True, "cascade_suppressed": True,
+            "detail": "runtime STOP: execution-producing mutation atomically refused"})
+
     def q() -> TaskQueue:
         return state["queue"]
 
@@ -2277,6 +2314,12 @@ def create_app(
 
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
+        # #314 §4 P0: replay 중에는 queue push 금지 — push는 다른 pending task를 claim/start하므로
+        # replay가 ACK 전 죽으면 다음 replay가 또 다른 task를 claim/start(중복). replay는 successor
+        # enqueue(durable transition)만; dispatch는 resume 후 정상 push 사이클/watchdog이 담당.
+        if _REPLAYING.get():
+            logger.debug(f"_try_push_next: replay 중 — push skip (role={role})")
+            return
         logger.debug(f"_try_push_next: role={role}")
         if not _push_enabled:
             logger.warning(
@@ -2497,6 +2540,10 @@ def create_app(
         to hold agent-name keys (e.g. 'claude', 'codex', 'gemini') alongside
         the role keys. Busy-check and dequeue are both scoped to the agent so
         concurrent panelists don't block each other."""
+        # #314 §4 P0: replay 중 push 금지(위 _try_push_next 참조).
+        if _REPLAYING.get():
+            logger.debug(f"_try_push_discuss: replay 중 — push skip (agent={agent})")
+            return
         logger.debug(f"_try_push_discuss: agent={agent}")
         if not _push_enabled:
             logger.warning(
@@ -4011,6 +4058,14 @@ def create_app(
             logger.info(
                 f"_requeue_review_at_head: {new_id} already exists — another result "
                 f"observed the same head; not duplicating it (#304)")
+        except _PausedError:
+            # #314 §4 P0: STOP race — 다른 successor helper와 동일하게 부모(review) outbox를
+            # reopen해 재개 후 result-carrying replay로 이 stale-review 재dispatch를 복구하고 전파.
+            try:
+                q().outbox_reopen(review_task_id)
+            except Exception:
+                logger.exception(f"_requeue_review_at_head: outbox_reopen({review_task_id}) 실패")
+            raise
         except Exception:  # noqa: BLE001
             logger.exception(
                 f"_requeue_review_at_head: could not requeue a review for PR "
@@ -4037,9 +4092,14 @@ def create_app(
                 # correct place to resolve from when the task context carries
                 # no explicit `repo`.
                 repo_cwd=_any_worktree_path(),
+                # #314 §4 P0: replay 중엔 fix-budget exhaustion PR comment skip.
+                suppress_side_effects=_REPLAYING.get(),
             )
             if fix_id:
                 _try_push_next("implementer")
+        except _PausedError:
+            # #314 §4 P0-2: pipeline이 이미 outbox reopen했음 — handler suppressed 200 위해 전파.
+            raise
         except Exception:
             logger.exception(
                 f"_auto_enqueue_fix: cascade failed for {review_task_id} — "
@@ -4107,20 +4167,32 @@ def create_app(
             retry_context["retry_attempt"] = db_retry_attempt + 1
             retry_context["original_task_id"] = task_id
 
+            # #314 §4 P0-1: 결정론 successor id — retry attempt로 구분(replay가 같은 attempt→같은 id).
             retry_req = TaskRequest(
-                task_id=f"retry-{task_id}-{uuid.uuid4().hex[:4]}",
+                task_id=f"retry-{task_id}-a{db_retry_attempt + 1}",
                 task_type=task_type,  # type: ignore
                 description=original_task.description,
                 branch=original_task.branch,
                 priority=original_task.priority + 1,  # Bump priority for retries
                 context=retry_context,
             )
-            q().enqueue(retry_req)
+            from agent_crew.queue import TaskAlreadyExistsError as _TAE
+            try:
+                q().enqueue(retry_req)
+            except _TAE:
+                logger.info(f"_auto_retry_failed_task: {retry_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")
             # Try to push the retry task
             role = _TYPE_TO_ROLE.get(task_type)
             if role:
                 _try_push_next(role)
+        except _PausedError:
+            # #314 §4 P0-2: STOP race — 부모(failed task) outbox reopen + 전파(handler suppressed 200).
+            try:
+                q().outbox_reopen(task_id)
+            except Exception:
+                logger.exception(f"_auto_retry_failed_task: outbox_reopen({task_id}) 실패")
+            raise
         except Exception as e:
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
@@ -4131,15 +4203,51 @@ def create_app(
         Failures are logged and swallowed — a merge error must never break
         the result-submission response.
         """
-        from agent_crew.github import get_repo, merge_pr
+        # #314 재리뷰: STOP 확인과 merge 시작을 원자화한다. external_op_reserve가 같은 BEGIN
+        # IMMEDIATE 트랜잭션에서 runtime_stop을 확인해 unpaused일 때만 admit+reserve → STOP이
+        # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
+        # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
+        from agent_crew.github import get_repo, merge_pr, pr_state
+        op_key = f"merge:pr:{pr_number}"
+        resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
+        if not resv.get("admitted"):
+            logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — "
+                           f"STOP admission 거부({resv.get('state')})")
+            return
+        if resv.get("state") == "done":
+            logger.info(f"_auto_merge_pr: {op_key} 이미 done(receipt) — merge 재실행 안 함")
+            return
+        # 비가역 실패 누적(conflict/closed 등)은 자동 재시도 안 함 → escalation 대상.
+        if resv.get("state") == "failed" and int(resv.get("attempt", 0)) >= _MAX_MERGE_ATTEMPTS:
+            logger.warning(f"_auto_merge_pr: {op_key} 실패 {resv.get('attempt')}회(≥{_MAX_MERGE_ATTEMPTS}) — "
+                           f"자동 재시도 중단, escalation 필요(last_error={resv.get('last_error')})")
+            return
         repo = get_repo()
-        ok = merge_pr(pr_number, merge_method="squash", repo=repo)
+        # reconciliation: 맹목 재실행이 아니라 실제 상태를 먼저 확인.
+        st = pr_state(int(pr_number), repo=repo)
+        if st == "merged":
+            q().external_op_mark(op_key, "done")
+            logger.info(f"_auto_merge_pr: PR #{pr_number} 이미 merged(재확인) → done 기록, 재merge 안 함")
+            return
+        if st == "closed":
+            q().external_op_mark(op_key, "failed",
+                                 last_error="PR closed(비가역) — 자동 merge 불가", inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: PR #{pr_number} closed — 자동 재시도 안 함, escalation 필요")
+            return
+        if st == "unknown":
+            q().external_op_mark(op_key, "failed",
+                                 last_error="PR 상태 불명(gh 실패) — 다음 재확인 대기", inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
+            return
+        # st == 'open' → merge 시도
+        ok = merge_pr(int(pr_number), merge_method="squash", repo=repo)
         if ok:
-            logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) — #171")
+            q().external_op_mark(op_key, "done")
+            logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) → done(receipt) — #171/§5")
         else:
-            logger.warning(
-                f"_auto_merge_pr: gh pr merge #{pr_number} failed or gh not available — #171"
-            )
+            q().external_op_mark(op_key, "failed",
+                                 last_error="gh pr merge 실패", inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: gh pr merge #{pr_number} 실패 — failed 기록(재시도 가능)")
 
     def _auto_fallback_failed_task(
         task_id: str,
@@ -4161,6 +4269,8 @@ def create_app(
             pane_map=pane_map,
             state_path=state_path,
             fallback_disabled=bool(fallback_disabled),
+            # #314 §4 P0: replay 중엔 escalation gate/telegram 같은 side effect skip(중복 방지).
+            suppress_side_effects=_REPLAYING.get(),
         )
         if handled:
             role = _TYPE_TO_ROLE.get(task_type)
@@ -4200,10 +4310,20 @@ def create_app(
         """
         ident = _server_identity()
         snap = _prov.snapshot(project=ident["project"], port=ident["port"])
+        # #314 §6: 이 런타임이 실제로 DB(runtime_stop)에서 읽은 STOP 상태를 노출한다. fleet_stop이
+        # post-restart ACK를 판정할 때 pause.json만이 아니라 "새 build가 DB stop epoch/incident를
+        # 읽어 paused로 올라왔는지"를 확인할 수 있어야 canary 자격이 생긴다. 조회 불가는 fail-closed(paused).
+        try:
+            _stop = q().get_stop_epoch()
+            _stop_out = {"epoch": _stop.get("epoch"), "paused": bool(_stop.get("paused")),
+                         "incident": _stop.get("incident")}
+        except Exception:
+            _stop_out = {"epoch": None, "paused": True, "incident": None, "error": "read_failed"}
         return {
             "status": "ok",
             "project": ident["project"],
             "identity": ident,
+            "stop": _stop_out,
             "build": {
                 "commit": snap["commit"],
                 "commit_short": snap["commit_short"],
@@ -4486,6 +4606,24 @@ def create_app(
                     f"POST /tasks/{task_id}/result: pr-mismatch event failed")
             return {"status": "ok", "held": "pr_number_mismatch",
                     "requested_pr": _requested, "reported_pr": _reported}
+        # #314 §3/§4 STOP: result는 이미 persist(marked done)돼 lineage/audit 보존됨.
+        # 억제 판단은 queue.submit_result가 result 저장과 **같은 원자 txn**에서 확정해 cascade_outbox에
+        # 기록했다(state='pending' → 억제 / 'applied' → 라이브 처리). 서버는 pause를 재확인하지 않고
+        # 그 원자 결정(outbox state)만 신뢰한다 → 재확인 divergence 제거. outbox row 자체가 durable
+        # suppression 기록이며(§3, result 저장과 원자적), 재개 후 executor(replay endpoint)가 drain한다.
+        # fail-closed: outbox 조회 불가/부재는 억제로 간주.
+        try:
+            _ob = q().outbox_get(task_id)
+        except Exception:
+            _ob = None
+        _suppressed = (_ob is None) or (_ob.get("state") == "pending")
+        if _suppressed:
+            _pepoch = (_ob or {}).get("stop_epoch")
+            logger.warning(f"POST /tasks/{task_id}/result: [PAUSE-SUPPRESSED] cascade 억제됨 "
+                           f"(task_type={task_type}, status={result.status}, outbox=pending, "
+                           f"stop_epoch={_pepoch}). result는 저장됨, 후속 stage 미생성.")
+            return {"status": "ok", "task_id": task_id, "suppressed_by_pause": True,
+                    "pause_generation": _pepoch, "cascade_suppressed": True}
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
@@ -4552,30 +4690,67 @@ def create_app(
                     if _pub.requeue_head:
                         _requeue_review_at_head(task_id, _review_pr, _pub.requeue_head, ctx)
                     _review_pr = None
-                if _review_pr:
-                    try:
-                        from agent_crew.github import post_review_comment
-                        _reviewer_agent = next(
-                            (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
-                            "agent",
-                        )
-                        post_review_comment(
-                            pr_number=int(_review_pr),
-                            # #208: use the same defensive resolver as the
-                            # auto-enqueue-test decision below, so a clean
-                            # verdict=null+[] review (or a reviewer that only
-                            # states "approve" in prose) doesn't render as a
-                            # request_changes header while the summary says
-                            # approve.
-                            verdict=_resolve_verdict(result),
-                            summary=result.summary or "",
-                            findings=result.findings or [],
-                            task_id=task_id,
-                            reviewer=_reviewer_agent,
-                        )
-                        logger.info(f"POST /tasks/{task_id}/result: posted review comment on PR #{_review_pr}")
-                    except Exception:
-                        logger.exception(f"POST /tasks/{task_id}/result: failed to post review comment on PR #{_review_pr}")
+                if _review_pr and _REPLAYING.get():
+                    # #314 §4 P0: replay 중 PR review comment 재게시 금지(gh comment는 receipt 없음
+                    # → 게시 후 ACK 전 crash 시 중복). 라이브 경로에서만 게시. verdict 소비(test/merge)는
+                    # 아래에서 계속되며 stable id/receipt로 멱등.
+                    logger.debug(f"POST /tasks/{task_id}/result: replay 중 — review comment skip (PR #{_review_pr})")
+                elif _review_pr:
+                    # #314 재리뷰: review comment도 GitHub 외부 mutation이므로 merge와 동일한 **원자
+                    # STOP admission**을 지난다. external_op_reserve가 같은 BEGIN IMMEDIATE에서
+                    # runtime_stop을 확인해, STOP이 먼저 linearize됐으면 admitted=False로 차단(outbox
+                    # applied 직후 STOP 걸린 comment race 제거). receipt(done)로 comment 성공→기록 전
+                    # crash 재시도 시 중복도 방지. root cause가 GitHub comment feedback loop였으므로 필수.
+                    _cop = f"comment:review:{task_id}"
+                    _cresv = q().external_op_reserve(_cop, pr_number=int(_review_pr))
+                    if not _cresv.get("admitted"):
+                        logger.warning(f"POST /tasks/{task_id}/result: review comment 억제 — "
+                                       f"STOP admission 거부(PR #{_review_pr}, {_cresv.get('state')})")
+                    elif _cresv.get("state") == "done":
+                        logger.info(f"POST /tasks/{task_id}/result: review comment 이미 done(receipt) — skip")
+                    else:
+                        # #314 재리뷰: review comment crash reconciliation. 게시 성공→done 기록 전
+                        # crash면 DB엔 reserved만 남고 재진입 시 중복 게시될 수 있다. merge의 pr_state
+                        # reconciliation과 동일하게, 기존 reserved(crash 의심)면 GitHub에 stable
+                        # marker('task: {id}')가 이미 있는지 먼저 확인한다:
+                        #   있음→재게시 없이 done / unknown→feedback fail-closed 미게시 / 없음→게시.
+                        # 그리고 post_review_comment는 실패를 False로 반환하므로 True일 때만 done.
+                        from agent_crew.github import post_review_comment, pr_has_comment_containing
+                        _marker = f"task: {task_id}"
+                        _do_post = True
+                        if not _cresv.get("reserved"):   # 기존 reserved = crash 의심 → 먼저 재확인
+                            _existing = pr_has_comment_containing(int(_review_pr), _marker)
+                            if _existing is True:
+                                q().external_op_mark(_cop, "done")
+                                logger.info(f"POST /tasks/{task_id}/result: review comment already on "
+                                            f"PR #{_review_pr} (reconciled) → done, 재게시 안 함")
+                                _do_post = False
+                            elif _existing is None:
+                                logger.warning(f"POST /tasks/{task_id}/result: review comment 존재 확인 "
+                                               f"불가(unknown) → fail-closed 미게시(재확인 대기)")
+                                _do_post = False
+                        if _do_post:
+                            _reviewer_agent = next(
+                                (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
+                                "agent",
+                            )
+                            _ok = post_review_comment(
+                                pr_number=int(_review_pr),
+                                verdict=_resolve_verdict(result),   # #208 defensive resolver
+                                summary=result.summary or "",
+                                findings=result.findings or [],
+                                task_id=task_id,
+                                reviewer=_reviewer_agent,
+                            )
+                            if _ok:
+                                q().external_op_mark(_cop, "done")
+                                logger.info(f"POST /tasks/{task_id}/result: posted review comment on PR #{_review_pr}")
+                            else:
+                                q().external_op_mark(_cop, "failed",
+                                                     last_error="post_review_comment returned False",
+                                                     inc_attempt=True)
+                                logger.warning(f"POST /tasks/{task_id}/result: post_review_comment "
+                                               f"False → done 미기록(재시도 가능, PR #{_review_pr})")
 
             # #304 review (P1): suppressing the COMMENT was not enough. The
             # verdict's CONSEQUENCES ran regardless — an approve with
@@ -4633,6 +4808,47 @@ def create_app(
             if role:
                 _try_push_next(role)
         return {"status": "ok"}
+
+    @app.post("/admin/replay-suppressed", status_code=200)
+    def replay_suppressed():
+        """#314 §4: 유효한 재개(unpaused) 후, STOP으로 억제됐던 result-cascade를 cascade_outbox에서
+        drain해 1회 replay한다. lease CAS(outbox_claim)로 동시 replay를 dedup하고, 저장된 result_json
+        으로 production submit_result를 재실행(cascade 중복 없음). 성공 시에만 applied로 CAS(at-most-once).
+        crash한 replaying은 lease 만료 후 다음 호출/부팅에서 reclaim된다. fail-closed: 여전히 STOP이면 skip."""
+        from agent_crew import pause as _pm
+        import uuid as _uuid
+        _sd = os.path.dirname(q()._db_path)
+        # 여전히 STOP(runtime_stop 권위 OR pause.json additive)이면 replay 금지.
+        try:
+            if bool(q().get_stop_epoch()["paused"]) or _pm.is_paused(_sd):
+                return {"status": "skipped", "reason": "still paused", "replayed": []}
+        except Exception:
+            return {"status": "skipped", "reason": "pause 판정불가(fail-closed)", "replayed": []}
+        from agent_crew.protocol import TaskResult
+        done = []
+        for rec in q().outbox_pending(include_replaying=True):
+            parent = rec.get("parent_task_id")
+            if not parent:
+                continue
+            owner = f"replay-{_uuid.uuid4().hex[:8]}"
+            claim = q().outbox_claim(parent, owner)      # lease CAS: pending/만료replaying만
+            if not claim:
+                continue                                 # 다른 executor 처리중 or 이미 applied
+            # #314 §4 P0: replay 동안 _REPLAYING=True → submit_result가 durable cascade transition
+            # (successor enqueue, stable id 멱등)만 재실행하고 non-idempotent side effect(PR comment/
+            # escalation gate+telegram/queue push)는 skip. replay side-effect boundary 확립.
+            _rtok = _REPLAYING.set(True)
+            try:
+                rd = json.loads(claim.get("result_json") or "{}")
+                submit_result(parent, TaskResult(**rd))  # outbox 'replaying' → cascade transition만 재실행
+                q().outbox_mark_applied(parent, owner)    # 성공분만 replaying→applied CAS
+                done.append(parent)
+            except Exception:
+                logger.exception(f"replay-suppressed: {parent} 실패(lease 만료 후 reclaim)")
+            finally:
+                _REPLAYING.reset(_rtok)
+        return {"status": "ok", "replayed": done,
+                "pending_remaining": len(q().outbox_pending(include_replaying=False))}
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):

@@ -123,6 +123,77 @@ def set_pause(state_dir: str, paused: bool, *, scope: str = "project",
     return rec
 
 
+def _suppressed_path(state_dir: str) -> str:
+    return os.path.join(state_dir, "pause_suppressed.jsonl")
+
+
+def record_suppressed(state_dir: str, *, task_id: str, task_type: str,
+                      status: Optional[str], pr_number: Optional[int],
+                      generation: Optional[int], result: Optional[Dict[str, Any]] = None) -> None:
+    """#313/#314: pause로 억제된 result-cascade를 durable 기록(재개 시 1회 replay + dedup용).
+    `result`(원 제출 result 직렬화)를 함께 저장해 재개 시 production cascade를 그대로 재실행한다.
+    이미 같은 task_id의 미replay 기록이 있으면 중복 append하지 않는다."""
+    for r in list_suppressed(state_dir, only_pending=True):
+        if r.get("task_id") == task_id:
+            return
+    rec = {"task_id": task_id, "task_type": task_type, "status": status,
+           "pr_number": pr_number, "pause_generation": generation,
+           "result": result, "suppressed_at": _now(), "replayed": False}
+    path = _suppressed_path(state_dir)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+
+def list_suppressed(state_dir: str, only_pending: bool = True) -> list:
+    path = _suppressed_path(state_dir)
+    if not os.path.isfile(path):
+        return []
+    out = []
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if only_pending and r.get("replayed"):
+            continue
+        out.append(r)
+    # 같은 task_id는 최신 것만(dedup)
+    seen, dedup = set(), []
+    for r in reversed(out):
+        if r.get("task_id") in seen:
+            continue
+        seen.add(r.get("task_id")); dedup.append(r)
+    return list(reversed(dedup))
+
+
+def mark_replayed(state_dir: str, task_ids: list) -> None:
+    """replay 완료 표시 — 파일 전체를 다시 쓰며 해당 task_id를 replayed=True로."""
+    path = _suppressed_path(state_dir)
+    if not os.path.isfile(path):
+        return
+    ids = set(task_ids)
+    lines = []
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            r = json.loads(line)
+        except Exception:
+            continue
+        if r.get("task_id") in ids:
+            r["replayed"] = True
+        lines.append(json.dumps(r, ensure_ascii=False))
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + ("\n" if lines else ""))
+
+
 def resume(state_dir: str, *, scope: str = "project", generation: int,
            source: str = "") -> Dict[str, Any]:
     """generation-aware resume. stale(요청 gen ≤ 현재 gen)이면 거부 — 최신 STOP을 못 덮는다.
