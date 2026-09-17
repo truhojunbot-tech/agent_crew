@@ -4273,10 +4273,20 @@ def create_app(
         """
         ident = _server_identity()
         snap = _prov.snapshot(project=ident["project"], port=ident["port"])
+        # #314 §6: 이 런타임이 실제로 DB(runtime_stop)에서 읽은 STOP 상태를 노출한다. fleet_stop이
+        # post-restart ACK를 판정할 때 pause.json만이 아니라 "새 build가 DB stop epoch/incident를
+        # 읽어 paused로 올라왔는지"를 확인할 수 있어야 canary 자격이 생긴다. 조회 불가는 fail-closed(paused).
+        try:
+            _stop = q().get_stop_epoch()
+            _stop_out = {"epoch": _stop.get("epoch"), "paused": bool(_stop.get("paused")),
+                         "incident": _stop.get("incident")}
+        except Exception:
+            _stop_out = {"epoch": None, "paused": True, "incident": None, "error": "read_failed"}
         return {
             "status": "ok",
             "project": ident["project"],
             "identity": ident,
+            "stop": _stop_out,
             "build": {
                 "commit": snap["commit"],
                 "commit_short": snap["commit_short"],
