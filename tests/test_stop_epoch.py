@@ -346,6 +346,25 @@ class TestExternalOpReceipt(Base):
         self.assertEqual(row["attempt"], 2)
         self.assertEqual(row["state"], "failed")
 
+    def test_reserve_blocked_when_paused_atomic_admission(self):
+        """재리뷰: external mutation reservation이 같은 txn에서 runtime_stop을 확인 → STOP이 먼저
+        linearize됐으면 admitted=False로 차단하고 행도 만들지 않는다(merge/comment mutation 시작 차단)."""
+        q = TaskQueue(self.db)
+        q.set_stop_epoch(True, incident="alfred#39")
+        r = q.external_op_reserve("merge:pr:1", pr_number=1)
+        self.assertFalse(r["admitted"], "STOP 중이면 admit 안 됨")
+        self.assertEqual(r["state"], "stop_blocked")
+        self.assertIsNone(q.external_op_get("merge:pr:1"), "차단 시 reservation 행 미생성")
+
+    def test_reserve_records_admitted_epoch(self):
+        q = TaskQueue(self.db)
+        q.set_stop_epoch(True)          # epoch1 paused
+        q.set_stop_epoch(False)         # epoch2 unpaused
+        r = q.external_op_reserve("merge:pr:2", pr_number=2)
+        self.assertTrue(r["admitted"])
+        self.assertEqual(q.external_op_get("merge:pr:2")["admitted_epoch"], 2,
+                         "admit된 시점의 stop epoch 기록")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

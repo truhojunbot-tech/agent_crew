@@ -246,15 +246,17 @@ CREATE TABLE IF NOT EXISTS cascade_outbox (
 # op_key의 reserved를 보고 pr_state를 재확인해 이미-merged면 done만 기록(재merge 없음).
 _DDL_EXTERNAL_OP = """
 CREATE TABLE IF NOT EXISTS external_op (
-    op_key      TEXT PRIMARY KEY,
-    state       TEXT NOT NULL DEFAULT 'reserved',
-    pr_number   INTEGER,
-    attempt     INTEGER NOT NULL DEFAULT 0,
-    last_error  TEXT,
-    reserved_at REAL NOT NULL DEFAULT 0,
-    done_at     REAL
+    op_key        TEXT PRIMARY KEY,
+    state         TEXT NOT NULL DEFAULT 'reserved',
+    pr_number     INTEGER,
+    attempt       INTEGER NOT NULL DEFAULT 0,
+    last_error    TEXT,
+    admitted_epoch INTEGER,
+    reserved_at   REAL NOT NULL DEFAULT 0,
+    done_at       REAL
 )
 """
+_DDL_MIGRATE_EXTERNAL_OP_ADMITTED = "ALTER TABLE external_op ADD COLUMN admitted_epoch INTEGER"
 
 # Performance indexes for common queries
 _DDL_INDEXES = """
@@ -394,6 +396,10 @@ class TaskQueue:
         conn.execute(_DDL_RUNTIME_STOP)
         conn.execute(_DDL_CASCADE_OUTBOX)
         conn.execute(_DDL_EXTERNAL_OP)
+        try:
+            conn.execute(_DDL_MIGRATE_EXTERNAL_OP_ADMITTED)
+        except Exception:
+            pass  # column already exists
         try:
             conn.execute("ALTER TABLE pr_announcements ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
         except Exception:
@@ -1225,26 +1231,46 @@ class TaskQueue:
     # ── #314 §5: external mutation receipt (merge idempotency) ────────────
 
     def external_op_reserve(self, op_key: str, pr_number: Optional[int] = None) -> dict:
-        """외부 mutation 의도를 원자적으로 예약. 새로 예약하면 reserved=True. 이미 있으면(reserved/
-        done/failed) 기존 행을 그대로 반환(reserved=False) → 호출측은 맹목 재실행 대신 reconciliation."""
+        """외부 GitHub mutation 시작 전 **원자적 STOP admission + reservation**(§5/재리뷰).
+
+        같은 BEGIN IMMEDIATE 트랜잭션에서 runtime_stop을 확인해, unpaused일 때만 reservation과
+        admitted_epoch를 기록하고 COMMIT한다. STOP이 이 reservation보다 먼저 linearize되면(=이미
+        commit되어 있으면) 같은 write-lock 도메인에서 반드시 보여 admitted=False로 차단된다 → merge/
+        comment 같은 remote mutation이 시작되지 않는다. reservation이 먼저 linearize됐다면 그 atomic
+        remote operation만 완료가 허용된다(reviewer 규칙 그대로).
+
+        반환:
+          - paused/판정불가 → {"admitted": False, "state": "stop_blocked"|"error"} (mutation 금지)
+          - unpaused → 기존/신규 행 dict + {"admitted": True, "reserved": 신규여부}. 호출측은
+            state('reserved'/'done'/'failed')로 reconciliation."""
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            stop = self._read_stop_row(conn)   # 같은 txn: STOP이 먼저 commit됐으면 반드시 보인다
+            if stop["paused"] or self._pausejson_active():
+                conn.execute("ROLLBACK")
+                return {"admitted": False, "state": "stop_blocked", "reserved": False,
+                        "reason": f"runtime STOP epoch={stop['epoch']}"}
             cur = conn.execute(
-                "INSERT OR IGNORE INTO external_op (op_key, state, pr_number, attempt, reserved_at) "
-                "VALUES (?, 'reserved', ?, 0, ?)", (op_key, pr_number, time.time()))
+                "INSERT OR IGNORE INTO external_op "
+                "(op_key, state, pr_number, attempt, admitted_epoch, reserved_at) "
+                "VALUES (?, 'reserved', ?, 0, ?, ?)",
+                (op_key, pr_number, int(stop["epoch"]), time.time()))
             newly = cur.rowcount == 1
             row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
             conn.execute("COMMIT")
             d = dict(row)
             d["reserved"] = newly
+            d["admitted"] = True
             return d
         except Exception:
             try:
                 conn.execute("ROLLBACK")
             except Exception:
                 pass
-            raise
+            # fail-closed: 예약 트랜잭션 실패 시 mutation을 admit하지 않는다.
+            logger.exception(f"external_op_reserve({op_key}) 실패 → admitted=False(fail-closed)")
+            return {"admitted": False, "state": "error", "reserved": False}
         finally:
             conn.close()
 

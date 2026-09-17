@@ -4203,25 +4203,16 @@ def create_app(
         Failures are logged and swallowed — a merge error must never break
         the result-submission response.
         """
-        # #314 P0-2b: merge는 enqueue choke point를 안 거치는 직접 외부 mutation이므로
-        # 여기서 별도로 pause를 확인한다(fail-closed, runtime_stop 권위 + pause.json additive).
-        try:
-            from agent_crew import pause as _pm
-            _mp = bool(q().get_stop_epoch()["paused"]) or _pm.is_paused(os.path.dirname(q()._db_path))
-        except Exception:
-            _mp = True
-        if _mp:
-            logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — runtime STOP")
-            return
-        # #314 §5: DB txn을 gh 호출과 공유 못 하므로 exactly-once 불가 → reservation + 실제 GitHub
-        # 상태 재확인 + idempotent reconciliation. crash(merge 후 done 기록 전)는 재기동 시 op_key
-        # reserved를 보고 pr_state 재확인 → 이미-merged면 재merge 없이 done만 기록.
+        # #314 재리뷰: STOP 확인과 merge 시작을 원자화한다. external_op_reserve가 같은 BEGIN
+        # IMMEDIATE 트랜잭션에서 runtime_stop을 확인해 unpaused일 때만 admit+reserve → STOP이
+        # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
+        # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
         from agent_crew.github import get_repo, merge_pr, pr_state
         op_key = f"merge:pr:{pr_number}"
-        try:
-            resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
-        except Exception:
-            logger.exception(f"_auto_merge_pr(#{pr_number}): external_op 예약 실패 — merge 보류")
+        resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
+        if not resv.get("admitted"):
+            logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — "
+                           f"STOP admission 거부({resv.get('state')})")
             return
         if resv.get("state") == "done":
             logger.info(f"_auto_merge_pr: {op_key} 이미 done(receipt) — merge 재실행 안 함")
@@ -4705,29 +4696,40 @@ def create_app(
                     # 아래에서 계속되며 stable id/receipt로 멱등.
                     logger.debug(f"POST /tasks/{task_id}/result: replay 중 — review comment skip (PR #{_review_pr})")
                 elif _review_pr:
-                    try:
-                        from agent_crew.github import post_review_comment
-                        _reviewer_agent = next(
-                            (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
-                            "agent",
-                        )
-                        post_review_comment(
-                            pr_number=int(_review_pr),
-                            # #208: use the same defensive resolver as the
-                            # auto-enqueue-test decision below, so a clean
-                            # verdict=null+[] review (or a reviewer that only
-                            # states "approve" in prose) doesn't render as a
-                            # request_changes header while the summary says
-                            # approve.
-                            verdict=_resolve_verdict(result),
-                            summary=result.summary or "",
-                            findings=result.findings or [],
-                            task_id=task_id,
-                            reviewer=_reviewer_agent,
-                        )
-                        logger.info(f"POST /tasks/{task_id}/result: posted review comment on PR #{_review_pr}")
-                    except Exception:
-                        logger.exception(f"POST /tasks/{task_id}/result: failed to post review comment on PR #{_review_pr}")
+                    # #314 재리뷰: review comment도 GitHub 외부 mutation이므로 merge와 동일한 **원자
+                    # STOP admission**을 지난다. external_op_reserve가 같은 BEGIN IMMEDIATE에서
+                    # runtime_stop을 확인해, STOP이 먼저 linearize됐으면 admitted=False로 차단(outbox
+                    # applied 직후 STOP 걸린 comment race 제거). receipt(done)로 comment 성공→기록 전
+                    # crash 재시도 시 중복도 방지. root cause가 GitHub comment feedback loop였으므로 필수.
+                    _cop = f"comment:review:{task_id}"
+                    _cresv = q().external_op_reserve(_cop, pr_number=int(_review_pr))
+                    if not _cresv.get("admitted"):
+                        logger.warning(f"POST /tasks/{task_id}/result: review comment 억제 — "
+                                       f"STOP admission 거부(PR #{_review_pr}, {_cresv.get('state')})")
+                    elif _cresv.get("state") == "done":
+                        logger.info(f"POST /tasks/{task_id}/result: review comment 이미 done(receipt) — skip")
+                    else:
+                        try:
+                            from agent_crew.github import post_review_comment
+                            _reviewer_agent = next(
+                                (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
+                                "agent",
+                            )
+                            post_review_comment(
+                                pr_number=int(_review_pr),
+                                # #208: defensive verdict resolver.
+                                verdict=_resolve_verdict(result),
+                                summary=result.summary or "",
+                                findings=result.findings or [],
+                                task_id=task_id,
+                                reviewer=_reviewer_agent,
+                            )
+                            q().external_op_mark(_cop, "done")
+                            logger.info(f"POST /tasks/{task_id}/result: posted review comment on PR #{_review_pr}")
+                        except Exception:
+                            q().external_op_mark(_cop, "failed",
+                                                 last_error="post_review_comment 실패", inc_attempt=True)
+                            logger.exception(f"POST /tasks/{task_id}/result: failed to post review comment on PR #{_review_pr}")
 
             # #304 review (P1): suppressing the COMMENT was not enough. The
             # verdict's CONSEQUENCES ran regardless — an approve with

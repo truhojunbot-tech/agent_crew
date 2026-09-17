@@ -573,15 +573,31 @@ def auto_enqueue_fix(
                 f"max {max_rounds}) — stopping, this needs a human"
             )
             # #314 §4 P0: replay 중에는 exhaustion PR comment를 게시하지 않는다(중복 방지).
-            if not suppress_side_effects:
+            if suppress_side_effects:
+                logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
+                             f"(review {review_task_id})")
+                return None
+            # #314 재리뷰: fix-budget comment도 GitHub 외부 mutation → merge/review comment와 동일한
+            # 원자 STOP admission. external_op_reserve가 같은 txn에서 runtime_stop 확인 후 admit할 때만
+            # 게시(STOP이 먼저 linearize되면 차단). receipt(done)로 게시→기록 전 crash 중복도 방지.
+            _cop = f"comment:fixbudget:{review_task_id}"
+            _cresv = queue.external_op_reserve(
+                _cop, pr_number=pr_number if isinstance(pr_number, int) else None)
+            if not _cresv.get("admitted"):
+                logger.warning(f"auto_enqueue_fix: fix-budget comment 억제 — STOP admission 거부 "
+                               f"(review {review_task_id}, {_cresv.get('state')})")
+            elif _cresv.get("state") == "done":
+                logger.info(f"auto_enqueue_fix: fix-budget comment 이미 done(receipt) — skip")
+            else:
                 _announce_fix_budget_exhausted(
                     pr_number=pr_number, review_task_id=review_task_id,
                     max_rounds=max_rounds, findings=review_result.findings or [],
                     comment_fn=comment_fn, already_announced_fn=already_announced_fn,
                     queue=queue)
-            else:
-                logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
-                             f"(review {review_task_id})")
+                try:
+                    queue.external_op_mark(_cop, "done")
+                except Exception:
+                    logger.exception(f"auto_enqueue_fix: external_op_mark({_cop}) 실패")
             return None
 
         findings_text = _findings_block(review_result.findings or [], review_task_id)
