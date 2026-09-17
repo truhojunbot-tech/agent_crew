@@ -107,6 +107,25 @@ Three properties the first version did not have:
   so a resume that had already read an older generation cannot overwrite a STOP
   written in between — a comparison cannot see a write it never read.
 
+## Every transport, and recovery too (review round 2)
+
+The first cascade gate lived in the HTTP server's wrapper helpers, so an
+MCP-only worker could complete or fail a task after STOP and still create a
+child, retry or replacement task. The gate now lives in the **pipeline**
+helpers (`auto_enqueue_review`/`test`/`fix`, `auto_fallback_failed_task`), which
+both transports call, and in `TaskQueue.requeue`, which every recovery path
+calls.
+
+That is the third time in this issue's lineage that a guard had to move from
+where one caller reaches it to where every caller must: the claim gate into
+`dequeue`, recovery into `requeue`, and the cascade out of the server. Same rule
+each time — the guard belongs at the chokepoint.
+
+**Recovery retains lineage.** Requirement 2 prohibits automatic recover/requeue
+while paused and requirement 3 asks for resumable state to be retained, so a
+dispatcher restarting during an incident leaves in-flight tasks `in_progress`
+with their checkpoints intact rather than sweeping them back to `pending`.
+
 ## Blocked-transition receipts
 
 A `dequeue` returning `None` is indistinguishable from an empty queue, so every

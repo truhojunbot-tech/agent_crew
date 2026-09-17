@@ -839,11 +839,31 @@ class TaskQueue:
         """
         from agent_crew.pause import GlobalPauseFile, decide
 
-        scopes = [self.pause_state("project")]
+        # ⛔FAIL CLOSED on BOTH scopes. The claim helper was made fail-closed in
+        #   round 1 and this one — the shared decision every cascade gate uses —
+        #   was left catching the global read and continuing on project state
+        #   alone. An unavailable global STOP could therefore reopen review,
+        #   retry, test, fix and merge, while the claim stayed blocked. The
+        #   comment here even claimed it would "never let telemetry unblock
+        #   work", which is precisely what it did (review round 2, P0).
+        from agent_crew.pause import PauseDecision
+
+        try:
+            scopes = [self.pause_state("project")]
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("pause_decision: project pause unreadable")
+            return PauseDecision(
+                allowed=False, scope="project",
+                reason=f"pause state unavailable: {exc}",
+                source="agent_crew", transition=transition)
         try:
             scopes.append((global_pause or GlobalPauseFile()).read())
-        except Exception:  # noqa: BLE001 — never let telemetry unblock work
-            logger.exception("pause_decision: global pause read failed")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("pause_decision: global pause unreadable")
+            return PauseDecision(
+                allowed=False, scope="global",
+                reason=f"pause state unavailable: {exc}",
+                source="agent_crew", transition=transition)
         return decide(scopes, transition)
 
     def dequeue(self, agent: str = "", role: str = "") -> Optional[TaskRequest]:
@@ -1063,6 +1083,36 @@ class TaskQueue:
 
     def requeue(self, task_id: str) -> None:
         """Roll an in_progress task back to pending so it can be dequeued again."""
+        # #311 review round 2 (P0): automatic recovery/requeue is a transition
+        # too. Requirement 2 prohibits recovering or requeueing work while
+        # paused, and requirement 3 asks for the lineage to be RETAINED rather
+        # than mutated past the safe boundary — so an in-progress task stays
+        # exactly as it is, checkpoint included, instead of being reset to
+        # pending by a dispatcher restart that happens during an incident.
+        # ⛔Gated here, at the one method every recovery path calls, rather than
+        #   at its five-plus call sites. Third time this lesson has come up in
+        #   this issue alone.
+        # ⛔Fails closed WITHOUT raising. A recovery gate that propagates its own
+        #   lookup error would turn an unreadable pause row into a crash on a
+        #   path whose whole job is to survive failure.
+        try:
+            _pause = self.pause_decision("recovery")
+        except Exception as exc:  # noqa: BLE001
+            from agent_crew.pause import PauseDecision
+
+            logger.exception("requeue: pause state unreadable — blocking")
+            _pause = PauseDecision(
+                allowed=False, scope="unknown",
+                reason=f"pause state unavailable: {exc}",
+                source="agent_crew", transition="recovery")
+        if not _pause.allowed:
+            logger.warning(
+                f"requeue BLOCKED for task_id={task_id!r} by a {_pause.scope} "
+                f"pause (generation {_pause.generation}): {_pause.reason}. The "
+                f"task is left in_progress with its lineage intact (#311)."
+            )
+            self._record_blocked_transition(_pause, task_id=task_id or "")
+            return
         conn = self._connect()
         try:
             conn.execute(

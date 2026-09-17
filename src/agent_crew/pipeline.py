@@ -492,6 +492,9 @@ def auto_enqueue_fix(
     Callers swallow the ``None`` — auto-enqueue must never crash a result
     submission.
     """
+    # #311 round 2 (P0): gated for EVERY transport, not just HTTP.
+    if pause_blocks_transition(queue, "fix", review_task_id):
+        return None
     try:
         review_tasks = [t for t in queue.list_tasks() if t.task_id == review_task_id]
         if not review_tasks:
@@ -796,6 +799,55 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
             pass
 
 
+def pause_blocks_transition(queue, transition: str, task_id: str = "") -> bool:
+    """May this automatic transition start? Transport-agnostic (#311 round 2).
+
+    ⛔Here, in the pipeline, because BOTH transports call these helpers. The
+      first pass gated the HTTP server's wrapper functions, so an MCP-only
+      worker could complete or fail a task after STOP and still create a child,
+      retry or replacement task — requirements 2 and 3, bypassed by choosing a
+      different transport.
+
+      That is the third time in this issue's lineage that a guard was placed
+      where one caller reaches it instead of where every caller must: the claim
+      gate had to move into `dequeue`, recovery had to move into `requeue`, and
+      this had to move out of the server. The rule is the same each time — the
+      guard belongs at the chokepoint, and "a guard on one transport is a guard
+      an agent walks around by changing how it reports" (#123).
+
+    Never raises, and fails closed: an unreadable pause state blocks.
+    """
+    try:
+        decision = queue.pause_decision(transition)
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            f"pause_blocks_transition: pause state unreadable for {transition!r} "
+            f"— blocking (fail closed, #311)")
+        return True
+    if decision.allowed:
+        return False
+    logger.warning(
+        f"pause_blocks_transition: {transition} BLOCKED for task_id={task_id!r} "
+        f"by a {decision.scope} pause (generation {decision.generation}, "
+        f"incident={decision.incident_ref!r}): {decision.reason}. The task's own "
+        f"result is still recorded; only new work is refused (#311)."
+    )
+    try:
+        ctx = queue.get_task_context(task_id) if task_id else {}
+    except Exception:  # noqa: BLE001
+        ctx = {}
+    try:
+        queue._record_blocked_transition(
+            decision, task_id=task_id or "",
+            context_id=str((ctx or {}).get("context_id") or ""),
+            provider=str((ctx or {}).get("provider") or (ctx or {}).get("agent") or ""),
+            provider_session_id=str((ctx or {}).get("provider_session_id") or ""),
+        )
+    except Exception:  # noqa: BLE001
+        logger.exception("pause_blocks_transition: could not record the refusal")
+    return True
+
+
 def auto_enqueue_review(
     queue: TaskQueue,
     impl_task_id: str,
@@ -816,6 +868,9 @@ def auto_enqueue_review(
     (cross-project guard, missing impl task, exception). Callers swallow
     the None — auto-enqueue must never crash a result submission.
     """
+    # #311 round 2 (P0): gated for EVERY transport, not just HTTP.
+    if pause_blocks_transition(queue, "review", impl_task_id):
+        return None
     try:
         impl_tasks = [t for t in queue.list_tasks() if t.task_id == impl_task_id]
         if not impl_tasks:
@@ -991,6 +1046,9 @@ def auto_enqueue_test(
     Returns the new test task_id, or ``None`` when no test is created
     (review missing/rejected, exception).
     """
+    # #311 round 2 (P0): gated for EVERY transport, not just HTTP.
+    if pause_blocks_transition(queue, "test", review_task_id):
+        return None
     try:
         review_tasks = [t for t in queue.list_tasks() if t.task_id == review_task_id]
         if not review_tasks:
@@ -1069,6 +1127,9 @@ def auto_fallback_failed_task(
     retry path. On chain exhaustion, opens an ``escalation`` gate and
     sends a Telegram alert (best-effort).
     """
+    # #311 round 2 (P0): gated for EVERY transport, not just HTTP.
+    if pause_blocks_transition(queue, "fallback", task_id):
+        return False
     if fallback_disabled:
         return False
     if not has_rate_limit_signal(result.summary, result.findings):

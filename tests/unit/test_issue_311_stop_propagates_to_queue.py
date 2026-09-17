@@ -751,3 +751,167 @@ def test_the_claim_fails_closed_when_the_global_read_raises(tmp_db, monkeypatch)
 
     monkeypatch.setattr(pause_module.GlobalPauseFile, "read", _boom)
     assert TaskQueue(tmp_db).dequeue(role="implementer") is None
+
+
+# ── 11. review round 2: the transports, recovery, and fail-open ───────
+#
+# Three P0s, all reproduced against this branch before fixing:
+#   * MCP called the pipeline helpers directly, so every cascade guard added in
+#     round 1 — which lived in the HTTP server's wrappers — was bypassed by
+#     choosing a different transport;
+#   * automatic recovery/requeue ran under STOP, mutating in-flight lineage past
+#     the safe boundary;
+#   * `pause_decision`, the shared decision every cascade gate uses, still
+#     caught an exceptional global read and continued on project state alone.
+
+
+def _mcp(tmp_db):
+    from agent_crew.mcp_server import build_mcp_server
+
+    return build_mcp_server(tmp_db)
+
+
+def _mcp_call(mcp, tool, **kwargs):
+    import asyncio
+
+    fn = mcp._tool_manager._tools[tool].fn
+    return asyncio.run(fn(**kwargs)) if asyncio.iscoroutinefunction(fn) else fn(**kwargs)
+
+
+def _mcp_submit(tmp_db, task_id, **fields):
+    mcp = _mcp(tmp_db)
+    ack = _mcp_call(mcp, "submit_result", task_id=task_id, **fields)
+    assert ack.get("acknowledged") is True, ack
+    return ack
+
+
+def test_an_mcp_result_under_stop_starts_no_review(tmp_db):
+    """★★P0. The round-1 gate lived in the HTTP wrappers; MCP calls the pipeline
+    helpers directly and walked straight past it."""
+    _inflight(tmp_db)
+    TaskQueue(tmp_db).activate_pause(reason="incident", incident_ref="ALFRED-39")
+    _mcp_submit(tmp_db, "impl-1", status="completed", summary="done")
+    reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
+    assert reviews == [], f"MCP bypassed the cascade gate: {reviews}"
+
+
+def test_an_mcp_result_under_stop_starts_no_retry_or_fallback(tmp_db):
+    _inflight(tmp_db)
+    TaskQueue(tmp_db).activate_pause(reason="incident")
+    before = {t.task_id for t in TaskQueue(tmp_db).list_tasks()}
+    _mcp_submit(tmp_db, "impl-1", status="failed", summary="rate limit")
+    after = {t.task_id for t in TaskQueue(tmp_db).list_tasks()}
+    assert after == before, f"MCP created replacement work under STOP: {after - before}"
+
+
+def test_an_mcp_approving_review_under_stop_starts_no_test(tmp_db, github_writes,
+                                                           monkeypatch):
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "open")
+    _inflight(tmp_db, task_id="review-1", task_type="review",
+              ctx={"pr_number": 42, "repo": "owner/repo"})
+    TaskQueue(tmp_db).activate_pause(reason="incident")
+    _mcp_submit(tmp_db, "review-1", status="completed", summary="ok",
+                verdict="approve", pr_number=42)
+    tests = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "test"]
+    assert tests == [], f"MCP started a test stage under STOP: {tests}"
+
+
+def test_an_mcp_rejecting_review_under_stop_starts_no_fix(tmp_db, github_writes,
+                                                          monkeypatch):
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *a, **k: "open")
+    _inflight(tmp_db, task_id="review-1", task_type="review",
+              ctx={"pr_number": 42, "repo": "owner/repo"})
+    TaskQueue(tmp_db).activate_pause(reason="incident")
+    _mcp_submit(tmp_db, "review-1", status="completed", summary="no",
+                verdict="request_changes", findings=["code_quality: x"], pr_number=42)
+    fixes = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_id.startswith("fix-")]
+    assert fixes == [], f"MCP started a fix round under STOP: {fixes}"
+
+
+def test_the_mcp_cascade_runs_normally_when_not_paused(tmp_db):
+    """⛔The control. Gating MCP into uselessness would 'fix' this by breaking
+    the transport."""
+    _inflight(tmp_db)
+    _mcp_submit(tmp_db, "impl-1", status="completed", summary="done")
+    reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
+    assert len(reviews) == 1, "the MCP cascade stopped working"
+
+
+def test_recovery_requeue_is_blocked_under_stop(tmp_db):
+    """★★P0. Requirement 2 prohibits automatic recover/requeue while paused, and
+    requirement 3 asks for the lineage to be RETAINED — so an in-flight task
+    stays in_progress rather than being reset by a restart during an incident."""
+    _inflight(tmp_db)
+    TaskQueue(tmp_db).activate_pause(reason="incident", incident_ref="ALFRED-39")
+
+    TaskQueue(tmp_db).requeue("impl-1")
+    assert TaskQueue(tmp_db).get_task_status("impl-1") == "in_progress", \
+        "STOP did not prevent the lineage being mutated past the safe boundary"
+
+    receipts = [r for r in TaskQueue(tmp_db).list_blocked_transitions()
+                if r["transition"] == "recovery"]
+    assert receipts and receipts[0]["task_id"] == "impl-1"
+
+
+def test_recovery_requeue_works_normally_when_not_paused(tmp_db):
+    """⛔The control: recovery is how a dead worker's task gets picked up again."""
+    _inflight(tmp_db)
+    TaskQueue(tmp_db).requeue("impl-1")
+    assert TaskQueue(tmp_db).get_task_status("impl-1") == "pending"
+
+
+def test_a_restart_while_paused_does_not_requeue_in_progress_work(tmp_db):
+    """★★The restart path the finding names: a dispatcher coming back up during
+    an incident must not sweep every in-flight task back to pending."""
+    _inflight(tmp_db)
+    TaskQueue(tmp_db).activate_pause(reason="incident")
+
+    with _server(tmp_db):          # startup runs the orphan sweep
+        pass
+    assert TaskQueue(tmp_db).get_task_status("impl-1") == "in_progress"
+
+
+@pytest.mark.parametrize("transport", ["http", "mcp"])
+def test_an_exceptional_global_read_blocks_the_cascade(tmp_db, transport, monkeypatch):
+    """★★P0. `pause_decision` — the decision every cascade gate consults —
+    caught an exceptional global read and carried on with project state alone,
+    so an unavailable global STOP could reopen review/retry/test/fix/merge while
+    the claim stayed blocked."""
+    from agent_crew import pause as pause_module
+
+    _inflight(tmp_db)
+
+    def _boom(self):
+        raise OSError("global pause file unreadable")
+
+    monkeypatch.setattr(pause_module.GlobalPauseFile, "read", _boom)
+    if transport == "http":
+        with _server(tmp_db) as client:
+            client.post("/tasks/impl-1/result", json={
+                "task_id": "impl-1", "status": "completed", "summary": "done"})
+    else:
+        _mcp_submit(tmp_db, "impl-1", status="completed", summary="done")
+
+    reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
+    assert reviews == [], f"{transport} cascade ran with an unknown global STOP"
+
+
+def test_the_pipeline_gate_fails_closed_when_the_decision_itself_raises(tmp_db):
+    """⛔The pipeline's OWN except branch, which the HTTP test cannot reach —
+    the server's gate catches the error first and blocks before the pipeline is
+    consulted. MCP calls the pipeline helpers directly, so it is the only
+    transport that exercises this path."""
+    _inflight(tmp_db)
+
+    def _boom(self, transition="claim", **kw):
+        raise sqlite3.OperationalError("pause table unreadable")
+
+    original = TaskQueue.pause_decision
+    TaskQueue.pause_decision = _boom
+    try:
+        _mcp_submit(tmp_db, "impl-1", status="completed", summary="done")
+    finally:
+        TaskQueue.pause_decision = original
+
+    reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
+    assert reviews == [], "the pipeline cascade ran with an unknown pause state"
