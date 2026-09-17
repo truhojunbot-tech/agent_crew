@@ -613,7 +613,9 @@ class TaskQueue:
             if pause.is_paused(os.path.dirname(self._db_path)):
                 return None
         except Exception:
-            pass  # pause 모듈 문제로 정상 dispatch를 막지 않는다(하위호환)
+            # fail-closed(#39): pause 판정이 불가능하면 STOP인지 확신할 수 없으므로
+            # 안전하게 dequeue를 막는다. (예전 fail-open은 STOP을 뚫는 안전결함이었음)
+            return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")

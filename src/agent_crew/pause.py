@@ -29,14 +29,26 @@ def _now() -> str:
     return datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+class _LoadError(dict):
+    """파일이 존재하나 읽기/파싱 실패 — fail-closed 신호(=paused로 취급)."""
+    pass
+
+
 def _load(path: str) -> Optional[Dict[str, Any]]:
-    if not path or not os.path.isfile(path):
+    """부재(=None, 정상 미pause) vs 손상(_LoadError, fail-closed=paused)을 구분한다.
+    안전 STOP에서는 상태를 확신할 수 없으면 paused여야 하므로, 손상은 절대 None으로 접지 않는다."""
+    if not path:
         return None
+    if not os.path.isfile(path):
+        return None            # 파일 없음 = 명시적으로 pause 아님(정상)
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return _LoadError({"error": "not-a-dict", "path": path})
+        return data
+    except Exception as e:      # 존재하나 손상 → fail-closed
+        return _LoadError({"error": repr(e)[:120], "path": path})
 
 
 def _save(path: str, rec: Dict[str, Any]) -> None:
@@ -54,6 +66,9 @@ def _project_pause_path(state_dir: str) -> str:
 
 
 def _active(rec: Optional[Dict[str, Any]]) -> bool:
+    # fail-closed: 손상된 상태파일(_LoadError)은 무조건 활성(paused)로 취급.
+    if isinstance(rec, _LoadError):
+        return True
     return bool(rec and rec.get("paused"))
 
 
@@ -82,8 +97,12 @@ def blocked_reason(state_dir: str = "") -> str:
     st = pause_state(state_dir)
     if not st["paused"]:
         return ""
-    parts = [f"{s['scope']}(incident={s.get('incident')},gen={s.get('generation')},reason={s.get('reason')})"
-             for s in st["active_scopes"]]
+    parts = []
+    for s in st["active_scopes"]:
+        if s.get("error"):
+            parts.append(f"{s['scope']}(FAIL-CLOSED: state 손상 {s['error']})")
+        else:
+            parts.append(f"{s['scope']}(incident={s.get('incident')},gen={s.get('generation')},reason={s.get('reason')})")
     return "paused by " + ", ".join(parts)
 
 

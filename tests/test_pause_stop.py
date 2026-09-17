@@ -99,6 +99,39 @@ class TestResume(Base):
         self.assertEqual(len([x for x in allt]), 2)
 
 
+class TestFailClosed(Base):
+    def test_corrupt_project_pause_fails_closed(self):
+        self._enqueue(1)
+        # pause.json이 존재하나 손상 → is_paused True(차단)여야. 예전 fail-open은 안전결함.
+        with open(os.path.join(self.state_dir, "pause.json"), "w") as f:
+            f.write("{ broken json ")
+        self.assertTrue(pause.is_paused(self.state_dir), "손상된 pause.json은 fail-closed=paused")
+        self.assertIsNone(self.q.dequeue(role="implementer"), "손상 상태에서 드레인 차단")
+        self.assertIn("FAIL-CLOSED", pause.blocked_reason(self.state_dir))
+
+    def test_corrupt_global_pause_fails_closed(self):
+        self._enqueue(1)
+        with open(self._gp, "w") as f:
+            f.write("not a dict")
+        self.assertTrue(pause.is_paused(self.state_dir))
+        self.assertIsNone(self.q.dequeue(role="implementer"))
+
+    def test_dequeue_fails_closed_on_pause_error(self):
+        # pause.is_paused가 예외를 던져도 dequeue는 fail-closed(None)여야
+        self._enqueue(1)
+        orig = pause.is_paused
+        pause.is_paused = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            self.assertIsNone(self.q.dequeue(role="implementer"),
+                              "pause 판정 예외 시 dequeue는 차단(fail-closed)")
+        finally:
+            pause.is_paused = orig
+
+    def test_missing_pause_is_not_paused(self):
+        # 파일 부재는 정상 미pause(손상과 구분)
+        self.assertFalse(pause.is_paused(self.state_dir))
+
+
 class TestTelemetryAndPortability(Base):
     def test_status_shows_reason(self):
         pause.set_pause(self.state_dir, True, reason="autonomous-loop runaway",
