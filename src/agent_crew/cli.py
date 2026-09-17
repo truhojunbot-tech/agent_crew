@@ -597,6 +597,96 @@ def crew():
     """agent_crew — multi-agent development crew CLI."""
 
 
+# ── #311: the generic STOP surface ────────────────────────────────────
+# ⛔A stable CLI/API contract an external system manager drives. Agent Crew owns
+#   the pause STATE and DECISION; deciding when a fleet should stop is not this
+#   runtime's job and nothing here imports one.
+
+
+def _pause_queue(project: str, base: str):
+    from agent_crew.queue import TaskQueue
+
+    db_file = os.path.join(base, project, "tasks.db")
+    if not os.path.exists(db_file):
+        raise click.ClickException(
+            f"no queue found for project {project!r} at {db_file}")
+    return TaskQueue(db_file)
+
+
+@crew.command()
+@click.argument("project")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--reason", default="paused by operator", show_default=True)
+@click.option("--source", default="", help="Who requested the stop (free text).")
+@click.option("--incident", default="", help="Incident/reference id.")
+@click.option("--scope", type=click.Choice(["project", "global"]), default="project",
+              show_default=True)
+def pause(project, base, reason, source, incident, scope):
+    """Halt new work. Prints the generation a later `crew resume` must name."""
+    if scope == "global":
+        from agent_crew.pause import GLOBAL_PAUSE_FILE_ENV, GlobalPauseFile
+
+        global_file = GlobalPauseFile()
+        if not global_file.configured:
+            raise click.ClickException(
+                f"no global pause file configured; set {GLOBAL_PAUSE_FILE_ENV}")
+        state = global_file.activate(reason=reason, source=source,
+                                     incident_ref=incident)
+    else:
+        state = _pause_queue(project, base).activate_pause(
+            reason=reason, source=source, incident_ref=incident)
+    click.echo(f"PAUSED scope={state.scope} generation={state.generation} "
+               f"reason={state.reason!r}")
+    click.echo(f"Resume with: crew resume {project} --generation {state.generation}"
+               + (f" --scope {scope}" if scope != "project" else ""))
+
+
+@crew.command()
+@click.argument("project")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--generation", type=int, required=True,
+              help="The generation this resume clears. A stale one is refused.")
+@click.option("--scope", type=click.Choice(["project", "global"]), default="project",
+              show_default=True)
+def resume(project, base, generation, scope):
+    """Resume, if --generation still names the STOP in force (#311)."""
+    if scope == "global":
+        from agent_crew.pause import GlobalPauseFile
+
+        released, state = GlobalPauseFile().release(generation)
+    else:
+        released, state = _pause_queue(project, base).release_pause(generation)
+    if not released:
+        raise click.ClickException(
+            f"REFUSED: generation {generation} is stale — generation "
+            f"{state.generation} is in force ({state.reason!r}). A newer STOP "
+            f"landed after this resume was decided; it is not this one's to clear."
+        )
+    click.echo(f"RESUMED scope={state.scope} generation={state.generation}")
+
+
+@crew.command("pause-status")
+@click.argument("project")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+def pause_status(project, base):
+    """Show whether work is blocked, by which scope, and why."""
+    from agent_crew.pause import GlobalPauseFile
+
+    queue = _pause_queue(project, base)
+    decision = queue.pause_decision("claim")
+    if decision.allowed:
+        click.echo("RUNNING — no pause in force")
+    else:
+        click.echo(f"BLOCKED by {decision.scope} pause "
+                   f"(generation {decision.generation})")
+        click.echo(f"  reason:   {decision.reason}")
+        click.echo(f"  source:   {decision.source or '(unset)'}")
+        click.echo(f"  incident: {decision.incident_ref or '(unset)'}")
+    global_file = GlobalPauseFile()
+    click.echo(f"  global scope: "
+               f"{'configured' if global_file.configured else 'not configured'}")
+
+
 @crew.command()
 @click.argument("project")
 @click.option("--agents", default=_DEFAULT_AGENTS,

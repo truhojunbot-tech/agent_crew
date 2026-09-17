@@ -4188,6 +4188,73 @@ def create_app(
         return {"project": name, "db_path": db_path, "port": port or 0,
                 "state_path": state_path or ""}
 
+    # ── #311: the operator/system-manager surface for STOP ────────────
+    # ⛔A stable interface, not an integration. An external system manager
+    #   drives these; nothing here knows or imports what that manager is.
+
+    @app.get("/pause")
+    def pause_status():
+        """Why transitions are blocked right now, and under which generation."""
+        from agent_crew.pause import GlobalPauseFile
+
+        decision = q().pause_decision("claim")
+        global_file = GlobalPauseFile()
+        return {
+            "decision": decision.to_dict(),
+            "project": q().pause_state("project").to_dict(),
+            "global": (global_file.read().to_dict() if global_file.configured
+                       else {"configured": False}),
+        }
+
+    @app.post("/pause")
+    def pause_activate(body: dict):
+        """Halt new work. Returns the generation a later resume must name."""
+        from agent_crew.pause import GlobalPauseFile
+
+        scope = (body or {}).get("scope") or "project"
+        reason = (body or {}).get("reason") or "paused by operator"
+        source = (body or {}).get("source") or ""
+        incident = (body or {}).get("incident_ref") or ""
+        if scope == "global":
+            global_file = GlobalPauseFile()
+            if not global_file.configured:
+                raise HTTPException(
+                    status_code=400,
+                    detail="no global pause file configured; set "
+                           "AGENT_CREW_GLOBAL_PAUSE_FILE to use the global scope",
+                )
+            state = global_file.activate(reason=reason, source=source,
+                                         incident_ref=incident)
+        else:
+            state = q().activate_pause(reason=reason, source=source,
+                                       incident_ref=incident, scope=scope)
+        return {"paused": True, "state": state.to_dict()}
+
+    @app.post("/resume")
+    def pause_release(body: dict):
+        """Resume, if the named generation is still the one in force (#311)."""
+        from agent_crew.pause import GlobalPauseFile
+
+        scope = (body or {}).get("scope") or "project"
+        generation = (body or {}).get("generation")
+        if scope == "global":
+            released, state = GlobalPauseFile().release(generation)
+        else:
+            released, state = q().release_pause(generation, scope=scope)
+        if not released:
+            # ⛔409, not 200-with-a-flag. A stale resume is a refused command,
+            #   and a caller that only reads the status code must not read it
+            #   as success.
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "released": False,
+                    "reason": "stale resume generation — a newer STOP is in force",
+                    "state": state.to_dict(),
+                },
+            )
+        return {"released": True, "state": state.to_dict()}
+
     @app.get("/health")
     def health():
         """Liveness plus the build this process is actually running (#248).

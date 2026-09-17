@@ -188,6 +188,20 @@ _DDL_MIGRATE_STATUS_CHANGED_AT = (
     "ALTER TABLE tasks ADD COLUMN status_changed_at REAL DEFAULT 0"
 )
 
+#: #311 — the project's own pause record. One row per scope, in the queue's own
+#: database so it survives a restart exactly as the queue does.
+_DDL_RUNTIME_PAUSE = """
+CREATE TABLE IF NOT EXISTS runtime_pause (
+    scope        TEXT PRIMARY KEY,
+    paused       INTEGER NOT NULL DEFAULT 0,
+    reason       TEXT NOT NULL DEFAULT '',
+    source       TEXT NOT NULL DEFAULT '',
+    incident_ref TEXT NOT NULL DEFAULT '',
+    generation   INTEGER NOT NULL DEFAULT 0,
+    activated_at REAL
+)
+"""
+
 _DDL_PR_ANNOUNCEMENTS = """
 CREATE TABLE IF NOT EXISTS pr_announcements (
     pr_number  INTEGER NOT NULL,
@@ -321,6 +335,7 @@ class TaskQueue:
         conn.execute(_DDL_CHECKPOINTS)
         conn.execute(_DDL_CONTEXT_STATE)
         conn.execute(_DDL_PR_ANNOUNCEMENTS)
+        conn.execute(_DDL_RUNTIME_PAUSE)
         try:
             conn.execute("ALTER TABLE pr_announcements ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
         except Exception:
@@ -588,6 +603,125 @@ class TaskQueue:
         finally:
             conn.close()
 
+    # ── #311: the runtime pause the queue itself enforces ──────────────
+
+    def pause_state(self, scope: str = "project") -> "PauseState":
+        """This scope's durable pause record (#311)."""
+        from agent_crew.pause import PauseState
+
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM runtime_pause WHERE scope = ?", (scope,)
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return PauseState(scope=scope)
+        return PauseState(
+            paused=bool(row["paused"]), scope=row["scope"],
+            reason=row["reason"] or "", source=row["source"] or "",
+            incident_ref=row["incident_ref"] or "",
+            generation=int(row["generation"] or 0),
+            activated_at=row["activated_at"],
+        )
+
+    def activate_pause(self, *, reason: str, source: str = "",
+                       incident_ref: str = "", scope: str = "project") -> "PauseState":
+        """Halt new work in this scope and bump its generation (#311).
+
+        ⛔The generation increments on every activation, including one that
+          arrives while already paused. A second incident during a STOP is a NEW
+          reason to be stopped, and a resume naming the first generation must
+          not clear it.
+        """
+        from agent_crew.pause import PauseState
+
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT generation FROM runtime_pause WHERE scope = ?", (scope,)
+            ).fetchone()
+            generation = int((row["generation"] if row else 0) or 0) + 1
+            now = time.time()
+            conn.execute(
+                """
+                INSERT INTO runtime_pause
+                    (scope, paused, reason, source, incident_ref, generation, activated_at)
+                VALUES (?, 1, ?, ?, ?, ?, ?)
+                ON CONFLICT(scope) DO UPDATE SET
+                    paused = 1, reason = excluded.reason, source = excluded.source,
+                    incident_ref = excluded.incident_ref,
+                    generation = excluded.generation,
+                    activated_at = excluded.activated_at
+                """,
+                (scope, reason, source, incident_ref, generation, now),
+            )
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+        logger.warning(
+            f"activate_pause: scope={scope} generation={generation} "
+            f"reason={reason!r} source={source!r} incident={incident_ref!r} — "
+            f"no new task will be claimed in this scope (#311)"
+        )
+        return PauseState(paused=True, scope=scope, reason=reason, source=source,
+                          incident_ref=incident_ref, generation=generation,
+                          activated_at=now)
+
+    def release_pause(self, generation, scope: str = "project") -> tuple:
+        """Resume, if ``generation`` still names the STOP in force (#311).
+
+        Returns ``(released, state)``. A stale generation is refused and the
+        pause is left exactly as it was — see `pause.resume_is_stale`.
+        """
+        from agent_crew.pause import PauseState, resume_is_stale
+
+        current = self.pause_state(scope)
+        if not current.paused:
+            return (True, current)
+        if resume_is_stale(current, generation):
+            logger.warning(
+                f"release_pause: REFUSED for scope={scope} — resume names "
+                f"generation {generation!r} but generation "
+                f"{current.generation} is in force. A newer STOP has landed "
+                f"since; it is not this resume's to clear (#311)."
+            )
+            return (False, current)
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE runtime_pause SET paused = 0, reason = '', source = '', "
+                "incident_ref = '', activated_at = NULL WHERE scope = ?",
+                (scope,),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        logger.info(
+            f"release_pause: scope={scope} resumed at generation "
+            f"{current.generation} — the queue may claim again (#311)")
+        return (True, PauseState(paused=False, scope=scope,
+                                 generation=current.generation))
+
+    def pause_decision(self, transition: str = "claim", *,
+                       global_pause=None) -> "PauseDecision":
+        """May this transition start? The single answer every caller uses (#311).
+
+        ⛔One decision function, consulted at the chokepoint below rather than
+          at each call site. The reported incident is precisely what happens
+          when a guard lives beside the work instead of inside it.
+        """
+        from agent_crew.pause import GlobalPauseFile, decide
+
+        scopes = [self.pause_state("project")]
+        try:
+            scopes.append((global_pause or GlobalPauseFile()).read())
+        except Exception:  # noqa: BLE001 — never let telemetry unblock work
+            logger.exception("pause_decision: global pause read failed")
+        return decide(scopes, transition)
+
     def dequeue(self, agent: str = "", role: str = "") -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -605,6 +739,23 @@ class TaskQueue:
            agent. Stage 2 only runs after stage 1 has no candidate.
         3. Neither given: any pending task, ordered by priority.
         """
+        # #311: the STOP gate, at the one place every transport claims work.
+        # ⛔Inside the claim, not beside it. A feeder-level STOP upstream stopped
+        #   new work being handed to this runtime and the runtime kept draining
+        #   the queue it already had — because the only guard lived in the thing
+        #   that supplies tasks. HTTP, the dispatcher loop, `_try_push_next` and
+        #   MCP all reach work through here, so a guard here cannot be walked
+        #   around by changing how a caller asks.
+        _pause = self.pause_decision("claim")
+        if not _pause.allowed:
+            logger.warning(
+                f"dequeue: BLOCKED by a {_pause.scope} pause "
+                f"(generation {_pause.generation}, source={_pause.source!r}, "
+                f"incident={_pause.incident_ref!r}): {_pause.reason}. Queued work "
+                f"stays queued (#311)."
+            )
+            self._last_pause_decision = _pause
+            return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -923,6 +1074,23 @@ class TaskQueue:
         """Atomic pending→in_progress for the oldest pending discuss task whose
         context.agent matches `agent`. Context is stored as JSON, so filtering
         happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
+        # #311: the STOP gate, at the one place every transport claims work.
+        # ⛔Inside the claim, not beside it. A feeder-level STOP upstream stopped
+        #   new work being handed to this runtime and the runtime kept draining
+        #   the queue it already had — because the only guard lived in the thing
+        #   that supplies tasks. HTTP, the dispatcher loop, `_try_push_next` and
+        #   MCP all reach work through here, so a guard here cannot be walked
+        #   around by changing how a caller asks.
+        _pause = self.pause_decision("claim")
+        if not _pause.allowed:
+            logger.warning(
+                f"dequeue_discuss_for_agent: BLOCKED by a {_pause.scope} pause "
+                f"(generation {_pause.generation}, source={_pause.source!r}, "
+                f"incident={_pause.incident_ref!r}): {_pause.reason}. Queued work "
+                f"stays queued (#311)."
+            )
+            self._last_pause_decision = _pause
+            return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
