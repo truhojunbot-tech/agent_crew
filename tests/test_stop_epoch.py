@@ -220,6 +220,20 @@ class TestCascadeOutbox(Base):
         self.assertTrue(q.outbox_mark_applied("t1", "owner-a"))
         self.assertEqual(q.outbox_get("t1")["state"], "applied")
 
+    def test_outbox_reopen_for_enqueue_race(self):
+        """라이브 cascade 중 STOP으로 successor enqueue가 거부되면 부모 outbox(applied)를 reopen →
+        pending → 재개 replay가 저장된 result로 전체 cascade 멱등 재실행(거부된 successor 복구)."""
+        q = TaskQueue(self.db)
+        q.submit_result("t1", self._seed(q))   # unpaused → applied(라이브 처리)
+        self.assertEqual(q.outbox_get("t1")["state"], "applied")
+        self.assertTrue(q.outbox_reopen("t1"))
+        self.assertEqual(q.outbox_get("t1")["state"], "pending")
+        self.assertIn("t1", [r["parent_task_id"] for r in q.outbox_pending()])
+        # result_json은 보존돼 result-carrying replay 가능(리뷰어 지적 해소)
+        self.assertIn("completed", q.outbox_get("t1")["result_json"])
+        # 이미 pending이면 reopen no-op(applied/replaying만 대상)
+        self.assertFalse(q.outbox_reopen("t1"))
+
     def test_outbox_stale_lease_reclaim(self):
         """crash한 replaying(만료 lease)은 다른 owner가 안전하게 reclaim."""
         q = TaskQueue(self.db)

@@ -48,8 +48,10 @@ class TestResultCascadeGate(Base):
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json().get("suppressed_by_pause"), r.json())
         self.assertEqual(self._review_count(), 0, "pause 중 auto-review가 enqueue되면 안 됨")
-        # 억제 durable 기록 존재(재개 replay용)
-        self.assertTrue(any(s["task_id"] == t.task_id for s in pause.list_suppressed(self.sd)))
+        # #314 §3/§4: 억제 durable 기록은 cascade_outbox(state=pending) — result 저장과 원자적.
+        ob = self.q.outbox_get(t.task_id)
+        self.assertIsNotNone(ob)
+        self.assertEqual(ob["state"], "pending")
 
     def test_control_no_pause_not_suppressed(self):
         # 대조군: pause가 없으면 게이트가 result를 통과시킨다(over-suppress 안 함).

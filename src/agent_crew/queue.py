@@ -1187,6 +1187,24 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def outbox_reopen(self, parent_task_id: str) -> bool:
+        """라이브 cascade 도중 STOP이 authoritative가 돼 successor enqueue가 PausedError로 거부되면,
+        이미 'applied'로 찍힌 부모 outbox를 'pending'으로 되돌린다 → 재개 후 executor가 저장된
+        result_json으로 전체 cascade를 멱등 재실행(거부된 successor 포함)한다. lease도 초기화.
+        이것이 리뷰어가 지적한 'PausedError가 result 없이 억제 기록 → replay 스킵' 문제의 해법이다:
+        outbox에는 이미 result가 있으므로 reopen만 하면 result-carrying replay가 보장된다."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state='pending', lease_owner=NULL, attempt_id=NULL, "
+                "lease_expires_at=NULL, updated_at=? "
+                "WHERE parent_task_id=? AND state IN ('applied','replaying')",
+                (time.time(), parent_task_id))
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     def requeue(self, task_id: str) -> None:
         """Roll an in_progress task back to pending so it can be dequeued again."""
         conn = self._connect()

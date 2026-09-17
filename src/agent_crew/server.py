@@ -2268,9 +2268,11 @@ def create_app(
 
     app = FastAPI(lifespan=lifespan)
 
-    # #314 P0-1: enqueue가 runtime STOP으로 원자적으로 거부(PausedError)되면 — result cascade의
-    # race 창에서 successor enqueue 시점에 STOP이 authoritative가 된 경우 — 500이 아니라
-    # suppressed 200으로 처리하고 억제를 durable 기록한다(successor는 이미 INSERT 안 됨).
+    # #314 §3/§4: 라이브 cascade 도중 successor enqueue 시점에 STOP이 authoritative가 돼 enqueue가
+    # PausedError로 원자 거부되면 — 부모 result는 이미 cascade_outbox에 result_json과 함께 원자
+    # 저장돼 있으므로(§3), 부모 outbox를 'pending'으로 reopen한다. 재개 후 executor(replay)가 저장된
+    # result로 전체 cascade를 멱등 재실행 → 거부됐던 successor까지 복구된다. (리뷰어가 지적한
+    # 'PausedError가 result 없이 억제 기록 → replay 스킵'을, result-carrying outbox reopen으로 해결.)
     from fastapi.responses import JSONResponse as _JSONResponse
     from agent_crew.queue import PausedError as _PausedError
 
@@ -2279,14 +2281,14 @@ def create_app(
         try:
             _m = re.search(r"/tasks/([^/]+)/result", str(request.url.path))
             _parent = _m.group(1) if _m else None
-            from agent_crew import pause as _pm
-            _sd = os.path.dirname(state["queue"]._db_path)
             if _parent:
-                _pm.record_suppressed(_sd, task_id=_parent, task_type="unknown",
-                                      status=None, pr_number=None, generation=None)
-            logger.warning(f"[PAUSE-SUPPRESSED] enqueue race 차단: {exc} (path={request.url.path})")
+                _reopened = state["queue"].outbox_reopen(_parent)
+                logger.warning(f"[PAUSE-SUPPRESSED] enqueue race 차단: {exc} "
+                               f"(parent={_parent}, outbox_reopened={_reopened}, path={request.url.path})")
+            else:
+                logger.warning(f"[PAUSE-SUPPRESSED] enqueue race 차단(파싱불가): {exc} (path={request.url.path})")
         except Exception:
-            logger.exception("PausedError 핸들러 기록 실패(그래도 억제)")
+            logger.exception("PausedError 핸들러 outbox reopen 실패(그래도 억제)")
         return _JSONResponse(status_code=200, content={
             "status": "ok", "suppressed_by_pause": True, "cascade_suppressed": True,
             "detail": "runtime STOP: execution-producing mutation atomically refused"})
@@ -4519,37 +4521,24 @@ def create_app(
                     f"POST /tasks/{task_id}/result: pr-mismatch event failed")
             return {"status": "ok", "held": "pr_number_mismatch",
                     "requested_pr": _requested, "reported_pr": _reported}
-        # #313 STOP: result는 이미 persist(marked done)돼 lineage/audit 보존됨. runtime pause면
-        # 어떤 result-driven 후속 실행 stage(review/test/merge/fix/retry/fallback/discuss-push)도
-        # 생성/시작하지 않는다. fail-closed(판정 불가 시 억제). 재개 시 1회 replay 위해 durable 기록.
+        # #314 §3/§4 STOP: result는 이미 persist(marked done)돼 lineage/audit 보존됨.
+        # 억제 판단은 queue.submit_result가 result 저장과 **같은 원자 txn**에서 확정해 cascade_outbox에
+        # 기록했다(state='pending' → 억제 / 'applied' → 라이브 처리). 서버는 pause를 재확인하지 않고
+        # 그 원자 결정(outbox state)만 신뢰한다 → 재확인 divergence 제거. outbox row 자체가 durable
+        # suppression 기록이며(§3, result 저장과 원자적), 재개 후 executor(replay endpoint)가 drain한다.
+        # fail-closed: outbox 조회 불가/부재는 억제로 간주.
         try:
-            from agent_crew import pause as _pausemod
-            _sd = os.path.dirname(q()._db_path)
-            _paused = _pausemod.is_paused(_sd)
+            _ob = q().outbox_get(task_id)
         except Exception:
-            _paused, _sd = True, ""   # fail-closed
-        if _paused:
-            try:
-                _pgen = (_pausemod.pause_state(_sd).get("active_scopes") or [{}])[0].get("generation")
-            except Exception:
-                _pgen = None
-            try:
-                try:
-                    _res_dump = result.model_dump()
-                except Exception:
-                    _res_dump = getattr(result, "__dict__", None)
-                _pausemod.record_suppressed(
-                    _sd, task_id=task_id, task_type=task_type,
-                    status=getattr(result, "status", None),
-                    pr_number=getattr(result, "pr_number", None), generation=_pgen,
-                    result=_res_dump)
-            except Exception:
-                logger.exception(f"POST /tasks/{task_id}/result: suppression 기록 실패(계속 억제)")
+            _ob = None
+        _suppressed = (_ob is None) or (_ob.get("state") == "pending")
+        if _suppressed:
+            _pepoch = (_ob or {}).get("stop_epoch")
             logger.warning(f"POST /tasks/{task_id}/result: [PAUSE-SUPPRESSED] cascade 억제됨 "
-                           f"(task_type={task_type}, status={result.status}, pause_gen={_pgen}). "
-                           "result는 저장됨, 후속 stage 미생성.")
+                           f"(task_type={task_type}, status={result.status}, outbox=pending, "
+                           f"stop_epoch={_pepoch}). result는 저장됨, 후속 stage 미생성.")
             return {"status": "ok", "task_id": task_id, "suppressed_by_pause": True,
-                    "pause_generation": _pgen, "cascade_suppressed": True}
+                    "pause_generation": _pepoch, "cascade_suppressed": True}
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
@@ -4700,29 +4689,38 @@ def create_app(
 
     @app.post("/admin/replay-suppressed", status_code=200)
     def replay_suppressed():
-        """#314 BLOCKER-3: 유효한 재개(unpaused) 후, pause로 억제됐던 result-cascade를 1회 replay.
-        저장된 원 result로 production submit_result를 재실행(cascade 로직 중복 없음). 기존 dedup
-        (fix-task-id, review-exists 등)으로 idempotent. 성공한 것만 replayed 표시(at most once)."""
+        """#314 §4: 유효한 재개(unpaused) 후, STOP으로 억제됐던 result-cascade를 cascade_outbox에서
+        drain해 1회 replay한다. lease CAS(outbox_claim)로 동시 replay를 dedup하고, 저장된 result_json
+        으로 production submit_result를 재실행(cascade 중복 없음). 성공 시에만 applied로 CAS(at-most-once).
+        crash한 replaying은 lease 만료 후 다음 호출/부팅에서 reclaim된다. fail-closed: 여전히 STOP이면 skip."""
         from agent_crew import pause as _pm
+        import uuid as _uuid
         _sd = os.path.dirname(q()._db_path)
-        if _pm.is_paused(_sd):
-            return {"status": "skipped", "reason": "still paused", "replayed": []}
+        # 여전히 STOP(runtime_stop 권위 OR pause.json additive)이면 replay 금지.
+        try:
+            if bool(q().get_stop_epoch()["paused"]) or _pm.is_paused(_sd):
+                return {"status": "skipped", "reason": "still paused", "replayed": []}
+        except Exception:
+            return {"status": "skipped", "reason": "pause 판정불가(fail-closed)", "replayed": []}
         from agent_crew.protocol import TaskResult
-        pending = _pm.list_suppressed(_sd, only_pending=True)
         done = []
-        for rec in pending:
-            tid, rd = rec.get("task_id"), rec.get("result")
-            if not tid or not rd:
+        for rec in q().outbox_pending(include_replaying=True):
+            parent = rec.get("parent_task_id")
+            if not parent:
                 continue
+            owner = f"replay-{_uuid.uuid4().hex[:8]}"
+            claim = q().outbox_claim(parent, owner)      # lease CAS: pending/만료replaying만
+            if not claim:
+                continue                                 # 다른 executor 처리중 or 이미 applied
             try:
-                submit_result(tid, TaskResult(**rd))   # unpaused → cascade 재실행, idempotent
-                done.append(tid)
+                rd = json.loads(claim.get("result_json") or "{}")
+                submit_result(parent, TaskResult(**rd))  # outbox 'replaying' → 서버가 cascade 재실행(멱등)
+                q().outbox_mark_applied(parent, owner)    # 성공분만 replaying→applied CAS
+                done.append(parent)
             except Exception:
-                logger.exception(f"replay-suppressed: {tid} 실패(다음 재개에서 재시도)")
-        if done:
-            _pm.mark_replayed(_sd, done)                # 성공분만 mark → at most once
+                logger.exception(f"replay-suppressed: {parent} 실패(lease 만료 후 reclaim)")
         return {"status": "ok", "replayed": done,
-                "pending_remaining": len(_pm.list_suppressed(_sd, only_pending=True))}
+                "pending_remaining": len(q().outbox_pending(include_replaying=False))}
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
