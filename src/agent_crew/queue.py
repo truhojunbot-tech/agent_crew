@@ -11,6 +11,7 @@ from typing import List, Optional
 
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 
 
 class PausedError(Exception):
@@ -185,6 +186,14 @@ _DDL_MIGRATE_ATTR_COORDINATOR_PROVIDER = "ALTER TABLE task_attribution ADD COLUM
 _DDL_MIGRATE_ATTR_COORDINATOR_MODEL = "ALTER TABLE task_attribution ADD COLUMN coordinator_model TEXT NOT NULL DEFAULT 'unknown'"
 _DDL_MIGRATE_ATTR_COORDINATOR_SESSION = "ALTER TABLE task_attribution ADD COLUMN coordinator_provider_session_id TEXT NOT NULL DEFAULT 'unknown'"
 _DDL_MIGRATE_ATTR_COORDINATOR_CHECKPOINT = "ALTER TABLE task_attribution ADD COLUMN coordinator_checkpoint_ref TEXT NOT NULL DEFAULT ''"
+_DDL_MIGRATE_ATTR_UNCACHED_INPUT = "ALTER TABLE task_attribution ADD COLUMN uncached_input_tokens INTEGER DEFAULT NULL"
+_DDL_MIGRATE_ATTR_CACHE_WRITE = "ALTER TABLE task_attribution ADD COLUMN cache_write_tokens INTEGER DEFAULT NULL"
+_DDL_MIGRATE_ATTR_CACHE_READ = "ALTER TABLE task_attribution ADD COLUMN cache_read_tokens INTEGER DEFAULT NULL"
+_DDL_MIGRATE_ATTR_OUTPUT = "ALTER TABLE task_attribution ADD COLUMN output_tokens INTEGER DEFAULT NULL"
+_DDL_MIGRATE_ATTR_REASONING = "ALTER TABLE task_attribution ADD COLUMN reasoning_tokens INTEGER DEFAULT NULL"
+_DDL_MIGRATE_ATTR_CONTEXT_WINDOW = "ALTER TABLE task_attribution ADD COLUMN context_window_tokens INTEGER DEFAULT NULL"
+_DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH = "ALTER TABLE task_attribution ADD COLUMN stable_prefix_hash TEXT DEFAULT NULL"
+_DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH = "ALTER TABLE task_attribution ADD COLUMN context_pack_hash TEXT DEFAULT NULL"
 
 _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
@@ -211,6 +220,14 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_COORDINATOR_MODEL,
     _DDL_MIGRATE_ATTR_COORDINATOR_SESSION,
     _DDL_MIGRATE_ATTR_COORDINATOR_CHECKPOINT,
+    _DDL_MIGRATE_ATTR_UNCACHED_INPUT,
+    _DDL_MIGRATE_ATTR_CACHE_WRITE,
+    _DDL_MIGRATE_ATTR_CACHE_READ,
+    _DDL_MIGRATE_ATTR_OUTPUT,
+    _DDL_MIGRATE_ATTR_REASONING,
+    _DDL_MIGRATE_ATTR_CONTEXT_WINDOW,
+    _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH,
+    _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH,
 )
 
 _DDL_CHECKPOINTS = """
@@ -420,8 +437,9 @@ def task_issue_number(task) -> Optional[int]:
 
 
 class TaskQueue:
-    def __init__(self, db_path: str):
+    def __init__(self, db_path: str, *, telemetry_adapter: Optional[TaskTelemetryAdapter] = None):
         self._db_path = db_path
+        self._telemetry_adapter = telemetry_adapter or default_telemetry_adapter()
         conn = self._connect()
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
@@ -1232,6 +1250,10 @@ class TaskQueue:
         try:
             if result.task_id != task_id:
                 raise ValueError(f"task_id mismatch: argument {task_id!r} != result.task_id {result.task_id!r}")
+            # Read the provider's own transcript before the terminal write. The
+            # adapter boundary is deliberately provider-neutral here; failure
+            # to observe a transcript is represented by NULL, never a guess.
+            telemetry = self._extract_task_telemetry(conn, task_id)
             # #314 §3: result 저장·outbox 기록·pause 판단을 하나의 write-lock 트랜잭션으로 원자화한다.
             # 이렇게 해야 outbox의 state(pending=억제 / applied=라이브처리)가 결과 저장 시점의 STOP
             # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
@@ -1300,6 +1322,7 @@ class TaskQueue:
                 "UPDATE task_attribution SET status=?, outcome=?, completed_at=?, updated_at=? WHERE task_id=?",
                 (result.status, outcome, now, now, task_id),
             )
+            self._store_task_telemetry(conn, task_id, telemetry, now)
             # #204: completed_at >= started_at is expected to always hold —
             # started_at is set once at first dispatch and never rewritten
             # (see record_attribution). It can only be violated by clock
@@ -1345,6 +1368,67 @@ class TaskQueue:
             raise
         finally:
             conn.close()
+
+    def _extract_task_telemetry(self, conn: sqlite3.Connection, task_id: str) -> TaskTelemetry:
+        row = conn.execute(
+            "SELECT agent, worktree_path, provider_session_id FROM task_attribution WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return TaskTelemetry()
+        try:
+            return self._telemetry_adapter.extract(
+                provider=str(row["agent"] or ""),
+                worktree_path=str(row["worktree_path"] or ""),
+                provider_session_id=str(row["provider_session_id"] or ""),
+            )
+        except Exception:
+            logger.exception("task telemetry adapter failed for %s", task_id)
+            return TaskTelemetry()
+
+    @staticmethod
+    def _store_task_telemetry(
+        conn: sqlite3.Connection, task_id: str, telemetry: TaskTelemetry, now: float
+    ) -> None:
+        """Persist only observed values so absent provider fields remain NULL."""
+        context_pack_hash = telemetry.context_pack_hash
+        if context_pack_hash is None:
+            row = conn.execute(
+                "SELECT context FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            try:
+                context = json.loads(row["context"] or "{}") if row is not None else {}
+            except (TypeError, ValueError):
+                context = {}
+            if isinstance(context, dict) and isinstance(context.get("context_pack_hash"), str):
+                context_pack_hash = context["context_pack_hash"]
+        fields = (
+            "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
+            "output_tokens", "reasoning_tokens", "context_window_tokens",
+            "stable_prefix_hash",
+        )
+        values = [getattr(telemetry, field) for field in fields]
+        observed = [(field, value) for field, value in zip(fields, values) if value is not None]
+        if context_pack_hash is not None:
+            observed.append(("context_pack_hash", context_pack_hash))
+        assignments = [f"{field}=?" for field, _ in observed]
+        params = [value for _, value in observed]
+        # Dispatch attribution is authoritative when it named a model/session;
+        # a transcript fills only an absent value, never rewrites lineage.
+        if telemetry.model:
+            assignments.append("model=CASE WHEN model IN ('', 'unknown') THEN ? ELSE model END")
+            params.append(telemetry.model)
+        if telemetry.provider_session_id:
+            assignments.append(
+                "provider_session_id=CASE WHEN provider_session_id IN ('', 'unknown') THEN ? ELSE provider_session_id END"
+            )
+            params.append(telemetry.provider_session_id)
+        if not assignments:
+            return
+        conn.execute(
+            f"UPDATE task_attribution SET {', '.join(assignments)}, updated_at=? WHERE task_id=?",
+            params + [now, task_id],
+        )
 
     # ── #314 §4: cascade outbox executor primitives (lease + CAS) ─────────
     #
