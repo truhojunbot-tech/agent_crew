@@ -20,6 +20,13 @@ from agent_crew import instructions
 from agent_crew import claude_transcript as _claude_transcript
 from agent_crew.anomaly import check_wrong_repo
 from agent_crew import context_pack as _cpack
+from agent_crew.memory import (
+    MemoryProvider,
+    MemoryRequest,
+    NullMemoryProvider,
+    shadow_retrieve,
+    shadow_telemetry,
+)
 from agent_crew.context_identity import (
     append_attribution_jsonl,
     detect_context_compaction,
@@ -2075,6 +2082,7 @@ def create_app(
     state_path: Optional[str] = None,
     fallback_disabled: Optional[bool] = None,
     worktree_map: Optional[dict] = None,
+    memory_provider: Optional[MemoryProvider] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -2102,7 +2110,10 @@ def create_app(
     worktree_map: {role: worktree_path} — when provided the server prepares
         each worktree (fetch + branch checkout) before dispatching a task to
         it. Falls back to _load_worktree_map(state_path) if omitted.
+    memory_provider: optional project-local historical-memory provider. Its
+        retrieval is shadow telemetry only and can never alter dispatch.
     """
+    _memory_provider = memory_provider or NullMemoryProvider()
     if worktree_map is None:
         worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
     if watchdog_interval is None:
@@ -3489,6 +3500,46 @@ def create_app(
             except Exception:
                 logger.exception(
                     f"dispatcher: context pack telemetry failed for {task.task_id}")
+
+        # #322: Shadow-only optional durable-memory observation.  This sits
+        # after the baseline message (including any Context Pack) is complete,
+        # and its result is deliberately never assigned to `message`, `task`,
+        # routing, retry, or context-policy state.  A provider failure is
+        # converted to telemetry by `shadow_retrieve`, not an execution error.
+        try:
+            _shadow_result = shadow_retrieve(_memory_provider, MemoryRequest(
+                project=_project,
+                task_id=task.task_id,
+                context_id=_ctx_info["context_id"],
+                agent_identity=agent,
+                context_generation=_ctx_info["context_generation"],
+                authoritative_ref=_ctx.get("reviewed_sha", "") if isinstance(_ctx, dict) else "",
+                branch=task.branch,
+                commit_ref=_ctx.get("reviewed_sha", "") if isinstance(_ctx, dict) else "",
+                memory_types=("procedural", "episodic", "decision", "failure_pattern", "evidence"),
+            ))
+            _shadow_event = {
+                **shadow_telemetry(_shadow_result),
+                "task_id": task.task_id,
+                "project": _project,
+                "role": role,
+                "agent": agent,
+                "context_id": _ctx_info["context_id"],
+                "context_generation": _ctx_info["context_generation"],
+            }
+            record_context_event(
+                _context_events_path, "shadow_memory_retrieval", **_shadow_event,
+            )
+            # Durable telemetry only. The task object used to render `message`
+            # remains untouched, so this write cannot influence this dispatch.
+            q().patch_context(task.task_id, {"shadow_memory": {
+                key: value for key, value in _shadow_event.items()
+                if key not in {"task_id", "project", "role", "agent", "context_id", "context_generation"}
+            }})
+        except Exception:
+            # Telemetry persistence is also non-critical; do not let it turn a
+            # successful baseline dispatch into a memory-dependent failure.
+            logger.exception("dispatcher: shadow memory telemetry failed for task=%s", task.task_id)
         # Per-role log file so `tail -f dispatch_{role}.log` in the pane
         # shows a continuous stream across all tasks for that role.
         log_path = os.path.join(os.path.dirname(db_path), f"dispatch_{role}.log")
