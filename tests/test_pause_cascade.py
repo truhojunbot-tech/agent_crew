@@ -140,10 +140,15 @@ class TestResumeReplay(Base):
                    json={"task_id": t.task_id, "status": "completed", "summary": "done"})
         self.assertTrue(r.json().get("suppressed_by_pause"))
         self.assertEqual(len([x for x in self.q.list_tasks() if x.task_type == "review"]), 0)
-        # resume(더 높은 generation)
+        # resume(더 높은 generation) — #314: DB 권위(runtime_stop)까지 해제해야 STOP이 풀린다.
+        # 서버 TaskQueue가 paused 상태에서 부팅되며 boot reconcile이 runtime_stop을 paused로 seeding하므로,
+        # pause.json만 푸는 것으로는 부족하다(fail-closed로 DB paused 승). 프로덕션 cli resume은
+        # resume_stop(DB)+pause.json 미러를 함께 수행한다 — 여기서도 동일하게 둘 다 해제한다.
         cur = pause._load(os.path.join(self.sd, "pause.json"))
         pause.resume(self.sd, generation=cur["generation"] + 1, source="test")
+        self.q.resume_stop(generation=self.q.get_stop_epoch()["epoch"] + 1)
         self.assertFalse(pause.is_paused(self.sd))
+        self.assertFalse(self.q.get_stop_epoch()["paused"])
         # replay
         rr = c.post("/admin/replay-suppressed")
         self.assertEqual(rr.status_code, 200)
@@ -162,10 +167,10 @@ class TestAtomicClaim(Base):
         self.q.enqueue(mk(4, "implement"))
         pause.set_pause(self.sd, True, source="test")
         self.assertIsNone(self.q.dequeue(role="implementer"))
-        # 트랜잭션 내부 재확인 코드 경로 존재 확인
+        # 트랜잭션 내부 재확인 코드 경로 존재 확인 (#314: runtime_stop 권위 in-txn 게이트)
         import inspect
         src = inspect.getsource(TaskQueue.dequeue)
-        self.assertIn("atomic pause recheck", src)
+        self.assertIn("_stop_active_in_txn", src)
 
 
 if __name__ == "__main__":
