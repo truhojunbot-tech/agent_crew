@@ -97,6 +97,98 @@ def _span_session_id(session_id, offset):
     return _TaskProviderSessionId(session_id, {"session_id": session_id, "offset": offset})
 
 
+def _fresh_session_id(snapshot):
+    """Queue carrier for a fresh-task transcript directory snapshot."""
+    from agent_crew.queue import _TaskProviderSessionId
+    return _TaskProviderSessionId("", {"session_id": "", "offset": 0,
+                                       "fresh_session_paths": snapshot})
+
+
+def test_fresh_dispatch_boundary_snapshots_existing_transcript_paths(tmp_path, monkeypatch):
+    from agent_crew import server
+
+    cwd = "/worktrees/claude-321-dispatch"
+    existing = _claude_session(tmp_path, cwd, {"input_tokens": 1})
+    monkeypatch.setattr(server, "_claude_home", lambda home=None: tmp_path)
+
+    assert server.claude_task_start_boundary(cwd) == {
+        "session_id": "", "offset": 0, "fresh_session_paths": [str(existing)]}
+
+
+def test_claude_adapter_reads_the_single_transcript_created_after_fresh_dispatch(tmp_path):
+    cwd = "/worktrees/claude-321-fresh"
+    directory = tmp_path / "projects" / re.sub(r"[/._]", "-", cwd)
+    directory.mkdir(parents=True)
+    created = directory / "created-by-task.jsonl"
+    created.write_text(
+        _usage_record("fresh-1", {"input_tokens": 2, "output_tokens": 3})
+        + _usage_record("fresh-2", {"input_tokens": 5, "output_tokens": 7})
+    )
+
+    observed = ClaudeSessionTelemetryAdapter(home=tmp_path).extract(
+        provider="claude", worktree_path=cwd, provider_session_id=_fresh_session_id([]))
+
+    assert (observed.uncached_input_tokens, observed.output_tokens,
+            observed.provider_session_id) == (7, 10, "created-by-task")
+
+
+def test_claude_adapter_keeps_ambiguous_fresh_transcripts_unknown(tmp_path):
+    cwd = "/worktrees/claude-321-ambiguous"
+    old = _claude_session(tmp_path, cwd, {"input_tokens": 999})
+    directory = old.parent
+    (directory / "new-one.jsonl").write_text(_usage_record("one", {"input_tokens": 2}))
+    (directory / "new-two.jsonl").write_text(_usage_record("two", {"input_tokens": 3}))
+
+    observed = ClaudeSessionTelemetryAdapter(home=tmp_path).extract(
+        provider="claude", worktree_path=cwd,
+        provider_session_id=_fresh_session_id([str(old)]))
+
+    assert observed.uncached_input_tokens is None
+    assert observed.provider_session_id is None
+
+
+def test_fresh_session_binding_survives_restart_and_next_task_uses_its_own_span(tmp_path):
+    db = tmp_path / "tasks.db"
+    cwd = "/worktrees/claude-321-continuity"
+    directory = tmp_path / "projects" / re.sub(r"[/._]", "-", cwd)
+    directory.mkdir(parents=True)
+    session = directory / "fresh-session.jsonl"
+    queue = TaskQueue(str(db), telemetry_adapter=ClaudeSessionTelemetryAdapter(home=tmp_path))
+    context = queue.get_or_create_context("project", "claude", cwd, role="implementer",
+                                          task_id="fresh-task")
+    queue.enqueue(TaskRequest(task_id="fresh-task", task_type="implement", description="d"))
+    queue.record_attribution(task_id="fresh-task", agent="claude", worktree_path=cwd,
+                             context_id=context["context_id"], status="in_progress")
+    queue.patch_context("fresh-task", {"claude_transcript_start": {
+        "session_id": "", "offset": 0, "fresh_session_paths": []}})
+    session.write_text(_usage_record("fresh", {"input_tokens": 11, "output_tokens": 13}))
+
+    restarted = TaskQueue(str(db), telemetry_adapter=ClaudeSessionTelemetryAdapter(home=tmp_path))
+    restarted.submit_result("fresh-task", TaskResult(
+        task_id="fresh-task", status="completed", summary="done"))
+    first = restarted.get_attribution("fresh-task")
+    assert (first["uncached_input_tokens"], first["output_tokens"],
+            first["provider_session_id"]) == (11, 13, "fresh-session")
+    assert restarted.peek_context_provider_session_id("project", "claude", cwd) == "fresh-session"
+
+    next_context = restarted.get_or_create_context("project", "claude", cwd,
+                                                   role="implementer", task_id="resume-task")
+    assert next_context["provider_session_id"] == "fresh-session"
+    start = session.stat().st_size
+    restarted.enqueue(TaskRequest(task_id="resume-task", task_type="implement", description="d"))
+    restarted.record_attribution(task_id="resume-task", agent="claude", worktree_path=cwd,
+                                 provider_session_id="fresh-session",
+                                 context_id=next_context["context_id"], status="in_progress")
+    restarted.patch_context("resume-task", {"claude_transcript_start": {
+        "session_id": "fresh-session", "offset": start}})
+    with session.open("a") as transcript:
+        transcript.write(_usage_record("resume", {"input_tokens": 17, "output_tokens": 19}))
+    restarted.submit_result("resume-task", TaskResult(
+        task_id="resume-task", status="completed", summary="done"))
+    second = restarted.get_attribution("resume-task")
+    assert (second["uncached_input_tokens"], second["output_tokens"]) == (17, 19)
+
+
 def test_sequential_tasks_use_only_their_own_transcript_spans(tmp_path):
     db = tmp_path / "tasks.db"
     cwd = "/worktrees/claude-317-sequential"

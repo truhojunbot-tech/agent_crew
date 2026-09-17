@@ -24,7 +24,7 @@ from agent_crew.memory import (
     MemoryProvider,
     MemoryRequest,
     NullMemoryProvider,
-    shadow_retrieve,
+    shadow_retrieve_bounded,
     shadow_telemetry,
 )
 from agent_crew.context_identity import (
@@ -1137,7 +1137,12 @@ def claude_task_start_boundary(cwd: str, *, provider_session_id: str = "") -> di
     that unobservable state explicit instead of reading an unrelated session.
     """
     if not provider_session_id:
-        return {"session_id": "", "offset": 0}
+        return {
+            "session_id": "",
+            "offset": 0,
+            "fresh_session_paths": _claude_transcript.claude_session_paths(
+                cwd, home=_claude_home()),
+        }
     path = _claude_transcript.claude_session_path(
         cwd, home=_claude_home(), session_id=provider_session_id)
     if path is None:
@@ -2083,6 +2088,8 @@ def create_app(
     fallback_disabled: Optional[bool] = None,
     worktree_map: Optional[dict] = None,
     memory_provider: Optional[MemoryProvider] = None,
+    shadow_memory_enabled: Optional[bool] = None,
+    shadow_memory_timeout_seconds: Optional[float] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -2112,8 +2119,20 @@ def create_app(
         it. Falls back to _load_worktree_map(state_path) if omitted.
     memory_provider: optional project-local historical-memory provider. Its
         retrieval is shadow telemetry only and can never alter dispatch.
+    shadow_memory_enabled: explicit opt-in for shadow retrieval. Disabled by
+        default, so even an injected provider receives zero calls until enabled.
     """
     _memory_provider = memory_provider or NullMemoryProvider()
+    if shadow_memory_enabled is None:
+        shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
+            "1", "true", "yes",
+        )
+    if shadow_memory_timeout_seconds is None:
+        try:
+            shadow_memory_timeout_seconds = float(
+                os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.05"))
+        except ValueError:
+            shadow_memory_timeout_seconds = 0.05
     if worktree_map is None:
         worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
     if watchdog_interval is None:
@@ -3506,40 +3525,46 @@ def create_app(
         # and its result is deliberately never assigned to `message`, `task`,
         # routing, retry, or context-policy state.  A provider failure is
         # converted to telemetry by `shadow_retrieve`, not an execution error.
-        try:
-            _shadow_result = shadow_retrieve(_memory_provider, MemoryRequest(
-                project=_project,
-                task_id=task.task_id,
-                context_id=_ctx_info["context_id"],
-                agent_identity=agent,
-                context_generation=_ctx_info["context_generation"],
-                authoritative_ref=_ctx.get("reviewed_sha", "") if isinstance(_ctx, dict) else "",
-                branch=task.branch,
-                commit_ref=_ctx.get("reviewed_sha", "") if isinstance(_ctx, dict) else "",
-                memory_types=("procedural", "episodic", "decision", "failure_pattern", "evidence"),
-            ))
-            _shadow_event = {
-                **shadow_telemetry(_shadow_result),
-                "task_id": task.task_id,
-                "project": _project,
-                "role": role,
-                "agent": agent,
-                "context_id": _ctx_info["context_id"],
-                "context_generation": _ctx_info["context_generation"],
-            }
-            record_context_event(
-                _context_events_path, "shadow_memory_retrieval", **_shadow_event,
-            )
-            # Durable telemetry only. The task object used to render `message`
-            # remains untouched, so this write cannot influence this dispatch.
-            q().patch_context(task.task_id, {"shadow_memory": {
-                key: value for key, value in _shadow_event.items()
-                if key not in {"task_id", "project", "role", "agent", "context_id", "context_generation"}
-            }})
-        except Exception:
-            # Telemetry persistence is also non-critical; do not let it turn a
-            # successful baseline dispatch into a memory-dependent failure.
-            logger.exception("dispatcher: shadow memory telemetry failed for task=%s", task.task_id)
+        if shadow_memory_enabled:
+            try:
+                _shadow_result = shadow_retrieve_bounded(
+                    _memory_provider, MemoryRequest(
+                        project=_project,
+                        task_id=task.task_id,
+                        context_id=_ctx_info["context_id"],
+                        agent_identity=agent,
+                        context_generation=_ctx_info["context_generation"],
+                        authoritative_ref=(
+                            _ctx.get("reviewed_sha", "") if isinstance(_ctx, dict) else ""),
+                        branch=task.branch,
+                        commit_ref=(
+                            _ctx.get("reviewed_sha", "") if isinstance(_ctx, dict) else ""),
+                        memory_types=(
+                            "procedural", "episodic", "decision", "failure_pattern", "evidence"),
+                    ), shadow_memory_timeout_seconds,
+                )
+                _shadow_event = {
+                    **shadow_telemetry(_shadow_result),
+                    "task_id": task.task_id,
+                    "project": _project,
+                    "role": role,
+                    "agent": agent,
+                    "context_id": _ctx_info["context_id"],
+                    "context_generation": _ctx_info["context_generation"],
+                }
+                record_context_event(
+                    _context_events_path, "shadow_memory_retrieval", **_shadow_event,
+                )
+                # Durable telemetry only. The task object used to render `message`
+                # remains untouched, so this write cannot influence this dispatch.
+                q().patch_context(task.task_id, {"shadow_memory": {
+                    key: value for key, value in _shadow_event.items()
+                    if key not in {"task_id", "project", "role", "agent", "context_id", "context_generation"}
+                }})
+            except Exception:
+                # Telemetry persistence is also non-critical; do not let it turn a
+                # successful baseline dispatch into a memory-dependent failure.
+                logger.exception("dispatcher: shadow memory telemetry failed for task=%s", task.task_id)
         # Per-role log file so `tail -f dispatch_{role}.log` in the pane
         # shows a continuous stream across all tasks for that role.
         log_path = os.path.join(os.path.dirname(db_path), f"dispatch_{role}.log")

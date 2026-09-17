@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import subprocess
+import time
 
 from fastapi.testclient import TestClient
 
@@ -12,6 +13,8 @@ from agent_crew.memory import (
     MemoryItem,
     MemoryRequest,
     NullMemoryProvider,
+    MemoryResult,
+    shadow_retrieve,
 )
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
@@ -70,7 +73,8 @@ class _TimeoutProvider:
         raise TimeoutError("memory lookup timed out")
 
 
-def _dispatch_snapshot(tmp_path, monkeypatch, provider):
+def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled=True,
+                       shadow_memory_timeout_seconds=None):
     """Run the production dispatch seam and return its actual provider prompt."""
     tmp_path.mkdir()
     wt = tmp_path / "claude"
@@ -108,6 +112,8 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider):
     app = create_app(
         db_path=db, pane_map={}, port=0, state_path=str(state_file), project="project-a",
         memory_provider=provider, watchdog_disabled=True, anomaly_disabled=True,
+        shadow_memory_enabled=shadow_memory_enabled,
+        shadow_memory_timeout_seconds=shadow_memory_timeout_seconds,
     )
     with TestClient(app):
         queue = TaskQueue(db)
@@ -118,17 +124,69 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider):
         ))
         task = queue.dequeue(role="implementer")
         assert task is not None
+        dispatch_started = time.perf_counter()
         asyncio.run(app.state.dispatch_task(task, "implementer"))
+        dispatch_seconds = time.perf_counter() - dispatch_started
 
     events = [json.loads(line) for line in open(os.path.join(tmp_path, "context_events.jsonl"))]
     shadow = [event for event in events if event["event_type"] == "shadow_memory_retrieval"]
-    return spawned["cmd"], TaskQueue(db).get_task_context("shadow-322"), shadow
+    return spawned["cmd"], TaskQueue(db).get_task_context("shadow-322"), shadow, dispatch_seconds
+
+
+class _MustNotBeCalledProvider:
+    name = "must-not-call"
+    backend = "test"
+
+    def retrieve(self, request):
+        raise AssertionError("disabled shadow retrieval invoked the provider")
+
+
+class _SlowProvider:
+    name = "slow"
+    backend = "test"
+
+    def retrieve(self, request):
+        time.sleep(2)
+        return MemoryResult(provider=self.name, backend=self.backend, state="empty")
+
+
+class _CrossProjectProvider:
+    name = "cross-project"
+    backend = "test"
+
+    def retrieve(self, request):
+        return MemoryResult(provider=self.name, backend=self.backend, state="results", items=(
+            _item("project-a", "project-a"), _item("project-b", "project-b"),
+        ))
+
+
+def test_shadow_memory_kill_switch_never_invokes_provider(tmp_path, monkeypatch):
+    _, context, events, _ = _dispatch_snapshot(
+        tmp_path / "disabled", monkeypatch, _MustNotBeCalledProvider(), shadow_memory_enabled=False)
+
+    assert "shadow_memory" not in context
+    assert events == []
+
+
+def test_slow_shadow_provider_cannot_hold_baseline_dispatch(tmp_path, monkeypatch):
+    _, _, events, dispatch_seconds = _dispatch_snapshot(
+        tmp_path / "slow", monkeypatch, _SlowProvider(), shadow_memory_timeout_seconds=0.05)
+
+    assert dispatch_seconds < 0.5
+    assert events[0]["state"] == "timeout"
+
+
+def test_shadow_retrieve_defense_in_depth_removes_cross_project_provider_items():
+    result = shadow_retrieve(_CrossProjectProvider(), MemoryRequest(project="project-a"))
+
+    assert result.state == "results"
+    assert [item.item_id for item in result.items] == ["project-a"]
 
 
 def test_shadow_results_leave_baseline_prompt_and_dispatch_byte_identical(tmp_path, monkeypatch):
-    baseline, baseline_context, baseline_events = _dispatch_snapshot(
+    baseline, baseline_context, baseline_events, _ = _dispatch_snapshot(
         tmp_path / "baseline", monkeypatch, NullMemoryProvider())
-    returned, returned_context, returned_events = _dispatch_snapshot(
+    returned, returned_context, returned_events, _ = _dispatch_snapshot(
         tmp_path / "returned", monkeypatch,
         FakeMemoryProvider([_item("decision-1", "project-a")]),
     )
@@ -144,10 +202,10 @@ def test_shadow_results_leave_baseline_prompt_and_dispatch_byte_identical(tmp_pa
 
 
 def test_shadow_failures_timeouts_and_empty_results_leave_baseline_unchanged(tmp_path, monkeypatch):
-    baseline, _, _ = _dispatch_snapshot(tmp_path / "baseline", monkeypatch, NullMemoryProvider())
-    broken, _, broken_events = _dispatch_snapshot(tmp_path / "broken", monkeypatch, _BrokenProvider())
-    timed_out, _, timeout_events = _dispatch_snapshot(tmp_path / "timeout", monkeypatch, _TimeoutProvider())
-    empty, _, empty_events = _dispatch_snapshot(
+    baseline, _, _, _ = _dispatch_snapshot(tmp_path / "baseline", monkeypatch, NullMemoryProvider())
+    broken, _, broken_events, _ = _dispatch_snapshot(tmp_path / "broken", monkeypatch, _BrokenProvider())
+    timed_out, _, timeout_events, _ = _dispatch_snapshot(tmp_path / "timeout", monkeypatch, _TimeoutProvider())
+    empty, _, empty_events, _ = _dispatch_snapshot(
         tmp_path / "empty", monkeypatch, FakeMemoryProvider([]))
 
     assert broken == timed_out == empty == baseline

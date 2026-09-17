@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import perf_counter
+import threading
 from typing import Optional, Protocol
 
 
@@ -160,6 +161,40 @@ def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryR
             latency_ms=(perf_counter() - started) * 1000,
             error_type=type(exc).__name__,
         )
+
+
+def shadow_retrieve_bounded(provider: MemoryProvider, request: MemoryRequest,
+                            timeout_seconds: float) -> MemoryResult:
+    """Observe retrieval without allowing an uncooperative backend to block dispatch.
+
+    The provider runs in a dedicated daemon thread, never in the dispatch event
+    loop or a shared executor.  On timeout the thread may remain orphaned, but
+    it cannot hold the baseline task past this bounded wait.
+    """
+    started = perf_counter()
+    name = getattr(provider, "name", provider.__class__.__name__)
+    backend = getattr(provider, "backend", "")
+    done = threading.Event()
+    observed = {}
+
+    def observe() -> None:
+        try:
+            observed["result"] = shadow_retrieve(provider, request)
+        finally:
+            done.set()
+
+    threading.Thread(target=observe, name="agent-crew-shadow-memory", daemon=True).start()
+    if done.wait(max(0.0, timeout_seconds)):
+        return observed.get("result", MemoryResult(
+            provider=name, backend=backend, state="error",
+            latency_ms=(perf_counter() - started) * 1000,
+            error_type="MissingShadowResult",
+        ))
+    return MemoryResult(
+        provider=name, backend=backend, state="timeout",
+        latency_ms=(perf_counter() - started) * 1000,
+        error_type="ShadowRetrievalTimeout",
+    )
 
 
 def shadow_telemetry(result: MemoryResult) -> dict:
