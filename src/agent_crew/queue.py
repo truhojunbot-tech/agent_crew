@@ -619,6 +619,17 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # #313 atomic pause recheck: write-lock을 쥔 임계구역 안에서 pause를 재확인한다.
+            # 사전 is_paused() 체크와 commit 사이에 STOP이 authoritative가 됐어도 여기서 잡혀
+            # 어떤 task도 pending->in_progress로 커밋되지 않는다(TOCTOU 제거). fail-closed.
+            try:
+                from agent_crew import pause as _pausemod
+                _paused_now = _pausemod.is_paused(os.path.dirname(self._db_path))
+            except Exception:
+                _paused_now = True
+            if _paused_now:
+                conn.execute("ROLLBACK")
+                return None
             row = None
             if agent:
                 # Stage 1 — explicit override claim for this agent.

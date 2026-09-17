@@ -4486,6 +4486,32 @@ def create_app(
                     f"POST /tasks/{task_id}/result: pr-mismatch event failed")
             return {"status": "ok", "held": "pr_number_mismatch",
                     "requested_pr": _requested, "reported_pr": _reported}
+        # #313 STOP: result는 이미 persist(marked done)돼 lineage/audit 보존됨. runtime pause면
+        # 어떤 result-driven 후속 실행 stage(review/test/merge/fix/retry/fallback/discuss-push)도
+        # 생성/시작하지 않는다. fail-closed(판정 불가 시 억제). 재개 시 1회 replay 위해 durable 기록.
+        try:
+            from agent_crew import pause as _pausemod
+            _sd = os.path.dirname(q()._db_path)
+            _paused = _pausemod.is_paused(_sd)
+        except Exception:
+            _paused, _sd = True, ""   # fail-closed
+        if _paused:
+            try:
+                _pgen = (_pausemod.pause_state(_sd).get("active_scopes") or [{}])[0].get("generation")
+            except Exception:
+                _pgen = None
+            try:
+                _pausemod.record_suppressed(
+                    _sd, task_id=task_id, task_type=task_type,
+                    status=getattr(result, "status", None),
+                    pr_number=getattr(result, "pr_number", None), generation=_pgen)
+            except Exception:
+                logger.exception(f"POST /tasks/{task_id}/result: suppression 기록 실패(계속 억제)")
+            logger.warning(f"POST /tasks/{task_id}/result: [PAUSE-SUPPRESSED] cascade 억제됨 "
+                           f"(task_type={task_type}, status={result.status}, pause_gen={_pgen}). "
+                           "result는 저장됨, 후속 stage 미생성.")
+            return {"status": "ok", "task_id": task_id, "suppressed_by_pause": True,
+                    "pause_generation": _pgen, "cascade_suppressed": True}
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
