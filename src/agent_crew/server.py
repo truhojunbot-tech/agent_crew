@@ -4058,6 +4058,14 @@ def create_app(
             logger.info(
                 f"_requeue_review_at_head: {new_id} already exists — another result "
                 f"observed the same head; not duplicating it (#304)")
+        except _PausedError:
+            # #314 §4 P0: STOP race — 다른 successor helper와 동일하게 부모(review) outbox를
+            # reopen해 재개 후 result-carrying replay로 이 stale-review 재dispatch를 복구하고 전파.
+            try:
+                q().outbox_reopen(review_task_id)
+            except Exception:
+                logger.exception(f"_requeue_review_at_head: outbox_reopen({review_task_id}) 실패")
+            raise
         except Exception:  # noqa: BLE001
             logger.exception(
                 f"_requeue_review_at_head: could not requeue a review for PR "
@@ -4084,6 +4092,8 @@ def create_app(
                 # correct place to resolve from when the task context carries
                 # no explicit `repo`.
                 repo_cwd=_any_worktree_path(),
+                # #314 §4 P0: replay 중엔 fix-budget exhaustion PR comment skip.
+                suppress_side_effects=_REPLAYING.get(),
             )
             if fix_id:
                 _try_push_next("implementer")

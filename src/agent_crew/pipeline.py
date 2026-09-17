@@ -460,8 +460,15 @@ def auto_enqueue_fix(
     head_sha_fn=None,
     repo: str = "",
     repo_cwd: str = "",
+    suppress_side_effects: bool = False,
 ) -> Optional[str]:
     """Create the fix task that follows a ``request_changes`` review (#244).
+
+    #314 §4 P0: ``suppress_side_effects`` (replay 경로) 시 fix-budget 소진 PR comment 게시
+    (_announce_fix_budget_exhausted)를 skip한다. pr_announcements claim이 동시 중복엔 강하나
+    comment 성공→posted_at 기록 전 crash 구간은 exactly-once가 아니므로, GitHub feedback이 root
+    cause에 포함된 이번 사고에서는 replay에서 announcement를 아예 수행하지 않는다. fix task enqueue
+    (결정론 id, 멱등)는 durable transition이므로 계속 수행된다.
 
     The cascade had transitions for `implement completed → review` and
     `review approve → test`, but the rejection path just ended. Every
@@ -565,11 +572,16 @@ def auto_enqueue_fix(
                 f"the automated fix budget is spent (round {fix_round} > "
                 f"max {max_rounds}) — stopping, this needs a human"
             )
-            _announce_fix_budget_exhausted(
-                pr_number=pr_number, review_task_id=review_task_id,
-                max_rounds=max_rounds, findings=review_result.findings or [],
-                comment_fn=comment_fn, already_announced_fn=already_announced_fn,
-                queue=queue)
+            # #314 §4 P0: replay 중에는 exhaustion PR comment를 게시하지 않는다(중복 방지).
+            if not suppress_side_effects:
+                _announce_fix_budget_exhausted(
+                    pr_number=pr_number, review_task_id=review_task_id,
+                    max_rounds=max_rounds, findings=review_result.findings or [],
+                    comment_fn=comment_fn, already_announced_fn=already_announced_fn,
+                    queue=queue)
+            else:
+                logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
+                             f"(review {review_task_id})")
             return None
 
         findings_text = _findings_block(review_result.findings or [], review_task_id)

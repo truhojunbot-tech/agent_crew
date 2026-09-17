@@ -282,6 +282,41 @@ class TestSuccessorAtMostOnce(Base):
                          "PausedError 시 부모 outbox reopen → 재개 replay로 복구")
 
 
+class TestFixBudgetReplaySkip(Base):
+    """§4 P0: fix-budget 소진 PR comment는 replay(suppress_side_effects) 중 게시하지 않는다."""
+
+    def _seed_review_reqchanges(self, q, tid, pr):
+        q.enqueue(TaskRequest(task_id=tid, task_type="review", description="r",
+                              branch="main", priority=3,
+                              context={"fix_round": 9, "pr_number": pr}, project="p"))
+        q.dequeue(role="reviewer")
+        q.submit_result(tid, TaskResult(task_id=tid, status="completed",
+                        verdict="request_changes", summary="fix it",
+                        findings=["x"], pr_number=pr))
+
+    def test_exhaustion_announce_gated_by_replay(self):
+        """auto_enqueue_fix가 budget 소진 시 _announce_fix_budget_exhausted를 호출하되,
+        replay(suppress_side_effects=True)에서는 호출하지 않는다(PR comment 중복 방지)."""
+        import agent_crew.pipeline as pl
+        open_state = lambda *a, **k: "open"
+        calls = []
+        orig = pl._announce_fix_budget_exhausted
+        pl._announce_fix_budget_exhausted = lambda **k: calls.append(k)
+        try:
+            q = TaskQueue(self.db)
+            self._seed_review_reqchanges(q, "rev-r", 91)
+            r = pl.auto_enqueue_fix(q, "rev-r", pr_state_fn=open_state, suppress_side_effects=True)
+            self.assertIsNone(r, "budget 소진 → fix task 없음")
+            self.assertEqual(len(calls), 0, "replay 중 _announce 미호출(comment skip)")
+            # 대조: 라이브에서는 _announce 호출
+            q2 = TaskQueue(os.path.join(self.dir, "live.db"))
+            self._seed_review_reqchanges(q2, "rev-l", 92)
+            pl.auto_enqueue_fix(q2, "rev-l", pr_state_fn=open_state, suppress_side_effects=False)
+            self.assertEqual(len(calls), 1, "라이브에서는 _announce 호출(대조)")
+        finally:
+            pl._announce_fix_budget_exhausted = orig
+
+
 class TestExternalOpReceipt(Base):
     """§5: 외부 mutation(merge) idempotency receipt — reservation + done 재요청 미재실행."""
 
