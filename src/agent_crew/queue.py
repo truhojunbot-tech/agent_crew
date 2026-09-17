@@ -220,6 +220,26 @@ CREATE TABLE IF NOT EXISTS runtime_stop (
 )
 """
 
+# #314 §3/§4: cascade outbox. result 저장과 **항상 같은 txn**에 기록되는 durable continuation
+# 레코드(result_json 전체). pause 여부와 무관하게 submit_result가 원자적으로 넣는다 → result 저장과
+# suppression 기록 사이 crash로 continuation을 잃는 B3-b를 제거. §4: pause-aware executor가 lease
+# (attempt_id/lease_owner/lease_expires_at)로 claim해 successor를 stable transition key로 생성하고
+# state를 pending→replaying→applied로 CAS 전이한다(crash-safe at-most-once).
+_DDL_CASCADE_OUTBOX = """
+CREATE TABLE IF NOT EXISTS cascade_outbox (
+    parent_task_id   TEXT PRIMARY KEY,
+    task_type        TEXT NOT NULL DEFAULT '',
+    result_json      TEXT NOT NULL,
+    stop_epoch       INTEGER NOT NULL DEFAULT 0,
+    state            TEXT NOT NULL DEFAULT 'pending',
+    attempt_id       TEXT,
+    lease_owner      TEXT,
+    lease_expires_at REAL,
+    created_at       REAL NOT NULL DEFAULT 0,
+    updated_at       REAL NOT NULL DEFAULT 0
+)
+"""
+
 # Performance indexes for common queries
 _DDL_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -266,6 +286,20 @@ def issue_from_description(description) -> Optional[int]:
         return None
     number = int(match.group(1))
     return number if number > 0 else None
+
+
+def _result_to_json(result) -> str:
+    """TaskResult를 replay 재현 가능한 JSON 문자열로. pydantic model_dump 우선, 실패 시 __dict__.
+    ⛔절대 'unknown' placeholder 금지 — cascade_outbox의 result_json은 executor가 원 제출 result를
+      그대로 재실행하는 근거이므로 손실 없이 보존해야 한다(§3)."""
+    try:
+        data = result.model_dump()
+    except Exception:
+        data = getattr(result, "__dict__", None)
+        if data is None:
+            data = {"task_id": getattr(result, "task_id", None),
+                    "status": getattr(result, "status", None)}
+    return json.dumps(data, ensure_ascii=False, default=str)
 
 
 def _is_duplicate_task_id(error: Exception) -> bool:
@@ -342,6 +376,7 @@ class TaskQueue:
         conn.execute(_DDL_CONTEXT_STATE)
         conn.execute(_DDL_PR_ANNOUNCEMENTS)
         conn.execute(_DDL_RUNTIME_STOP)
+        conn.execute(_DDL_CASCADE_OUTBOX)
         try:
             conn.execute("ALTER TABLE pr_announcements ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
         except Exception:
@@ -956,6 +991,10 @@ class TaskQueue:
         try:
             if result.task_id != task_id:
                 raise ValueError(f"task_id mismatch: argument {task_id!r} != result.task_id {result.task_id!r}")
+            # #314 §3: result 저장·outbox 기록·pause 판단을 하나의 write-lock 트랜잭션으로 원자화한다.
+            # 이렇게 해야 outbox의 state(pending=억제 / applied=라이브처리)가 결과 저장 시점의 STOP
+            # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
+            conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
                 "SELECT task_type, status FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
@@ -1036,8 +1075,115 @@ class TaskQueue:
                         f"task_attribution timing invariant violated for {task_id!r}: "
                         f"completed_at={now} < started_at={started_at}"
                     )
+            # #314 §3: result 저장과 **같은 txn**에 cascade_outbox 원자 insert(같은 write-lock).
+            # state는 이 시점 STOP에 따라 원자적으로 결정된다:
+            #   paused  → 'pending'  (억제됨 — pause-aware executor(§4)가 재개 후 drain)
+            #   unpaused→ 'applied'  (라이브 cascade가 동기 처리 — 부팅 executor가 재실행 안 함)
+            # 이로써 "result 저장→crash→suppression 기록 전 continuation 유실"(B3-b)이 제거되고,
+            # 서버는 outbox state만 보면 되어 pause 재확인 divergence가 사라진다.
+            # INSERT OR IGNORE: 이미 있으면(replay 재호출) 기존 state 보존(pending/applied 안 뒤집음).
+            # ⛔실패를 삼키지 않는다 — insert 실패 시 txn 전체 rollback되어 result도 미저장(원자성).
+            _stop = self._read_stop_row(conn)
+            # 게이트와 동일한 union: runtime_stop(원자 권위) OR pause.json(additive fail-closed).
+            _suppressed = bool(_stop["paused"]) or self._pausejson_active()
+            self._last_cascade_suppressed = _suppressed
+            self._last_stop_epoch = int(_stop["epoch"])
+            conn.execute(
+                "INSERT OR IGNORE INTO cascade_outbox "
+                "(parent_task_id, task_type, result_json, stop_epoch, state, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (task_id, task_type, _result_to_json(result), int(_stop["epoch"]),
+                 "pending" if _suppressed else "applied", now, now))
             conn.commit()
             return task_type
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    # ── #314 §4: cascade outbox executor primitives (lease + CAS) ─────────
+    #
+    # executor는 pending(및 만료된 replaying) 행을 lease로 claim → stored result_json으로
+    # cascade를 재실행(server 측 _run_result_cascade) → applied로 CAS. crash한 replaying은
+    # lease 만료 후 다른 owner가 안전하게 reclaim(at-most-once는 successor stable id로 보장).
+
+    #: replaying lease 유효기간. 이보다 오래된 replaying은 crash한 owner로 간주해 회수한다.
+    CASCADE_LEASE_TTL = 300.0
+
+    def outbox_pending(self, include_replaying: bool = True) -> List[dict]:
+        """처리 대기(pending) + (옵션)회수 대상 replaying 행 목록."""
+        conn = self._connect()
+        try:
+            if include_replaying:
+                rows = conn.execute(
+                    "SELECT * FROM cascade_outbox WHERE state IN ('pending','replaying') "
+                    "ORDER BY created_at ASC").fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM cascade_outbox WHERE state='pending' ORDER BY created_at ASC"
+                ).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def outbox_get(self, parent_task_id: str) -> Optional[dict]:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM cascade_outbox WHERE parent_task_id=?", (parent_task_id,)
+            ).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def outbox_claim(self, parent_task_id: str, owner: str,
+                     ttl: Optional[float] = None) -> Optional[dict]:
+        """lease CAS로 outbox 행을 claim. pending이거나 **만료된 replaying**(crash 회수)일 때만
+        성공. rowcount=1인 claimer만 진행(동시 replay dedup). 반환: claim한 행 dict 또는 None."""
+        ttl = self.CASCADE_LEASE_TTL if ttl is None else ttl
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            now = time.time()
+            attempt = uuid.uuid4().hex
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state='replaying', lease_owner=?, attempt_id=?, "
+                "lease_expires_at=?, updated_at=? "
+                "WHERE parent_task_id=? AND (state='pending' "
+                "   OR (state='replaying' AND (lease_expires_at IS NULL OR lease_expires_at < ?)))",
+                (owner, attempt, now + ttl, now, parent_task_id, now))
+            if cur.rowcount != 1:
+                conn.execute("ROLLBACK")
+                return None
+            row = conn.execute(
+                "SELECT * FROM cascade_outbox WHERE parent_task_id=?", (parent_task_id,)
+            ).fetchone()
+            conn.execute("COMMIT")
+            return dict(row) if row else None
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def outbox_mark_applied(self, parent_task_id: str, owner: str) -> bool:
+        """cascade 성공 후 replaying→applied CAS. 자기 lease일 때만 적용(회수된 lease는 무효).
+        반환: 적용 여부."""
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state='applied', updated_at=? "
+                "WHERE parent_task_id=? AND lease_owner=? AND state='replaying'",
+                (time.time(), parent_task_id, owner))
+            conn.commit()
+            return cur.rowcount > 0
         finally:
             conn.close()
 

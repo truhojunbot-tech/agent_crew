@@ -15,7 +15,7 @@ import unittest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from agent_crew.queue import TaskQueue, PausedError  # noqa: E402
-from agent_crew.protocol import TaskRequest  # noqa: E402
+from agent_crew.protocol import TaskRequest, TaskResult  # noqa: E402
 from agent_crew import pause as pausemod  # noqa: E402
 
 
@@ -169,6 +169,67 @@ class TestResumeCAS(Base):
         res = q.resume_stop(generation=2)                  # gen2 <= 현재 epoch2 → 거부
         self.assertFalse(res["resumed"])
         self.assertTrue(q.get_stop_epoch()["paused"])
+
+
+class TestCascadeOutbox(Base):
+    """§3/§4: result 저장과 cascade_outbox 원자 기록 + lease/CAS executor primitive."""
+
+    def _seed(self, q, tid="t1"):
+        q.enqueue(_task(tid))
+        q.dequeue(role="implementer")   # pending→in_progress
+        return TaskResult(task_id=tid, status="completed", summary="done")
+
+    def test_outbox_applied_when_unpaused(self):
+        q = TaskQueue(self.db)
+        q.submit_result("t1", self._seed(q))
+        ob = q.outbox_get("t1")
+        self.assertIsNotNone(ob)
+        self.assertEqual(ob["state"], "applied")   # 라이브 처리
+        self.assertIn("completed", ob["result_json"])   # result 전체 보존
+
+    def test_outbox_pending_when_paused(self):
+        q = TaskQueue(self.db)
+        r = self._seed(q)
+        q.set_stop_epoch(True, incident="alfred#39")
+        q.submit_result("t1", r)
+        ob = q.outbox_get("t1")
+        self.assertEqual(ob["state"], "pending", "STOP 중이면 억제(pending) — executor가 재개 후 drain")
+        self.assertEqual(ob["stop_epoch"], q.get_stop_epoch()["epoch"])
+
+    def test_outbox_atomic_with_result(self):
+        """result 저장과 outbox 기록은 같은 txn — 하나 있으면 반드시 다른 하나도 있다."""
+        q = TaskQueue(self.db)
+        r = self._seed(q)
+        q.set_stop_epoch(True)
+        q.submit_result("t1", r)
+        # 결과가 저장됐으면 outbox도 반드시 존재(원자성)
+        self.assertIsNotNone(q.get_result("t1"))
+        self.assertIsNotNone(q.outbox_get("t1"))
+
+    def test_outbox_claim_lease_and_mark(self):
+        q = TaskQueue(self.db)
+        r = self._seed(q); q.set_stop_epoch(True); q.submit_result("t1", r)
+        c1 = q.outbox_claim("t1", "owner-a")
+        self.assertIsNotNone(c1)
+        self.assertEqual(c1["state"], "replaying")
+        # 아직 만료 안 된 lease → 다른 owner claim 불가(동시 replay dedup)
+        self.assertIsNone(q.outbox_claim("t1", "owner-b"))
+        # 다른 owner의 mark_applied는 무효(자기 lease 아님)
+        self.assertFalse(q.outbox_mark_applied("t1", "owner-b"))
+        # 정당 owner mark → applied
+        self.assertTrue(q.outbox_mark_applied("t1", "owner-a"))
+        self.assertEqual(q.outbox_get("t1")["state"], "applied")
+
+    def test_outbox_stale_lease_reclaim(self):
+        """crash한 replaying(만료 lease)은 다른 owner가 안전하게 reclaim."""
+        q = TaskQueue(self.db)
+        r = self._seed(q); q.set_stop_epoch(True); q.submit_result("t1", r)
+        q.outbox_claim("t1", "dead-owner", ttl=-1)   # 즉시 만료된 lease(=crash 가정)
+        c = q.outbox_claim("t1", "owner-b")
+        self.assertIsNotNone(c, "만료 lease는 reclaim 가능")
+        self.assertEqual(c["lease_owner"], "owner-b")
+        # dead-owner는 더 이상 mark 못 함(회수됨)
+        self.assertFalse(q.outbox_mark_applied("t1", "dead-owner"))
 
 
 if __name__ == "__main__":
