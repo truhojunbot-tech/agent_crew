@@ -131,6 +131,27 @@ class TestFailClosed(Base):
         # 파일 부재는 정상 미pause(손상과 구분)
         self.assertFalse(pause.is_paused(self.state_dir))
 
+    def test_discuss_dequeue_fails_closed_on_pause_error(self):
+        # 독립리뷰 blocker①: discuss dequeue의 pause 판정 예외도 fail-closed(None)
+        self._enqueue(1, "discuss")
+        orig = pause.is_paused
+        pause.is_paused = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("boom"))
+        try:
+            self.assertIsNone(self.q.dequeue_discuss_for_agent("someagent"),
+                              "pause 판정 예외 시 discuss dequeue도 차단")
+        finally:
+            pause.is_paused = orig
+
+    def test_resume_refused_on_corrupt_state(self):
+        # 독립리뷰 blocker②: 손상 pause state에서 resume은 열리면 안 됨(거부)
+        pause.set_pause(self.state_dir, True, source="test", incident="alfred#39")
+        with open(os.path.join(self.state_dir, "pause.json"), "w") as f:
+            f.write("{ corrupt ")
+        res = pause.resume(self.state_dir, generation=999, source="test")
+        self.assertFalse(res["resumed"], "손상 상태에서 resume은 거부")
+        self.assertTrue(res.get("still_paused"))
+        self.assertTrue(pause.is_paused(self.state_dir), "손상 상태는 계속 paused")
+
 
 class TestTelemetryAndPortability(Base):
     def test_status_shows_reason(self):

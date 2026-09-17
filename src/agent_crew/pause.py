@@ -128,7 +128,13 @@ def resume(state_dir: str, *, scope: str = "project", generation: int,
     """generation-aware resume. stale(요청 gen ≤ 현재 gen)이면 거부 — 최신 STOP을 못 덮는다.
     resume은 task를 복제하거나 lineage를 리셋하지 않는다(상태 파일만 변경)."""
     path = GLOBAL_PAUSE_FILE if scope == "global" else _project_pause_path(state_dir)
-    cur = _load(path) or {}
+    cur = _load(path)
+    # fail-closed(#39): 상태파일이 손상(_LoadError)이면 pause 여부를 확신할 수 없으므로
+    # resume을 거부한다. 모르는 상태에서 resume이 열리면 STOP이 뚫린다.
+    if isinstance(cur, _LoadError):
+        return {"resumed": False, "reason": f"FAIL-CLOSED: pause state 손상 {cur.get('error')} — resume 거부",
+                "still_paused": True}
+    cur = cur or {}
     cur_gen = int(cur.get("generation", 0))
     if not cur.get("paused"):
         return {"resumed": True, "reason": "not paused", "generation": cur_gen}

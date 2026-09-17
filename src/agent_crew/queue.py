@@ -940,7 +940,7 @@ class TaskQueue:
             if pause.is_paused(os.path.dirname(self._db_path)):
                 return None
         except Exception:
-            pass
+            return None  # fail-closed(#39): pause 판정 불가 시 discuss도 차단
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
