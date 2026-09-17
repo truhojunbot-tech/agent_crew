@@ -246,5 +246,35 @@ class TestCascadeOutbox(Base):
         self.assertFalse(q.outbox_mark_applied("t1", "dead-owner"))
 
 
+class TestExternalOpReceipt(Base):
+    """§5: 외부 mutation(merge) idempotency receipt — reservation + done 재요청 미재실행."""
+
+    def test_reserve_once_then_existing(self):
+        q = TaskQueue(self.db)
+        r1 = q.external_op_reserve("merge:pr:42", pr_number=42)
+        self.assertTrue(r1["reserved"])
+        self.assertEqual(r1["state"], "reserved")
+        r2 = q.external_op_reserve("merge:pr:42", pr_number=42)
+        self.assertFalse(r2["reserved"], "이미 예약됨 → 새 예약 아님(맹목 재실행 금지)")
+        self.assertEqual(r2["state"], "reserved")
+
+    def test_done_receipt_blocks_reexec(self):
+        q = TaskQueue(self.db)
+        q.external_op_reserve("merge:pr:42", pr_number=42)
+        q.external_op_mark("merge:pr:42", "done")
+        r = q.external_op_reserve("merge:pr:42", pr_number=42)
+        self.assertEqual(r["state"], "done", "done receipt → 호출측이 merge 재실행 안 함")
+        self.assertIsNotNone(q.external_op_get("merge:pr:42")["done_at"])
+
+    def test_failed_attempt_increments(self):
+        q = TaskQueue(self.db)
+        q.external_op_reserve("merge:pr:7", pr_number=7)
+        q.external_op_mark("merge:pr:7", "failed", last_error="gh 실패", inc_attempt=True)
+        q.external_op_mark("merge:pr:7", "failed", last_error="gh 실패", inc_attempt=True)
+        row = q.external_op_get("merge:pr:7")
+        self.assertEqual(row["attempt"], 2)
+        self.assertEqual(row["state"], "failed")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

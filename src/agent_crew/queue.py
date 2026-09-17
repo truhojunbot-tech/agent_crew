@@ -240,6 +240,22 @@ CREATE TABLE IF NOT EXISTS cascade_outbox (
 )
 """
 
+# #314 §5: 외부 mutation(merge 등) idempotency receipt. DB txn을 외부 gh 호출과 공유할 수 없으므로
+# exactly-once는 불가 — 대신 reservation(의도 기록) + 실제 GitHub 상태 재확인 + idempotent
+# reconciliation으로 at-most-one-effect를 보장한다. crash(merge 후 done 기록 전)는 재기동 시
+# op_key의 reserved를 보고 pr_state를 재확인해 이미-merged면 done만 기록(재merge 없음).
+_DDL_EXTERNAL_OP = """
+CREATE TABLE IF NOT EXISTS external_op (
+    op_key      TEXT PRIMARY KEY,
+    state       TEXT NOT NULL DEFAULT 'reserved',
+    pr_number   INTEGER,
+    attempt     INTEGER NOT NULL DEFAULT 0,
+    last_error  TEXT,
+    reserved_at REAL NOT NULL DEFAULT 0,
+    done_at     REAL
+)
+"""
+
 # Performance indexes for common queries
 _DDL_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -377,6 +393,7 @@ class TaskQueue:
         conn.execute(_DDL_PR_ANNOUNCEMENTS)
         conn.execute(_DDL_RUNTIME_STOP)
         conn.execute(_DDL_CASCADE_OUTBOX)
+        conn.execute(_DDL_EXTERNAL_OP)
         try:
             conn.execute("ALTER TABLE pr_announcements ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
         except Exception:
@@ -1202,6 +1219,58 @@ class TaskQueue:
                 (time.time(), parent_task_id))
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    # ── #314 §5: external mutation receipt (merge idempotency) ────────────
+
+    def external_op_reserve(self, op_key: str, pr_number: Optional[int] = None) -> dict:
+        """외부 mutation 의도를 원자적으로 예약. 새로 예약하면 reserved=True. 이미 있으면(reserved/
+        done/failed) 기존 행을 그대로 반환(reserved=False) → 호출측은 맹목 재실행 대신 reconciliation."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO external_op (op_key, state, pr_number, attempt, reserved_at) "
+                "VALUES (?, 'reserved', ?, 0, ?)", (op_key, pr_number, time.time()))
+            newly = cur.rowcount == 1
+            row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
+            conn.execute("COMMIT")
+            d = dict(row)
+            d["reserved"] = newly
+            return d
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def external_op_mark(self, op_key: str, state: str, *, last_error: Optional[str] = None,
+                         inc_attempt: bool = False) -> None:
+        """external_op 상태 전이. state='done'이면 done_at 기록. inc_attempt면 attempt+1(재시도 backoff/cap용)."""
+        conn = self._connect()
+        try:
+            done_at = time.time() if state == "done" else None
+            if inc_attempt:
+                conn.execute(
+                    "UPDATE external_op SET state=?, last_error=?, attempt=attempt+1, done_at=? WHERE op_key=?",
+                    (state, last_error, done_at, op_key))
+            else:
+                conn.execute(
+                    "UPDATE external_op SET state=?, last_error=?, done_at=? WHERE op_key=?",
+                    (state, last_error, done_at, op_key))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def external_op_get(self, op_key: str) -> Optional[dict]:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
+            return dict(row) if row else None
         finally:
             conn.close()
 

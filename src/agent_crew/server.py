@@ -734,6 +734,9 @@ _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 #: Statuses a task can hold when a result still arrives afterwards. Both mean
 #: "the dispatcher stopped watching", not "the work is over" (#265).
 _LATE_RESULT_STATUSES = frozenset({"failed", "timed_out"})
+# #314 §5: merge 자동 재시도 상한. 이 횟수 이상 실패(conflict/gh 실패 등)면 자동 재시도 중단 →
+# escalation 대상(무한 재시도 금지). 비가역 상태(closed)는 횟수와 무관하게 즉시 재시도 안 함.
+_MAX_MERGE_ATTEMPTS = 3
 
 _TRANSIENT_RETRIABLE_TAGS = frozenset({
     "claude_429",
@@ -4157,24 +4160,59 @@ def create_app(
         the result-submission response.
         """
         # #314 P0-2b: merge는 enqueue choke point를 안 거치는 직접 외부 mutation이므로
-        # 여기서 별도로 pause를 확인한다(fail-closed). paused면 merge를 시작하지 않는다.
+        # 여기서 별도로 pause를 확인한다(fail-closed, runtime_stop 권위 + pause.json additive).
         try:
             from agent_crew import pause as _pm
-            _mp = _pm.is_paused(os.path.dirname(q()._db_path))
+            _mp = bool(q().get_stop_epoch()["paused"]) or _pm.is_paused(os.path.dirname(q()._db_path))
         except Exception:
             _mp = True
         if _mp:
             logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — runtime STOP")
             return
-        from agent_crew.github import get_repo, merge_pr
+        # #314 §5: DB txn을 gh 호출과 공유 못 하므로 exactly-once 불가 → reservation + 실제 GitHub
+        # 상태 재확인 + idempotent reconciliation. crash(merge 후 done 기록 전)는 재기동 시 op_key
+        # reserved를 보고 pr_state 재확인 → 이미-merged면 재merge 없이 done만 기록.
+        from agent_crew.github import get_repo, merge_pr, pr_state
+        op_key = f"merge:pr:{pr_number}"
+        try:
+            resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
+        except Exception:
+            logger.exception(f"_auto_merge_pr(#{pr_number}): external_op 예약 실패 — merge 보류")
+            return
+        if resv.get("state") == "done":
+            logger.info(f"_auto_merge_pr: {op_key} 이미 done(receipt) — merge 재실행 안 함")
+            return
+        # 비가역 실패 누적(conflict/closed 등)은 자동 재시도 안 함 → escalation 대상.
+        if resv.get("state") == "failed" and int(resv.get("attempt", 0)) >= _MAX_MERGE_ATTEMPTS:
+            logger.warning(f"_auto_merge_pr: {op_key} 실패 {resv.get('attempt')}회(≥{_MAX_MERGE_ATTEMPTS}) — "
+                           f"자동 재시도 중단, escalation 필요(last_error={resv.get('last_error')})")
+            return
         repo = get_repo()
-        ok = merge_pr(pr_number, merge_method="squash", repo=repo)
+        # reconciliation: 맹목 재실행이 아니라 실제 상태를 먼저 확인.
+        st = pr_state(int(pr_number), repo=repo)
+        if st == "merged":
+            q().external_op_mark(op_key, "done")
+            logger.info(f"_auto_merge_pr: PR #{pr_number} 이미 merged(재확인) → done 기록, 재merge 안 함")
+            return
+        if st == "closed":
+            q().external_op_mark(op_key, "failed",
+                                 last_error="PR closed(비가역) — 자동 merge 불가", inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: PR #{pr_number} closed — 자동 재시도 안 함, escalation 필요")
+            return
+        if st == "unknown":
+            q().external_op_mark(op_key, "failed",
+                                 last_error="PR 상태 불명(gh 실패) — 다음 재확인 대기", inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
+            return
+        # st == 'open' → merge 시도
+        ok = merge_pr(int(pr_number), merge_method="squash", repo=repo)
         if ok:
-            logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) — #171")
+            q().external_op_mark(op_key, "done")
+            logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) → done(receipt) — #171/§5")
         else:
-            logger.warning(
-                f"_auto_merge_pr: gh pr merge #{pr_number} failed or gh not available — #171"
-            )
+            q().external_op_mark(op_key, "failed",
+                                 last_error="gh pr merge 실패", inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: gh pr merge #{pr_number} 실패 — failed 기록(재시도 가능)")
 
     def _auto_fallback_failed_task(
         task_id: str,
