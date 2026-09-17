@@ -1426,9 +1426,12 @@ def resume(project: str, base: str, generation: int, source: str, scope: str):
         # (1) DB CAS resume (권위). 거부되면 pause.json 미변경.
         res = TaskQueue(db_path).resume_stop(generation=generation)
         if res.get("resumed"):
-            # (2) pause.json 미러 — DB가 unpause를 승인한 epoch로만.
+            # (2) pause.json 미러 — DB가 unpause를 승인한 epoch로만. #canary#1 fix: DB가 보존한
+            # incident를 pause.json에도 명시적으로 mirror한다(None으로 만들지 않음). 그래야 부팅
+            # reconcile이 같은 epoch에서 incident mismatch를 보지 않는다.
             pausemod.set_pause(state_dir, False, scope=scope, reason="resumed",
-                               source=source, generation=res["epoch"])
+                               source=source, generation=res["epoch"],
+                               incident=res.get("incident"))
         click.echo(json.dumps(res, ensure_ascii=False))
         if not res.get("resumed"):
             raise SystemExit(1)

@@ -514,21 +514,26 @@ class TaskQueue:
             cur = self._read_stop_row(conn)
             if not cur["paused"]:
                 conn.execute("ROLLBACK")
-                return {"resumed": True, "epoch": cur["epoch"], "reason": "not paused"}
+                # incident도 반환해 cli가 pause.json에 provenance를 mirror할 수 있게 한다.
+                return {"resumed": True, "epoch": cur["epoch"], "reason": "not paused",
+                        "incident": cur["incident"]}
             if int(generation) <= int(cur["epoch"]):
                 conn.execute("ROLLBACK")
                 return {"resumed": False, "epoch": cur["epoch"],
                         "reason": f"stale resume gen {generation} <= current epoch {cur['epoch']} — 거부",
-                        "still_paused": True}
+                        "incident": cur["incident"], "still_paused": True}
+            # DB는 resume 후에도 incident를 provenance로 보존한다(명시 incident 없으면 기존 유지).
+            _kept_incident = incident if incident is not None else cur["incident"]
             conn.execute(
                 "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
                 "VALUES (1, ?, 0, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=0, "
                 "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at",
-                (int(generation), incident if incident is not None else cur["incident"],
-                 "resumed via cli", time.time()))
+                (int(generation), _kept_incident, "resumed via cli", time.time()))
             conn.execute("COMMIT")
-            return {"resumed": True, "epoch": int(generation), "reason": "resumed"}
+            # cli는 이 incident를 pause.json에도 mirror해 두 소스의 provenance를 일치시킨다.
+            return {"resumed": True, "epoch": int(generation), "reason": "resumed",
+                    "incident": _kept_incident}
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -622,15 +627,26 @@ class TaskQueue:
             elif db_epoch > pj_epoch:
                 win_paused, win_epoch, win_incident = db_paused, db_epoch, db_incident
             else:
-                # 같은 epoch — 상태 일치해야 정상. 불일치면 화해 불가 → fail-closed.
-                if (bool(pj_paused) == bool(db_paused)) and (pj_incident == db_incident):
-                    win_paused, win_epoch, win_incident = db_paused, db_epoch, db_incident
-                else:
+                # 같은 epoch — STOP 판단이 실제로 갈릴 때만 CONFLICT(fail-closed). incident는 STOP
+                # 상태에서만 의미 있는 provenance이므로, 둘 다 unpaused면 incident mismatch는 conflict가
+                # 아니다(canary#1이 잡은 버그: resume 후 pause.json incident=None vs db incident=set을
+                # 같은 epoch에서 conflict로 오판 → 무한 fail-closed re-pause).
+                if bool(pj_paused) != bool(db_paused):
+                    # (1) paused 값 자체가 다름 → 화해 불가 → fail-closed
                     win_paused, win_epoch, win_incident = True, db_epoch, (db_incident or pj_incident)
-                    note = (f"boot-reconcile CONFLICT: 같은 epoch({db_epoch}) 상태불일치 "
-                            f"pj(paused={pj_paused},inc={pj_incident}) vs db(paused={db_paused},inc={db_incident}) "
-                            f"→ fail-closed paused. 사람 개입 필요.")
+                    note = (f"boot-reconcile CONFLICT: 같은 epoch({db_epoch}) paused 불일치 "
+                            f"pj={pj_paused} vs db={db_paused} → fail-closed paused. 사람 개입 필요.")
                     logger.critical(note)
+                elif db_paused and (pj_incident != db_incident):
+                    # (2) 둘 다 paused=true인데 incident가 다름 → 화해 불가 → fail-closed
+                    win_paused, win_epoch, win_incident = True, db_epoch, (db_incident or pj_incident)
+                    note = (f"boot-reconcile CONFLICT: 같은 epoch({db_epoch}) 둘다 paused인데 incident "
+                            f"불일치 pj={pj_incident} vs db={db_incident} → fail-closed paused. 사람 개입 필요.")
+                    logger.critical(note)
+                else:
+                    # (3) 둘 다 unpaused(incident mismatch 무해) 또는 둘 다 paused+incident 일치 →
+                    #     정상. DB incident를 provenance 기준으로 유지.
+                    win_paused, win_epoch, win_incident = db_paused, db_epoch, db_incident
             conn.execute(
                 "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
                 "VALUES (1, ?, ?, ?, ?, ?) "

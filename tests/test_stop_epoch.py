@@ -141,6 +141,70 @@ class TestBootReconcile(Base):
         self.assertIn("CONFLICT", (st["note"] or ""))
 
 
+class TestReconcileIncidentFix(Base):
+    """canary#1이 잡은 버그: resume 후 pause.json incident=None vs db incident=set을 같은 epoch에서
+    conflict로 오판→무한 fail-closed re-pause. 수정 기준(4 케이스) 회귀."""
+
+    def test_unpaused_incident_mismatch_no_conflict(self):
+        q = TaskQueue(self.db)
+        q.set_stop_epoch(True, incident="alfred#39")   # epoch1 paused
+        q.resume_stop(generation=2)                    # epoch2 unpaused, incident 보존(alfred#39)
+        # pause.json: unpaused gen2 incident=None (버그 재현 형상)
+        pausemod.set_pause(self.dir, False, scope="project", generation=2, incident=None)
+        st = TaskQueue(self.db).get_stop_epoch()        # 재부팅 reconcile
+        self.assertFalse(st["paused"], "둘 다 unpaused면 incident mismatch는 conflict 아님 → unpaused 유지")
+        self.assertEqual(st["incident"], "alfred#39", "DB incident를 provenance로 유지")
+
+    def test_cli_resume_mirrors_incident_integration(self):
+        """실제 project-scope `crew resume`(CLI)을 호출하는 load-bearing integration test.
+        cli.py의 incident mirror 한 줄(canary#1이 잡은 production 누락)이 다시 삭제되면 이 테스트가
+        실패해야 한다 — 그래서 테스트가 아니라 실제 CLI 경로를 구동한다.
+        DB unpaused/new epoch → pause.json same generation/unpaused → 양쪽 incident=alfred#39 →
+        fresh TaskQueue 생성 후에도 unpaused."""
+        from click.testing import CliRunner
+        from agent_crew.cli import crew as crew_cli
+        base = tempfile.mkdtemp()
+        proj = "canaryproj"
+        sd = os.path.join(base, proj)
+        os.makedirs(sd)
+        db = os.path.join(sd, "tasks.db")
+        q = TaskQueue(db)
+        e = q.set_stop_epoch(True, incident="alfred#39")           # DB epoch1 paused inc alfred#39
+        pausemod.set_pause(sd, True, scope="project", generation=e, incident="alfred#39")  # pause.json mirror
+        # 실제 CLI resume(project scope) — cli.py의 mirror 경로를 구동
+        r = CliRunner().invoke(crew_cli, ["resume", proj, "--generation", "2", "--base", base])
+        self.assertEqual(r.exit_code, 0, r.output)
+        # DB: unpaused, 새 epoch, incident 보존
+        st = q.get_stop_epoch()
+        self.assertFalse(st["paused"])
+        self.assertEqual(st["epoch"], 2)
+        self.assertEqual(st["incident"], "alfred#39")
+        # pause.json: same generation, unpaused, incident=alfred#39 (load-bearing: mirror 삭제 시 None→실패)
+        pj = pausemod.pause_state(sd)["project"]
+        self.assertFalse(pj["paused"])
+        self.assertEqual(int(pj["generation"]), 2)
+        self.assertEqual(pj.get("incident"), "alfred#39",
+                         "CLI resume이 DB incident를 pause.json에 mirror해야(None化 금지)")
+        # fresh TaskQueue 재구성 후에도 unpaused(재-pause 없음 — canary가 잡은 무한 re-pause 방지 확인)
+        self.assertFalse(TaskQueue(db).get_stop_epoch()["paused"])
+
+    def test_paused_state_mismatch_failclosed(self):
+        q = TaskQueue(self.db)
+        q.set_stop_epoch(True, incident="alfred#39")   # db epoch1 paused
+        pausemod.set_pause(self.dir, False, scope="project", generation=1, incident="alfred#39")
+        st = TaskQueue(self.db).get_stop_epoch()
+        self.assertTrue(st["paused"], "paused 값 불일치 → fail-closed paused")
+        self.assertIn("CONFLICT", (st["note"] or ""))
+
+    def test_both_paused_incident_mismatch_failclosed(self):
+        q = TaskQueue(self.db)
+        q.set_stop_epoch(True, incident="alfred#39")   # db epoch1 paused inc alfred#39
+        pausemod.set_pause(self.dir, True, scope="project", generation=1, incident="other#99")
+        st = TaskQueue(self.db).get_stop_epoch()
+        self.assertTrue(st["paused"], "둘 다 paused인데 incident 불일치 → fail-closed")
+        self.assertIn("CONFLICT", (st["note"] or ""))
+
+
 class TestResumeCAS(Base):
     def test_resume_stale_rejected(self):
         q = TaskQueue(self.db)
