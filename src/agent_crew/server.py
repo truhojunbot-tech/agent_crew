@@ -4154,6 +4154,16 @@ def create_app(
         Failures are logged and swallowed — a merge error must never break
         the result-submission response.
         """
+        # #314 P0-2b: merge는 enqueue choke point를 안 거치는 직접 외부 mutation이므로
+        # 여기서 별도로 pause를 확인한다(fail-closed). paused면 merge를 시작하지 않는다.
+        try:
+            from agent_crew import pause as _pm
+            _mp = _pm.is_paused(os.path.dirname(q()._db_path))
+        except Exception:
+            _mp = True
+        if _mp:
+            logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — runtime STOP")
+            return
         from agent_crew.github import get_repo, merge_pr
         repo = get_repo()
         ok = merge_pr(pr_number, merge_method="squash", repo=repo)
