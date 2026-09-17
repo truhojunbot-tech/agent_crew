@@ -4341,6 +4341,35 @@ def create_app(
             },
         }
 
+    @app.get("/runtime/coordinator")
+    def get_runtime_coordinator():
+        """Generic, project-scoped coordinator authority (#309 K1)."""
+        return q().get_coordinator_state()
+
+    @app.post("/runtime/coordinator/handoff")
+    def handoff_runtime_coordinator(body: dict):
+        """Advance coordinator authority with a generation CAS; never dispatches work."""
+        required = ("coordinator_id", "generation")
+        missing = [key for key in required if key not in body]
+        if missing:
+            raise HTTPException(status_code=422, detail=f"missing required coordinator fields: {missing}")
+        result = q().advance_coordinator(
+            coordinator_id=str(body["coordinator_id"]), generation=body["generation"],
+            provider=str(body.get("provider") or "unknown"),
+            model=str(body.get("model") or "unknown"),
+            provider_session_id=str(body.get("provider_session_id") or "unknown"),
+            handoff_reason=str(body.get("handoff_reason") or ""),
+            previous_receipt_hash=str(body.get("previous_receipt_hash") or ""),
+        )
+        if not result["accepted"]:
+            raise HTTPException(status_code=409, detail=result)
+        return result
+
+    @app.get("/runtime/export")
+    def export_runtime_state():
+        """Read-only successor-coordinator snapshot; no scheduler coupling (#309)."""
+        return q().export_project_runtime_state()
+
     @app.get("/provenance")
     def provenance(expect: str = ""):
         """Full build provenance, optionally graded against an expected ref.
