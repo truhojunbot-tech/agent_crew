@@ -605,6 +605,17 @@ class TaskQueue:
            agent. Stage 2 only runs after stage 1 has no candidate.
         3. Neither given: any pending task, ordered by priority.
         """
+        # #311 STOP 전파: 런타임 pause 활성이면 어떤 task도 claim/start하지 않는다.
+        # 이 한 지점이 tmux push(_try_push_next)와 MCP GET /tasks/next를 모두 덮어
+        # 큐 드레인·successor/retry stage 시작을 막는다. in-flight는 자기 원자단위까지만.
+        try:
+            from agent_crew import pause
+            if pause.is_paused(os.path.dirname(self._db_path)):
+                return None
+        except Exception:
+            # fail-closed(#39): pause 판정이 불가능하면 STOP인지 확신할 수 없으므로
+            # 안전하게 dequeue를 막는다. (예전 fail-open은 STOP을 뚫는 안전결함이었음)
+            return None
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -923,6 +934,13 @@ class TaskQueue:
         """Atomic pending→in_progress for the oldest pending discuss task whose
         context.agent matches `agent`. Context is stored as JSON, so filtering
         happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
+        # #311 STOP 전파: pause 활성이면 discuss task도 시작하지 않는다.
+        try:
+            from agent_crew import pause
+            if pause.is_paused(os.path.dirname(self._db_path)):
+                return None
+        except Exception:
+            return None  # fail-closed(#39): pause 판정 불가 시 discuss도 차단
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
