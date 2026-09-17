@@ -246,6 +246,42 @@ class TestCascadeOutbox(Base):
         self.assertFalse(q.outbox_mark_applied("t1", "dead-owner"))
 
 
+class TestSuccessorAtMostOnce(Base):
+    """§4 P0-1/P0-2: successor stable transition key(replay 시 중복 없음) + PausedError 전파·reopen."""
+
+    def _seed_impl(self, q, tid="impl-1", pr=5):
+        q.enqueue(_task(tid))
+        q.dequeue(role="implementer")
+        q.submit_result(tid, TaskResult(task_id=tid, status="completed", summary="d", pr_number=pr))
+
+    def test_review_id_deterministic_and_dedup(self):
+        """crash 후 replay가 cascade를 두 번 돌려도 결정론 id로 review는 1개(at-most-once)."""
+        import agent_crew.pipeline as pl
+        q = TaskQueue(self.db)
+        self._seed_impl(q, "impl-1", pr=5)
+        open_state = lambda *a, **k: "open"
+        r1 = pl.auto_enqueue_review(q, "impl-1", pr_number=5, pr_state_fn=open_state)
+        r2 = pl.auto_enqueue_review(q, "impl-1", pr_number=5, pr_state_fn=open_state)  # replay 재실행 모사
+        self.assertEqual(r1, r2)
+        self.assertEqual(r1, "review-impl-1-r0", "UUID 아닌 stable transition key")
+        reviews = [t for t in q.list_tasks() if t.task_type == "review"]
+        self.assertEqual(len(reviews), 1, "결정론 id + PK dedup → review 정확히 1개")
+
+    def test_pausederror_propagates_and_reopens_outbox(self):
+        """라이브 cascade 중 STOP → enqueue PausedError가 helper에서 삼켜지지 않고 전파되며,
+        부모 outbox가 reopen(applied→pending)돼 continuation이 replay로 복구된다."""
+        import agent_crew.pipeline as pl
+        q = TaskQueue(self.db)
+        self._seed_impl(q, "impl-2", pr=6)
+        self.assertEqual(q.outbox_get("impl-2")["state"], "applied")  # unpaused 저장 → 라이브
+        q.set_stop_epoch(True, incident="alfred#39")                  # 그 뒤 STOP
+        open_state = lambda *a, **k: "open"
+        with self.assertRaises(PausedError):
+            pl.auto_enqueue_review(q, "impl-2", pr_number=6, pr_state_fn=open_state)
+        self.assertEqual(q.outbox_get("impl-2")["state"], "pending",
+                         "PausedError 시 부모 outbox reopen → 재개 replay로 복구")
+
+
 class TestExternalOpReceipt(Base):
     """§5: 외부 mutation(merge) idempotency receipt — reservation + done 재요청 미재실행."""
 

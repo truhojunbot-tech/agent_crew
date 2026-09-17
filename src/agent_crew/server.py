@@ -4068,6 +4068,9 @@ def create_app(
             )
             if fix_id:
                 _try_push_next("implementer")
+        except _PausedError:
+            # #314 §4 P0-2: pipeline이 이미 outbox reopen했음 — handler suppressed 200 위해 전파.
+            raise
         except Exception:
             logger.exception(
                 f"_auto_enqueue_fix: cascade failed for {review_task_id} — "
@@ -4135,20 +4138,32 @@ def create_app(
             retry_context["retry_attempt"] = db_retry_attempt + 1
             retry_context["original_task_id"] = task_id
 
+            # #314 §4 P0-1: 결정론 successor id — retry attempt로 구분(replay가 같은 attempt→같은 id).
             retry_req = TaskRequest(
-                task_id=f"retry-{task_id}-{uuid.uuid4().hex[:4]}",
+                task_id=f"retry-{task_id}-a{db_retry_attempt + 1}",
                 task_type=task_type,  # type: ignore
                 description=original_task.description,
                 branch=original_task.branch,
                 priority=original_task.priority + 1,  # Bump priority for retries
                 context=retry_context,
             )
-            q().enqueue(retry_req)
+            from agent_crew.queue import TaskAlreadyExistsError as _TAE
+            try:
+                q().enqueue(retry_req)
+            except _TAE:
+                logger.info(f"_auto_retry_failed_task: {retry_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")
             # Try to push the retry task
             role = _TYPE_TO_ROLE.get(task_type)
             if role:
                 _try_push_next(role)
+        except _PausedError:
+            # #314 §4 P0-2: STOP race — 부모(failed task) outbox reopen + 전파(handler suppressed 200).
+            try:
+                q().outbox_reopen(task_id)
+            except Exception:
+                logger.exception(f"_auto_retry_failed_task: outbox_reopen({task_id}) 실패")
+            raise
         except Exception as e:
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
