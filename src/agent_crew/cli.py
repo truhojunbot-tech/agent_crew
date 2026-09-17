@@ -1199,6 +1199,15 @@ def status(project: str, base: str, preview: int):
     db_file = state.get("db", "")
     click.echo(f"Project: {project}")
     click.echo(f"Port: {port}")
+    try:
+        from agent_crew import pause as _pausemod
+        _pstate = _pausemod.pause_state(os.path.join(base, project))
+        if _pstate["paused"]:
+            click.echo(f"⏸  PAUSED (#311): {_pausemod.blocked_reason(os.path.join(base, project))}")
+        else:
+            click.echo("Pause: none (running)")
+    except Exception:
+        pass
 
     # Result cache for completed-task preview. Loaded from DB directly — the
     # list_tasks API only returns TaskRequest shape (no summary/verdict).
@@ -1362,6 +1371,41 @@ def status(project: str, base: str, preview: int):
                 ttype = t.get("task_type") if isinstance(t, dict) else getattr(t, "task_type", "?")
                 role_running[ttype] = role_running.get(ttype, 0) + 1
             click.echo(f"  In progress: {role_running}")
+
+
+@crew.command()
+@click.argument("project", default="", required=False)
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--reason", default="", help="Why paused (provenance)")
+@click.option("--source", default="cli", help="Who requested the pause")
+@click.option("--incident", default="", help="Incident/reference id, e.g. alfred#39")
+@click.option("--scope", type=click.Choice(["project", "global"]), default="project", show_default=True)
+def pause(project: str, base: str, reason: str, source: str, incident: str, scope: str):
+    """#311 STOP: 런타임 pause 활성화. paused 동안 큐 드레인/claim/dispatch/retry/review 시작이 막힌다.
+    (in-flight task는 현재 원자단위까지만; 완료로 조작하지 않음.)"""
+    from agent_crew import pause as pausemod
+    state_dir = os.path.join(base, project) if scope == "project" else ""
+    rec = pausemod.set_pause(state_dir, True, scope=scope, reason=reason,
+                             source=source, incident=(incident or None))
+    click.echo(json.dumps({"paused": True, "scope": scope, "generation": rec["generation"],
+                           "incident": rec["incident"], "reason": reason}, ensure_ascii=False))
+
+
+@crew.command()
+@click.argument("project", default="", required=False)
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.option("--generation", type=int, required=True,
+              help="Must be > current pause generation; stale resume is rejected")
+@click.option("--source", default="cli")
+@click.option("--scope", type=click.Choice(["project", "global"]), default="project", show_default=True)
+def resume(project: str, base: str, generation: int, source: str, scope: str):
+    """#311 generation-aware resume. 오래된(stale) generation resume은 최신 STOP을 덮지 못한다."""
+    from agent_crew import pause as pausemod
+    state_dir = os.path.join(base, project) if scope == "project" else ""
+    res = pausemod.resume(state_dir, scope=scope, generation=generation, source=source)
+    click.echo(json.dumps(res, ensure_ascii=False))
+    if not res.get("resumed"):
+        raise SystemExit(1)
 
 
 @crew.group("task")
