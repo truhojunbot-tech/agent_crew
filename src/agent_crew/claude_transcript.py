@@ -31,6 +31,22 @@ def claude_session_path(cwd: str, *, home=None, session_id: str = ""):
         return None
 
 
+def claude_session_paths(cwd: str, *, home=None) -> Optional[list[str]]:
+    """Return the exact transcript paths present for ``cwd`` at one instant.
+
+    This is used to prove fresh-session ownership: only a path absent from the
+    dispatch snapshot can be considered newly created by that invocation.
+    Observation errors intentionally yield no proof rather than a guess.
+    """
+    if not cwd:
+        return None
+    try:
+        directory = claude_home(home) / "projects" / re.sub(r"[/._]", "-", cwd)
+        return [str(path) for path in directory.glob("*.jsonl") if path.is_file()]
+    except Exception:  # noqa: BLE001 — transcript observation must not break callers
+        return None
+
+
 def claude_session_size(cwd: str, *, home=None) -> tuple:
     """Return ``(bytes, session_id)`` for Claude's newest transcript."""
     path = claude_session_path(cwd, home=home)

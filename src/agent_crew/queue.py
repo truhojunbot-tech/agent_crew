@@ -1449,6 +1449,18 @@ class TaskQueue:
             f"UPDATE task_attribution SET {', '.join(assignments)}, updated_at=? WHERE task_id=?",
             params + [now, task_id],
         )
+        # A transcript path proven from a fresh task's dispatch snapshot is a
+        # provider-native session binding just like one parsed from CLI output.
+        # Keep it on the exact context generation that ran this task, so the
+        # next dispatch can take an ordinary byte-offset boundary.
+        if telemetry.provider_session_id:
+            conn.execute(
+                """
+                UPDATE context_state SET provider_session_id=?, updated_at=?
+                WHERE context_id=(SELECT context_id FROM task_attribution WHERE task_id=?)
+                """,
+                (telemetry.provider_session_id, now, task_id),
+            )
 
     # ── #314 §4: cascade outbox executor primitives (lease + CAS) ─────────
     #

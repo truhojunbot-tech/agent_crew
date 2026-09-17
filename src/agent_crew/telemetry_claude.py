@@ -1,6 +1,8 @@
 """Claude Code JSONL implementation of the provider-neutral telemetry API."""
 from __future__ import annotations
 
+import pathlib
+
 from agent_crew import claude_transcript
 from agent_crew.telemetry import TaskTelemetry
 
@@ -25,10 +27,21 @@ class ClaudeSessionTelemetryAdapter:
                     and not isinstance(candidate_offset, bool) and candidate_offset >= 0):
                 boundary_session, offset = candidate, candidate_offset
         # A fresh Claude invocation has no transcript id until Claude creates
-        # it. Reading the newest pre-existing transcript would contaminate this
-        # task, so this stays explicitly unknown.
+        # it. It is observable only when the persisted dispatch snapshot proves
+        # exactly one transcript path appeared in the same project directory.
         if offset is not None and not boundary_session:
-            return TaskTelemetry()
+            snapshot = boundary.get("fresh_session_paths") if isinstance(boundary, dict) else None
+            if not isinstance(snapshot, list) or not all(isinstance(path, str) for path in snapshot):
+                return TaskTelemetry()
+            current_paths = claude_transcript.claude_session_paths(
+                worktree_path, home=self._home)
+            if not isinstance(current_paths, list):
+                return TaskTelemetry()
+            current = set(current_paths)
+            created = current - set(snapshot)
+            if len(created) != 1:
+                return TaskTelemetry()
+            return self._extract_span(pathlib.Path(next(iter(created))), 0)
         path = claude_transcript.claude_session_path(
             worktree_path, home=self._home,
             session_id=boundary_session or provider_session_id)
