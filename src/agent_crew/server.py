@@ -4709,27 +4709,48 @@ def create_app(
                     elif _cresv.get("state") == "done":
                         logger.info(f"POST /tasks/{task_id}/result: review comment 이미 done(receipt) — skip")
                     else:
-                        try:
-                            from agent_crew.github import post_review_comment
+                        # #314 재리뷰: review comment crash reconciliation. 게시 성공→done 기록 전
+                        # crash면 DB엔 reserved만 남고 재진입 시 중복 게시될 수 있다. merge의 pr_state
+                        # reconciliation과 동일하게, 기존 reserved(crash 의심)면 GitHub에 stable
+                        # marker('task: {id}')가 이미 있는지 먼저 확인한다:
+                        #   있음→재게시 없이 done / unknown→feedback fail-closed 미게시 / 없음→게시.
+                        # 그리고 post_review_comment는 실패를 False로 반환하므로 True일 때만 done.
+                        from agent_crew.github import post_review_comment, pr_has_comment_containing
+                        _marker = f"task: {task_id}"
+                        _do_post = True
+                        if not _cresv.get("reserved"):   # 기존 reserved = crash 의심 → 먼저 재확인
+                            _existing = pr_has_comment_containing(int(_review_pr), _marker)
+                            if _existing is True:
+                                q().external_op_mark(_cop, "done")
+                                logger.info(f"POST /tasks/{task_id}/result: review comment already on "
+                                            f"PR #{_review_pr} (reconciled) → done, 재게시 안 함")
+                                _do_post = False
+                            elif _existing is None:
+                                logger.warning(f"POST /tasks/{task_id}/result: review comment 존재 확인 "
+                                               f"불가(unknown) → fail-closed 미게시(재확인 대기)")
+                                _do_post = False
+                        if _do_post:
                             _reviewer_agent = next(
                                 (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
                                 "agent",
                             )
-                            post_review_comment(
+                            _ok = post_review_comment(
                                 pr_number=int(_review_pr),
-                                # #208: defensive verdict resolver.
-                                verdict=_resolve_verdict(result),
+                                verdict=_resolve_verdict(result),   # #208 defensive resolver
                                 summary=result.summary or "",
                                 findings=result.findings or [],
                                 task_id=task_id,
                                 reviewer=_reviewer_agent,
                             )
-                            q().external_op_mark(_cop, "done")
-                            logger.info(f"POST /tasks/{task_id}/result: posted review comment on PR #{_review_pr}")
-                        except Exception:
-                            q().external_op_mark(_cop, "failed",
-                                                 last_error="post_review_comment 실패", inc_attempt=True)
-                            logger.exception(f"POST /tasks/{task_id}/result: failed to post review comment on PR #{_review_pr}")
+                            if _ok:
+                                q().external_op_mark(_cop, "done")
+                                logger.info(f"POST /tasks/{task_id}/result: posted review comment on PR #{_review_pr}")
+                            else:
+                                q().external_op_mark(_cop, "failed",
+                                                     last_error="post_review_comment returned False",
+                                                     inc_attempt=True)
+                                logger.warning(f"POST /tasks/{task_id}/result: post_review_comment "
+                                               f"False → done 미기록(재시도 가능, PR #{_review_pr})")
 
             # #304 review (P1): suppressing the COMMENT was not enough. The
             # verdict's CONSEQUENCES ran regardless — an approve with

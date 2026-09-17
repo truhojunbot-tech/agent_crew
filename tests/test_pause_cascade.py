@@ -198,6 +198,58 @@ class TestReplaySideEffectBoundary(Base):
                          "replay는 queue push를 하지 않아야(다른 task claim/start 방지)")
 
 
+class TestReviewCommentReconciliation(Base):
+    def test_crash_after_post_before_done_no_double_post(self):
+        """#314 재리뷰: review comment 게시 성공→external_op done 기록 전 crash로 reserved만 남은 뒤
+        동일 result 재진입 시, GitHub에 이미 댓글(stable marker)이 있으면 재게시하지 않고 done으로 화해."""
+        import agent_crew.github as gh
+        posts = []
+        orig_post, orig_has = gh.post_review_comment, gh.pr_has_comment_containing
+        gh.post_review_comment = lambda **k: (posts.append(k), True)[1]
+        gh.pr_has_comment_containing = lambda *a, **k: True   # GitHub엔 이미 댓글 존재(게시됐었음)
+        try:
+            c = self._client()
+            self.q.enqueue(TaskRequest(task_id="rev-x", task_type="review", description="r",
+                                       branch="main", priority=1,
+                                       context={"pr_number": 77}, project="testproj"))
+            self.q.dequeue(role="reviewer")
+            # crash 시뮬레이션: 게시는 됐지만 done 기록 전 죽어 reserved만 남은 상태
+            self.q.external_op_reserve("comment:review:rev-x", pr_number=77)
+            r = c.post("/tasks/rev-x/result",
+                       json={"task_id": "rev-x", "status": "completed", "verdict": "approve",
+                             "summary": "lgtm", "pr_number": 77})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(len(posts), 0, "이미 있는 댓글 → 재게시 안 함(reconciliation)")
+            self.assertEqual(self.q.external_op_get("comment:review:rev-x")["state"], "done",
+                             "화해 후 done으로 마감")
+        finally:
+            gh.post_review_comment, gh.pr_has_comment_containing = orig_post, orig_has
+
+    def test_reconcile_unknown_fails_closed_no_post(self):
+        """존재 확인 unknown(None)이면 feedback mutation 특성상 재게시하지 않는다(fail-closed)."""
+        import agent_crew.github as gh
+        posts = []
+        orig_post, orig_has = gh.post_review_comment, gh.pr_has_comment_containing
+        gh.post_review_comment = lambda **k: (posts.append(k), True)[1]
+        gh.pr_has_comment_containing = lambda *a, **k: None    # 확인 불가
+        try:
+            c = self._client()
+            self.q.enqueue(TaskRequest(task_id="rev-y", task_type="review", description="r",
+                                       branch="main", priority=1,
+                                       context={"pr_number": 78}, project="testproj"))
+            self.q.dequeue(role="reviewer")
+            self.q.external_op_reserve("comment:review:rev-y", pr_number=78)  # 기존 reserved
+            r = c.post("/tasks/rev-y/result",
+                       json={"task_id": "rev-y", "status": "completed", "verdict": "approve",
+                             "summary": "lgtm", "pr_number": 78})
+            self.assertEqual(r.status_code, 200)
+            self.assertEqual(len(posts), 0, "unknown → fail-closed 미게시")
+            self.assertEqual(self.q.external_op_get("comment:review:rev-y")["state"], "reserved",
+                             "미게시 → done 안 됨(다음 재확인 대기)")
+        finally:
+            gh.post_review_comment, gh.pr_has_comment_containing = orig_post, orig_has
+
+
 class TestAtomicClaim(Base):
     def test_pause_set_blocks_claim_in_transaction(self):
         # 사전체크를 우회하더라도 임계구역 재확인이 claim을 막는다(간이 검증: pause 상태서 dequeue None)
