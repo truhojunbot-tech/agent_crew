@@ -1094,8 +1094,13 @@ def auto_fallback_failed_task(
     pane_map: Optional[dict] = None,
     state_path: Optional[str] = None,
     fallback_disabled: bool = False,
+    suppress_side_effects: bool = False,
 ) -> bool:
     """Reroute a rate-limit-shaped failure to the next agent in the chain.
+
+    #314 §4 P0: ``suppress_side_effects`` (replay 경로) 시 escalation gate 생성과 telegram
+    notification 같은 non-idempotent side effect를 skip한다. fallback successor enqueue(stable id)와
+    task cancel(idempotent)은 durable transition이므로 계속 수행된다.
 
     Returns ``True`` when fallback handled the task — caller should skip
     auto-retry. ``False`` means caller should fall through to its normal
@@ -1144,21 +1149,24 @@ def auto_fallback_failed_task(
                 f"original_task_id: {original_task_id or '(unknown)'}\n"
                 f"last summary: {(result.summary or '')[:200]}"
             )
-            try:
-                queue.create_gate(
-                    GateRequest(
-                        id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
-                        type="escalation",
-                        message=msg,
-                        status="pending",
+            # #314 §4 P0: escalation gate 생성 + telegram notify는 non-idempotent side effect.
+            # replay(suppress_side_effects)에서는 skip해 중복 gate/notification을 막는다.
+            if not suppress_side_effects:
+                try:
+                    queue.create_gate(
+                        GateRequest(
+                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
+                            type="escalation",
+                            message=msg,
+                            status="pending",
+                        )
                     )
-                )
-            except Exception as e:
-                logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
-            try:
-                notify_telegram(msg)
-            except Exception:
-                pass
+                except Exception as e:
+                    logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
+                try:
+                    notify_telegram(msg)
+                except Exception:
+                    pass
             return True
 
         role = _TYPE_TO_ROLE.get(task_type)
@@ -1193,21 +1201,24 @@ def auto_fallback_failed_task(
                 f"tried agents: {', '.join(excluded) or '(none)'}\n"
                 f"last summary: {(result.summary or '')[:200]}"
             )
-            try:
-                queue.create_gate(
-                    GateRequest(
-                        id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
-                        type="escalation",
-                        message=msg,
-                        status="pending",
+            # #314 §4 P0: escalation gate 생성 + telegram notify는 non-idempotent side effect.
+            # replay(suppress_side_effects)에서는 skip해 중복 gate/notification을 막는다.
+            if not suppress_side_effects:
+                try:
+                    queue.create_gate(
+                        GateRequest(
+                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
+                            type="escalation",
+                            message=msg,
+                            status="pending",
+                        )
                     )
-                )
-            except Exception as e:
-                logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
-            try:
-                notify_telegram(msg)
-            except Exception:
-                pass
+                except Exception as e:
+                    logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
+                try:
+                    notify_telegram(msg)
+                except Exception:
+                    pass
             return True
 
         new_ctx = dict(ctx)

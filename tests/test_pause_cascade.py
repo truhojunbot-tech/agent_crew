@@ -163,6 +163,41 @@ class TestResumeReplay(Base):
         self.assertEqual(len([x for x in self.q.list_tasks() if x.task_type == "review"]), 1)
 
 
+class TestReplaySideEffectBoundary(Base):
+    def test_replay_creates_successor_but_skips_push(self):
+        """#314 §4 P0: replay는 durable cascade transition(successor enqueue)만 재실행하고
+        non-idempotent side effect(queue push)는 skip한다 — replay가 다른 pending task를
+        claim/start하는 중복을 막는다."""
+        from fastapi.testclient import TestClient
+        from agent_crew.server import create_app
+        pushes = []
+        app = create_app(db_path=self.db, push_fn=lambda *a, **k: pushes.append(a),
+                         project="testproj")
+        c = TestClient(app); c.__enter__()
+        self.addCleanup(lambda: c.__exit__(None, None, None))
+
+        self.q.enqueue(mk(1, "implement"))
+        t = self.q.dequeue(role="implementer")
+        pause.set_pause(self.sd, True, source="test", incident="alfred#39")
+        r = c.post(f"/tasks/{t.task_id}/result",
+                   json={"task_id": t.task_id, "status": "completed", "summary": "done"})
+        self.assertTrue(r.json().get("suppressed_by_pause"))
+        pushes_at_suppress = len(pushes)   # 억제 경로도 push 안 함
+
+        # resume (pause.json + DB 권위)
+        cur = pause._load(os.path.join(self.sd, "pause.json"))
+        pause.resume(self.sd, generation=cur["generation"] + 1, source="test")
+        self.q.resume_stop(generation=self.q.get_stop_epoch()["epoch"] + 1)
+
+        rr = c.post("/admin/replay-suppressed")
+        self.assertEqual(rr.status_code, 200)
+        # durable transition: review successor 1개 생성
+        self.assertEqual(len([x for x in self.q.list_tasks() if x.task_type == "review"]), 1)
+        # side-effect boundary: replay 동안 queue push는 발생하지 않음
+        self.assertEqual(len(pushes), pushes_at_suppress,
+                         "replay는 queue push를 하지 않아야(다른 task claim/start 방지)")
+
+
 class TestAtomicClaim(Base):
     def test_pause_set_blocks_claim_in_transaction(self):
         # 사전체크를 우회하더라도 임계구역 재확인이 claim을 막는다(간이 검증: pause 상태서 dequeue None)

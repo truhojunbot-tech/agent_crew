@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -733,6 +734,14 @@ _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 # Tags that mean "retryable in the next few minutes" (server-side load-shed).
 #: Statuses a task can hold when a result still arrives afterwards. Both mean
 #: "the dispatcher stopped watching", not "the work is over" (#265).
+# #314 §4 P0(replay side-effect boundary): replay는 **durable cascade transition(successor enqueue)만**
+# 재실행해야 한다. replay가 전체 submit_result를 다시 돌리면 non-idempotent side effect가 중복된다:
+#   · PR review comment(gh, receipt 없음) · fallback escalation gate + telegram · queue push(_try_push_next/
+#     _try_push_discuss가 다른 pending task를 claim/start). successor enqueue는 stable id로 멱등하지만
+# 이 side effect들은 아니다. replay 동안 이 ContextVar를 True로 세우고, 각 side effect가 확인해 skip한다.
+# (억제됐다 replay되는 result의 comment/escalation은 loss 가능하나, 리뷰어 판정상 duplication보다 허용됨.)
+_REPLAYING = contextvars.ContextVar("agent_crew_replaying", default=False)
+
 _LATE_RESULT_STATUSES = frozenset({"failed", "timed_out"})
 # #314 §5: merge 자동 재시도 상한. 이 횟수 이상 실패(conflict/gh 실패 등)면 자동 재시도 중단 →
 # escalation 대상(무한 재시도 금지). 비가역 상태(closed)는 횟수와 무관하게 즉시 재시도 안 함.
@@ -2305,6 +2314,12 @@ def create_app(
 
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
+        # #314 §4 P0: replay 중에는 queue push 금지 — push는 다른 pending task를 claim/start하므로
+        # replay가 ACK 전 죽으면 다음 replay가 또 다른 task를 claim/start(중복). replay는 successor
+        # enqueue(durable transition)만; dispatch는 resume 후 정상 push 사이클/watchdog이 담당.
+        if _REPLAYING.get():
+            logger.debug(f"_try_push_next: replay 중 — push skip (role={role})")
+            return
         logger.debug(f"_try_push_next: role={role}")
         if not _push_enabled:
             logger.warning(
@@ -2525,6 +2540,10 @@ def create_app(
         to hold agent-name keys (e.g. 'claude', 'codex', 'gemini') alongside
         the role keys. Busy-check and dequeue are both scoped to the agent so
         concurrent panelists don't block each other."""
+        # #314 §4 P0: replay 중 push 금지(위 _try_push_next 참조).
+        if _REPLAYING.get():
+            logger.debug(f"_try_push_discuss: replay 중 — push skip (agent={agent})")
+            return
         logger.debug(f"_try_push_discuss: agent={agent}")
         if not _push_enabled:
             logger.warning(
@@ -4249,6 +4268,8 @@ def create_app(
             pane_map=pane_map,
             state_path=state_path,
             fallback_disabled=bool(fallback_disabled),
+            # #314 §4 P0: replay 중엔 escalation gate/telegram 같은 side effect skip(중복 방지).
+            suppress_side_effects=_REPLAYING.get(),
         )
         if handled:
             role = _TYPE_TO_ROLE.get(task_type)
@@ -4668,7 +4689,12 @@ def create_app(
                     if _pub.requeue_head:
                         _requeue_review_at_head(task_id, _review_pr, _pub.requeue_head, ctx)
                     _review_pr = None
-                if _review_pr:
+                if _review_pr and _REPLAYING.get():
+                    # #314 §4 P0: replay 중 PR review comment 재게시 금지(gh comment는 receipt 없음
+                    # → 게시 후 ACK 전 crash 시 중복). 라이브 경로에서만 게시. verdict 소비(test/merge)는
+                    # 아래에서 계속되며 stable id/receipt로 멱등.
+                    logger.debug(f"POST /tasks/{task_id}/result: replay 중 — review comment skip (PR #{_review_pr})")
+                elif _review_pr:
                     try:
                         from agent_crew.github import post_review_comment
                         _reviewer_agent = next(
@@ -4775,13 +4801,19 @@ def create_app(
             claim = q().outbox_claim(parent, owner)      # lease CAS: pending/만료replaying만
             if not claim:
                 continue                                 # 다른 executor 처리중 or 이미 applied
+            # #314 §4 P0: replay 동안 _REPLAYING=True → submit_result가 durable cascade transition
+            # (successor enqueue, stable id 멱등)만 재실행하고 non-idempotent side effect(PR comment/
+            # escalation gate+telegram/queue push)는 skip. replay side-effect boundary 확립.
+            _rtok = _REPLAYING.set(True)
             try:
                 rd = json.loads(claim.get("result_json") or "{}")
-                submit_result(parent, TaskResult(**rd))  # outbox 'replaying' → 서버가 cascade 재실행(멱등)
+                submit_result(parent, TaskResult(**rd))  # outbox 'replaying' → cascade transition만 재실행
                 q().outbox_mark_applied(parent, owner)    # 성공분만 replaying→applied CAS
                 done.append(parent)
             except Exception:
                 logger.exception(f"replay-suppressed: {parent} 실패(lease 만료 후 reclaim)")
+            finally:
+                _REPLAYING.reset(_rtok)
         return {"status": "ok", "replayed": done,
                 "pending_remaining": len(q().outbox_pending(include_replaying=False))}
 
