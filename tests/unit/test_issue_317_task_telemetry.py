@@ -72,6 +72,7 @@ def test_result_submission_persists_adapter_telemetry_and_lifecycle(tmp_path):
         provider_session_id="session-317", worktree_path=cwd, status="in_progress",
         retry_of="earlier-attempt", fallback_of="fallback-source",
     )
+    queue.patch_context("telemetry-317", {"context_pack_hash": "pack-317-hash"})
 
     queue.submit_result("telemetry-317", TaskResult(
         task_id="telemetry-317", status="failed", summary="failed",
@@ -90,7 +91,7 @@ def test_result_submission_persists_adapter_telemetry_and_lifecycle(tmp_path):
     assert row["reasoning_tokens"] is None
     assert row["context_window_tokens"] == 15
     assert row["stable_prefix_hash"] is None
-    assert row["context_pack_hash"] is None
+    assert row["context_pack_hash"] == "pack-317-hash"
     assert row["status"] == "failed"
     assert row["outcome"] == "failed:provider_error"
     assert row["retry_of"] == "earlier-attempt"

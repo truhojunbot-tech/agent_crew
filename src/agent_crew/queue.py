@@ -1391,13 +1391,26 @@ class TaskQueue:
         conn: sqlite3.Connection, task_id: str, telemetry: TaskTelemetry, now: float
     ) -> None:
         """Persist only observed values so absent provider fields remain NULL."""
+        context_pack_hash = telemetry.context_pack_hash
+        if context_pack_hash is None:
+            row = conn.execute(
+                "SELECT context FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            try:
+                context = json.loads(row["context"] or "{}") if row is not None else {}
+            except (TypeError, ValueError):
+                context = {}
+            if isinstance(context, dict) and isinstance(context.get("context_pack_hash"), str):
+                context_pack_hash = context["context_pack_hash"]
         fields = (
             "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
             "output_tokens", "reasoning_tokens", "context_window_tokens",
-            "stable_prefix_hash", "context_pack_hash",
+            "stable_prefix_hash",
         )
         values = [getattr(telemetry, field) for field in fields]
         observed = [(field, value) for field, value in zip(fields, values) if value is not None]
+        if context_pack_hash is not None:
+            observed.append(("context_pack_hash", context_pack_hash))
         assignments = [f"{field}=?" for field, _ in observed]
         params = [value for _, value in observed]
         # Dispatch attribution is authoritative when it named a model/session;

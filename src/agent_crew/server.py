@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
+from agent_crew import claude_transcript as _claude_transcript
 from agent_crew.anomaly import check_wrong_repo
 from agent_crew import context_pack as _cpack
 from agent_crew.context_identity import (
@@ -917,11 +918,6 @@ CLAUDE_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CLAUDE_CONTEXT_MAX_MB", "64"
 #:   way (see `claude_context_exceeds_cap`), so the decision has data.
 CLAUDE_CONTEXT_MAX_TOKENS = int(os.getenv("AGENT_CREW_CLAUDE_CONTEXT_MAX_TOKENS", "0"))
 
-#: How far back from EOF to look for the last turn carrying a usage block.
-_CLAUDE_TAIL_CHUNK = 1 << 20
-_CLAUDE_TAIL_CHUNKS = 16
-
-
 #: How many rollout files `codex_session_for_cwd` will read before giving up.
 #: Codex's store is date-partitioned and unbounded — 9,894 sessions on this
 #: host — so the search walks newest-first and stops early. A miss returns "",
@@ -1122,9 +1118,7 @@ def _codex_session_and_path(cwd: str, *, home=None, limit=None) -> tuple:
 
 
 def _claude_home(home=None):
-    import pathlib
-
-    return pathlib.Path(home) if home else pathlib.Path.home() / ".claude"
+    return _claude_transcript.claude_home(home)
 
 
 def claude_session_size(cwd: str, *, home=None) -> tuple:
@@ -1140,22 +1134,7 @@ def claude_session_size(cwd: str, *, home=None) -> tuple:
     that directory. ``(0, "")`` when anything is missing or unreadable —
     sizing must never break a dispatch.
     """
-    import re as _re
-
-    try:
-        if not cwd:
-            return (0, "")
-        mangled = _re.sub(r"[/._]", "-", cwd)
-        d = _claude_home(home) / "projects" / mangled
-        if not d.is_dir():
-            return (0, "")
-        sessions = sorted(d.glob("*.jsonl"), key=lambda f: f.stat().st_mtime,
-                          reverse=True)
-        if not sessions:
-            return (0, "")
-        return (sessions[0].stat().st_size, sessions[0].stem)
-    except Exception:  # noqa: BLE001 — sizing must never break a dispatch
-        return (0, "")
+    return _claude_transcript.claude_session_size(cwd, home=_claude_home(home))
 
 
 def _usage_context_tokens(usage) -> Optional[int]:
@@ -1174,17 +1153,7 @@ def _usage_context_tokens(usage) -> Optional[int]:
       and treating it as a measurement would make an output-only block look
       like a zero window.
     """
-    if not isinstance(usage, dict):
-        return None
-    total = 0
-    measured = False
-    for key in ("cache_read_input_tokens", "cache_creation_input_tokens",
-                "input_tokens"):
-        value = usage.get(key)
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            total += int(value)
-            measured = True
-    return total if measured else None
+    return _claude_transcript.usage_context_tokens(usage)
 
 
 def claude_context_tokens(cwd: str, *, home=None) -> tuple:
@@ -1206,46 +1175,7 @@ def claude_context_tokens(cwd: str, *, home=None) -> tuple:
       detect afterwards. Sizing still never breaks a dispatch; it just says so
       now instead of returning a number it never took.
     """
-    try:
-        _, session = claude_session_size(cwd, home=home)
-        if not session:
-            return (None, "")
-        import re as _re
-
-        mangled = _re.sub(r"[/._]", "-", cwd)
-        path = _claude_home(home) / "projects" / mangled / f"{session}.jsonl"
-        size = path.stat().st_size
-        with open(path, "rb") as f:
-            end, buf = size, b""
-            for _ in range(_CLAUDE_TAIL_CHUNKS):
-                start = max(0, end - _CLAUDE_TAIL_CHUNK)
-                f.seek(start)
-                buf = f.read(end - start) + buf
-                end = start
-                # At a non-zero offset the first element is a partial line.
-                # It needs no special case: truncated JSONL never parses, so it
-                # is skipped here and re-read whole once the previous chunk is
-                # prepended. Dropping it explicitly was dead code — a mutation
-                # removing that guard killed no test, which is how it was found.
-                for line in reversed(buf.split(b"\n")):
-                    if not line.strip():
-                        continue
-                    try:
-                        entry = json.loads(line)
-                    except Exception:
-                        continue
-                    tokens = _usage_context_tokens(
-                        (entry.get("message") or {}).get("usage"))
-                    if tokens is not None:
-                        # `is not None`, not truthiness: a turn that really did
-                        # re-read nothing is the answer, and walking past it
-                        # would report a window the session has already left.
-                        return (tokens, session)
-                if start == 0:
-                    break
-        return (None, session)
-    except Exception:
-        return (None, "")
+    return _claude_transcript.claude_context_tokens(cwd, home=_claude_home(home))
 
 
 def claude_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
