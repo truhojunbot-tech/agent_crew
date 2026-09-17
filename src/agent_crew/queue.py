@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import os
 import re
@@ -111,6 +112,29 @@ CREATE TABLE IF NOT EXISTS context_state (
 )
 """
 
+_DDL_COORDINATOR_STATE = """
+CREATE TABLE IF NOT EXISTS coordinator_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1), project TEXT NOT NULL DEFAULT '',
+    coordinator_id TEXT NOT NULL DEFAULT 'unknown',
+    coordinator_generation INTEGER NOT NULL DEFAULT 0,
+    provider TEXT NOT NULL DEFAULT 'unknown', model TEXT NOT NULL DEFAULT 'unknown',
+    provider_session_id TEXT NOT NULL DEFAULT 'unknown', checkpoint_ref TEXT NOT NULL DEFAULT '',
+    previous_receipt_hash TEXT NOT NULL DEFAULT '', handoff_reason TEXT NOT NULL DEFAULT '',
+    updated_at REAL NOT NULL DEFAULT 0
+)
+"""
+
+_DDL_COORDINATOR_RECEIPTS = """
+CREATE TABLE IF NOT EXISTS coordinator_receipts (
+    receipt_hash TEXT PRIMARY KEY, event TEXT NOT NULL, project TEXT NOT NULL DEFAULT '',
+    coordinator_id TEXT NOT NULL DEFAULT 'unknown', coordinator_generation INTEGER NOT NULL DEFAULT 0,
+    provider TEXT NOT NULL DEFAULT 'unknown', model TEXT NOT NULL DEFAULT 'unknown',
+    provider_session_id TEXT NOT NULL DEFAULT 'unknown', checkpoint_ref TEXT NOT NULL DEFAULT '',
+    previous_receipt_hash TEXT NOT NULL DEFAULT '', handoff_reason TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL
+)
+"""
+
 # task_attribution migrations (#202) — durable context identity + lineage
 # fields, added via the same defensive ALTER-TABLE pattern as the existing
 # tasks-table migrations below. All nullable/defaulted so existing rows
@@ -155,6 +179,12 @@ _DDL_MIGRATE_ATTR_LOCK_WAIT = (
     "ALTER TABLE task_attribution ADD COLUMN lock_wait_seconds REAL DEFAULT NULL")
 _DDL_MIGRATE_ATTR_LOCK_DEFERS = (
     "ALTER TABLE task_attribution ADD COLUMN lock_defer_count INTEGER DEFAULT NULL")
+_DDL_MIGRATE_ATTR_COORDINATOR_ID = "ALTER TABLE task_attribution ADD COLUMN coordinator_id TEXT NOT NULL DEFAULT 'unknown'"
+_DDL_MIGRATE_ATTR_COORDINATOR_GENERATION = "ALTER TABLE task_attribution ADD COLUMN coordinator_generation INTEGER NOT NULL DEFAULT 0"
+_DDL_MIGRATE_ATTR_COORDINATOR_PROVIDER = "ALTER TABLE task_attribution ADD COLUMN coordinator_provider TEXT NOT NULL DEFAULT 'unknown'"
+_DDL_MIGRATE_ATTR_COORDINATOR_MODEL = "ALTER TABLE task_attribution ADD COLUMN coordinator_model TEXT NOT NULL DEFAULT 'unknown'"
+_DDL_MIGRATE_ATTR_COORDINATOR_SESSION = "ALTER TABLE task_attribution ADD COLUMN coordinator_provider_session_id TEXT NOT NULL DEFAULT 'unknown'"
+_DDL_MIGRATE_ATTR_COORDINATOR_CHECKPOINT = "ALTER TABLE task_attribution ADD COLUMN coordinator_checkpoint_ref TEXT NOT NULL DEFAULT ''"
 
 _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
@@ -175,6 +205,12 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_TEST_SCOPE_HASH,
     _DDL_MIGRATE_ATTR_LOCK_WAIT,
     _DDL_MIGRATE_ATTR_LOCK_DEFERS,
+    _DDL_MIGRATE_ATTR_COORDINATOR_ID,
+    _DDL_MIGRATE_ATTR_COORDINATOR_GENERATION,
+    _DDL_MIGRATE_ATTR_COORDINATOR_PROVIDER,
+    _DDL_MIGRATE_ATTR_COORDINATOR_MODEL,
+    _DDL_MIGRATE_ATTR_COORDINATOR_SESSION,
+    _DDL_MIGRATE_ATTR_COORDINATOR_CHECKPOINT,
 )
 
 _DDL_CHECKPOINTS = """
@@ -392,6 +428,8 @@ class TaskQueue:
         conn.execute(_DDL_ATTRIBUTION)
         conn.execute(_DDL_CHECKPOINTS)
         conn.execute(_DDL_CONTEXT_STATE)
+        conn.execute(_DDL_COORDINATOR_STATE)
+        conn.execute(_DDL_COORDINATOR_RECEIPTS)
         conn.execute(_DDL_PR_ANNOUNCEMENTS)
         conn.execute(_DDL_RUNTIME_STOP)
         conn.execute(_DDL_CASCADE_OUTBOX)
@@ -446,6 +484,170 @@ class TaskQueue:
         conn = sqlite3.connect(self._db_path, timeout=10, check_same_thread=False)
         conn.row_factory = sqlite3.Row
         return conn
+
+    # ── #309 K1: project coordinator handoff authority ──────────────────
+
+    @staticmethod
+    def _unknown(value: Optional[str]) -> str:
+        """Keep absent coordinator attribution explicit rather than guessed."""
+        return str(value).strip() if value is not None and str(value).strip() else "unknown"
+
+    def _coordinator_project_on(self, conn) -> str:
+        row = conn.execute(
+            "SELECT project FROM tasks WHERE project <> '' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        return (row["project"] if row else "") or ""
+
+    def _coordinator_state_on(self, conn) -> dict:
+        row = conn.execute("SELECT * FROM coordinator_state WHERE id=1").fetchone()
+        if row is None:
+            return {
+                "project": self._coordinator_project_on(conn), "coordinator_id": "unknown",
+                "coordinator_generation": 0, "provider": "unknown", "model": "unknown",
+                "provider_session_id": "unknown", "checkpoint_ref": "",
+                "previous_receipt_hash": "", "handoff_reason": "", "updated_at": 0.0,
+            }
+        return {key: row[key] for key in row.keys() if key != "id"}
+
+    def get_coordinator_state(self) -> dict:
+        """Read the project-local coordinator authority; missing is explicit unknown."""
+        conn = self._connect()
+        try:
+            return self._coordinator_state_on(conn)
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _coordinator_receipt_hash(event: str, state: dict) -> str:
+        material = {"event": event, **state}
+        return hashlib.sha256(
+            json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def advance_coordinator(
+        self, *, coordinator_id: str, generation: int, provider: str = "unknown",
+        model: str = "unknown", provider_session_id: str = "unknown",
+        handoff_reason: str = "", previous_receipt_hash: str = "",
+    ) -> dict:
+        """Atomically advance the durable coordinator generation (#309 K1).
+
+        ``generation`` is an externally supplied compare-and-swap target.  A
+        stale/equal proposal is quarantined as a receipt and cannot alter the
+        authority, task rows, contexts, or worker lineage.  This mirrors the
+        runtime_stop higher-generation-wins authority, but has no scheduler or
+        fleet dependency.
+        """
+        try:
+            requested = int(generation)
+        except (TypeError, ValueError):
+            requested = -1
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._coordinator_state_on(conn)
+            current_generation = int(current["coordinator_generation"] or 0)
+            now = time.time()
+            project = current["project"] or self._coordinator_project_on(conn)
+            if requested <= current_generation:
+                rejected = {
+                    "project": project, "coordinator_id": self._unknown(coordinator_id),
+                    "coordinator_generation": requested, "provider": self._unknown(provider),
+                    "model": self._unknown(model), "provider_session_id": self._unknown(provider_session_id),
+                    "checkpoint_ref": "", "previous_receipt_hash": previous_receipt_hash or "",
+                    "handoff_reason": handoff_reason or "", "updated_at": now,
+                }
+                receipt_hash = self._coordinator_receipt_hash("stale_generation_rejected", rejected)
+                conn.execute(
+                    "INSERT OR IGNORE INTO coordinator_receipts "
+                    "(receipt_hash,event,project,coordinator_id,coordinator_generation,provider,model,provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,created_at) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (receipt_hash, "stale_generation_rejected", project, rejected["coordinator_id"],
+                     requested, rejected["provider"], rejected["model"], rejected["provider_session_id"],
+                     "", rejected["previous_receipt_hash"], rejected["handoff_reason"], now),
+                )
+                conn.execute("COMMIT")
+                return {"accepted": False, "quarantined": True, "receipt_hash": receipt_hash,
+                        "current": current, "reason": "stale coordinator_generation"}
+            state = {
+                "project": project, "coordinator_id": self._unknown(coordinator_id),
+                "coordinator_generation": requested, "provider": self._unknown(provider),
+                "model": self._unknown(model), "provider_session_id": self._unknown(provider_session_id),
+                "checkpoint_ref": f"coordinator:{project}:{self._unknown(coordinator_id)}:{requested}",
+                "previous_receipt_hash": previous_receipt_hash or "",
+                "handoff_reason": handoff_reason or "", "updated_at": now,
+            }
+            receipt_hash = self._coordinator_receipt_hash("handoff_accepted", state)
+            conn.execute(
+                "INSERT INTO coordinator_state "
+                "(id,project,coordinator_id,coordinator_generation,provider,model,provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,updated_at) "
+                "VALUES (1,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(id) DO UPDATE SET project=excluded.project, coordinator_id=excluded.coordinator_id, "
+                "coordinator_generation=excluded.coordinator_generation, provider=excluded.provider, model=excluded.model, "
+                "provider_session_id=excluded.provider_session_id, checkpoint_ref=excluded.checkpoint_ref, "
+                "previous_receipt_hash=excluded.previous_receipt_hash, handoff_reason=excluded.handoff_reason, updated_at=excluded.updated_at",
+                (state["project"], state["coordinator_id"], requested, state["provider"], state["model"],
+                 state["provider_session_id"], state["checkpoint_ref"], state["previous_receipt_hash"],
+                 state["handoff_reason"], now),
+            )
+            conn.execute(
+                "INSERT INTO coordinator_receipts "
+                "(receipt_hash,event,project,coordinator_id,coordinator_generation,provider,model,provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (receipt_hash, "handoff_accepted", state["project"], state["coordinator_id"], requested,
+                 state["provider"], state["model"], state["provider_session_id"], state["checkpoint_ref"],
+                 state["previous_receipt_hash"], state["handoff_reason"], now),
+            )
+            conn.execute("COMMIT")
+            return {"accepted": True, "quarantined": False, "receipt_hash": receipt_hash, **state}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def list_coordinator_receipts(self, limit: int = 50) -> list:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM coordinator_receipts ORDER BY created_at DESC LIMIT ?", (int(limit),)
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def export_project_runtime_state(self) -> dict:
+        """A portable successor-coordinator snapshot; it never mutates runtime state."""
+        conn = self._connect()
+        try:
+            tasks = []
+            for row in conn.execute("SELECT * FROM tasks ORDER BY created_at ASC").fetchall():
+                item = dict(row)
+                item["context"] = json.loads(item["context"] or "{}")
+                item["findings"] = json.loads(item["findings"] or "[]")
+                item["error_info"] = json.loads(item["error_info"]) if item.get("error_info") else None
+                tasks.append(item)
+            receipts = []
+            for row in conn.execute("SELECT * FROM task_attribution ORDER BY created_at ASC").fetchall():
+                item = dict(row)
+                item["worker_provider"] = item.pop("agent", "unknown") or "unknown"
+                item["worker_provider_session_id"] = item.pop("provider_session_id", "unknown") or "unknown"
+                item["worker_model"] = item.pop("model", "unknown") or "unknown"
+                receipts.append(item)
+            return {
+                "schema_version": 1, "coordinator": self._coordinator_state_on(conn),
+                "tasks": tasks, "worker_receipts": receipts,
+                "gates": [dict(row) for row in conn.execute("SELECT * FROM gates ORDER BY created_at ASC").fetchall()],
+                "claims": {
+                    "cascade_outbox": [dict(row) for row in conn.execute("SELECT * FROM cascade_outbox ORDER BY created_at ASC").fetchall()],
+                    "external_operations": [dict(row) for row in conn.execute("SELECT * FROM external_op ORDER BY reserved_at ASC").fetchall()],
+                },
+                "coordinator_receipts": self.list_coordinator_receipts(),
+            }
+        finally:
+            conn.close()
 
     # ── #314 §1: DB-backed STOP epoch (authoritative) ────────────────────
     #
@@ -1840,6 +2042,10 @@ class TaskQueue:
         now = time.time()
         conn = self._connect()
         try:
+            # Snapshot the coordinator authority beside the worker receipt.  The
+            # worker fields above remain worker-only; a successor can therefore
+            # distinguish "who dispatched" from "who executed" without prose.
+            coordinator = self._coordinator_state_on(conn)
             conn.execute(
                 """
                 INSERT INTO task_attribution
@@ -1847,8 +2053,10 @@ class TaskQueue:
                      codex_logs_path, repo_url, git_branch, created_at, updated_at, status,
                      schema_version, model, context_id, provider_session_id, context_policy,
                      context_generation, session_task_index, previous_task_id, retry_of,
-                     fallback_of, started_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     fallback_of, started_at, coordinator_id, coordinator_generation,
+                     coordinator_provider, coordinator_model, coordinator_provider_session_id,
+                     coordinator_checkpoint_ref)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     status=excluded.status, updated_at=excluded.updated_at,
                     model=excluded.model, context_id=excluded.context_id,
@@ -1857,13 +2065,22 @@ class TaskQueue:
                     context_generation=excluded.context_generation,
                     session_task_index=excluded.session_task_index,
                     previous_task_id=excluded.previous_task_id,
-                    retry_of=excluded.retry_of, fallback_of=excluded.fallback_of
+                    retry_of=excluded.retry_of, fallback_of=excluded.fallback_of,
+                    coordinator_id=excluded.coordinator_id,
+                    coordinator_generation=excluded.coordinator_generation,
+                    coordinator_provider=excluded.coordinator_provider,
+                    coordinator_model=excluded.coordinator_model,
+                    coordinator_provider_session_id=excluded.coordinator_provider_session_id,
+                    coordinator_checkpoint_ref=excluded.coordinator_checkpoint_ref
                 """,
                 (task_id, project, agent, role, task_type, worktree_path,
                  codex_logs_path, repo_url, git_branch, now, now, status,
                  CONTEXT_SCHEMA_VERSION, model, context_id, provider_session_id,
                  context_policy, context_generation, session_task_index,
-                 previous_task_id, retry_of, fallback_of, started_at or now),
+                 previous_task_id, retry_of, fallback_of, started_at or now,
+                 coordinator["coordinator_id"], coordinator["coordinator_generation"],
+                 coordinator["provider"], coordinator["model"], coordinator["provider_session_id"],
+                 coordinator["checkpoint_ref"]),
             )
             conn.commit()
         finally:
