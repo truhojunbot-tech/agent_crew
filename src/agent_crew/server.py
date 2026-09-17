@@ -3926,6 +3926,7 @@ def create_app(
     def _auto_enqueue_review(
         impl_task_id: str,
         pr_number: Optional[int] = None,
+        result=None,
     ) -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
 
@@ -3940,6 +3941,10 @@ def create_app(
             pr_number,
             pane_map=pane_map,
             server_project=project,
+            # #305: the implementer's own report of where it pushed. Without it
+            # the cascade can only route from the task, which for a
+            # watch-ingested issue is `main`.
+            result=result,
         )
         if review_id:
             _try_push_next("reviewer")
@@ -4503,7 +4508,8 @@ def create_app(
                     logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto review enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
-                    _auto_enqueue_review(task_id, pr_number=result.pr_number)
+                    _auto_enqueue_review(task_id, pr_number=result.pr_number,
+                                         result=result)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
             # review counts as approved (#100). Skip when the review task was
