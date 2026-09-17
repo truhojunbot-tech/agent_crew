@@ -1121,6 +1121,26 @@ def _claude_home(home=None):
     return _claude_transcript.claude_home(home)
 
 
+def claude_task_start_boundary(cwd: str, *, provider_session_id: str = "") -> dict:
+    """Return the durable append boundary for a Claude task at dispatch.
+
+    A resumed Claude session is an append-only JSONL file, so its exact byte
+    size is the boundary between the prior task and this one. A fresh session
+    has no known transcript identity yet; retaining an empty identity makes
+    that unobservable state explicit instead of reading an unrelated session.
+    """
+    if not provider_session_id:
+        return {"session_id": "", "offset": 0}
+    path = _claude_transcript.claude_session_path(
+        cwd, home=_claude_home(), session_id=provider_session_id)
+    if path is None:
+        return {"session_id": provider_session_id, "offset": 0}
+    try:
+        return {"session_id": path.stem, "offset": path.stat().st_size}
+    except OSError:
+        return {"session_id": path.stem, "offset": 0}
+
+
 def claude_session_size(cwd: str, *, home=None) -> tuple:
     """``(bytes, session_id)`` for the Claude Code session bound to ``cwd``.
 
@@ -3339,6 +3359,13 @@ def create_app(
                 retry_of=_retry_of,
                 fallback_of=_fallback_of,
             )
+            if agent == "claude":
+                # Claude's append-only transcript is shared by sequential
+                # tasks in this worktree. Persist its pre-invocation byte
+                # offset so result handling reads only this task's suffix.
+                q().patch_context(task.task_id, {"claude_transcript_start":
+                    claude_task_start_boundary(
+                        wt, provider_session_id=_ctx_info.get("provider_session_id") or "")})
             # #278: the tester treatment, as a structured field rather than a
             # sentence in the agent's summary. Resolved on the dispatch path so
             # it reflects the config in force for THIS task — an operator can

@@ -97,6 +97,39 @@ def last_usage(path) -> Optional[dict]:
     return message.get("usage") if message is not None else None
 
 
+def messages_from_offset(path, offset: int) -> list[dict]:
+    """Read usage-bearing JSONL records in the bounded transcript suffix.
+
+    The end is snapshotted before reading, so records appended after result
+    handling starts are outside this observation.  Malformed lines remain
+    unobserved rather than being inferred from neighbouring records.
+    """
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
+        return []
+    try:
+        with open(path, "rb") as transcript:
+            end = path.stat().st_size
+            if offset > end:
+                return []
+            transcript.seek(offset)
+            lines = transcript.read(end - offset).splitlines()
+    except Exception:  # noqa: BLE001 — transcript observation must not break callers
+        return []
+
+    messages = []
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except Exception:  # noqa: BLE001 — malformed JSONL is skipped
+            continue
+        message = entry.get("message")
+        if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+            messages.append({"entry": entry, "message": message})
+    return messages
+
+
 def claude_context_tokens(cwd: str, *, home=None) -> tuple:
     """Return ``(input-side tokens, session_id)`` for Claude's newest session."""
     path = claude_session_path(cwd, home=home)

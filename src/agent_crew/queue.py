@@ -21,6 +21,15 @@ class PausedError(Exception):
 
 logger = logging.getLogger(__name__)
 
+
+class _TaskProviderSessionId(str):
+    """Keep the adapter API stable while carrying a task-local boundary."""
+
+    def __new__(cls, value: str, claude_transcript_start=None):
+        result = super().__new__(cls, value)
+        result.claude_transcript_start = claude_transcript_start
+        return result
+
 _ROLE_TO_TYPE = {
     "coder": "implement",
     "implementer": "implement",
@@ -1371,16 +1380,27 @@ class TaskQueue:
 
     def _extract_task_telemetry(self, conn: sqlite3.Connection, task_id: str) -> TaskTelemetry:
         row = conn.execute(
-            "SELECT agent, worktree_path, provider_session_id FROM task_attribution WHERE task_id=?",
+            """
+            SELECT a.agent, a.worktree_path, a.provider_session_id, t.context
+            FROM task_attribution AS a JOIN tasks AS t ON t.task_id=a.task_id
+            WHERE a.task_id=?
+            """,
             (task_id,),
         ).fetchone()
         if row is None:
             return TaskTelemetry()
         try:
+            try:
+                context = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                context = {}
+            boundary = (context.get("claude_transcript_start")
+                        if isinstance(context, dict) else None)
             return self._telemetry_adapter.extract(
                 provider=str(row["agent"] or ""),
                 worktree_path=str(row["worktree_path"] or ""),
-                provider_session_id=str(row["provider_session_id"] or ""),
+                provider_session_id=_TaskProviderSessionId(
+                    str(row["provider_session_id"] or ""), boundary),
             )
         except Exception:
             logger.exception("task telemetry adapter failed for %s", task_id)
