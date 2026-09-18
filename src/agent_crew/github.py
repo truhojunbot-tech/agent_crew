@@ -188,7 +188,7 @@ def post_review_comment(
 
 
 def pr_state(pr_number: int, repo: Optional[str] = None,
-             timeout: float = 20.0) -> str:
+             timeout: float = 20.0, cwd: Optional[str] = None) -> str:
     """``"open" | "merged" | "closed" | "unknown"`` for a PR (#250).
 
     ``unknown`` is a real answer, not a failure to report: `gh` missing, no
@@ -198,7 +198,7 @@ def pr_state(pr_number: int, repo: Optional[str] = None,
     if not pr_number or not check_gh_installed():
         return "unknown"
     if not repo:
-        repo = get_repo()
+        repo = get_repo(cwd=cwd)
     if not repo:
         return "unknown"
     try:

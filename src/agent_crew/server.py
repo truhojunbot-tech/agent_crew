@@ -4026,17 +4026,20 @@ def create_app(
             # the cascade can only route from the task, which for a
             # watch-ingested issue is `main`.
             result=result,
+            repo_cwd=_any_worktree_path(),
         )
         if review_id:
             _try_push_next("reviewer")
 
-    def _auto_enqueue_test(review_task_id: str) -> None:
+    def _auto_enqueue_test(review_task_id: str, repo: str = "") -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123)."""
         test_id = _pipeline_auto_enqueue_test(
             q(),
             review_task_id,
             pane_map=pane_map,
+            repo=repo,
+            repo_cwd=_any_worktree_path(),
         )
         if test_id:
             _try_push_next("tester")
@@ -4105,7 +4108,7 @@ def create_app(
                 f"_requeue_review_at_head: could not requeue a review for PR "
                 f"#{pr_number} at {head[:12]}")
 
-    def _auto_enqueue_fix(review_task_id: str) -> None:
+    def _auto_enqueue_fix(review_task_id: str, repo: str = "") -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
         # The cascade swallows its own errors, but the invariant it is
@@ -4119,6 +4122,7 @@ def create_app(
                 review_task_id,
                 pane_map=pane_map,
                 server_project=project,
+                repo=repo,
                 # #253 review: name the repository. This process's cwd is the
                 # instance directory, which belongs to a DIFFERENT repo, so any
                 # `gh` call that infers from it asks the wrong one. An agent
@@ -4231,7 +4235,7 @@ def create_app(
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
 
-    def _auto_merge_pr(pr_number: int) -> None:
+    def _auto_merge_pr(pr_number: int, repo: str = "", repo_cwd: str = "") -> None:
         """Merge PR via gh CLI after the pipeline approves it (#171).
 
         Failures are logged and swallowed — a merge error must never break
@@ -4242,6 +4246,7 @@ def create_app(
         # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
         # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
         from agent_crew.github import get_repo, merge_pr, pr_state
+        _merge_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         op_key = f"merge:pr:{pr_number}"
         resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
         if not resv.get("admitted"):
@@ -4256,9 +4261,17 @@ def create_app(
             logger.warning(f"_auto_merge_pr: {op_key} 실패 {resv.get('attempt')}회(≥{_MAX_MERGE_ATTEMPTS}) — "
                            f"자동 재시도 중단, escalation 필요(last_error={resv.get('last_error')})")
             return
-        repo = get_repo()
+        if not _merge_repo:
+            q().external_op_mark(
+                op_key, "failed",
+                last_error="repo identity unresolved (no explicit repo, no "
+                           "project worktree) — fail-closed, no merge attempted",
+                inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: repo identity 미확정 — merge 억제(PR #{pr_number}, "
+                           f"mutation 0)")
+            return
         # reconciliation: 맹목 재실행이 아니라 실제 상태를 먼저 확인.
-        st = pr_state(int(pr_number), repo=repo)
+        st = pr_state(int(pr_number), repo=_merge_repo)
         if st == "merged":
             q().external_op_mark(op_key, "done")
             logger.info(f"_auto_merge_pr: PR #{pr_number} 이미 merged(재확인) → done 기록, 재merge 안 함")
@@ -4274,7 +4287,7 @@ def create_app(
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
             return
         # st == 'open' → merge 시도
-        ok = merge_pr(int(pr_number), merge_method="squash", repo=repo)
+        ok = merge_pr(int(pr_number), merge_method="squash", repo=_merge_repo)
         if ok:
             q().external_op_mark(op_key, "done")
             logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) → done(receipt) — #171/§5")
@@ -4855,12 +4868,12 @@ def create_app(
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
                     # #171: no tester stage → merge immediately on review approval
                     if pr_number and not review_ctx.get("coordinator_managed"):
-                        _auto_merge_pr(int(pr_number))
+                        _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt)
                 elif review_ctx.get("coordinator_managed"):
                     logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto test enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
-                    _auto_enqueue_test(task_id)
+                    _auto_enqueue_test(task_id, repo=_review_repo)
             # #244: review requested changes → auto-enqueue the fix. The
             # rejection path used to just end here, so every extra review round
             # needed an operator to hand-enqueue the fix with the findings
@@ -4873,13 +4886,15 @@ def create_app(
                     logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto fix enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
-                    _auto_enqueue_fix(task_id)
+                    _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
             if task_type == "test" and result.status == "completed":
                 if not _task_ctx.get("coordinator_managed"):
                     test_pr = result.pr_number or _task_ctx.get("pr_number")
                     if test_pr:
-                        _auto_merge_pr(int(test_pr))
+                        _test_wt = _any_worktree_path()
+                        _test_repo = _task_ctx.get("repo") or ""
+                        _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")

@@ -109,7 +109,7 @@ def test_a_stale_review_creates_no_fix_task(q):
     """★The regression: the finding was fixed between review and dispatch."""
     review_id = _review(q, reviewed_sha=OLD)
 
-    assert auto_enqueue_fix(q, review_id, head_sha_fn=_head(NEW)) is None
+    assert auto_enqueue_fix(q, review_id, head_sha_fn=_head(NEW), repo="owner/repo") is None
     assert not [t for t in q.list_tasks() if t.task_type == "implement"]
 
 
@@ -118,7 +118,7 @@ def test_a_current_review_still_creates_the_fix(q):
     reason the cascade exists."""
     review_id = _review(q, reviewed_sha=NEW)
 
-    fix_id = auto_enqueue_fix(q, review_id, head_sha_fn=_head(NEW))
+    fix_id = auto_enqueue_fix(q, review_id, head_sha_fn=_head(NEW), repo="owner/repo")
 
     assert fix_id is not None
     assert FINDING in {t.task_id: t for t in q.list_tasks()}[fix_id].description
@@ -139,7 +139,7 @@ def test_a_stale_review_spends_no_round_and_announces_nothing(q, monkeypatch):
                                     pr_number=PR))
 
     assert auto_enqueue_fix(q, rid, head_sha_fn=_head(NEW),
-                            comment_fn=lambda pr, b: posted.append(b)) is None
+                            comment_fn=lambda pr, b: posted.append(b), repo="owner/repo") is None
     assert posted == []
 
 
@@ -147,7 +147,7 @@ def test_the_review_result_stays_durable_when_the_cascade_stops(q):
     """Only the follow-up work stops; the audit trail does not."""
     review_id = _review(q, reviewed_sha=OLD)
 
-    auto_enqueue_fix(q, review_id, head_sha_fn=_head(NEW))
+    auto_enqueue_fix(q, review_id, head_sha_fn=_head(NEW), repo="owner/repo")
 
     result = q.get_result(review_id)
     assert result.status == "completed"
@@ -168,12 +168,12 @@ def test_two_reviews_of_one_head_with_a_fix_between_them(q):
     first = _review(q, reviewed_sha=OLD)
     second = _review(q, reviewed_sha=OLD)
 
-    fix_id = auto_enqueue_fix(q, first, head_sha_fn=lambda pr: head["sha"])
+    fix_id = auto_enqueue_fix(q, first, head_sha_fn=lambda pr: head["sha"], repo="owner/repo")
     assert fix_id is not None, "the first review must still produce work"
 
     head["sha"] = NEW          # the fix lands
 
-    assert auto_enqueue_fix(q, second, head_sha_fn=lambda pr: head["sha"]) is None
+    assert auto_enqueue_fix(q, second, head_sha_fn=lambda pr: head["sha"], repo="owner/repo") is None
     assert len([t for t in q.list_tasks() if t.task_type == "implement"]) == 1
 
 
@@ -273,7 +273,7 @@ def test_the_head_lookup_names_the_repo_from_the_review_context(monkeypatch, q):
                                     verdict="request_changes", findings=[FINDING],
                                     pr_number=PR))
 
-    assert auto_enqueue_fix(q, rid) is None, "a superseded review still created work"
+    assert auto_enqueue_fix(q, rid, repo="truhojunbot-tech/agent_crew") is None, "a superseded review still created work"
 
     assert calls, "no gh call was made — the default lookup path was skipped"
     # Several subprocesses run in this path (#250's state gate too); find the
