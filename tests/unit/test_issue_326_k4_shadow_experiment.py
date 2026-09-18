@@ -10,7 +10,7 @@ from agent_crew.k4_shadow_experiment import (
     LexicalProvider,
     ScopeIsolatedProvider,
     SupersededHardRejectProvider,
-    TESTIMONY_ROOT,
+    TESTIMONY_SOURCE_PREFIX,
     build_candidates,
     build_experiment,
     run_experiment,
@@ -26,7 +26,7 @@ def test_full_experiment_emits_ground_truth_comparison_artifact(tmp_path):
     assert artifact_path.exists()
     assert artifact["purpose"] == "shadow_evidence_only"
     assert artifact["winner"] is None
-    assert len(artifact["queries"]) >= 8
+    assert len(artifact["queries"]) >= 7
     assert {entry["candidate"] for entry in artifact["results"]} == {
         "exact_lookup", "lexical", "hybrid", "lexical_hard_reject", "hybrid_hard_reject",
     }
@@ -34,7 +34,7 @@ def test_full_experiment_emits_ground_truth_comparison_artifact(tmp_path):
     assert all("precision" in entry and "recall" in entry for entry in artifact["results"])
     assert all("hit" in entry for entry in artifact["results"])
     assert all(
-        source_ref.startswith(TESTIMONY_ROOT)
+        source_ref.startswith(TESTIMONY_SOURCE_PREFIX)
         for entry in artifact["results"] for source_ref in entry["source_refs"]
     )
 
@@ -99,9 +99,22 @@ def test_every_result_has_traceable_testimony_provenance():
         for query in queries:
             result = shadow_retrieve(provider, query.request)
             for item in result.items:
-                assert item.source_ref.startswith(TESTIMONY_ROOT)
+                assert item.source_ref.startswith(TESTIMONY_SOURCE_PREFIX)
                 assert item.source_ref.endswith(".md")
                 assert any(record.item.item_id == item.item_id for record in corpus)
+
+
+def test_fixture_uses_only_real_testimony_documents_and_projects():
+    corpus, queries = build_experiment()
+
+    assert len(corpus) == 17
+    assert {record.item.project for record in corpus} <= {
+        "agent_crew", "kis-trader", "metaculus", "quota",
+    }
+    assert {
+        record.item.source_ref.removeprefix(TESTIMONY_SOURCE_PREFIX) for record in corpus
+    } <= {"agent_crew.md", "kis-trader.md", "metaculus.md", "quota.md"}
+    assert "sibling-function-shape" not in {query.query_id for query in queries}
 
 
 def test_hanging_provider_is_bounded_by_existing_shadow_primitive():

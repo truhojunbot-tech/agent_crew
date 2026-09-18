@@ -18,12 +18,9 @@ from .memory import (
 )
 
 
-# Kept as a composition so the source tree contains no references to systems
-# outside this repository; evaluated values remain the traceable document paths.
-TESTIMONY_ROOT = "docs/operations/" + "al" + "fred/council-126-testimony/"
-COMPANION_PROJECT = "quota" + "_" + "core"
-COMPANION_DOCUMENT = "quota" + "-" + "core.md"
-COMPANION_ITEM_ID = "quota" + "-" + "core-sibling-drift"
+# Portable identifiers retain the testimony filename without embedding an
+# external vault path in the agent_crew core package.
+TESTIMONY_SOURCE_PREFIX = "council-126-testimony/"
 
 
 @dataclass(frozen=True)
@@ -54,7 +51,7 @@ def _record(
             item_id=item_id,
             project=project,
             memory_type="episodic",
-            source_ref=TESTIMONY_ROOT + document,
+            source_ref=TESTIMONY_SOURCE_PREFIX + document,
             created_at="2026-09-18T00:00:00Z",
             version_at="2026-09-18T00:00:00Z",
             superseded=superseded,
@@ -67,7 +64,7 @@ def _record(
 
 
 def build_experiment() -> tuple[tuple[CorpusRecord, ...], tuple[ExperimentQuery, ...]]:
-    """Return the fixed 18-record corpus and representative query judgments.
+    """Return the fixed 17-record corpus and representative query judgments.
 
     Records faithfully paraphrase the supplied Round 1 testimony summaries.
     The one constructed record is explicitly marked and exists only to prove
@@ -106,9 +103,6 @@ def build_experiment() -> tuple[tuple[CorpusRecord, ...], tuple[ExperimentQuery,
         _record("quota-review-retry-incident", "quota", "quota.md",
                 "The retry budget incident requires a bounded retry count and records REVIEW_RETRY_MAX as a canary safety constraint.",
                 exact_keys=("REVIEW_RETRY_MAX",)),
-        _record(COMPANION_ITEM_ID, COMPANION_PROJECT, COMPANION_DOCUMENT,
-                "Issue #72 found sibling function drift: two structurally identical functions existed, one received a bugfix and regression test while its sibling remained broken because matching shape was not surfaced.",
-                exact_keys=("#72", "quota" + "-core#72")),
         _record("agent-crew-reviewed-sha", "agent_crew", "agent_crew.md",
                 "A review must pin and verify the reviewed commit so a report cannot describe a different branch as if it were the task branch."),
         _record("agent-crew-review-not-run", "agent_crew", "agent_crew.md",
@@ -137,7 +131,6 @@ def build_experiment() -> tuple[tuple[CorpusRecord, ...], tuple[ExperimentQuery,
         query("metaculus-reversal-currentness", "metaculus", "Is this backtest/signal result still valid, or has it been reverted since?", ["metaculus-signal-reverted-current"], ["metaculus-signal-positive-snapshot"]),
         query("entry-filter-rejected", "kis-trader", "Has an entry-filter approach like this been tried and rejected before, and why?", ["kis-task-36-rejected", "kis-task-40-rejected"]),
         query("crew-run-acceptable", "quota", "Is crew run an acceptable tool choice for this kind of task?", ["quota-crew-run-banned"]),
-        query("sibling-function-shape", COMPANION_PROJECT, "Are there other functions in this codebase with the same shape as this one that might have the same bug?", [COMPANION_ITEM_ID]),
         query("quota-retry-scope", "quota", "What does REVIEW_RETRY_MAX mean for this task?", ["quota-review-retry-incident", "quota-crew-run-banned"], ["constructed-agent-crew-review-retry"]),
         query("agent-crew-retry-scope", "agent_crew", "What does REVIEW_RETRY_MAX mean for this task?", ["constructed-agent-crew-review-retry"]),
     )
