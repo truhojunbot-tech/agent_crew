@@ -271,3 +271,162 @@ class TestAtomicClaim(Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestRequiredRegressionsNotYetNamed(Base):
+    """#313's required regressions 4, 5 and 9, which had no named counterpart.
+
+    ⛔Written as probes FIRST, against unmodified main: all three passed, which
+      is the evidence that #313's behaviour was already delivered by #314's
+      outbox/epoch work rather than an assumption that it was. They are kept
+      because the issue asks for them by name — a behaviour nobody tests is one
+      refactor from being lost.
+    """
+
+    def _inflight(self, tid="t1", tt="implement", ctx=None):
+        self.q.enqueue(TaskRequest(task_id=tid, task_type=tt, description="d",
+                                   branch="main", priority=1,
+                                   context=ctx or {}, project="testproj"))
+        got = self.q.dequeue(role={"implement": "implementer",
+                                   "review": "reviewer"}.get(tt, "implementer"))
+        self.assertIsNotNone(got, "fixture did not claim the task")
+        return got
+
+    def test_4_failed_result_under_pause_creates_no_replacement(self):
+        """retry / provider-fallback are replacement work — requirement 2."""
+        self._inflight()
+        pause.set_pause(self.sd, True, reason="incident", incident="alfred#39")
+        before = {t.task_id for t in self.q.list_tasks()}
+        r = self._client().post("/tasks/t1/result", json={
+            "task_id": "t1", "status": "failed", "summary": "rate limit"})
+        self.assertEqual(r.status_code, 200, r.text)
+        after = {t.task_id for t in TaskQueue(self.db).list_tasks()}
+        self.assertEqual(after, before, f"replacement work created under STOP: {after - before}")
+
+    def test_5_discuss_result_under_pause_creates_no_successor(self):
+        """The discuss path is an alternate lane; one ungated lane is a bypass."""
+        self.q.enqueue(TaskRequest(task_id="d1", task_type="discuss", description="topic",
+                                   branch="main", priority=1,
+                                   context={"agent": "claude"}, project="testproj"))
+        self.assertIsNotNone(self.q.dequeue_discuss_for_agent("claude"))
+        pause.set_pause(self.sd, True, reason="incident")
+        before = {t.task_id for t in self.q.list_tasks()}
+        r = self._client().post("/tasks/d1/result", json={
+            "task_id": "d1", "status": "completed", "summary": "done"})
+        self.assertEqual(r.status_code, 200, r.text)
+        after = {t.task_id for t in TaskQueue(self.db).list_tasks()}
+        self.assertEqual(after, before, f"discuss created a successor under STOP: {after - before}")
+
+    def test_9_restart_while_paused_keeps_the_cascade_suppressed(self):
+        """Distinct from restart-preserves-pause: this asserts the CASCADE stays
+        suppressed across the restart, not merely that the claim gate does."""
+        self._inflight()
+        pause.set_pause(self.sd, True, reason="incident")
+        first = self._client()
+        first.__exit__(None, None, None)          # restart boundary
+        r = self._client().post("/tasks/t1/result", json={
+            "task_id": "t1", "status": "completed", "summary": "done"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(self._review_count(), 0,
+                         "cascade ran after a restart while paused")
+
+
+class TestMcpTransportParity(Base):
+    """★★The gap this task actually found. #313 requires EVERY alternate path.
+
+    The queue refuses a successor enqueue atomically with `PausedError`. HTTP
+    registers an exception handler that reopens the parent's outbox row and
+    answers 200 with `suppressed_by_pause`. MCP had no handling at all, so the
+    same STOP raised out of `submit_result`: the durable state was already safe
+    — result stored, outbox continuation present, no successor — but the worker
+    saw a failed submission rather than a suppression and could not tell them
+    apart.
+
+    ⛔The guard was there; the CONTRACT was not. Same transport-parity rule this
+      repo keeps relearning (#123, #302, #305).
+    """
+
+    def _mcp(self, tool, **kw):
+        import asyncio
+
+        from agent_crew.mcp_server import build_mcp_server
+
+        fn = build_mcp_server(self.db)._tool_manager._tools[tool].fn
+        return asyncio.run(fn(**kw)) if asyncio.iscoroutinefunction(fn) else fn(**kw)
+
+    def test_mcp_result_under_pause_acknowledges_instead_of_raising(self):
+        self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
+                                   branch="main", priority=1, context={}, project="testproj"))
+        self.assertIsNotNone(self.q.dequeue(role="implementer"))
+        pause.set_pause(self.sd, True, reason="incident", incident="alfred#39")
+
+        ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
+        self.assertTrue(ack.get("acknowledged"), ack)
+        self.assertTrue(ack.get("suppressed_by_pause"), ack)
+        self.assertEqual(self._review_count(), 0, "MCP cascade ran under STOP")
+
+    def test_mcp_suppression_keeps_the_lineage_replayable(self):
+        """⛔The reason the contract matters: the parent's outbox row must stay
+        pending so resume replays the stored result exactly once."""
+        self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
+                                   branch="main", priority=1, context={}, project="testproj"))
+        self.q.dequeue(role="implementer")
+        pause.set_pause(self.sd, True, reason="incident")
+        self._mcp("submit_result", task_id="t1", status="completed", summary="done")
+
+        q2 = TaskQueue(self.db)
+        self.assertIsNotNone(q2.get_result("t1"), "the result itself was lost")
+        pending = [r.get("parent_task_id")
+                   for r in q2.outbox_pending(include_replaying=True)]
+        self.assertIn("t1", pending, "the suppressed cascade is not replayable")
+
+    def test_mcp_suppression_leaves_the_row_replayable_even_after_a_claim(self):
+        """The replay property holds even when the row had been claimed.
+
+        ⚠️I wrote this expecting `outbox_reopen` to be load-bearing, and measured
+          otherwise: with the reopen deleted the test still passes, and the call
+          itself returns False. `submit_result` writes the parent's outbox row
+          atomically with the result BEFORE the cascade runs (#314 §3), so by
+          the time the STOP raises, the row is pending again on its own.
+
+          The reopen is therefore defence-in-depth on this transport, not the
+          mechanism — kept for symmetry with the HTTP handler, where the row can
+          genuinely be `applied` at raise time. Recording that here so nobody
+          reads the call as a guarantee it does not provide.
+
+        What this test does pin is the PROPERTY the issue asks for: whatever
+        provides it, a suppressed cascade must stay replayable.
+        """
+        self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
+                                   branch="main", priority=1, context={}, project="testproj"))
+        self.q.dequeue(role="implementer")
+        self.q.outbox_claim("t1", "owner-under-test")
+        self.assertNotIn("t1", [r.get("parent_task_id")
+                                for r in self.q.outbox_pending(include_replaying=False)],
+                         "fixture did not move the row out of pending")
+
+        pause.set_pause(self.sd, True, reason="incident")
+        ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
+        self.assertTrue(ack.get("suppressed_by_pause"), ack)
+        self.assertIn("t1", [r.get("parent_task_id")
+                             for r in TaskQueue(self.db).outbox_pending(include_replaying=False)],
+                      "the suppressed cascade was left unreplayable")
+
+    def test_mcp_claim_is_blocked_under_pause(self):
+        self.q.enqueue(TaskRequest(task_id="t2", task_type="implement", description="d",
+                                   branch="main", priority=1, context={}, project="testproj"))
+        pause.set_pause(self.sd, True, reason="incident")
+        got = self._mcp("get_next_task", role="implementer")
+        self.assertFalse(got and got.get("task_id"), f"MCP claimed under STOP: {got}")
+
+    def test_mcp_cascade_runs_normally_when_not_paused(self):
+        """⛔The control. Swallowing PausedError must not become swallowing the
+        cascade."""
+        self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
+                                   branch="main", priority=1, context={}, project="testproj"))
+        self.q.dequeue(role="implementer")
+        ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
+        self.assertTrue(ack.get("acknowledged"), ack)
+        self.assertFalse(ack.get("suppressed_by_pause"))
+        self.assertEqual(self._review_count(), 1, "the normal MCP cascade stopped working")
+
