@@ -7,6 +7,7 @@ checkpoint recovery, prompt construction, task routing, or retry decisions.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from time import perf_counter
 import threading
 from typing import Optional, Protocol
@@ -41,6 +42,8 @@ class MemoryRequest:
     retrieval_mode: str = "shadow"
     limit: int = 10
     pipeline: tuple[str, ...] = PIPELINE_STAGES
+    retrieval_query: str = ""
+    query_source: str = ""
 
 
 @dataclass(frozen=True)
@@ -197,9 +200,9 @@ def shadow_retrieve_bounded(provider: MemoryProvider, request: MemoryRequest,
     )
 
 
-def shadow_telemetry(result: MemoryResult) -> dict:
+def shadow_telemetry(result: MemoryResult, request: MemoryRequest | None = None) -> dict:
     """Content-free telemetry; excerpts never leave the provider boundary."""
-    return {
+    telemetry = {
         "provider": result.provider,
         "backend": result.backend,
         "state": result.state,
@@ -212,3 +215,9 @@ def shadow_telemetry(result: MemoryResult) -> dict:
         "freshness": [item.freshness for item in result.items],
         "superseded": [item.superseded for item in result.items],
     }
+    if request is not None and request.retrieval_query:
+        telemetry["query_hash"] = hashlib.sha256(
+            request.retrieval_query.encode("utf-8")
+        ).hexdigest()[:16]
+        telemetry["query_source"] = request.query_source
+    return telemetry
