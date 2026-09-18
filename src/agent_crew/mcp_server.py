@@ -42,7 +42,7 @@ from agent_crew.pipeline import (
     auto_fallback_failed_task,    hold_mismatched_pr_result,
 )
 from agent_crew.protocol import TaskRequest, TaskResult
-from agent_crew.queue import TaskQueue
+from agent_crew.queue import PausedError as _PausedError, TaskQueue
 
 logger = logging.getLogger(__name__)
 
@@ -203,6 +203,42 @@ def build_mcp_server(
         # not stall after the first stage when an agent uses MCP-only
         # delivery (#123). Push side-effects are not part of the cascade
         # contract; agents pull tasks themselves on the MCP loop.
+        # #313: runtime STOP may become authoritative mid-cascade, and the queue
+        # then refuses the successor enqueue atomically with PausedError. This
+        # transport had NO handling at all, so that STOP raised straight out of
+        # `submit_result`: the worker saw a failed submission instead of a
+        # suppression and could not tell the two apart — and a retry loop on
+        # that error would hammer a paused runtime. The durable state was
+        # already safe; the CONTRACT was not.
+        #
+        # ⛔Same transport-parity rule this repo keeps relearning: "a guard on
+        #   one transport is a guard an agent walks around by changing how it
+        #   reports" (#123, #302, #305). Here it is the suppression contract
+        #   rather than the guard, and it has to match HTTP's.
+        #
+        # ⛔This handler deliberately does NOT reopen the parent's outbox row.
+        #   Every cascade helper it calls (auto_enqueue_review / _test / _fix /
+        #   auto_fallback) already catches PausedError, reopens the parent, and
+        #   re-raises — the chokepoint is inside the one function every caller
+        #   reaches, which is where this repo keeps concluding a guard belongs.
+        #   Review of PR #335 pushed on exactly this: my first version reopened
+        #   here too, and the duplicate made BOTH copies mutation-invisible —
+        #   deleting either one left the suite green because the other
+        #   compensated, while deleting both left the row `applied` and the
+        #   refused successor unrecoverable. Two copies of a safety rule mask
+        #   each other's absence; one copy, tested, does not.
+        try:
+            _cascade_stage(queue, task_id, task_type, result, _task_ctx)
+        except _PausedError as exc:
+            logger.warning(f"[PAUSE-SUPPRESSED] mcp cascade refused: {exc} (parent={task_id})")
+            return {"acknowledged": True, "task_id": task_id, "task_type": task_type,
+                    "suppressed_by_pause": True, "cascade_suppressed": True,
+                    "detail": "runtime STOP: execution-producing mutation atomically refused"}
+
+        return {"acknowledged": True, "task_id": task_id, "task_type": task_type}
+
+    def _cascade_stage(queue, task_id, task_type, result, _task_ctx):
+        """The stage cascade itself, so the STOP handling above wraps all of it."""
         if task_type == "implement" and result.status == "completed":
             # #305 (review of PR #307): forward the result. Without it this
             # transport routes from the implement TASK's branch — `main` for
@@ -223,8 +259,6 @@ def build_mcp_server(
             auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "")
         if result.status == "failed":
             auto_fallback_failed_task(queue, task_id, result, task_type)
-
-        return {"acknowledged": True, "task_id": task_id, "task_type": task_type}
 
     @mcp.tool()
     def bump_activity(task_id: str) -> dict[str, Any]:
