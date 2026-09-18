@@ -1,8 +1,25 @@
 """GitHub integration for crew run workflow."""
 
 import json
+import logging
 import subprocess
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
+
+_MAX_GH_STDERR_LOG_CHARS = 300
+
+
+def _log_gh_failure(op: str, repo: Optional[str], pr_number: Optional[int], result) -> None:
+    """Safe, bounded failure record — never logs credentials/tokens (gh's own
+    subprocess stderr for a resolution/API error contains neither)."""
+    stderr = (getattr(result, "stderr", "") or "").strip().replace("\n", " ")
+    stderr = stderr[:_MAX_GH_STDERR_LOG_CHARS]
+    logger.warning(
+        f"github.{op}: gh failed repo={repo!r} pr={pr_number!r} "
+        f"exit_code={getattr(result, 'returncode', None)} stderr={stderr!r}"
+    )
 
 
 def check_gh_installed() -> bool:
@@ -163,6 +180,8 @@ def post_review_comment(
             text=True,
             timeout=30,
         )
+        if result.returncode != 0:
+            _log_gh_failure("post_review_comment", repo, pr_number, result)
         return result.returncode == 0
     except Exception:
         return False
@@ -221,6 +240,7 @@ def pr_has_comment_containing(pr_number: int, needle: str,
             ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "comments"],
             capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
+            _log_gh_failure("pr_has_comment_containing", repo, pr_number, r)
             return None
         comments = (json.loads(r.stdout or "{}") or {}).get("comments") or []
     except Exception:
