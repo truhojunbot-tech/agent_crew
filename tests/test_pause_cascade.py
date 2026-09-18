@@ -380,37 +380,78 @@ class TestMcpTransportParity(Base):
                    for r in q2.outbox_pending(include_replaying=True)]
         self.assertIn("t1", pending, "the suppressed cascade is not replayable")
 
-    def test_mcp_suppression_leaves_the_row_replayable_even_after_a_claim(self):
-        """The replay property holds even when the row had been claimed.
+    def _outbox_state(self, parent):
+        import sqlite3
+        conn = sqlite3.connect(self.db)
+        try:
+            row = conn.execute("SELECT state FROM cascade_outbox WHERE parent_task_id=?",
+                               (parent,)).fetchone()
+            return row[0] if row else None
+        finally:
+            conn.close()
 
-        ⚠️I wrote this expecting `outbox_reopen` to be load-bearing, and measured
-          otherwise: with the reopen deleted the test still passes, and the call
-          itself returns False. `submit_result` writes the parent's outbox row
-          atomically with the result BEFORE the cascade runs (#314 §3), so by
-          the time the STOP raises, the row is pending again on its own.
+    def test_mcp_mid_cascade_stop_reopens_the_applied_outbox_row(self):
+        """★★The actual production race, and the only case where `outbox_reopen`
+        is load-bearing. Caught by review of PR #335.
 
-          The reopen is therefore defence-in-depth on this transport, not the
-          mechanism — kept for symmetry with the HTTP handler, where the row can
-          genuinely be `applied` at raise time. Recording that here so nobody
-          reads the call as a guarantee it does not provide.
+        ⛔My first attempt at this test was worthless and I drew a false
+          conclusion from it. It called `outbox_claim` BEFORE `submit_result` —
+          but `submit_result` is the operation that INSERTs the cascade_outbox
+          row (queue.py #314 §3), so there was nothing to claim, and the
+          "row left pending" assertion passed because no row existed at all.
+          It then set the pause before submitting, so the row was BORN
+          `pending`, and `outbox_reopen` — whose WHERE clause only matches
+          `state IN ('applied','replaying')` — could never do anything. From
+          that I concluded the reopen was redundant defence-in-depth and wrote
+          it into the docstring. That conclusion was wrong.
 
-        What this test does pin is the PROPERTY the issue asks for: whatever
-        provides it, a suppressed cascade must stay replayable.
+        The row's state is decided atomically from the STOP observed at
+        result-commit time: unpaused → `applied` (a live cascade handles it
+        synchronously), paused → `pending` (the executor drains it later). So
+        the dangerous interleaving is the one where the result commits while
+        UNPAUSED — row `applied` — and STOP only becomes authoritative before
+        the successor enqueue. Without the reopen that `applied` row is never
+        replayed, and the refused successor is lost permanently.
+
+        Forced deterministically by making STOP authoritative inside the
+        cascade, between the result commit and the enqueue. The `PausedError`
+        is then raised by the real queue, not simulated.
         """
+        from unittest import mock
+
+        import agent_crew.mcp_server as mcp_server
+
         self.q.enqueue(TaskRequest(task_id="t1", task_type="implement", description="d",
                                    branch="main", priority=1, context={}, project="testproj"))
         self.q.dequeue(role="implementer")
-        self.q.outbox_claim("t1", "owner-under-test")
-        self.assertNotIn("t1", [r.get("parent_task_id")
-                                for r in self.q.outbox_pending(include_replaying=False)],
-                         "fixture did not move the row out of pending")
 
-        pause.set_pause(self.sd, True, reason="incident")
-        ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
+        _real = mcp_server.auto_enqueue_review
+
+        def _stop_lands_mid_cascade(queue, task_id, **kw):
+            queue.set_stop_epoch(True, incident="alfred#39")
+            return _real(queue, task_id, **kw)
+
+        with mock.patch.object(mcp_server, "auto_enqueue_review", _stop_lands_mid_cascade):
+            ack = self._mcp("submit_result", task_id="t1", status="completed", summary="done")
+
+        self.assertTrue(ack.get("acknowledged"), ack)
         self.assertTrue(ack.get("suppressed_by_pause"), ack)
-        self.assertIn("t1", [r.get("parent_task_id")
-                             for r in TaskQueue(self.db).outbox_pending(include_replaying=False)],
-                      "the suppressed cascade was left unreplayable")
+        self.assertEqual(self._review_count(), 0, "a successor survived the STOP")
+        self.assertEqual(self._outbox_state("t1"), "pending",
+                         "the applied outbox row was not reopened — the refused "
+                         "successor can never be replayed")
+
+        # Valid resume → the stored result replays and the lineage advances ONCE.
+        q2 = TaskQueue(self.db)
+        q2.resume_stop(generation=int(q2.get_stop_epoch()["epoch"]) + 1)
+        c = self._client()
+        self.assertEqual(c.post("/admin/replay-suppressed").status_code, 200)
+        self.assertEqual(self._review_count(), 1,
+                         "the suppressed lineage did not advance after resume")
+
+        # ⛔Exactly once: a second drain must not duplicate the successor.
+        c.post("/admin/replay-suppressed")
+        self.assertEqual(self._review_count(), 1, "replay duplicated the successor")
 
     def test_mcp_claim_is_blocked_under_pause(self):
         self.q.enqueue(TaskRequest(task_id="t2", task_type="implement", description="d",

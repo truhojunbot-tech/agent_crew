@@ -203,31 +203,34 @@ def build_mcp_server(
         # not stall after the first stage when an agent uses MCP-only
         # delivery (#123). Push side-effects are not part of the cascade
         # contract; agents pull tasks themselves on the MCP loop.
-        # #313: runtime STOP may become authoritative mid-cascade, and the
-        # queue then refuses the successor enqueue atomically with PausedError.
-        # ⛔HTTP registers a FastAPI exception handler for exactly this: it
-        #   reopens the parent's cascade_outbox row (so the stored result is
-        #   replayed once on resume) and answers 200 with
-        #   `suppressed_by_pause`. This transport had NO handling at all, so the
-        #   same STOP raised out of `submit_result` — the worker saw a failed
-        #   submission instead of a suppression, and could not tell the two
-        #   apart. The durable state was already safe; the CONTRACT was not.
+        # #313: runtime STOP may become authoritative mid-cascade, and the queue
+        # then refuses the successor enqueue atomically with PausedError. This
+        # transport had NO handling at all, so that STOP raised straight out of
+        # `submit_result`: the worker saw a failed submission instead of a
+        # suppression and could not tell the two apart — and a retry loop on
+        # that error would hammer a paused runtime. The durable state was
+        # already safe; the CONTRACT was not.
         #
         # ⛔Same transport-parity rule this repo keeps relearning: "a guard on
         #   one transport is a guard an agent walks around by changing how it
         #   reports" (#123, #302, #305). Here it is the suppression contract
-        #   rather than the guard, and it has to match.
+        #   rather than the guard, and it has to match HTTP's.
+        #
+        # ⛔This handler deliberately does NOT reopen the parent's outbox row.
+        #   Every cascade helper it calls (auto_enqueue_review / _test / _fix /
+        #   auto_fallback) already catches PausedError, reopens the parent, and
+        #   re-raises — the chokepoint is inside the one function every caller
+        #   reaches, which is where this repo keeps concluding a guard belongs.
+        #   Review of PR #335 pushed on exactly this: my first version reopened
+        #   here too, and the duplicate made BOTH copies mutation-invisible —
+        #   deleting either one left the suite green because the other
+        #   compensated, while deleting both left the row `applied` and the
+        #   refused successor unrecoverable. Two copies of a safety rule mask
+        #   each other's absence; one copy, tested, does not.
         try:
             _cascade_stage(queue, task_id, task_type, result, _task_ctx)
         except _PausedError as exc:
-            try:
-                _reopened = queue.outbox_reopen(task_id)
-            except Exception:  # noqa: BLE001
-                _reopened = False
-                logger.exception("mcp submit_result: outbox reopen failed (still suppressed)")
-            logger.warning(
-                f"[PAUSE-SUPPRESSED] mcp cascade refused: {exc} "
-                f"(parent={task_id}, outbox_reopened={_reopened})")
+            logger.warning(f"[PAUSE-SUPPRESSED] mcp cascade refused: {exc} (parent={task_id})")
             return {"acknowledged": True, "task_id": task_id, "task_type": task_type,
                     "suppressed_by_pause": True, "cascade_suppressed": True,
                     "detail": "runtime STOP: execution-producing mutation atomically refused"}
