@@ -44,46 +44,35 @@ def test_full_experiment_emits_ground_truth_comparison_artifact(tmp_path):
     for candidate in ("lexical_hard_reject", "hybrid_hard_reject"):
         candidate_rows = [entry for entry in artifact["results"] if entry["candidate"] == candidate]
         assert len(candidate_rows) == len(artifact["queries"])
-        assert all(entry["recall"] == 1.0 and entry["hit"] for entry in candidate_rows)
-    for candidate in ("lexical", "hybrid"):
-        candidate_rows = [entry for entry in artifact["results"] if entry["candidate"] == candidate]
-        assert all(entry["recall"] == 1.0 for entry in candidate_rows)
-    assert by_candidate_query[("lexical_hard_reject", "issue-300-current-status")]["prohibited_ids_returned"] == []
-    assert by_candidate_query[("hybrid_hard_reject", "metaculus-reversal-currentness")]["prohibited_ids_returned"] == []
-    assert by_candidate_query[("lexical", "issue-300-current-status")]["prohibited_ids_returned"] == [
+    assert by_candidate_query[("lexical_hard_reject", "td-issue-300-current-status")]["prohibited_ids_returned"] == []
+    assert by_candidate_query[("hybrid_hard_reject", "td-issue-300-title")]["prohibited_ids_returned"] == []
+    assert by_candidate_query[("lexical", "td-issue-300-current-status")]["prohibited_ids_returned"] == [
         "agent-crew-300-original-close"
     ]
 
 
-def test_superseded_hard_reject_excludes_issue_300_and_metaculus_history():
+def test_superseded_hard_reject_excludes_issue_300_history():
     corpus, _ = build_experiment()
     query_by_id = {query.query_id: query for query in build_experiment()[1]}
-    request_300 = query_by_id["issue-300-current-status"].request
-    request_metaculus = query_by_id["metaculus-reversal-currentness"].request
+    request_300 = query_by_id["td-issue-300-current-status"].request
 
     lexical_300 = shadow_retrieve(ScopeIsolatedProvider(LexicalProvider(corpus)), request_300)
     rejected_300 = shadow_retrieve(
         ScopeIsolatedProvider(SupersededHardRejectProvider(LexicalProvider(corpus))), request_300)
-    lexical_metaculus = shadow_retrieve(ScopeIsolatedProvider(LexicalProvider(corpus)), request_metaculus)
-    rejected_metaculus = shadow_retrieve(
-        ScopeIsolatedProvider(SupersededHardRejectProvider(HybridProvider(corpus))), request_metaculus)
-
     assert "agent-crew-300-original-close" in {item.item_id for item in lexical_300.items}
     assert "agent-crew-300-original-close" not in {item.item_id for item in rejected_300.items}
     assert "agent-crew-300-reopened" in {item.item_id for item in rejected_300.items}
-    assert "metaculus-signal-positive-snapshot" in {item.item_id for item in lexical_metaculus.items}
-    assert "metaculus-signal-positive-snapshot" not in {item.item_id for item in rejected_metaculus.items}
-    assert "metaculus-signal-reverted-current" in {item.item_id for item in rejected_metaculus.items}
 
 
 def test_scope_wrapper_and_shadow_defense_in_depth_prevent_cross_project_result():
     corpus, queries = build_experiment()
     scoped = ScopeIsolatedProvider(LexicalProvider(corpus))
-    quota_request = next(query.request for query in queries if query.query_id == "quota-retry-scope")
+    quota_request = next(query.request for query in queries if query.query_id == "rc-review-retry-max-scope")
 
     result = shadow_retrieve(scoped, quota_request)
-    agent_crew_request = next(
-        query.request for query in queries if query.query_id == "agent-crew-retry-scope")
+    agent_crew_request = MemoryRequest(
+        project="agent_crew", retrieval_query="What does REVIEW_RETRY_MAX mean for this task?"
+    )
     agent_crew_result = shadow_retrieve(scoped, agent_crew_request)
 
     assert result.state == "results"

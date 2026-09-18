@@ -37,6 +37,10 @@ class ExperimentQuery:
     """A representative historical question and its deterministic judgment."""
 
     query_id: str
+    source: str
+    original_query: str
+    effective_query: str
+    label_provenance: str
     request: MemoryRequest
     expected_ids: frozenset[str]
     prohibited_ids: frozenset[str] = frozenset()
@@ -119,20 +123,36 @@ def build_experiment() -> tuple[tuple[CorpusRecord, ...], tuple[ExperimentQuery,
                 "Constructed scope-isolation fixture: REVIEW_RETRY_MAX is an unrelated documentation label for this project.",
                 exact_keys=("REVIEW_RETRY_MAX",)),
     )
-    def query(query_id: str, project: str, text: str, expected: Iterable[str], prohibited: Iterable[str] = ()) -> ExperimentQuery:
+    def query(
+        query_id: str, source: str, original_query: str, effective_query: str,
+        label_provenance: str, project: str, expected: Iterable[str],
+        prohibited: Iterable[str] = (),
+    ) -> ExperimentQuery:
         return ExperimentQuery(
             query_id=query_id,
-            request=MemoryRequest(project=project, task_id="326", context_id=text, limit=10),
+            source=source,
+            original_query=original_query,
+            effective_query=effective_query,
+            label_provenance=label_provenance,
+            request=MemoryRequest(
+                project=project, task_id="328", retrieval_query=effective_query,
+                query_source=label_provenance.lower(), limit=10,
+            ),
             expected_ids=frozenset(expected), prohibited_ids=frozenset(prohibited),
         )
     queries = (
-        query("root-cause-falsified", "agent_crew", "What prior root-cause theory for this class of symptom was tried and falsified?", ["agent-crew-301-misdiagnosis"]),
-        query("issue-300-current-status", "agent_crew", "What is the current, up-to-date status of issue #300 — is it still open, and is there evidence beyond the original close?", ["agent-crew-300-reopened"], ["agent-crew-300-original-close"]),
-        query("metaculus-reversal-currentness", "metaculus", "Is this backtest/signal result still valid, or has it been reverted since?", ["metaculus-signal-reverted-current"], ["metaculus-signal-positive-snapshot"]),
-        query("entry-filter-rejected", "kis-trader", "Has an entry-filter approach like this been tried and rejected before, and why?", ["kis-task-36-rejected", "kis-task-40-rejected"]),
-        query("crew-run-acceptable", "quota", "Is crew run an acceptable tool choice for this kind of task?", ["quota-crew-run-banned"]),
-        query("quota-retry-scope", "quota", "What does REVIEW_RETRY_MAX mean for this task?", ["quota-review-retry-incident", "quota-crew-run-banned"], ["constructed-agent-crew-review-retry"]),
-        query("agent-crew-retry-scope", "agent_crew", "What does REVIEW_RETRY_MAX mean for this task?", ["constructed-agent-crew-review-retry"]),
+        query("td-codex-sandbox-hang", "council-126-testimony/agent_crew.md#8", "Has this exact codex exec sandbox hang signature been seen before on this test/suite, and was it ever a real bug or always an artifact?", "Has this exact codex exec sandbox hang signature been seen before on this test/suite, and was it ever a real bug or always an artifact?", "TESTIMONY_DERIVED", "agent_crew", []),
+        query("td-telemetry-offset-mismatch", "council-126-testimony/agent_crew.md#8", "What was the actual root cause the last time a telemetry/context-boundary test failed with a similar offset/session_id mismatch symptom?", "What was the actual root cause the last time a telemetry/context-boundary test failed with a similar offset/session_id mismatch symptom?", "TESTIMONY_DERIVED", "agent_crew", []),
+        query("td-stop-gating-rejected-approaches", "council-126-testimony/agent_crew.md#8", "What prior approaches to fixing this class of STOP-propagation / pause-gating gap were tried and rejected, and why?", "What prior approaches to fixing this class of STOP-propagation / pause-gating gap were tried and rejected, and why?", "TESTIMONY_DERIVED", "agent_crew", ["agent-crew-301-misdiagnosis", "agent-crew-300-reopened"], ["agent-crew-300-original-close"]),
+        query("td-issue-300-current-status", "council-126-testimony/agent_crew.md#8", "What is the current, up-to-date status of issue #300 — is it still open, and what's the latest evidence, superseding any earlier close?", "What is the current, up-to-date status of issue #300 — is it still open, and what's the latest evidence, superseding any earlier close?", "TESTIMONY_DERIVED", "agent_crew", ["agent-crew-300-reopened"], ["agent-crew-300-original-close"]),
+        query("td-fstring-python-version-gotcha", "council-126-testimony/agent_crew.md#8", "Has this exact Python-version (3.10 vs 3.12) f-string gotcha class been hit before in this repo, and how was it fixed?", "Has this exact Python-version (3.10 vs 3.12) f-string gotcha class been hit before in this repo, and how was it fixed?", "TESTIMONY_DERIVED", "agent_crew", []),
+        query("td-issue-300-title", "github_issue:agent_crew#300 (title)", "possible regression: shared-branch-ref corruption symptoms recurring on alpha_engine after implementer role now alternates claude/codex", "possible regression: shared-branch-ref corruption symptoms recurring on alpha_engine after implementer role now alternates claude/codex", "TASK_DESCRIPTION", "agent_crew", ["agent-crew-300-reopened"], ["agent-crew-300-original-close"]),
+        query("td-issue-301-title", "github_issue:agent_crew#301 (title)", "review tasks for a branch in another repo fail exit_1 and drive an implement/review loop", "review tasks for a branch in another repo fail exit_1 and drive an implement/review loop", "TASK_DESCRIPTION", "agent_crew", ["agent-crew-301-misdiagnosis"]),
+        query("td-issue-313-title", "github_issue:agent_crew#313 (title)", "[P0][SAFETY] Gate result cascades + make claim pause check atomic under runtime STOP", "[P0][SAFETY] Gate result cascades + make claim pause check atomic under runtime STOP", "TASK_DESCRIPTION", "agent_crew", []),
+        query("rc-no-project-wide-resume", "state.json#ruled_out (2026-09-18 snapshot)", "Using a project-wide gen6/full-project resume of agent_crew's queue/dispatcher to run an independent code review or a shadow/offline experiment", "Using a project-wide gen6/full-project resume of agent_crew's queue/dispatcher to run an independent code review or a shadow/offline experiment", "ROOT_CAUSE_QUESTION", "agent_crew", []),
+        query("rc-no-raw-sql-park-backlog", "state.json#ruled_out (2026-09-18 snapshot)", "Temporarily parking unrelated pending backlog tasks (e.g. via a raw SQL status='blocked' update) as a workaround to allow a scoped project resume without risking those tasks being claimed", "Temporarily parking unrelated pending backlog tasks (e.g. via a raw SQL status='blocked' update) as a workaround to allow a scoped project resume without risking those tasks being claimed", "ROOT_CAUSE_QUESTION", "agent_crew", []),
+        query("rc-no-trust-codex-self-report", "state.json#ruled_out (2026-09-18 snapshot)", "Trusting codex exec's own self-reported test pass/fail counts, root-cause diagnoses, or portability-grep results without independent re-verification", "Trusting codex exec's own self-reported test pass/fail counts, root-cause diagnoses, or portability-grep results without independent re-verification", "ROOT_CAUSE_QUESTION", "agent_crew", []),
+        query("rc-review-retry-max-scope", "github_issue:agent_crew#326 review round1 finding", "What does REVIEW_RETRY_MAX mean for this task?", "What does REVIEW_RETRY_MAX mean for this task?", "ROOT_CAUSE_QUESTION", "quota", ["quota-review-retry-incident", "quota-crew-run-banned"], ["constructed-agent-crew-review-retry"]),
     )
     return corpus, queries
 
@@ -184,7 +204,7 @@ class ExactLookupProvider(_CorpusProvider):
     name = "exact_lookup"
 
     def score(self, record: CorpusRecord, request: MemoryRequest) -> float:
-        question = request.context_id.lower()
+        question = request.retrieval_query.lower()
         return float(sum(key.lower() in question for key in record.exact_keys))
 
 
@@ -194,7 +214,7 @@ class LexicalProvider(_CorpusProvider):
     name = "lexical"
 
     def score(self, record: CorpusRecord, request: MemoryRequest) -> float:
-        return float(len(_tokens(request.context_id) & _tokens(record.text)))
+        return float(len(_tokens(request.retrieval_query) & _tokens(record.text)))
 
 
 class HybridProvider(_CorpusProvider):
@@ -203,7 +223,7 @@ class HybridProvider(_CorpusProvider):
     name = "hybrid"
 
     def score(self, record: CorpusRecord, request: MemoryRequest) -> float:
-        query_tokens = _tokens(request.context_id)
+        query_tokens = _tokens(request.retrieval_query)
         record_tokens = _tokens(record.text)
         overlap = len(query_tokens & record_tokens)
         if not overlap:
