@@ -211,7 +211,12 @@ class TestReviewCommentReconciliation(Base):
             c = self._client()
             self.q.enqueue(TaskRequest(task_id="rev-x", task_type="review", description="r",
                                        branch="main", priority=1,
-                                       context={"pr_number": 77}, project="testproj"))
+                                       # #330: repo identity is now resolved explicitly
+                                       # (ctx.repo, else reviewer worktree) and fails
+                                       # closed otherwise; supply it so this test keeps
+                                       # exercising reconciliation, not the new gate.
+                                       context={"pr_number": 77, "repo": "truhojunbot-tech/agent_crew"},
+                                       project="testproj"))
             self.q.dequeue(role="reviewer")
             # crash 시뮬레이션: 게시는 됐지만 done 기록 전 죽어 reserved만 남은 상태
             self.q.external_op_reserve("comment:review:rev-x", pr_number=77)
@@ -236,7 +241,9 @@ class TestReviewCommentReconciliation(Base):
             c = self._client()
             self.q.enqueue(TaskRequest(task_id="rev-y", task_type="review", description="r",
                                        branch="main", priority=1,
-                                       context={"pr_number": 78}, project="testproj"))
+                                       # #330: see test_crash_after_post_before_done_no_double_post
+                                       context={"pr_number": 78, "repo": "truhojunbot-tech/agent_crew"},
+                                       project="testproj"))
             self.q.dequeue(role="reviewer")
             self.q.external_op_reserve("comment:review:rev-y", pr_number=78)  # 기존 reserved
             r = c.post("/tasks/rev-y/result",

@@ -39,7 +39,13 @@ def _review_payload(task_id, pr_number):
         "description": "Review PR",
         "branch": "agent/agent_crew/claude",
         "priority": 3,
-        "context": {"pr_number": pr_number},
+        # #330: the review-comment path now resolves repo identity explicitly
+        # (ctx.repo, else the reviewer's worktree remote) and fails closed
+        # when neither resolves, instead of inferring from process cwd. This
+        # fixture is about verdict resolution (#208), not repo identity, so
+        # it supplies an explicit repo to keep exercising the verdict logic
+        # without depending on the now-removed cwd inference.
+        "context": {"pr_number": pr_number, "repo": "truhojunbot-tech/agent_crew"},
         "project": "",
     }
 

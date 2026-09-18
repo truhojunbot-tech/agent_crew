@@ -34,6 +34,7 @@ from agent_crew.context_identity import (
     record_context_event,
 )
 from agent_crew.fallback import is_rate_limit_error
+from agent_crew.github import get_repo
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
     auto_enqueue_fix as _pipeline_auto_enqueue_fix,
@@ -4722,6 +4723,9 @@ def create_app(
             _pub = None
             if task_type == "review":
                 _review_pr = result.pr_number or (ctx.get("pr_number") if isinstance(ctx, dict) else None)
+                _review_ctx_repo = (ctx.get("repo") if isinstance(ctx, dict) else "") or ""
+                _reviewer_wt = (_load_worktree_map(state_path) or {}).get("reviewer", "")
+                _review_repo = _review_ctx_repo or (get_repo(cwd=_reviewer_wt) if _reviewer_wt else "") or ""
                 # #304: a verdict describes the commit that was READ. If the PR
                 # head has moved since this review was prepared, posting it
                 # attributes a judgement to code the reviewer never saw — a
@@ -4731,8 +4735,8 @@ def create_app(
                 # on again with no head-anchored review anywhere.
                 _pub = review_publication_decision(
                     ctx if isinstance(ctx, dict) else {}, _review_pr,
-                    repo=(ctx.get("repo") if isinstance(ctx, dict) else "") or "",
-                    repo_cwd=(_load_worktree_map(state_path) or {}).get("reviewer", ""),
+                    repo=_review_repo,
+                    repo_cwd=_reviewer_wt,
                 ) if _review_pr else None
                 if _pub is not None and not _pub.publish:
                     logger.warning(
@@ -4770,6 +4774,17 @@ def create_app(
                                        f"STOP admission 거부(PR #{_review_pr}, {_cresv.get('state')})")
                     elif _cresv.get("state") == "done":
                         logger.info(f"POST /tasks/{task_id}/result: review comment 이미 done(receipt) — skip")
+                    elif not _review_repo:
+                        q().external_op_mark(
+                            _cop, "failed",
+                            last_error="repo identity unresolved (no ctx.repo, no reviewer worktree remote) "
+                                       "— fail-closed, no external mutation attempted",
+                            inc_attempt=True,
+                        )
+                        logger.warning(
+                            f"POST /tasks/{task_id}/result: review comment 억제 — repo identity 미확정, "
+                            f"fail-closed(PR #{_review_pr}, mutation 0)"
+                        )
                     else:
                         # #314 재리뷰: review comment crash reconciliation. 게시 성공→done 기록 전
                         # crash면 DB엔 reserved만 남고 재진입 시 중복 게시될 수 있다. merge의 pr_state
@@ -4781,7 +4796,7 @@ def create_app(
                         _marker = f"task: {task_id}"
                         _do_post = True
                         if not _cresv.get("reserved"):   # 기존 reserved = crash 의심 → 먼저 재확인
-                            _existing = pr_has_comment_containing(int(_review_pr), _marker)
+                            _existing = pr_has_comment_containing(int(_review_pr), _marker, repo=_review_repo)
                             if _existing is True:
                                 q().external_op_mark(_cop, "done")
                                 logger.info(f"POST /tasks/{task_id}/result: review comment already on "
@@ -4803,6 +4818,7 @@ def create_app(
                                 findings=result.findings or [],
                                 task_id=task_id,
                                 reviewer=_reviewer_agent,
+                                repo=_review_repo,
                             )
                             if _ok:
                                 q().external_op_mark(_cop, "done")
