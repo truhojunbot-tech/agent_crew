@@ -10,6 +10,7 @@ import time
 _logger = logging.getLogger(__name__)
 
 from agent_crew import instructions, session
+from agent_crew.role_mapping import DEFAULT_AGENT_TO_ROLE
 
 _AGENT_CMDS = {
     "claude": "claude --dangerously-skip-permissions --continue --model claude-sonnet-5",
@@ -495,7 +496,7 @@ def _convert_origin_to_ssh_if_safe(project_path: str) -> None:
         )
 
 
-_AGENT_TO_ROLE = {"claude": "implementer", "codex": "reviewer", "gemini": "tester"}
+_AGENT_TO_ROLE = dict(DEFAULT_AGENT_TO_ROLE)
 
 
 def _iter_role_entries(

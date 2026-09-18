@@ -11,6 +11,7 @@ import time
 import click
 
 from agent_crew import setup as setup_module
+from agent_crew.role_mapping import resolve_role_to_agent
 
 _DEFAULT_BASE = os.path.expanduser("~/.agent_crew")
 _DEFAULT_AGENTS = "claude,codex,gemini"
@@ -597,6 +598,64 @@ def crew():
     """agent_crew — multi-agent development crew CLI."""
 
 
+_STANDARD_ROLES = ("implementer", "reviewer", "tester")
+
+
+def _parse_role_assignments(assignments: tuple[str, ...]) -> dict[str, str]:
+    """Validate ``role=agent`` CLI tokens before any state is touched."""
+    mapping: dict[str, str] = {}
+    for assignment in assignments:
+        if assignment.count("=") != 1:
+            raise click.ClickException(f"Invalid role assignment: {assignment!r}. Use ROLE=AGENT.")
+        role, agent = assignment.split("=", 1)
+        if not role or not agent:
+            raise click.ClickException(f"Invalid role assignment: {assignment!r}. Use ROLE=AGENT.")
+        if role not in _STANDARD_ROLES:
+            raise click.ClickException(f"Unknown role: {role!r}.")
+        if role in mapping:
+            raise click.ClickException(f"Duplicate role assignment: {role!r}.")
+        mapping[role] = agent
+
+    missing = [role for role in _STANDARD_ROLES if role not in mapping]
+    if missing:
+        raise click.ClickException(f"Missing role assignments: {', '.join(missing)}.")
+    return {role: mapping[role] for role in _STANDARD_ROLES}
+
+
+@crew.group("roles")
+def roles():
+    """Set and inspect per-project role-to-agent mappings."""
+
+
+@roles.command("set")
+@click.argument("project")
+@click.argument("assignments", nargs=-1, required=True)
+@click.option("--base", default=_DEFAULT_BASE, show_default=True, help="Base directory for state/worktrees")
+def roles_set(project: str, assignments: tuple[str, ...], base: str):
+    """Persist all standard ROLE=AGENT assignments for PROJECT."""
+    mapping = _parse_role_assignments(assignments)
+    existing_state = _read_state(base, project)
+    state = dict(existing_state) if existing_state is not None else {"project": project}
+    state["explicit_role_to_agent"] = mapping
+    _write_state(base, project, state)
+    click.echo(f"Set roles for {project}: " + ", ".join(f"{role}={mapping[role]}" for role in _STANDARD_ROLES))
+
+
+@roles.command("show")
+@click.argument("project")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True, help="Base directory for state/worktrees")
+def roles_show(project: str, base: str):
+    """Display PROJECT's resolved role-to-agent mapping without writing state."""
+    mapping, source = resolve_role_to_agent(_read_state(base, project))
+    click.echo(f"Project: {project}")
+    click.echo(f"Source: {source}")
+    for role in _STANDARD_ROLES:
+        if role in mapping:
+            click.echo(f"{role}: {mapping[role]}")
+    for role in sorted(role for role in mapping if role not in _STANDARD_ROLES):
+        click.echo(f"{role}: {mapping[role]}")
+
+
 @crew.command()
 @click.argument("project")
 @click.option("--agents", default=_DEFAULT_AGENTS,
@@ -884,7 +943,7 @@ def setup(project: str, agents: str, base: str):
     # Write state.json BEFORE starting the server so the server reads correct
     # worktrees from state.json on startup. server_pid is backfilled below.
     db_file = os.path.join(proj_dir, "tasks.db")
-    _write_state(base, project, {
+    state = {
         "project": project,
         "port": port,
         "port_file": port_file,
@@ -900,7 +959,10 @@ def setup(project: str, agents: str, base: str):
         "server_pid": 0,
         "sessions_file": sessions_file,
         "dispatcher_mode": _dispatcher_mode,
-    })
+    }
+    if existing_state is not None and "explicit_role_to_agent" in existing_state:
+        state["explicit_role_to_agent"] = existing_state["explicit_role_to_agent"]
+    _write_state(base, project, state)
 
     # Start server — skip if reusing existing server (pane-only recreation path).
     if not _reuse_server:

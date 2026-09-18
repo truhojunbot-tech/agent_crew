@@ -13,6 +13,12 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
+from agent_crew.role_mapping import (
+    DEFAULT_AGENT_TO_ROLE as _DEFAULT_AGENT_TO_ROLE,
+    DEFAULT_ROLE_TO_AGENT as _DEFAULT_ROLE_TO_AGENT,
+    resolve_role_to_agent,
+)
+
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
@@ -734,10 +740,6 @@ def _review_result_is_actionable(result) -> bool:
       spent are not. That asymmetry is the whole argument (#250).
     """
     return getattr(result, "status", None) in (None, "completed")
-
-
-_DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}
-_DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 
 
 # Tags that mean "retryable in the next few minutes" (server-side load-shed).
@@ -1468,26 +1470,21 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
 
 
 def _load_role_to_agent(state_path: Optional[str]) -> dict[str, str]:
-    """Load {role: agent_name} mapping from state.json's roles list.
+    """Load {role: agent_name} mapping from a project's state.json.
 
-    Falls back to the hardcoded default when state.json lacks a roles list
-    (legacy setups). Always returns all 3 roles populated — missing roles
-    default to the legacy assignment.
+    ``explicit_role_to_agent`` is returned as the complete mapping when
+    present, so it may omit legacy roles. Legacy ``roles`` entries overlay the
+    hardcoded defaults; absent state falls back to those defaults.
     """
-    result = dict(_DEFAULT_ROLE_TO_AGENT)
     if not state_path or not os.path.exists(state_path):
-        return result
+        return resolve_role_to_agent(None)[0]
     try:
         with open(state_path) as f:
             state = json.load(f)
-        for r in state.get("roles") or []:
-            role = r.get("role")
-            agent = r.get("agent")
-            if role and agent:
-                result[role] = agent
+        return resolve_role_to_agent(state)[0]
     except Exception:
         logger.exception("_load_role_to_agent: failed to read state.json")
-    return result
+        return resolve_role_to_agent(None)[0]
 
 
 _THINKING_TAIL_LINES = 10
