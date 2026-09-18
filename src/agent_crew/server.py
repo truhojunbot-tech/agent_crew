@@ -7,7 +7,6 @@ import os
 import re
 import signal
 import subprocess
-import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -58,11 +57,6 @@ from agent_crew.testing_policy import (
 )
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="[%(asctime)s] %(levelname)s: %(message)s",
-    stream=sys.stderr,
-)
 
 
 class ResolveBody(BaseModel):
