@@ -233,7 +233,8 @@ def test_exhausting_the_budget_says_so_on_the_pr(q, monkeypatch):
 
     auto_enqueue_fix(q, review_id, pr_state_fn=_open,
                      already_announced_fn=lambda pr, marker: False,
-                     comment_fn=lambda pr, body: posted.append((pr, body)))
+                     comment_fn=lambda pr, body: posted.append((pr, body)),
+                     repo="owner/repo")
 
     assert len(posted) == 1
     pr, body = posted[0]

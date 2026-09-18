@@ -137,7 +137,8 @@ def hold_mismatched_pr_result(task_id: str, result: TaskResult,
     )
 
 
-def pr_is_actionable(pr_number, *, pr_state_fn=None) -> tuple:
+def pr_is_actionable(pr_number, *, pr_state_fn=None, repo: str = "",
+                     repo_cwd: str = "") -> tuple:
     """``(actionable, state)`` — may the cascade still create work for this PR?
 
     A round budget bounds ONE lineage; it does not make the work useful. #250
@@ -162,25 +163,33 @@ def pr_is_actionable(pr_number, *, pr_state_fn=None) -> tuple:
     """
     if not pr_number:
         return (True, "no_pr")
+    if pr_state_fn is None and not repo and not repo_cwd:
+        logger.warning(
+            f"pr_is_actionable: no repo identity for PR #{pr_number} (no explicit repo, "
+            f"no worktree) — treating as unknown rather than inferring from process cwd"
+        )
+        return (False, "unknown")
     try:
         if pr_state_fn is not None:
             state = pr_state_fn(int(pr_number))
         else:
             from agent_crew.github import pr_state as _pr_state
 
-            state = _pr_state(int(pr_number))
+            state = _pr_state(int(pr_number), repo=repo or None, cwd=repo_cwd or None)
     except Exception as e:  # noqa: BLE001 — a lookup never breaks a cascade
         logger.warning(f"pr_is_actionable: lookup failed for PR #{pr_number}: {e}")
         return (False, "unknown")
     return (state == "open", state or "unknown")
 
 
-def _skip_terminal_pr(what: str, task_id: str, pr_number, *, pr_state_fn=None) -> Optional[str]:
+def _skip_terminal_pr(what: str, task_id: str, pr_number, *, pr_state_fn=None,
+                      repo: str = "", repo_cwd: str = "") -> Optional[str]:
     """Shared guard for the cascade entry points.
 
     Returns the blocking state, or ``None`` when the cascade may proceed.
     """
-    actionable, state = pr_is_actionable(pr_number, pr_state_fn=pr_state_fn)
+    actionable, state = pr_is_actionable(pr_number, pr_state_fn=pr_state_fn,
+                                         repo=repo, repo_cwd=repo_cwd)
     if actionable:
         return None
     if state == "unknown":
@@ -274,7 +283,7 @@ def review_head_status(
 
     # ⛔The repository must be named, not inferred from the process's working
     #   directory. The server runs in the instance directory, which belongs to
-    #   a DIFFERENT repository — `get_repo()` there answers a different slug, so
+    #   a DIFFERENT repository — an implicit repository lookup there answers a different slug, so
     #   the head lookup asks the wrong repo about this PR number and returns
     #   nothing (review of PR #255). Same root cause as the reviewer-branch
     #   resolution fixed in PR #251: `gh` inheriting a cwd nobody chose.
@@ -543,7 +552,7 @@ def auto_enqueue_fix(
         # Checked BEFORE the budget so an exhausted lineage on a merged PR stays
         # silent instead of announcing itself to an already-decided artifact.
         if _skip_terminal_pr("auto_enqueue_fix", review_task_id, pr_number,
-                             pr_state_fn=pr_state_fn):
+                             pr_state_fn=pr_state_fn, repo=repo, repo_cwd=repo_cwd):
             return None
 
         # #253: the finding has to be about the CURRENT code, not about a state
@@ -593,7 +602,7 @@ def auto_enqueue_fix(
                     pr_number=pr_number, review_task_id=review_task_id,
                     max_rounds=max_rounds, findings=review_result.findings or [],
                     comment_fn=comment_fn, already_announced_fn=already_announced_fn,
-                    queue=queue)
+                    queue=queue, repo=repo, repo_cwd=repo_cwd)
                 try:
                     queue.external_op_mark(_cop, "done")
                 except Exception:
@@ -692,7 +701,7 @@ def auto_enqueue_fix(
 def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
                                    max_rounds: int, findings: list,
                                    comment_fn=None, already_announced_fn=None,
-                                   queue=None) -> None:
+                                   queue=None, repo: str = "", repo_cwd: str = "") -> None:
     """Say on the PR that automation has stopped. Best-effort, never raises.
 
     ⛔A silent stop is the worst outcome available here: the PR would simply go
@@ -709,6 +718,8 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
     if not pr_number:
         return
     pr_number = int(pr_number)
+    from agent_crew.github import get_repo
+    _fix_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
 
     # ⛔The claim comes FIRST, and it is a row, not a question. Asking GitHub
     #   "is the notice already there?" and then posting is check-then-act: two
@@ -743,7 +754,7 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
         else:
             from agent_crew.github import pr_has_comment_containing
 
-            seen = pr_has_comment_containing(pr_number, FIX_EXHAUSTED_MARKER)
+            seen = pr_has_comment_containing(pr_number, FIX_EXHAUSTED_MARKER, repo=_fix_repo)
     except Exception as e:  # noqa: BLE001
         # ⛔A failing best-effort check must not swallow the escalation. It is
         #   the same rule as `None`: when we cannot tell, we post.
@@ -792,13 +803,25 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
         except Exception:  # noqa: BLE001
             pass            # cannot verify ownership → fall through and post
 
+    if not _fix_repo:
+        logger.warning(
+            f"auto_enqueue_fix: canonical repo identity unresolved — not posting the "
+            f"fix-budget notice for PR #{pr_number}, mutation 0"
+        )
+        if queue is not None and claim_token:
+            try:
+                queue.release_pr_announcement(pr_number, FIX_EXHAUSTED_KIND, claim_token)
+            except Exception:  # noqa: BLE001
+                pass
+        return
+
     try:
         if comment_fn is not None:
             comment_fn(pr_number, body)
         else:
             from agent_crew.github import post_pr_comment
 
-            if not post_pr_comment(pr_number, body):
+            if not post_pr_comment(pr_number, body, repo=_fix_repo):
                 raise RuntimeError(
                     f"post_pr_comment returned False for PR #{pr_number} "
                     f"(gh not installed, repo unresolved, or gh exited non-zero)"
@@ -840,6 +863,7 @@ def auto_enqueue_review(
     server_project: Optional[str] = None,
     pr_state_fn=None,
     result=None,
+    repo_cwd: str = "",
 ) -> Optional[str]:
     """Create the review task that follows a completed impl task.
 
@@ -857,6 +881,9 @@ def auto_enqueue_review(
             return None
         impl_task = impl_tasks[0]
         impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
+        from agent_crew.github import get_repo
+        _impl_repo = (impl_ctx.get("repo") or "") or (
+            get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
 
         # #305: route to where the implementer actually pushed, not to the
         # branch the TASK happened to name.
@@ -899,7 +926,7 @@ def auto_enqueue_review(
 
         # #250: reviewing a merged/closed PR cannot change the artifact.
         if _skip_terminal_pr("auto_enqueue_review", impl_task_id, pr_number,
-                             pr_state_fn=pr_state_fn):
+                             pr_state_fn=pr_state_fn, repo=_impl_repo, repo_cwd=repo_cwd):
             return None
 
         # #161: no-PR guard — if the impl task has neither a branch nor a
@@ -974,10 +1001,11 @@ def auto_enqueue_review(
         # #244: carry the fix-round counter along the lineage. Without this the
         # counter resets every time a fix task produces a fresh review, and the
         # cap that makes review→fix safe to automate would never be reached.
-        for key in ("fix_round", "issue", "issue_title", "issue_body",
-                    "issue_url", "repo"):
+        for key in ("fix_round", "issue", "issue_title", "issue_body", "issue_url"):
             if impl_ctx.get(key) is not None:
                 review_context[key] = impl_ctx[key]
+        if _impl_repo:
+            review_context["repo"] = _impl_repo
 
         # #305: pin the review to the commit the implementer actually pushed.
         # ⛔Only when it is a real object id — `TaskResult` normalises anything
@@ -1035,6 +1063,8 @@ def auto_enqueue_test(
     *,
     pane_map: Optional[dict] = None,
     pr_state_fn=None,
+    repo: str = "",
+    repo_cwd: str = "",
 ) -> Optional[str]:
     """Create the test task that follows an approved review.
 
@@ -1059,6 +1089,9 @@ def auto_enqueue_test(
         # Propagate upstream agent identities so review/test fallback can
         # avoid self-review and self-test (#117).
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
+        from agent_crew.github import get_repo
+        _test_repo = repo or (review_ctx.get("repo") or "") or (
+            get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         implementer_agent = review_ctx.get("implementer_agent")
         reviewer_agent = (
             review_ctx.get("agent_override")
@@ -1068,11 +1101,13 @@ def auto_enqueue_test(
         pr_number = review_ctx.get("pr_number")
         # #250: same gate — a merged PR does not need testing on our account.
         if _skip_terminal_pr("auto_enqueue_test", review_task_id, pr_number,
-                             pr_state_fn=pr_state_fn):
+                             pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
         test_context: dict = {"prev_task_id": review_task_id}
         if pr_number is not None:
             test_context["pr_number"] = pr_number  # #171: propagate for post-test merge
+        if _test_repo:
+            test_context["repo"] = _test_repo
         if implementer_agent:
             test_context["implementer_agent"] = implementer_agent
         if reviewer_agent:

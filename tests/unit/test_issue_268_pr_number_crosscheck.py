@@ -227,7 +227,11 @@ def test_http_an_agreeing_review_still_cascades(tmp_db, monkeypatch, github_writ
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
     monkeypatch.setattr("agent_crew.github.post_review_comment", lambda *a, **k: True)
     with TestClient(_server(tmp_db, _Push())) as c:
-        _enqueue(c, "review-ok", "review", {"pr_number": REQUESTED})
+        # canonical-repo-identity remediation: the fix-round terminal-PR gate
+        # now needs an explicit repo (or worktree) to proceed at all rather
+        # than inferring from process cwd — supply one so this test keeps
+        # exercising the #268 control, not the repo-identity guard.
+        _enqueue(c, "review-ok", "review", {"pr_number": REQUESTED, "repo": "truhojunbot-tech/agent_crew"})
         assert _submit(c, "review-ok", pr_number=REQUESTED).json().get("held") is None
         assert c.get("/tasks/review-ok").json()["status"] == "completed"
 
@@ -241,7 +245,8 @@ def test_http_an_implement_result_may_still_name_the_pr_it_just_opened(tmp_db, m
     One-sided is not a mismatch."""
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
     with TestClient(_server(tmp_db, _Push())) as c:
-        _enqueue(c, "impl-new", "implement", {"issue": 268})
+        # canonical-repo-identity remediation: see test_http_an_agreeing_review_still_cascades.
+        _enqueue(c, "impl-new", "implement", {"issue": 268, "repo": "truhojunbot-tech/agent_crew"})
         r = _submit(c, "impl-new", verdict=None, findings=[], summary="opened the PR")
         assert r.json().get("held") is None
 
@@ -312,8 +317,10 @@ def test_mcp_an_agreeing_result_still_cascades(tmp_db, monkeypatch):
     """⛔The MCP control."""
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
     q = TaskQueue(tmp_db)
+    # canonical-repo-identity remediation: see test_http_an_agreeing_review_still_cascades.
     q.enqueue(TaskRequest(task_id="review-mcp-ok", task_type="review", description="review",
-                          branch=BRANCH, context={"pr_number": REQUESTED}))
+                          branch=BRANCH,
+                          context={"pr_number": REQUESTED, "repo": "truhojunbot-tech/agent_crew"}))
     q.dequeue(role="reviewer")
 
     out = _mcp_submit(tmp_db, task_id="review-mcp-ok", status="completed",
@@ -374,7 +381,8 @@ def test_http_a_hash_prefixed_pr_number_agrees_and_cascades(tmp_db, monkeypatch,
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
     monkeypatch.setattr("agent_crew.github.post_review_comment", lambda *a, **k: True)
     with TestClient(_server(tmp_db, _Push())) as c:
-        _enqueue(c, "review-hash", "review", {"pr_number": REQUESTED})
+        # canonical-repo-identity remediation: see test_http_an_agreeing_review_still_cascades.
+        _enqueue(c, "review-hash", "review", {"pr_number": REQUESTED, "repo": "truhojunbot-tech/agent_crew"})
         r = _submit(c, "review-hash", pr_number=f"#{REQUESTED}")
         assert r.status_code == 200, r.text
         assert r.json().get("held") is None

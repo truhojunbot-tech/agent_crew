@@ -51,7 +51,7 @@ def q(tmp_db):
 def _review(q, *, verdict="request_changes", findings=(FINDING,), pr_number=PR,
             context=None, summary="request_changes: fix the cap"):
     rid = f"review-{uuid.uuid4().hex[:8]}"
-    ctx = {"prev_task_id": "impl-1", "pr_number": pr_number}
+    ctx = {"prev_task_id": "impl-1", "pr_number": pr_number, "repo": "owner/repo"}
     ctx.update(context or {})
     q.enqueue(TaskRequest(task_id=rid, task_type="review", description="review",
                           branch=BRANCH, context=ctx))
@@ -64,7 +64,7 @@ def _review(q, *, verdict="request_changes", findings=(FINDING,), pr_number=PR,
 def _implement(q, pr_number=PR):
     iid = f"impl-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=iid, task_type="implement", description="impl",
-                          branch=BRANCH, context={"pr_number": pr_number}))
+                          branch=BRANCH, context={"pr_number": pr_number, "repo": "owner/repo"}))
     q.submit_result(iid, TaskResult(task_id=iid, status="completed", summary="done",
                                     pr_number=pr_number))
     return iid
@@ -177,7 +177,8 @@ def test_the_exhaustion_notice_is_said_once_per_pr(q, monkeypatch):
     for _ in range(4):          # four distinct late results, same PR
         auto_enqueue_fix(q, _review(q, context={"fix_round": 3}),
                          pr_state_fn=_state("open"),
-                         already_announced_fn=announced, comment_fn=comment)
+                         already_announced_fn=announced, comment_fn=comment,
+                         repo="owner/repo")
 
     assert len(posted) == 1, f"posted {len(posted)} identical exhaustion notices"
     assert FIX_EXHAUSTED_MARKER in posted[0]
@@ -194,7 +195,7 @@ def test_an_unverifiable_comment_check_still_posts(q, monkeypatch):
     auto_enqueue_fix(q, _review(q, context={"fix_round": 3}),
                      pr_state_fn=_state("open"),
                      already_announced_fn=lambda pr, marker: None,   # cannot tell
-                     comment_fn=lambda pr, body: posted.append(body))
+                     comment_fn=lambda pr, body: posted.append(body), repo="owner/repo")
 
     assert len(posted) == 1
 
@@ -244,7 +245,7 @@ class _Push:
 def _enqueue_review(c, task_id):
     return c.post("/tasks", json={"task_id": task_id, "task_type": "review",
                                   "description": "review", "branch": BRANCH,
-                                  "priority": 3, "context": {"pr_number": PR},
+                                  "priority": 3, "context": {"pr_number": PR, "repo": "owner/repo"},
                                   "project": ""})
 
 
@@ -326,7 +327,7 @@ def test_a_github_outage_during_the_handler_loses_nothing(tmp_db, monkeypatch, g
 
 def _impl_with_context_pr(q, task_id="impl-ctx", pr=PR, reported=None, branch=BRANCH):
     q.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="impl",
-                          branch=branch, context={"pr_number": pr} if pr else {}))
+                          branch=branch, context={"pr_number": pr, "repo": "owner/repo"} if pr else {}))
     q.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
                                         summary="done", pr_number=reported))
     return task_id
@@ -365,7 +366,7 @@ def test_an_explicitly_reported_pr_wins_over_the_context(q):
 def test_a_string_pr_number_in_context_is_still_resolved(q):
     """Contexts are JSON round-tripped by several producers; "241" is a PR."""
     q.enqueue(TaskRequest(task_id="impl-str", task_type="implement", description="impl",
-                          branch=BRANCH, context={"pr_number": "241"}))
+                          branch=BRANCH, context={"pr_number": "241", "repo": "owner/repo"}))
     q.submit_result("impl-str", TaskResult(task_id="impl-str", status="completed",
                                            summary="done"))
 
@@ -390,7 +391,7 @@ def test_http_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeyp
     with TestClient(_server(tmp_db, push)) as c:
         c.post("/tasks", json={"task_id": "impl-http", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
-                               "context": {"pr_number": PR}, "project": ""})
+                               "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
         r = c.post("/tasks/impl-http/result",
                    json={"task_id": "impl-http", "status": "completed",
                          "summary": "done", "verdict": None, "findings": [],
@@ -411,7 +412,7 @@ def test_mcp_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeypa
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "merged")
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-mcp", task_type="implement", description="impl",
-                          branch=BRANCH, context={"pr_number": PR}))
+                          branch=BRANCH, context={"pr_number": PR, "repo": "owner/repo"}))
     q.dequeue(role="implementer")
 
     mcp = build_mcp_server(tmp_db)
@@ -432,7 +433,7 @@ def test_http_result_omitting_the_pr_still_reviews_an_open_pr(tmp_db, monkeypatc
     with TestClient(_server(tmp_db, push)) as c:
         c.post("/tasks", json={"task_id": "impl-open", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
-                               "context": {"pr_number": PR}, "project": ""})
+                               "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
         c.post("/tasks/impl-open/result",
                json={"task_id": "impl-open", "status": "completed", "summary": "done",
                      "verdict": None, "findings": [], "pr_number": None})
@@ -575,7 +576,7 @@ def test_concurrent_exhausted_results_post_one_notice(tmp_db, monkeypatch):
         start.wait()
         auto_enqueue_fix(TaskQueue(tmp_db), rid,      # own connection, as in prod
                          pr_state_fn=_state("open"),
-                         already_announced_fn=announced, comment_fn=comment)
+                         already_announced_fn=announced, comment_fn=comment, repo="owner/repo")
 
     threads = [threading.Thread(target=go, args=(r,)) for r in ids]
     for t in threads:
@@ -595,12 +596,12 @@ def test_the_claim_is_durable_across_connections(tmp_db, monkeypatch):
     auto_enqueue_fix(TaskQueue(tmp_db), _exhausted_review(TaskQueue(tmp_db)),
                      pr_state_fn=_state("open"),
                      already_announced_fn=lambda pr, m: False,
-                     comment_fn=lambda pr, body: posted.append(body))
+                     comment_fn=lambda pr, body: posted.append(body), repo="owner/repo")
     # ...a fresh TaskQueue, as a restarted server would build:
     auto_enqueue_fix(TaskQueue(tmp_db), _exhausted_review(TaskQueue(tmp_db)),
                      pr_state_fn=_state("open"),
                      already_announced_fn=lambda pr, m: False,
-                     comment_fn=lambda pr, body: posted.append(body))
+                     comment_fn=lambda pr, body: posted.append(body), repo="owner/repo")
 
     assert len(posted) == 1
 
@@ -617,12 +618,13 @@ def test_a_failed_post_gives_the_claim_back(tmp_db, monkeypatch):
         raise RuntimeError("gh is down")
 
     auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
-                     already_announced_fn=lambda pr, m: False, comment_fn=boom)
+                     already_announced_fn=lambda pr, m: False, comment_fn=boom,
+                     repo="owner/repo")
     assert q.pr_announcement_state(PR, "fix_exhausted") is None, "claim not released"
 
     auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
                      already_announced_fn=lambda pr, m: False,
-                     comment_fn=lambda pr, body: posted.append(body))
+                     comment_fn=lambda pr, body: posted.append(body), repo="owner/repo")
     assert len(posted) == 1, "the retry could not reclaim the announcement"
 
 
@@ -637,7 +639,7 @@ def test_a_false_return_from_post_pr_comment_gives_the_claim_back(tmp_db, monkey
     q = TaskQueue(tmp_db)
 
     auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
-                     already_announced_fn=lambda pr, m: False)
+                     already_announced_fn=lambda pr, m: False, repo="owner/repo")
     assert q.pr_announcement_state(PR, "fix_exhausted") is None, \
         "a False return was treated as success -- claim was not released"
 
@@ -689,7 +691,7 @@ def test_a_broken_prior_notice_check_still_posts(tmp_db, monkeypatch):
 
     auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
                      already_announced_fn=boom,
-                     comment_fn=lambda pr, body: posted.append(body))
+                     comment_fn=lambda pr, body: posted.append(body), repo="owner/repo")
 
     assert len(posted) == 1
 
@@ -750,7 +752,7 @@ def test_a_worker_that_lost_the_lease_does_not_post(tmp_db, monkeypatch):
 
     auto_enqueue_fix(q, _exhausted_review(q), pr_state_fn=_state("open"),
                      already_announced_fn=steal_then_report,
-                     comment_fn=lambda pr, body: posted.append(body))
+                     comment_fn=lambda pr, body: posted.append(body), repo="owner/repo")
 
     assert posted == [], "posted after the lease was taken over"
     assert q.pr_announcement_state(PR, "fix_exhausted")["claimed_by"] == "B"

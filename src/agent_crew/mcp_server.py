@@ -187,8 +187,8 @@ def build_mcp_server(
         # was dispatched for, before the row is written — same gate as the HTTP
         # transport, because a guard on one transport is a guard an agent walks
         # around by changing how it reports (#123 exists for this reason).
-        result, mismatch = hold_mismatched_pr_result(
-            task_id, result, queue.get_task_context(task_id))
+        _task_ctx = queue.get_task_context(task_id)
+        result, mismatch = hold_mismatched_pr_result(task_id, result, _task_ctx)
         try:
             task_type = queue.submit_result(task_id, result)
         except ValueError as e:
@@ -215,7 +215,12 @@ def build_mcp_server(
         elif task_type == "review" and _resolve_verdict(result) == "request_changes":
             # #244: the rejection path must cascade on this transport too,
             # otherwise an MCP-only crew stalls on every request_changes.
-            auto_enqueue_fix(queue, task_id)
+            # canonical-repo-identity remediation: this transport has no
+            # worktree-map concept, so the review task's own explicit
+            # context.repo (if any) is the only signal available here —
+            # unlike the HTTP wrapper, there is no process-cwd fallback to
+            # avoid, only "use what the task context already names."
+            auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "")
         if result.status == "failed":
             auto_fallback_failed_task(queue, task_id, result, task_type)
 
