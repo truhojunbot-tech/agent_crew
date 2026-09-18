@@ -11,6 +11,11 @@ import time
 import click
 
 from agent_crew import setup as setup_module
+from agent_crew.role_mapping import (
+    DEFAULT_ROLE_TO_AGENT,
+    effective_role_mapping,
+    validate_explicit_role_agents,
+)
 
 _DEFAULT_BASE = os.path.expanduser("~/.agent_crew")
 _DEFAULT_AGENTS = "claude,codex,gemini"
@@ -595,6 +600,56 @@ def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
 @click.group()
 def crew():
     """agent_crew — multi-agent development crew CLI."""
+
+
+@crew.group()
+def roles():
+    """Inspect or explicitly configure a project's role-to-provider mapping."""
+
+
+@roles.command("set")
+@click.argument("project")
+@click.argument("assignments", nargs=-1)
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+def roles_set(project: str, assignments: tuple[str, ...], base: str):
+    """Persist complete ROLE=AGENT assignments for PROJECT."""
+    state = _read_state(base, project)
+    if state is None:
+        raise click.ClickException(f"project {project!r} not found. Run setup first.")
+    mapping: dict[str, str] = {}
+    for assignment in assignments:
+        role, separator, agent = assignment.partition("=")
+        if not separator or not role.strip() or not agent.strip() or role.strip() in mapping:
+            raise click.ClickException(
+                "use exactly: implementer=AGENT reviewer=AGENT tester=AGENT"
+            )
+        mapping[role.strip()] = agent.strip()
+    try:
+        mapping = validate_explicit_role_agents(mapping)
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if state.get("role_agents") != mapping:
+        state["role_agents"] = mapping
+        _write_state(base, project, state)
+    click.echo(f"Updated explicit role mapping for {project}:")
+    for role, agent in mapping.items():
+        click.echo(f"  {role}: {agent}")
+    click.echo(f"Restart the server (crew recover {project}) for this to take effect.")
+
+
+@roles.command("show")
+@click.argument("project")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+def roles_show(project: str, base: str):
+    """Show PROJECT's effective role mapping and its configuration source."""
+    state = _read_state(base, project)
+    if state is None:
+        raise click.ClickException(f"project {project!r} not found. Run setup first.")
+    mapping, source = effective_role_mapping(state, project=project)
+    click.echo(f"Project: {project}")
+    click.echo(f"Source: {source}")
+    for role in DEFAULT_ROLE_TO_AGENT:
+        click.echo(f"{role}: {mapping[role]}")
 
 
 @crew.command()

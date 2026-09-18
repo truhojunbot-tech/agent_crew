@@ -48,6 +48,7 @@ from agent_crew.pipeline import (
 from agent_crew import provenance as _prov
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
+from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
 from agent_crew.watch import active_tasks_for_issue
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
@@ -736,7 +737,7 @@ def _review_result_is_actionable(result) -> bool:
     return getattr(result, "status", None) in (None, "completed")
 
 
-_DEFAULT_ROLE_TO_AGENT = {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}
+_DEFAULT_ROLE_TO_AGENT = dict(DEFAULT_ROLE_TO_AGENT)
 _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 
 
@@ -1443,23 +1444,60 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
     try:
         with open(state_path) as f:
             state = json.load(f)
-        # New schema: explicit roles list with per-role worktree.
+        # New schema: ``roles`` stores existing worktrees.  A later explicit
+        # provider assignment may re-key those worktrees by provider.
         roles_list = state.get("roles")
         if roles_list:
-            result = {
+            by_role = {
                 r["role"]: r["worktree"]
                 for r in roles_list
-                if r.get("role") and r.get("worktree")
+                if isinstance(r, dict) and r.get("role") and r.get("worktree")
             }
+            mapping, source = effective_role_mapping(state, project=state.get("project", "unknown"))
+            if source == EXPLICIT_SOURCE:
+                by_agent = {
+                    r.get("agent"): r.get("worktree")
+                    for r in roles_list
+                    if isinstance(r, dict) and r.get("agent") and r.get("worktree")
+                }
+                worktrees = state.get("worktrees", {})
+                if isinstance(worktrees, dict):
+                    by_agent.update({agent: path for agent, path in worktrees.items() if agent and path})
+                result = {}
+                for role, agent in mapping.items():
+                    path = by_agent.get(agent)
+                    if path:
+                        result[role] = path
+                    else:
+                        logger.warning(
+                            "_load_worktree_map: explicit role %s uses agent %s with no worktree; omitting role",
+                            role, agent,
+                        )
+            else:
+                result = by_role
             logger.info(f"_load_worktree_map: state_path={state_path!r} (roles) → worktree_map={result}")
             return result
         # Legacy schema: agent-keyed worktrees + default role mapping.
         worktrees = state.get("worktrees", {})
+        if not isinstance(worktrees, dict):
+            worktrees = {}
         result = {}
-        for agent, path in worktrees.items():
-            role = _DEFAULT_AGENT_TO_ROLE.get(agent)
-            if role and path:
-                result[role] = path
+        mapping, source = effective_role_mapping(state, project=state.get("project", "unknown"))
+        if source == EXPLICIT_SOURCE:
+            for role, agent in mapping.items():
+                path = worktrees.get(agent)
+                if path:
+                    result[role] = path
+                else:
+                    logger.warning(
+                        "_load_worktree_map: explicit role %s uses agent %s with no worktree; omitting role",
+                        role, agent,
+                    )
+        else:
+            for agent, path in worktrees.items():
+                role = _DEFAULT_AGENT_TO_ROLE.get(agent)
+                if role and path:
+                    result[role] = path
         logger.info(f"_load_worktree_map: state_path={state_path!r} (legacy) → worktree_map={result}")
         return result
     except Exception:
@@ -1467,27 +1505,22 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
         return {}
 
 
-def _load_role_to_agent(state_path: Optional[str]) -> dict[str, str]:
-    """Load {role: agent_name} mapping from state.json's roles list.
-
-    Falls back to the hardcoded default when state.json lacks a roles list
-    (legacy setups). Always returns all 3 roles populated — missing roles
-    default to the legacy assignment.
-    """
-    result = dict(_DEFAULT_ROLE_TO_AGENT)
+def _load_role_to_agent_with_source(state_path: Optional[str]) -> tuple[dict[str, str], str]:
+    """Load the effective provider-neutral mapping and its source label."""
     if not state_path or not os.path.exists(state_path):
-        return result
+        return effective_role_mapping(None)
     try:
         with open(state_path) as f:
             state = json.load(f)
-        for r in state.get("roles") or []:
-            role = r.get("role")
-            agent = r.get("agent")
-            if role and agent:
-                result[role] = agent
+        return effective_role_mapping(state, project=state.get("project", "unknown"))
     except Exception:
         logger.exception("_load_role_to_agent: failed to read state.json")
-    return result
+        return effective_role_mapping(None)
+
+
+def _load_role_to_agent(state_path: Optional[str]) -> dict[str, str]:
+    """Load the effective mapping, retaining the older helper shape."""
+    return _load_role_to_agent_with_source(state_path)[0]
 
 
 _THINKING_TAIL_LINES = 10
@@ -3997,6 +4030,9 @@ def create_app(
     # than asserting against a helper the dispatcher may not actually call.
     # Its absence is why PR #241 shipped a Context Pack that silently omitted
     # the acceptance criteria on every live dispatch while unit tests passed.
+    # Exposed for integration tests and operational introspection of the exact
+    # provider/worktree decision the dispatcher will use.
+    app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
     # Same rationale (#248, #265): expose the terminal-marking helper so a test
     # can drive the real timeout path instead of asserting against a
