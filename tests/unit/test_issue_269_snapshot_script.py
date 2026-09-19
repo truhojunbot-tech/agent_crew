@@ -22,6 +22,7 @@ Reproduced before fixing, with a poisoned `PYTHONPATH`:
 
 import importlib.util
 import json
+import logging
 import os
 import subprocess
 import sys
@@ -62,6 +63,23 @@ def test_a_broken_import_raises_instead_of_returning_no_sizes(snap, monkeypatch)
     _break_import(monkeypatch, snap)
     with pytest.raises(snap.SnapshotUnavailable, match="cap functions"):
         snap.provider_sizes()
+
+
+def test_provider_sizes_restores_the_callers_logging_disable_level(snap, monkeypatch):
+    """Snapshot collection must not suppress warnings from later unit tests."""
+    monkeypatch.setattr(snap, "cap_functions", lambda: {
+        "claude": lambda *_: (False, {}), "codex": lambda *_: (False, {}),
+        "gemini": lambda *_: (False, {}), "codex_session_for_cwd": lambda *_: None,
+        "caps": {},
+    })
+    monkeypatch.setattr(snap.glob, "glob", lambda *_: [])
+    previous = logging.root.manager.disable
+    logging.disable(logging.ERROR)
+    try:
+        snap.provider_sizes()
+        assert logging.root.manager.disable == logging.ERROR
+    finally:
+        logging.disable(previous)
 
 
 def test_the_refusal_says_how_to_fix_it(snap, monkeypatch):
