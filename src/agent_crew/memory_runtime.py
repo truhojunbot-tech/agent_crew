@@ -7,7 +7,7 @@ import sqlite3
 import time
 from contextlib import closing
 from dataclasses import dataclass, asdict
-from typing import Protocol
+from typing import Optional, Protocol
 
 LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic"})
 
@@ -15,12 +15,34 @@ LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic"})
 @dataclass(frozen=True)
 class MemoryScope:
     fleet: str = ""; project: str = ""; worktree: str = ""; issue: str = ""
-    task_id: str = ""; context_generation: int = 0; provider_session: str = ""
+    task_id: str = ""; context_generation: Optional[int] = None; provider_session: str = ""
 
 
 @dataclass(frozen=True)
 class MemoryRecord:
     layer: str; key: str; value: dict; scope: MemoryScope; version: int = 1
+
+
+def _scope_from_json(scope: str) -> MemoryScope:
+    fields = json.loads(scope)
+    # ADR-001 previously encoded the unset generation as 0.  It was never a
+    # concrete generation, so normalize it before matching or ranking records.
+    if fields.get("context_generation") == 0:
+        fields["context_generation"] = None
+    return MemoryScope(**fields)
+
+
+def _canonical_scope_json(scope: MemoryScope) -> str:
+    fields = asdict(scope)
+    # Generation 0 represented "unset" before ADR-001 made the field
+    # optional.  Canonicalize it on write so it cannot create a second key.
+    if fields["context_generation"] == 0:
+        fields["context_generation"] = None
+    return json.dumps(fields, sort_keys=True)
+
+
+def _scope_specificity(scope: MemoryScope) -> int:
+    return sum(value not in ("", None) for value in asdict(scope).values())
 
 
 class MemoryStorage(Protocol):
@@ -33,31 +55,67 @@ class SQLiteMemoryStorage:
     def __init__(self, path: str):
         self.path = path
         with closing(sqlite3.connect(path)) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))"); db.commit()
+            db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))")
+            self._migrate_legacy_generation_zero(db)
+            db.commit()
+
+    @staticmethod
+    def _migrate_legacy_generation_zero(db: sqlite3.Connection) -> None:
+        rows = db.execute("SELECT layer,key,value,scope,version,created FROM adr001_memory WHERE json_extract(scope, '$.context_generation') = 0").fetchall()
+        for layer, key, value, legacy_scope, version, created in rows:
+            scope = _canonical_scope_json(_scope_from_json(legacy_scope))
+            existing = db.execute(
+                "SELECT version FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
+                (layer, key, scope),
+            ).fetchone()
+            if existing is None:
+                db.execute(
+                    "UPDATE adr001_memory SET scope=? WHERE layer=? AND key=? AND scope=?",
+                    (scope, layer, key, legacy_scope),
+                )
+            else:
+                if version > existing[0]:
+                    db.execute(
+                        "UPDATE adr001_memory SET value=?,version=?,created=? WHERE layer=? AND key=? AND scope=?",
+                        (value, version, created, layer, key, scope),
+                    )
+                db.execute(
+                    "DELETE FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
+                    (layer, key, legacy_scope),
+                )
+
     def put(self, record: MemoryRecord) -> None:
         if record.layer not in LAYERS: raise ValueError("unknown memory layer")
         with closing(sqlite3.connect(self.path)) as db:
             db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
                 ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
                 WHERE excluded.version > adr001_memory.version""",
-                (record.layer, record.key, json.dumps(record.value), json.dumps(asdict(record.scope), sort_keys=True), record.version, time.time())); db.commit()
+                (record.layer, record.key, json.dumps(record.value), _canonical_scope_json(record.scope), record.version, time.time())); db.commit()
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
         fields = asdict(scope)
         clauses, params = [], []
         for name, value in fields.items():
             # A stored empty field is an ancestor; a nonempty one must agree.
-            clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' OR json_extract(scope, ?) = ?)")
-            path = f"$.{name}"; params.extend((path, path, path, value))
+            path = f"$.{name}"
+            if name == "context_generation":
+                clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' OR json_extract(scope, ?) = 0 OR json_extract(scope, ?) = ?)")
+                params.extend((path, path, path, path, value))
+            else:
+                clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' OR json_extract(scope, ?) = ?)")
+                params.extend((path, path, path, value))
         if exact_key:
             clauses.append("key=?"); params.append(exact_key)
         with closing(sqlite3.connect(self.path)) as db:
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE " + " AND ".join(clauses), params).fetchall()
-        result = [MemoryRecord(r[0], r[1], json.loads(r[2]), MemoryScope(**json.loads(r[3])), r[4]) for r in rows]
+        result = [
+            MemoryRecord(r[0], r[1], json.loads(r[2]), _scope_from_json(r[3]), r[4])
+            for r in rows
+        ]
         terms = set(query.lower().replace('-', ' ').split())
         def rank(record):
             text = (record.key + ' ' + json.dumps(record.value)).lower().replace('-', ' ')
             relevance = len(terms.intersection(text.split()))
-            specificity = sum(bool(value) for value in asdict(record.scope).values())
+            specificity = _scope_specificity(record.scope)
             return (-relevance, -specificity, record.key)
         return sorted(result, key=rank)
 
@@ -75,7 +133,10 @@ def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: 
     records += [r for r in storage.retrieve(scope) if r.layer in {"authoritative", "checkpoint"}]
     unique = {}
     for record in records:
-        # retrieve() is specificity-descending; first is the nearest truth.
-        unique.setdefault((record.layer, record.key), record)
+        identity = (record.layer, record.key)
+        # Records arrive relevance-first.  Scope specificity takes precedence;
+        # retaining the existing value on ties preserves relevance rank.
+        if identity not in unique or _scope_specificity(record.scope) > _scope_specificity(unique[identity].scope):
+            unique[identity] = record
     return {"enabled": True, "role": role, "task_id": task_id,
             "records": [asdict(r) for r in unique.values()]}
