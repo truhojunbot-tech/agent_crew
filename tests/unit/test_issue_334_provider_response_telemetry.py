@@ -52,10 +52,37 @@ def test_claude_log_suffix_deduplicates_repeated_message_usage():
         "input_tokens": 2, "cache_creation_input_tokens": 3, "cache_read_input_tokens": 5,
         "output_tokens": 7, "reasoning_tokens": 11,
     }}}
-    telemetry = response_log_telemetry("claude", "\n".join((json.dumps(record), json.dumps(record))))
+    result = {"type": "result", "usage": {"output_tokens": 7}}
+    telemetry = response_log_telemetry("claude", "\n".join((json.dumps(record), json.dumps(record), json.dumps(result))))
     assert (telemetry.uncached_input_tokens, telemetry.cache_write_tokens,
             telemetry.cache_read_tokens, telemetry.output_tokens,
             telemetry.reasoning_tokens, telemetry.context_window_tokens) == (2, 3, 5, 7, 11, 10)
+
+
+def test_claude_context_window_is_peak_request_not_task_span_sum():
+    first = {"type": "assistant", "message": {"id": "one", "usage": {
+        "input_tokens": 2, "cache_creation_input_tokens": 3, "cache_read_input_tokens": 5,
+    }}}
+    second = {"type": "assistant", "message": {"id": "two", "usage": {
+        "input_tokens": 11, "cache_creation_input_tokens": 13, "cache_read_input_tokens": 17,
+    }}}
+    result = {"type": "result", "usage": {"output_tokens": 1}}
+
+    telemetry = response_log_telemetry("claude", "\n".join(map(json.dumps, (first, second, result))))
+
+    assert telemetry.context_window_tokens == 41
+    assert (telemetry.uncached_input_tokens, telemetry.cache_write_tokens,
+            telemetry.cache_read_tokens) == (13, 16, 22)
+
+
+def test_claude_without_terminal_result_keeps_output_unknown():
+    message = {"type": "assistant", "message": {"id": "message-334", "usage": {
+        "input_tokens": 2, "output_tokens": 73,
+    }}}
+
+    telemetry = response_log_telemetry("claude", json.dumps(message))
+
+    assert telemetry.output_tokens is None
 
 
 def test_claude_terminal_result_usage_overrides_message_output_only():

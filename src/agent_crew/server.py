@@ -3671,6 +3671,7 @@ def create_app(
         # was erased every attempt and _MAX_TRANSIENT_RETRY never actually
         # capped anything (#201).
         _terminal = True
+        _task_log_tail = ""
         try:
             import datetime as _dt
             with open(log_path, "a") as log_f:
@@ -3756,11 +3757,6 @@ def create_app(
                 with open(log_path, "r", errors="replace") as _lf:
                     _lf.seek(_task_log_start_offset)
                     _task_log_tail = _lf.read()
-                q().record_task_telemetry(
-                    task.task_id, response_log_telemetry(agent, _task_log_tail))
-                _telemetry_attr = q().get_attribution(task.task_id)
-                if _telemetry_attr:
-                    append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
                 if agent == "claude":
                     _discovered_session_id = extract_claude_session_id(_task_log_tail)
                     if _discovered_session_id and _discovered_session_id != _ctx_info.get("provider_session_id"):
@@ -3785,6 +3781,14 @@ def create_app(
                     )
             except Exception:
                 logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
+            try:
+                q().record_task_telemetry(
+                    task.task_id, response_log_telemetry(agent, _task_log_tail))
+                _telemetry_attr = q().get_attribution(task.task_id)
+                if _telemetry_attr:
+                    append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
+            except Exception:
+                logger.exception("dispatcher: terminal telemetry enrichment failed for task=%s", task.task_id)
             if _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n

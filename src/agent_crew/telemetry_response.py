@@ -72,6 +72,8 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
               "output_tokens", "reasoning_tokens", "context_window_tokens")
     totals: dict[str, int | None] = {field: None for field in fields}
     final_values: dict[str, int | None] = {}
+    peak_context_window = None
+    saw_terminal_claude_result = False
     seen: set[str] = set()
     model = session = None
     for line in text.splitlines():
@@ -82,6 +84,7 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
         if not isinstance(record, dict):
             continue
         is_terminal_claude_result = provider == "claude" and record.get("type") == "result"
+        saw_terminal_claude_result = saw_terminal_claude_result or is_terminal_claude_result
         message = _mapping(record.get("message"))
         identity = message.get("id") if provider == "claude" else record.get("id")
         if isinstance(identity, str) and identity:
@@ -92,11 +95,16 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
         for field in fields:
             value = getattr(item, field)
             if value is not None:
-                if is_terminal_claude_result and field in ("output_tokens", "reasoning_tokens"):
+                if field == "context_window_tokens":
+                    peak_context_window = max(peak_context_window or 0, value)
+                elif is_terminal_claude_result and field in ("output_tokens", "reasoning_tokens"):
                     final_values[field] = value
                 else:
                     totals[field] = (totals[field] or 0) + value
         model = item.model or model
         session = item.provider_session_id or session
     totals.update(final_values)
+    totals["context_window_tokens"] = peak_context_window
+    if provider == "claude" and not saw_terminal_claude_result:
+        totals["output_tokens"] = None
     return TaskTelemetry(**totals, model=model, provider_session_id=session)
