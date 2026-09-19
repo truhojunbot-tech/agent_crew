@@ -91,3 +91,69 @@ def test_specific_generation_does_not_match_a_different_or_unset_generation(tmp_
 
     assert store.retrieve(MemoryScope(project="p", context_generation=7)) == []
     assert store.retrieve(MemoryScope(project="p")) == []
+
+
+def test_broader_unset_dimension_does_not_leak_to_another_fleet(tmp_path):
+    store = SQLiteMemoryStorage(str(tmp_path / "memory.sqlite"))
+    store.put(MemoryRecord("procedural", "project-rule", {}, MemoryScope(project="p")))
+
+    assert store.retrieve(MemoryScope(fleet="f", project="p")) == []
+
+
+def test_same_shape_scope_is_returned(tmp_path):
+    store = SQLiteMemoryStorage(str(tmp_path / "memory.sqlite"))
+    store.put(MemoryRecord("procedural", "project-rule", {}, MemoryScope(project="p")))
+
+    assert [record.key for record in store.retrieve(MemoryScope(project="p"))] == ["project-rule"]
+
+
+def test_ancestor_scope_inherits_downward_to_descendants(tmp_path):
+    store = SQLiteMemoryStorage(str(tmp_path / "memory.sqlite"))
+    store.put(MemoryRecord("procedural", "fleet-rule", {}, MemoryScope(fleet="f")))
+
+    query = MemoryScope(fleet="f", project="p", task_id="t")
+    assert [record.key for record in store.retrieve(query)] == ["fleet-rule"]
+
+
+def test_sibling_scope_is_excluded(tmp_path):
+    store = SQLiteMemoryStorage(str(tmp_path / "memory.sqlite"))
+    store.put(MemoryRecord(
+        "procedural", "task-a-rule", {}, MemoryScope(fleet="f", project="p", task_id="a")
+    ))
+
+    assert store.retrieve(MemoryScope(fleet="f", project="p", task_id="b")) == []
+
+
+def test_unset_generation_inherits_but_specific_generation_must_match(tmp_path):
+    store = SQLiteMemoryStorage(str(tmp_path / "memory.sqlite"))
+    task_scope = MemoryScope(fleet="f", project="p", task_id="t")
+    store.put(MemoryRecord("procedural", "unset-generation", {}, task_scope))
+    store.put(MemoryRecord(
+        "procedural", "generation-three", {},
+        MemoryScope(fleet="f", project="p", task_id="t", context_generation=3),
+    ))
+
+    query = MemoryScope(fleet="f", project="p", task_id="t", context_generation=7)
+    assert [record.key for record in store.retrieve(query)] == ["unset-generation"]
+
+
+def test_put_canonicalizes_zero_generation_to_one_null_keyed_row(tmp_path):
+    store = SQLiteMemoryStorage(str(tmp_path / "memory.sqlite"))
+    store.put(MemoryRecord(
+        "procedural", "rule", {"version": "zero"},
+        MemoryScope(fleet="f", context_generation=0), version=1,
+    ))
+    store.put(MemoryRecord(
+        "procedural", "rule", {"version": "null"},
+        MemoryScope(fleet="f"), version=2,
+    ))
+
+    with sqlite3.connect(store.path) as db:
+        rows = db.execute(
+            "SELECT scope FROM adr001_memory WHERE layer='procedural' AND key='rule'"
+        ).fetchall()
+
+    assert rows == [(json.dumps({
+        "fleet": "f", "project": "", "worktree": "", "issue": "",
+        "task_id": "", "context_generation": None, "provider_session": "",
+    }, sort_keys=True),)]

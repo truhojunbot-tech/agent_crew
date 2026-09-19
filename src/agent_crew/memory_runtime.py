@@ -45,6 +45,34 @@ def _scope_specificity(scope: MemoryScope) -> int:
     return sum(value not in ("", None) for value in asdict(scope).values())
 
 
+def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope) -> bool:
+    """Return whether a stored scope applies to a query under ADR-001 order."""
+    record_fields = list(asdict(record_scope).items())
+    query_fields = dict(asdict(query_scope))
+    # Generation zero was the legacy representation of unset.  Preserve that
+    # meaning even for callers that still construct a scope with zero.
+    if query_fields["context_generation"] == 0:
+        query_fields["context_generation"] = None
+
+    def is_unset(value: object) -> bool:
+        return value in ("", None)
+
+    deepest_set = max(
+        (index for index, (_, value) in enumerate(record_fields) if not is_unset(value)),
+        default=-1,
+    )
+    for index, (name, record_value) in enumerate(record_fields):
+        query_value = query_fields[name]
+        if not is_unset(record_value):
+            if record_value != query_value:
+                return False
+        elif index <= deepest_set and not is_unset(query_value):
+            # An unset ancestor of the record's deepest set dimension is an
+            # exact-unset requirement, not a wildcard into another branch.
+            return False
+    return True
+
+
 class MemoryStorage(Protocol):
     def put(self, record: MemoryRecord) -> None: ...
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]: ...
@@ -111,6 +139,7 @@ class SQLiteMemoryStorage:
             MemoryRecord(r[0], r[1], json.loads(r[2]), _scope_from_json(r[3]), r[4])
             for r in rows
         ]
+        result = [record for record in result if _scope_applies(record.scope, scope)]
         terms = set(query.lower().replace('-', ' ').split())
         def rank(record):
             text = (record.key + ' ' + json.dumps(record.value)).lower().replace('-', ' ')
