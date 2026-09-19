@@ -24,6 +24,15 @@ def response_telemetry(provider: str, response: object) -> TaskTelemetry:
     """Map only explicit provider usage fields; absent stays unknown."""
     response = _mapping(response)
     if provider == "claude":
+        # Claude stream-json's terminal result is the authoritative span-wide
+        # output count.  Its per-message usage is correct for input/cache but
+        # reports only a tiny final-message output slice.
+        if response.get("type") == "result":
+            usage = _mapping(response.get("usage"))
+            return TaskTelemetry(
+                output_tokens=_token(usage.get("output_tokens")),
+                reasoning_tokens=_token(usage.get("reasoning_tokens")),
+            )
         message = _mapping(response.get("message"))
         usage = _mapping(message.get("usage"))
         uncached = _token(usage.get("input_tokens"))
@@ -62,6 +71,7 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
     fields = ("uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
               "output_tokens", "reasoning_tokens", "context_window_tokens")
     totals: dict[str, int | None] = {field: None for field in fields}
+    final_values: dict[str, int | None] = {}
     seen: set[str] = set()
     model = session = None
     for line in text.splitlines():
@@ -71,6 +81,7 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
             continue
         if not isinstance(record, dict):
             continue
+        is_terminal_claude_result = provider == "claude" and record.get("type") == "result"
         message = _mapping(record.get("message"))
         identity = message.get("id") if provider == "claude" else record.get("id")
         if isinstance(identity, str) and identity:
@@ -81,7 +92,11 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
         for field in fields:
             value = getattr(item, field)
             if value is not None:
-                totals[field] = (totals[field] or 0) + value
+                if is_terminal_claude_result and field in ("output_tokens", "reasoning_tokens"):
+                    final_values[field] = value
+                else:
+                    totals[field] = (totals[field] or 0) + value
         model = item.model or model
         session = item.provider_session_id or session
+    totals.update(final_values)
     return TaskTelemetry(**totals, model=model, provider_session_id=session)

@@ -56,3 +56,17 @@ def test_claude_log_suffix_deduplicates_repeated_message_usage():
     assert (telemetry.uncached_input_tokens, telemetry.cache_write_tokens,
             telemetry.cache_read_tokens, telemetry.output_tokens,
             telemetry.reasoning_tokens, telemetry.context_window_tokens) == (2, 3, 5, 7, 11, 10)
+
+
+def test_claude_terminal_result_usage_overrides_message_output_only():
+    message = {"type": "assistant", "message": {"id": "message-334", "usage": {
+        "input_tokens": 2, "cache_creation_input_tokens": 3, "cache_read_input_tokens": 5,
+        "output_tokens": 73,
+    }}}
+    result = {"type": "result", "usage": {"output_tokens": 11657}}
+
+    telemetry = response_log_telemetry("claude", "\n".join((json.dumps(message), json.dumps(result))))
+
+    assert telemetry.output_tokens == 11657
+    assert (telemetry.uncached_input_tokens, telemetry.cache_write_tokens,
+            telemetry.cache_read_tokens, telemetry.context_window_tokens) == (2, 3, 5, 10)
