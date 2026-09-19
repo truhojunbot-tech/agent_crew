@@ -177,7 +177,16 @@ def provider_sizes() -> list[dict]:
     Raises ``SnapshotUnavailable`` rather than returning ``[]`` — an empty list
     here is not a smaller answer, it is no answer wearing one's clothes.
     """
+    previous_disable = logging.root.manager.disable
     logging.disable(logging.CRITICAL)
+    try:
+        return _provider_sizes()
+    finally:
+        logging.disable(previous_disable)
+
+
+def _provider_sizes() -> list[dict]:
+    """Collect provider sizes while ``provider_sizes`` suppresses probe noise."""
     fns = cap_functions()
     claude_context_exceeds_cap = fns["claude"]
     codex_context_exceeds_cap = fns["codex"]
