@@ -12,6 +12,7 @@ from typing import List, Optional
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
+from agent_crew.tokenomics_shadow import shadow_recommendation
 
 
 class PausedError(Exception):
@@ -54,6 +55,14 @@ CREATE TABLE IF NOT EXISTS gates (
     message    TEXT NOT NULL,
     status     TEXT NOT NULL DEFAULT 'pending',
     created_at REAL NOT NULL
+)
+"""
+
+_DDL_TOKENOMICS_SHADOW = """
+CREATE TABLE IF NOT EXISTS tokenomics_shadow_receipts (
+    task_id TEXT PRIMARY KEY, decision_source TEXT NOT NULL,
+    policy_version TEXT, recommendation_json TEXT, actual_execution_json TEXT NOT NULL,
+    economics_json TEXT, outcome TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
 )
 """
 
@@ -452,6 +461,7 @@ class TaskQueue:
         conn = self._connect()
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
+        conn.execute(_DDL_TOKENOMICS_SHADOW)
         conn.execute(_DDL_ATTRIBUTION)
         conn.execute(_DDL_CHECKPOINTS)
         conn.execute(_DDL_CONTEXT_STATE)
@@ -954,6 +964,18 @@ class TaskQueue:
                     task.project,
                 ),
             )
+            shadow = shadow_recommendation(task)
+            now = time.time()
+            # Actual is deliberately the existing baseline, not the proposal.
+            conn.execute(
+                """INSERT INTO tokenomics_shadow_receipts
+                   (task_id, decision_source, policy_version, recommendation_json,
+                    actual_execution_json, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (task.task_id, shadow["decision_source"], shadow["policy_version"],
+                 json.dumps(shadow["recommendation"]),
+                 json.dumps({"cascade": "baseline", "task_type": task.task_type}), now, now),
+            )
             conn.commit()
         except sqlite3.IntegrityError as e:
             # #273: task_id is the primary key, so a duplicate insert raises
@@ -1332,6 +1354,14 @@ class TaskQueue:
                 (result.status, outcome, now, now, task_id),
             )
             self._store_task_telemetry(conn, task_id, telemetry, now)
+            economics = conn.execute(
+                """SELECT uncached_input_tokens, cache_write_tokens, cache_read_tokens,
+                          output_tokens, reasoning_tokens, context_window_tokens
+                   FROM task_attribution WHERE task_id=?""", (task_id,)).fetchone()
+            conn.execute(
+                "UPDATE tokenomics_shadow_receipts SET outcome=?, economics_json=?, updated_at=? WHERE task_id=?",
+                (outcome, json.dumps(dict(economics)) if economics is not None else None, now, task_id),
+            )
             # #204: completed_at >= started_at is expected to always hold —
             # started_at is set once at first dispatch and never rewritten
             # (see record_attribution). It can only be violated by clock
@@ -2491,6 +2521,41 @@ class TaskQueue:
             return dict(row) if row else None
         finally:
             conn.close()
+
+    def get_tokenomics_shadow_receipt(self, task_id: str) -> Optional[dict]:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM tokenomics_shadow_receipts WHERE task_id=?", (task_id,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def token_cost_summary(self) -> dict:
+        """Observed provider tokens grouped by issue; NULL remains unknown."""
+        conn = self._connect()
+        try:
+            rows = conn.execute("""SELECT a.uncached_input_tokens, a.cache_write_tokens,
+                a.cache_read_tokens, a.output_tokens, t.context
+                FROM tasks t LEFT JOIN task_attribution a ON t.task_id=a.task_id""").fetchall()
+        finally:
+            conn.close()
+        result = {"total_tokens": 0, "observed_tasks": 0, "unobserved_tasks": 0, "by_issue": {}}
+        for row in rows:
+            values = [value for value in (row["uncached_input_tokens"], row["cache_write_tokens"],
+                      row["cache_read_tokens"], row["output_tokens"]) if value is not None]
+            total = sum(int(value) for value in values) if values else None
+            result["observed_tasks" if total is not None else "unobserved_tasks"] += 1
+            if total is not None:
+                result["total_tokens"] += total
+            try:
+                issue = json.loads(row["context"] or "{}").get("issue")
+            except (TypeError, ValueError):
+                issue = None
+            if issue is not None:
+                bucket = result["by_issue"].setdefault(str(issue), {"total_tokens": 0})
+                if total is not None:
+                    bucket["total_tokens"] += total
+        return result
 
     def force_fail(self, task_id: str, summary: str, error_info: Optional[dict] = None) -> Optional[str]:
         """Mark an in_progress task as failed (used by the watchdog when a pane
