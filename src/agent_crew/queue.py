@@ -1406,6 +1406,22 @@ class TaskQueue:
             logger.exception("task telemetry adapter failed for %s", task_id)
             return TaskTelemetry()
 
+    def record_task_telemetry(self, task_id: str, telemetry: TaskTelemetry) -> None:
+        """Persist terminal provider-response observations after process exit."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._store_task_telemetry(conn, task_id, telemetry, time.time())
+            conn.commit()
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     @staticmethod
     def _store_task_telemetry(
         conn: sqlite3.Connection, task_id: str, telemetry: TaskTelemetry, now: float
