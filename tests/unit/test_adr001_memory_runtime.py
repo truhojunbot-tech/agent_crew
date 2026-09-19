@@ -15,3 +15,20 @@ def test_exact_and_hybrid_retrieval(tmp_path):
 def test_flag_off_reconstruction_is_empty(monkeypatch,tmp_path):
     monkeypatch.delenv('AGENT_CREW_ADR001_MEMORY_ENABLED', raising=False)
     assert reconstruct_context(SQLiteMemoryStorage(str(tmp_path/'m.sqlite')), 'reviewer','t',MemoryScope()) == {'enabled':False,'records':[]}
+
+def test_task_scope_inherits_project_and_fleet_memory(tmp_path):
+    store=SQLiteMemoryStorage(str(tmp_path/'m.sqlite'))
+    store.put(MemoryRecord('procedural','fleet-rule',{},MemoryScope(fleet='f')))
+    store.put(MemoryRecord('procedural','project-rule',{},MemoryScope(fleet='f',project='p')))
+    task=MemoryScope(fleet='f',project='p',worktree='w',task_id='t')
+    assert [r.key for r in store.retrieve(task)] == ['project-rule','fleet-rule']
+
+def test_reconstruction_keeps_authoritative_and_checkpoint(monkeypatch,tmp_path):
+    monkeypatch.setenv('AGENT_CREW_ADR001_MEMORY_ENABLED','1'); store=SQLiteMemoryStorage(str(tmp_path/'m.sqlite')); s=MemoryScope(project='p',task_id='t')
+    store.put(MemoryRecord('authoritative','git-ref',{},s)); store.put(MemoryRecord('checkpoint','state',{},s))
+    assert {r['layer'] for r in reconstruct_context(store,'reviewer','t',s)['records']} >= {'authoritative','checkpoint'}
+
+def test_newer_memory_version_cannot_regress(tmp_path):
+    store=SQLiteMemoryStorage(str(tmp_path/'m.sqlite')); s=MemoryScope(project='p')
+    store.put(MemoryRecord('authoritative','spec',{'v':2},s,version=2)); store.put(MemoryRecord('authoritative','spec',{'v':1},s,version=1))
+    assert store.retrieve(s,exact_key='spec')[0].value == {'v':2}

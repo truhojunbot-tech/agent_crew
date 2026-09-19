@@ -36,14 +36,29 @@ class SQLiteMemoryStorage:
     def put(self, record: MemoryRecord) -> None:
         if record.layer not in LAYERS: raise ValueError("unknown memory layer")
         with sqlite3.connect(self.path) as db:
-            db.execute("INSERT OR REPLACE INTO adr001_memory VALUES (?,?,?,?,?,?)", (record.layer, record.key, json.dumps(record.value), json.dumps(asdict(record.scope), sort_keys=True), record.version, time.time()))
+            db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
+                ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
+                WHERE excluded.version >= adr001_memory.version""",
+                (record.layer, record.key, json.dumps(record.value), json.dumps(asdict(record.scope), sort_keys=True), record.version, time.time()))
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
+        fields = asdict(scope)
+        clauses, params = [], []
+        for name, value in fields.items():
+            # A stored empty field is an ancestor; a nonempty one must agree.
+            clauses.append("(json_extract(scope, ?) = '' OR json_extract(scope, ?) = ?)")
+            path = f"$.{name}"; params.extend((path, path, value))
+        if exact_key:
+            clauses.append("key=?"); params.append(exact_key)
         with sqlite3.connect(self.path) as db:
-            rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE scope=?", (json.dumps(asdict(scope), sort_keys=True),)).fetchall()
+            rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE " + " AND ".join(clauses), params).fetchall()
         result = [MemoryRecord(r[0], r[1], json.loads(r[2]), MemoryScope(**json.loads(r[3])), r[4]) for r in rows]
-        if exact_key: return [r for r in result if r.key == exact_key]
-        q = query.lower()
-        return [r for r in result if not q or q in r.key.lower() or q in json.dumps(r.value).lower()]
+        terms = set(query.lower().replace('-', ' ').split())
+        def rank(record):
+            text = (record.key + ' ' + json.dumps(record.value)).lower().replace('-', ' ')
+            relevance = len(terms.intersection(text.split()))
+            specificity = sum(bool(value) for value in asdict(record.scope).values())
+            return (-relevance, -specificity, record.key)
+        return sorted(result, key=rank)
 
 
 def memory_enabled() -> bool:
@@ -53,7 +68,10 @@ def memory_enabled() -> bool:
 def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: MemoryScope) -> dict:
     """Quality-first pack: authoritative refs are always included; no budget trimming."""
     if not memory_enabled(): return {"enabled": False, "records": []}
-    records = storage.retrieve(scope, query=role) + storage.retrieve(scope, exact_key=task_id)
+    records = storage.retrieve(scope, query=f"{role} {task_id}") + storage.retrieve(scope, exact_key=task_id)
+    # Truth and checkpoint state are mandatory quality inputs, independent of
+    # lexical relevance or any future economics budget.
+    records += [r for r in storage.retrieve(scope) if r.layer in {"authoritative", "checkpoint"}]
     unique = {(r.layer, r.key): r for r in records}
     return {"enabled": True, "role": role, "task_id": task_id,
             "records": [asdict(r) for r in unique.values()]}
