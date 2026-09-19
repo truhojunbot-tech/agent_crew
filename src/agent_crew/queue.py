@@ -2492,6 +2492,54 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def token_cost_summary(self) -> dict:
+        """Observed task_attribution token cost, grouped by issue.
+
+        NULL means unreported: it is counted separately and never converted to
+        zero. ``reasoning_tokens`` is intentionally excluded from total because
+        providers report it as a component of output on some transports.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute("""
+                SELECT a.task_id, a.uncached_input_tokens, a.cache_write_tokens,
+                       a.cache_read_tokens, a.output_tokens, t.context
+                FROM task_attribution a JOIN tasks t ON t.task_id=a.task_id
+            """).fetchall()
+        finally:
+            conn.close()
+        total = 0
+        observed = 0
+        by_issue: dict = {}
+        for row in rows:
+            parts = (row["uncached_input_tokens"], row["cache_write_tokens"],
+                     row["cache_read_tokens"], row["output_tokens"])
+            # A partial provider response is still an observed lower-bound; a
+            # wholly NULL row remains explicitly unobserved.
+            known = [int(v) for v in parts if v is not None]
+            if known:
+                observed += 1
+                task_total = sum(known)
+                total += task_total
+            else:
+                task_total = None
+            try:
+                context = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                context = {}
+            issue = context.get("issue") if isinstance(context, dict) else None
+            if issue is not None:
+                bucket = by_issue.setdefault(str(issue), {"observed_tasks": 0,
+                                                          "unobserved_tasks": 0,
+                                                          "total_tokens": 0})
+                if task_total is None:
+                    bucket["unobserved_tasks"] += 1
+                else:
+                    bucket["observed_tasks"] += 1
+                    bucket["total_tokens"] += task_total
+        return {"observed_tasks": observed, "unobserved_tasks": len(rows) - observed,
+                "total_tokens": total, "by_issue": by_issue}
+
     def force_fail(self, task_id: str, summary: str, error_info: Optional[dict] = None) -> Optional[str]:
         """Mark an in_progress task as failed (used by the watchdog when a pane
         has been silent past the timeout). Returns the task_type so callers can

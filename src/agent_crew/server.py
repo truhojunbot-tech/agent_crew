@@ -3438,6 +3438,14 @@ def create_app(
             # from setup-time state would silently mix the two.
             if task.task_type == "test":
                 _scope = _load_test_scope(wt, _project)
+                # Council #39 Tier 1 has a fixed verification budget: changed
+                # scope plus the usual cross-cutting guards, never an
+                # operator-configured full-suite override. The cascade stores
+                # this decision on the task so replay/restart cannot infer it
+                # from a provider or project name.
+                if isinstance(task.context, dict) and task.context.get("test_scope") == "targeted":
+                    _scope = {**_scope, "full_suite": False,
+                              "source": "risk_tier", "source_kind": "risk_tier"}
                 _scope_name = _effective_scope(_scope)
                 _scope_hash = _scope_fingerprint(_scope)
                 q().record_test_economics(

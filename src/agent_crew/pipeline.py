@@ -40,6 +40,10 @@ from agent_crew.protocol import (
     normalize_pr_number,
 )
 from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
+from agent_crew.risk_tier import (
+    TIER_0, TIER_1, TIER_2, TIER_3, cascade_metadata, classify_task,
+    effective_fix_round_cap,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -569,7 +573,10 @@ def auto_enqueue_fix(
             )
             return None
 
-        max_rounds = review_fix_max_rounds()
+        # Council #39 A-4: the configured value remains a hard ceiling, while
+        # low-risk work stops once an additional fix is less valuable than its
+        # independent review/test cost.
+        max_rounds = effective_fix_round_cap(review_ctx, review_fix_max_rounds())
         # The lineage counter rides in the task context, so it survives a
         # server restart and counts ROUNDS rather than tasks. An in-memory
         # per-task_id counter (the transient-retry shape) could not work here:
@@ -881,6 +888,34 @@ def auto_enqueue_review(
             return None
         impl_task = impl_tasks[0]
         impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
+        risk = cascade_metadata(impl_task.description, impl_ctx)
+        # A review→fix lineage created before Council #39 has no tier receipt.
+        # Do not retroactively alter its already-running cap halfway through.
+        # Fresh implementation tasks receive the classification below.
+        legacy_fix_lineage = "fix_round" in impl_ctx and "risk_tier" not in impl_ctx
+        if legacy_fix_lineage:
+            risk = {}
+            tier = TIER_2
+        else:
+            tier = risk["risk_tier"]
+        # Tier 0 is intentionally implement-only. It remains observable via
+        # its task/result and can still be manually reviewed by an operator.
+        if tier == TIER_0:
+            logger.info("auto_enqueue_review: Tier 0 task %s is implement-only", impl_task_id)
+            return None
+        # Tier 3 contains irreversible/external work. Do not make a new worker
+        # runnable until a human resolves the durable approval gate.
+        if tier == TIER_3:
+            gate_id = f"risk-tier3-{impl_task_id}"
+            if not any(g.id == gate_id for g in queue.list_gates()):
+                queue.create_gate(GateRequest(
+                    id=gate_id, type="approval",
+                    message=(f"Tier 3 human/independent gate for {impl_task_id}: "
+                             "irreversible or external work must be explicitly approved "
+                             "before review/test continuation."),
+                ))
+            logger.warning("auto_enqueue_review: Tier 3 task %s held at %s", impl_task_id, gate_id)
+            return None
         from agent_crew.github import get_repo
         _impl_repo = (impl_ctx.get("repo") or "") or (
             get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
@@ -994,6 +1029,10 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
+        review_context.update(risk)
+        if tier == TIER_2:
+            review_context["review_mode"] = "adversarial"
+            review_context["instructions"] += "\n\nTier 2: perform an adversarial independent review; actively seek regression and safety gaps."
         if implementer_agent:
             review_context["implementer_agent"] = implementer_agent
         if impl_ctx.get("no_tester"):
@@ -1089,6 +1128,18 @@ def auto_enqueue_test(
         # Propagate upstream agent identities so review/test fallback can
         # avoid self-review and self-test (#117).
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
+        tier = classify_task(review_task.description, review_ctx)
+        if tier == TIER_0:
+            return None
+        if tier == TIER_3:
+            gate_id = f"risk-tier3-test-{review_task_id}"
+            if not any(g.id == gate_id for g in queue.list_gates()):
+                queue.create_gate(GateRequest(
+                    id=gate_id, type="approval",
+                    message=(f"Tier 3 human/independent gate for {review_task_id}: "
+                             "approve before test continuation."),
+                ))
+            return None
         from agent_crew.github import get_repo
         _test_repo = repo or (review_ctx.get("repo") or "") or (
             get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
@@ -1103,7 +1154,13 @@ def auto_enqueue_test(
         if _skip_terminal_pr("auto_enqueue_test", review_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
-        test_context: dict = {"prev_task_id": review_task_id}
+        test_context: dict = {"prev_task_id": review_task_id, "risk_tier": tier,
+                              "risk_tier_source": review_ctx.get("risk_tier_source", "metadata")}
+        if tier == TIER_1:
+            # #272's tester consumes this as an explicit treatment rather than
+            # guessing scope from the project/provider.
+            test_context["test_scope"] = "targeted"
+            test_context["test_scope_source"] = "risk_tier"
         if pr_number is not None:
             test_context["pr_number"] = pr_number  # #171: propagate for post-test merge
         if _test_repo:

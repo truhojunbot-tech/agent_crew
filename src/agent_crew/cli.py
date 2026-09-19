@@ -1268,7 +1268,7 @@ def status(project: str, base: str, preview: int):
     # list_tasks API only returns TaskRequest shape (no summary/verdict).
     result_cache: dict = {}
     _queue_for_preview = None
-    if preview > 0 and db_file and os.path.exists(db_file):
+    if db_file and os.path.exists(db_file):
         try:
             from agent_crew.queue import TaskQueue
             _queue_for_preview = TaskQueue(db_file)
@@ -1364,6 +1364,18 @@ def status(project: str, base: str, preview: int):
                             if len(snippet) > preview:
                                 snippet = snippet[:preview] + "…"
                             click.echo(f"      summary: {snippet}")
+
+    if _queue_for_preview is not None:
+        try:
+            costs = _queue_for_preview.token_cost_summary()
+            click.echo("\nToken cost (observed task_attribution): "
+                       f"{costs['total_tokens']} tokens across {costs['observed_tasks']} observed "
+                       f"tasks; {costs['unobserved_tasks']} unobserved")
+            for issue, value in sorted(costs["by_issue"].items()):
+                click.echo(f"  issue #{issue}: {value['total_tokens']} tokens, "
+                           f"{value['observed_tasks']} observed / {value['unobserved_tasks']} unobserved")
+        except Exception:
+            logger.exception("status token-cost summary failed")
 
     click.echo("\nAgents:")
     pane_targets = state.get("pane_ids") or [
