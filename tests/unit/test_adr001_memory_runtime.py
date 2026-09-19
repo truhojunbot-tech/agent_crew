@@ -32,3 +32,15 @@ def test_newer_memory_version_cannot_regress(tmp_path):
     store=SQLiteMemoryStorage(str(tmp_path/'m.sqlite')); s=MemoryScope(project='p')
     store.put(MemoryRecord('authoritative','spec',{'v':2},s,version=2)); store.put(MemoryRecord('authoritative','spec',{'v':1},s,version=1))
     assert store.retrieve(s,exact_key='spec')[0].value == {'v':2}
+
+def test_sibling_task_memory_does_not_leak_and_null_ancestor_inherits(tmp_path):
+    store=SQLiteMemoryStorage(str(tmp_path/'m.sqlite')); project=MemoryScope(fleet='f',project='p')
+    store.put(MemoryRecord('procedural','project',{},project))
+    store.put(MemoryRecord('episodic','only-a',{},MemoryScope(fleet='f',project='p',task_id='a')))
+    got=store.retrieve(MemoryScope(fleet='f',project='p',task_id='b'))
+    assert [r.key for r in got] == ['project']
+
+def test_equal_version_never_overwrites_content(tmp_path):
+    store=SQLiteMemoryStorage(str(tmp_path/'m.sqlite')); s=MemoryScope(project='p')
+    store.put(MemoryRecord('authoritative','spec',{'v':'first'},s,version=2)); store.put(MemoryRecord('authoritative','spec',{'v':'second'},s,version=2))
+    assert store.retrieve(s,exact_key='spec')[0].value == {'v':'first'}

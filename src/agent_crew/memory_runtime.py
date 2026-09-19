@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import dataclass, asdict
 from typing import Protocol
 
@@ -31,25 +32,25 @@ class SQLiteMemoryStorage:
     """Local-first POC; callers depend only on :class:`MemoryStorage`."""
     def __init__(self, path: str):
         self.path = path
-        with sqlite3.connect(path) as db:
-            db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))")
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))"); db.commit()
     def put(self, record: MemoryRecord) -> None:
         if record.layer not in LAYERS: raise ValueError("unknown memory layer")
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
                 ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
-                WHERE excluded.version >= adr001_memory.version""",
-                (record.layer, record.key, json.dumps(record.value), json.dumps(asdict(record.scope), sort_keys=True), record.version, time.time()))
+                WHERE excluded.version > adr001_memory.version""",
+                (record.layer, record.key, json.dumps(record.value), json.dumps(asdict(record.scope), sort_keys=True), record.version, time.time())); db.commit()
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
         fields = asdict(scope)
         clauses, params = [], []
         for name, value in fields.items():
             # A stored empty field is an ancestor; a nonempty one must agree.
-            clauses.append("(json_extract(scope, ?) = '' OR json_extract(scope, ?) = ?)")
-            path = f"$.{name}"; params.extend((path, path, value))
+            clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' OR json_extract(scope, ?) = ?)")
+            path = f"$.{name}"; params.extend((path, path, path, value))
         if exact_key:
             clauses.append("key=?"); params.append(exact_key)
-        with sqlite3.connect(self.path) as db:
+        with closing(sqlite3.connect(self.path)) as db:
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE " + " AND ".join(clauses), params).fetchall()
         result = [MemoryRecord(r[0], r[1], json.loads(r[2]), MemoryScope(**json.loads(r[3])), r[4]) for r in rows]
         terms = set(query.lower().replace('-', ' ').split())
@@ -72,6 +73,9 @@ def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: 
     # Truth and checkpoint state are mandatory quality inputs, independent of
     # lexical relevance or any future economics budget.
     records += [r for r in storage.retrieve(scope) if r.layer in {"authoritative", "checkpoint"}]
-    unique = {(r.layer, r.key): r for r in records}
+    unique = {}
+    for record in records:
+        # retrieve() is specificity-descending; first is the nearest truth.
+        unique.setdefault((record.layer, record.key), record)
     return {"enabled": True, "role": role, "task_id": task_id,
             "records": [asdict(r) for r in unique.values()]}
