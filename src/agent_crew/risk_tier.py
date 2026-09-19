@@ -40,12 +40,27 @@ def classify_task(description: str, context: Mapping | None = None) -> int:
     explicit = _override(context)
     if explicit is not None:
         return explicit
-    text = description or ""
+    ctx = context or {}
+    # Watch/direct enqueue callers often put the touched paths in structured
+    # metadata and leave the description as a short title. Fold only declared
+    # routing metadata into the deterministic classifier; never infer it from
+    # cwd/provider/session state.
+    path_values = []
+    for key in ("changed_paths", "paths", "files", "touches"):
+        value = ctx.get(key) if isinstance(ctx, Mapping) else None
+        if isinstance(value, str):
+            path_values.append(value)
+        elif isinstance(value, (list, tuple)):
+            path_values.extend(str(item) for item in value)
+    text = " ".join([description or "", *path_values])
+    if isinstance(ctx, Mapping) and any(ctx.get(key) is True for key in
+                                        ("external_impact", "irreversible", "requires_human_gate")):
+        return TIER_3
     if _TIER3.search(text):
         return TIER_3
     if _TIER2.search(text):
         return TIER_2
-    if (context or {}).get("doc_only") is True or _DOC_ONLY.search(text):
+    if ctx.get("doc_only") is True or _DOC_ONLY.search(text):
         return TIER_0
     return TIER_1
 

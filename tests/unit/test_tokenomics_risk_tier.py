@@ -21,6 +21,8 @@ def test_classifier_honours_explicit_override_and_metadata():
     assert classify_task("change src/agent_crew/queue.py", {}) == 2
     assert classify_task("add internal unit test", {}) == 1
     assert classify_task("run production deploy", {}) == 3
+    assert classify_task("small cleanup", {"changed_paths": ["src/agent_crew/pause.py"]}) == 3
+    assert classify_task("small cleanup", {"changed_paths": ["docs/runbook.md"]}) == 0
 
 
 def test_low_tiers_reduce_automatic_cascade_and_fix_budget(tmp_db):
