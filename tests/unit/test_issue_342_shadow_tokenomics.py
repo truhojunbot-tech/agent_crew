@@ -15,6 +15,13 @@ def test_unavailable_contract_records_baseline_and_never_blocks(monkeypatch, tmp
     assert json.loads(receipt["actual_execution_json"])["cascade"] == "baseline"
 
 
+def test_unexpected_shadow_failure_cannot_block_enqueue(monkeypatch, tmp_db):
+    monkeypatch.setattr("agent_crew.queue.shadow_recommendation",
+                        lambda _task: (_ for _ in ()).throw(RuntimeError("shadow down")))
+    queue = TaskQueue(tmp_db)
+    assert queue.enqueue(TaskRequest("shadow-exception", "implement", "x")) == "shadow-exception"
+
+
 def test_contract_recommendation_is_counterfactual_and_outcome_keeps_economics(monkeypatch, tmp_path, tmp_db):
     policy = tmp_path / "policy.json"
     policy.write_text(json.dumps({"version": "80.1", "recommendation": {"tier": 0, "test": "skip"}}))
@@ -28,6 +35,16 @@ def test_contract_recommendation_is_counterfactual_and_outcome_keeps_economics(m
     assert json.loads(receipt["recommendation_json"])["test"] == "skip"
     assert json.loads(receipt["actual_execution_json"])["cascade"] == "baseline"
     assert receipt["outcome"] == "completed"
+
+
+def test_late_provider_telemetry_refreshes_counterfactual_economics(tmp_db):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("late-usage", "implement", "x"))
+    queue.record_attribution("late-usage")
+    queue.submit_result("late-usage", TaskResult(task_id="late-usage", status="completed", summary="done"))
+    queue.record_task_telemetry("late-usage", TaskTelemetry(output_tokens=19))
+    receipt = queue.get_tokenomics_shadow_receipt("late-usage")
+    assert json.loads(receipt["economics_json"])["output_tokens"] == 19
 
 
 def test_cost_summary_keeps_unreported_usage_unknown(tmp_db):

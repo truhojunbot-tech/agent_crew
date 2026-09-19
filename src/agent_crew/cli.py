@@ -1271,7 +1271,7 @@ def status(project: str, base: str, preview: int):
     if db_file and os.path.exists(db_file):
         try:
             from agent_crew.queue import TaskQueue
-            _queue_for_preview = TaskQueue(db_file)
+            _queue_for_preview = TaskQueue(db_file, read_only=True)
         except Exception:
             _queue_for_preview = None
 
@@ -1298,7 +1298,7 @@ def status(project: str, base: str, preview: int):
         if db_file and os.path.exists(db_file):
             try:
                 from agent_crew.queue import TaskQueue as _TQ
-                _tq_all = _TQ(db_file)
+                _tq_all = _TQ(db_file, read_only=True)
                 _all_tasks = _tq_all.list_all_with_status()
                 task_groups = {}
                 for _t in _all_tasks:

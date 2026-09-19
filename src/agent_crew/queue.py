@@ -455,10 +455,16 @@ def task_issue_number(task) -> Optional[int]:
 
 
 class TaskQueue:
-    def __init__(self, db_path: str, *, telemetry_adapter: Optional[TaskTelemetryAdapter] = None):
+    def __init__(self, db_path: str, *, telemetry_adapter: Optional[TaskTelemetryAdapter] = None,
+                 read_only: bool = False):
         self._db_path = db_path
         self._telemetry_adapter = telemetry_adapter or default_telemetry_adapter()
         conn = self._connect()
+        if read_only:
+            # Status/reporting must not acquire schema/STOP authority merely
+            # to inspect an already-initialized project database.
+            conn.close()
+            return
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
         conn.execute(_DDL_TOKENOMICS_SHADOW)
@@ -964,18 +970,6 @@ class TaskQueue:
                     task.project,
                 ),
             )
-            shadow = shadow_recommendation(task)
-            now = time.time()
-            # Actual is deliberately the existing baseline, not the proposal.
-            conn.execute(
-                """INSERT INTO tokenomics_shadow_receipts
-                   (task_id, decision_source, policy_version, recommendation_json,
-                    actual_execution_json, created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (task.task_id, shadow["decision_source"], shadow["policy_version"],
-                 json.dumps(shadow["recommendation"]),
-                 json.dumps({"cascade": "baseline", "task_type": task.task_type}), now, now),
-            )
             conn.commit()
         except sqlite3.IntegrityError as e:
             # #273: task_id is the primary key, so a duplicate insert raises
@@ -1000,6 +994,28 @@ class TaskQueue:
             raise TaskAlreadyExistsError(task.task_id, existing_status) from None
         finally:
             conn.close()
+        # Shadow telemetry is strictly post-commit and best-effort: a policy
+        # reader, receipt write, or future adapter bug can never veto domain
+        # admission (including through an unfamiliar exception class).
+        try:
+            shadow = shadow_recommendation(task)
+            now = time.time()
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """INSERT OR IGNORE INTO tokenomics_shadow_receipts
+                       (task_id, decision_source, policy_version, recommendation_json,
+                        actual_execution_json, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (task.task_id, shadow["decision_source"], shadow["policy_version"],
+                     json.dumps(shadow["recommendation"]),
+                     json.dumps({"cascade": "baseline", "task_type": task.task_type}), now, now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+        except Exception:
+            logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
         return task.task_id
 
     # ── one-shot PR announcements (#250 review) ───────────────────────
@@ -1354,14 +1370,7 @@ class TaskQueue:
                 (result.status, outcome, now, now, task_id),
             )
             self._store_task_telemetry(conn, task_id, telemetry, now)
-            economics = conn.execute(
-                """SELECT uncached_input_tokens, cache_write_tokens, cache_read_tokens,
-                          output_tokens, reasoning_tokens, context_window_tokens
-                   FROM task_attribution WHERE task_id=?""", (task_id,)).fetchone()
-            conn.execute(
-                "UPDATE tokenomics_shadow_receipts SET outcome=?, economics_json=?, updated_at=? WHERE task_id=?",
-                (outcome, json.dumps(dict(economics)) if economics is not None else None, now, task_id),
-            )
+            self._refresh_shadow_economics(conn, task_id, now, outcome)
             # #204: completed_at >= started_at is expected to always hold —
             # started_at is set once at first dispatch and never rewritten
             # (see record_attribution). It can only be violated by clock
@@ -1441,7 +1450,11 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            self._store_task_telemetry(conn, task_id, telemetry, time.time())
+            now = time.time()
+            self._store_task_telemetry(conn, task_id, telemetry, now)
+            # #334 may write final provider usage after submit_result. Refresh
+            # the counterfactual from the same durable row, not an early copy.
+            self._refresh_shadow_economics(conn, task_id, now)
             conn.commit()
         except Exception:
             try:
@@ -1451,6 +1464,19 @@ class TaskQueue:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _refresh_shadow_economics(conn: sqlite3.Connection, task_id: str, now: float,
+                                  outcome: Optional[str] = None) -> None:
+        economics = conn.execute(
+            """SELECT uncached_input_tokens, cache_write_tokens, cache_read_tokens,
+                      output_tokens, reasoning_tokens, context_window_tokens
+               FROM task_attribution WHERE task_id=?""", (task_id,)).fetchone()
+        conn.execute(
+            """UPDATE tokenomics_shadow_receipts
+               SET outcome=COALESCE(?, outcome), economics_json=?, updated_at=? WHERE task_id=?""",
+            (outcome, json.dumps(dict(economics)) if economics is not None else None, now, task_id),
+        )
 
     @staticmethod
     def _store_task_telemetry(
