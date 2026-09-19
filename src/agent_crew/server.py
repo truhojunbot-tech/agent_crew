@@ -56,6 +56,7 @@ from agent_crew.testing_policy import (
     scope_fingerprint as _scope_fingerprint,
     test_stage_lock,
 )
+from agent_crew.telemetry_response import response_log_telemetry
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -3639,7 +3640,8 @@ def create_app(
             cmd = ["agy", "-p", message]
             if _ctx_info["context_policy"] == "resume":
                 cmd.append("--continue")
-            cmd += ["--dangerously-skip-permissions", "--model", _known_model]
+            cmd += ["--dangerously-skip-permissions", "--model", _known_model,
+                    "--output-format", "json"]
         else:  # codex — resume last session for context continuity; falls back to fresh if none exists
             # #260: policy-aware for the same reason as claude above. Codex has
             # no per-worktree store to size — `~/.codex/sessions` is partitioned
@@ -3656,10 +3658,10 @@ def create_app(
             #   cross-project content leak.
             if _codex_session:
                 cmd = ["codex", "exec", "resume", _codex_session,
-                       "--dangerously-bypass-approvals-and-sandbox", message]
+                       "--dangerously-bypass-approvals-and-sandbox", "--json", message]
             else:
                 cmd = ["codex", "exec",
-                       "--dangerously-bypass-approvals-and-sandbox", message]
+                       "--dangerously-bypass-approvals-and-sandbox", "--json", message]
 
         timeout_secs = _dispatch_timeout_for_role(role)
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
@@ -3669,6 +3671,7 @@ def create_app(
         # was erased every attempt and _MAX_TRANSIENT_RETRY never actually
         # capped anything (#201).
         _terminal = True
+        _task_log_tail = ""
         try:
             import datetime as _dt
             with open(log_path, "a") as log_f:
@@ -3778,6 +3781,14 @@ def create_app(
                     )
             except Exception:
                 logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
+            try:
+                q().record_task_telemetry(
+                    task.task_id, response_log_telemetry(agent, _task_log_tail))
+                _telemetry_attr = q().get_attribution(task.task_id)
+                if _telemetry_attr:
+                    append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
+            except Exception:
+                logger.exception("dispatcher: terminal telemetry enrichment failed for task=%s", task.task_id)
             if _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
