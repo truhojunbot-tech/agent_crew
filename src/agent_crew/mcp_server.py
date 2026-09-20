@@ -193,6 +193,20 @@ def build_mcp_server(
             task_type = queue.submit_result(task_id, result)
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
+        # #348: mirror HTTP's post-commit, fail-soft persistence. This is
+        # intentionally outside the STOP-atomic result submit and must not
+        # change the cascade suppression response when STOP wins the race.
+        _result_ref = {
+            key: value for key, value in (
+                ("result_branch", result.branch),
+                ("result_commit", result.commit),
+            ) if value
+        }
+        if _result_ref:
+            try:
+                queue.merge_task_context(task_id, _result_ref)
+            except Exception:
+                logger.exception("MCP submit_result: could not persist result ref metadata for %s", task_id)
         if mismatch:
             requested, reported = mismatch
             return {"acknowledged": True, "task_id": task_id, "task_type": task_type,

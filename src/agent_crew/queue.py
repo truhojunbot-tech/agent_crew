@@ -1175,6 +1175,24 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def merge_task_context(self, task_id: str, updates: dict) -> None:
+        """Best-effort-safe JSON merge for result metadata written after submit.
+
+        This intentionally has no STOP admission or cascade behaviour: callers
+        use it only after ``submit_result`` committed the terminal result.
+        """
+        if not updates:
+            return
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET context = json_patch(context, ?) WHERE task_id = ?",
+                (json.dumps(updates), task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def dequeue(self, agent: str = "", role: str = "") -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -2040,17 +2058,22 @@ class TaskQueue:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT task_id, status, summary, verdict, findings FROM tasks WHERE task_id = ?",
+                "SELECT task_id, status, summary, verdict, findings, pr_number, context "
+                "FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
             if row is None or row["status"] not in ("completed", "failed", "needs_human"):
                 return None
+            context = json.loads(row["context"] or "{}")
             return TaskResult(
                 task_id=row["task_id"],
                 status=row["status"],
                 summary=row["summary"] or "",
                 verdict=row["verdict"],
                 findings=json.loads(row["findings"]) if row["findings"] else [],
+                pr_number=row["pr_number"],
+                branch=context.get("result_branch") or "",
+                commit=context.get("result_commit") or "",
             )
         finally:
             conn.close()

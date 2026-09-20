@@ -4635,6 +4635,25 @@ def create_app(
         _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
         try:
             task_type = q().submit_result(task_id, result)
+            # #348: coordinator-managed loops consume the persisted result,
+            # not this handler's in-memory object. Keep this deliberately
+            # outside submit_result's STOP-atomic transaction: a telemetry-like
+            # ref update must never alter result admission, cascade/outbox, or
+            # pause suppression semantics.
+            _result_ref = {
+                key: value for key, value in (
+                    ("result_branch", result.branch),
+                    ("result_commit", result.commit),
+                ) if value
+            }
+            if _result_ref:
+                try:
+                    q().merge_task_context(task_id, _result_ref)
+                except Exception:
+                    logger.exception(
+                        "POST /tasks/%s/result: could not persist result ref metadata",
+                        task_id,
+                    )
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
             if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
                 logger.warning(
