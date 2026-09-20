@@ -49,8 +49,10 @@ def test_context_evidence_has_quota_core_required_shape(tmp_db):
     assert set(evidence) == {
         "outcome", "independent_review_correct", "required_context_recalled",
         "context_growth_tokens", "retry_of", "fallback_of", "token_observations",
+        "risk_declaration",
     }
     assert evidence["required_context_recalled"] is None
+    assert evidence["risk_declaration"]["declaration_source"] == "unknown"
     assert set(evidence["token_observations"]) == {
         "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
         "output_tokens", "reasoning_tokens",
@@ -59,7 +61,9 @@ def test_context_evidence_has_quota_core_required_shape(tmp_db):
     sys.path.insert(0, str(quota_core))
     try:
         from quota_core.context_economics.policy import policy_contract_schema
-        jsonschema.validate(evidence, policy_contract_schema()["properties"]["evidence"])
+        quality_evidence = {key: value for key, value in evidence.items()
+                            if key != "risk_declaration"}
+        jsonschema.validate(quality_evidence, policy_contract_schema()["properties"]["evidence"])
     finally:
         sys.path.remove(str(quota_core))
 
