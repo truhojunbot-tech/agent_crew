@@ -103,6 +103,9 @@ def test_cost_summary_preserves_unknowns_and_groups_by_issue(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("known", "implement", "internal", context={"issue": 39}))
     queue.enqueue(TaskRequest("unknown", "implement", "internal", context={"issue": 39}))
+    # A task can legitimately have no attribution row yet (for example before
+    # it is claimed). It is unknown, not absent from the cost denominator.
+    queue.enqueue(TaskRequest("missing", "implement", "internal", context={"issue": 39}))
     queue.record_attribution("known")
     queue.record_attribution("unknown")
     queue.record_task_telemetry("known", TaskTelemetry(
@@ -111,6 +114,7 @@ def test_cost_summary_preserves_unknowns_and_groups_by_issue(tmp_db):
     ))
     summary = queue.token_cost_summary()
     assert summary["observed_tasks"] == 1
-    assert summary["unobserved_tasks"] == 1
+    assert summary["unobserved_tasks"] == 2
     assert summary["total_tokens"] == 20
     assert summary["by_issue"]["39"]["total_tokens"] == 20
+    assert summary["by_issue"]["39"]["unobserved_tasks"] == 2
