@@ -41,7 +41,9 @@ from agent_crew.pipeline import (
     auto_enqueue_test,
     auto_fallback_failed_task,    hold_mismatched_pr_result,
 )
-from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.protocol import (
+    TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
+)
 from agent_crew.queue import PausedError as _PausedError, TaskQueue
 
 logger = logging.getLogger(__name__)
@@ -198,8 +200,8 @@ def build_mcp_server(
         # change the cascade suppression response when STOP wins the race.
         _result_ref = {
             key: value for key, value in (
-                ("result_branch", result.branch),
-                ("result_commit", result.commit),
+                (RESULT_BRANCH_CONTEXT_KEY, result.branch),
+                (RESULT_COMMIT_CONTEXT_KEY, result.commit),
             ) if value
         }
         if _result_ref:

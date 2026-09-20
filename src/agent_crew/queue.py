@@ -10,7 +10,10 @@ import uuid
 from typing import List, Optional
 
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
-from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+from agent_crew.protocol import (
+    GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
+    RESULT_COMMIT_CONTEXT_KEY,
+)
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_shadow import shadow_recommendation
 
@@ -2072,8 +2075,8 @@ class TaskQueue:
                 verdict=row["verdict"],
                 findings=json.loads(row["findings"]) if row["findings"] else [],
                 pr_number=row["pr_number"],
-                branch=context.get("result_branch") or "",
-                commit=context.get("result_commit") or "",
+                branch=context.get(RESULT_BRANCH_CONTEXT_KEY) or "",
+                commit=context.get(RESULT_COMMIT_CONTEXT_KEY) or "",
             )
         finally:
             conn.close()

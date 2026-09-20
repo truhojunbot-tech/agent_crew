@@ -87,6 +87,60 @@ def test_paused_http_submit_keeps_existing_suppression_and_ref_persistence_is_sa
     assert (result.branch, result.commit) == ("fix/348-result", COMMIT)
 
 
+def test_retry_child_drops_parent_result_refs_and_empty_result_stays_empty(tmp_path):
+    db_path = str(tmp_path / "tasks.db")
+    TaskQueue(db_path).enqueue(TaskRequest(
+        task_id="impl-parent", task_type="implement", description="work", branch="main",
+        priority=3, context={"result_branch": "fix/stale", "result_commit": COMMIT},
+    ))
+
+    async def submit_failed_parent():
+        app = _app(db_path)
+        async with app.router.lifespan_context(app):
+            handler = next(route.endpoint for route in app.routes
+                           if getattr(route, "path", "") == "/tasks/{task_id}/result")
+            return handler("impl-parent", TaskResult(
+                task_id="impl-parent", status="failed", summary="ordinary failure",
+            ))
+
+    asyncio.run(submit_failed_parent())
+    queue = TaskQueue(db_path)
+    child = next(task for task in queue.list_tasks() if task.task_id.startswith("retry-"))
+    assert "result_branch" not in child.context
+    assert "result_commit" not in child.context
+    queue.submit_result(child.task_id, TaskResult(
+        task_id=child.task_id, status="completed", summary="child done",
+    ))
+    result = queue.get_result(child.task_id)
+    assert result is not None
+    assert (result.branch, result.commit) == ("", "")
+
+
+def test_mcp_submit_persists_result_refs_fail_soft(tmp_path, monkeypatch):
+    import agent_crew.mcp_server as mcp_server
+
+    db_path = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db_path)
+    queue.enqueue(TaskRequest(task_id="mcp-348", task_type="discuss", description="work",
+                              branch="main", context={}))
+    tool = mcp_server.build_mcp_server(db_path)._tool_manager._tools["submit_result"].fn
+    ack = asyncio.run(tool(task_id="mcp-348", summary="done", branch="fix/mcp", commit=COMMIT)) \
+        if asyncio.iscoroutinefunction(tool) else tool(
+            task_id="mcp-348", summary="done", branch="fix/mcp", commit=COMMIT)
+    assert ack["acknowledged"] is True
+    persisted = TaskQueue(db_path).get_result("mcp-348")
+    assert persisted is not None
+    assert (persisted.branch, persisted.commit) == ("fix/mcp", COMMIT)
+
+    monkeypatch.setattr(TaskQueue, "merge_task_context", lambda *args: (_ for _ in ()).throw(OSError("disk")))
+    queue.enqueue(TaskRequest(task_id="mcp-fail-soft", task_type="discuss", description="work",
+                              branch="main", context={}))
+    ack = asyncio.run(tool(task_id="mcp-fail-soft", summary="done", branch="fix/mcp", commit=COMMIT)) \
+        if asyncio.iscoroutinefunction(tool) else tool(
+            task_id="mcp-fail-soft", summary="done", branch="fix/mcp", commit=COMMIT)
+    assert ack["acknowledged"] is True
+
+
 class _LoopQueue:
     def __init__(self, results):
         self.results = iter(results)
@@ -155,3 +209,19 @@ def test_run_loop_stops_when_implementer_reports_same_commit_twice(tmp_path, mon
     assert invocation.exit_code == 0, invocation.output
     assert "implementer changes not persisting (same commit reported twice)" in invocation.output
     assert [kind for kind, *_ in dispatched] == ["implement", "review", "implement"]
+
+
+def test_run_loop_carries_last_nonempty_branch_when_next_result_omits_one(tmp_path, monkeypatch):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done",
+                   branch="fix/348-result", commit=COMMIT),
+        TaskResult(task_id="review-1", status="completed", summary="changes",
+                   verdict="request_changes", findings=["fix it"]),
+        TaskResult(task_id="impl-2", status="completed", summary="done", commit="b" * 40),
+        TaskResult(task_id="review-2", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert dispatched[3][0:2] == ("review", "fix/348-result")

@@ -2333,13 +2333,17 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     _loop_pr_number: int | None = None  # first PR number seen across all results
     _previous_impl_commit = ""
+    _last_impl_branch = ""
 
     for iteration in range(1, max_iter + 1):
         impl_start = time.time()
         impl_result = _wait(impl_id)
         impl_elapsed = int(time.time() - impl_start)
         _loop_pr_number = _loop_pr_number or getattr(impl_result, "pr_number", None)
-        impl_branch = getattr(impl_result, "branch", "") or ""
+        reported_branch = getattr(impl_result, "branch", "") or ""
+        if reported_branch:
+            _last_impl_branch = reported_branch
+        impl_branch = _last_impl_branch
         impl_commit = getattr(impl_result, "commit", "") or ""
         if impl_commit and impl_commit == _previous_impl_commit:
             click.echo(
