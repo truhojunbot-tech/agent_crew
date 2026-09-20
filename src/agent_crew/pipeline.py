@@ -38,6 +38,8 @@ from agent_crew.protocol import (
     TaskRequest,
     TaskResult,
     normalize_pr_number,
+    RESULT_BRANCH_CONTEXT_KEY,
+    RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
 from agent_crew.risk_tier import (
@@ -1262,6 +1264,8 @@ def auto_fallback_failed_task(
             return False
         original = tasks[0]
         ctx = dict(original.context) if isinstance(original.context, dict) else {}
+        ctx.pop(RESULT_BRANCH_CONTEXT_KEY, None)
+        ctx.pop(RESULT_COMMIT_CONTEXT_KEY, None)
 
         # #167: stop infinite fallback loops — if the chain has already been
         # retried MAX_FALLBACK_CHAIN_DEPTH times, cancel the original task and
