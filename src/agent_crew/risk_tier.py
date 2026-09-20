@@ -15,9 +15,8 @@ logger = logging.getLogger(__name__)
 
 TIER_0, TIER_1, TIER_2, TIER_3 = range(4)
 
-_TIER3 = re.compile(r"\b(stop|pause|resume|merge|deploy|production|release|external\s+(?:mutation|write|api)|delete|destroy)\b", re.I)
+_TIER3 = re.compile(r"\b(stop|pause|resume|merge|deploy|external\s+(?:mutation|write|api)|delete|destroy)\b", re.I)
 _TIER2 = re.compile(r"\b(core|queue|pipeline|server|protocol|schema|migration|database|api|mcp|interface|auth(?:entication)?|security)\b", re.I)
-_DOC_ONLY = re.compile(r"\b(docs?/|readme(?:\.md)?|\.md\b|documentation|typo|comment)\b", re.I)
 
 
 def _override(context: Mapping | None):
@@ -37,9 +36,6 @@ def classify_task(description: str, context: Mapping | None = None) -> int:
     ``context.risk_tier`` is the explicit operator override. Invalid values are
     ignored rather than coerced into a potentially lower safety tier.
     """
-    explicit = _override(context)
-    if explicit is not None:
-        return explicit
     ctx = context or {}
     # Watch/direct enqueue callers often put the touched paths in structured
     # metadata and leave the description as a short title. Fold only declared
@@ -55,14 +51,17 @@ def classify_task(description: str, context: Mapping | None = None) -> int:
     text = " ".join([description or "", *path_values])
     if isinstance(ctx, Mapping) and any(ctx.get(key) is True for key in
                                         ("external_impact", "irreversible", "requires_human_gate")):
-        return TIER_3
-    if _TIER3.search(text):
-        return TIER_3
-    if _TIER2.search(text):
-        return TIER_2
-    if ctx.get("doc_only") is True or _DOC_ONLY.search(text):
-        return TIER_0
-    return TIER_1
+        automatic = TIER_3
+    elif _TIER3.search(text):
+        automatic = TIER_3
+    elif _TIER2.search(text):
+        automatic = TIER_2
+    elif path_values and all(path.startswith("docs/") or path.endswith(".md") for path in path_values):
+        automatic = TIER_0
+    else:
+        automatic = TIER_1
+    explicit = _override(context)
+    return max(automatic, explicit) if explicit is not None else automatic
 
 
 def effective_fix_round_cap(context: Mapping | None, ceiling: int | None = None) -> int:

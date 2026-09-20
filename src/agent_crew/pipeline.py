@@ -905,7 +905,7 @@ def auto_enqueue_review(
             return None
         # Tier 3 contains irreversible/external work. Do not make a new worker
         # runnable until a human resolves the durable approval gate.
-        if tier == TIER_3:
+        if tier == TIER_3 and not impl_ctx.get("tier3_gate_approved"):
             gate_id = f"risk-tier3-{impl_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1030,6 +1030,8 @@ def auto_enqueue_review(
             "pr_number": pr_number,
         }
         review_context.update(risk)
+        if impl_ctx.get("tier3_gate_approved"):
+            review_context["tier3_gate_approved"] = True
         if tier == TIER_2:
             review_context["review_mode"] = "adversarial"
             review_context["instructions"] += "\n\nTier 2: perform an adversarial independent review; actively seek regression and safety gaps."
@@ -1203,6 +1205,16 @@ def auto_enqueue_test(
     except Exception as e:
         logger.warning(f"auto_enqueue_test: unexpected error: {e}")
         return None
+
+
+def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Optional[str]:
+    """Resume the deterministic review held by an approved Tier 3 gate."""
+    gate = next((item for item in queue.list_gates() if item.id == gate_id), None)
+    if gate is None or gate.status != "approved" or not gate_id.startswith("risk-tier3-"):
+        return None
+    task_id = gate_id[len("risk-tier3-"):]
+    queue.patch_context(task_id, {"tier3_gate_approved": True})
+    return auto_enqueue_review(queue, task_id, pr_state_fn=pr_state_fn)
 
 
 def auto_fallback_failed_task(

@@ -1,6 +1,6 @@
 """Council #39 enforcement: risk determines automated cascade spend."""
 
-from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_review, auto_enqueue_test
+from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_review, auto_enqueue_test, resume_tier3_gate
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.risk_tier import classify_task, effective_fix_round_cap
@@ -17,7 +17,7 @@ def _task(queue, task_id):
 
 def test_classifier_honours_explicit_override_and_metadata():
     assert classify_task("update docs/README.md", {"risk_tier": 3}) == 3
-    assert classify_task("update docs/README.md", {}) == 0
+    assert classify_task("update docs/README.md", {"changed_paths": ["docs/README.md"]}) == 0
     assert classify_task("change src/agent_crew/queue.py", {}) == 2
     assert classify_task("add internal unit test", {}) == 1
     assert classify_task("run production deploy", {}) == 3
@@ -25,9 +25,19 @@ def test_classifier_honours_explicit_override_and_metadata():
     assert classify_task("small cleanup", {"changed_paths": ["docs/runbook.md"]}) == 0
 
 
+def test_explicit_override_never_downgrades_merge_or_deploy():
+    assert classify_task("merge then deploy", {"risk_tier": 0}) == 3
+
+
+def test_description_comment_cannot_make_code_change_tier_zero():
+    assert classify_task("fix request_changes comment", {}) == 1
+    assert classify_task("fix comment", {"changed_paths": ["src/agent_crew/queue.py"]}) == 2
+
+
 def test_low_tiers_reduce_automatic_cascade_and_fix_budget(tmp_db):
     queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest("doc", "implement", "docs/README.md only", branch="b"))
+    queue.enqueue(TaskRequest("doc", "implement", "docs/README.md only", branch="b",
+                              context={"changed_paths": ["docs/README.md"]}))
     assert auto_enqueue_review(queue, "doc", pr_number=1, pr_state_fn=_open) is None
     queue.enqueue(TaskRequest("internal", "implement", "internal helper with unit tests",
                               branch="b", context={"issue": 39}))
@@ -52,6 +62,8 @@ def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(tmp_db):
     assert len(gates) == 1
     assert gates[0].type == "approval"
     assert "Tier 3" in gates[0].message
+    queue.resolve_gate("risk-tier3-deploy", approved=True)
+    assert resume_tier3_gate(queue, "risk-tier3-deploy", pr_state_fn=_open) == "review-deploy-r0"
 
 
 def test_cost_summary_preserves_unknowns_and_groups_by_issue(tmp_db):
