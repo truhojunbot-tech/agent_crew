@@ -137,10 +137,11 @@ def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Option
 
 
 #: Branch names agent_crew generates itself, and may therefore force-move.
-_OWNED_TASK_BRANCH_RE = re.compile(r"\Aagent/[^/]{12}\Z")
+_OWNED_TASK_BRANCH_RE = re.compile(r"\Aagent/[^/]{1,12}\Z")
 _OWNED_SETUP_BRANCH_RE = re.compile(
     r"\Aagent/[^/]+/(?:claude|codex|gemini|implementer|reviewer|tester)\Z"
 )
+_OWNED_REVIEW_OR_TEST_BRANCH_RE = re.compile(r"\A(?:review|test)/[0-9a-f]{8}\Z")
 
 
 def _agent_crew_owns_branch(branch: str) -> bool:
@@ -164,9 +165,9 @@ def _agent_crew_owns_branch(branch: str) -> bool:
     """
     name = (branch or "").strip()
     return (
-        name.startswith(("review/", "test/"))
-        or bool(_OWNED_TASK_BRANCH_RE.match(name))
+        bool(_OWNED_TASK_BRANCH_RE.match(name))
         or bool(_OWNED_SETUP_BRANCH_RE.match(name))
+        or bool(_OWNED_REVIEW_OR_TEST_BRANCH_RE.match(name))
     )
 
 

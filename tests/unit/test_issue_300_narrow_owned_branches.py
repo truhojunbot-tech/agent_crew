@@ -90,10 +90,13 @@ def test_owned_branch_with_unpushed_commit_is_preserved_on_retry(shared_clone, t
 
 @pytest.mark.parametrize(("branch", "owned"), [
     ("agent/claude-cli/x", False),
+    ("agent/impl-1", True),
     ("agent/0123456789ab", True),
     ("agent/project/claude", True),
-    ("review/x", True),
-    ("test/x", True),
+    ("review/my-notes", False),
+    ("test/my-local-experiment", False),
+    ("review/ab12cd34", True),
+    ("test/ff00ff00", True),
 ])
 def test_owned_branch_shapes_are_deliberately_narrow(branch, owned):
     assert _agent_crew_owns_branch(branch) is owned

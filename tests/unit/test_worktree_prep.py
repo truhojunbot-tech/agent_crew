@@ -57,8 +57,8 @@ def _git_calls(cmds_list):
     return [c for c in cmds_list if isinstance(c, list) and c[:2] == ["git", "-C"]]
 
 
-def test_prepare_implementer_checks_out_task_branch():
-    """Implementer: stash → fetch → checkout -B <task_branch> origin/main."""
+def test_prepare_implementer_checks_out_owned_task_branch():
+    """Implementer force-resets its generated branch from origin/main."""
     cmds = []
 
     def fake_run(cmd, **_kw):
@@ -67,7 +67,7 @@ def test_prepare_implementer_checks_out_task_branch():
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
         _prepare_worktree_for_task(
-            "/wt/claude", "task-abc123", "agent/feat-xyz", "implementer"
+            "/wt/claude", "0123456789ab", "agent/0123456789ab", "implementer"
         )
 
     git = _git_calls(cmds)
@@ -75,11 +75,32 @@ def test_prepare_implementer_checks_out_task_branch():
     assert any("stash" in " ".join(c) for c in git)
     # fetch
     assert any("fetch" in " ".join(c) for c in git)
-    # checkout -B agent/feat-xyz origin/main
+    # checkout -B agent/0123456789ab origin/main
     checkout = [c for c in git if "checkout" in c]
     assert checkout, "no checkout call"
-    assert any("agent/feat-xyz" in " ".join(c) for c in checkout)
-    assert any("origin/main" in " ".join(c) for c in checkout)
+    assert [c[-3:] for c in checkout] == [["-B", "agent/0123456789ab", "origin/main"]]
+
+
+def test_prepare_implementer_detaches_for_unowned_agent_branch():
+    """A human-named agent branch is never reset or created locally."""
+    cmds = []
+
+    def fake_run(cmd, **_kw):
+        cmds.append(cmd)
+        if "rev-parse" in cmd:
+            return MagicMock(returncode=0, stderr="", stdout="a" * 40 + "\n")
+        return MagicMock(returncode=0, stderr="", stdout="")
+
+    with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
+        _prepare_worktree_for_task(
+            "/wt/claude", "0123456789ab", "agent/my-local-experiment", "implementer"
+        )
+
+    checkout = [c for c in _git_calls(cmds) if "checkout" in c]
+    assert checkout == [[
+        "git", "-C", "/wt/claude", "checkout", "--detach",
+        "origin/agent/my-local-experiment",
+    ]]
 
 
 def test_prepare_implementer_derives_branch_from_task_id_when_empty():
