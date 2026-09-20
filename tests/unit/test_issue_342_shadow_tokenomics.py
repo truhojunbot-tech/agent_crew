@@ -1,6 +1,7 @@
 """#342 must observe external economics policy without enforcing it."""
 import json
 
+from agent_crew.cli import _tokenomics_policy_path
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.telemetry import TaskTelemetry
@@ -35,6 +36,30 @@ def test_contract_recommendation_is_counterfactual_and_outcome_keeps_economics(m
     assert json.loads(receipt["recommendation_json"])["test"] == "skip"
     assert json.loads(receipt["actual_execution_json"])["cascade"] == "baseline"
     assert receipt["outcome"] == "completed"
+
+
+def test_quota_core_v1_report_selects_the_matching_task_decision(monkeypatch, tmp_path, tmp_db):
+    policy = tmp_path / "quota-core-v1.json"
+    policy.write_text(json.dumps({
+        "contract_version": "1.0", "mode": "shadow", "decision_count": 1,
+        "decisions": [{"task_id": "quota-v1", "risk_tier": "routine",
+                       "recommended_provider_tier": "preserve_current"}],
+    }))
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(tmp_db)
+
+    queue.enqueue(TaskRequest("quota-v1", "implement", "organic-shaped", branch="b"))
+
+    receipt = queue.get_tokenomics_shadow_receipt("quota-v1")
+    assert receipt["decision_source"] == "quota_core_contract"
+    assert receipt["policy_version"] == "1.0"
+    assert json.loads(receipt["recommendation_json"])["risk_tier"] == "routine"
+
+
+def test_project_policy_path_is_durable_and_operator_overridable(tmp_path):
+    default = _tokenomics_policy_path(str(tmp_path), {})
+    assert default == str(tmp_path / "tokenomics-policy.json")
+    assert _tokenomics_policy_path(str(tmp_path), {"tokenomics_policy_path": "/contract/v1.json"}) == "/contract/v1.json"
 
 
 def test_late_provider_telemetry_refreshes_counterfactual_economics(tmp_db):

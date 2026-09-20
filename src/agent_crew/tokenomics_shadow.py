@@ -25,7 +25,27 @@ def shadow_recommendation(task) -> dict[str, Any]:
     try:
         with open(path, encoding="utf-8") as handle:
             contract = json.load(handle)
-        if not isinstance(contract, dict) or not isinstance(contract.get("recommendation"), dict):
+        if not isinstance(contract, dict):
+            return baseline
+        # quota-core #80 / PR #81 v1.0 is a shadow report containing one
+        # decision per task. Agent Crew consumes it as opaque evidence; it
+        # never evaluates or applies the policy itself.
+        if contract.get("contract_version") == "1.0" and contract.get("mode") == "shadow":
+            decisions = contract.get("decisions")
+            if not isinstance(decisions, list):
+                return baseline
+            recommendation = next(
+                (item for item in decisions
+                 if isinstance(item, dict) and item.get("task_id") == task.task_id),
+                None,
+            )
+            if not isinstance(recommendation, dict):
+                return baseline
+            return {"decision_source": "quota_core_contract",
+                    "policy_version": contract["contract_version"],
+                    "recommendation": recommendation,
+                    "reason": "shadow_only"}
+        if not isinstance(contract.get("recommendation"), dict):
             return baseline
         return {"decision_source": "quota_core_contract",
                 "policy_version": contract.get("version"),

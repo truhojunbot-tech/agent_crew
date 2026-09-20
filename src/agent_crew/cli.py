@@ -49,6 +49,12 @@ def _state_path(base: str, project: str) -> str:
     return os.path.join(base, project, "state.json")
 
 
+def _tokenomics_policy_path(proj_dir: str, state: dict | None = None) -> str:
+    """Durable project-local location for the external shadow contract."""
+    configured = (state or {}).get("tokenomics_policy_path")
+    return configured if isinstance(configured, str) and configured else os.path.join(proj_dir, "tokenomics-policy.json")
+
+
 def _parse_interval(text: str) -> float:
     """Parse a '30s' / '5m' / '1h' duration into seconds (#224)."""
     import re as _re
@@ -939,6 +945,7 @@ def setup(project: str, agents: str, base: str):
     # Write state.json BEFORE starting the server so the server reads correct
     # worktrees from state.json on startup. server_pid is backfilled below.
     db_file = os.path.join(proj_dir, "tasks.db")
+    policy_path = _tokenomics_policy_path(proj_dir, existing_state)
     _write_state(base, project, {
         "project": project,
         "port": port,
@@ -955,6 +962,7 @@ def setup(project: str, agents: str, base: str):
         "server_pid": 0,
         "sessions_file": sessions_file,
         "dispatcher_mode": _dispatcher_mode,
+        "tokenomics_policy_path": policy_path,
     })
 
     # Start server — skip if reusing existing server (pane-only recreation path).
@@ -968,6 +976,7 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
+            "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         log_file = open(os.path.join(proj_dir, "server.log"), "w")
@@ -1019,6 +1028,7 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
+            "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         log_file = open(os.path.join(proj_dir, "server.log"), "a")
@@ -1625,6 +1635,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         pane_map_file = os.path.join(proj_dir, "pane_map.json")
         state_file = _state_path(base, project)
+        policy_path = _tokenomics_policy_path(proj_dir, state)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
@@ -1632,6 +1643,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
+            "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         log_path = os.path.join(proj_dir, "server.log")
