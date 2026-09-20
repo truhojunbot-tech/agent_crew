@@ -136,8 +136,11 @@ def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Option
     return None
 
 
-#: Branch namespaces agent_crew generates itself, and may therefore force-move.
-_OWNED_BRANCH_PREFIXES = ("agent/", "review/", "test/")
+#: Branch names agent_crew generates itself, and may therefore force-move.
+_OWNED_TASK_BRANCH_RE = re.compile(r"\Aagent/[^/]{12}\Z")
+_OWNED_SETUP_BRANCH_RE = re.compile(
+    r"\Aagent/[^/]+/(?:claude|codex|gemini|implementer|reviewer|tester)\Z"
+)
 
 
 def _agent_crew_owns_branch(branch: str) -> bool:
@@ -160,7 +163,38 @@ def _agent_crew_owns_branch(branch: str) -> bool:
       detached checkout, which touches no ref at all.
     """
     name = (branch or "").strip()
-    return any(name.startswith(prefix) for prefix in _OWNED_BRANCH_PREFIXES)
+    return (
+        name.startswith(("review/", "test/"))
+        or bool(_OWNED_TASK_BRANCH_RE.match(name))
+        or bool(_OWNED_SETUP_BRANCH_RE.match(name))
+    )
+
+
+def _branch_ref(worktree_path: str, ref: str) -> str:
+    """Return ``ref``'s commit SHA, or ``""`` when it does not resolve."""
+    result = subprocess.run(
+        ["git", "-C", worktree_path, "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _is_ancestor(worktree_path: str, older: str, newer: str) -> bool:
+    """Whether ``older`` is reachable from ``newer``."""
+    return subprocess.run(
+        ["git", "-C", worktree_path, "merge-base", "--is-ancestor", older, newer],
+        capture_output=True, text=True, timeout=30,
+    ).returncode == 0
+
+
+def _owned_branch_reset_is_safe(worktree_path: str, branch: str, main_branch: str) -> tuple[bool, str]:
+    """Whether resetting an owned ref cannot discard a local-only commit."""
+    local = _branch_ref(worktree_path, f"refs/heads/{branch}")
+    if not local:
+        return True, ""
+    remote = _branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
+    comparison = remote or _branch_ref(worktree_path, f"refs/remotes/origin/{main_branch}")
+    return (bool(comparison) and _is_ancestor(worktree_path, local, comparison), local)
 
 
 def _checkout_detached(worktree_path: str, refs, *, what: str) -> bool:
@@ -535,16 +569,29 @@ def _prepare_worktree_for_task_inner(
                 what=f"implementer {task_id}",
             )
         else:
-            r = subprocess.run(
-                ["git", "-C", worktree_path, "checkout", "-B", branch,
-                 f"origin/{main_branch}"],
-                capture_output=True, text=True, timeout=30,
-            )
-            if r.returncode != 0:
+            reset_is_safe, local_sha = _owned_branch_reset_is_safe(
+                worktree_path, branch, main_branch)
+            if not reset_is_safe:
                 logger.warning(
-                    f"_prepare_worktree_for_task: implementer checkout {branch} "
-                    f"from origin/{main_branch} failed: {r.stderr.strip()}"
+                    f"_prepare_worktree_for_task: refusing to reset owned branch {branch} "
+                    f"at local-only commit {local_sha}; detaching at origin instead (#300)"
                 )
+                _checkout_detached(
+                    worktree_path,
+                    [f"origin/{branch}", f"origin/{main_branch}"],
+                    what=f"implementer {task_id} preserving {branch}",
+                )
+            else:
+                r = subprocess.run(
+                    ["git", "-C", worktree_path, "checkout", "-B", branch,
+                     f"origin/{main_branch}"],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    logger.warning(
+                        f"_prepare_worktree_for_task: implementer checkout {branch} "
+                        f"from origin/{main_branch} failed: {r.stderr.strip()}"
+                    )
     else:
         # Reviewer/tester: checkout the PR branch from origin (#141, #186).
         # task.branch holds the base branch (e.g. main), not the PR head.
