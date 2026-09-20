@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from unittest.mock import MagicMock
+import asyncio
 
 from fastapi.testclient import TestClient
 
@@ -131,3 +132,29 @@ def test_dispatch_regenerates_a_missing_role_protocol(tmp_path):
         "implementer", str(tmp_path), "demo", str(port_file), agent="claude",
     )
     assert (tmp_path / ".claude" / "CLAUDE.md").is_file()
+
+
+def test_mcp_accepts_a_verified_artifact_from_its_worker_checkout(tmp_db, monkeypatch):
+    """MCP runs in the worker worktree, not in the HTTP server process (#353)."""
+    from agent_crew.mcp_server import build_mcp_server
+
+    queue = TaskQueue(tmp_db)
+    _implement(queue, "impl-mcp-artifact")
+    assert queue.dequeue(role="implementer") is not None
+    seen = []
+
+    def verified(_task, _result, *, repo_cwd):
+        seen.append(repo_cwd)
+        return True, "origin branch contains reported commit"
+
+    monkeypatch.setattr("agent_crew.mcp_server.verify_implement_artifact", verified)
+    monkeypatch.setattr("agent_crew.mcp_server.os.getcwd", lambda: "/worker-checkout")
+    tool = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"].fn
+    result = tool(task_id="impl-mcp-artifact", status="completed", summary="done",
+                  branch="feat/work", commit=SHA_NEW)
+    if asyncio.iscoroutine(result):
+        result = asyncio.run(result)
+
+    assert result["acknowledged"] is True
+    assert seen == ["/worker-checkout"]
+    assert any(t.task_type == "review" for t in queue.list_tasks())

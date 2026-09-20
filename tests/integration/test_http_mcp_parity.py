@@ -275,6 +275,33 @@ class TestSubmitResultParity:
         assert _queue_snapshot(db_a)["p-cascade-1"]["status"] == "failed"
         assert _queue_snapshot(db_b)["p-cascade-1"]["status"] == "failed"
 
+    def test_completed_impl_with_verified_artifact_enqueues_review_on_both_sides(
+        self, parity_pair, tmp_path, monkeypatch
+    ):
+        """#353 gate must accept code as well as rejecting prose-only reports."""
+        verified = lambda *_args, **_kwargs: (True, "origin branch contains reported commit")
+        monkeypatch.setattr("agent_crew.server.verify_implement_artifact", verified)
+        monkeypatch.setattr("agent_crew.mcp_server.verify_implement_artifact", verified)
+        context = {"worktree_base_sha": "a" * 40}
+        commit = "b" * 40
+        http_client, _, db_a = parity_pair
+        _enqueue_task(db_a, "p-artifact-http", branch="feat/work", context=context)
+        http_client.get("/tasks/next", params={"role": "implementer"})
+        http_client.post("/tasks/p-artifact-http/result", json={
+            "task_id": "p-artifact-http", "status": "completed", "summary": "done",
+            "branch": "feat/work", "commit": commit,
+        })
+
+        db_b = str(tmp_path / "parity_mcp_artifact.db")
+        _enqueue_task(db_b, "p-artifact-mcp", branch="feat/work", context=context)
+        mcp = build_mcp_server(db_b)
+        _call_tool(mcp, "get_next_task", role="implementer")
+        _call_tool(mcp, "submit_result", task_id="p-artifact-mcp", status="completed",
+                   branch="feat/work", commit=commit)
+
+        assert sum(t.task_type == "review" for t in TaskQueue(db_a).list_tasks()) == 1
+        assert sum(t.task_type == "review" for t in TaskQueue(db_b).list_tasks()) == 1
+
     def test_failed_status_propagates_both_sides(self, parity_pair, tmp_path):
         http_client, _, db_a = parity_pair
         _enqueue_task(db_a, "p-sub-2")

@@ -199,12 +199,21 @@ def build_mcp_server(
         except Exception:
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
+        if (not _runtime_paused and _task is not None
+                and _task.task_type == "implement" and result.status == "completed"
+                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
+            logger.info("MCP submit_result: artifact gate not applied — dispatch base absent (task=%s)", task_id)
         if (not _runtime_paused
                 and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))
                 and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"):
+            # MCP is a per-worker subprocess launched from that worker's
+            # checkout. Unlike HTTP it has no in-process worktree map; its cwd
+            # is therefore the equivalent authoritative checkout. An explicit
+            # context path remains available to embedding callers (#353).
             _ok, _detail = verify_implement_artifact(
-                _task, result, repo_cwd=str((_task_ctx or {}).get("artifact_repo_path") or ""))
+                _task, result,
+                repo_cwd=str((_task_ctx or {}).get("artifact_repo_path") or os.getcwd()))
             if not _ok:
                 _artifact_held = _detail
                 result = no_artifact_result(result, _detail)

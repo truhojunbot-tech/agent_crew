@@ -4745,6 +4745,10 @@ def create_app(
             # its established fail-closed cascade handling (#313).
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
+        if (not _runtime_paused and not _REPLAYING.get() and _task is not None
+                and _task.task_type == "implement" and result.status == "completed"
+                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
+            logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
         if (not _runtime_paused and not _REPLAYING.get()
                 and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))
                 and _task is not None
