@@ -89,6 +89,83 @@ def test_late_provider_telemetry_refreshes_counterfactual_economics(tmp_db):
     assert json.loads(receipt["economics_json"])["output_tokens"] == 19
 
 
+def test_completion_refresh_preserves_admission_receipt_and_records_later_decision(
+        monkeypatch, tmp_path, tmp_db):
+    """A report published after admission must not rewrite what admission knew."""
+    policy = tmp_path / "quota-core-v1.json"
+    policy.write_text(json.dumps({
+        "contract_version": "1.0", "mode": "shadow", "decisions": [],
+    }))
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("completion-refresh", "implement", "organic-shaped", branch="b"))
+    admission = queue.get_tokenomics_shadow_receipt("completion-refresh")
+    assert admission["decision_source"] == "baseline"
+    assert admission["policy_version"] is None
+    assert json.loads(admission["recommendation_json"]) is None
+
+    # This is a later quota-core publication, not an admission-time lookup.
+    policy.write_text(json.dumps({
+        "contract_version": "1.0", "mode": "shadow", "decisions": [{
+            "task_id": "completion-refresh", "risk_tier": "routine",
+        }],
+    }))
+    queue.record_attribution("completion-refresh")
+    queue.submit_result("completion-refresh", TaskResult(
+        task_id="completion-refresh", status="completed", summary="done"))
+
+    receipt = queue.get_tokenomics_shadow_receipt("completion-refresh")
+    # Immutable admission fact.
+    assert receipt["decision_source"] == "baseline"
+    assert receipt["policy_version"] is None
+    assert json.loads(receipt["recommendation_json"]) is None
+    # Separately-provenanced completion fact.
+    assert receipt["shadow_decision_source"] == "quota_core_contract"
+    assert receipt["shadow_policy_version"] == "1.0"
+    assert json.loads(receipt["shadow_recommendation_json"])["risk_tier"] == "routine"
+    assert receipt["shadow_contract_sha"]
+    assert receipt["shadow_resolved_at"] is not None
+
+
+def test_completion_refresh_marks_missing_or_corrupt_contract_baseline(monkeypatch, tmp_path, tmp_db):
+    policy = tmp_path / "policy.json"
+    policy.write_text("not json")
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("completion-baseline", "implement", "x"))
+    queue.record_attribution("completion-baseline")
+    queue.submit_result("completion-baseline", TaskResult(
+        task_id="completion-baseline", status="completed", summary="done"))
+    receipt = queue.get_tokenomics_shadow_receipt("completion-baseline")
+    assert receipt["shadow_decision_source"] == "baseline"
+    assert receipt["shadow_recommendation_json"] is None
+    assert receipt["shadow_reason"] == "policy_unavailable"
+
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(tmp_path / "missing.json"))
+    queue.enqueue(TaskRequest("completion-missing", "implement", "x"))
+    queue.record_attribution("completion-missing")
+    queue.submit_result("completion-missing", TaskResult(
+        task_id="completion-missing", status="completed", summary="done"))
+    missing = queue.get_tokenomics_shadow_receipt("completion-missing")
+    assert missing["shadow_decision_source"] == "baseline"
+    assert missing["shadow_recommendation_json"] is None
+    assert missing["shadow_reason"] == "policy_unavailable"
+    assert missing["shadow_contract_sha"] is None
+
+
+def test_completion_refresh_failure_cannot_fail_submitted_result(monkeypatch, tmp_db):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("completion-exception", "implement", "x"))
+    queue.record_attribution("completion-exception")
+    monkeypatch.setattr(queue, "_refresh_shadow_after_commit",
+                        lambda *_args: (_ for _ in ()).throw(RuntimeError("shadow down")))
+
+    queue.submit_result("completion-exception", TaskResult(
+        task_id="completion-exception", status="completed", summary="done"))
+
+    assert queue.get_task_status("completion-exception") == "completed"
+
+
 def test_cost_summary_keeps_unreported_usage_unknown(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("known", "implement", "x", context={"issue": 342}))

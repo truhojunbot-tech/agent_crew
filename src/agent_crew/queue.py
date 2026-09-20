@@ -15,7 +15,7 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
-from agent_crew.tokenomics_shadow import shadow_recommendation
+from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
 
 
 class PausedError(Exception):
@@ -65,9 +65,22 @@ _DDL_TOKENOMICS_SHADOW = """
 CREATE TABLE IF NOT EXISTS tokenomics_shadow_receipts (
     task_id TEXT PRIMARY KEY, decision_source TEXT NOT NULL,
     policy_version TEXT, recommendation_json TEXT, actual_execution_json TEXT NOT NULL,
-    economics_json TEXT, outcome TEXT, created_at REAL NOT NULL, updated_at REAL NOT NULL
+    economics_json TEXT, outcome TEXT,
+    shadow_decision_source TEXT, shadow_policy_version TEXT,
+    shadow_recommendation_json TEXT, shadow_contract_sha TEXT,
+    shadow_resolved_at REAL, shadow_reason TEXT,
+    created_at REAL NOT NULL, updated_at REAL NOT NULL
 )
 """
+
+_DDL_MIGRATE_SHADOW_COLUMNS = (
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_decision_source TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_policy_version TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_recommendation_json TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_contract_sha TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_resolved_at REAL",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_reason TEXT",
+)
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -471,6 +484,11 @@ class TaskQueue:
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
         conn.execute(_DDL_TOKENOMICS_SHADOW)
+        for _stmt in _DDL_MIGRATE_SHADOW_COLUMNS:
+            try:
+                conn.execute(_stmt)
+            except Exception:
+                pass  # column already exists
         conn.execute(_DDL_ATTRIBUTION)
         conn.execute(_DDL_CHECKPOINTS)
         conn.execute(_DDL_CONTEXT_STATE)
@@ -1392,7 +1410,6 @@ class TaskQueue:
                 (result.status, outcome, now, now, task_id),
             )
             self._store_task_telemetry(conn, task_id, telemetry, now)
-            self._refresh_shadow_economics(conn, task_id, now, outcome)
             # #204: completed_at >= started_at is expected to always hold —
             # started_at is set once at first dispatch and never rewritten
             # (see record_attribution). It can only be violated by clock
@@ -1429,6 +1446,14 @@ class TaskQueue:
                 (task_id, task_type, _result_to_json(result), int(_stop["epoch"]),
                  "pending" if _suppressed else "applied", now, now))
             conn.commit()
+            # Completion-time recommendations are intentionally a separate,
+            # post-commit receipt.  Admission's decision fields are immutable:
+            # a later quota-core report must not rewrite what was known when
+            # the task entered the queue.
+            try:
+                self._refresh_shadow_after_commit(task_id, outcome)
+            except Exception:
+                logger.exception("tokenomics completion shadow refresh failed for %s", task_id)
             return task_type
         except Exception:
             try:
@@ -1474,10 +1499,13 @@ class TaskQueue:
             conn.execute("BEGIN IMMEDIATE")
             now = time.time()
             self._store_task_telemetry(conn, task_id, telemetry, now)
-            # #334 may write final provider usage after submit_result. Refresh
-            # the counterfactual from the same durable row, not an early copy.
-            self._refresh_shadow_economics(conn, task_id, now)
             conn.commit()
+            # #334 may write final provider usage after submit_result. Refresh
+            # the shadow receipt only after that telemetry is durable.
+            try:
+                self._refresh_shadow_after_commit(task_id)
+            except Exception:
+                logger.exception("late tokenomics completion shadow refresh failed for %s", task_id)
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -1499,6 +1527,41 @@ class TaskQueue:
                SET outcome=COALESCE(?, outcome), economics_json=?, updated_at=? WHERE task_id=?""",
             (outcome, json.dumps(dict(economics)) if economics is not None else None, now, task_id),
         )
+
+    def _refresh_shadow_after_commit(self, task_id: str, outcome: Optional[str] = None) -> None:
+        """Best-effort completion-time policy observation (#342 Option A).
+
+        This deliberately opens a new transaction after result/telemetry has
+        committed.  It can therefore never roll back admission or task
+        completion, and it records a later recommendation in separate fields
+        rather than laundering the immutable admission-time receipt.
+        """
+        shadow = shadow_recommendation_for_task_id(task_id)
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._refresh_shadow_economics(conn, task_id, now, outcome)
+            conn.execute(
+                """UPDATE tokenomics_shadow_receipts
+                   SET shadow_decision_source=?, shadow_policy_version=?,
+                       shadow_recommendation_json=?, shadow_contract_sha=?,
+                       shadow_resolved_at=?, shadow_reason=?, updated_at=?
+                   WHERE task_id=?""",
+                (shadow["decision_source"], shadow["policy_version"],
+                 (json.dumps(shadow["recommendation"])
+                  if shadow["recommendation"] is not None else None), shadow.get("contract_sha"),
+                 now, shadow["reason"], now, task_id),
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
 
     @staticmethod
     def _store_task_telemetry(
