@@ -827,7 +827,7 @@ def _is_port_listening(port: int) -> bool:
 
 
 def _collect_active_ports(base: str | None = None) -> set[int]:
-    """Return ports from ~/.agent_crew/*/port files whose servers are still listening."""
+    """Return all durable project-owned ports, whether or not they listen."""
     if base is None:
         base = os.path.expanduser("~/.agent_crew")
     active: set[int] = set()
@@ -843,22 +843,29 @@ def _collect_active_ports(base: str | None = None) -> set[int]:
             port = require_project_port(int(open(port_file).read().strip()), entry.name)
         except (ValueError, OSError):
             continue
-        if _is_port_listening(port):
-            active.add(port)
+        active.add(port)
     return active
 
 
-def find_free_port(start: int = 8100) -> int:
-    """Find a free port, blacklisting ports held by alive agent_crew servers.
+def find_free_port(start: int = 8100, *, base: str | None = None,
+                   project: str = "", limit: int = 65535) -> int:
+    """Find a port owned by no other project and free to bind.
 
     Scans ~/.agent_crew/*/port files and skips any port whose server is still
     listening. Ports from dead (non-listening) projects remain eligible.
     Binds the socket to verify (SO_REUSEADDR off) to avoid TOCTOU.
     """
     require_project_port(start, "allocator")
-    blacklisted = _collect_active_ports()
+    blacklisted = _collect_active_ports(base)
+    if project and base:
+        own_file = os.path.join(base, project, "port")
+        try:
+            own_port = require_project_port(int(open(own_file).read().strip()), project)
+            return own_port
+        except (OSError, ValueError):
+            pass
     port = start
-    while True:
+    while port <= limit:
         if port in blacklisted:
             port += 1
             continue
@@ -868,6 +875,7 @@ def find_free_port(start: int = 8100) -> int:
                 return port
             except OSError:
                 port += 1
+    raise RuntimeError(f"no free ports available in range {start}-{limit}")
 
 
 def write_port_file(path: str, port: int, *, project: str = "") -> None:

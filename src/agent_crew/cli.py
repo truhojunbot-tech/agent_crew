@@ -815,7 +815,7 @@ def setup(project: str, agents: str, base: str):
         port = existing_state["port"]
         server_pid = existing_state["server_pid"]
     else:
-        port = setup_module.find_free_port()
+        port = setup_module.find_free_port(base=base, project=project)
         setup_module.write_port_file(port_file, port, project=project)
 
     # Instruction files (into each worktree)
