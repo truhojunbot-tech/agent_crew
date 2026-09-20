@@ -47,7 +47,7 @@ def _run_prepare(task_branch, role, *, rc=0):
         return MagicMock(returncode=rc, stderr="", stdout="")
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
-        _prepare_worktree_for_task("/wt/claude", "task-abc123", task_branch, role)
+        _prepare_worktree_for_task("/wt/claude", "0123456789ab", task_branch, role)
     return _git_calls(cmds)
 
 
@@ -64,7 +64,7 @@ def _forced(git_calls):
 
 
 @pytest.mark.parametrize("branch", [
-    "agent/task-abc123", "agent/quota-ops/claude", "agent/claude/280-fix",
+    "agent/0123456789ab", "agent/quota-ops/claude",
     "review/ab12cd34", "test/ff00ff00",
 ])
 def test_agent_crew_owns_its_own_namespaces(branch):
@@ -73,6 +73,7 @@ def test_agent_crew_owns_its_own_namespaces(branch):
 
 @pytest.mark.parametrize("branch", [
     CALLER_BRANCH, "main", "dev", "master", "feature/x", "fix/foo",
+    "agent/claude/280-fix", "agent/claude-cli/x",
     "agentic/x",          # ⛔prefix lookalike — not the `agent/` namespace
     "agents/x", "myagent/x", "", "   ",
 ])
@@ -126,8 +127,8 @@ def test_the_derived_implementer_branch_still_gets_a_real_branch(  ):
         "the implementer lost its own working branch"
 
 
-def test_an_explicitly_named_agent_branch_is_still_ours(  ):
-    assert "agent/feat-xyz" in _forced(_run_prepare("agent/feat-xyz", "implementer"))
+def test_an_explicitly_named_generated_agent_branch_is_still_ours(  ):
+    assert "agent/0123456789ab" in _forced(_run_prepare("agent/0123456789ab", "implementer"))
 
 
 @pytest.mark.parametrize("role", ["reviewer", "tester"])
