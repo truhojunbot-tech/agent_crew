@@ -1928,7 +1928,7 @@ def teardown(project: str, base: str):
     click.echo(f"Teardown complete: {project}")
 
 
-def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> None:
+def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[str, dict]:
     """Reset all agent worktrees to their configured origin base branch.
 
     Used both before a crew run/discuss (so agents start from latest main)
@@ -1936,6 +1936,7 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> None:
     logged but never propagated — a sync error must not block the task.
     """
     main_branch = base_branch or os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    landed_bases: dict[str, dict] = {}
     for agent, wt_path in worktrees.items():
         if not wt_path or not os.path.isdir(wt_path):
             continue
@@ -1956,12 +1957,54 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> None:
             # all of them — discarding any local-only commits the developer had
             # on it. Detaching leaves the worktree at the same commit and owns
             # no ref; the next dispatch gives it a proper branch anyway.
-            subprocess.run(
-                ["git", "-C", wt_path, "checkout", "--detach", f"origin/{main_branch}"],
+            requested_ref = f"origin/{main_branch}"
+            actual_ref = requested_ref
+            status = "known"
+            checkout = subprocess.run(
+                ["git", "-C", wt_path, "checkout", "--detach", requested_ref],
                 capture_output=True, text=True,
             )
+            if checkout.returncode != 0:
+                # A new task base is often not on origin yet.  Do not leave
+                # the prior (unknown/stale) checkout in place: resolve the
+                # remote's advertised default branch and land there instead.
+                default_ref = subprocess.run(
+                    ["git", "-C", wt_path, "symbolic-ref", "--quiet", "--short",
+                     "refs/remotes/origin/HEAD"],
+                    capture_output=True, text=True,
+                )
+                fallback = default_ref.stdout.strip() if default_ref.returncode == 0 else ""
+                fallback = fallback or f"origin/{os.environ.get('AGENT_CREW_MAIN_BRANCH', 'main')}"
+                actual_ref = fallback
+                status = "fallback"
+                fallback_checkout = subprocess.run(
+                    ["git", "-C", wt_path, "checkout", "--detach", fallback],
+                    capture_output=True, text=True,
+                )
+                if fallback_checkout.returncode != 0:
+                    click.echo(
+                        f"Warning: worktree {agent!r} could not checkout origin/{main_branch} "
+                        f"or fallback {fallback}: {fallback_checkout.stderr.strip()}"
+                    )
+                    landed_bases[agent] = {"requested_ref": requested_ref, "actual_ref": None,
+                                           "sha": None, "status": "unknown"}
+                    continue
+                click.echo(
+                    f"Warning: worktree {agent!r} could not checkout origin/{main_branch}; "
+                    f"fell back to {fallback}"
+                )
+            head = subprocess.run(
+                ["git", "-C", wt_path, "rev-parse", "HEAD"],
+                capture_output=True, text=True,
+            )
+            landed_bases[agent] = {"requested_ref": requested_ref, "actual_ref": actual_ref,
+                                   "sha": head.stdout.strip() if head.returncode == 0 else None,
+                                   "status": status if head.returncode == 0 else "unknown"}
         except Exception as exc:
             click.echo(f"Warning: could not sync worktree {agent!r} to {main_branch}: {exc}")
+            landed_bases[agent] = {"requested_ref": f"origin/{main_branch}", "actual_ref": None,
+                                   "sha": None, "status": "unknown"}
+    return landed_bases
 
 
 @crew.command("run")
@@ -2360,13 +2403,14 @@ def run_cmd(task: str, db: str, project: str, base: str,
     # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the
     # implementer always branches off the most recent merged state.
+    _sync_landed_bases: dict = {}
     if _run_worktrees:
         click.echo(f"Syncing worktrees to origin/{branch}...")
-        _sync_worktrees_to_main(_run_worktrees, base_branch=branch)
+        _sync_landed_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=branch)
 
     _CM: dict = {"coordinator_managed": True}
 
-    impl_context = {**_CM, "base_branch": branch}
+    impl_context = {**_CM, "base_branch": branch, "sync_landed_bases": _sync_landed_bases}
     if implementer:
         impl_context["agent_override"] = implementer
     if no_tester:
@@ -2489,8 +2533,9 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     return
                 else:
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
+                    retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                               context={**_CM, "retry": True}, port=_run_port)
+                                               context={**_CM, "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
                 if _run_port:
@@ -2508,7 +2553,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
         # request_changes: re-implement with feedback
         click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
         feedback = build_feedback(review_result)
-        retry_context = {**_CM, "feedback": feedback}
+        retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
+        retry_context = {**_CM, "feedback": feedback, "sync_landed_bases": retry_bases}
         if implementer:
             retry_context["agent_override"] = implementer
         impl_id = enqueue_implement(queue, task, impl_branch or branch,
@@ -2745,7 +2791,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     _discuss_worktrees = project_state.get("worktrees", {}) if project_state else {}
     if _discuss_worktrees:
         click.echo("Syncing worktrees to origin/main...")
-        _sync_worktrees_to_main(_discuss_worktrees)
+        _discuss_sync_bases = _sync_worktrees_to_main(_discuss_worktrees)
 
     prior_synthesis = ""
     final_synthesis = ""
@@ -2753,7 +2799,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     missing_by_round: dict = {}
 
     for round_num in range(1, rounds + 1):
-        context = {"round": round_num}
+        context = {"round": round_num, "sync_landed_bases": _discuss_sync_bases if _discuss_worktrees else {}}
         if round_num > 1 and prior_synthesis:
             context["prior_synthesis"] = prior_synthesis
         if github_discussion:
