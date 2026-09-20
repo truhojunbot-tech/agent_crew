@@ -180,7 +180,9 @@ time a result is skipped — there is no fallback.
 |-------|------|----------|-------|
 | `task_id` | string | yes | Echo the task_id from the received block exactly. |
 | `status` | enum | yes | `completed` \\| `failed` \\| `needs_human` |
-| `summary` | string | yes | 1–3 sentences. Include branch + commit hash for code tasks. |
+| `summary` | string | yes | 1–3 sentences describing the work. |
+| `branch` | string | code tasks | The pushed branch; report it as a field, not only in prose. |
+| `commit` | string | code tasks | Full pushed commit SHA; report it as a field, not only in prose. |
 | `verdict` | enum\\|null | reviewers only | `approve` \\| `request_changes` \\| `null` |
 | `findings` | string[] | reviewers only | Actionable issues. Empty array for non-reviewers. |
 | `pr_number` | int\\|null | if opened | GitHub PR number, otherwise `null`. |
@@ -193,7 +195,9 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks/<task_id>/result \\
   -d '{
     "task_id": "<task_id>",
     "status": "completed",
-    "summary": "<what was done — include branch + commit hash for code tasks>",
+    "summary": "<what was done>",
+    "branch": "<branch-name>",
+    "commit": "<full-commit-sha>",
     "verdict": null,
     "findings": [],
     "pr_number": null
@@ -204,10 +208,12 @@ Expected HTTP response: `200 OK` with `{"status":"ok"}`. If you receive a
 non-2xx status or a network error, retry immediately — do not leave the task
 unresolved.
 
-### Summary field — include these whenever they apply
+### Structured artifact fields — required for code tasks
 
-- `branch: <branch-name>` — the branch the work lives on
-- `commit: <short-hash>` — the commit you produced (after `git commit`)
+- `branch` — the branch the work lives on
+- `commit` — the full commit SHA you produced (after `git commit` and push)
+- Also mention them in `summary` if useful, but prose is not a substitute for
+  the JSON fields.
 - `pr: #<number>` — include in both `summary` text and the `pr_number` field
 - `notes: <anything unusual>` — blockers, assumptions, deviations
 
@@ -220,6 +226,8 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks/t-042/result \\
     "task_id": "t-042",
     "status": "completed",
     "summary": "Fixed login timeout. branch: agent/fix-login-timeout commit: a1b2c3d. Added regression test in test_auth.py::test_login_timeout_retries.",
+    "branch": "agent/fix-login-timeout",
+    "commit": "a1b2c3d4e5f6789012345678901234567890abcd",
     "verdict": null,
     "findings": [],
     "pr_number": 42
@@ -360,14 +368,20 @@ claim something you did not verify.
 
 ## Result Submission — MANDATORY, NOT OPTIONAL
 
-Call `submit_result(task_id=..., status=..., summary=..., verdict=..., findings=..., pr_number=...)`.
+Call `submit_result(task_id=..., status=..., summary=..., branch=..., commit=...,
+verdict=..., findings=..., pr_number=...)`. For code tasks, `branch` and the
+full pushed `commit` SHA are required structured fields, not just summary text.
+Use `branch="<branch-name>"` and `commit="<full-commit-sha>"`; mentioning
+them only in `summary` does not report the artifact.
 A role stays `in_progress` until `submit_result` is called. Silence stalls the crew.
 
 | Field | Required | Notes |
 |-------|----------|-------|
 | `task_id` | yes | Echo exactly as received. |
 | `status` | yes | `completed` \\| `failed` \\| `needs_human` |
-| `summary` | yes | 1–3 sentences. Include branch + commit hash for code tasks. |
+| `summary` | yes | 1–3 sentences describing the work. |
+| `branch` | code tasks | Pushed branch, supplied as a structured field. |
+| `commit` | code tasks | Full pushed commit SHA, supplied as a structured field. |
 | `verdict` | reviewers only | `approve` \\| `request_changes` \\| `null` |
 | `findings` | reviewers only | Actionable issues. Empty list for non-reviewers. |
 | `pr_number` | if opened | GitHub PR number, otherwise `null`. |
@@ -375,10 +389,12 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 **Never skip `submit_result`.** POST `status: failed` or `status: needs_human`
 with an honest summary rather than staying silent.
 
-### Summary field — include these whenever they apply
+### Structured artifact fields — required for code tasks
 
-- `branch: <branch-name>` — the branch the work lives on
-- `commit: <short-hash>` — the commit you produced (after `git commit`)
+- `branch` — the branch the work lives on
+- `commit` — the full pushed commit SHA
+- Also mention them in `summary` if useful, but prose is not a substitute for
+  the structured fields.
 - `pr: #<number>` — include in both `summary` text and the `pr_number` field
 - `notes: <anything unusual>` — blockers, assumptions, deviations
 
@@ -727,8 +743,8 @@ Copy it exactly. The result body must be JSON with these fields:
   "task_id": "<task_id from the task block>",
   "status": "done",
   "summary": "one-line summary of what was done",
-  "branch": "agent/claude/...",
-  "commit": "<git commit hash or empty string>",
+  "branch": "<branch-name>",
+  "commit": "<full-commit-sha>",
   "notes": "any issues or observations"
 }
 ```

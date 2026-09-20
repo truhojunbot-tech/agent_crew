@@ -115,7 +115,9 @@ Required fields:
 ### 3. Execute the work — branch on `task_type`
 
 **implement** — write tests first (TDD), implement until they pass, refactor,
-commit, open or update the PR. Set `pr_number` in `submit_result`.
+commit, push, and open or update the PR. Set `branch`, the full pushed
+`commit` SHA, and `pr_number` in `submit_result`; do not put branch/commit
+only in the summary prose.
 
 **review** — run `gh pr diff <pr_number>` against the LATEST PR head (do NOT
 trust line numbers from a previous round; always re-fetch). Apply the
@@ -134,8 +136,9 @@ two so the watchdog knows you are still making progress and does not
 auto-fail you.
 
 ### 5. Submit the result
-Call `submit_result(task_id=..., status=..., summary=..., verdict=...,
-findings=..., pr_number=...)`.
+Call `submit_result(task_id=..., status=..., summary=..., branch=...,
+commit=..., verdict=..., findings=..., pr_number=...)`. For code tasks,
+`branch` and the full pushed `commit` SHA are required structured fields.
 
 `status` is one of:
 - `"completed"` — work finished as expected

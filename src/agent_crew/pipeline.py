@@ -92,9 +92,36 @@ def verify_implement_artifact(
     commit = (result.commit or "").strip()
     if not repo_cwd:
         return False, "artifact repository unavailable"
-    if not base or not branch or not commit:
-        return False, "missing base, branch, or full commit"
+    if not base or not branch:
+        return False, "missing base or branch"
     try:
+        # Workers should report their full SHA, but a missing typed field must
+        # not discard code that origin can prove was pushed.  Deriving only
+        # from the reported branch's fetched origin ref keeps this a git proof,
+        # never a trust decision over summary prose.
+        fetch = subprocess.run(
+            ["git", "-C", repo_cwd, "fetch", "origin", branch, "--quiet"],
+            capture_output=True, text=True, timeout=60,
+        )
+        derived_commit = False
+        if not commit:
+            if fetch.returncode != 0:
+                return False, "origin branch unavailable for commit derivation"
+            origin_head = subprocess.run(
+                ["git", "-C", repo_cwd, "rev-parse", "--verify",
+                 f"origin/{branch}^{{commit}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            commit = origin_head.stdout.strip()
+            if origin_head.returncode != 0 or not commit:
+                return False, "origin branch head is not resolvable for commit derivation"
+            # Persist the independently-derived full SHA so the accepted
+            # handoff remains auditable through the normal result path.
+            result.commit = commit
+            derived_commit = True
+
+        if commit == base:
+            return False, "reported commit is the dispatch base (no new artifact)"
         local_commit = subprocess.run(
             ["git", "-C", repo_cwd, "rev-parse", "--verify", f"{commit}^{{commit}}"],
             capture_output=True, text=True, timeout=30,
@@ -108,10 +135,6 @@ def verify_implement_artifact(
         if descends_from_base.returncode != 0:
             return False, "reported commit does not descend from the dispatch base"
 
-        fetch = subprocess.run(
-            ["git", "-C", repo_cwd, "fetch", "origin", branch, "--quiet"],
-            capture_output=True, text=True, timeout=60,
-        )
         if fetch.returncode == 0:
             reachable = subprocess.run(
                 ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", commit,
@@ -119,6 +142,8 @@ def verify_implement_artifact(
                 capture_output=True, text=True, timeout=30,
             )
             if reachable.returncode == 0:
+                if derived_commit:
+                    return True, "origin branch contains derived commit"
                 return True, "origin branch contains reported commit"
 
         # A PR is an alternate durable handoff artifact: a branch may be

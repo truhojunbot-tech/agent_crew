@@ -103,6 +103,135 @@ def test_artifact_verifier_rejects_commit_that_was_not_pushed(monkeypatch):
     assert "origin" in detail
 
 
+def test_artifact_verifier_derives_and_records_origin_branch_head_when_worker_omits_commit(monkeypatch):
+    """#353: a pushed artifact remains auditable when the POST omits commit."""
+    from agent_crew.pipeline import verify_implement_artifact
+
+    task = TaskRequest("impl-derived", "implement", "x", branch="feat/work",
+                       context={"worktree_base_sha": SHA_BASE})
+    result = TaskResult("impl-derived", "completed", "done", branch="feat/work")
+    calls = []
+
+    def git_origin_head(argv, **_kwargs):
+        calls.append(argv)
+        if "fetch" in argv:
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if argv[3] == "rev-parse":
+            target = argv[-1]
+            if target == "origin/feat/work^{commit}":
+                return MagicMock(returncode=0, stdout=SHA_NEW + "\n", stderr="")
+            if target == f"{SHA_NEW}^{{commit}}":
+                return MagicMock(returncode=0, stdout=SHA_NEW + "\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", git_origin_head)
+    ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
+
+    assert ok is True
+    assert "derived" in detail
+    assert result.commit == SHA_NEW
+    assert any(call[-1] == "origin/feat/work^{commit}" for call in calls)
+
+
+def test_http_result_persists_the_server_derived_commit_for_audit(tmp_db, monkeypatch):
+    """The verifier mutation must survive the result write, not just memory."""
+    from agent_crew.server import create_app
+
+    queue = TaskQueue(tmp_db)
+    _implement(queue, "impl-derived-http")
+
+    def derives(_task, result, *, repo_cwd):
+        result.commit = SHA_NEW
+        return True, "origin branch contains derived commit"
+
+    monkeypatch.setattr("agent_crew.server.verify_implement_artifact", derives)
+    with TestClient(create_app(tmp_db, pane_map={"reviewer": "%1"},
+                               watchdog_disabled=True, worktree_map={})) as client:
+        response = client.post("/tasks/impl-derived-http/result", json={
+            "task_id": "impl-derived-http", "status": "completed", "summary": "done",
+            "branch": "feat/work",
+        })
+
+    assert response.status_code == 200
+    stored = next(task for task in queue.list_tasks() if task.task_id == "impl-derived-http")
+    assert stored.context["result_commit"] == SHA_NEW
+
+
+def test_artifact_verifier_rejects_missing_commit_when_origin_head_is_dispatch_base(monkeypatch):
+    from agent_crew.pipeline import verify_implement_artifact
+
+    task = TaskRequest("impl-no-new", "implement", "x", branch="feat/work",
+                       context={"worktree_base_sha": SHA_BASE})
+    result = TaskResult("impl-no-new", "completed", "done", branch="feat/work")
+
+    def head_is_base(argv, **_kwargs):
+        if "fetch" in argv:
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if argv[3] == "rev-parse":
+            return MagicMock(returncode=0, stdout=SHA_BASE + "\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", head_is_base)
+    ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
+
+    assert ok is False
+    assert "dispatch base" in detail
+    assert result.commit == SHA_BASE
+
+
+def test_artifact_verifier_rejects_missing_commit_when_origin_branch_is_absent(monkeypatch):
+    from agent_crew.pipeline import verify_implement_artifact
+
+    task = TaskRequest("impl-no-branch", "implement", "x", branch="feat/missing",
+                       context={"worktree_base_sha": SHA_BASE})
+    result = TaskResult("impl-no-branch", "completed", "done", branch="feat/missing")
+
+    def no_origin_branch(argv, **_kwargs):
+        if "fetch" in argv:
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if argv[3] == "rev-parse":
+            return MagicMock(returncode=1, stdout="", stderr="unknown revision")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", no_origin_branch)
+    ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
+
+    assert ok is False
+    assert "origin branch head" in detail
+    assert result.commit == ""
+
+
+def test_artifact_verifier_rejects_missing_commit_when_origin_is_unavailable(monkeypatch):
+    from agent_crew.pipeline import verify_implement_artifact
+
+    task = TaskRequest("impl-no-origin", "implement", "x", branch="feat/work",
+                       context={"worktree_base_sha": SHA_BASE})
+    result = TaskResult("impl-no-origin", "completed", "done", branch="feat/work")
+    monkeypatch.setattr(
+        "agent_crew.pipeline.subprocess.run",
+        lambda argv, **_kwargs: MagicMock(returncode=1, stdout="", stderr="offline")
+        if "fetch" in argv else MagicMock(returncode=0, stdout="", stderr=""),
+    )
+
+    ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
+
+    assert ok is False
+    assert "origin" in detail
+    assert result.commit == ""
+
+
+def test_generated_implementer_protocol_requires_structured_branch_and_commit():
+    from agent_crew import instructions
+
+    for role in ("implementer", "reviewer", "tester"):
+        for delivery in ("both", "mcp", "dispatcher"):
+            protocol = instructions.generate(
+                role, "demo", 8105, agent="codex", delivery=delivery,
+            )
+            assert "<branch-name>" in protocol
+            assert "<full-commit-sha>" in protocol
+
+
 def test_sync_preserves_protocol_files_and_uses_project_base(monkeypatch, tmp_path):
     from agent_crew.cli import _sync_worktrees_to_main
 
