@@ -1004,6 +1004,7 @@ def setup(project: str, agents: str, base: str):
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
@@ -1060,6 +1061,7 @@ def setup(project: str, agents: str, base: str):
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
@@ -1678,6 +1680,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
@@ -2123,7 +2126,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         req = _urllib_req.Request(
             f"http://127.0.0.1:{_run_port}/tasks/{task_id}/result",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Agent-Crew-Project": project},
             method="POST",
         )
         try:
@@ -2388,6 +2391,12 @@ def run_cmd(task: str, db: str, project: str, base: str,
             f"Server at port {_run_port} unreachable — "
             f"check crew status or run crew recover"
         )
+    if _run_port and project:
+        from agent_crew.project_identity import ProjectIdentityError, verify_server_identity
+        try:
+            verify_server_identity(f"http://127.0.0.1:{_run_port}", project)
+        except ProjectIdentityError as exc:
+            raise click.ClickException(str(exc)) from exc
 
     # Create GitHub issue if requested
     issue_number = None
