@@ -39,22 +39,20 @@ def test_context_recall_evidence_preserves_true_false_and_unknown(tmp_db):
         queue.record_required_context_recalled(task_id, observed)
         queue.submit_result(task_id, TaskResult(task_id, "completed", "done"))
         receipt = queue.get_tokenomics_shadow_receipt(task_id)
-        assert json.loads(receipt["evidence_json"])["quality_evidence"][
-            "required_context_recalled"
-        ] is observed
+        assert json.loads(receipt["evidence_json"])["required_context_recalled"] is observed
 
 
 def test_context_evidence_has_quota_core_required_shape(tmp_db):
     queue = TaskQueue(tmp_db)
     receipt = _completed_receipt(queue, "evidence-shape")
-    envelope = json.loads(receipt["evidence_json"])
-    evidence = envelope["quality_evidence"]
+    evidence = json.loads(receipt["evidence_json"])
     assert set(evidence) == {
         "outcome", "independent_review_correct", "required_context_recalled",
         "context_growth_tokens", "retry_of", "fallback_of", "token_observations",
+        "risk_declaration",
     }
     assert evidence["required_context_recalled"] is None
-    assert envelope["risk_declaration"]["declaration_source"] == "unknown"
+    assert evidence["risk_declaration"]["declaration_source"] == "unknown"
     assert set(evidence["token_observations"]) == {
         "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
         "output_tokens", "reasoning_tokens",
@@ -63,7 +61,9 @@ def test_context_evidence_has_quota_core_required_shape(tmp_db):
     sys.path.insert(0, str(quota_core))
     try:
         from quota_core.context_economics.policy import policy_contract_schema
-        jsonschema.validate(evidence, policy_contract_schema()["properties"]["evidence"])
+        quality_evidence = {key: value for key, value in evidence.items()
+                            if key != "risk_declaration"}
+        jsonschema.validate(quality_evidence, policy_contract_schema()["properties"]["evidence"])
     finally:
         sys.path.remove(str(quota_core))
 

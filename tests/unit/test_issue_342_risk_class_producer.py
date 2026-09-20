@@ -25,8 +25,8 @@ def test_explicit_risk_declaration_is_persisted_with_explicit_provenance(tmp_db)
     assert declared["confidence"] == "high"
 
     receipt = queue.get_tokenomics_shadow_receipt("risk-explicit")
-    envelope = json.loads(receipt["evidence_json"])
-    assert envelope["risk_declaration"] == declared
+    evidence = json.loads(receipt["evidence_json"])
+    assert evidence["risk_declaration"] == declared
 
 
 def test_heuristic_architecture_signal_is_never_labelled_explicit():
@@ -105,15 +105,17 @@ def test_risk_declaration_uses_quota_core_da6779b_quality_evidence_fields(tmp_db
 
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("risk-schema", "implement", "x"))
-    envelope = json.loads(queue.get_tokenomics_shadow_receipt("risk-schema")["evidence_json"])
-    assert expected <= set(envelope["risk_declaration"])
+    evidence = json.loads(queue.get_tokenomics_shadow_receipt("risk-schema")["evidence_json"])
+    assert expected <= set(evidence["risk_declaration"])
 
-    # The original policy evidence remains a valid, unmodified sub-document;
-    # risk declaration provenance is an Agent Crew envelope, not a fabricated
-    # extra property inside quota-core's closed evidence schema.
+    # Keep the deployed #342(A) evidence document flat.  The additive
+    # declaration is removed only for validation against quota-core's closed
+    # quality-evidence schema; consumers still read both from one document.
     sys.path.insert(0, str(quota_core))
     try:
         from quota_core.context_economics.policy import policy_contract_schema
-        jsonschema.validate(envelope["quality_evidence"], policy_contract_schema()["properties"]["evidence"])
+        quality_evidence = {key: value for key, value in evidence.items()
+                            if key != "risk_declaration"}
+        jsonschema.validate(quality_evidence, policy_contract_schema()["properties"]["evidence"])
     finally:
         sys.path.remove(str(quota_core))

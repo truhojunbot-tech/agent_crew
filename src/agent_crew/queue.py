@@ -53,9 +53,14 @@ def _normalize_risk_declaration(value: object) -> dict:
 
 
 def _quality_evidence_envelope(quality_evidence: dict, risk: dict) -> dict:
-    """Keep quota-core's closed evidence schema separate from declaration provenance."""
+    """Preserve #342(A)'s flat evidence contract with additive provenance.
+
+    Existing consumers read the quota-core quality-evidence fields directly
+    from ``evidence_json``.  Risk provenance is an additive key, not an
+    envelope that relocates those deployed fields.
+    """
     return {
-        "quality_evidence": quality_evidence,
+        **quality_evidence,
         "risk_declaration": _normalize_risk_declaration(risk),
     }
 
