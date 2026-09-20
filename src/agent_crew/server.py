@@ -42,6 +42,7 @@ from agent_crew.pipeline import (
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     hold_mismatched_pr_result,
+    resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
     stale_review_task_id,
 )
@@ -5034,6 +5035,16 @@ def create_app(
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         if body.status == "approved":
+            # A Tier 3 gate is intentionally created before its successor so
+            # generic pending-task pushing alone cannot advance it.  Resume
+            # the exact held transition first; the helper is idempotent via
+            # deterministic child IDs and recognizes review vs test gates.
+            try:
+                _resume_tier3_gate(q(), gate_id)
+            except Exception:
+                logger.exception(
+                    "resolve_gate: failed to resume Tier 3 gate %r after approval", gate_id
+                )
             # Gate approved → push next pending tasks for all roles so the crew
             # continues without manual intervention after a human approval.
             for role in ("implementer", "reviewer", "tester"):

@@ -66,6 +66,39 @@ def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(tmp_db):
     assert resume_tier3_gate(queue, "risk-tier3-deploy", pr_state_fn=_open) == "review-deploy-r0"
 
 
+def test_tier_three_gate_approval_via_http_enqueues_review(tmp_db, test_client):
+    """The production gate endpoint, not only the helper, resumes Tier 3 work."""
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("endpoint-deploy", "implement", "deploy release", branch="b"))
+    assert auto_enqueue_review(queue, "endpoint-deploy", pr_number=4, pr_state_fn=_open) is None
+
+    response = test_client.post(
+        "/gates/risk-tier3-endpoint-deploy/resolve", json={"status": "approved"}
+    )
+
+    assert response.status_code == 200
+    assert _task(queue, "review-endpoint-deploy-r0").task_type == "review"
+
+
+def test_tier_three_test_gate_approval_via_http_resumes_test_once(tmp_db, test_client):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(
+        "review-tier3", "review", "review a deploy", branch="b", context={"risk_tier": 3},
+    ))
+    queue.submit_result("review-tier3", TaskResult(
+        task_id="review-tier3", status="completed", summary="approved", verdict="approve",
+    ))
+    assert auto_enqueue_test(queue, "review-tier3", pr_state_fn=_open) is None
+
+    response = test_client.post(
+        "/gates/risk-tier3-test-review-tier3/resolve", json={"status": "approved"}
+    )
+
+    assert response.status_code == 200
+    assert _task(queue, "test-review-tier3").task_type == "test"
+    assert len(queue.list_gates()) == 1
+
+
 def test_cost_summary_preserves_unknowns_and_groups_by_issue(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("known", "implement", "internal", context={"issue": 39}))

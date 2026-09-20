@@ -1133,7 +1133,10 @@ def auto_enqueue_test(
         tier = classify_task(review_task.description, review_ctx)
         if tier == TIER_0:
             return None
-        if tier == TIER_3:
+        # An approved Tier 3 test gate replays this exact transition.  The
+        # durable receipt lives on the reviewed task, so a restart/replay does
+        # not create a second gate or strand the already-approved lineage.
+        if tier == TIER_3 and not review_ctx.get("tier3_gate_approved"):
             gate_id = f"risk-tier3-test-{review_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1208,13 +1211,22 @@ def auto_enqueue_test(
 
 
 def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Optional[str]:
-    """Resume the deterministic review held by an approved Tier 3 gate."""
+    """Resume the exact Tier 3 successor held by an approved approval gate."""
     gate = next((item for item in queue.list_gates() if item.id == gate_id), None)
-    if gate is None or gate.status != "approved" or not gate_id.startswith("risk-tier3-"):
+    if gate is None or gate.status != "approved":
         return None
-    task_id = gate_id[len("risk-tier3-"):]
-    queue.patch_context(task_id, {"tier3_gate_approved": True})
-    return auto_enqueue_review(queue, task_id, pr_state_fn=pr_state_fn)
+    # Test gates deliberately come first: their prefix is a strict extension
+    # of the review-gate prefix and must resume a test, never be misread as an
+    # implementation task named ``test-...``.
+    if gate_id.startswith("risk-tier3-test-"):
+        review_task_id = gate_id[len("risk-tier3-test-"):]
+        queue.patch_context(review_task_id, {"tier3_gate_approved": True})
+        return auto_enqueue_test(queue, review_task_id, pr_state_fn=pr_state_fn)
+    if gate_id.startswith("risk-tier3-"):
+        impl_task_id = gate_id[len("risk-tier3-"):]
+        queue.patch_context(impl_task_id, {"tier3_gate_approved": True})
+        return auto_enqueue_review(queue, impl_task_id, pr_state_fn=pr_state_fn)
+    return None
 
 
 def auto_fallback_failed_task(
