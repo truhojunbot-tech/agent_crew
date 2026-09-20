@@ -2332,12 +2332,27 @@ def run_cmd(task: str, db: str, project: str, base: str,
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
 
     _loop_pr_number: int | None = None  # first PR number seen across all results
+    _previous_impl_commit = ""
+    _last_impl_branch = ""
 
     for iteration in range(1, max_iter + 1):
         impl_start = time.time()
         impl_result = _wait(impl_id)
         impl_elapsed = int(time.time() - impl_start)
         _loop_pr_number = _loop_pr_number or getattr(impl_result, "pr_number", None)
+        reported_branch = getattr(impl_result, "branch", "") or ""
+        if reported_branch:
+            _last_impl_branch = reported_branch
+        impl_branch = _last_impl_branch
+        impl_commit = getattr(impl_result, "commit", "") or ""
+        if impl_commit and impl_commit == _previous_impl_commit:
+            click.echo(
+                f"[{iteration}/{max_iter}] ❌ implementer changes not persisting "
+                "(same commit reported twice)"
+            )
+            return
+        if impl_commit:
+            _previous_impl_commit = impl_commit
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
         review_context = {**_CM}
@@ -2347,6 +2362,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
             review_context["no_tester"] = True
         if _loop_pr_number:
             review_context["pr_number"] = _loop_pr_number
+        if impl_commit:
+            review_context["reviewed_sha"] = impl_commit
         # #302: a review that fails to RUN is a dispatch failure, not a
         # verdict — retry it, bounded, the way any transient failure is retried.
         # #301 stopped outright here; retrying covers the transient case, and
@@ -2354,7 +2371,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
         # from spinning the same loop with review tasks.
         _review_attempts = 0
         while True:
-            review_id = enqueue_review(queue, task, branch, prev_task_id=impl_id, context=review_context, port=_run_port)
+            review_id = enqueue_review(queue, task, impl_branch or branch,
+                                       prev_task_id=impl_id, context=review_context, port=_run_port)
             click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
             review_start = time.time()
             review_result = _wait(review_id)
@@ -2425,7 +2443,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     return
                 else:
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
-                    impl_id = enqueue_implement(queue, task, branch,
+                    impl_id = enqueue_implement(queue, task, impl_branch or branch,
                                                context={**_CM, "retry": True}, port=_run_port)
                     continue
             else:
@@ -2447,7 +2465,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
         retry_context = {**_CM, "feedback": feedback}
         if implementer:
             retry_context["agent_override"] = implementer
-        impl_id = enqueue_implement(queue, task, branch, context=retry_context, port=_run_port)
+        impl_id = enqueue_implement(queue, task, impl_branch or branch,
+                                    context=retry_context, port=_run_port)
 
     click.echo(f"❌ Max iterations ({max_iter}) reached without approval.")
 

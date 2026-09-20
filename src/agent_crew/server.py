@@ -46,7 +46,10 @@ from agent_crew.pipeline import (
     stale_review_task_id,
 )
 from agent_crew import provenance as _prov
-from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+from agent_crew.protocol import (
+    GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
+    RESULT_COMMIT_CONTEXT_KEY,
+)
 from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
 from agent_crew.watch import active_tasks_for_issue
@@ -4249,6 +4252,8 @@ def create_app(
 
             # Create retry task with incremented retry count
             retry_context = dict(original_task.context) if isinstance(original_task.context, dict) else {}
+            retry_context.pop(RESULT_BRANCH_CONTEXT_KEY, None)
+            retry_context.pop(RESULT_COMMIT_CONTEXT_KEY, None)
             retry_context["retry_attempt"] = db_retry_attempt + 1
             retry_context["original_task_id"] = task_id
 
@@ -4635,6 +4640,25 @@ def create_app(
         _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
         try:
             task_type = q().submit_result(task_id, result)
+            # #348: coordinator-managed loops consume the persisted result,
+            # not this handler's in-memory object. Keep this deliberately
+            # outside submit_result's STOP-atomic transaction: a telemetry-like
+            # ref update must never alter result admission, cascade/outbox, or
+            # pause suppression semantics.
+            _result_ref = {
+                key: value for key, value in (
+                    (RESULT_BRANCH_CONTEXT_KEY, result.branch),
+                    (RESULT_COMMIT_CONTEXT_KEY, result.commit),
+                ) if value
+            }
+            if _result_ref:
+                try:
+                    q().merge_task_context(task_id, _result_ref)
+                except Exception:
+                    logger.exception(
+                        "POST /tasks/%s/result: could not persist result ref metadata",
+                        task_id,
+                    )
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
             if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
                 logger.warning(

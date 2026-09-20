@@ -10,6 +10,12 @@ _VALID_RESULT_STATUSES = {"completed", "failed", "needs_human", "timed_out", "bl
 _VALID_STATUSES = _VALID_RESULT_STATUSES
 _VALID_GATE_TYPES = {"approval", "merge", "escalation"}
 
+# #348: result transport metadata belongs only to the task that reported it.
+# Child tasks must not inherit these keys as though their own worker had
+# produced the parent's branch/commit.
+RESULT_BRANCH_CONTEXT_KEY = "result_branch"
+RESULT_COMMIT_CONTEXT_KEY = "result_commit"
+
 
 def normalize_pr_number(value) -> Optional[int]:
     """``value`` as a PR number, or ``None`` when it does not name one.
