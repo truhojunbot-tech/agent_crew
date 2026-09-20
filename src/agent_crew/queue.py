@@ -16,6 +16,7 @@ from agent_crew.protocol import (
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
+from agent_crew.risk_tier import RISK_DECLARATION_FIELDS, risk_declaration
 
 
 class PausedError(Exception):
@@ -24,6 +25,39 @@ class PausedError(Exception):
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _unknown_risk_declaration() -> dict:
+    return {
+        **{field: None for field in RISK_DECLARATION_FIELDS},
+        "declaration_source": "unknown",
+        "confidence": None,
+    }
+
+
+def _normalize_risk_declaration(value: object) -> dict:
+    """Keep the serialized #342(C) declaration typed and nullable."""
+    if not isinstance(value, dict):
+        return _unknown_risk_declaration()
+    normalized = {
+        field: value.get(field) if isinstance(value.get(field), bool) else None
+        for field in RISK_DECLARATION_FIELDS
+    }
+    source = value.get("declaration_source")
+    confidence = value.get("confidence")
+    normalized["declaration_source"] = (
+        source if source in {"explicit", "heuristic", "unknown"} else "unknown"
+    )
+    normalized["confidence"] = confidence if confidence in {"high", "medium", "low"} else None
+    return normalized
+
+
+def _quality_evidence_envelope(quality_evidence: dict, risk: dict) -> dict:
+    """Keep quota-core's closed evidence schema separate from declaration provenance."""
+    return {
+        "quality_evidence": quality_evidence,
+        "risk_declaration": _normalize_risk_declaration(risk),
+    }
 
 
 class _TaskProviderSessionId(str):
@@ -231,6 +265,18 @@ _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH = "ALTER TABLE task_attribution ADD COLUMN 
 _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH = "ALTER TABLE task_attribution ADD COLUMN context_pack_hash TEXT DEFAULT NULL"
 _DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED = (
     "ALTER TABLE task_attribution ADD COLUMN required_context_recalled INTEGER DEFAULT NULL")
+_DDL_MIGRATE_ATTR_SAFETY_OR_LIVE_CHANGE = (
+    "ALTER TABLE task_attribution ADD COLUMN safety_or_live_change INTEGER DEFAULT NULL")
+_DDL_MIGRATE_ATTR_BROAD_ARCHITECTURE_CHANGE = (
+    "ALTER TABLE task_attribution ADD COLUMN broad_architecture_change INTEGER DEFAULT NULL")
+_DDL_MIGRATE_ATTR_BOUNDED_ROUTINE_FIX = (
+    "ALTER TABLE task_attribution ADD COLUMN bounded_routine_fix INTEGER DEFAULT NULL")
+_DDL_MIGRATE_ATTR_HUMAN_GATE_REQUIRED = (
+    "ALTER TABLE task_attribution ADD COLUMN human_gate_required INTEGER DEFAULT NULL")
+_DDL_MIGRATE_ATTR_RISK_DECLARATION_SOURCE = (
+    "ALTER TABLE task_attribution ADD COLUMN risk_declaration_source TEXT DEFAULT NULL")
+_DDL_MIGRATE_ATTR_RISK_DECLARATION_CONFIDENCE = (
+    "ALTER TABLE task_attribution ADD COLUMN risk_declaration_confidence TEXT DEFAULT NULL")
 
 _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
@@ -266,6 +312,12 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH,
     _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH,
     _DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED,
+    _DDL_MIGRATE_ATTR_SAFETY_OR_LIVE_CHANGE,
+    _DDL_MIGRATE_ATTR_BROAD_ARCHITECTURE_CHANGE,
+    _DDL_MIGRATE_ATTR_BOUNDED_ROUTINE_FIX,
+    _DDL_MIGRATE_ATTR_HUMAN_GATE_REQUIRED,
+    _DDL_MIGRATE_ATTR_RISK_DECLARATION_SOURCE,
+    _DDL_MIGRATE_ATTR_RISK_DECLARATION_CONFIDENCE,
 )
 
 _DDL_CHECKPOINTS = """
@@ -1019,6 +1071,17 @@ class TaskQueue:
             raise TaskAlreadyExistsError(task.task_id, existing_status) from None
         finally:
             conn.close()
+        # #342(C): risk declaration is strictly post-commit telemetry.  Even
+        # an unexpected classifier exception can never veto the task INSERT,
+        # and a failure leaves the declaration honestly unknown.
+        declaration = _unknown_risk_declaration()
+        try:
+            declaration = _normalize_risk_declaration(
+                risk_declaration(task.description, context)
+            )
+            self.patch_context(task.task_id, {"risk_declaration": declaration})
+        except Exception:
+            logger.exception("risk declaration telemetry failed after enqueue for %s", task.task_id)
         # Shadow telemetry is strictly post-commit and best-effort: a policy
         # reader, receipt write, or future adapter bug can never veto domain
         # admission (including through an unfamiliar exception class).
@@ -1030,12 +1093,22 @@ class TaskQueue:
                 conn.execute(
                     """INSERT OR IGNORE INTO tokenomics_shadow_receipts
                        (task_id, decision_source, policy_version, recommendation_json,
-                        actual_execution_json, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        actual_execution_json, evidence_json, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     (task.task_id, shadow["decision_source"], shadow["policy_version"],
                      json.dumps(shadow["recommendation"]),
                      json.dumps({"cascade": "baseline", "task_type": task.task_type,
-                                 "shadow_reason": shadow["reason"]}), now, now),
+                                 "shadow_reason": shadow["reason"]}),
+                     json.dumps(_quality_evidence_envelope({
+                         "outcome": None, "independent_review_correct": None,
+                         "required_context_recalled": None, "context_growth_tokens": None,
+                         "retry_of": None, "fallback_of": None,
+                         "token_observations": {
+                             "uncached_input_tokens": None, "cache_write_tokens": None,
+                             "cache_read_tokens": None, "output_tokens": None,
+                             "reasoning_tokens": None,
+                         },
+                     }, declaration)), now, now),
                 )
                 conn.commit()
             finally:
@@ -1548,11 +1621,21 @@ class TaskQueue:
             "fallback_of": (economics["fallback_of"] or None) if economics is not None and "fallback_of" in economics.keys() else None,
             "token_observations": token_observations,
         }
+        task_row = conn.execute(
+            "SELECT context FROM tasks WHERE task_id=?", (task_id,)
+        ).fetchone()
+        try:
+            task_context = json.loads(task_row["context"] or "{}") if task_row is not None else {}
+        except (TypeError, ValueError):
+            task_context = {}
         conn.execute(
             """UPDATE tokenomics_shadow_receipts
                SET outcome=COALESCE(?, outcome), economics_json=?, evidence_json=?, updated_at=? WHERE task_id=?""",
             (outcome, json.dumps(dict(economics)) if economics is not None else None,
-             json.dumps(evidence), now, task_id),
+             json.dumps(_quality_evidence_envelope(
+                 evidence,
+                 task_context.get("risk_declaration") if isinstance(task_context, dict) else None,
+             )), now, task_id),
         )
 
     def record_required_context_recalled(self, task_id: str, observed: Optional[bool]) -> None:
@@ -2366,6 +2449,19 @@ class TaskQueue:
             # worker fields above remain worker-only; a successor can therefore
             # distinguish "who dispatched" from "who executed" without prose.
             coordinator = self._coordinator_state_on(conn)
+            try:
+                task_row = conn.execute(
+                    "SELECT context FROM tasks WHERE task_id=?", (task_id,)
+                ).fetchone()
+                task_context = json.loads(task_row["context"] or "{}") if task_row else {}
+                declaration = _normalize_risk_declaration(
+                    task_context.get("risk_declaration") if isinstance(task_context, dict) else None
+                )
+            except Exception:
+                # Attribution remains a dispatch receipt if the optional
+                # declaration payload is malformed or cannot be read.
+                logger.exception("risk declaration attribution read failed for %s", task_id)
+                declaration = _unknown_risk_declaration()
             conn.execute(
                 """
                 INSERT INTO task_attribution
@@ -2375,8 +2471,10 @@ class TaskQueue:
                      context_generation, session_task_index, previous_task_id, retry_of,
                      fallback_of, started_at, coordinator_id, coordinator_generation,
                      coordinator_provider, coordinator_model, coordinator_provider_session_id,
-                     coordinator_checkpoint_ref)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     coordinator_checkpoint_ref, safety_or_live_change,
+                     broad_architecture_change, bounded_routine_fix, human_gate_required,
+                     risk_declaration_source, risk_declaration_confidence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(task_id) DO UPDATE SET
                     status=excluded.status, updated_at=excluded.updated_at,
                     model=excluded.model, context_id=excluded.context_id,
@@ -2391,7 +2489,13 @@ class TaskQueue:
                     coordinator_provider=excluded.coordinator_provider,
                     coordinator_model=excluded.coordinator_model,
                     coordinator_provider_session_id=excluded.coordinator_provider_session_id,
-                    coordinator_checkpoint_ref=excluded.coordinator_checkpoint_ref
+                    coordinator_checkpoint_ref=excluded.coordinator_checkpoint_ref,
+                    safety_or_live_change=excluded.safety_or_live_change,
+                    broad_architecture_change=excluded.broad_architecture_change,
+                    bounded_routine_fix=excluded.bounded_routine_fix,
+                    human_gate_required=excluded.human_gate_required,
+                    risk_declaration_source=excluded.risk_declaration_source,
+                    risk_declaration_confidence=excluded.risk_declaration_confidence
                 """,
                 (task_id, project, agent, role, task_type, worktree_path,
                  codex_logs_path, repo_url, git_branch, now, now, status,
@@ -2400,7 +2504,10 @@ class TaskQueue:
                  previous_task_id, retry_of, fallback_of, started_at or now,
                  coordinator["coordinator_id"], coordinator["coordinator_generation"],
                  coordinator["provider"], coordinator["model"], coordinator["provider_session_id"],
-                 coordinator["checkpoint_ref"]),
+                 coordinator["checkpoint_ref"],
+                 *(None if declaration[field] is None else int(declaration[field])
+                   for field in RISK_DECLARATION_FIELDS),
+                 declaration["declaration_source"], declaration["confidence"]),
             )
             conn.commit()
         finally:

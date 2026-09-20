@@ -39,18 +39,22 @@ def test_context_recall_evidence_preserves_true_false_and_unknown(tmp_db):
         queue.record_required_context_recalled(task_id, observed)
         queue.submit_result(task_id, TaskResult(task_id, "completed", "done"))
         receipt = queue.get_tokenomics_shadow_receipt(task_id)
-        assert json.loads(receipt["evidence_json"])["required_context_recalled"] is observed
+        assert json.loads(receipt["evidence_json"])["quality_evidence"][
+            "required_context_recalled"
+        ] is observed
 
 
 def test_context_evidence_has_quota_core_required_shape(tmp_db):
     queue = TaskQueue(tmp_db)
     receipt = _completed_receipt(queue, "evidence-shape")
-    evidence = json.loads(receipt["evidence_json"])
+    envelope = json.loads(receipt["evidence_json"])
+    evidence = envelope["quality_evidence"]
     assert set(evidence) == {
         "outcome", "independent_review_correct", "required_context_recalled",
         "context_growth_tokens", "retry_of", "fallback_of", "token_observations",
     }
     assert evidence["required_context_recalled"] is None
+    assert envelope["risk_declaration"]["declaration_source"] == "unknown"
     assert set(evidence["token_observations"]) == {
         "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
         "output_tokens", "reasoning_tokens",
