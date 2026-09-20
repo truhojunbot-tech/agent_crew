@@ -2429,6 +2429,20 @@ def create_app(
     def q() -> TaskQueue:
         return state["queue"]
 
+    def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
+                              caller: str) -> None:
+        """Persist the exact prepared base, including an explicit unknown (#358)."""
+        try:
+            base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
+            base_context = {
+                base_key: prepared_sha or None,
+                "worktree_base_status": "known" if prepared_sha else "unknown",
+            }
+            q().patch_context(task.task_id, base_context)
+            task.context = {**(task.context or {}), **base_context}
+        except Exception:
+            logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
+
     # Expose watchdog tick on app.state so tests can drive it deterministically
     # without the asyncio loop. Production code never reads this attribute.
     app.state.reminded_task_ids = reminded_task_ids
@@ -2508,17 +2522,7 @@ def create_app(
                     # see which commit it was given can say so in its result,
                     # and a reviewer that cannot has no way to notice the head
                     # moved under it.
-                    if _reviewed_sha:
-                        try:
-                            _base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
-                            q().patch_context(task.task_id, {_base_key: _reviewed_sha})
-                            task.context = {**(task.context or {}),
-                                            _base_key: _reviewed_sha}
-                        except Exception:
-                            logger.exception(
-                                f"_try_push_next: could not record reviewed_sha for "
-                                f"{task.task_id}"
-                            )
+                    _record_prepared_base(task, role, _reviewed_sha, "_try_push_next")
                     logger.info(
                         f"_try_push_next: worktree prepared for {role} "
                         f"task_id={task.task_id} branch={task.branch or '(none)'}"
@@ -3444,18 +3448,11 @@ def create_app(
                     wt, task.task_id, task.branch or "", role,
                     task_context=task.context if isinstance(task.context, dict) else {},
                 )
-                if _reviewed_sha:
-                    # #253: same record on the headless path, and before the
-                    # prompt is built so the agent is told which commit it got.
-                    try:
-                        _base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
-                        q().patch_context(task.task_id, {_base_key: _reviewed_sha})
-                        task.context = {**(task.context or {}),
-                                        _base_key: _reviewed_sha}
-                    except Exception:
-                        logger.exception(
-                            f"dispatcher: could not record reviewed_sha for {task.task_id}"
-                        )
+                # #253/#358: record the exact prepared commit, or explicit
+                # unknown, before prompt construction.  A prep failure still
+                # dispatches, but can no longer masquerade as an unrecorded
+                # stale base later in the task lineage.
+                _record_prepared_base(task, role, _reviewed_sha, "dispatcher")
                 logger.info(
                     f"dispatcher: worktree prepared for {role} "
                     f"task_id={task.task_id} branch={task.branch or '(none)'} "
