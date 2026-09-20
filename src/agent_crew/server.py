@@ -108,7 +108,7 @@ _WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
 
 
 def _ensure_role_protocol(
-    role: str, worktree_path: str, project: str, port_file: str, *, agent: str,
+    role: str, worktree_path: str, project: str, port_file: str, *, agent: str, port: int = 0,
 ) -> bool:
     """Ensure the role's worker contract survived worktree synchronisation (#353)."""
     relative = instructions.ROLE_FILES.get(role)
@@ -119,6 +119,12 @@ def _ensure_role_protocol(
     if os.path.isfile(expected):
         return True
     try:
+        # Production setup writes this first.  Keep recovery/test dispatches
+        # self-contained: regenerating a protocol needs a port file, and the
+        # server already owns the authoritative bound port.
+        if not os.path.exists(port_file):
+            with open(port_file, "w") as f:
+                f.write(f"{port}\n")
         created = instructions.write(
             role, worktree_path, project, port_file, agent=agent, delivery="dispatcher",
         )
@@ -2542,7 +2548,7 @@ def create_app(
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
         if _push_worktree and not _ensure_role_protocol(
             role, _push_worktree, _push_project,
-            os.path.join(os.path.dirname(db_path), "port"), agent=_target_agent,
+            os.path.join(os.path.dirname(db_path), "port"), agent=_target_agent, port=port,
         ):
             _fail_if_active(task.task_id, "missing_role_protocol")
             return
@@ -3470,7 +3476,7 @@ def create_app(
                 )
 
         if not _ensure_role_protocol(
-            role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent,
+            role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent, port=port,
         ):
             _lock_stack.close()
             _fail_if_active(task.task_id, "missing_role_protocol")
