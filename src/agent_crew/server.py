@@ -2263,6 +2263,8 @@ def create_app(
     shadow_memory_enabled: explicit opt-in for shadow retrieval. Disabled by
         default, so even an injected provider receives zero calls until enabled.
     """
+    logger.info("Context Pack effective enabled=%s (AGENT_CREW_CONTEXT_PACK=%r)",
+                _cpack.enabled(), os.environ.get("AGENT_CREW_CONTEXT_PACK"))
     _memory_provider = memory_provider or NullMemoryProvider()
     if shadow_memory_enabled is None:
         shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
