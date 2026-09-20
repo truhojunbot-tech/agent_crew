@@ -2503,8 +2503,9 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     return
                 else:
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
+                    retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                               context={**_CM, "retry": True}, port=_run_port)
+                                               context={**_CM, "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
                 if _run_port:
@@ -2522,7 +2523,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
         # request_changes: re-implement with feedback
         click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
         feedback = build_feedback(review_result)
-        retry_context = {**_CM, "feedback": feedback}
+        retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
+        retry_context = {**_CM, "feedback": feedback, "sync_landed_bases": retry_bases}
         if implementer:
             retry_context["agent_override"] = implementer
         impl_id = enqueue_implement(queue, task, impl_branch or branch,
@@ -2759,7 +2761,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     _discuss_worktrees = project_state.get("worktrees", {}) if project_state else {}
     if _discuss_worktrees:
         click.echo("Syncing worktrees to origin/main...")
-        _sync_worktrees_to_main(_discuss_worktrees)
+        _discuss_sync_bases = _sync_worktrees_to_main(_discuss_worktrees)
 
     prior_synthesis = ""
     final_synthesis = ""
@@ -2767,7 +2769,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     missing_by_round: dict = {}
 
     for round_num in range(1, rounds + 1):
-        context = {"round": round_num}
+        context = {"round": round_num, "sync_landed_bases": _discuss_sync_bases if _discuss_worktrees else {}}
         if round_num > 1 and prior_synthesis:
             context["prior_synthesis"] = prior_synthesis
         if github_discussion:
