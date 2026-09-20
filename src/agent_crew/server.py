@@ -135,6 +135,13 @@ def _ensure_role_protocol(
     return True
 
 
+def _required_context_recalled_observation(pack) -> Optional[bool]:
+    """Map Context Pack's existing state to quota-core's nullable evidence (#342)."""
+    # No pack means search did not run: unknown, never false. A built degraded
+    # pack already denotes observed incomplete/failed retrieval.
+    return None if pack is None else not bool(pack.degraded)
+
+
 def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Optional[str]:
     """Return the head ref name for a GitHub PR, or None on failure.
 
@@ -3665,6 +3672,21 @@ def create_app(
                     "context_pack_hash": _pack.pack_hash,
                     "context_pack_degraded": _pack.degraded,
                 })
+                # #342(A) producer: a pack was built, so degraded means an
+                # observed retrieval failure/incomplete required context (false)
+                # and a healthy pack means the required context was recalled
+                # (true).  When Context Pack is disabled there is no search
+                # observation at all, so no call leaves the DB value NULL.
+                # This is telemetry only: any persistence failure must never
+                # alter dispatch, admission, STOP, or the rendered message.
+                try:
+                    q().record_required_context_recalled(
+                        task.task_id, _required_context_recalled_observation(_pack))
+                except Exception:
+                    logger.exception(
+                        "dispatcher: required_context_recalled telemetry failed for %s",
+                        task.task_id,
+                    )
             except Exception:
                 logger.exception(
                     f"dispatcher: context pack telemetry failed for {task.task_id}")
