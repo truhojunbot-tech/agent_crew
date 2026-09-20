@@ -1368,12 +1368,14 @@ def status(project: str, base: str, preview: int):
     if _queue_for_preview is not None:
         try:
             costs = _queue_for_preview.token_cost_summary()
-            click.echo(f"\nToken cost: {costs['total_tokens']} observed tokens across "
-                       f"{costs['observed_tasks']} tasks; {costs['unobserved_tasks']} unknown")
+            click.echo("\nToken cost (observed task_attribution): "
+                       f"{costs['total_tokens']} tokens across {costs['observed_tasks']} observed "
+                       f"tasks; {costs['unobserved_tasks']} unobserved")
             for issue, value in sorted(costs["by_issue"].items()):
-                click.echo(f"  issue #{issue}: {value['total_tokens']} tokens")
+                click.echo(f"  issue #{issue}: {value['total_tokens']} tokens, "
+                           f"{value['observed_tasks']} observed / {value['unobserved_tasks']} unobserved")
         except Exception:
-            pass
+            logger.exception("status token-cost summary failed")
 
     click.echo("\nAgents:")
     pane_targets = state.get("pane_ids") or [

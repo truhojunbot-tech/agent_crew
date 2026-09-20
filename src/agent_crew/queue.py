@@ -2575,39 +2575,63 @@ class TaskQueue:
             conn.close()
 
     def get_tokenomics_shadow_receipt(self, task_id: str) -> Optional[dict]:
+        """Return the main-branch shadow decision receipt for one task, if any."""
         conn = self._connect()
         try:
-            row = conn.execute("SELECT * FROM tokenomics_shadow_receipts WHERE task_id=?", (task_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM tokenomics_shadow_receipts WHERE task_id=?", (task_id,)
+            ).fetchone()
             return dict(row) if row else None
         finally:
             conn.close()
 
     def token_cost_summary(self) -> dict:
-        """Observed provider tokens grouped by issue; NULL remains unknown."""
+        """Observed task_attribution token cost, grouped by issue.
+
+        NULL means unreported: it is counted separately and never converted to
+        zero. ``reasoning_tokens`` is intentionally excluded from total because
+        providers report it as a component of output on some transports.
+        """
         conn = self._connect()
         try:
-            rows = conn.execute("""SELECT a.uncached_input_tokens, a.cache_write_tokens,
-                a.cache_read_tokens, a.output_tokens, t.context
-                FROM tasks t LEFT JOIN task_attribution a ON t.task_id=a.task_id""").fetchall()
+            rows = conn.execute("""
+                SELECT a.task_id, a.uncached_input_tokens, a.cache_write_tokens,
+                       a.cache_read_tokens, a.output_tokens, t.context
+                FROM tasks t LEFT JOIN task_attribution a ON t.task_id=a.task_id
+            """).fetchall()
         finally:
             conn.close()
-        result = {"total_tokens": 0, "observed_tasks": 0, "unobserved_tasks": 0, "by_issue": {}}
+        total = 0
+        observed = 0
+        by_issue: dict = {}
         for row in rows:
-            values = [value for value in (row["uncached_input_tokens"], row["cache_write_tokens"],
-                      row["cache_read_tokens"], row["output_tokens"]) if value is not None]
-            total = sum(int(value) for value in values) if values else None
-            result["observed_tasks" if total is not None else "unobserved_tasks"] += 1
-            if total is not None:
-                result["total_tokens"] += total
+            parts = (row["uncached_input_tokens"], row["cache_write_tokens"],
+                     row["cache_read_tokens"], row["output_tokens"])
+            # A partial provider response is still an observed lower-bound; a
+            # wholly NULL row remains explicitly unobserved.
+            known = [int(v) for v in parts if v is not None]
+            if known:
+                observed += 1
+                task_total = sum(known)
+                total += task_total
+            else:
+                task_total = None
             try:
-                issue = json.loads(row["context"] or "{}").get("issue")
+                context = json.loads(row["context"] or "{}")
             except (TypeError, ValueError):
-                issue = None
+                context = {}
+            issue = context.get("issue") if isinstance(context, dict) else None
             if issue is not None:
-                bucket = result["by_issue"].setdefault(str(issue), {"total_tokens": 0})
-                if total is not None:
-                    bucket["total_tokens"] += total
-        return result
+                bucket = by_issue.setdefault(str(issue), {"observed_tasks": 0,
+                                                          "unobserved_tasks": 0,
+                                                          "total_tokens": 0})
+                if task_total is None:
+                    bucket["unobserved_tasks"] += 1
+                else:
+                    bucket["observed_tasks"] += 1
+                    bucket["total_tokens"] += task_total
+        return {"observed_tasks": observed, "unobserved_tasks": len(rows) - observed,
+                "total_tokens": total, "by_issue": by_issue}
 
     def force_fail(self, task_id: str, summary: str, error_info: Optional[dict] = None) -> Optional[str]:
         """Mark an in_progress task as failed (used by the watchdog when a pane
