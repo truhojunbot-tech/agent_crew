@@ -189,7 +189,7 @@ def test_a_matching_branch_changes_nothing(tmp_db):
 # ── 4. the server hands the result over ───────────────────────────────
 
 
-def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db):
+def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db, monkeypatch):
     """★★The incident end to end, through the real POST path.
 
     ⛔This started as a source grep for `result=result`, which SURVIVED a mutant
@@ -209,6 +209,15 @@ def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db):
         task_id="impl-watch-0073c3a7", task_type="implement",
         description="Implement #304", branch="main",
         context={"issue": 304, "reviewed_sha": "990ce86"}))
+
+    # #366: this test exercises review routing, not git reachability.  #354
+    # correctly made its old made-up SHA fail closed before the cascade.  Give
+    # the routing test a verified artifact; the artifact-gate suite owns the
+    # negative and real-git evidence cases.
+    monkeypatch.setattr(
+        "agent_crew.server.verify_implement_artifact",
+        lambda _task, _result, *, repo_cwd: (True, "verified artifact"),
+    )
 
     app = create_app(db_path=tmp_db, pane_map={}, port=0, watchdog_disabled=True,
                      anomaly_disabled=True, push_fn=lambda *a, **k: None)
@@ -250,7 +259,7 @@ def _mcp_call(mcp, tool_name, **kwargs):
     return func(**kwargs)
 
 
-def _mcp_submit(tmp_db, **result_fields):
+def _mcp_submit(tmp_db, monkeypatch=None, **result_fields):
     """Enqueue a watch-shaped implement task and complete it over MCP."""
     from agent_crew.mcp_server import build_mcp_server
     from agent_crew.protocol import TaskRequest
@@ -260,6 +269,14 @@ def _mcp_submit(tmp_db, **result_fields):
         task_id="impl-watch-mcp", task_type="implement",
         description="Implement #304", branch="main",
         context={"issue": 304, "reviewed_sha": "990ce86"}))
+    if monkeypatch is not None:
+        # Keep the fail-closed gate in the real path.  These transport/routing
+        # tests supply the gate's positive evidence at its boundary instead of
+        # asking an invented SHA to be accepted by the checkout on this host.
+        monkeypatch.setattr(
+            "agent_crew.mcp_server.verify_implement_artifact",
+            lambda _task, _result, *, repo_cwd: (True, "verified artifact"),
+        )
     mcp = build_mcp_server(tmp_db)
     _mcp_call(mcp, "get_next_task", role="implementer")
     ack = _mcp_call(mcp, "submit_result", task_id="impl-watch-mcp",
@@ -269,30 +286,30 @@ def _mcp_submit(tmp_db, **result_fields):
     return ack, reviews
 
 
-def test_the_mcp_contract_accepts_the_branch_and_commit(tmp_db):
+def test_the_mcp_contract_accepts_the_branch_and_commit(tmp_db, monkeypatch):
     """★★An MCP caller could not report where it pushed at all — the arguments
     did not exist, so the fields could never be populated on that transport."""
-    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review")
+    _, reviews = _mcp_submit(tmp_db, monkeypatch, branch="fix/304-stale-pr-head-review")
     assert reviews, "no review was enqueued over MCP"
 
 
-def test_an_mcp_submission_routes_the_review_to_the_pushed_branch(tmp_db):
+def test_an_mcp_submission_routes_the_review_to_the_pushed_branch(tmp_db, monkeypatch):
     """★★The finding. An MCP-delivered watch task still reviewed `main`."""
-    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review")
+    _, reviews = _mcp_submit(tmp_db, monkeypatch, branch="fix/304-stale-pr-head-review")
     assert reviews[0].branch == "fix/304-stale-pr-head-review"
 
 
-def test_an_mcp_submission_pins_the_reviewed_sha(tmp_db):
+def test_an_mcp_submission_pins_the_reviewed_sha(tmp_db, monkeypatch):
     sha = "9edda6900000000000000000000000000000abcd"
-    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review", commit=sha)
+    _, reviews = _mcp_submit(tmp_db, monkeypatch, branch="fix/304-stale-pr-head-review", commit=sha)
     assert reviews[0].context.get("reviewed_sha") == sha
 
 
-def test_the_mcp_transport_applies_the_same_commit_guard(tmp_db):
+def test_the_mcp_transport_applies_the_same_commit_guard(tmp_db, monkeypatch):
     """⛔The normalisation lives in `TaskResult`, so both transports inherit it —
     but only if MCP actually constructs the field. Asserted through MCP so a
     future hand-rolled construction there cannot skip it."""
-    _, reviews = _mcp_submit(tmp_db, branch="fix/304-stale-pr-head-review",
+    _, reviews = _mcp_submit(tmp_db, monkeypatch, branch="fix/304-stale-pr-head-review",
                              commit="HEAD")
     assert reviews[0].context.get("reviewed_sha") != "HEAD"
 
