@@ -108,7 +108,7 @@ _WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
 
 
 def _ensure_role_protocol(
-    role: str, worktree_path: str, project: str, port_file: str, *, agent: str,
+    role: str, worktree_path: str, project: str, port_file: str, *, agent: str, port: int = 0,
 ) -> bool:
     """Ensure the role's worker contract survived worktree synchronisation (#353)."""
     relative = instructions.ROLE_FILES.get(role)
@@ -119,6 +119,12 @@ def _ensure_role_protocol(
     if os.path.isfile(expected):
         return True
     try:
+        # Production setup writes this first.  Keep recovery/test dispatches
+        # self-contained: regenerating a protocol needs a port file, and the
+        # server already owns the authoritative bound port.
+        if not os.path.exists(port_file):
+            with open(port_file, "w") as f:
+                f.write(f"{port}\n")
         created = instructions.write(
             role, worktree_path, project, port_file, agent=agent, delivery="dispatcher",
         )
@@ -133,6 +139,18 @@ def _ensure_role_protocol(
         return False
     logger.warning("dispatcher: regenerated missing %s protocol at %s (#353)", role, created)
     return True
+
+
+def _required_context_recalled_observation(pack) -> Optional[bool]:
+    """Map Context Pack's existing state to quota-core's nullable evidence (#342)."""
+    # No pack (or a healthy pack with no recalled items) provides no positive
+    # retrieval observation: unknown, never false.  A built degraded pack
+    # denotes observed incomplete/failed retrieval.
+    if pack is None:
+        return None
+    if bool(pack.degraded):
+        return False
+    return True if getattr(pack, "items", ()) else None
 
 
 def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Optional[str]:
@@ -2535,7 +2553,7 @@ def create_app(
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
         if _push_worktree and not _ensure_role_protocol(
             role, _push_worktree, _push_project,
-            os.path.join(os.path.dirname(db_path), "port"), agent=_target_agent,
+            os.path.join(os.path.dirname(db_path), "port"), agent=_target_agent, port=port,
         ):
             _fail_if_active(task.task_id, "missing_role_protocol")
             return
@@ -3463,7 +3481,7 @@ def create_app(
                 )
 
         if not _ensure_role_protocol(
-            role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent,
+            role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent, port=port,
         ):
             _lock_stack.close()
             _fail_if_active(task.task_id, "missing_role_protocol")
@@ -3665,6 +3683,21 @@ def create_app(
                     "context_pack_hash": _pack.pack_hash,
                     "context_pack_degraded": _pack.degraded,
                 })
+                # #342(A) producer: degraded means an observed retrieval
+                # failure/incomplete required context (false); a healthy pack
+                # proves recall only when it contains items (true).  A disabled
+                # search or empty healthy pack has no such observation, so it
+                # remains NULL (unknown), never a guessed false or true.
+                # This is telemetry only: any persistence failure must never
+                # alter dispatch, admission, STOP, or the rendered message.
+                try:
+                    q().record_required_context_recalled(
+                        task.task_id, _required_context_recalled_observation(_pack))
+                except Exception:
+                    logger.exception(
+                        "dispatcher: required_context_recalled telemetry failed for %s",
+                        task.task_id,
+                    )
             except Exception:
                 logger.exception(
                     f"dispatcher: context pack telemetry failed for {task.task_id}")

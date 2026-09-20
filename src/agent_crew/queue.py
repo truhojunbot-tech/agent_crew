@@ -68,7 +68,7 @@ CREATE TABLE IF NOT EXISTS tokenomics_shadow_receipts (
     economics_json TEXT, outcome TEXT,
     shadow_decision_source TEXT, shadow_policy_version TEXT,
     shadow_recommendation_json TEXT, shadow_contract_sha TEXT,
-    shadow_resolved_at REAL, shadow_reason TEXT,
+    shadow_resolved_at REAL, shadow_reason TEXT, evidence_json TEXT,
     created_at REAL NOT NULL, updated_at REAL NOT NULL
 )
 """
@@ -80,6 +80,7 @@ _DDL_MIGRATE_SHADOW_COLUMNS = (
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_contract_sha TEXT",
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_resolved_at REAL",
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_reason TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN evidence_json TEXT",
 )
 
 _DDL = """
@@ -228,6 +229,8 @@ _DDL_MIGRATE_ATTR_REASONING = "ALTER TABLE task_attribution ADD COLUMN reasoning
 _DDL_MIGRATE_ATTR_CONTEXT_WINDOW = "ALTER TABLE task_attribution ADD COLUMN context_window_tokens INTEGER DEFAULT NULL"
 _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH = "ALTER TABLE task_attribution ADD COLUMN stable_prefix_hash TEXT DEFAULT NULL"
 _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH = "ALTER TABLE task_attribution ADD COLUMN context_pack_hash TEXT DEFAULT NULL"
+_DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED = (
+    "ALTER TABLE task_attribution ADD COLUMN required_context_recalled INTEGER DEFAULT NULL")
 
 _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
@@ -262,6 +265,7 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_CONTEXT_WINDOW,
     _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH,
     _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH,
+    _DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED,
 )
 
 _DDL_CHECKPOINTS = """
@@ -1520,13 +1524,50 @@ class TaskQueue:
                                   outcome: Optional[str] = None) -> None:
         economics = conn.execute(
             """SELECT uncached_input_tokens, cache_write_tokens, cache_read_tokens,
-                      output_tokens, reasoning_tokens, context_window_tokens
+                      output_tokens, reasoning_tokens, context_window_tokens,
+                      outcome, retry_of, fallback_of, required_context_recalled
                FROM task_attribution WHERE task_id=?""", (task_id,)).fetchone()
+        token_observations = {
+            key: (economics[key] if economics is not None else None)
+            for key in ("uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
+                        "output_tokens", "reasoning_tokens")
+        }
+        # quota-core #80 evidence contract: NULL is an observation of unknown,
+        # never an inferred false/zero.  `required_context_recalled` is written
+        # only by the Context Pack producer; other quality facts remain NULL
+        # until Agent Crew has a direct observation for them (#342 A).
+        evidence = {
+            "outcome": outcome or (economics["outcome"] if economics is not None and "outcome" in economics.keys() else None),
+            "independent_review_correct": None,
+            "required_context_recalled": (
+                None if economics is None else
+                (None if economics["required_context_recalled"] is None
+                 else bool(economics["required_context_recalled"]))),
+            "context_growth_tokens": None,
+            "retry_of": (economics["retry_of"] or None) if economics is not None and "retry_of" in economics.keys() else None,
+            "fallback_of": (economics["fallback_of"] or None) if economics is not None and "fallback_of" in economics.keys() else None,
+            "token_observations": token_observations,
+        }
         conn.execute(
             """UPDATE tokenomics_shadow_receipts
-               SET outcome=COALESCE(?, outcome), economics_json=?, updated_at=? WHERE task_id=?""",
-            (outcome, json.dumps(dict(economics)) if economics is not None else None, now, task_id),
+               SET outcome=COALESCE(?, outcome), economics_json=?, evidence_json=?, updated_at=? WHERE task_id=?""",
+            (outcome, json.dumps(dict(economics)) if economics is not None else None,
+             json.dumps(evidence), now, task_id),
         )
+
+    def record_required_context_recalled(self, task_id: str, observed: Optional[bool]) -> None:
+        """Persist Context Pack recall evidence without converting unknown to false (#342)."""
+        if observed is not None and not isinstance(observed, bool):
+            raise TypeError("required_context_recalled must be bool or None")
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE task_attribution SET required_context_recalled=?, updated_at=? WHERE task_id=?",
+                (None if observed is None else int(observed), time.time(), task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def _refresh_shadow_after_commit(self, task_id: str, outcome: Optional[str] = None) -> None:
         """Best-effort completion-time policy observation (#342 Option A).
