@@ -24,7 +24,9 @@ def test_sync_records_requested_origin_base_when_checkout_succeeds(monkeypatch, 
     monkeypatch.setattr("agent_crew.cli.subprocess.run", run)
     bases = _sync_worktrees_to_main({"implementer": str(worktree)}, base_branch="feature/live")
 
-    assert bases == {"implementer": SHA_REQUESTED}
+    assert bases == {"implementer": {"requested_ref": "origin/feature/live",
+                                      "actual_ref": "origin/feature/live",
+                                      "sha": SHA_REQUESTED, "status": "known"}}
     assert any(call[-1] == "origin/feature/live" for call in calls if "checkout" in call)
 
 
@@ -49,7 +51,9 @@ def test_sync_falls_back_to_origin_default_and_records_actual_base(monkeypatch, 
     bases = _sync_worktrees_to_main(
         {"implementer": str(worktree)}, base_branch="unpushed-feature")
 
-    assert bases == {"implementer": SHA_DEFAULT}
+    assert bases == {"implementer": {"requested_ref": "origin/unpushed-feature",
+                                      "actual_ref": "origin/main",
+                                      "sha": SHA_DEFAULT, "status": "fallback"}}
     assert any(call[-1] == "origin/main" for call in calls if "checkout" in call)
 
 
@@ -64,7 +68,8 @@ def test_sync_git_failure_returns_unknown_without_raising(monkeypatch, tmp_path)
     )
 
     assert _sync_worktrees_to_main({"implementer": str(worktree)}) == {
-        "implementer": None,
+        "implementer": {"requested_ref": "origin/main", "actual_ref": None,
+                          "sha": None, "status": "unknown"},
     }
 
 

@@ -2438,6 +2438,18 @@ def create_app(
                 base_key: prepared_sha or None,
                 "worktree_base_status": "known" if prepared_sha else "unknown",
             }
+            landed = (task.context or {}).get("sync_landed_bases", {})
+            if isinstance(landed, dict):
+                record = landed.get(role)
+                if not isinstance(record, dict) and len(landed) == 1:
+                    record = next(iter(landed.values()))
+                if isinstance(record, dict):
+                    base_context.update({
+                        "sync_base_requested_ref": record.get("requested_ref"),
+                        "sync_base_actual_ref": record.get("actual_ref"),
+                        "sync_base_sha": record.get("sha"),
+                        "sync_base_status": record.get("status", "unknown"),
+                    })
             q().patch_context(task.task_id, base_context)
             task.context = {**(task.context or {}), **base_context}
         except Exception:
