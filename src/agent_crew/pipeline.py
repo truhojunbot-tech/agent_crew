@@ -21,6 +21,8 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import json
+import subprocess
 import uuid
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -72,6 +74,86 @@ FIX_EXHAUSTED_KIND = "fix_exhausted"
 #: one its task was dispatched for (#268). Grep-able on purpose: it is the only
 #: trace a human has that the reviewer answered a different question.
 PR_MISMATCH_MARKER = "[agent_crew] PR MISMATCH"
+
+
+def verify_implement_artifact(
+    task: TaskRequest, result: TaskResult, *, repo_cwd: str,
+) -> tuple[bool, str]:
+    """Fail closed unless a completed implementation names pushed new code (#353).
+
+    This is deliberately a git proof, not a trust decision over the worker's
+    prose: the result commit must descend from the worktree base and be
+    reachable from the reported branch on ``origin``.  Any unavailable git
+    evidence is indistinguishable from no artifact for handoff purposes.
+    """
+    context = task.context if isinstance(task.context, dict) else {}
+    base = str(context.get("worktree_base_sha") or context.get("reviewed_sha") or "").strip()
+    branch = (result.branch or task.branch or "").strip()
+    commit = (result.commit or "").strip()
+    if not repo_cwd:
+        return False, "artifact repository unavailable"
+    if not base or not branch or not commit:
+        return False, "missing base, branch, or full commit"
+    try:
+        local_commit = subprocess.run(
+            ["git", "-C", repo_cwd, "rev-parse", "--verify", f"{commit}^{{commit}}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if local_commit.returncode != 0:
+            return False, "reported commit is not locally resolvable"
+        descends_from_base = subprocess.run(
+            ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", base, commit],
+            capture_output=True, text=True, timeout=30,
+        )
+        if descends_from_base.returncode != 0:
+            return False, "reported commit does not descend from the dispatch base"
+
+        fetch = subprocess.run(
+            ["git", "-C", repo_cwd, "fetch", "origin", branch, "--quiet"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if fetch.returncode == 0:
+            reachable = subprocess.run(
+                ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", commit,
+                 f"origin/{branch}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            if reachable.returncode == 0:
+                return True, "origin branch contains reported commit"
+
+        # A PR is an alternate durable handoff artifact: a branch may be
+        # unavailable to the worker's remote configuration while GitHub still
+        # has an open PR pinned to precisely this commit.  It is not a prose
+        # bypass — both the PR number and its immutable head SHA must agree.
+        pr_number = result.pr_number or context.get("pr_number")
+        if isinstance(pr_number, bool):
+            pr_number = None
+        if pr_number is not None:
+            view = subprocess.run(
+                ["gh", "pr", "view", str(pr_number), "--json", "state,headRefOid"],
+                cwd=repo_cwd, capture_output=True, text=True, timeout=30,
+            )
+            if view.returncode == 0:
+                try:
+                    pr = json.loads(view.stdout)
+                    if pr.get("state") == "OPEN" and pr.get("headRefOid") == commit:
+                        return True, f"open PR #{pr_number} pins reported commit"
+                except (TypeError, ValueError):
+                    pass
+        return False, "reported commit is not reachable from origin or a linked open PR"
+    except Exception as exc:  # git availability is evidence, not a bypass.
+        return False, f"artifact verification unavailable: {type(exc).__name__}"
+
+
+def no_artifact_result(result: TaskResult, detail: str) -> TaskResult:
+    """Preserve the worker report while making the absent artifact terminal."""
+    return TaskResult(
+        task_id=result.task_id, status="failed",
+        summary=f"[no_artifact] {detail}; worker summary: {result.summary}",
+        verdict=result.verdict, findings=result.findings, pr_number=result.pr_number,
+        branch=result.branch, commit=result.commit,
+        error_info={"reason": "no_artifact", "detail": detail},
+    )
 
 
 #: The spelling normaliser lives on the protocol type, because FastAPI has to

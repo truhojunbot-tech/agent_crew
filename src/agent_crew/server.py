@@ -42,9 +42,11 @@ from agent_crew.pipeline import (
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     hold_mismatched_pr_result,
+    no_artifact_result,
     resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
     stale_review_task_id,
+    verify_implement_artifact,
 )
 from agent_crew import provenance as _prov
 from agent_crew.protocol import (
@@ -103,6 +105,34 @@ _WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").low
     "1", "true", "yes",
 )
 _WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
+
+
+def _ensure_role_protocol(
+    role: str, worktree_path: str, project: str, port_file: str, *, agent: str,
+) -> bool:
+    """Ensure the role's worker contract survived worktree synchronisation (#353)."""
+    relative = instructions.ROLE_FILES.get(role)
+    if not relative:
+        logger.error("dispatcher: no protocol file is defined for role=%s", role)
+        return False
+    expected = os.path.join(worktree_path, relative)
+    if os.path.isfile(expected):
+        return True
+    try:
+        created = instructions.write(
+            role, worktree_path, project, port_file, agent=agent, delivery="dispatcher",
+        )
+    except Exception:
+        logger.exception(
+            "dispatcher: could not regenerate missing protocol for role=%s worktree=%s",
+            role, worktree_path,
+        )
+        return False
+    if not os.path.isfile(created):
+        logger.error("dispatcher: protocol write returned missing path %s", created)
+        return False
+    logger.warning("dispatcher: regenerated missing %s protocol at %s (#353)", role, created)
+    return True
 
 
 def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Optional[str]:
@@ -467,7 +497,8 @@ def _prepare_worktree_for_task(
 
     - All roles: stash local changes, fetch origin (catches stale worktrees that
       missed weeks of merged PRs, #141).
-    - implementer: checkout a fresh branch per task from origin/main so each
+    - implementer: checkout a fresh branch per task from the task's configured
+      base so each
       impl task starts clean and pushes to its own PR branch (#140).
     - reviewer/tester: checkout the task's PR branch from origin so reviews
       run against the actual changed code, not stale main (#141, #186).
@@ -514,9 +545,14 @@ def _prepare_worktree_for_task_inner(
     task_context: Optional[dict] = None,
 ) -> None:
     """Inner (may raise). Wrapped by _prepare_worktree_for_task."""
-    main_branch = _WORKTREE_MAIN_BRANCH
     if task_context is None:
         task_context = {}
+    # `main` is only a default.  A project can run on a long-lived integration
+    # branch; dispatching its worker from origin/main silently makes it edit a
+    # stale, different tree (#353).  The explicit context is produced by the
+    # CLI and survives queue/restart; task.branch remains the useful fallback
+    # for callers which do not supply one.
+    main_branch = str(task_context.get("base_branch") or _WORKTREE_MAIN_BRANCH).strip()
     # #296: is this worktree even usable? Asked BEFORE any other git call,
     # because an interrupted ref update can leave HEAD pointing at a branch that
     # was never created, and `stash`/`fetch`/`checkout` all behave differently
@@ -557,7 +593,7 @@ def _prepare_worktree_for_task_inner(
     )
 
     if role == "implementer":
-        # Fresh branch per task from origin/main (#140). Use task.branch when
+        # Fresh branch per task from the configured base (#140/#353). Use task.branch when
         # set (crew run --branch), otherwise derive from task_id.
         branch = task_branch if task_branch else f"agent/{task_id[:12]}"
         if not _agent_crew_owns_branch(branch):
@@ -2456,9 +2492,10 @@ def create_app(
                     # moved under it.
                     if _reviewed_sha:
                         try:
-                            q().patch_context(task.task_id, {"reviewed_sha": _reviewed_sha})
+                            _base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
+                            q().patch_context(task.task_id, {_base_key: _reviewed_sha})
                             task.context = {**(task.context or {}),
-                                            "reviewed_sha": _reviewed_sha}
+                                            _base_key: _reviewed_sha}
                         except Exception:
                             logger.exception(
                                 f"_try_push_next: could not record reviewed_sha for "
@@ -2493,6 +2530,15 @@ def create_app(
                         f"_try_push_next: worktree prep failed for {role} "
                         f"task_id={task.task_id} — continuing with dispatch"
                     )
+
+        _push_worktree = worktree_map.get(role) if worktree_map else ""
+        _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
+        if _push_worktree and not _ensure_role_protocol(
+            role, _push_worktree, _push_project,
+            os.path.join(os.path.dirname(db_path), "port"), agent=_target_agent,
+        ):
+            _fail_if_active(task.task_id, "missing_role_protocol")
+            return
 
         # #151: if target pane shows a usage-limit message, immediately reroute
         # via fallback rather than pushing into a blocked agent.
@@ -3384,9 +3430,10 @@ def create_app(
                     # #253: same record on the headless path, and before the
                     # prompt is built so the agent is told which commit it got.
                     try:
-                        q().patch_context(task.task_id, {"reviewed_sha": _reviewed_sha})
+                        _base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
+                        q().patch_context(task.task_id, {_base_key: _reviewed_sha})
                         task.context = {**(task.context or {}),
-                                        "reviewed_sha": _reviewed_sha}
+                                        _base_key: _reviewed_sha}
                     except Exception:
                         logger.exception(
                             f"dispatcher: could not record reviewed_sha for {task.task_id}"
@@ -3414,6 +3461,13 @@ def create_app(
                 logger.exception(
                     f"dispatcher: worktree prep failed for {role} task_id={task.task_id} — continuing"
                 )
+
+        if not _ensure_role_protocol(
+            role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent,
+        ):
+            _lock_stack.close()
+            _fail_if_active(task.task_id, "missing_role_protocol")
+            return
 
         # Record durable attribution before dispatch so quota systems can map
         # token usage back to the project even after worktrees are torn down (#174).
@@ -4681,6 +4735,29 @@ def create_app(
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
         ctx = q().get_task_context(task_id)
+        _artifact_held = None
+        _task = next((item for item in q().list_tasks() if item.task_id == task_id), None)
+        try:
+            _runtime_paused = bool(q().get_stop_epoch().get("paused")) or q()._pausejson_active()
+        except Exception:
+            # STOP state is safety authority.  Do not rewrite an in-flight
+            # result while its state cannot be read; submit_result will retain
+            # its established fail-closed cascade handling (#313).
+            _runtime_paused = True
+        _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
+        if (not _runtime_paused and not _REPLAYING.get() and _task is not None
+                and _task.task_type == "implement" and result.status == "completed"
+                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
+            logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
+        if (not _runtime_paused and not _REPLAYING.get()
+                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))
+                and _task is not None
+                and _task.task_type == "implement" and result.status == "completed"):
+            _ok, _detail = verify_implement_artifact(
+                _task, result, repo_cwd=_any_worktree_path())
+            if not _ok:
+                _artifact_held = _detail
+                result = no_artifact_result(result, _detail)
         # #268: does this result even claim to be about the PR we dispatched
         # it for? Must happen before the row is written, so what lands in the
         # DB is the held form — a human reading the row later sees the
@@ -4828,6 +4905,10 @@ def create_app(
                            f"stop_epoch={_pepoch}). result는 저장됨, 후속 stage 미생성.")
             return {"status": "ok", "task_id": task_id, "suppressed_by_pause": True,
                     "pause_generation": _pepoch, "cascade_suppressed": True}
+        if _artifact_held is not None:
+            logger.warning("POST /tasks/%s/result: no artifact — %s", task_id, _artifact_held)
+            return {"status": "ok", "task_id": task_id, "held": "no_artifact",
+                    "reason": "no_artifact", "detail": _artifact_held}
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")

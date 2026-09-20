@@ -2005,7 +2005,7 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, task_type, description, branch, priority, context, status, project "
+                "SELECT task_id, task_type, description, branch, priority, context, status, project, error_info "
                 "FROM tasks ORDER BY priority ASC, created_at ASC"
             ).fetchall()
             return [
@@ -2018,6 +2018,7 @@ class TaskQueue:
                     "context": json.loads(r["context"]) if r["context"] else {},
                     "status": r["status"],
                     "project": r["project"] if r["project"] else "",
+                    "error_info": json.loads(r["error_info"]) if r["error_info"] else None,
                 }
                 for r in rows
             ]
