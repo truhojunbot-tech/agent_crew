@@ -62,6 +62,23 @@ def test_project_policy_path_is_durable_and_operator_overridable(tmp_path):
     assert _tokenomics_policy_path(str(tmp_path), {"tokenomics_policy_path": "/contract/v1.json"}) == "/contract/v1.json"
 
 
+def test_unsupported_or_task_missing_contracts_remain_baseline_with_distinct_reason(monkeypatch, tmp_path, tmp_db):
+    policy = tmp_path / "unsupported.json"
+    policy.write_text(json.dumps({"contract_version": "9.9", "mode": "shadow", "decisions": []}))
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("unsupported", "implement", "x"))
+    unsupported = queue.get_tokenomics_shadow_receipt("unsupported")
+    assert json.loads(unsupported["recommendation_json"]) is None
+    assert json.loads(unsupported["actual_execution_json"])["shadow_reason"] == "contract_version_unsupported"
+
+    policy.write_text(json.dumps({"contract_version": "1.0", "mode": "shadow", "decisions": []}))
+    queue.enqueue(TaskRequest("missing-decision", "implement", "x"))
+    missing = queue.get_tokenomics_shadow_receipt("missing-decision")
+    assert missing["decision_source"] == "baseline"
+    assert json.loads(missing["actual_execution_json"])["shadow_reason"] == "task_decision_unavailable"
+
+
 def test_late_provider_telemetry_refreshes_counterfactual_economics(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("late-usage", "implement", "x"))

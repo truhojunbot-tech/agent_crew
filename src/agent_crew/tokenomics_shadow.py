@@ -7,8 +7,11 @@ then leaves the crew's baseline cascade untouched.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 def shadow_recommendation(task) -> dict[str, Any]:
@@ -40,11 +43,15 @@ def shadow_recommendation(task) -> dict[str, Any]:
                 None,
             )
             if not isinstance(recommendation, dict):
-                return baseline
+                return {**baseline, "reason": "task_decision_unavailable"}
             return {"decision_source": "quota_core_contract",
                     "policy_version": contract["contract_version"],
                     "recommendation": recommendation,
                     "reason": "shadow_only"}
+        if "contract_version" in contract:
+            logger.warning("unsupported tokenomics policy contract version %r at %s",
+                           contract.get("contract_version"), path)
+            return {**baseline, "reason": "contract_version_unsupported"}
         if not isinstance(contract.get("recommendation"), dict):
             return baseline
         return {"decision_source": "quota_core_contract",

@@ -1012,7 +1012,8 @@ class TaskQueue:
                        VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     (task.task_id, shadow["decision_source"], shadow["policy_version"],
                      json.dumps(shadow["recommendation"]),
-                     json.dumps({"cascade": "baseline", "task_type": task.task_type}), now, now),
+                     json.dumps({"cascade": "baseline", "task_type": task.task_type,
+                                 "shadow_reason": shadow["reason"]}), now, now),
                 )
                 conn.commit()
             finally:
