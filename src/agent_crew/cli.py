@@ -55,6 +55,19 @@ def _tokenomics_policy_path(proj_dir: str, state: dict | None = None) -> str:
     return configured if isinstance(configured, str) and configured else os.path.join(proj_dir, "tokenomics-policy.json")
 
 
+def _context_pack_enabled(state: dict | None = None) -> bool:
+    """Resolve the durable Context Pack default; absent state remains off."""
+    return bool((state or {}).get("context_pack_enabled", False))
+
+
+def _context_pack_launch_value(state: dict | None = None) -> tuple[str, str]:
+    """Return effective flag and source; an explicit launch env wins once."""
+    override = os.environ.get("AGENT_CREW_CONTEXT_PACK")
+    if override is not None:
+        return override, "environment"
+    return ("1" if _context_pack_enabled(state) else "0"), "project_state"
+
+
 def _parse_interval(text: str) -> float:
     """Parse a '30s' / '5m' / '1h' duration into seconds (#224)."""
     import re as _re
@@ -946,6 +959,11 @@ def setup(project: str, agents: str, base: str):
     # worktrees from state.json on startup. server_pid is backfilled below.
     db_file = os.path.join(proj_dir, "tasks.db")
     policy_path = _tokenomics_policy_path(proj_dir, existing_state)
+    context_pack_enabled = _context_pack_enabled(existing_state)
+    if "AGENT_CREW_CONTEXT_PACK" in os.environ:
+        context_pack_enabled = os.environ["AGENT_CREW_CONTEXT_PACK"].strip().lower() in (
+            "1", "true", "yes", "on",
+        )
     _write_state(base, project, {
         "project": project,
         "port": port,
@@ -963,12 +981,15 @@ def setup(project: str, agents: str, base: str):
         "sessions_file": sessions_file,
         "dispatcher_mode": _dispatcher_mode,
         "tokenomics_policy_path": policy_path,
+        "context_pack_enabled": context_pack_enabled,
     })
 
     # Start server — skip if reusing existing server (pane-only recreation path).
     if not _reuse_server:
         state_file = _state_path(base, project)
         pythonpath = os.pathsep.join(p for p in sys.path if p)
+        context_pack_value, context_pack_source = _context_pack_launch_value(
+            {"context_pack_enabled": context_pack_enabled})
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
@@ -977,8 +998,10 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
+            "AGENT_CREW_CONTEXT_PACK": context_pack_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
+        _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_file = open(os.path.join(proj_dir, "server.log"), "w")
         server_proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
@@ -1021,6 +1044,8 @@ def setup(project: str, agents: str, base: str):
                 pass
         state_file = _state_path(base, project)
         pythonpath = os.pathsep.join(p for p in sys.path if p)
+        context_pack_value, context_pack_source = _context_pack_launch_value(
+            {"context_pack_enabled": context_pack_enabled})
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
@@ -1029,8 +1054,10 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
+            "AGENT_CREW_CONTEXT_PACK": context_pack_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
+        _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_file = open(os.path.join(proj_dir, "server.log"), "a")
         server_proc = subprocess.Popen(
             [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
@@ -1636,6 +1663,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         pane_map_file = os.path.join(proj_dir, "pane_map.json")
         state_file = _state_path(base, project)
         policy_path = _tokenomics_policy_path(proj_dir, state)
+        context_pack_value, context_pack_source = _context_pack_launch_value(state)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
@@ -1644,8 +1672,10 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
+            "AGENT_CREW_CONTEXT_PACK": context_pack_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
+        _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_path = os.path.join(proj_dir, "server.log")
         log_file = open(log_path, "a")
         server_proc = subprocess.Popen(
