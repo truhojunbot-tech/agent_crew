@@ -44,7 +44,7 @@ from agent_crew.protocol import (
 from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
 from agent_crew.risk_tier import (
     TIER_0, TIER_1, TIER_2, TIER_3, cascade_metadata, classify_task,
-    effective_fix_round_cap,
+    effective_fix_round_cap, risk_tier_enforcement_enabled, shadow_decision,
 )
 
 logger = logging.getLogger(__name__)
@@ -404,6 +404,21 @@ def review_fix_max_rounds() -> int:
         return DEFAULT_REVIEW_FIX_MAX_ROUNDS
 
 
+def _record_risk_tier_shadow(queue: TaskQueue, task, actual_action: str) -> None:
+    """Append a best-effort, idempotent counterfactual without changing work."""
+    try:
+        context = task.context if isinstance(task.context, dict) else {}
+        record = shadow_decision(
+            task.description, context, task.task_id, actual_action, review_fix_max_rounds(),
+        )
+        records = context.get("risk_tier_shadow")
+        records = list(records) if isinstance(records, list) else []
+        if record not in records:
+            queue.patch_context(task.task_id, {"risk_tier_shadow": records + [record]})
+    except Exception:
+        logger.exception("risk-tier shadow receipt failed for %s", getattr(task, "task_id", "unknown"))
+
+
 def fix_task_id(review_task_id: str, fix_round: int) -> str:
     """The task id a given review round's fix MUST have.
 
@@ -578,6 +593,8 @@ def auto_enqueue_fix(
         # Council #39 A-4: the configured value remains a hard ceiling, while
         # low-risk work stops once an additional fix is less valuable than its
         # independent review/test cost.
+        if not risk_tier_enforcement_enabled():
+            _record_risk_tier_shadow(queue, review_task, "fix_legacy_cap")
         max_rounds = effective_fix_round_cap(review_ctx, review_fix_max_rounds())
         # The lineage counter rides in the task context, so it survives a
         # server restart and counts ROUNDS rather than tasks. An in-memory
@@ -890,6 +907,7 @@ def auto_enqueue_review(
             return None
         impl_task = impl_tasks[0]
         impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
+        enforce_risk_tier = risk_tier_enforcement_enabled()
         risk = cascade_metadata(impl_task.description, impl_ctx)
         # A review→fix lineage created before Council #39 has no tier receipt.
         # Do not retroactively alter its already-running cap halfway through.
@@ -900,14 +918,16 @@ def auto_enqueue_review(
             tier = TIER_2
         else:
             tier = risk["risk_tier"]
+        if not enforce_risk_tier:
+            _record_risk_tier_shadow(queue, impl_task, "review_enqueued")
         # Tier 0 is intentionally implement-only. It remains observable via
         # its task/result and can still be manually reviewed by an operator.
-        if tier == TIER_0:
+        if enforce_risk_tier and tier == TIER_0:
             logger.info("auto_enqueue_review: Tier 0 task %s is implement-only", impl_task_id)
             return None
         # Tier 3 contains irreversible/external work. Do not make a new worker
         # runnable until a human resolves the durable approval gate.
-        if tier == TIER_3 and not impl_ctx.get("tier3_gate_approved"):
+        if enforce_risk_tier and tier == TIER_3 and not impl_ctx.get("tier3_gate_approved"):
             gate_id = f"risk-tier3-{impl_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1031,10 +1051,11 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
-        review_context.update(risk)
-        if impl_ctx.get("tier3_gate_approved"):
+        if enforce_risk_tier:
+            review_context.update(risk)
+        if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
             review_context["tier3_gate_approved"] = True
-        if tier == TIER_2:
+        if enforce_risk_tier and tier == TIER_2:
             review_context["review_mode"] = "adversarial"
             review_context["instructions"] += "\n\nTier 2: perform an adversarial independent review; actively seek regression and safety gaps."
         if implementer_agent:
@@ -1132,13 +1153,16 @@ def auto_enqueue_test(
         # Propagate upstream agent identities so review/test fallback can
         # avoid self-review and self-test (#117).
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
+        enforce_risk_tier = risk_tier_enforcement_enabled()
         tier = classify_task(review_task.description, review_ctx)
-        if tier == TIER_0:
+        if not enforce_risk_tier:
+            _record_risk_tier_shadow(queue, review_task, "test_enqueued")
+        if enforce_risk_tier and tier == TIER_0:
             return None
         # An approved Tier 3 test gate replays this exact transition.  The
         # durable receipt lives on the reviewed task, so a restart/replay does
         # not create a second gate or strand the already-approved lineage.
-        if tier == TIER_3 and not review_ctx.get("tier3_gate_approved"):
+        if enforce_risk_tier and tier == TIER_3 and not review_ctx.get("tier3_gate_approved"):
             gate_id = f"risk-tier3-test-{review_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1161,9 +1185,11 @@ def auto_enqueue_test(
         if _skip_terminal_pr("auto_enqueue_test", review_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
-        test_context: dict = {"prev_task_id": review_task_id, "risk_tier": tier,
-                              "risk_tier_source": review_ctx.get("risk_tier_source", "metadata")}
-        if tier == TIER_1:
+        test_context: dict = {"prev_task_id": review_task_id}
+        if enforce_risk_tier:
+            test_context.update({"risk_tier": tier,
+                                 "risk_tier_source": review_ctx.get("risk_tier_source", "metadata")})
+        if enforce_risk_tier and tier == TIER_1:
             # #272's tester consumes this as an explicit treatment rather than
             # guessing scope from the project/provider.
             test_context["test_scope"] = "targeted"

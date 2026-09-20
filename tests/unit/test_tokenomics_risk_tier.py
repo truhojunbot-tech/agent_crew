@@ -34,7 +34,45 @@ def test_description_comment_cannot_make_code_change_tier_zero():
     assert classify_task("fix comment", {"changed_paths": ["src/agent_crew/queue.py"]}) == 2
 
 
-def test_low_tiers_reduce_automatic_cascade_and_fix_budget(tmp_db):
+def test_default_shadow_mode_preserves_legacy_cascade_and_records_counterfactual(tmp_db, monkeypatch):
+    """Default-off policy observes Tier 3 without creating its approval gate."""
+    monkeypatch.delenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", raising=False)
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "5")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("shadow-deploy", "implement", "deploy release", branch="b"))
+
+    review_id = auto_enqueue_review(queue, "shadow-deploy", pr_number=9, pr_state_fn=_open)
+
+    assert review_id == "review-shadow-deploy-r0"
+    assert queue.list_gates(status="pending") == []
+    task = _task(queue, "shadow-deploy")
+    shadow = task.context["risk_tier_shadow"][-1]
+    assert shadow == {
+        "task_id": "shadow-deploy", "tier": 3, "tier_source": "metadata",
+        "would_gate": True, "would_test_scope": "full", "would_fix_cap": 3,
+        "actual_action": "review_enqueued",
+    }
+    assert effective_fix_round_cap({"risk_tier": 1}, 5) == 5
+    review = _task(queue, review_id)
+    assert "risk_tier" not in review.context
+    assert "review_mode" not in review.context
+    queue.submit_result(review_id, TaskResult(task_id=review_id, status="completed",
+                                               summary="ok", verdict="approve"))
+    test_id = auto_enqueue_test(queue, review_id, pr_state_fn=_open)
+    assert "test_scope" not in _task(queue, test_id).context
+
+
+def test_enforcement_flag_retains_tier_three_gate(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "yes")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("enforced-deploy", "implement", "deploy release", branch="b"))
+
+    assert auto_enqueue_review(queue, "enforced-deploy", pr_number=10, pr_state_fn=_open) is None
+    assert [gate.id for gate in queue.list_gates(status="pending")] == ["risk-tier3-enforced-deploy"]
+
+
+def test_low_tiers_reduce_automatic_cascade_and_fix_budget(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("doc", "implement", "docs/README.md only", branch="b",
                               context={"changed_paths": ["docs/README.md"]}))
@@ -51,7 +89,8 @@ def test_low_tiers_reduce_automatic_cascade_and_fix_budget(tmp_db):
     assert _task(queue, test_id).context["test_scope"] == "targeted"
 
 
-def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(tmp_db):
+def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("core", "implement", "change src/agent_crew/queue.py", branch="b"))
     review_id = auto_enqueue_review(queue, "core", pr_number=3, pr_state_fn=_open)
@@ -66,8 +105,9 @@ def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(tmp_db):
     assert resume_tier3_gate(queue, "risk-tier3-deploy", pr_state_fn=_open) == "review-deploy-r0"
 
 
-def test_tier_three_gate_approval_via_http_enqueues_review(tmp_db, test_client):
+def test_tier_three_gate_approval_via_http_enqueues_review(tmp_db, test_client, monkeypatch):
     """The production gate endpoint, not only the helper, resumes Tier 3 work."""
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("endpoint-deploy", "implement", "deploy release", branch="b"))
     assert auto_enqueue_review(queue, "endpoint-deploy", pr_number=4, pr_state_fn=_open) is None
@@ -80,7 +120,8 @@ def test_tier_three_gate_approval_via_http_enqueues_review(tmp_db, test_client):
     assert _task(queue, "review-endpoint-deploy-r0").task_type == "review"
 
 
-def test_tier_three_test_gate_approval_via_http_resumes_test_once(tmp_db, test_client):
+def test_tier_three_test_gate_approval_via_http_resumes_test_once(tmp_db, test_client, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
         "review-tier3", "review", "review a deploy", branch="b", context={"risk_tier": 3},

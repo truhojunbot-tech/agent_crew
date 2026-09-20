@@ -8,6 +8,7 @@ It is policy metadata, not an LLM judgement, so replaying a task is stable.
 from __future__ import annotations
 
 import logging
+import os
 import re
 from typing import Mapping
 
@@ -17,6 +18,11 @@ TIER_0, TIER_1, TIER_2, TIER_3 = range(4)
 
 _TIER3 = re.compile(r"\b(stop|pause|resume|merge|deploy|external\s+(?:mutation|write|api)|delete|destroy)\b", re.I)
 _TIER2 = re.compile(r"\b(core|queue|pipeline|server|protocol|schema|migration|database|api|mcp|interface|auth(?:entication)?|security)\b", re.I)
+
+
+def risk_tier_enforcement_enabled() -> bool:
+    """Whether Council #39 cascade changes are explicitly enabled."""
+    return os.getenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "").lower() in {"1", "true", "yes", "on"}
 
 
 def _override(context: Mapping | None):
@@ -66,6 +72,8 @@ def classify_task(description: str, context: Mapping | None = None) -> int:
 
 def effective_fix_round_cap(context: Mapping | None, ceiling: int | None = None) -> int:
     """Apply A-4: low-risk feedback stops before it costs another full round."""
+    if not risk_tier_enforcement_enabled():
+        return max(0, ceiling) if ceiling is not None else 3
     # Pre-Council review rows have no tier metadata. Preserve their established
     # ceiling exactly; only newly-classified lineages receive the lower cap.
     if not isinstance(context, Mapping) or "risk_tier" not in context:
@@ -80,3 +88,21 @@ def cascade_metadata(description: str, context: Mapping | None) -> dict:
     """Stable context copied to every successor in a lineage."""
     tier = classify_task(description, context)
     return {"risk_tier": tier, "risk_tier_source": "explicit" if _override(context) is not None else "metadata"}
+
+
+def shadow_decision(description: str, context: Mapping | None, task_id: str, actual_action: str,
+                    ceiling: int | None = None) -> dict:
+    """Counterfactual Council decision; observation must never affect execution."""
+    metadata = cascade_metadata(description, context)
+    tier = metadata["risk_tier"]
+    policy_cap = {TIER_0: 0, TIER_1: 1, TIER_2: 3, TIER_3: 3}[tier]
+    would_fix_cap = policy_cap if ceiling is None else min(max(0, ceiling), policy_cap)
+    return {
+        "task_id": task_id,
+        "tier": tier,
+        "tier_source": metadata["risk_tier_source"],
+        "would_gate": tier == TIER_3,
+        "would_test_scope": "skip" if tier == TIER_0 else "targeted" if tier == TIER_1 else "full",
+        "would_fix_cap": would_fix_cap,
+        "actual_action": actual_action,
+    }
