@@ -1898,20 +1898,22 @@ def teardown(project: str, base: str):
     click.echo(f"Teardown complete: {project}")
 
 
-def _sync_worktrees_to_main(worktrees: dict) -> None:
-    """Reset all agent worktrees to origin/main.
+def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> None:
+    """Reset all agent worktrees to their configured origin base branch.
 
     Used both before a crew run/discuss (so agents start from latest main)
     and after a run completes (so the next run isn't stale). Failures are
     logged but never propagated — a sync error must not block the task.
     """
-    main_branch = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    main_branch = base_branch or os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
     for agent, wt_path in worktrees.items():
         if not wt_path or not os.path.isdir(wt_path):
             continue
         try:
             subprocess.run(
-                ["git", "-C", wt_path, "stash", "push", "-u", "-m", "agent_crew sync"],
+                ["git", "-C", wt_path, "stash", "push", "-u", "-m", "agent_crew sync", "--", ".",
+                 ":(exclude).claude/CLAUDE.md", ":(exclude)AGENTS.md", ":(exclude)GEMINI.md",
+                 ":(exclude).gemini/settings.json"],
                 capture_output=True, text=True,
             )
             subprocess.run(
@@ -2325,16 +2327,16 @@ def run_cmd(task: str, db: str, project: str, base: str,
     # review→test). Without this flag the server and coordinator both enqueue the
     # next phase independently, creating duplicate tasks and causing _wait() to
     # block on the coordinator's copy while the agent completes the server's copy.
-    # Sync all worktrees to latest origin/main before starting (#175, #176).
+    # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the
     # implementer always branches off the most recent merged state.
     if _run_worktrees:
-        click.echo("Syncing worktrees to origin/main...")
-        _sync_worktrees_to_main(_run_worktrees)
+        click.echo(f"Syncing worktrees to origin/{branch}...")
+        _sync_worktrees_to_main(_run_worktrees, base_branch=branch)
 
     _CM: dict = {"coordinator_managed": True}
 
-    impl_context = {**_CM}
+    impl_context = {**_CM, "base_branch": branch}
     if implementer:
         impl_context["agent_override"] = implementer
     if no_tester:
@@ -2453,7 +2455,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     if auto_merge:
                         _auto_merge_pr(_loop_pr_number, repo)
                     if _run_worktrees:
-                        _sync_worktrees_to_main(_run_worktrees)  # #166
+                        _sync_worktrees_to_main(_run_worktrees, base_branch=branch)  # #166
                     return
                 else:
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
@@ -2470,7 +2472,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 if auto_merge:
                     _auto_merge_pr(_loop_pr_number, repo)
                 if _run_worktrees:
-                    _sync_worktrees_to_main(_run_worktrees)  # #166
+                    _sync_worktrees_to_main(_run_worktrees, base_branch=branch)  # #166
             return
 
         # request_changes: re-implement with feedback

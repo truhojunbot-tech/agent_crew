@@ -40,6 +40,7 @@ from agent_crew.pipeline import (
     auto_enqueue_review,
     auto_enqueue_test,
     auto_fallback_failed_task,    hold_mismatched_pr_result,
+    no_artifact_result, verify_implement_artifact,
 )
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
@@ -191,6 +192,22 @@ def build_mcp_server(
         # around by changing how it reports (#123 exists for this reason).
         _task_ctx = queue.get_task_context(task_id)
         result, mismatch = hold_mismatched_pr_result(task_id, result, _task_ctx)
+        _artifact_held = None
+        _task = next((item for item in queue.list_tasks() if item.task_id == task_id), None)
+        try:
+            _runtime_paused = bool(queue.get_stop_epoch().get("paused")) or queue._pausejson_active()
+        except Exception:
+            _runtime_paused = True
+        _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
+        if (not _runtime_paused
+                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))
+                and _task is not None
+                and _task.task_type == "implement" and result.status == "completed"):
+            _ok, _detail = verify_implement_artifact(
+                _task, result, repo_cwd=str((_task_ctx or {}).get("artifact_repo_path") or ""))
+            if not _ok:
+                _artifact_held = _detail
+                result = no_artifact_result(result, _detail)
         try:
             task_type = queue.submit_result(task_id, result)
         except ValueError as e:
@@ -214,6 +231,9 @@ def build_mcp_server(
             return {"acknowledged": True, "task_id": task_id, "task_type": task_type,
                     "held": "pr_number_mismatch",
                     "requested_pr": requested, "reported_pr": reported}
+        if _artifact_held is not None:
+            return {"acknowledged": True, "task_id": task_id, "task_type": task_type,
+                    "held": "no_artifact", "reason": "no_artifact", "detail": _artifact_held}
 
         # Stage cascade — same hooks as the HTTP path so the pipeline does
         # not stall after the first stage when an agent uses MCP-only

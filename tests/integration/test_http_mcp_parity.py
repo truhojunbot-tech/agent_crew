@@ -233,15 +233,12 @@ class TestSubmitResultParity:
         }
         assert snap_a == snap_b
 
-    def test_completed_impl_auto_enqueues_review_on_both_sides(
+    def test_completed_impl_without_artifact_is_held_on_both_sides(
         self, parity_pair, tmp_path
     ):
-        """Cascade hook parity (#123 closed): both transports now run the
-        same `pipeline.auto_enqueue_review` after `submit_result`, so an
-        MCP-only agent sees the review task land just like the HTTP path.
-        Was strict-xfail before #123."""
+        """#353: neither transport may turn prose-only completion into review."""
         http_client, _, db_a = parity_pair
-        _enqueue_task(db_a, "p-cascade-1")
+        _enqueue_task(db_a, "p-cascade-1", context={"worktree_base_sha": "a" * 40})
         http_client.get("/tasks/next", params={"role": "implementer"})
         http_client.post(
             "/tasks/p-cascade-1/result",
@@ -256,7 +253,7 @@ class TestSubmitResultParity:
         )
 
         db_b = str(tmp_path / "parity_mcp.db")
-        _enqueue_task(db_b, "p-cascade-1")
+        _enqueue_task(db_b, "p-cascade-1", context={"worktree_base_sha": "a" * 40})
         mcp = build_mcp_server(db_b)
         _call_tool(mcp, "get_next_task", role="implementer")
         _call_tool(
@@ -274,7 +271,9 @@ class TestSubmitResultParity:
             1 for row in _queue_snapshot(db_b).values()
             if row["task_type"] == "review"
         )
-        assert http_review_count == mcp_review_count == 1
+        assert http_review_count == mcp_review_count == 0
+        assert _queue_snapshot(db_a)["p-cascade-1"]["status"] == "failed"
+        assert _queue_snapshot(db_b)["p-cascade-1"]["status"] == "failed"
 
     def test_failed_status_propagates_both_sides(self, parity_pair, tmp_path):
         http_client, _, db_a = parity_pair
