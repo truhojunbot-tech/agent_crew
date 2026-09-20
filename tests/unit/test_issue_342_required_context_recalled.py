@@ -13,8 +13,13 @@ def test_context_pack_observation_maps_healthy_degraded_and_absent_to_tri_state(
     from types import SimpleNamespace
     from agent_crew.server import _required_context_recalled_observation
 
-    assert _required_context_recalled_observation(SimpleNamespace(degraded=False)) is True
+    assert _required_context_recalled_observation(
+        SimpleNamespace(degraded=False, items=[object()])
+    ) is True
     assert _required_context_recalled_observation(SimpleNamespace(degraded=True)) is False
+    assert _required_context_recalled_observation(
+        SimpleNamespace(degraded=False, items=[])
+    ) is None
     assert _required_context_recalled_observation(None) is None
 
 
