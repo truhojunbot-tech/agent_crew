@@ -89,6 +89,35 @@ def _pane_alive_for_push(pane_id: str) -> bool:
     return r.returncode == 0
 
 
+def _resolve_tmux_pane_target(target: str) -> str:
+    """Resolve a send-keys target to tmux's canonical ``%pane_id`` form."""
+    if re.fullmatch(r"%\d+", target or ""):
+        return target
+    result = subprocess.run(
+        ["tmux", "display-message", "-t", target, "-p", "#{pane_id}"],
+        capture_output=True, text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def _recorded_pane_ids(state_path: Optional[str], pane_map: Optional[dict]) -> set[str]:
+    """Load the project's durable pane ownership boundary for tmux pushes."""
+    if state_path:
+        try:
+            with open(state_path) as state_file:
+                state = json.load(state_file)
+            pane_ids = state.get("pane_ids") if isinstance(state, dict) else None
+            if isinstance(pane_ids, list):
+                return {pane_id for pane_id in pane_ids if isinstance(pane_id, str) and pane_id}
+        except (OSError, json.JSONDecodeError):
+            pass
+        return set()
+    # Embedded callers without a project state have no wider project boundary;
+    # keep their explicit pane map as the ownership declaration. Crew servers
+    # always pass state_path and therefore take the durable branch above.
+    return {pane_id for pane_id in (pane_map or {}).values() if isinstance(pane_id, str) and pane_id}
+
+
 # Per-pane snapshot of the previous capture, keyed by pane_id. Used by the
 # default pane-busy probe to decide "did anything change since the last
 # tick?". Tests inject their own busy_fn so this dict is only touched by the
@@ -2431,6 +2460,52 @@ def create_app(
     def q() -> TaskQueue:
         return state["queue"]
 
+    _owned_pane_ids = _recorded_pane_ids(state_path, pane_map)
+
+    def _guard_task_existence(task_id: str, target: str) -> bool:
+        """Refuse a task block whose DB row is missing or terminal."""
+        task_status = q().get_task_status(task_id)
+        if task_status not in {"pending", "in_progress"}:
+            reason = "task_missing" if task_status is None else f"task_status_{task_status}"
+            logger.warning(
+                "refusing tmux dispatch task_id=%s target=%s reason=%s",
+                task_id, target, reason,
+            )
+            return False
+        return True
+
+    def _guard_tmx_push(task_id: str, target: str) -> str:
+        """Return a live, project-owned pane id or refuse the dispatch."""
+        if not _guard_task_existence(task_id, target):
+            return ""
+        pane_id = _resolve_tmux_pane_target(target)
+        if not pane_id:
+            logger.warning(
+                "refusing tmux dispatch task_id=%s target=%s reason=pane_target_unresolvable",
+                task_id, target,
+            )
+            q().requeue(task_id)
+            return ""
+        if pane_id not in _owned_pane_ids:
+            logger.warning(
+                "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=pane_not_owned",
+                task_id, target, pane_id,
+            )
+            q().requeue(task_id)
+            return ""
+        if not _pane_alive_for_push(pane_id):
+            logger.warning(
+                "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=pane_dead",
+                task_id, target, pane_id,
+            )
+            q().requeue(task_id)
+            return ""
+        return pane_id
+
+    # Expose the exact push boundary for state-backed guard tests; production
+    # dispatch still reaches it only through _try_push_next/_try_push_discuss.
+    app.state.guard_tmx_push = _guard_tmx_push
+
     def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
                               caller: str) -> None:
         """Persist the exact prepared base, including an explicit unknown (#358)."""
@@ -2513,15 +2588,6 @@ def create_app(
                 logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
                 return
 
-        # Verify pane is alive before pushing — dead pane causes silent task loss.
-        if not _pane_alive_for_push(pane_id):
-            logger.error(
-                f"_try_push_next: pane {pane_id} is dead — rolling task "
-                f"{task.task_id} back to queued"
-            )
-            q().requeue(task.task_id)
-            return
-
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
             wt_path = worktree_map.get(role)
@@ -2574,6 +2640,12 @@ def create_app(
             os.path.join(os.path.dirname(db_path), "port"), agent=_target_agent, port=port,
         ):
             _fail_if_active(task.task_id, "missing_role_protocol")
+            return
+
+        # Guard every tmux side effect below (/clear, prompt dismissal, and the
+        # task block itself) against a pane that is not ours.
+        guarded_pane_id = _guard_tmx_push(task.task_id, pane_id)
+        if not guarded_pane_id:
             return
 
         # #151: if target pane shows a usage-limit message, immediately reroute
@@ -2675,7 +2747,11 @@ def create_app(
             )
         # #134: auto-dismiss gemini permission prompt if present.
         _pane_dismiss_permission_prompt(pane_id)
-        push_fn(pane_id, _format_task_message(task, port))
+        # The row can change while preparing context; do not hand a terminal
+        # or deleted task block to an otherwise healthy owned pane.
+        if not _guard_task_existence(task.task_id, guarded_pane_id):
+            return
+        push_fn(guarded_pane_id, _format_task_message(task, port))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id)
@@ -2728,15 +2804,9 @@ def create_app(
         if task is None:
             logger.debug(f"_try_push_discuss: no pending discuss task for agent {agent}")
             return
-        # Verify pane is alive before pushing — dead pane causes silent task loss.
-        if not _pane_alive_for_push(pane_id):
-            logger.error(
-                f"_try_push_discuss: pane {pane_id} is dead — rolling discuss task "
-                f"{task.task_id} back to queued"
-            )
-            q().requeue(task.task_id)
+        guarded_pane_id = _guard_tmx_push(task.task_id, pane_id)
+        if not guarded_pane_id:
             return
-
         logger.info(f"_try_push_discuss: dequeued task_id={task.task_id} for agent={agent}, calling push_fn")
         # #260: the same oversized-context guard `_try_push_next` has had since
         # #133. `crew discuss` is the path these panels actually run on, and it
@@ -2775,7 +2845,9 @@ def create_app(
                 f"_try_push_discuss: pane {pane_id} context size is UNKNOWN — no "
                 f"transcript and no on-screen hint. Not clearing (#292)."
             )
-        push_fn(pane_id, _format_task_message(task, port))
+        if not _guard_task_existence(task.task_id, guarded_pane_id):
+            return
+        push_fn(guarded_pane_id, _format_task_message(task, port))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id)
 
@@ -2942,6 +3014,10 @@ def create_app(
                                     f"watchdog: failed to push next task for role {role}"
                                 )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
+                guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+                if not guarded_pane_id:
+                    continue
+                pane_id = guarded_pane_id
                 # #173: if pane is stuck in bash error state (> prompt from
                 # partial-text injection), send Ctrl+C to recover instead of
                 # pushing a reminder that would be injected into bash again.
