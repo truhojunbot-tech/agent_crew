@@ -671,6 +671,99 @@ def roles_show(project: str, base: str):
         click.echo(f"{role}: {mapping[role]}")
 
 
+def _worktree_owner_repo(worktree: str) -> tuple[str | None, str]:
+    """Return the repository that owns a linked worktree, or a diagnostic."""
+    result = subprocess.run(
+        ["git", "-C", worktree, "rev-parse", "--git-common-dir"],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        return None, result.stderr.strip() or "not a git worktree"
+    common_dir = result.stdout.strip()
+    if not os.path.isabs(common_dir):
+        common_dir = os.path.abspath(os.path.join(worktree, common_dir))
+    return os.path.dirname(common_dir), ""
+
+
+def _worktree_teardown_plan(worktrees: dict, repo_path: str) -> tuple[list[tuple[str, str, str]], list[str]]:
+    """Preflight worktree teardown without risking dirty or unpublished work."""
+    removals: list[tuple[str, str, str]] = []
+    blockers: list[str] = []
+    for name, worktree in worktrees.items():
+        if not worktree:
+            continue
+        if not os.path.exists(worktree):
+            if repo_path:
+                removals.append((name, worktree, repo_path))
+            else:
+                blockers.append(
+                    f"{name}: worktree {worktree!r} is already missing, but its owning "
+                    "repository is unknown. Preserve its registration and run "
+                    "`git -C <owning-repository> worktree prune` after locating it."
+                )
+            continue
+
+        owner_repo, error = _worktree_owner_repo(worktree)
+        if owner_repo is None:
+            blockers.append(
+                f"{name}: cannot identify the repository owning {worktree!r}: {error}. "
+                f"Inspect it with `git -C {worktree} status --porcelain`."
+            )
+            continue
+
+        status_command = ["git", "-C", worktree, "status", "--porcelain", "--untracked-files=all"]
+        status = subprocess.run(status_command, capture_output=True, text=True)
+        if status.returncode != 0:
+            blockers.append(
+                f"{name}: unable to inspect {worktree!r}; run "
+                f"`git -C {worktree} status --porcelain` before teardown: "
+                f"{status.stderr.strip()}"
+            )
+            continue
+        if status.stdout.strip():
+            blockers.append(
+                f"{name}: worktree {worktree!r} has uncommitted changes and was preserved. "
+                f"Review them with `git -C {worktree} status --porcelain`."
+            )
+            continue
+
+        unpublished_command = ["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]
+        unpublished = subprocess.run(unpublished_command, capture_output=True, text=True)
+        if unpublished.returncode != 0:
+            blockers.append(
+                f"{name}: unable to determine whether {worktree!r} has unpublished commits; run "
+                f"`git -C {worktree} log --oneline HEAD --not --remotes`: "
+                f"{unpublished.stderr.strip()}"
+            )
+            continue
+        if unpublished.stdout.strip():
+            blockers.append(
+                f"{name}: worktree {worktree!r} has unpublished commits and was preserved:\n"
+                f"{unpublished.stdout.strip()}\n"
+                f"Push or review them with `git -C {worktree} log --oneline HEAD --not --remotes`."
+            )
+            continue
+        removals.append((name, worktree, owner_repo))
+    return removals, blockers
+
+
+def _remove_planned_worktrees(removals: list[tuple[str, str, str]]) -> list[str]:
+    """Remove safe worktrees through their owning repositories and prune stale ones."""
+    failures: list[str] = []
+    for name, worktree, owner_repo in removals:
+        if os.path.exists(worktree):
+            command = ["git", "-C", owner_repo, "worktree", "remove", worktree]
+        else:
+            command = ["git", "-C", owner_repo, "worktree", "prune"]
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
+            failures.append(
+                f"{name}: Git did not remove {worktree!r} (rc={result.returncode}): "
+                f"{result.stderr.strip()}\nRun `{' '.join(command)}` manually."
+            )
+    return failures
+
+
 @crew.command()
 @click.argument("project")
 @click.option("--agents", default=_DEFAULT_AGENTS,
@@ -966,6 +1059,7 @@ def setup(project: str, agents: str, base: str):
         )
     _write_state(base, project, {
         "project": project,
+        "repo_path": cwd,
         "port": port,
         "port_file": port_file,
         "session": session_name,
@@ -1892,6 +1986,17 @@ def teardown(project: str, base: str):
     _crew_log(proj_dir, f"teardown START session={session_name} agents={agent_list} server_pid={server_pid}")
     _crew_log(proj_dir, f"tmux before teardown: {_tmux_snapshot(session_name)}")
 
+    # Do this before stopping panes or the server: an unsafe worktree must leave
+    # the project entirely intact so an operator can inspect and push it.
+    removals, blockers = _worktree_teardown_plan(worktrees, state.get("repo_path", ""))
+    if blockers:
+        for blocker in blockers:
+            _crew_log(proj_dir, f"teardown REFUSED: {blocker}")
+            click.echo(f"Teardown refused: {blocker}", err=True)
+        raise click.ClickException(
+            "worktrees were preserved; resolve the reported changes before retrying teardown"
+        )
+
     # Kill only the saved agent pane_ids — never kill the session.
     # Using saved IDs is reliable even if agents cd'd away from their worktree paths.
     pane_ids = state.get("pane_ids", [])
@@ -1912,14 +2017,17 @@ def teardown(project: str, base: str):
         except (ProcessLookupError, OSError) as e:
             _crew_log(proj_dir, f"server kill skipped pid={server_pid}: {e}")
 
-    # Remove worktrees
-    for agent in agent_list:
-        wt_path = worktrees.get(agent, "")
-        if wt_path:
-            r = subprocess.run(["git", "worktree", "remove", "--force", wt_path],
-                               capture_output=True, text=True)
-            _crew_log(proj_dir, f"worktree remove {agent} rc={r.returncode}")
-    subprocess.run(["git", "worktree", "prune"], capture_output=True, text=True)
+    # Remove worktrees through their owning repositories so their Git
+    # registrations disappear too.  Never use --force here: preflight above
+    # deliberately treats local changes and unpublished commits as blockers.
+    failures = _remove_planned_worktrees(removals)
+    if failures:
+        for failure in failures:
+            _crew_log(proj_dir, f"teardown INCOMPLETE: {failure}")
+            click.echo(f"Teardown incomplete: {failure}", err=True)
+        raise click.ClickException(
+            "project state was retained because one or more worktrees remain"
+        )
 
     _crew_log(proj_dir, f"teardown DONE — removing state dir {proj_dir}")
     # Remove state dir

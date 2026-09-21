@@ -406,6 +406,7 @@ def test_u_c15_teardown_runs_worktree_prune(tmp_path):
         "session": "crew_myproj",
         "agents": ["claude"],
         "worktrees": {"claude": str(tmp_path / "wt" / "claude")},
+        "repo_path": str(tmp_path),
         "server_pid": 0,
         "port_file": str(tmp_path / "port"),
     }

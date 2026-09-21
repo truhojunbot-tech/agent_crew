@@ -34,8 +34,9 @@ requires_tmux = pytest.mark.skipif(
 
 @pytest.fixture
 def git_repo(tmp_path):
-    """A minimal git repo with one commit."""
+    """A minimal git repo whose base commit is published to origin."""
     repo = tmp_path / "repo"
+    origin = tmp_path / "origin.git"
     repo.mkdir()
     for cmd in [
         ["git", "init", str(repo)],
@@ -46,6 +47,9 @@ def git_repo(tmp_path):
     (repo / "README.md").write_text("test")
     subprocess.run(["git", "-C", str(repo), "add", "."], capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], capture_output=True)
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-u", "origin", "HEAD"], check=True)
     return repo
 
 
@@ -144,6 +148,10 @@ def test_e_st03_teardown_cleans_up(monkeypatch, git_repo, base_dir, e2e_project)
     wt_path = state["worktrees"]["claude"]
     port_file = state["port_file"]
     agent_pane_id = state["pane_ids"][0]
+    # Setup writes disposable worker configuration files.  This test exercises
+    # the clean-worktree teardown path; user changes are covered by the #362
+    # fixture and must instead make teardown refuse.
+    subprocess.run(["git", "-C", wt_path, "clean", "-fd"], check=True)
 
     result = runner.invoke(crew, ["teardown", "testproj", "--base", base_dir])
 
