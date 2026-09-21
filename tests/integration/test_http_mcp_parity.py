@@ -25,6 +25,8 @@ If a future change makes one of those agent-facing, add it here.
 from __future__ import annotations
 
 import asyncio
+import os
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -301,6 +303,64 @@ class TestSubmitResultParity:
 
         assert sum(t.task_type == "review" for t in TaskQueue(db_a).list_tasks()) == 1
         assert sum(t.task_type == "review" for t in TaskQueue(db_b).list_tasks()) == 1
+
+    def test_mcp_real_pushed_artifact_routes_and_pins_review(self, tmp_path):
+        """#366: MCP must prove a real pushed artifact without a gate stub.
+
+        This deliberately invokes the MCP server from the clone because its
+        current directory is the authoritative checkout for the #353 gate.
+        """
+        def git(cwd, *args):
+            return subprocess.run(
+                ["git", *args], cwd=cwd, check=True, text=True, capture_output=True,
+            )
+
+        origin = tmp_path / "origin.git"
+        clone = tmp_path / "clone"
+        feature_branch = "fix/366-real-mcp-artifact"
+        git(tmp_path, "init", "--bare", str(origin))
+        git(tmp_path, "clone", str(origin), str(clone))
+        git(clone, "config", "user.email", "crew@example.test")
+        git(clone, "config", "user.name", "Crew Test")
+        (clone / "README.md").write_text("base\n")
+        git(clone, "add", "README.md")
+        git(clone, "commit", "-m", "base")
+        git(clone, "branch", "-M", "main")
+        git(clone, "push", "-u", "origin", "main")
+        base_sha = git(clone, "rev-parse", "HEAD").stdout.strip()
+
+        git(clone, "switch", "-c", feature_branch)
+        (clone / "feature.txt").write_text("real pushed artifact\n")
+        git(clone, "add", "feature.txt")
+        git(clone, "commit", "-m", "real artifact")
+        feature_sha = git(clone, "rev-parse", "HEAD").stdout.strip()
+        git(clone, "push", "-u", "origin", feature_branch)
+
+        db_path = str(tmp_path / "mcp-real-artifact.db")
+        _enqueue_task(
+            db_path, "p-mcp-real-artifact", branch="main",
+            context={"issue": 366, "reviewed_sha": base_sha},
+        )
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(clone)
+            mcp = build_mcp_server(db_path)
+            _call_tool(mcp, "get_next_task", role="implementer")
+            acknowledgement = _call_tool(
+                mcp, "submit_result", task_id="p-mcp-real-artifact",
+                status="completed", summary="pushed", branch=feature_branch,
+                commit=feature_sha,
+            )
+        finally:
+            os.chdir(previous_cwd)
+
+        snapshot = _queue_snapshot(db_path)
+        reviews = [task for task in TaskQueue(db_path).list_tasks() if task.task_type == "review"]
+        assert acknowledgement.get("held") != "no_artifact", acknowledgement
+        assert snapshot["p-mcp-real-artifact"]["status"] == "completed"
+        assert len(reviews) == 1
+        assert reviews[0].branch == feature_branch
+        assert reviews[0].context.get("reviewed_sha") == feature_sha
 
     def test_failed_status_propagates_both_sides(self, parity_pair, tmp_path):
         http_client, _, db_a = parity_pair
