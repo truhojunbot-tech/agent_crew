@@ -740,6 +740,9 @@ def _remove_untracked_generated_worktree_files(worktree: str) -> str | None:
         if not line.startswith("?? ") or line[3:] not in generated:
             continue
         path = os.path.join(worktree, line[3:])
+        ownership_error = _generated_file_ownership_error(path, line[3:])
+        if ownership_error:
+            return ownership_error
         if line[3:] in {"AGENTS.md", "GEMINI.md"}:
             try:
                 with open(path) as generated_file:
@@ -764,6 +767,41 @@ def _remove_untracked_generated_worktree_files(worktree: str) -> str | None:
         except OSError:
             pass
     return None
+
+
+def _generated_file_ownership_error(path: str, relative: str) -> str | None:
+    """Return a refusal unless a generated-looking file is wholly ours.
+
+    Marker blocks establish ownership for instruction docs; the Telegram file
+    has one exact disabled-token value; JSON/TOML configs must contain only
+    agent_crew's generated configuration. Filename alone is never ownership.
+    """
+    try:
+        with open(path) as generated_file:
+            content = generated_file.read()
+    except OSError as exc:
+        return f"could not inspect generated-looking file {path!r}: {exc}"
+    if relative in {"AGENTS.md", "GEMINI.md"}:
+        begin, end = "<!-- agent_crew:begin -->", "<!-- agent_crew:end -->"
+        if begin in content and end in content:
+            before, rest = content.split(begin, 1)
+            _block, after = rest.split(end, 1)
+            if not before.strip() and not after.strip():
+                return None
+    elif relative == ".telegram/.env" and content == "TELEGRAM_BOT_TOKEN=DISABLED_AGENT_CREW_WORKER\n":
+        return None
+    elif relative == ".claude/CLAUDE.md" and "# Agent Crew — " in content and "OVERRIDE: You are an agent_crew worker" in content:
+        return None
+    elif relative == ".gemini/settings.json":
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict) and set(parsed) == {"mcpServers"} and set(parsed["mcpServers"]) == {"agent_crew"}:
+            return None
+    elif relative in {".mcp.json", ".codex_local/config.toml", ".codex_local/auth.json"} and "agent_crew" in content:
+        return None
+    return f"{path!r} contains developer content and was preserved"
 
 
 def _worktree_teardown_plan(worktrees: dict, repo_path: str) -> tuple[list[tuple[str, str, str]], list[str]]:
@@ -809,6 +847,17 @@ def _worktree_teardown_plan(worktrees: dict, repo_path: str) -> tuple[list[tuple
                 f"{name}: worktree {worktree!r} has uncommitted changes and was preserved. "
                 f"Review them with `git -C {worktree} status --porcelain`."
             )
+            continue
+        ownership_blocked = False
+        for line in status.stdout.splitlines():
+            if line.startswith("?? ") and line[3:] in _generated_worktree_files():
+                ownership_error = _generated_file_ownership_error(
+                    os.path.join(worktree, line[3:]), line[3:])
+                if ownership_error:
+                    blockers.append(f"{name}: {ownership_error}")
+                    ownership_blocked = True
+                    break
+        if ownership_blocked:
             continue
 
         unpublished_command = ["git", "-C", worktree, "log", "--oneline", "HEAD", "--not", "--remotes"]
