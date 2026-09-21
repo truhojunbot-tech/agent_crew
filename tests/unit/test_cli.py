@@ -179,7 +179,7 @@ def test_u_c18_discuss_rejects_unknown_agents_in_project_mode(tmp_path):
     db_file = str(proj_dir / "tasks.db")
     state = {
         "project": "myproj",
-        "port": 0,
+        "port": 8105,
         "session": "crew_myproj",
         "agents": ["claude", "codex"],
         "db": db_file,

@@ -10,6 +10,7 @@ import time
 _logger = logging.getLogger(__name__)
 
 from agent_crew import instructions, session
+from agent_crew.port_validation import require_project_port
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
 _AGENT_CMDS = {
@@ -839,7 +840,7 @@ def _collect_active_ports(base: str | None = None) -> set[int]:
         if not os.path.isfile(port_file):
             continue
         try:
-            port = int(open(port_file).read().strip())
+            port = require_project_port(int(open(port_file).read().strip()), entry.name)
         except (ValueError, OSError):
             continue
         if _is_port_listening(port):
@@ -854,6 +855,7 @@ def find_free_port(start: int = 8100) -> int:
     listening. Ports from dead (non-listening) projects remain eligible.
     Binds the socket to verify (SO_REUSEADDR off) to avoid TOCTOU.
     """
+    require_project_port(start, "allocator")
     blacklisted = _collect_active_ports()
     port = start
     while True:
@@ -868,6 +870,8 @@ def find_free_port(start: int = 8100) -> int:
                 port += 1
 
 
-def write_port_file(path: str, port: int) -> None:
+def write_port_file(path: str, port: int, *, project: str = "") -> None:
+    project = project or os.path.basename(os.path.dirname(os.path.abspath(path))) or "unknown"
+    port = require_project_port(port, project)
     with open(path, "w") as f:
         f.write(str(port))

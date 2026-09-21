@@ -2,6 +2,7 @@ import os
 
 from agent_crew.prompts.task_loop import build_task_loop_prompt
 from agent_crew.testing_policy import load_scope, render_scope
+from agent_crew.port_validation import require_project_port
 
 # Per-role instruction file paths inside each worktree (Issue #110 fix).
 #
@@ -837,7 +838,7 @@ def write(
     if role not in ROLE_FILES:
         raise ValueError(f"Unknown role: {role!r}. Must be one of {list(ROLE_FILES)}")
     with open(port_file) as f:
-        port = int(f.read().strip())
+        port = require_project_port(int(f.read().strip()), project)
     filename = ROLE_FILES[role]
     new_block = generate(role, project, port, agent=agent, delivery=delivery,
                          worktree_path=worktree_path)
