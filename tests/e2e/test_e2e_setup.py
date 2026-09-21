@@ -142,16 +142,15 @@ def test_e_st03_teardown_cleans_up(monkeypatch, git_repo, base_dir, e2e_project)
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
-    runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
+    runner.invoke(crew, ["setup", "testproj", "--agents", "gemini", "--base", base_dir])
     e2e_project(base_dir, "testproj")
     state = _read_state(base_dir, "testproj")
-    wt_path = state["worktrees"]["claude"]
+    wt_path = state["worktrees"]["gemini"]
     port_file = state["port_file"]
     agent_pane_id = state["pane_ids"][0]
-    # Setup writes disposable worker configuration files.  This test exercises
-    # the clean-worktree teardown path; user changes are covered by the #362
-    # fixture and must instead make teardown refuse.
-    subprocess.run(["git", "-C", wt_path, "clean", "-fd"], check=True)
+    # These are real setup output, deliberately left in place for teardown.
+    assert os.path.exists(os.path.join(wt_path, "GEMINI.md"))
+    assert os.path.exists(os.path.join(wt_path, ".gemini", "settings.json"))
 
     result = runner.invoke(crew, ["teardown", "testproj", "--base", base_dir])
 

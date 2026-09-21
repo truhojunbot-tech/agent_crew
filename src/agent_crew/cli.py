@@ -11,6 +11,7 @@ import time
 import click
 
 from agent_crew import setup as setup_module
+from agent_crew.instructions import ROLE_FILES
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT,
     effective_role_mapping,
@@ -685,6 +686,74 @@ def _worktree_owner_repo(worktree: str) -> tuple[str | None, str]:
     return os.path.dirname(common_dir), ""
 
 
+def _generated_worktree_files() -> set[str]:
+    """Return exactly the untracked protocol files setup creates per worktree."""
+    # ROLE_FILES is the source of truth for role instructions.  The two MCP
+    # configuration writers in setup.py create the remaining entries.
+    return set(ROLE_FILES.values()) | {".gemini/settings.json", ".mcp.json"}
+
+
+def _user_worktree_status(porcelain: str) -> str:
+    """Keep all status entries except untracked agent_crew protocol files.
+
+    A tracked protocol file that was edited is deliberately retained: only a
+    ``??`` entry proves this is disposable setup output rather than user work.
+    """
+    generated = _generated_worktree_files()
+    entries = []
+    for line in porcelain.splitlines():
+        if line.startswith("?? ") and line[3:] in generated:
+            continue
+        entries.append(line)
+    return "\n".join(entries)
+
+
+def _legacy_worktree_owner(worktrees: dict, missing_worktree: str) -> str | None:
+    """Find a missing legacy worktree's repository via a surviving sibling."""
+    for sibling in worktrees.values():
+        if not sibling or os.path.abspath(sibling) == os.path.abspath(missing_worktree):
+            continue
+        if not os.path.exists(sibling):
+            continue
+        owner_repo, _error = _worktree_owner_repo(sibling)
+        if owner_repo is not None:
+            return owner_repo
+    return None
+
+
+def _remove_untracked_generated_worktree_files(worktree: str) -> str | None:
+    """Remove only the disposable files preflight identified as setup output.
+
+    ``git worktree remove`` itself rejects every untracked file.  Recheck the
+    porcelain output immediately before removal so a user file appearing after
+    preflight cannot be lost, then unlink only the fixed generated file set.
+    """
+    status = subprocess.run(
+        ["git", "-C", worktree, "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True, text=True,
+    )
+    if status.returncode != 0:
+        return status.stderr.strip() or "could not recheck worktree status"
+    if _user_worktree_status(status.stdout):
+        return "worktree changed after preflight and now contains user changes"
+
+    generated = _generated_worktree_files()
+    for line in status.stdout.splitlines():
+        if not line.startswith("?? ") or line[3:] not in generated:
+            continue
+        path = os.path.join(worktree, line[3:])
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return f"could not remove generated file {path!r}: {exc}"
+    for directory in (".claude", ".gemini"):
+        try:
+            os.rmdir(os.path.join(worktree, directory))
+        except OSError:
+            pass
+    return None
+
+
 def _worktree_teardown_plan(worktrees: dict, repo_path: str) -> tuple[list[tuple[str, str, str]], list[str]]:
     """Preflight worktree teardown without risking dirty or unpublished work."""
     removals: list[tuple[str, str, str]] = []
@@ -693,13 +762,16 @@ def _worktree_teardown_plan(worktrees: dict, repo_path: str) -> tuple[list[tuple
         if not worktree:
             continue
         if not os.path.exists(worktree):
-            if repo_path:
-                removals.append((name, worktree, repo_path))
+            owner_repo = repo_path or _legacy_worktree_owner(worktrees, worktree)
+            if owner_repo:
+                # `git worktree prune` is idempotent, so this also accepts a
+                # registration a human already pruned before retrying.
+                removals.append((name, worktree, owner_repo))
             else:
                 blockers.append(
                     f"{name}: worktree {worktree!r} is already missing, but its owning "
-                    "repository is unknown. Preserve its registration and run "
-                    "`git -C <owning-repository> worktree prune` after locating it."
+                    "repository is unknown. Retry with `crew teardown "
+                    f"<project> --repo-path <owning-repository>` after locating it."
                 )
             continue
 
@@ -720,7 +792,7 @@ def _worktree_teardown_plan(worktrees: dict, repo_path: str) -> tuple[list[tuple
                 f"{status.stderr.strip()}"
             )
             continue
-        if status.stdout.strip():
+        if _user_worktree_status(status.stdout):
             blockers.append(
                 f"{name}: worktree {worktree!r} has uncommitted changes and was preserved. "
                 f"Review them with `git -C {worktree} status --porcelain`."
@@ -752,6 +824,13 @@ def _remove_planned_worktrees(removals: list[tuple[str, str, str]]) -> list[str]
     failures: list[str] = []
     for name, worktree, owner_repo in removals:
         if os.path.exists(worktree):
+            cleanup_error = _remove_untracked_generated_worktree_files(worktree)
+            if cleanup_error:
+                failures.append(
+                    f"{name}: Git did not remove {worktree!r}: {cleanup_error}. "
+                    f"Run `git -C {worktree} status --porcelain` manually."
+                )
+                continue
             command = ["git", "-C", owner_repo, "worktree", "remove", worktree]
         else:
             command = ["git", "-C", owner_repo, "worktree", "prune"]
@@ -1971,7 +2050,8 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
 @crew.command()
 @click.argument("project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
-def teardown(project: str, base: str):
+@click.option("--repo-path", default="", help="Owning repository for a missing legacy worktree")
+def teardown(project: str, base: str, repo_path: str):
     """Tear down PROJECT."""
     state = _read_state(base, project)
     if state is None:
@@ -1988,7 +2068,9 @@ def teardown(project: str, base: str):
 
     # Do this before stopping panes or the server: an unsafe worktree must leave
     # the project entirely intact so an operator can inspect and push it.
-    removals, blockers = _worktree_teardown_plan(worktrees, state.get("repo_path", ""))
+    removals, blockers = _worktree_teardown_plan(
+        worktrees, repo_path or state.get("repo_path", ""),
+    )
     if blockers:
         for blocker in blockers:
             _crew_log(proj_dir, f"teardown REFUSED: {blocker}")
