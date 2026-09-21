@@ -33,6 +33,9 @@ _LEGACY_ROLE_FILES: dict = {
     "reviewer": "AGENTS.md",
     "tester": "GEMINI.md",
 }
+# Compatibility for consumers that still import the legacy role mapping. New
+# writes use AGENT_FILES exclusively.
+ROLE_FILES = _LEGACY_ROLE_FILES
 
 AGENT_FILES: dict = {
     "claude": ".claude/CLAUDE.md",
@@ -853,16 +856,14 @@ def _remove_stale_protocol_files(worktree_path: str, destination: str) -> None:
         path = os.path.join(worktree_path, filename)
         if not os.path.exists(path):
             continue
-        if filename.startswith(".claude/"):
-            # This path has always been wholly agent_crew-owned.
-            os.unlink(path)
-            continue
         try:
             with open(path) as f:
                 existing = f.read()
         except OSError:
             continue
         remaining = _remove_agent_crew_block(existing)
+        if remaining == existing:
+            continue
         if remaining.strip():
             with open(path, "w") as f:
                 f.write(remaining)
@@ -898,19 +899,14 @@ def write(
     if parent:
         os.makedirs(parent, exist_ok=True)
 
-    if filename.startswith(".claude/"):
-        # `.claude/CLAUDE.md` is fully owned by agent_crew — overwrite
-        # entirely. No project-side content to preserve.
-        content = new_block
-    else:
-        existing = ""
-        if os.path.exists(path):
-            try:
-                with open(path) as f:
-                    existing = f.read()
-            except OSError:
-                existing = ""
-        content = _merge_agent_crew_block(existing, new_block)
+    existing = ""
+    if os.path.exists(path):
+        try:
+            with open(path) as f:
+                existing = f.read()
+        except OSError:
+            existing = ""
+    content = _merge_agent_crew_block(existing, new_block)
 
     with open(path, "w") as f:
         f.write(content)

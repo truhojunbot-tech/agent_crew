@@ -157,7 +157,12 @@ def _ensure_role_protocol(
         return False
     expected = os.path.join(worktree_path, relative)
     if os.path.isfile(expected):
-        return True
+        try:
+            with open(expected) as protocol_file:
+                if f"## Role: {role}" in protocol_file.read():
+                    return True
+        except OSError:
+            pass
     try:
         # Production setup writes this first.  Keep recovery/test dispatches
         # self-contained: regenerating a protocol needs a port file, and the

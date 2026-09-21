@@ -280,6 +280,15 @@ def test_dispatch_regenerates_protocol_at_the_assigned_agents_filename(tmp_path)
     assert "## Role: implementer" in (tmp_path / "AGENTS.md").read_text()
 
 
+def test_dispatch_rewrites_wrong_role_protocol(tmp_path):
+    from agent_crew.server import _ensure_role_protocol
+    port_file = tmp_path / "port"
+    port_file.write_text("8105\n")
+    (tmp_path / "AGENTS.md").write_text("## Role: reviewer\n")
+    assert _ensure_role_protocol("implementer", str(tmp_path), "demo", str(port_file), agent="codex")
+    assert "## Role: implementer" in (tmp_path / "AGENTS.md").read_text()
+
+
 def test_mcp_accepts_a_verified_artifact_from_its_worker_checkout(tmp_db, monkeypatch):
     """MCP runs in the worker worktree, not in the HTTP server process (#353)."""
     from agent_crew.mcp_server import build_mcp_server

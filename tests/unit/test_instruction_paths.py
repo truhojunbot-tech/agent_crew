@@ -57,11 +57,11 @@ class TestWriteImplementer:
     def test_overwrites_dot_claude_claude_md(self, tmp_path):
         wt = tmp_path / "wt"
         wt.mkdir()
-        # Pre-existing .claude/CLAUDE.md should be replaced wholesale —
-        # we own this file.
+        # A marker-owned stale contract is replaced; unmarked developer rules
+        # are deliberately preserved.
         old = wt / ".claude" / "CLAUDE.md"
         old.parent.mkdir()
-        old.write_text("OLD CONTENT")
+        old.write_text("<!-- agent_crew:begin -->\nOLD CONTENT\n<!-- agent_crew:end -->\n")
         path = instructions.write(
             "implementer",
             str(wt),
@@ -170,6 +170,14 @@ class TestWriteTester:
 
 
 class TestAgentSelectedProtocolFiles:
+    def test_developer_claude_doc_survives_stale_cleanup(self, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        stale = wt / ".claude" / "CLAUDE.md"
+        stale.parent.mkdir()
+        stale.write_text("developer Claude rules\n")
+        instructions.write("tester", str(wt), project="proj", port_file=_write_port(tmp_path), agent="gemini")
+        assert stale.read_text() == "developer Claude rules\n"
     def test_codex_implementer_receives_push_contract_in_agents_md(self, tmp_path):
         wt = tmp_path / "wt"
         wt.mkdir()
@@ -201,7 +209,7 @@ class TestAgentSelectedProtocolFiles:
         wt.mkdir()
         stale = wt / ".claude" / "CLAUDE.md"
         stale.parent.mkdir()
-        stale.write_text("## Role: implementer\nold agent_crew contract\n")
+        stale.write_text("<!-- agent_crew:begin -->\n## Role: implementer\n<!-- agent_crew:end -->\n")
 
         instructions.write(
             "implementer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="codex",
