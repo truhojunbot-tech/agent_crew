@@ -268,7 +268,7 @@ def _push_server(tmp_db, push, wt, state_path):
     from agent_crew.server import create_app
 
     return create_app(db_path=tmp_db, state_path=str(state_path),
-                      pane_map={"implementer": "%1", "reviewer": "%2", "tester": "%3"},
+                      pane_map={"implementer": "%91", "reviewer": "%92", "tester": "%93"},
                       port=8105, push_fn=push, watchdog_disabled=True,
                       anomaly_disabled=True)
 

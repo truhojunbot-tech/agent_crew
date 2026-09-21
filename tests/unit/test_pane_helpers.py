@@ -33,7 +33,7 @@ def test_pane_token_count_k_suffix():
     with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
         "new task? /clear to save 544.1k tokens"
     )):
-        assert _pane_token_count("%1") == 544_100
+        assert _pane_token_count("%91") == 544_100
 
 
 def test_pane_token_count_m_suffix():
@@ -41,7 +41,7 @@ def test_pane_token_count_m_suffix():
     with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
         "new task? /clear to save 1.2M tokens"
     )):
-        assert _pane_token_count("%1") == 1_200_000
+        assert _pane_token_count("%91") == 1_200_000
 
 
 def test_pane_token_count_plain_integer():
@@ -49,7 +49,7 @@ def test_pane_token_count_plain_integer():
     with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
         "/clear to save 200,000 tokens"
     )):
-        assert _pane_token_count("%1") == 200_000
+        assert _pane_token_count("%91") == 200_000
 
 
 def test_pane_token_count_no_hint():
@@ -63,7 +63,7 @@ def test_pane_token_count_no_hint():
     with patch("agent_crew.server.subprocess.run", return_value=_fake_capture(
         "claude is thinking..."
     )):
-        assert _pane_token_count("%1") is None
+        assert _pane_token_count("%91") is None
 
 
 def test_pane_token_count_subprocess_failure():
@@ -72,7 +72,7 @@ def test_pane_token_count_subprocess_failure():
     Still never raises — the guarantee this test was written for is intact. It
     just no longer reports a failed read as a small measurement (#292)."""
     with patch("agent_crew.server.subprocess.run", side_effect=OSError("no tmux")):
-        assert _pane_token_count("%1") is None
+        assert _pane_token_count("%91") is None
 
 
 # ---------------------------------------------------------------------------
@@ -89,10 +89,10 @@ def test_pane_clear_context_sends_slash_clear():
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
         with patch("agent_crew.server.time.sleep"):
-            _pane_clear_context("%5")
+            _pane_clear_context("%95")
 
     assert any("/clear" in " ".join(c) for c in calls)
-    assert any("%5" in " ".join(c) for c in calls)
+    assert any("%95" in " ".join(c) for c in calls)
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ def test_pane_dismiss_returns_true_when_prompt_present():
         return MagicMock()
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
-        result = _pane_dismiss_permission_prompt("%7")
+        result = _pane_dismiss_permission_prompt("%97")
 
     assert result is True
     assert any("2" in c for c in sent)
@@ -138,7 +138,7 @@ def test_pane_dismiss_returns_false_when_no_prompt():
         return MagicMock()
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
-        result = _pane_dismiss_permission_prompt("%7")
+        result = _pane_dismiss_permission_prompt("%97")
 
     assert result is False
     # send-keys must NOT have been called
@@ -147,7 +147,7 @@ def test_pane_dismiss_returns_false_when_no_prompt():
 
 def test_pane_dismiss_subprocess_failure_returns_false():
     with patch("agent_crew.server.subprocess.run", side_effect=OSError("no tmux")):
-        assert _pane_dismiss_permission_prompt("%3") is False
+        assert _pane_dismiss_permission_prompt("%93") is False
 
 
 # ---------------------------------------------------------------------------

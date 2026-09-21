@@ -432,16 +432,15 @@ def _no_tmux_injection(request, tmux_injections, monkeypatch):
     """Keep pane writes issued by a test inside the test.
 
     A pane id in a fixture is a plausible-looking string, but tmux hands the
-    same ids to real panes: `pane_map={"reviewer": "%1"}` pushed a fixture task
+    same ids to real panes: `pane_map={"reviewer": "%91"}` pushed a fixture task
     block into a live session on this machine roughly every time the suite ran.
     Guarded at the subprocess boundary, below every import alias, for the same
     reason the gh guard sits there — a test cannot capture it early.
 
-    Writes are recorded and answered with a success, not refused: tests assert
-    that the dispatcher *attempted* a push, and failing the call would rewrite
-    what they cover. Read-only tmux and the `tmux_session` fixture's own
-    session are untouched. Opt out with `@pytest.mark.allow_tmux_injection`
-    when a test genuinely needs a live pane.
+    Pane writes are recorded and answered with fake success. This preserves
+    assertions about dispatch attempts while making every test scope incapable
+    of reaching the real tmux server; broad production exception handlers
+    cannot swallow this containment boundary.
     """
     if "allow_tmux_injection" in request.keywords:
         yield
@@ -453,12 +452,10 @@ def _no_tmux_injection(request, tmux_injections, monkeypatch):
         if not _tmux_injection_argv(argv):
             return real_run(argv, *args, **kwargs)
         tmux_injections.append(tuple(str(a) for a in argv))
-
         class _R:
             returncode = 0
             stdout = ""
             stderr = ""
-
         return _R()
 
     monkeypatch.setattr(subprocess, "run", guarded_run)

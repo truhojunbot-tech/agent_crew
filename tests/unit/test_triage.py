@@ -157,7 +157,7 @@ def test_u_t10_triage_cli_exits_on_repo_mismatch(tmp_path):
         "db": db_file,
         "session": "crew_proj_t10",
         "agents": ["claude"],
-        "pane_ids": ["%10"],
+        "pane_ids": ["%910"],
     }
     (tmp_path / "proj_t10").mkdir()
     (tmp_path / "proj_t10" / "state.json").write_text(json.dumps(state))

@@ -11,7 +11,7 @@ from agent_crew.queue import TaskQueue
 
 
 #: A pane id tmux can never hand out — real ids are "%" + digits. Hardcoding
-#: a plausible one ("%1") meant the dispatcher pushed this fixture into a
+#: a plausible one ("%91") meant the dispatcher pushed this fixture into a
 #: developer's live pane; see conftest's tmux injection guard.
 UNREACHABLE_PANE = "%crew-test-reviewer"
 

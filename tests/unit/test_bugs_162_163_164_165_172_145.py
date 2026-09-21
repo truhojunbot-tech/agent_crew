@@ -76,7 +76,7 @@ class TestMcpReminderFormat:
         def fake_push(pane_id: str, msg: str) -> None:
             pushed.append(msg)
 
-        pane_map = {"implementer": "%1"}
+        pane_map = {"implementer": "%91"}
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp"}):
             from agent_crew.server import create_app
             app = create_app(
@@ -114,7 +114,7 @@ class TestMcpAutoClearSkipped:
         def fake_push(pane_id: str, msg: str) -> None:
             pass
 
-        pane_map = {"implementer": "%2"}
+        pane_map = {"implementer": "%92"}
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp"}):
             from agent_crew.server import create_app
             app = create_app(
@@ -312,7 +312,7 @@ class TestMcpNoClientAutoFail:
                                description="mcp task", branch="main"))
         self._make_stale_pending(db, task_id, seconds_ago=200)
 
-        pane_map = {"implementer": "%3"}
+        pane_map = {"implementer": "%93"}
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
@@ -348,7 +348,7 @@ class TestMcpNoClientAutoFail:
         # Make it only 10 seconds old — well within the 120s window
         self._make_stale_pending(db, task_id, seconds_ago=10)
 
-        pane_map = {"implementer": "%4"}
+        pane_map = {"implementer": "%94"}
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
@@ -389,7 +389,7 @@ class TestMcpNoClientAutoFail:
         def fake_push(pane_id: str, msg: str) -> None:
             pushed.append(msg)
 
-        pane_map = {"implementer": "%5"}
+        pane_map = {"implementer": "%95"}
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "push",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app
@@ -435,7 +435,7 @@ class TestMcpNoClientAutoFail:
         conn.commit()
         conn.close()
 
-        pane_map = {"implementer": "%6"}
+        pane_map = {"implementer": "%96"}
         with patch.dict("os.environ", {"AGENT_CREW_DELIVERY": "mcp",
                                         "AGENT_CREW_STALE_PENDING_SECONDS": "120"}):
             from agent_crew.server import create_app

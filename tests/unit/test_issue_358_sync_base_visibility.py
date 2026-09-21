@@ -138,7 +138,7 @@ def test_dispatch_records_actual_or_unknown_worktree_base_without_blocking(
     monkeypatch.setattr("agent_crew.server._prepare_worktree_for_task", lambda *_a, **_k: "")
     monkeypatch.setattr("agent_crew.server._pane_has_usage_limit", lambda *_a, **_k: False)
     app = create_app(
-        tmp_db, state_path=str(state), pane_map={"implementer": "%1"},
+        tmp_db, state_path=str(state), pane_map={"implementer": "%91"},
         push_fn=lambda *args: pushed.append(args), watchdog_disabled=True,
     )
 
@@ -170,7 +170,7 @@ def test_dispatch_records_the_exact_prepared_worktree_base(monkeypatch, tmp_db, 
     )
     monkeypatch.setattr("agent_crew.server._pane_has_usage_limit", lambda *_a, **_k: False)
     app = create_app(
-        tmp_db, state_path=str(state), pane_map={"implementer": "%1"},
+        tmp_db, state_path=str(state), pane_map={"implementer": "%91"},
         push_fn=lambda *_args: None, watchdog_disabled=True,
     )
 
