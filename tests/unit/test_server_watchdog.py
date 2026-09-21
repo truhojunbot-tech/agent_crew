@@ -200,10 +200,13 @@ def test_u_wd05_idle_past_timeout_auto_fails_and_pushes_next(tmp_db):
 
 
 # U-WD06: discuss tasks → watchdog uses context.agent for pane resolution.
-def test_u_wd06_resolves_discuss_pane_via_agent(tmp_db):
+def test_u_wd06_resolves_discuss_pane_via_agent(tmp_db, monkeypatch):
     busy = _PaneState()
     push = _RecordingPush()
-    panes = {"panel": "%999", "claude": "%CLA", "codex": "%COD"}
+    # Tmux canonical pane IDs are numeric. The old symbolic IDs were an
+    # unrealistic fixture that the new ownership resolver correctly refused.
+    panes = {"panel": "%999", "claude": "%1001", "codex": "%1002"}
+    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda _pane: True)
     app = _make_app(tmp_db, panes=panes, busy_fn=busy, push_fn=push,
                     reminder=300.0, timeout=900.0)
 
@@ -215,7 +218,7 @@ def test_u_wd06_resolves_discuss_pane_via_agent(tmp_db):
         TaskQueue(tmp_db).bump_activity("d-claude", ts=1000.0)
         # Mark only the *correct* pane busy — if resolution were broken the
         # watchdog would treat this task as idle.
-        busy.set_busy("%CLA", True)
+        busy.set_busy("%1001", True)
         result = app.state.watchdog_tick(now=1500.0)
 
     assert result["bumped"] == ["d-claude"]

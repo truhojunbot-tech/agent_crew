@@ -507,7 +507,10 @@ def test_u_sp18_dead_pane_rolls_back_task_to_queued(tmp_db, monkeypatch):
     push = RecordingPush()
     app = create_app(
         db_path=tmp_db,
-        pane_map={"implementer": "%dead"},
+        # Canonical tmux pane IDs are numeric.  A symbolic target cannot be
+        # resolved by the ownership guard, so it never reaches this test's
+        # intentionally-dead-pane liveness branch.
+        pane_map={"implementer": "%10018"},
         port=8100,
         push_fn=push,
     )
