@@ -100,8 +100,10 @@ def _resolve_tmux_pane_target(target: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _recorded_pane_ids(state_path: Optional[str], pane_map: Optional[dict]) -> tuple[set[str], bool]:
-    """Load the project's durable pane ownership boundary for tmux pushes."""
+def _recorded_pane_ids(
+    state_path: Optional[str], pane_map: Optional[dict],
+) -> tuple[set[str], bool, str]:
+    """Load durable pane ownership, including why a fallback was needed."""
     if state_path:
         try:
             with open(state_path) as state_file:
@@ -112,14 +114,18 @@ def _recorded_pane_ids(state_path: Optional[str], pane_map: Optional[dict]) -> t
                 state_map = state.get("pane_map", {}) if isinstance(state, dict) else {}
                 if isinstance(state_map, dict):
                     owned.update(v for v in state_map.values() if isinstance(v, str) and v)
-                return owned, True
+                return owned, True, ""
         except (OSError, json.JSONDecodeError):
-            pass
-        return {pane_id for pane_id in (pane_map or {}).values() if isinstance(pane_id, str) and pane_id}, False
+            reason = "state_unreadable"
+        else:
+            reason = "pane_ids_missing"
+        return ({pane_id for pane_id in (pane_map or {}).values()
+                 if isinstance(pane_id, str) and pane_id}, False, reason)
     # Embedded callers without a project state have no wider project boundary;
     # keep their explicit pane map as the ownership declaration. Crew servers
     # always pass state_path and therefore take the durable branch above.
-    return {pane_id for pane_id in (pane_map or {}).values() if isinstance(pane_id, str) and pane_id}, False
+    return ({pane_id for pane_id in (pane_map or {}).values()
+             if isinstance(pane_id, str) and pane_id}, False, "state_path_missing")
 
 
 # Per-pane snapshot of the previous capture, keyed by pane_id. Used by the
@@ -2491,7 +2497,15 @@ def create_app(
         # Pane ownership changes on `crew recover` and pane-map reload.  Read
         # the durable state at the boundary, rather than freezing startup's
         # pane IDs and permanently refusing a legitimate replacement pane.
-        owned_pane_ids, ownership_authoritative = _recorded_pane_ids(state_path, pane_map)
+        owned_pane_ids, ownership_authoritative, ownership_reason = _recorded_pane_ids(
+            state_path, pane_map,
+        )
+        if not ownership_authoritative:
+            logger.warning(
+                "tmux ownership fallback project=%s reason=%s target=%s resolved=%s",
+                _server_identity()["project"] or "unknown",
+                ownership_reason, target, pane_id,
+            )
         if pane_id not in owned_pane_ids:
             logger.warning(
                 "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=pane_not_owned",

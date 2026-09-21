@@ -129,6 +129,35 @@ def test_guard_reads_current_pane_ids_after_state_changes(tmp_db, project_state,
     assert result == "%202"
 
 
+@pytest.mark.parametrize(("state_text", "reason"), [
+    (None, "state_unreadable"),
+    ("", "state_unreadable"),
+    ('{"project": "owned"}', "pane_ids_missing"),
+])
+def test_guard_logs_each_non_authoritative_ownership_fallback(
+    tmp_db, tmp_path, caplog, state_text, reason,
+):
+    """A missing, torn, or incomplete ownership record may not be silent."""
+    missing_state = tmp_path / "state.json"
+    if state_text is not None:
+        missing_state.write_text(state_text)
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="fallback-visible", task_type="implement", description="work"))
+    app = create_app(
+        tmp_db, pane_map={"implementer": "%101"}, state_path=str(missing_state),
+        project="owned", port=8100, push_fn=RecordingPush(), watchdog_disabled=True,
+        anomaly_disabled=True,
+    )
+
+    with TestClient(app) as client:
+        assert client.app.state.guard_tmx_push("fallback-visible", "%101") == "%101"
+        assert client.app.state.guard_tmx_push("fallback-visible", "%101") == "%101"
+
+    assert caplog.text.count("tmux ownership fallback") == 2
+    assert "project=owned" in caplog.text
+    assert f"reason={reason}" in caplog.text
+
+
 def test_named_target_uses_tmux_canonical_pane_id(monkeypatch):
     from types import SimpleNamespace
     from agent_crew.server import _resolve_tmux_pane_target

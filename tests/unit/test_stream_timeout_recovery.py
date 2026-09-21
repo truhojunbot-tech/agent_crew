@@ -112,9 +112,11 @@ def test_watchdog_timeout_routes_to_next_agent_via_fallback(tmp_db):
     task assigned to the next agent in the chain, not a same-role retry."""
     push = _Push()
     panes = {
-        "implementer": "%C", "claude": "%C",
-        "reviewer": "%X", "codex": "%X",
-        "tester": "%G", "gemini": "%G",
+        # Canonical tmux pane IDs are numeric.  These fixtures exercise the
+        # watchdog timeout/fallback path, not named-target resolution.
+        "implementer": "%10101", "claude": "%10101",
+        "reviewer": "%10102", "codex": "%10102",
+        "tester": "%10103", "gemini": "%10103",
     }
     app = create_app(
         db_path=tmp_db,
