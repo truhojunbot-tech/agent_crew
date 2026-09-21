@@ -1,4 +1,4 @@
-from agent_crew.instructions import ROLE_FILES, generate
+from agent_crew.instructions import AGENT_FILES, generate
 
 
 def test_u_i01_generate_describes_push_model_and_result_submission():
@@ -63,24 +63,21 @@ def test_u_i05_failure_path_documented():
     assert "needs direction" in content.lower() or "needs_human" in content
 
 
-def test_u_i06_role_files_match_each_agent_cli_lookup_path():
-    """Each role's instruction file must live where that agent's CLI
+def test_u_i06_agent_files_match_each_agent_cli_lookup_path():
+    """Each agent's instruction file must live where that agent's CLI
     actually reads from (Issue #110):
 
-    - implementer (claude) → `.claude/CLAUDE.md` (Claude Code merges
-      with the project root CLAUDE.md without conflict)
-    - reviewer (codex)     → `AGENTS.md` (Codex reads only the
-      project-root copy)
-    - tester (gemini)      → `GEMINI.md` (Gemini reads only the
-      project-root copy)
+    - claude → `.claude/CLAUDE.md`
+    - codex  → `AGENTS.md`
+    - gemini → `GEMINI.md`
 
     The previous all-`.claude/` layout meant codex/gemini never saw
     the agent_crew prompts and led to the tester force-pushing over
     the implementer's PR head.
     """
-    assert ROLE_FILES["implementer"] == ".claude/CLAUDE.md"
-    assert ROLE_FILES["reviewer"] == "AGENTS.md"
-    assert ROLE_FILES["tester"] == "GEMINI.md"
+    assert AGENT_FILES["claude"] == ".claude/CLAUDE.md"
+    assert AGENT_FILES["codex"] == "AGENTS.md"
+    assert AGENT_FILES["gemini"] == "GEMINI.md"
 
 
 def test_u_i07_common_instructs_ignore_alfred_global():

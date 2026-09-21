@@ -30,21 +30,21 @@ def _write_port(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# ROLE_FILES: paths now match what each agent CLI actually reads
+# AGENT_FILES: paths match what each agent CLI actually reads
 # ---------------------------------------------------------------------------
 
 
-class TestRoleFiles:
-    def test_implementer_stays_under_dot_claude(self):
-        assert instructions.ROLE_FILES["implementer"] == ".claude/CLAUDE.md"
+class TestAgentFiles:
+    def test_claude_reads_dot_claude(self):
+        assert instructions.AGENT_FILES["claude"] == ".claude/CLAUDE.md"
 
-    def test_reviewer_writes_to_root_agents_md(self):
+    def test_codex_reads_root_agents_md(self):
         # Codex reads ./AGENTS.md, not ./.claude/AGENTS.md.
-        assert instructions.ROLE_FILES["reviewer"] == "AGENTS.md"
+        assert instructions.AGENT_FILES["codex"] == "AGENTS.md"
 
-    def test_tester_writes_to_root_gemini_md(self):
+    def test_gemini_reads_root_gemini_md(self):
         # Gemini reads ./GEMINI.md, not ./.claude/GEMINI.md.
-        assert instructions.ROLE_FILES["tester"] == "GEMINI.md"
+        assert instructions.AGENT_FILES["gemini"] == "GEMINI.md"
 
 
 # ---------------------------------------------------------------------------
@@ -167,3 +167,59 @@ class TestWriteTester:
         assert body.startswith("<!-- agent_crew:begin -->")
         assert "# Gemini Project Guide" in body
         assert "Project-specific tester notes." in body
+
+
+class TestAgentSelectedProtocolFiles:
+    def test_codex_implementer_receives_push_contract_in_agents_md(self, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        path = instructions.write(
+            "implementer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="codex",
+        )
+
+        assert path == os.path.abspath(str(wt / "AGENTS.md"))
+        body = (wt / "AGENTS.md").read_text()
+        assert "## Role: implementer" in body
+        assert "git push origin HEAD:<branch-name>" in body
+
+    def test_claude_reviewer_receives_review_contract_in_claude_md(self, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+
+        path = instructions.write(
+            "reviewer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="claude",
+        )
+
+        assert path == os.path.abspath(str(wt / ".claude" / "CLAUDE.md"))
+        body = (wt / ".claude" / "CLAUDE.md").read_text()
+        assert "## Role: reviewer" in body
+        assert "git push origin HEAD:<branch-name>" not in body
+
+    def test_agent_write_removes_stale_legacy_role_protocol_file(self, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        stale = wt / ".claude" / "CLAUDE.md"
+        stale.parent.mkdir()
+        stale.write_text("## Role: implementer\nold agent_crew contract\n")
+
+        instructions.write(
+            "implementer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="codex",
+        )
+
+        assert (wt / "AGENTS.md").exists()
+        assert not stale.exists()
+
+    def test_codex_contract_preserves_developer_agents_doc(self, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        developer_doc = "# Project guide\nDo not overwrite this.\n"
+        (wt / "AGENTS.md").write_text(developer_doc)
+
+        instructions.write(
+            "implementer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="codex",
+        )
+
+        body = (wt / "AGENTS.md").read_text()
+        assert developer_doc in body
+        assert "## Role: implementer" in body

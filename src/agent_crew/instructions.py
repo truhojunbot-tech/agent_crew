@@ -4,7 +4,7 @@ from agent_crew.prompts.task_loop import build_task_loop_prompt
 from agent_crew.testing_policy import load_scope, render_scope
 from agent_crew.port_validation import require_project_port
 
-# Per-role instruction file paths inside each worktree (Issue #110 fix).
+# Per-agent instruction file paths inside each worktree (Issue #368 fix).
 #
 # The naive ".claude/<NAME>.md" layout used to keep our prompts isolated
 # from the project's own git-tracked instructions, but it only worked for
@@ -16,19 +16,28 @@ from agent_crew.port_validation import require_project_port
 # as implementer instructions and force-pushing over the implementer's
 # work (alpha_engine PRs #801–#805).
 #
-# Layout:
-#   implementer → ".claude/CLAUDE.md"   Claude Code merges with root.
-#   reviewer    → "AGENTS.md"           Codex reads this at the root.
-#   tester      → "GEMINI.md"           Gemini reads this at the root.
+# Layout is selected by the agent that reads the file, not by the role whose
+# content is rendered. A role may be assigned to any provider.
+#   claude → ".claude/CLAUDE.md"
+#   codex  → "AGENTS.md"
+#   gemini → "GEMINI.md"
 #
 # AGENTS.md / GEMINI.md may already exist in the project (developer-facing
 # guides). To avoid clobbering them, `write()` uses a marker-bracketed
 # section that gets idempotently replaced on each rewrite — see
 # `_AGENT_CREW_BLOCK_*` below.
-ROLE_FILES: dict = {
+# Legacy role paths are retained only to remove stale contracts written by
+# older setup versions. New writes must use AGENT_FILES.
+_LEGACY_ROLE_FILES: dict = {
     "implementer": ".claude/CLAUDE.md",
     "reviewer": "AGENTS.md",
     "tester": "GEMINI.md",
+}
+
+AGENT_FILES: dict = {
+    "claude": ".claude/CLAUDE.md",
+    "codex": "AGENTS.md",
+    "gemini": "GEMINI.md",
 }
 
 # Marker-bracketed block — the only region `write()` touches in
@@ -827,6 +836,40 @@ def _merge_agent_crew_block(existing: str, new_block: str) -> str:
     return existing[:begin] + bracketed + existing[end_marker_close:]
 
 
+def _remove_agent_crew_block(existing: str) -> str:
+    """Remove our marked block while retaining any developer documentation."""
+    begin = existing.find(_AGENT_CREW_BLOCK_BEGIN)
+    end = existing.find(_AGENT_CREW_BLOCK_END)
+    if begin == -1 or end == -1 or end < begin:
+        return existing
+    end_marker_close = end + len(_AGENT_CREW_BLOCK_END)
+    return (existing[:begin] + existing[end_marker_close:]).strip() + "\n"
+
+
+def _remove_stale_protocol_files(worktree_path: str, destination: str) -> None:
+    """Remove obsolete agent_crew contracts without clobbering project docs."""
+    stale_files = (set(_LEGACY_ROLE_FILES.values()) | set(AGENT_FILES.values())) - {destination}
+    for filename in stale_files:
+        path = os.path.join(worktree_path, filename)
+        if not os.path.exists(path):
+            continue
+        if filename.startswith(".claude/"):
+            # This path has always been wholly agent_crew-owned.
+            os.unlink(path)
+            continue
+        try:
+            with open(path) as f:
+                existing = f.read()
+        except OSError:
+            continue
+        remaining = _remove_agent_crew_block(existing)
+        if remaining.strip():
+            with open(path, "w") as f:
+                f.write(remaining)
+        elif _AGENT_CREW_BLOCK_BEGIN in existing:
+            os.unlink(path)
+
+
 def write(
     role: str,
     worktree_path: str,
@@ -835,12 +878,20 @@ def write(
     agent: str = "",
     delivery: str | None = None,
 ) -> str:
-    if role not in ROLE_FILES:
-        raise ValueError(f"Unknown role: {role!r}. Must be one of {list(ROLE_FILES)}")
+    if role not in _DEFAULT_AGENT_FOR_ROLE:
+        raise ValueError(
+            f"Unknown role: {role!r}. Must be one of {list(_DEFAULT_AGENT_FOR_ROLE)}"
+        )
+    resolved_agent = agent or _DEFAULT_AGENT_FOR_ROLE.get(role, role)
+    if resolved_agent not in AGENT_FILES:
+        raise ValueError(
+            f"Unknown agent {resolved_agent!r}. Must be one of {list(AGENT_FILES)}"
+        )
     with open(port_file) as f:
         port = require_project_port(int(f.read().strip()), project)
-    filename = ROLE_FILES[role]
-    new_block = generate(role, project, port, agent=agent, delivery=delivery,
+    filename = AGENT_FILES[resolved_agent]
+    _remove_stale_protocol_files(worktree_path, filename)
+    new_block = generate(role, project, port, agent=resolved_agent, delivery=delivery,
                          worktree_path=worktree_path)
     path = os.path.join(worktree_path, filename)
     parent = os.path.dirname(path)

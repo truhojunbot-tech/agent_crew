@@ -151,9 +151,9 @@ def _ensure_role_protocol(
     role: str, worktree_path: str, project: str, port_file: str, *, agent: str, port: int = 0,
 ) -> bool:
     """Ensure the role's worker contract survived worktree synchronisation (#353)."""
-    relative = instructions.ROLE_FILES.get(role)
+    relative = instructions.AGENT_FILES.get(agent)
     if not relative:
-        logger.error("dispatcher: no protocol file is defined for role=%s", role)
+        logger.error("dispatcher: no protocol file is defined for agent=%s role=%s", agent, role)
         return False
     expected = os.path.join(worktree_path, relative)
     if os.path.isfile(expected):
