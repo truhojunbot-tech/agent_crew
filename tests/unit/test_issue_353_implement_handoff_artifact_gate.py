@@ -10,6 +10,11 @@ from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
 
+#: A pane id tmux can never hand out — real ids are "%" + digits. Hardcoding
+#: a plausible one ("%1") meant the dispatcher pushed this fixture into a
+#: developer's live pane; see conftest's tmux injection guard.
+UNREACHABLE_PANE = "%crew-test-reviewer"
+
 SHA_BASE = "a" * 40
 SHA_NEW = "b" * 40
 
@@ -19,7 +24,7 @@ def _app(tmp_db, monkeypatch, artifact_ok):
 
     monkeypatch.setattr("agent_crew.server.verify_implement_artifact",
                         lambda *_args, **_kwargs: (artifact_ok, "test evidence"))
-    return TestClient(create_app(tmp_db, pane_map={"reviewer": "%1"},
+    return TestClient(create_app(tmp_db, pane_map={"reviewer": UNREACHABLE_PANE},
                                  watchdog_disabled=True, worktree_map={}))
 
 
@@ -145,7 +150,7 @@ def test_http_result_persists_the_server_derived_commit_for_audit(tmp_db, monkey
         return True, "origin branch contains derived commit"
 
     monkeypatch.setattr("agent_crew.server.verify_implement_artifact", derives)
-    with TestClient(create_app(tmp_db, pane_map={"reviewer": "%1"},
+    with TestClient(create_app(tmp_db, pane_map={"reviewer": UNREACHABLE_PANE},
                                watchdog_disabled=True, worktree_map={})) as client:
         response = client.post("/tasks/impl-derived-http/result", json={
             "task_id": "impl-derived-http", "status": "completed", "summary": "done",
