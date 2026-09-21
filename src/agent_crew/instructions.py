@@ -849,12 +849,63 @@ def _remove_agent_crew_block(existing: str) -> str:
     return (existing[:begin] + existing[end_marker_close:]).strip() + "\n"
 
 
-def _is_legacy_agent_crew_protocol(content: str) -> bool:
-    """Recognize the unmarked contract shape emitted by pre-marker setup."""
-    return "# Agent Crew — " in content and "OVERRIDE: You are an agent_crew worker" in content and "## Role: " in content
+def _has_agent_crew_markers(content: str) -> bool:
+    """Whether content contains any marker from the current ownership format.
+
+    A marked file is never a legacy file, even when its generated block has
+    the same header text as the old format.  In particular, this prevents a
+    routine rewrite from discarding developer content outside our block.
+    """
+    return _AGENT_CREW_BLOCK_BEGIN in content or _AGENT_CREW_BLOCK_END in content
 
 
-def _remove_stale_protocol_files(worktree_path: str, destination: str) -> None:
+def _normalize_protocol(content: str) -> str:
+    """Compare generated protocols without treating line-ending whitespace as data."""
+    return "\n".join(line.rstrip() for line in content.strip().splitlines())
+
+
+def _is_legacy_agent_crew_protocol(
+    content: str,
+    project: str,
+    port: int,
+    delivery: str | None,
+    worktree_path: str,
+) -> bool:
+    """Recognize only an *exact*, unmarked protocol emitted before markers.
+
+    The old protocol had no structural ownership marker.  Its phrases also
+    occur inside the current marker block and can occur in project prose, so
+    phrase matching would delete developer documentation.  We therefore only
+    claim an unmarked file when it exactly matches a generated legacy
+    protocol for one of the historical role/agent combinations.
+    """
+    if _has_agent_crew_markers(content):
+        return False
+    normalized = _normalize_protocol(content)
+    if not normalized:
+        return False
+    # ``both`` was the historical setup default; the remaining variants make
+    # cleanup work when a project was set up with a delivery override.
+    deliveries = (delivery, "both", "dispatcher", "mcp")
+    for candidate_delivery in dict.fromkeys(deliveries):
+        for role in _DEFAULT_AGENT_FOR_ROLE:
+            for agent in AGENT_FILES:
+                generated = generate(
+                    role, project, port, agent=agent,
+                    delivery=candidate_delivery, worktree_path=worktree_path,
+                )
+                if normalized == _normalize_protocol(generated):
+                    return True
+    return False
+
+
+def _remove_stale_protocol_files(
+    worktree_path: str,
+    destination: str,
+    project: str,
+    port: int,
+    delivery: str | None,
+) -> None:
     """Remove obsolete agent_crew contracts without clobbering project docs."""
     stale_files = (set(_LEGACY_ROLE_FILES.values()) | set(AGENT_FILES.values())) - {destination}
     for filename in stale_files:
@@ -867,7 +918,9 @@ def _remove_stale_protocol_files(worktree_path: str, destination: str) -> None:
         except OSError:
             continue
         remaining = _remove_agent_crew_block(existing)
-        if remaining == existing and _is_legacy_agent_crew_protocol(existing):
+        if remaining == existing and _is_legacy_agent_crew_protocol(
+            existing, project, port, delivery, worktree_path,
+        ):
             os.unlink(path)
             continue
         if remaining == existing:
@@ -899,7 +952,7 @@ def write(
     with open(port_file) as f:
         port = require_project_port(int(f.read().strip()), project)
     filename = AGENT_FILES[resolved_agent]
-    _remove_stale_protocol_files(worktree_path, filename)
+    _remove_stale_protocol_files(worktree_path, filename, project, port, delivery)
     new_block = generate(role, project, port, agent=resolved_agent, delivery=delivery,
                          worktree_path=worktree_path)
     path = os.path.join(worktree_path, filename)
@@ -914,7 +967,7 @@ def write(
                 existing = f.read()
         except OSError:
             existing = ""
-    if _is_legacy_agent_crew_protocol(existing):
+    if _is_legacy_agent_crew_protocol(existing, project, port, delivery, worktree_path):
         existing = ""
     content = _merge_agent_crew_block(existing, new_block)
 

@@ -71,6 +71,8 @@ class TestWriteImplementer:
         assert "OLD CONTENT" not in body
         # task-loop prompt + agent_crew block are present
         assert "You are claude" in body
+        assert "## Role: implementer" in body
+        assert "## Role: reviewer" not in body
 
 
 class TestWriteReviewer:
@@ -169,6 +171,64 @@ class TestWriteTester:
 
 
 class TestAgentSelectedProtocolFiles:
+    def test_rewrite_twice_preserves_developer_content_outside_markers(self, tmp_path):
+        """A normal post-task rewrite must not eat project documentation."""
+        developer_doc = "# Project guide\nMINE: project-specific rule\n"
+        # Each provider's own filename is rewritten after a dispatcher task.
+        for role, agent, filename in (
+            ("reviewer", "claude", ".claude/CLAUDE.md"),
+            ("implementer", "codex", "AGENTS.md"),
+            ("tester", "gemini", "GEMINI.md"),
+        ):
+            wt = tmp_path / agent
+            wt.mkdir()
+            target = wt / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(developer_doc)
+
+            for _ in range(2):
+                instructions.write(
+                    role, str(wt), project="proj", port_file=_write_port(tmp_path), agent=agent,
+                )
+
+            body = target.read_text()
+            assert developer_doc in body
+            assert body.count("<!-- agent_crew:begin -->") == 1
+
+    def test_developer_doc_quoting_legacy_signals_is_not_replaced(self, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        developer_doc = (
+            "# Team notes\n"
+            "We quote '# Agent Crew — example' in this document.\n"
+            "OVERRIDE: You are an agent_crew worker is a quoted policy line.\n"
+            "## Role: documentation\n"
+        )
+        target = wt / "AGENTS.md"
+        target.write_text(developer_doc)
+
+        instructions.write(
+            "implementer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="codex",
+        )
+
+        assert developer_doc in target.read_text()
+
+    def test_lightly_edited_legacy_contract_is_preserved_as_developer_content(self, tmp_path):
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        target = wt / ".claude" / "CLAUDE.md"
+        target.parent.mkdir()
+        developer_rule = "\n## My extra rule\nNever touch production.\n"
+        target.write_text(
+            instructions.generate("implementer", "proj", 9123, agent="claude") + developer_rule
+        )
+
+        instructions.write(
+            "reviewer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="claude",
+        )
+
+        assert developer_rule in target.read_text()
+
     def test_developer_claude_doc_survives_stale_cleanup(self, tmp_path):
         wt = tmp_path / "wt"
         wt.mkdir()
