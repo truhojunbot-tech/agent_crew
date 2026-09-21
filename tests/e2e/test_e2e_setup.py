@@ -22,6 +22,7 @@ import pytest
 from click.testing import CliRunner
 
 from agent_crew.cli import crew
+from agent_crew.role_mapping import effective_role_mapping
 
 
 pytestmark = pytest.mark.e2e
@@ -91,6 +92,13 @@ def test_e_st01_setup_creates_artifacts(monkeypatch, git_repo, base_dir, e2e_pro
     assert "Setup complete" in result.output
 
     state = _read_state(base_dir, "testproj")
+
+    # #368: setup persists its chosen mapping; a later reader must never infer
+    # provider roles from a legacy list alone.
+    assert effective_role_mapping(state, project="testproj") == (
+        {"implementer": "codex", "reviewer": "claude", "tester": "gemini"},
+        "explicit project config",
+    )
 
     # port file written
     port_file = os.path.join(base_dir, "testproj", "port")

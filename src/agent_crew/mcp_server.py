@@ -46,18 +46,17 @@ from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import PausedError as _PausedError, TaskQueue
+from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
 logger = logging.getLogger(__name__)
 
 # Default role per agent. The MCP `get_next_task(agent=...)` flow falls
 # back to this when no explicit ``role`` is passed, so each agent picks up
 # tasks of its primary type unless an override redirects work elsewhere.
-# Stays in lockstep with `setup._AGENT_TO_ROLE`; kept here so this module
-# stays free of `setup` import overhead.
+# Derived from the one canonical policy rather than copied: MCP pull and setup
+# must never assign a provider different primary roles.
 _DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
-    "claude": "implementer",
-    "codex": "reviewer",
-    "gemini": "tester",
+    agent: role for role, agent in DEFAULT_ROLE_TO_AGENT.items()
 }
 
 

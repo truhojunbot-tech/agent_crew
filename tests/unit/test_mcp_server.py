@@ -94,10 +94,10 @@ class TestGetNextTask:
 
     def test_default_agent_role_resolved_when_role_omitted(self, tmp_db):
         """Calling get_next_task with only an agent name must resolve the
-        agent's default role (claude→implementer)."""
+        agent's default role (codex→implementer)."""
         TaskQueue(tmp_db).enqueue(_make_task("t-impl", task_type="implement"))
         mcp = build_mcp_server(tmp_db)
-        result = _call_tool(mcp, "get_next_task", agent="claude")
+        result = _call_tool(mcp, "get_next_task", agent="codex")
         assert result is not None
         assert result["task_id"] == "t-impl"
 
@@ -116,7 +116,7 @@ class TestGetNextTask:
 
     def test_override_for_other_agent_blocks_pickup(self, tmp_db):
         """A review task with agent_override="claude" must NOT be picked
-        up by codex even though codex is the default reviewer."""
+        up by codex even though codex is polling for its default work."""
         q = TaskQueue(tmp_db)
         task = _make_task("t-rev-fallback", task_type="review")
         task.context = {"agent_override": "claude"}

@@ -14,11 +14,12 @@ from agent_crew import setup as setup_module
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT,
     effective_role_mapping,
+    role_mapping_drift,
     validate_explicit_role_agents,
 )
 
 _DEFAULT_BASE = os.path.expanduser("~/.agent_crew")
-_DEFAULT_AGENTS = "claude,codex,gemini"
+_DEFAULT_AGENTS = "codex,claude,gemini"
 
 
 def _proj_dir(base: str, project: str) -> str:
@@ -681,7 +682,7 @@ def setup(project: str, agents: str, base: str):
 
     Examples:
 
-      crew setup myproj                        # default: claude,codex,gemini
+      crew setup myproj                        # default: codex,claude,gemini
 
       crew setup myproj --agents codex         # single-agent task
 
@@ -797,6 +798,8 @@ def setup(project: str, agents: str, base: str):
             _r = setup_module._AGENT_TO_ROLE.get(_a, "implementer")
             if _a in worktrees:
                 roles_meta.append({"role": _r, "agent": _a, "worktree": worktrees[_a]})
+    role_agents = dict(DEFAULT_ROLE_TO_AGENT)
+    role_agents.update({entry["role"]: entry["agent"] for entry in roles_meta})
 
     # Port + port file — reuse existing when server is already running
     port_file = os.path.join(proj_dir, "port")
@@ -964,7 +967,7 @@ def setup(project: str, agents: str, base: str):
         context_pack_enabled = os.environ["AGENT_CREW_CONTEXT_PACK"].strip().lower() in (
             "1", "true", "yes", "on",
         )
-    _write_state(base, project, {
+    state_to_write = {
         "project": project,
         "port": port,
         "port_file": port_file,
@@ -982,7 +985,15 @@ def setup(project: str, agents: str, base: str):
         "dispatcher_mode": _dispatcher_mode,
         "tokenomics_policy_path": policy_path,
         "context_pack_enabled": context_pack_enabled,
-    })
+    }
+    # #368: new projects record the policy they were created with.  Re-running
+    # setup for an existing project must not silently migrate an old legacy
+    # state or mask the drift status is meant to expose.
+    if existing_state is None:
+        state_to_write["role_agents"] = role_agents
+    elif "role_agents" in existing_state:
+        state_to_write["role_agents"] = existing_state["role_agents"]
+    _write_state(base, project, state_to_write)
 
     # Start server — skip if reusing existing server (pane-only recreation path).
     if not _reuse_server:
@@ -1291,6 +1302,18 @@ def status(project: str, base: str, preview: int):
     db_file = state.get("db", "")
     click.echo(f"Project: {project}")
     click.echo(f"Port: {port}")
+    role_mapping, role_source, role_issues = role_mapping_drift(state, project=project)
+    click.echo(
+        "Role mapping "
+        f"({role_source}): "
+        + ", ".join(f"{role}={role_mapping[role]}" for role in DEFAULT_ROLE_TO_AGENT)
+    )
+    if role_issues:
+        click.echo("ROLE MAPPING: FAIL")
+        for issue in role_issues:
+            click.echo(f"  - {issue}")
+    else:
+        click.echo("Role mapping: OK (canonical)")
     try:
         from agent_crew import pause as _pausemod
         _pstate = _pausemod.pause_state(os.path.join(base, project))
