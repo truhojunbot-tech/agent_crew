@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import shutil
 import signal
@@ -19,6 +20,7 @@ from agent_crew.role_mapping import (
 
 _DEFAULT_BASE = os.path.expanduser("~/.agent_crew")
 _DEFAULT_AGENTS = "claude,codex,gemini"
+logger = logging.getLogger(__name__)
 
 
 def _proj_dir(base: str, project: str) -> str:
@@ -86,10 +88,19 @@ def _read_state(base: str, project: str) -> dict | None:
     if not os.path.exists(path):
         return None
     with open(path) as f:
-        return json.load(f)
+        state = json.load(f)
+    try:
+        if "port" in state:
+            setup_module.require_project_port(state["port"], project)
+    except ValueError as exc:
+        logger.warning("Ignoring corrupt state for project %r: %s", project, exc)
+        return None
+    return state
 
 
 def _write_state(base: str, project: str, state: dict) -> None:
+    if "port" in state:
+        setup_module.require_project_port(state["port"], project)
     os.makedirs(_proj_dir(base, project), exist_ok=True)
     with open(_state_path(base, project), "w") as f:
         json.dump(state, f, indent=2)
@@ -805,7 +816,7 @@ def setup(project: str, agents: str, base: str):
         server_pid = existing_state["server_pid"]
     else:
         port = setup_module.find_free_port()
-        setup_module.write_port_file(port_file, port)
+        setup_module.write_port_file(port_file, port, project=project)
 
     # Instruction files (into each worktree)
     setup_module.write_instruction_files(worktrees, project, port_file, roles=roles_meta)

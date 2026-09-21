@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
+from agent_crew.port_validation import require_project_port
 from agent_crew import claude_transcript as _claude_transcript
 from agent_crew.anomaly import check_wrong_repo
 from agent_crew import context_pack as _cpack
@@ -123,6 +124,7 @@ def _ensure_role_protocol(
         # self-contained: regenerating a protocol needs a port file, and the
         # server already owns the authoritative bound port.
         if not os.path.exists(port_file):
+            require_project_port(port, project)
             with open(port_file, "w") as f:
                 f.write(f"{port}\n")
         created = instructions.write(
