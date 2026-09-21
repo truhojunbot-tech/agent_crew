@@ -437,24 +437,26 @@ def _no_tmux_injection(request, tmux_injections, monkeypatch):
     Guarded at the subprocess boundary, below every import alias, for the same
     reason the gh guard sits there — a test cannot capture it early.
 
-    Unit tests fail loudly for *every* tmux subprocess invocation. E2E tests
-    retain their explicitly-created isolated tmux session fixture.
+    Pane writes are recorded and answered with fake success. This preserves
+    assertions about dispatch attempts while making every test scope incapable
+    of reaching the real tmux server; broad production exception handlers
+    cannot swallow this containment boundary.
     """
-    if "/tests/unit/" not in str(request.fspath):
+    if "allow_tmux_injection" in request.keywords:
         yield
         return
 
     real_run = subprocess.run
 
     def guarded_run(argv, *args, **kwargs):
-        try:
-            is_tmux = bool(argv) and os.path.basename(str(argv[0])) == "tmux"
-        except (TypeError, IndexError):
-            is_tmux = False
-        if not is_tmux:
+        if not _tmux_injection_argv(argv):
             return real_run(argv, *args, **kwargs)
         tmux_injections.append(tuple(str(a) for a in argv))
-        raise AssertionError("unit test attempted real tmux invocation: " + " ".join(map(str, argv)))
+        class _R:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return _R()
 
     monkeypatch.setattr(subprocess, "run", guarded_run)
     yield
