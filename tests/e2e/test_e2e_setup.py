@@ -142,15 +142,16 @@ def test_e_st03_teardown_cleans_up(monkeypatch, git_repo, base_dir, e2e_project)
     monkeypatch.chdir(git_repo)
     runner = CliRunner()
 
-    runner.invoke(crew, ["setup", "testproj", "--agents", "gemini", "--base", base_dir])
+    runner.invoke(crew, ["setup", "testproj", "--agents", "claude", "--base", base_dir])
     e2e_project(base_dir, "testproj")
     state = _read_state(base_dir, "testproj")
-    wt_path = state["worktrees"]["gemini"]
+    wt_path = state["worktrees"]["claude"]
     port_file = state["port_file"]
     agent_pane_id = state["pane_ids"][0]
     # These are real setup output, deliberately left in place for teardown.
-    assert os.path.exists(os.path.join(wt_path, "GEMINI.md"))
-    assert os.path.exists(os.path.join(wt_path, ".gemini", "settings.json"))
+    assert os.path.exists(os.path.join(wt_path, ".claude", "CLAUDE.md"))
+    assert os.path.exists(os.path.join(wt_path, ".mcp.json"))
+    assert os.path.exists(os.path.join(wt_path, ".telegram", ".env"))
 
     result = runner.invoke(crew, ["teardown", "testproj", "--base", base_dir])
 

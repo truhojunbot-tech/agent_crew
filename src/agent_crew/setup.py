@@ -12,6 +12,17 @@ _logger = logging.getLogger(__name__)
 from agent_crew import instructions, session
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
+# The complete set of disposable per-worktree files written by setup.  Teardown
+# and worktree-sync consume this source rather than recreating partial lists.
+GENERATED_WORKTREE_FILES = frozenset({
+    *instructions.ROLE_FILES.values(),
+    ".mcp.json",
+    ".gemini/settings.json",
+    ".codex_local/auth.json",
+    ".codex_local/config.toml",
+    ".telegram/.env",
+})
+
 _AGENT_CMDS = {
     "claude": "claude --dangerously-skip-permissions --continue --model claude-sonnet-5",
     "codex": "codex --dangerously-bypass-approvals-and-sandbox",

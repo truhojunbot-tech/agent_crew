@@ -688,9 +688,7 @@ def _worktree_owner_repo(worktree: str) -> tuple[str | None, str]:
 
 def _generated_worktree_files() -> set[str]:
     """Return exactly the untracked protocol files setup creates per worktree."""
-    # ROLE_FILES is the source of truth for role instructions.  The two MCP
-    # configuration writers in setup.py create the remaining entries.
-    return set(ROLE_FILES.values()) | {".gemini/settings.json", ".mcp.json"}
+    return set(setup_module.GENERATED_WORKTREE_FILES)
 
 
 def _user_worktree_status(porcelain: str) -> str:
@@ -742,6 +740,20 @@ def _remove_untracked_generated_worktree_files(worktree: str) -> str | None:
         if not line.startswith("?? ") or line[3:] not in generated:
             continue
         path = os.path.join(worktree, line[3:])
+        if line[3:] in {"AGENTS.md", "GEMINI.md"}:
+            try:
+                with open(path) as generated_file:
+                    content = generated_file.read()
+            except OSError as exc:
+                return f"could not inspect generated-looking file {path!r}: {exc}"
+            begin = "<!-- agent_crew:begin -->"
+            end = "<!-- agent_crew:end -->"
+            if begin not in content or end not in content:
+                return f"{path!r} is not solely an agent_crew protocol and was preserved"
+            before, remainder = content.split(begin, 1)
+            _owned, after = remainder.split(end, 1)
+            if before.strip() or after.strip():
+                return f"{path!r} contains developer content outside the agent_crew block and was preserved"
         try:
             os.unlink(path)
         except OSError as exc:
