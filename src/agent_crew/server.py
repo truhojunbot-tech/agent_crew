@@ -2460,8 +2460,6 @@ def create_app(
     def q() -> TaskQueue:
         return state["queue"]
 
-    _owned_pane_ids = _recorded_pane_ids(state_path, pane_map)
-
     def _guard_task_existence(task_id: str, target: str) -> bool:
         """Refuse a task block whose DB row is missing or terminal."""
         task_status = q().get_task_status(task_id)
@@ -2484,14 +2482,18 @@ def create_app(
                 "refusing tmux dispatch task_id=%s target=%s reason=pane_target_unresolvable",
                 task_id, target,
             )
-            q().requeue(task_id)
+            _fail_if_active(task_id, "pane_target_unresolvable")
             return ""
-        if pane_id not in _owned_pane_ids:
+        # Pane ownership changes on `crew recover` and pane-map reload.  Read
+        # the durable state at the boundary, rather than freezing startup's
+        # pane IDs and permanently refusing a legitimate replacement pane.
+        owned_pane_ids = _recorded_pane_ids(state_path, pane_map)
+        if pane_id not in owned_pane_ids:
             logger.warning(
                 "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=pane_not_owned",
                 task_id, target, pane_id,
             )
-            q().requeue(task_id)
+            _fail_if_active(task_id, "pane_not_owned")
             return ""
         if not _pane_alive_for_push(pane_id):
             logger.warning(
@@ -2650,7 +2652,7 @@ def create_app(
 
         # #151: if target pane shows a usage-limit message, immediately reroute
         # via fallback rather than pushing into a blocked agent.
-        if _pane_has_usage_limit(pane_id):
+        if _pane_has_usage_limit(guarded_pane_id):
             blocked_agent = next(
                 (k for k, v in (pane_map or {}).items() if v == pane_id and k in ("claude", "codex", "gemini")),
                 None,
@@ -2685,7 +2687,7 @@ def create_app(
 
         # #158: if pane shows a bare shell prompt (agent CLI crashed), requeue
         # the task instead of pushing bash commands into it.
-        if _pane_has_bash_prompt(pane_id):
+        if _pane_has_bash_prompt(guarded_pane_id):
             logger.warning(
                 f"_try_push_next: pane {pane_id} shows bare shell prompt — "
                 f"agent CLI appears crashed. Requeuing task {task.task_id}."
@@ -2708,7 +2710,7 @@ def create_app(
         #   configuration. The measurement must not depend on whether prep ran.
         _tok_wt = _agent_worktree(worktree_map, _target_agent, role,
                                   role_to_agent=_DISPATCH_ROLE_TO_AGENT)
-        tok, _tok_source = _context_token_count(pane_id, _tok_wt,
+        tok, _tok_source = _context_token_count(guarded_pane_id, _tok_wt,
                                                 agent=_target_agent)
         if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
             logger.info(
@@ -2716,7 +2718,7 @@ def create_app(
                 f"(>= {_TOKEN_CLEAR_THRESHOLD}) — sending /clear before push"
             )
             _sent = _pane_clear_context(
-                pane_id, task_id=task.task_id, project=task.project or "",
+                guarded_pane_id, task_id=task.task_id, project=task.project or "",
                 role=role, agent=_target_agent, worktree_path=_tok_wt,
                 context_tokens=tok, token_source=_tok_source,
                 threshold=_TOKEN_CLEAR_THRESHOLD,
@@ -2746,7 +2748,7 @@ def create_app(
                 f"unguarded until something can measure it (#292)."
             )
         # #134: auto-dismiss gemini permission prompt if present.
-        _pane_dismiss_permission_prompt(pane_id)
+        _pane_dismiss_permission_prompt(guarded_pane_id)
         # The row can change while preparing context; do not hand a terminal
         # or deleted task block to an otherwise healthy owned pane.
         if not _guard_task_existence(task.task_id, guarded_pane_id):
@@ -2818,7 +2820,7 @@ def create_app(
         # context, which is why #260 added a guard here at all.
         _discuss_wt = _agent_worktree(worktree_map, agent,
                                       role_to_agent=_DISPATCH_ROLE_TO_AGENT)
-        tok, _tok_source = _context_token_count(pane_id, _discuss_wt, agent=agent)
+        tok, _tok_source = _context_token_count(guarded_pane_id, _discuss_wt, agent=agent)
         if _push_enabled and _should_clear_context(tok, threshold=_TOKEN_CLEAR_THRESHOLD):
             logger.info(
                 f"_try_push_discuss: pane {pane_id} has {tok} tokens via "
@@ -2826,7 +2828,7 @@ def create_app(
                 f"before push"
             )
             _sent = _pane_clear_context(
-                pane_id, task_id=task.task_id, project=task.project or "",
+                guarded_pane_id, task_id=task.task_id, project=task.project or "",
                 role=_agent_role(agent, _DISPATCH_ROLE_TO_AGENT), agent=agent,
                 worktree_path=_discuss_wt, context_tokens=tok,
                 token_source=_tok_source, threshold=_TOKEN_CLEAR_THRESHOLD,
@@ -2890,6 +2892,13 @@ def create_app(
             pane_id = _resolve_pane_for_row(row)
             if not pane_id:
                 continue
+            # Every watchdog tmux interaction, including permission dismissal
+            # and timeout Ctrl+C, must use the same live ownership boundary as
+            # task delivery. Never inspect or interrupt a foreign pane.
+            guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+            if not guarded_pane_id:
+                continue
+            pane_id = guarded_pane_id
             try:
                 # #134: dismiss gemini permission prompt before busy-check so
                 # the prompt doesn't freeze the pane and appear as idle.

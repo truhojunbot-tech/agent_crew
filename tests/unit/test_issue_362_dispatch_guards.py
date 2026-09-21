@@ -65,6 +65,8 @@ def test_push_refuses_pane_not_owned_by_project(tmp_db, project_state, caplog):
     assert response.status_code == 201
     assert push.calls == []
     assert "pane_not_owned" in caplog.text
+    assert next(row["status"] for row in TaskQueue(tmp_db).list_all_with_status()
+                if row["task_id"] == "guarded") == "failed"
 
 
 def test_push_resolves_named_target_before_ownership_check(tmp_db, project_state, monkeypatch, caplog):
@@ -113,3 +115,23 @@ def test_push_delivers_existing_task_to_live_owned_pane(tmp_db, project_state):
     assert response.status_code == 201
     assert len(push.calls) == 1
     assert push.calls[0][0] == "%101"
+
+
+def test_guard_reads_current_pane_ids_after_state_changes(tmp_db, project_state, monkeypatch):
+    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda _pane: True)
+    app = create_app(tmp_db, pane_map={"implementer": "%101"}, state_path=str(project_state),
+                     port=8100, push_fn=RecordingPush(), watchdog_disabled=True, anomaly_disabled=True)
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="rotated", task_type="implement", description="work"))
+    project_state.write_text(json.dumps({"project": "owned", "pane_ids": ["%202"]}))
+    with TestClient(app) as client:
+        result = client.app.state.guard_tmx_push("rotated", "%202")
+    assert result == "%202"
+
+
+def test_named_target_uses_tmux_canonical_pane_id(monkeypatch):
+    from types import SimpleNamespace
+    from agent_crew.server import _resolve_tmux_pane_target
+    monkeypatch.setattr("agent_crew.server.subprocess.run",
+                        lambda *_args, **_kwargs: SimpleNamespace(returncode=0, stdout="%4242\n"))
+    assert _resolve_tmux_pane_target("owned:0.1") == "%4242"
