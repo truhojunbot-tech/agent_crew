@@ -82,17 +82,17 @@ class TestAgentLiveness:
         """★The canonical crash signature from #195 — the CLI exited and the
         pane fell back to its shell."""
         with patch("agent_crew.cli.subprocess.run", return_value=_cmd(shell)):
-            assert agent_liveness("%1") == "dead"
+            assert agent_liveness("%91") == "dead"
 
     @pytest.mark.parametrize("proc", ["claude", "node", "codex", "agy", "python3"])
     def test_agent_process_means_quiet_not_dead(self, proc):
         with patch("agent_crew.cli.subprocess.run", return_value=_cmd(proc)):
-            assert agent_liveness("%1") == "alive"
+            assert agent_liveness("%91") == "alive"
 
     def test_tmux_failure_is_unknown_not_a_verdict(self):
         with patch("agent_crew.cli.subprocess.run",
                    return_value=_cmd("", returncode=1)):
-            assert agent_liveness("%1") == "unknown"
+            assert agent_liveness("%91") == "unknown"
 
     def test_empty_pane_target_is_unknown(self):
         assert agent_liveness("") == "unknown"
@@ -101,7 +101,7 @@ class TestAgentLiveness:
         """⛔Conservative: something we do not recognise is more likely a
         wrapper than a corpse, and guessing 'dead' destroys real work."""
         with patch("agent_crew.cli.subprocess.run", return_value=_cmd("uv")):
-            assert agent_liveness("%1") == "alive"
+            assert agent_liveness("%91") == "alive"
 
 
 # ── 3. the policy that consumes the two above ─────────────────────────
@@ -142,12 +142,12 @@ class TestComposition:
 
         # And even past the window, a live agent is not failed.
         with patch("agent_crew.cli.subprocess.run", return_value=_cmd("claude")):
-            assert should_auto_fail_idle(agent_liveness("%1")) is False
+            assert should_auto_fail_idle(agent_liveness("%91")) is False
 
     def test_crashed_agent_is_still_reaped(self):
         """⛔The fix must not make genuine crashes invisible."""
         with patch("agent_crew.cli.subprocess.run", return_value=_cmd("bash")):
-            assert should_auto_fail_idle(agent_liveness("%1")) is True
+            assert should_auto_fail_idle(agent_liveness("%91")) is True
 
 
 # ── 5. server-side watchdog: extend for a live agent, don't disable ───
@@ -283,7 +283,7 @@ _PROBE_FAILURES = [
 def test_liveness_never_raises_whatever_the_probe_does(exc):
     """★The policy the docstring promised and the code did not keep."""
     with patch("agent_crew.cli.subprocess.run", side_effect=exc):
-        assert agent_liveness("%1") == "unknown"
+        assert agent_liveness("%91") == "unknown"
 
 
 @pytest.mark.parametrize("exc", _PROBE_FAILURES, ids=lambda e: type(e).__name__)
@@ -291,7 +291,7 @@ def test_pane_current_command_absorbs_probe_failures(exc):
     """Its docstring says "empty string if the pane is gone" — make it true
     for a tmux that is missing or wedged, not just one that exits non-zero."""
     with patch("agent_crew.cli.subprocess.run", side_effect=exc):
-        assert _pane_current_command("%1") == ""
+        assert _pane_current_command("%91") == ""
 
 
 @pytest.mark.parametrize("exc", _PROBE_FAILURES, ids=lambda e: type(e).__name__)
@@ -299,7 +299,7 @@ def test_capture_pane_absorbs_probe_failures(exc):
     """⛔Same defect one line earlier on the same `_wait` path: `_pane_changed`
     calls this every poll, so an escape here is equally fatal."""
     with patch("agent_crew.cli.subprocess.run", side_effect=exc):
-        assert _capture_pane("%1") is None
+        assert _capture_pane("%91") is None
 
 
 @pytest.mark.parametrize("exc", _PROBE_FAILURES, ids=lambda e: type(e).__name__)
@@ -307,7 +307,7 @@ def test_pane_changed_stays_inconclusive_on_probe_failure(exc):
     """A broken probe must read as "no change", never as an exception."""
     _reset_pane_content_cache()
     with patch("agent_crew.cli.subprocess.run", side_effect=exc):
-        assert _pane_changed("%1") is False
+        assert _pane_changed("%91") is False
 
 
 def test_probes_pass_a_bounded_timeout():
@@ -320,8 +320,8 @@ def test_probes_pass_a_bounded_timeout():
         return MagicMock(returncode=0, stdout="claude\n")
 
     with patch("agent_crew.cli.subprocess.run", side_effect=_record):
-        _pane_current_command("%1")
-        _capture_pane("%1")
+        _pane_current_command("%91")
+        _capture_pane("%91")
 
     assert seen and all(t == PANE_PROBE_TIMEOUT_S for t in seen), seen
     assert 0 < PANE_PROBE_TIMEOUT_S <= 10, "probe timeout must be short"
@@ -332,4 +332,4 @@ def test_unknown_still_auto_fails_so_the_queue_is_cleaned_up():
     behind a broken tmux still has to release the queue slot."""
     with patch("agent_crew.cli.subprocess.run",
                side_effect=FileNotFoundError("tmux")):
-        assert should_auto_fail_idle(agent_liveness("%1")) is True
+        assert should_auto_fail_idle(agent_liveness("%91")) is True

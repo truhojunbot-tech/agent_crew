@@ -229,7 +229,7 @@ def _server(tmp_db, push):
     from agent_crew.server import create_app
 
     return create_app(db_path=tmp_db,
-                      pane_map={"implementer": "%1", "reviewer": "%2", "tester": "%3"},
+                      pane_map={"implementer": "%91", "reviewer": "%92", "tester": "%93"},
                       port=8105, push_fn=push, watchdog_disabled=True,
                       anomaly_disabled=True)
 
@@ -282,7 +282,7 @@ def test_merge_during_an_in_flight_review_creates_no_follow_up(tmp_db, monkeypat
     q = TaskQueue(tmp_db)
     assert not [t for t in q.list_tasks() if t.task_type == "implement"], \
         "a fix task was spawned for a merged PR"
-    assert not [p for p, _ in push.calls if p == "%1"], \
+    assert not [p for p, _ in push.calls if p == "%91"], \
         "work was pushed to an agent for a merged PR"
 
 

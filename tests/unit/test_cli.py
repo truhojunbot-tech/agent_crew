@@ -80,19 +80,19 @@ def test_u_c08_pane_looks_idle_active():
 def test_u_c09_capture_pane_success():
     mock_result = MagicMock(returncode=0, stdout="line1\nline2\n$ ")
     with patch("agent_crew.cli.subprocess.run", return_value=mock_result) as mock_run:
-        output = _capture_pane("%42")
+        output = _capture_pane("%942")
     assert output == "line1\nline2\n$ "
     args = mock_run.call_args[0][0]
     assert "tmux" in args
     assert "capture-pane" in args
-    assert "%42" in args
+    assert "%942" in args
 
 
 # U-C10: _capture_pane — tmux not available
 def test_u_c10_capture_pane_failure():
     mock_result = MagicMock(returncode=1, stdout="")
     with patch("agent_crew.cli.subprocess.run", return_value=mock_result):
-        output = _capture_pane("%42")
+        output = _capture_pane("%942")
     assert output is None
 
 
@@ -184,8 +184,8 @@ def test_u_c18_discuss_rejects_unknown_agents_in_project_mode(tmp_path):
         "agents": ["claude", "codex"],
         "db": db_file,
         "pane_map": {
-            "implementer": "%1", "claude": "%1",
-            "reviewer": "%2", "codex": "%2",
+            "implementer": "%91", "claude": "%91",
+            "reviewer": "%92", "codex": "%92",
         },
     }
     (proj_dir / "state.json").write_text(json.dumps(state))
@@ -245,10 +245,10 @@ def test_u_c20_recover_all_panes_alive_noop(tmp_path):
         "session": "crew_rcproj",
         "window": "0",
         "agents": ["claude", "codex"],
-        "pane_ids": ["%1", "%2"],
+        "pane_ids": ["%91", "%92"],
         "pane_map": {
-            "claude": "%1", "codex": "%2",
-            "implementer": "%1", "reviewer": "%2",
+            "claude": "%91", "codex": "%92",
+            "implementer": "%91", "reviewer": "%92",
         },
         "worktrees": {"claude": "/tmp/wt/claude", "codex": "/tmp/wt/codex"},
         "db": str(proj_dir / "tasks.db"),
@@ -291,10 +291,10 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
         "session": "crew_rcproj",
         "window": "0",
         "agents": ["claude", "codex"],
-        "pane_ids": ["%1", "%2"],
+        "pane_ids": ["%91", "%92"],
         "pane_map": {
-            "claude": "%1", "codex": "%2",
-            "implementer": "%1", "reviewer": "%2",
+            "claude": "%91", "codex": "%92",
+            "implementer": "%91", "reviewer": "%92",
         },
         "worktrees": {"claude": "/tmp/wt/claude", "codex": "/tmp/wt/codex"},
         "db": str(proj_dir / "tasks.db"),
@@ -303,13 +303,13 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
     (proj_dir / "state.json").write_text(json.dumps(state))
 
     def _fake_pane_alive(pane_id):
-        return pane_id == "%1"
+        return pane_id == "%91"
 
     def _fake_run(args, **_kw):
         if "list-windows" in args:
             return MagicMock(returncode=0, stdout="0", stderr="")
         if "split-window" in args:
-            return MagicMock(returncode=0, stdout="%9\n", stderr="")
+            return MagicMock(returncode=0, stdout="%99\n", stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
 
     runner = CliRunner()
@@ -330,13 +330,13 @@ def test_u_c21_recover_recreates_only_dead_panes(tmp_path):
     pos = mock_start.call_args[0]
     kw = mock_start.call_args[1]
     assert pos[1] == ["codex"]
-    assert kw.get("pane_targets") == ["%9"]
+    assert kw.get("pane_targets") == ["%99"]
 
     new_state = json.loads((proj_dir / "state.json").read_text())
-    assert new_state["pane_ids"] == ["%1", "%9"]
-    assert new_state["pane_map"]["codex"] == "%9"
-    assert new_state["pane_map"]["reviewer"] == "%9"
-    assert new_state["pane_map"]["claude"] == "%1"
+    assert new_state["pane_ids"] == ["%91", "%99"]
+    assert new_state["pane_map"]["codex"] == "%99"
+    assert new_state["pane_map"]["reviewer"] == "%99"
+    assert new_state["pane_map"]["claude"] == "%91"
     assert "pane" in result.output.lower()
 
 
@@ -351,10 +351,10 @@ def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
         "session": "crew_rcproj",
         "window": "0",
         "agents": ["claude", "codex"],
-        "pane_ids": ["%1", "%2"],
+        "pane_ids": ["%91", "%92"],
         "pane_map": {
-            "claude": "%1", "codex": "%2",
-            "implementer": "%1", "reviewer": "%2",
+            "claude": "%91", "codex": "%92",
+            "implementer": "%91", "reviewer": "%92",
         },
         "worktrees": {"claude": "/tmp/wt/claude", "codex": "/tmp/wt/codex"},
         "db": str(proj_dir / "tasks.db"),
@@ -362,7 +362,7 @@ def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
     }
     (proj_dir / "state.json").write_text(json.dumps(state))
 
-    fresh_ids = iter(["%7\n", "%8\n"])
+    fresh_ids = iter(["%97\n", "%98\n"])
 
     def _fake_run(args, **_kw):
         if "list-windows" in args:
@@ -389,12 +389,12 @@ def test_u_c22_recover_all_panes_dead_recreates_all(tmp_path):
     pos = mock_start.call_args[0]
     kw = mock_start.call_args[1]
     assert pos[1] == ["claude", "codex"]
-    assert kw.get("pane_targets") == ["%7", "%8"]
+    assert kw.get("pane_targets") == ["%97", "%98"]
 
     new_state = json.loads((proj_dir / "state.json").read_text())
-    assert new_state["pane_ids"] == ["%7", "%8"]
-    assert new_state["pane_map"]["claude"] == "%7"
-    assert new_state["pane_map"]["codex"] == "%8"
+    assert new_state["pane_ids"] == ["%97", "%98"]
+    assert new_state["pane_map"]["claude"] == "%97"
+    assert new_state["pane_map"]["codex"] == "%98"
 
 
 # U-C15: teardown runs git worktree prune after removing worktrees
@@ -591,7 +591,7 @@ def test_u_c40_run_exits_on_dead_pane(tmp_path):
         "db": db_file,
         "session": "crew_test_proj",
         "agents": ["claude", "codex"],
-        "pane_ids": ["%10", "%20"],
+        "pane_ids": ["%910", "%920"],
     }
     (tmp_path / "test_proj").mkdir()
     (tmp_path / "test_proj" / "state.json").write_text(json.dumps(state))
@@ -622,7 +622,7 @@ def test_u_c41_run_proceeds_when_all_panes_alive(tmp_path):
         "db": db_file,
         "session": "crew_test_proj2",
         "agents": ["claude"],
-        "pane_ids": ["%10"],
+        "pane_ids": ["%910"],
     }
     (tmp_path / "test_proj2").mkdir()
     (tmp_path / "test_proj2" / "state.json").write_text(json.dumps(state))
@@ -658,7 +658,7 @@ def test_u_c42_status_shows_all_terminal_statuses(tmp_path):
         "db": db_file,
         "session": "crew_proj42",
         "agents": ["claude"],
-        "pane_ids": ["%10"],
+        "pane_ids": ["%910"],
     }
     (tmp_path / "proj42").mkdir()
     (tmp_path / "proj42" / "state.json").write_text(json.dumps(state))
@@ -717,7 +717,7 @@ def test_u_c43_status_uses_server_when_reachable(tmp_path):
         "db": db_file,
         "session": "crew_proj43",
         "agents": ["claude"],
-        "pane_ids": ["%10"],
+        "pane_ids": ["%910"],
     }
     (tmp_path / "proj43").mkdir()
     (tmp_path / "proj43" / "state.json").write_text(json.dumps(state))
@@ -769,7 +769,7 @@ def test_u_c44_status_falls_back_to_db_with_warning(tmp_path):
         "db": db_file,
         "session": "crew_proj44",
         "agents": ["claude"],
-        "pane_ids": ["%10"],
+        "pane_ids": ["%910"],
     }
     (tmp_path / "proj44").mkdir()
     (tmp_path / "proj44" / "state.json").write_text(json.dumps(state))
@@ -802,7 +802,7 @@ def test_u_c45_run_exits_immediately_when_server_unreachable(tmp_path):
         "db": db_file,
         "session": "crew_proj45",
         "agents": ["claude"],
-        "pane_ids": ["%10"],
+        "pane_ids": ["%910"],
     }
     (tmp_path / "proj45").mkdir()
     (tmp_path / "proj45" / "state.json").write_text(json.dumps(state))
@@ -840,7 +840,7 @@ def test_u_c46_run_proceeds_when_server_reachable(tmp_path):
         "db": db_file,
         "session": "crew_proj46",
         "agents": ["claude"],
-        "pane_ids": ["%10"],
+        "pane_ids": ["%910"],
     }
     (tmp_path / "proj46").mkdir()
     (tmp_path / "proj46" / "state.json").write_text(json.dumps(state))
@@ -916,7 +916,7 @@ def test_u_c49_setup_prints_tip_after_completion(tmp_path):
                 return MagicMock(returncode=0, stdout="100\n", stderr="")
             return MagicMock(returncode=0, stdout="crew\n", stderr="")
         if cmd == "split-window":
-            return MagicMock(returncode=0, stdout="%99\n", stderr="")
+            return MagicMock(returncode=0, stdout="%999\n", stderr="")
         if cmd == "select-layout":
             return MagicMock(returncode=0, stdout="", stderr="")
         if cmd in ("list-panes", "list-windows"):
@@ -926,7 +926,7 @@ def test_u_c49_setup_prints_tip_after_completion(tmp_path):
     mock_proc = MagicMock()
     mock_proc.pid = 12345
 
-    runner = CliRunner(env={"TMUX_PANE": "%0"})
+    runner = CliRunner(env={"TMUX_PANE": "%90"})
     with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
          patch("agent_crew.cli._read_state", return_value=None), \
          patch("agent_crew.cli.setup_module.find_free_port", return_value=19999), \
@@ -966,7 +966,7 @@ def test_u_c50_single_agent_setup_fills_all_roles(tmp_path):
                 return MagicMock(returncode=0, stdout="100\n", stderr="")
             return MagicMock(returncode=0, stdout="crew\n", stderr="")
         if cmd == "split-window":
-            return MagicMock(returncode=0, stdout="%99\n", stderr="")
+            return MagicMock(returncode=0, stdout="%999\n", stderr="")
         if cmd == "select-layout":
             return MagicMock(returncode=0, stdout="", stderr="")
         if cmd in ("list-panes", "list-windows"):
@@ -975,7 +975,7 @@ def test_u_c50_single_agent_setup_fills_all_roles(tmp_path):
 
     mock_proc = MagicMock()
     mock_proc.pid = 12345
-    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "0"})
+    runner = CliRunner(env={"TMUX_PANE": "%90", "AGENT_CREW_DISPATCHER": "0"})
     with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
          patch("agent_crew.cli._read_state", return_value=None), \
          patch("agent_crew.cli.setup_module.find_free_port", return_value=19999), \
@@ -994,10 +994,10 @@ def test_u_c50_single_agent_setup_fills_all_roles(tmp_path):
 
     assert result.exit_code == 0, result.output
     pane_map = json.loads((tmp_path / "soloproj" / "pane_map.json").read_text())
-    assert pane_map["codex"] == "%99"
-    assert pane_map["implementer"] == "%99"
-    assert pane_map["reviewer"] == "%99"
-    assert pane_map["tester"] == "%99"
+    assert pane_map["codex"] == "%999"
+    assert pane_map["implementer"] == "%999"
+    assert pane_map["reviewer"] == "%999"
+    assert pane_map["tester"] == "%999"
 
 
 # U-C51: recover --agents <single> backfills missing standard roles in pane_map
@@ -1012,8 +1012,8 @@ def test_u_c51_single_agent_recover_fills_all_roles(tmp_path):
         "session": "crew_soloproj",
         "window": "0",
         "agents": ["codex"],
-        "pane_ids": ["%1"],
-        "pane_map": {"codex": "%1", "reviewer": "%1"},
+        "pane_ids": ["%91"],
+        "pane_map": {"codex": "%91", "reviewer": "%91"},
         "worktrees": {"codex": "/tmp/wt/codex"},
         "db": str(proj_dir / "tasks.db"),
         "server_pid": 999,
@@ -1027,7 +1027,7 @@ def test_u_c51_single_agent_recover_fills_all_roles(tmp_path):
         if "list-windows" in args:
             return MagicMock(returncode=0, stdout="0", stderr="")
         if "split-window" in args:
-            return MagicMock(returncode=0, stdout="%9\n", stderr="")
+            return MagicMock(returncode=0, stdout="%99\n", stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
 
     runner = CliRunner()
@@ -1040,10 +1040,10 @@ def test_u_c51_single_agent_recover_fills_all_roles(tmp_path):
 
     assert result.exit_code == 0, result.output
     new_state = json.loads((proj_dir / "state.json").read_text())
-    assert new_state["pane_map"]["codex"] == "%9"
-    assert new_state["pane_map"]["reviewer"] == "%9"
-    assert new_state["pane_map"]["implementer"] == "%9"
-    assert new_state["pane_map"]["tester"] == "%9"
+    assert new_state["pane_map"]["codex"] == "%99"
+    assert new_state["pane_map"]["reviewer"] == "%99"
+    assert new_state["pane_map"]["implementer"] == "%99"
+    assert new_state["pane_map"]["tester"] == "%99"
 
 
 def test_u_c52_discuss_help_default_timeout_is_300():
@@ -1062,7 +1062,7 @@ def test_u_c53_status_lists_queue_in_progress_and_completed_tasks(tmp_path):
         "port": 8100,
         "session": "crew_proj",
         "agents": ["claude"],
-        "pane_ids": ["%1"],
+        "pane_ids": ["%91"],
         "worktrees": {"claude": str(tmp_path / "wt")},
         "db": str(proj_dir / "tasks.db"),
     }
@@ -1139,7 +1139,7 @@ def test_u_c56_dispatcher_setup_creates_panes_with_empty_server_pane_map(tmp_pat
 
     mock_proc = MagicMock()
     mock_proc.pid = 12345
-    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "1"})
+    runner = CliRunner(env={"TMUX_PANE": "%90", "AGENT_CREW_DISPATCHER": "1"})
     with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
          patch("agent_crew.cli._read_state", return_value=None), \
          patch("agent_crew.cli.setup_module.find_free_port", return_value=19998), \
@@ -1278,7 +1278,7 @@ def test_u_c57_dispatcher_setup_split_window_fail_graceful(tmp_path):
 
     mock_proc = MagicMock()
     mock_proc.pid = 12345
-    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "1"})
+    runner = CliRunner(env={"TMUX_PANE": "%90", "AGENT_CREW_DISPATCHER": "1"})
     with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
          patch("agent_crew.cli._read_state", return_value=None), \
          patch("agent_crew.cli.setup_module.find_free_port", return_value=19997), \
@@ -1483,7 +1483,7 @@ def test_u_c60_agent_to_role_fallback_for_unknown_agents(tmp_path):
     def _fake_write_state(_base, _project, state_data):
         captured_state.update(state_data)
 
-    runner = CliRunner(env={"TMUX_PANE": "%0", "AGENT_CREW_DISPATCHER": "0"})
+    runner = CliRunner(env={"TMUX_PANE": "%90", "AGENT_CREW_DISPATCHER": "0"})
     with patch("agent_crew.cli.setup_module.validate_git_repo", return_value=True), \
          patch("agent_crew.cli._read_state", return_value=None), \
          patch("agent_crew.cli.setup_module.find_free_port", return_value=19994), \

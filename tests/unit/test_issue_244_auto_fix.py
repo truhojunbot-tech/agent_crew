@@ -339,8 +339,8 @@ def _server(tmp_db, push, **kw):
     from agent_crew.server import create_app
 
     return create_app(db_path=tmp_db,
-                      pane_map={"implementer": "%1", "reviewer": "%2",
-                                "tester": "%3"},
+                      pane_map={"implementer": "%91", "reviewer": "%92",
+                                "tester": "%93"},
                       port=8100, push_fn=push, **kw)
 
 
@@ -385,7 +385,7 @@ def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db):
     assert len(fixes) == 1
     assert FINDING in fixes[0].description
     # ...and it was pushed to the implementer pane, not left sitting in the queue.
-    assert any(pane == "%1" and fixes[0].task_id in text
+    assert any(pane == "%91" and fixes[0].task_id in text
                for pane, text in push.calls)
 
 

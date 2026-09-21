@@ -9,7 +9,7 @@ rather than "unknown" — so the 200,000 auto-clear silently never fired.
 Measured on this host, 2026-09-13, with the threshold at 200,000:
 
     project            pane   hint?   transcript tokens   verdict
-    agent_council      %22    no                 62,025   under
+    agent_council      %922    no                 62,025   under
     agent_crew         -      n/a               786,552   OVER THRESHOLD
     alpha_engine       -      n/a               664,792   OVER THRESHOLD
     halla              -      n/a               231,590   OVER THRESHOLD
@@ -60,19 +60,19 @@ NO_HINT = "  [Edit] /tmp/wt/tests/unit/test_thing.py\n  → 41L: # ...\n"
 def test_a_missing_hint_is_unknown_not_zero():
     """★★The bug. `0` reads as "well under threshold" to every caller."""
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
-        assert sv._pane_token_count("%1") is None
+        assert sv._pane_token_count("%91") is None
 
 
 def test_a_present_hint_is_still_parsed():
     with patch.object(sv.subprocess, "run", _pane(HINT)):
-        assert sv._pane_token_count("%1") == 544_100
+        assert sv._pane_token_count("%91") == 544_100
 
 
 def test_a_pane_that_cannot_be_read_is_unknown():
     def boom(*a, **k):
         raise OSError("no tmux")
     with patch.object(sv.subprocess, "run", boom):
-        assert sv._pane_token_count("%1") is None
+        assert sv._pane_token_count("%91") is None
 
 
 # ── 2. the transcript is the ground truth ─────────────────────────────
@@ -83,7 +83,7 @@ def test_the_transcript_is_preferred_over_the_pane(tmp_path):
     situation exactly; the transcript has to win."""
     _session(tmp_path, "/w/claude", {"cache_read_input_tokens": 900_000})
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/claude", agent="claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%91", "/w/claude", agent="claude", home=tmp_path)
     assert tokens == 900_000 and source == "transcript"
 
 
@@ -93,7 +93,7 @@ def test_the_transcript_wins_even_when_the_hint_is_present(tmp_path):
     is the one to threshold against."""
     _session(tmp_path, "/w/claude", {"cache_read_input_tokens": 123_456})
     with patch.object(sv.subprocess, "run", _pane(HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/claude", agent="claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%91", "/w/claude", agent="claude", home=tmp_path)
     assert tokens == 123_456 and source == "transcript"
 
 
@@ -105,7 +105,7 @@ def test_a_measured_zero_from_the_transcript_is_not_unknown(tmp_path):
                                      "cache_creation_input_tokens": 0,
                                      "input_tokens": 0})
     with patch.object(sv.subprocess, "run", _pane(HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/claude", agent="claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%91", "/w/claude", agent="claude", home=tmp_path)
     assert tokens == 0 and source == "transcript"
 
 
@@ -113,13 +113,13 @@ def test_without_a_transcript_the_pane_hint_is_the_fallback(tmp_path):
     """Providers other than Claude have no transcript to read; the old signal
     is still better than nothing for them."""
     with patch.object(sv.subprocess, "run", _pane(HINT)):
-        tokens, source = sv._context_token_count("%1", "", agent="claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%91", "", agent="claude", home=tmp_path)
     assert tokens == 544_100 and source == "pane_hint"
 
 
 def test_neither_source_is_unknown(tmp_path):
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
-        tokens, source = sv._context_token_count("%1", "/w/nothing", agent="claude", home=tmp_path)
+        tokens, source = sv._context_token_count("%91", "/w/nothing", agent="claude", home=tmp_path)
     assert tokens is None and source == "unknown"
 
 
@@ -184,7 +184,7 @@ def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch):
     db = str(tmp_path / "tasks.db")
     pushed = []
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%1"}, port=0,
+                     pane_map={"implementer": "%91"}, port=0,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -194,8 +194,8 @@ def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch):
             "task_id": "t-292", "task_type": "implement", "description": "go",
             "branch": "main", "priority": 3, "context": {}, "project": "demo"})
 
-    assert cleared == ["%1"], "a saturated pane was pushed to without clearing"
-    assert pushed == ["%1"]
+    assert cleared == ["%91"], "a saturated pane was pushed to without clearing"
+    assert pushed == ["%91"]
 
 
 def test_the_push_path_does_not_clear_a_small_session(tmp_path, monkeypatch):
@@ -222,7 +222,7 @@ def test_the_push_path_does_not_clear_a_small_session(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%1"}, port=0,
+                     pane_map={"implementer": "%91"}, port=0,
                      push_fn=lambda pane, text: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -256,7 +256,7 @@ def test_a_non_claude_agent_never_reads_a_claude_transcript(tmp_path):
     _session(tmp_path, "/w/codex", {"cache_read_input_tokens": 900_000})
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
         tokens, source = sv._context_token_count(
-            "%2", "/w/codex", agent="codex", home=tmp_path)
+            "%92", "/w/codex", agent="codex", home=tmp_path)
     assert source != "transcript"
     assert tokens is None
 
@@ -267,7 +267,7 @@ def test_a_non_claude_agent_still_gets_the_pane_hint(tmp_path):
     _session(tmp_path, "/w/codex", {"cache_read_input_tokens": 900_000})
     with patch.object(sv.subprocess, "run", _pane(HINT)):
         tokens, source = sv._context_token_count(
-            "%2", "/w/codex", agent="codex", home=tmp_path)
+            "%92", "/w/codex", agent="codex", home=tmp_path)
     assert (tokens, source) == (544_100, "pane_hint")
 
 
@@ -275,7 +275,7 @@ def test_claude_still_reads_its_transcript(tmp_path):
     _session(tmp_path, "/w/claude", {"cache_read_input_tokens": 900_000})
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
         tokens, source = sv._context_token_count(
-            "%1", "/w/claude", agent="claude", home=tmp_path)
+            "%91", "/w/claude", agent="claude", home=tmp_path)
     assert (tokens, source) == (900_000, "transcript")
 
 
@@ -284,7 +284,7 @@ def test_an_unknown_agent_does_not_read_a_transcript(tmp_path):
     cannot say the transcript is the one it is carrying."""
     _session(tmp_path, "/w/x", {"cache_read_input_tokens": 900_000})
     with patch.object(sv.subprocess, "run", _pane(NO_HINT)):
-        assert sv._context_token_count("%9", "/w/x", agent="", home=tmp_path) == (None, "unknown")
+        assert sv._context_token_count("%99", "/w/x", agent="", home=tmp_path) == (None, "unknown")
 
 
 def test_the_worktree_follows_the_agent_not_the_role():
@@ -335,8 +335,8 @@ def _override_push(tmp_path, monkeypatch, *, override, role_worktrees, claude_to
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%1", "reviewer": "%2",
-                               "claude": "%1", "codex": "%2"},
+                     pane_map={"implementer": "%91", "reviewer": "%92",
+                               "claude": "%91", "codex": "%92"},
                      port=0, push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -355,7 +355,7 @@ def test_an_override_does_not_clear_the_wrong_pane(tmp_path, monkeypatch):
         tmp_path, monkeypatch, override="codex",
         role_worktrees={"implementer": "claude", "reviewer": "codex"},
         claude_tokens=900_000)
-    assert pushed == ["%2"], pushed
+    assert pushed == ["%92"], pushed
     assert cleared == [], f"cleared the wrong pane: {cleared}"
 
 
@@ -366,8 +366,8 @@ def test_without_an_override_the_saturated_pane_is_still_cleared(tmp_path, monke
         tmp_path, monkeypatch, override="claude",
         role_worktrees={"implementer": "claude", "reviewer": "codex"},
         claude_tokens=900_000)
-    assert pushed == ["%1"]
-    assert cleared == ["%1"]
+    assert pushed == ["%91"]
+    assert cleared == ["%91"]
 
 
 def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
@@ -407,8 +407,8 @@ def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%1", "reviewer": "%2",
-                               "claude": "%1", "codex": "%2"},
+                     pane_map={"implementer": "%91", "reviewer": "%92",
+                               "claude": "%91", "codex": "%92"},
                      port=0, push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -417,7 +417,7 @@ def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
             "description": "review", "branch": "main", "priority": 3,
             "project": "demo", "context": {"agent_override": "claude"}})
 
-    assert pushed == ["%1"], pushed
+    assert pushed == ["%91"], pushed
     assert cleared == [], "cleared on a transcript from a worktree claude does not own"
 
 
@@ -446,7 +446,7 @@ def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"codex": "%2", "reviewer": "%2"}, port=0,
+                     pane_map={"codex": "%92", "reviewer": "%92"}, port=0,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -455,7 +455,7 @@ def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch):
             "description": "discuss", "branch": "main", "priority": 3,
             "project": "demo", "context": {"agent": "codex"}})
 
-    assert pushed == ["%2"], pushed
+    assert pushed == ["%92"], pushed
     assert cleared == [], "a codex panel was cleared on a Claude transcript"
 
 
@@ -554,7 +554,7 @@ def test_a_configured_claude_reviewer_is_not_sized_by_the_implementer(tmp_path,
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%1", "reviewer": "%2"}, port=0,
+                     pane_map={"implementer": "%91", "reviewer": "%92"}, port=0,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -563,7 +563,7 @@ def test_a_configured_claude_reviewer_is_not_sized_by_the_implementer(tmp_path,
             "description": "review", "branch": "main", "priority": 3,
             "project": "demo", "context": {}})
 
-    assert pushed == ["%2"], pushed
+    assert pushed == ["%92"], pushed
     assert cleared == [], "the reviewer pane was cleared on the implementer's window"
 
 
@@ -599,7 +599,7 @@ def test_the_configured_implementer_is_still_cleared_when_saturated(tmp_path,
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%1", "reviewer": "%2"}, port=0,
+                     pane_map={"implementer": "%91", "reviewer": "%92"}, port=0,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -608,8 +608,8 @@ def test_the_configured_implementer_is_still_cleared_when_saturated(tmp_path,
             "description": "go", "branch": "main", "priority": 3,
             "project": "demo", "context": {}})
 
-    assert pushed == ["%1"]
-    assert cleared == ["%1"]
+    assert pushed == ["%91"]
+    assert cleared == ["%91"]
 
 
 def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch):
@@ -648,7 +648,7 @@ def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"claude": "%1", "implementer": "%1"}, port=0,
+                     pane_map={"claude": "%91", "implementer": "%91"}, port=0,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -657,5 +657,5 @@ def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch):
             "description": "discuss", "branch": "main", "priority": 3,
             "project": "demo", "context": {"agent": "claude"}})
 
-    assert pushed == ["%1"], pushed
+    assert pushed == ["%91"], pushed
     assert cleared == [], "cleared on a worktree the panel's role could not be tied to"

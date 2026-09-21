@@ -71,7 +71,7 @@ def _cleared_events(db_path):
 
 
 def _run(tmp_path, monkeypatch, *, tokens=BIG, task_type="implement",
-         context=None, agent_key="claude", pane="%1"):
+         context=None, agent_key="claude", pane="%91"):
     """Push one task through the real path; return (db, sent_keys, task_ctx)."""
     wt = tmp_path / "worktrees" / "demo" / agent_key
     wt.mkdir(parents=True, exist_ok=True)
@@ -124,7 +124,7 @@ def test_the_event_carries_what_an_audit_needs(tmp_path, monkeypatch):
     event = _cleared_events(db)[0]
     assert event["task_id"] == "t-297"
     assert event["agent"] == "claude"
-    assert event["pane_id"] == "%1"
+    assert event["pane_id"] == "%91"
     assert event["reason"] == "auto_clear_token_threshold"
 
 
@@ -164,7 +164,7 @@ def test_a_failed_send_is_recorded_as_such(tmp_path, monkeypatch):
     monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
     with monkeypatch.context() as m:
         m.setattr(sv.subprocess, "run", failing)
-        sv._pane_clear_context("%9", events_path=str(tmp_path / "e.jsonl"),
+        sv._pane_clear_context("%99", events_path=str(tmp_path / "e.jsonl"),
                                task_id="t", agent="claude")
     lines = [json.loads(x) for x in open(tmp_path / "e.jsonl")]
     assert lines[0]["outcome"] == "send_failed"
@@ -304,7 +304,7 @@ def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None)
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%1", "claude": "%1"}, port=0,
+                     pane_map={"implementer": "%91", "claude": "%91"}, port=0,
                      push_fn=lambda p, t: None, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as client:
@@ -381,7 +381,7 @@ def test_the_discuss_event_uses_the_configured_role(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"claude": "%2", "reviewer": "%2"}, port=0,
+                     pane_map={"claude": "%92", "reviewer": "%92"}, port=0,
                      push_fn=lambda p, t: None, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as client:

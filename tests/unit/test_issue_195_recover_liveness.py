@@ -24,65 +24,65 @@ def _fake_cmd_lookup(mapping: dict):
 
 
 def test_b195_dispatcher_mode_python3_panes_are_healthy():
-    alive, cmd = _fake_cmd_lookup({"%1": "python3", "%2": "python3", "%3": "python3"})
+    alive, cmd = _fake_cmd_lookup({"%91": "python3", "%92": "python3", "%93": "python3"})
     with patch("agent_crew.cli._pane_alive", side_effect=alive), \
          patch("agent_crew.cli._pane_current_command", side_effect=cmd):
         dead = _detect_dead_agent_panes(
-            ["claude", "codex", "gemini"], ["%1", "%2", "%3"], dispatcher_mode=True,
+            ["claude", "codex", "gemini"], ["%91", "%92", "%93"], dispatcher_mode=True,
         )
     assert dead == []
 
 
 def test_b195_dispatcher_mode_bash_pane_flagged():
     """Log viewer crashed → pane sitting at bash prompt is the #195 signature."""
-    alive, cmd = _fake_cmd_lookup({"%1": "python3", "%2": "bash", "%3": "python3"})
+    alive, cmd = _fake_cmd_lookup({"%91": "python3", "%92": "bash", "%93": "python3"})
     with patch("agent_crew.cli._pane_alive", side_effect=alive), \
          patch("agent_crew.cli._pane_current_command", side_effect=cmd):
         dead = _detect_dead_agent_panes(
-            ["claude", "codex", "gemini"], ["%1", "%2", "%3"], dispatcher_mode=True,
+            ["claude", "codex", "gemini"], ["%91", "%92", "%93"], dispatcher_mode=True,
         )
-    assert dead == [("codex", "%2", "bash")]
+    assert dead == [("codex", "%92", "bash")]
 
 
 def test_b195_legacy_mode_agent_cli_panes_are_healthy():
-    alive, cmd = _fake_cmd_lookup({"%1": "claude", "%2": "codex", "%3": "node"})
+    alive, cmd = _fake_cmd_lookup({"%91": "claude", "%92": "codex", "%93": "node"})
     with patch("agent_crew.cli._pane_alive", side_effect=alive), \
          patch("agent_crew.cli._pane_current_command", side_effect=cmd):
         dead = _detect_dead_agent_panes(
-            ["claude", "codex", "gemini"], ["%1", "%2", "%3"], dispatcher_mode=False,
+            ["claude", "codex", "gemini"], ["%91", "%92", "%93"], dispatcher_mode=False,
         )
     assert dead == []
 
 
 def test_b195_legacy_mode_codex_crashed_to_bash():
-    alive, cmd = _fake_cmd_lookup({"%1": "claude", "%2": "bash", "%3": "node"})
+    alive, cmd = _fake_cmd_lookup({"%91": "claude", "%92": "bash", "%93": "node"})
     with patch("agent_crew.cli._pane_alive", side_effect=alive), \
          patch("agent_crew.cli._pane_current_command", side_effect=cmd):
         dead = _detect_dead_agent_panes(
-            ["claude", "codex", "gemini"], ["%1", "%2", "%3"], dispatcher_mode=False,
+            ["claude", "codex", "gemini"], ["%91", "%92", "%93"], dispatcher_mode=False,
         )
-    assert dead == [("codex", "%2", "bash")]
+    assert dead == [("codex", "%92", "bash")]
 
 
 def test_b195_missing_pane_flagged():
     """Pane id present in state but gone from tmux → flag as crashed."""
-    alive, cmd = _fake_cmd_lookup({"%1": "python3", "%3": "python3"})  # %2 absent
+    alive, cmd = _fake_cmd_lookup({"%91": "python3", "%93": "python3"})  # %92 absent
     with patch("agent_crew.cli._pane_alive", side_effect=alive), \
          patch("agent_crew.cli._pane_current_command", side_effect=cmd):
         dead = _detect_dead_agent_panes(
-            ["claude", "codex", "gemini"], ["%1", "%2", "%3"], dispatcher_mode=True,
+            ["claude", "codex", "gemini"], ["%91", "%92", "%93"], dispatcher_mode=True,
         )
-    assert ("codex", "%2", "(missing)") in dead
+    assert ("codex", "%92", "(missing)") in dead
     assert len(dead) == 1
 
 
 def test_b195_all_shells_count_as_dead():
     """Any standard shell prompt counts as a crash signature."""
     for sh in ("bash", "sh", "zsh", "fish", "dash"):
-        alive, cmd = _fake_cmd_lookup({"%1": sh})
+        alive, cmd = _fake_cmd_lookup({"%91": sh})
         with patch("agent_crew.cli._pane_alive", side_effect=alive), \
              patch("agent_crew.cli._pane_current_command", side_effect=cmd):
             dead = _detect_dead_agent_panes(
-                ["claude"], ["%1"], dispatcher_mode=True,
+                ["claude"], ["%91"], dispatcher_mode=True,
             )
-        assert dead == [("claude", "%1", sh)], f"shell {sh!r} not flagged"
+        assert dead == [("claude", "%91", sh)], f"shell {sh!r} not flagged"

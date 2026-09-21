@@ -139,7 +139,7 @@ def test_u_se08b_log_viewer_panes_respawn_on_death(tmp_path):
     mock_result = MagicMock(returncode=0)
     with patch("agent_crew.setup.subprocess.run", return_value=mock_result) as mock_run, \
          patch("agent_crew.setup.time.sleep"):
-        start_log_viewers_in_panes(["claude"], ["%1"], str(tmp_path))
+        start_log_viewers_in_panes(["claude"], ["%91"], str(tmp_path))
 
     literal_calls = [
         call[0][0] for call in mock_run.call_args_list

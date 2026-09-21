@@ -215,7 +215,7 @@ class TestFallbackLoop:
         )
         auto_fallback_failed_task(
             q, "orig", result, "implement",
-            pane_map={"implementer": "%1", "claude": "%1", "codex": "%2", "gemini": "%3"},
+            pane_map={"implementer": "%91", "claude": "%91", "codex": "%92", "gemini": "%93"},
         )
         pending = q.list_tasks(status="pending")
         assert len(pending) == 1, "one fallback task should be created"
@@ -244,7 +244,7 @@ class TestFallbackLoop:
         )
         auto_fallback_failed_task(
             q, "fb3", result, "implement",
-            pane_map={"implementer": "%1", "claude": "%1", "codex": "%2", "gemini": "%3"},
+            pane_map={"implementer": "%91", "claude": "%91", "codex": "%92", "gemini": "%93"},
         )
         pending = q.list_tasks(status="pending")
         assert len(pending) == 0, (
@@ -417,7 +417,7 @@ class TestFallbackCancellation:
         )
         auto_fallback_failed_task(
             q, "fb3", result, "implement",
-            pane_map={"implementer": "%1", "claude": "%1", "codex": "%2", "gemini": "%3"},
+            pane_map={"implementer": "%91", "claude": "%91", "codex": "%92", "gemini": "%93"},
         )
 
         pending = q.list_tasks(status="pending")
