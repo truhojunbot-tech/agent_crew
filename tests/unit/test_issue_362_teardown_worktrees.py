@@ -126,6 +126,30 @@ def test_teardown_preserves_user_notes_in_untracked_agents_md(tmp_path, worktree
     assert worktree.exists() and "MY HAND-WRITTEN NOTES" in (worktree / "AGENTS.md").read_text()
 
 
+@pytest.mark.parametrize(("relative", "content"), [
+    (".telegram/.env", "TELEGRAM_BOT_TOKEN=real-developer-token\n"),
+    (".gemini/settings.json", '{"mcpServers": {"agent_crew": {}, "MINE": {}}}\n'),
+    (".mcp.json", '{"mcpServers": {"agent_crew": {}, "MINE": {}}}\n'),
+    (".codex_local/config.toml", "[mcp_servers.agent_crew]\n[mcp_servers.MINE]\n"),
+])
+def test_teardown_preserves_developer_owned_generated_named_file(
+    tmp_path, worktree_project, monkeypatch, relative, content,
+):
+    """A generated-looking filename never authorizes deleting user content."""
+    repo, worktree = worktree_project
+    project = _state(tmp_path, repo, worktree)
+    target = worktree / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content)
+    monkeypatch.setattr("agent_crew.cli._tmux_snapshot", lambda _session: "")
+
+    result = CliRunner().invoke(crew, ["teardown", project, "--base", str(tmp_path)])
+
+    assert result.exit_code != 0
+    assert worktree.exists() and _listed(repo, worktree)
+    assert target.read_text() == content
+
+
 def test_teardown_accepts_all_setup_generated_config_paths(tmp_path, worktree_project, monkeypatch):
     repo, worktree = worktree_project
     project = _state(tmp_path, repo, worktree)
