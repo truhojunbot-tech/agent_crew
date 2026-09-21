@@ -100,7 +100,7 @@ def _resolve_tmux_pane_target(target: str) -> str:
     return result.stdout.strip() if result.returncode == 0 else ""
 
 
-def _recorded_pane_ids(state_path: Optional[str], pane_map: Optional[dict]) -> set[str]:
+def _recorded_pane_ids(state_path: Optional[str], pane_map: Optional[dict]) -> tuple[set[str], bool]:
     """Load the project's durable pane ownership boundary for tmux pushes."""
     if state_path:
         try:
@@ -108,14 +108,18 @@ def _recorded_pane_ids(state_path: Optional[str], pane_map: Optional[dict]) -> s
                 state = json.load(state_file)
             pane_ids = state.get("pane_ids") if isinstance(state, dict) else None
             if isinstance(pane_ids, list):
-                return {pane_id for pane_id in pane_ids if isinstance(pane_id, str) and pane_id}
+                owned = {pane_id for pane_id in pane_ids if isinstance(pane_id, str) and pane_id}
+                state_map = state.get("pane_map", {}) if isinstance(state, dict) else {}
+                if isinstance(state_map, dict):
+                    owned.update(v for v in state_map.values() if isinstance(v, str) and v)
+                return owned, True
         except (OSError, json.JSONDecodeError):
             pass
-        return set()
+        return {pane_id for pane_id in (pane_map or {}).values() if isinstance(pane_id, str) and pane_id}, False
     # Embedded callers without a project state have no wider project boundary;
     # keep their explicit pane map as the ownership declaration. Crew servers
     # always pass state_path and therefore take the durable branch above.
-    return {pane_id for pane_id in (pane_map or {}).values() if isinstance(pane_id, str) and pane_id}
+    return {pane_id for pane_id in (pane_map or {}).values() if isinstance(pane_id, str) and pane_id}, False
 
 
 # Per-pane snapshot of the previous capture, keyed by pane_id. Used by the
@@ -2487,13 +2491,17 @@ def create_app(
         # Pane ownership changes on `crew recover` and pane-map reload.  Read
         # the durable state at the boundary, rather than freezing startup's
         # pane IDs and permanently refusing a legitimate replacement pane.
-        owned_pane_ids = _recorded_pane_ids(state_path, pane_map)
+        owned_pane_ids, ownership_authoritative = _recorded_pane_ids(state_path, pane_map)
         if pane_id not in owned_pane_ids:
             logger.warning(
                 "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=pane_not_owned",
                 task_id, target, pane_id,
             )
-            _fail_if_active(task_id, "pane_not_owned")
+            if ownership_authoritative:
+                _fail_if_active(task_id, "pane_not_owned")
+            else:
+                logger.warning("tmux ownership record unavailable; requeueing task_id=%s", task_id)
+                q().requeue(task_id)
             return ""
         if not _pane_alive_for_push(pane_id):
             logger.warning(
