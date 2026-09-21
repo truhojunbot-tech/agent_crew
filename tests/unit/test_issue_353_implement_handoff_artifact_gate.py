@@ -284,9 +284,31 @@ def test_dispatch_rewrites_wrong_role_protocol(tmp_path):
     from agent_crew.server import _ensure_role_protocol
     port_file = tmp_path / "port"
     port_file.write_text("8105\n")
-    (tmp_path / "AGENTS.md").write_text("## Role: reviewer\n")
+    (tmp_path / "AGENTS.md").write_text(
+        "<!-- agent_crew:begin -->\n## Role: reviewer\n<!-- agent_crew:end -->\n"
+    )
     assert _ensure_role_protocol("implementer", str(tmp_path), "demo", str(port_file), agent="codex")
     assert "## Role: implementer" in (tmp_path / "AGENTS.md").read_text()
+
+
+def test_dispatch_refuses_protocol_that_remains_contradictory_after_rewrite(tmp_path):
+    """An edited tracked legacy contract cannot be silently paired with ours."""
+    from agent_crew import instructions
+    from agent_crew.server import _ensure_role_protocol
+
+    port_file = tmp_path / "port"
+    port_file.write_text("8105\n")
+    target = tmp_path / ".claude" / "CLAUDE.md"
+    target.parent.mkdir()
+    target.write_text(
+        instructions.generate("implementer", "demo", 8105, agent="claude")
+        + "\n## Developer rule\nDo not deploy.\n"
+    )
+
+    assert not _ensure_role_protocol("reviewer", str(tmp_path), "demo", str(port_file), agent="claude")
+    body = target.read_text()
+    assert "## Role: reviewer" in body
+    assert "## Role: implementer" in body
 
 
 def test_mcp_accepts_a_verified_artifact_from_its_worker_checkout(tmp_db, monkeypatch):

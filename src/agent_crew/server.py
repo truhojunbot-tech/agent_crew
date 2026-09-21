@@ -184,6 +184,19 @@ def _ensure_role_protocol(
     if not os.path.isfile(created):
         logger.error("dispatcher: protocol write returned missing path %s", created)
         return False
+    try:
+        with open(created) as protocol_file:
+            roles = re.findall(r"^## Role: (.+)$", protocol_file.read(), re.MULTILINE)
+    except OSError as exc:
+        logger.error("dispatcher: could not verify regenerated protocol %s: %s", created, exc)
+        return False
+    if roles != [role]:
+        logger.error(
+            "dispatcher: refusing contradictory_role_protocol role=%s path=%s roles=%s; "
+            "preserve developer content and resolve the conflicting contract before retrying",
+            role, created, roles,
+        )
+        return False
     logger.warning("dispatcher: regenerated missing %s protocol at %s (#353)", role, created)
     return True
 
