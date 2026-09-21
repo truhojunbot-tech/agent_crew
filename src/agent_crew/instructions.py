@@ -849,6 +849,11 @@ def _remove_agent_crew_block(existing: str) -> str:
     return (existing[:begin] + existing[end_marker_close:]).strip() + "\n"
 
 
+def _is_legacy_agent_crew_protocol(content: str) -> bool:
+    """Recognize the unmarked contract shape emitted by pre-marker setup."""
+    return "# Agent Crew — " in content and "OVERRIDE: You are an agent_crew worker" in content and "## Role: " in content
+
+
 def _remove_stale_protocol_files(worktree_path: str, destination: str) -> None:
     """Remove obsolete agent_crew contracts without clobbering project docs."""
     stale_files = (set(_LEGACY_ROLE_FILES.values()) | set(AGENT_FILES.values())) - {destination}
@@ -862,6 +867,9 @@ def _remove_stale_protocol_files(worktree_path: str, destination: str) -> None:
         except OSError:
             continue
         remaining = _remove_agent_crew_block(existing)
+        if remaining == existing and _is_legacy_agent_crew_protocol(existing):
+            os.unlink(path)
+            continue
         if remaining == existing:
             continue
         if remaining.strip():
@@ -906,6 +914,8 @@ def write(
                 existing = f.read()
         except OSError:
             existing = ""
+    if _is_legacy_agent_crew_protocol(existing):
+        existing = ""
     content = _merge_agent_crew_block(existing, new_block)
 
     with open(path, "w") as f:

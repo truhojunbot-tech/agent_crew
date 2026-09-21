@@ -57,11 +57,10 @@ class TestWriteImplementer:
     def test_overwrites_dot_claude_claude_md(self, tmp_path):
         wt = tmp_path / "wt"
         wt.mkdir()
-        # A marker-owned stale contract is replaced; unmarked developer rules
-        # are deliberately preserved.
+        # Legacy setup emitted an unmarked agent_crew contract; replace it.
         old = wt / ".claude" / "CLAUDE.md"
         old.parent.mkdir()
-        old.write_text("<!-- agent_crew:begin -->\nOLD CONTENT\n<!-- agent_crew:end -->\n")
+        old.write_text(instructions.generate("reviewer", "proj", 9123, agent="claude"))
         path = instructions.write(
             "implementer",
             str(wt),
@@ -209,7 +208,7 @@ class TestAgentSelectedProtocolFiles:
         wt.mkdir()
         stale = wt / ".claude" / "CLAUDE.md"
         stale.parent.mkdir()
-        stale.write_text("<!-- agent_crew:begin -->\n## Role: implementer\n<!-- agent_crew:end -->\n")
+        stale.write_text(instructions.generate("implementer", "proj", 9123, agent="claude"))
 
         instructions.write(
             "implementer", str(wt), project="proj", port_file=_write_port(tmp_path), agent="codex",

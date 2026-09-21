@@ -159,7 +159,8 @@ def _ensure_role_protocol(
     if os.path.isfile(expected):
         try:
             with open(expected) as protocol_file:
-                if f"## Role: {role}" in protocol_file.read():
+                roles = re.findall(r"^## Role: (.+)$", protocol_file.read(), re.MULTILINE)
+                if roles == [role]:
                     return True
         except OSError:
             pass
