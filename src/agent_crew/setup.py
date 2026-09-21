@@ -847,6 +847,41 @@ def _collect_active_ports(base: str | None = None) -> set[int]:
     return active
 
 
+def _claim_path(base: str, port: int) -> str:
+    return os.path.join(base, ".ports", str(port))
+
+
+def _claim_is_live(path: str) -> bool:
+    try:
+        pid = int(open(path).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _claim_port(base: str | None, port: int) -> bool:
+    """Atomically reserve a pre-write allocation; reclaim dead-owner claims."""
+    if not base:
+        return True
+    claims = os.path.join(base, ".ports")
+    os.makedirs(claims, exist_ok=True)
+    path = _claim_path(base, port)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        if _claim_is_live(path):
+            return False
+        try:
+            os.unlink(path)
+        except OSError:
+            return False
+        return _claim_port(base, port)
+    with os.fdopen(fd, "w") as claim:
+        claim.write(str(os.getpid()))
+    return True
+
+
 def find_free_port(start: int = 8100, *, base: str | None = None,
                    project: str = "", limit: int = 65535) -> int:
     """Find a port owned by no other project and free to bind.
@@ -861,7 +896,10 @@ def find_free_port(start: int = 8100, *, base: str | None = None,
         own_file = os.path.join(base, project, "port")
         try:
             own_port = require_project_port(int(open(own_file).read().strip()), project)
-            return own_port
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", own_port))
+            if _claim_port(base, own_port):
+                return own_port
         except (OSError, ValueError):
             pass
     port = start
@@ -872,7 +910,9 @@ def find_free_port(start: int = 8100, *, base: str | None = None,
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
                 sock.bind(("127.0.0.1", port))
-                return port
+                if _claim_port(base, port):
+                    return port
+                port += 1
             except OSError:
                 port += 1
     raise RuntimeError(f"no free ports available in range {start}-{limit}")
@@ -883,3 +923,10 @@ def write_port_file(path: str, port: int, *, project: str = "") -> None:
     port = require_project_port(port, project)
     with open(path, "w") as f:
         f.write(str(port))
+    base = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    claim = _claim_path(base, port)
+    try:
+        if int(open(claim).read().strip()) == os.getpid():
+            os.unlink(claim)
+    except (OSError, ValueError):
+        pass
