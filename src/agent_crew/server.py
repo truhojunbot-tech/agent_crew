@@ -56,6 +56,7 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
+from agent_crew.risk_tier import risk_tier_enforcement_enabled
 from agent_crew.watch import active_tasks_for_issue
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
@@ -3687,7 +3688,9 @@ def create_app(
                 # operator-configured full-suite override. The cascade stores
                 # this decision on the task so replay/restart cannot infer it
                 # from a provider or project name.
-                if isinstance(task.context, dict) and task.context.get("test_scope") == "targeted":
+                if (risk_tier_enforcement_enabled()
+                        and isinstance(task.context, dict)
+                        and task.context.get("test_scope") == "targeted"):
                     _scope = {**_scope, "full_suite": False,
                               "source": "risk_tier", "source_kind": "risk_tier"}
                 _scope_name = _effective_scope(_scope)
