@@ -233,15 +233,32 @@ def enforcing_queues(monkeypatch):
     ``create_app`` takes no CEA arguments on purpose (the mode is a deployment
     fact, read from the environment), so the injection point for a test is the
     constructor.
+
+    ⛔``setdefault`` is not enough, and ``install_from_env`` must be stubbed —
+      the same harness leak s4d-r3 closed in
+      :mod:`tests.unit.sev0_cea_acceptance_helpers`. After s4e, ``create_app``
+      builds its queue with an explicit ``cea_providers=wiring.providers`` from
+      :func:`agent_crew.cea.wiring.install_from_env`, so both ``setdefault``
+      calls lose to the caller's kwargs. This test then ran ``mode=shadow``
+      against the LIVE alfred governance files, where the unkeyed snapshot is
+      an unverified input and enqueue BLOCKs (P7) — a 403 that has nothing to
+      do with the RESULT-before-START rule under test. A harness must read no
+      production input and mutate no process-global authority.
     """
+    import types
+
+    from agent_crew.cea import wiring as cea_wiring
+
     original = TaskQueue.__init__
 
     def patched(self, db_path, **kw):
-        kw.setdefault("cea_config", EngineConfig(mode="test"))
-        kw.setdefault("cea_providers", dict(WIRED))
+        kw["cea_config"] = EngineConfig(mode="test")
+        kw["cea_providers"] = dict(WIRED)
         original(self, db_path, **kw)
 
     monkeypatch.setattr(TaskQueue, "__init__", patched)
+    monkeypatch.setattr(cea_wiring, "install_from_env", lambda *a, **k: types.SimpleNamespace(
+        providers=dict(WIRED), authority=None, mode="test", statuses=()))
     return patched
 
 
