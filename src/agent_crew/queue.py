@@ -893,7 +893,7 @@ class TaskQueue:
         self._cea_config_override = cea_config
         self._cea_config_by_project: dict = {}
         self._cea_providers = dict(cea_providers or {})
-        self._cea_engine_cache = None
+        self._cea_engine_cache: dict = {}
         # P6: who may loosen this runtime. Fail-closed by default — a runtime with
         # no verifier refuses every loosening rather than trusting the requester's
         # own account of its authority. Wire a :class:`SnapshotLooseningAuthority`
@@ -1839,6 +1839,42 @@ class TaskQueue:
             context.pop("issue")
         return context
 
+    @property
+    def project_identity(self) -> str:
+        """The project this queue *is*, read off its own state directory.
+
+        Production lays a queue out as ``<base>/<project>/tasks.db`` (``crew
+        setup``), so the directory holding the DB is the project — the same
+        identity ``server._server_identity`` already falls back to for #248,
+        and for the same reason: the caller-supplied name is absent on most
+        paths, while the path is always there.
+
+        This is what the §7 adapters that *synthesise* their own TaskRequest
+        (the loop, the discussion panel, the cascades, triage, the server's
+        retry and stale-review requeues) name as their project when nothing
+        upstream named one. They have no transport to read it from — before
+        s4j they simply left it empty, and the engine crashed on the frozen
+        contract (`$.project` non-empty) inside every one of them.
+
+        ⛔Never a *substitute* for a project the caller did name. `POST /tasks`,
+          `crew enqueue` and `watch.run_cycle` carry the caller's project and
+          keep it: back-filling there would let a task be admitted under a
+          rollout mode its submitter did not choose. Those refuse instead
+          (`PROJECT_REQUIRED`).
+
+        ``""`` when there is nothing to read — an in-memory DB, a bare
+        filename, or a DB sitting directly in the ``.agent_crew`` root. Empty
+        is then refused with a receipt, which is the honest answer; guessing
+        ``"agent_crew"`` from the package name would not be.
+        """
+        path = str(self._db_path or "")
+        if not path or path == ":memory:":
+            return ""
+        parent = os.path.basename(os.path.dirname(os.path.abspath(path)))
+        if not parent or parent in (".agent_crew", "/", "."):
+            return ""
+        return parent
+
     def cea_config(self, project: Optional[str] = None) -> "_CeaEngineConfig":
         """The engine config in force — ``shadow`` unless the env says otherwise.
 
@@ -1896,17 +1932,30 @@ class TaskQueue:
             project = str(receipt.get("project") or "").strip()
         return self.cea_config(project or None)
 
-    def cea_engine(self):
+    def cea_engine(self, project: Optional[str] = None):
         """The T1 engine (in-process, or a socket client when one is configured).
 
-        Cached per queue for the same reason, plus a practical one: constructing
-        it re-reads the signing key from disk, and the claim path runs on every
-        poll of an idle queue.
+        Cached **per project** for the same reason as :meth:`cea_config`, plus a
+        practical one: constructing it re-reads the signing key from disk, and
+        the claim path runs on every poll of an idle queue.
+
+        ⛔``project`` is not decoration. Before s4j this always built the engine
+          from ``cea_config()`` — the *process-wide* mode — so admission decided
+          under one mode while :meth:`enqueue_with_receipt` gated the very same
+          task under ``cea_config(task.project)``. A project pinned to ``shadow``
+          inside a process running ``enforce`` was therefore admitted by an
+          enforcing engine, which is the half-enforced state
+          :meth:`cea_config_for_receipt` exists to prevent, one call site
+          earlier. The post-admission sites still resolve from the *receipt*;
+          admission is the one place the project is known from the task.
         """
-        if self._cea_engine_cache is None:
-            self._cea_engine_cache = _cea_get_engine(config=self.cea_config(),
-                                                     **(self._cea_providers or {}))
-        return self._cea_engine_cache
+        key = (project or "").strip() or None
+        cached = self._cea_engine_cache.get(key)
+        if cached is None:
+            cached = _cea_get_engine(config=self.cea_config(key),
+                                     **(self._cea_providers or {}))
+            self._cea_engine_cache[key] = cached
+        return cached
 
     def authorize_task(self, task: TaskRequest, *, context: Optional[dict] = None,
                        provenance: "_CeaProvenance" = _CeaProvenance.DIRECT,
@@ -1926,7 +1975,11 @@ class TaskQueue:
         either way"), while a task row without a receipt is the thing the
         ``tasks.receipt_id`` trigger makes impossible.
         """
-        engine = self.cea_engine()
+        # s4j: the engine is resolved for **this task's project**, so admission
+        # decides under the same rollout mode `enqueue_with_receipt` then gates
+        # it with. A task with no project resolves the process-wide mode and is
+        # refused PROJECT_REQUIRED by the engine — a BLOCK receipt, not a raise.
+        engine = self.cea_engine(getattr(task, "project", None))
         caller = _cea_in_process_caller(provenance)
         intent = intent_for_task(task, context=context)
         conn = self._connect()
@@ -1964,7 +2017,7 @@ class TaskQueue:
         raises :class:`AdmissionRefused` and nothing is written.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
-        engine = self.cea_engine()
+        engine = self.cea_engine(getattr(task, "project", None))
         # ENQUEUE is the one call site that resolves rollout from the *task*:
         # it is where the project first becomes known, and the receipt it writes
         # is what the four post-admission sites will read it back from.

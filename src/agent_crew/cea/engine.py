@@ -175,6 +175,15 @@ MODES = (OFF, TEST, SHADOW, ENFORCE)
 
 EMBEDDED_MODES = (OFF, TEST, SHADOW)
 
+#: What a refusal receipt names as its ``project`` when the intent named none.
+#: §3 freezes ``project`` as a non-empty string and P2 requires the audit row
+#: either way, so the two are reconciled by a sentinel that says *no project was
+#: named* rather than by guessing one or by dropping the receipt. It contains
+#: ``/`` so it can never collide with a real project: a project name is a
+#: directory basename (``~/.agent_crew/<project>/``) and an env-var suffix
+#: (:func:`project_mode_env_var`), and neither can hold a separator.
+UNNAMED_PROJECT = "cea/unnamed-project"
+
 
 def project_mode_env_var(project: str) -> str:
     """The per-project override's environment variable name.
@@ -482,7 +491,7 @@ class AuthorizationEngine:
         disagree about which file was named.
 
         Returns ``(intent, intent_hash)``, or an :class:`Authorization` refusal
-        when the anchors do not canonicalize.
+        when the anchors do not canonicalize, or when no project was named.
         """
         try:
             intent = replace(intent, identity=canonical_identity(intent.identity))
@@ -491,6 +500,24 @@ class AuthorizationEngine:
                 receipt=self._refusal(intent, caller, uncanonical_intent_hash(intent.identity),
                                       "INVALID_SCOPE_ANCHOR", str(exc), conn=conn),
                 http_status=400, code="INVALID_SCOPE_ANCHOR")
+        if not str(intent.identity.project or "").strip():
+            # P2: a refusal still has an audit row. Before s4j this fell through
+            # to `_record`, where the closed schema's `project: minLength 1`
+            # turned it into `EngineError("engine produced a receipt that
+            # violates the frozen contract")` — an unhandled exception out of
+            # every §7 adapter that builds its own TaskRequest, with nothing
+            # persisted. A missing project is a refusal the caller can read, not
+            # a crash: the adapter is the thing that has to name the project
+            # (§7.1 step 2), so the engine says so and records it.
+            return Authorization(
+                receipt=self._refusal(
+                    intent, caller, uncanonical_intent_hash(intent.identity),
+                    "PROJECT_REQUIRED",
+                    "§7.1 step 2: the adapter must name the project it is admitting for; "
+                    "an intent with no project cannot be keyed to a rollout mode, a lineage "
+                    "or a policy snapshot (P4, §3)",
+                    conn=conn),
+                http_status=400, code="PROJECT_REQUIRED")
         return intent, intent_hash(intent.identity)
 
     # ── public API ──────────────────────────────────────────────────────
@@ -1131,11 +1158,19 @@ class AuthorizationEngine:
         It is deliberately built from the refusal alone and not from the full
         input sweep: the answer does not depend on policy, so reading policy to
         produce it would be spending provider calls to decorate a refusal.
+
+        ⛔The project falls back to :data:`UNNAMED_PROJECT`. The frozen schema
+          requires ``project`` to be non-empty (§3), and P2 requires the audit
+          row anyway — so a refusal *for* a missing project says in the receipt
+          that none was named instead of failing to record the refusal at all.
+          The sentinel contains ``/``, which no project name can: the queue's
+          project is a directory basename.
         """
         receipt = {
             "receipt_id": str(uuid.uuid4()), "issued_at": _rfc3339(self._clock()),
             "issuer": self.config.issuer, "task_id": intent.task_id, "intent_hash": ih,
-            "parent_receipt_id": intent.parent_receipt_id, "project": intent.identity.project,
+            "parent_receipt_id": intent.parent_receipt_id,
+            "project": str(intent.identity.project or "").strip() or UNNAMED_PROJECT,
             "authority_source": {"decision_ids": sorted(set(intent.identity.authority_decision_ids)),
                                  "tier": None},
             "policy_generation": 0, "policy_hash": "not-consulted",
@@ -1408,7 +1443,7 @@ def reset_engine() -> None:
 __all__ = [
     "Authorization", "AuthorizationEngine", "DEFAULT_ROLE_AGENTS", "EMBEDDED_MODES",
     "ENFORCE", "MODES", "TEST", "EngineConfig",
-    "EngineError", "REVIEW_FLOOR", "SHADOW", "SnapshotHumanGate", "UnauthenticatedCaller",
+    "EngineError", "REVIEW_FLOOR", "SHADOW", "UNNAMED_PROJECT", "SnapshotHumanGate", "UnauthenticatedCaller",
     "UnavailableBudget", "UnavailableCapabilityRegistry", "UnavailablePolicySnapshot",
     "UnavailableRuntimeState", "get_engine", "intent_from_receipt", "intent_hash",
     "reset_engine", "work_hash",

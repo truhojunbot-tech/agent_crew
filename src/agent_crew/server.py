@@ -4686,6 +4686,27 @@ def create_app(
             pass
         return ""
 
+    def _successor_project_for(parent_task_id: str, ctx: Optional[dict] = None) -> str:
+        """The project a server-internal successor is admitted under (§7.1, s4j).
+
+        In precedence order: the parent row's own project, the project its
+        context named, then this dispatcher's identity — which is
+        `_server_identity()`'s, i.e. the `create_app` argument or the state
+        directory the DB sits in (#248). `""` only when none of the three
+        answer, and an empty project is then refused with a receipt rather
+        than crashing the caller.
+        """
+        row_project = ""
+        try:
+            for t in q().list_tasks():
+                if t.task_id == parent_task_id:
+                    row_project = str(getattr(t, "project", "") or "").strip()
+                    break
+        except Exception:  # noqa: BLE001 — provenance, never a reason to drop the successor
+            row_project = ""
+        ctx_project = str((ctx or {}).get("project") or "").strip()
+        return row_project or ctx_project or str(_server_identity()["project"] or "").strip()
+
     def _requeue_review_at_head(review_task_id: str, pr_number, head: str, ctx) -> None:
         """Enqueue one head-anchored review for a PR whose head moved (#304).
 
@@ -4711,6 +4732,12 @@ def create_app(
                 branch=base.get("branch") or "main",
                 priority=3,
                 context=context,
+                # s4j: a re-dispatched review is the same project as the review
+                # it supersedes. Naming none admitted project-less and the
+                # engine raised the frozen-contract violation inside the
+                # watchdog. `_server_identity` is the same fallback /health
+                # already reports this dispatcher under (#248).
+                project=_successor_project_for(review_task_id, base),
             ),
                         ingress="watchdog.stale_review")
             logger.info(
@@ -4840,6 +4867,10 @@ def create_app(
                 branch=original_task.branch,
                 priority=original_task.priority + 1,  # Bump priority for retries
                 context=retry_context,
+                # s4j: a retry is the same work, so the same project. The row is
+                # right here — `original_task` — so prefer it over the lookup.
+                project=(str(getattr(original_task, "project", "") or "").strip()
+                         or _successor_project_for(task_id, retry_context)),
             )
             from agent_crew.queue import TaskAlreadyExistsError as _TAE
             try:

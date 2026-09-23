@@ -49,6 +49,7 @@ from agent_crew.cea import adapters
 from agent_crew.cea.providers import SignatureStatus
 from agent_crew.cea.receipt import BudgetClass, HumanGateState
 from agent_crew.cea.runtime_state import RuntimeState
+from agent_crew.cea.engine import UNNAMED_PROJECT
 from agent_crew.cea.schema import validate_receipt
 
 from tests.unit.sev0_cea_acceptance_helpers import (
@@ -438,23 +439,21 @@ TRANSPORT_STATES = (AuthorityState("active"),
                     AuthorityState("budget-exhausted", budget=BudgetClass.EXHAUSTED))
 
 
-S4F_EMPTY_PROJECT = ("s4f item 'empty-project admission': {kind} builds its TaskRequest with no "
-                     "project (loop.enqueue_* / discussion.enqueue_panel_tasks); the engine RAISES "
-                     "EngineError ($.project non-empty) instead of a P2 BLOCK receipt, so the "
-                     "adapter crashes and nothing is persisted")
-
-
-#: Transports whose adapter builds its TaskRequest with no ``project`` (checked by
-#: ``test_every_transport_reaches_admission_as_its_own_ingress`` below: they reach
-#: admission and the engine raises). 4d-r3 adds six to the s4d-r2 two.
-EMPTY_PROJECT_KINDS = {"loop", "discussion", "cascade_test", "cascade_fallback", "cron_triage",
-                       "loop_review", "loop_test", "retry_http", "stale_review_http"}
-
-S4F_EMPTY_PROJECT = S4F_EMPTY_PROJECT.replace(
-    "(loop.enqueue_* / discussion.enqueue_panel_tasks)",
-    "(loop.enqueue_* / discussion.enqueue_panel_tasks / pipeline.auto_enqueue_test / "
-    "pipeline.auto_fallback_failed_task / triage.enqueue_task / server _auto_retry_failed_task "
-    "/ server _requeue_review_at_head)")
+#: Transports whose adapter built its TaskRequest with **no** ``project``.
+#:
+#: s4j emptied this set. Through s4i it held nine — ``loop``, ``discussion``,
+#: ``cascade_test``, ``cascade_fallback``, ``cron_triage``, ``loop_review``,
+#: ``loop_test``, ``retry_http``, ``stale_review_http`` — each of which reached
+#: admission with ``project=""`` and got ``EngineError($.project non-empty)``
+#: out of ``_record``: an unhandled exception inside the adapter, with nothing
+#: persisted. Each now names its project (the caller's, the parent row's, or the
+#: queue's own ``<base>/<project>/tasks.db`` identity), and an empty one that
+#: survives adapter translation is a ``PROJECT_REQUIRED`` BLOCK receipt.
+#:
+#: ⛔Keep it and keep it empty rather than deleting it. The assertion below is
+#:   what pins "no §7 adapter admits project-less" for every *future* transport;
+#:   a new adapter that forgets its project lands in the else-branch and fails.
+EMPTY_PROJECT_KINDS: set[str] = set()
 
 
 def _run(kind, tmp_path, live, monkeypatch):
@@ -469,10 +468,13 @@ def test_every_transport_reaches_admission_as_its_own_ingress(tmp_path, monkeypa
     """Not xfailed for any transport: the driver is real, whatever admission then does.
 
     Separates "the entry point reaches the one admission entry under its own
-    ingress id" (asserted for all fourteen) from "and the decision equals HTTP"
-    (strict-xfailed where the s4f item is open). For the empty-project kinds it
-    also pins *why* they fail, so the strict xfail cannot be failing for a
-    different reason (a broken driver) without this test going red."""
+    ingress id" (asserted for all fourteen) from "and the decision equals HTTP".
+
+    s4j: it also asserts that **every** adapter names a project. That used to be
+    the other way round — nine kinds were listed as project-less and this test
+    pinned *why* they failed, so their strict xfail could not be passing for the
+    wrong reason. With :data:`EMPTY_PROJECT_KINDS` empty the same assertion now
+    pins the fix, and a new adapter that forgets its project fails here."""
     live = LiveState(AuthorityState("active"))
     inject_cea(monkeypatch, live)
     spy = EnqueueSpy(monkeypatch)
@@ -489,16 +491,78 @@ def test_every_transport_reaches_admission_as_its_own_ingress(tmp_path, monkeypa
         assert empty and all(c[2] is None for c in empty), (
             f"{kind}: expected the empty-project raise; got {[(c[1].project, c[2]) for c in mine]}")
     else:
-        assert not empty, f"{kind}: builds a project-less request but is not listed as such"
+        assert not empty, (f"{kind}: builds a project-less request but is not listed as such — "
+                           f"every §7 adapter names its project (s4j)")
+
+
+#: s4j, **new item**: the two transports whose successor is the *same work* as
+#: its parent — a retry and a provider fallback keep the task_type, branch and
+#: (now) project of the task they replace, and `intent_hash` is exactly that
+#: tuple: task_id and description are deliberately not members (P4). So once
+#: s4j made them name their parent's project, their intent hash equals their
+#: parent's and P4 answers `DUPLICATE_INTENT` — correctly. Every other cascade
+#: changes work_class on the way (review→test, review→fix) and does not collide.
+#:
+#: This is not a regression of the project-required ingress; it is the invariant
+#: underneath it becoming reachable. Closing it is §8 re-admission: a retry and
+#: a fallback are the *same lineage* re-admitted (`retry=True`, which
+#: `_existing_lineage` already implements as RETRY_SAME_RECEIPT / supersede),
+#: not a new one — and `TaskQueue.enqueue` has no `retry=` passthrough yet, and
+#: the I1 baseline would have to seed the parent lineage to compare like for
+#: like. Both are out of s4j's one bounded item.
+#:
+#: Pinned by `test_s4j_retry_and_fallback_now_collide_with_their_parent_lineage`
+#: below, so this strict xfail cannot be failing for some other reason.
+SAME_WORK_AS_PARENT = {"retry_http", "cascade_fallback"}
+
+S4J_SAME_WORK = (
+    "s4j new item 'retry/fallback re-admission': {kind}'s successor carries its parent's "
+    "project (s4j), task_type and branch, so its intent_hash equals the parent's and P4 "
+    "answers DUPLICATE_INTENT — while the HTTP baseline, in a fresh DB with no parent "
+    "lineage, is admitted. Needs §8 re-admission (retry=True through TaskQueue.enqueue) "
+    "and an I1 baseline that seeds the lineage; neither is this step's item")
+
+
+def test_s4j_retry_and_fallback_now_collide_with_their_parent_lineage(tmp_path, monkeypatch):
+    """Why the two strict xfails above fail, asserted rather than asserted-about.
+
+    Drives the fallback cascade for real and reads the receipts out of its own
+    DB: the successor's `intent_hash` equals the parent's, and the refusal is
+    P4's `DUPLICATE_INTENT`. If the cause ever changes — a different code, or
+    the hashes diverging again — this goes red and the xfail's reason stops
+    being a story about code that has moved on."""
+    live = LiveState(AuthorityState("active"))
+    inject_cea(monkeypatch, live)
+    db = str(tmp_path / "collide.db")
+    _drive_r3("cascade_fallback", db, live, monkeypatch)
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = [json.loads(r["receipt_json"])
+                for r in conn.execute("SELECT receipt_json FROM authorization_receipts "
+                                      "ORDER BY rowid")]
+    finally:
+        conn.close()
+    parent = [r for r in rows if r["task_id"] == "impl-f"]
+    child = [r for r in rows if r["task_id"].startswith("fallback-")]
+    assert parent and child, [r["task_id"] for r in rows]
+    # the s4j half: the successor names the parent's project rather than ""
+    assert child[-1]["project"] == parent[-1]["project"] == "agent_crew"
+    # ...which is exactly why it collides: identity has no task_id in it (P4)
+    assert child[-1]["intent_hash"] == parent[-1]["intent_hash"]
+    assert child[-1]["decision"] == "BLOCK"
+    assert child[-1]["reason"]["code"] == "DUPLICATE_INTENT"
 
 
 @pytest.mark.parametrize("state", TRANSPORT_STATES, ids=lambda s: s.label)
 @pytest.mark.parametrize("kind", sorted(set(TRANSPORTS.values())))
 def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind, state,
                                                      request):
-    if kind in EMPTY_PROJECT_KINDS:
-        request.applymarker(pytest.mark.xfail(strict=True, raises=Exception,
-                                              reason=S4F_EMPTY_PROJECT.format(kind=kind)))
+    assert kind not in EMPTY_PROJECT_KINDS, (
+        f"{kind} is listed project-less; s4j closed that item — see EMPTY_PROJECT_KINDS")
+    if kind in SAME_WORK_AS_PARENT:
+        request.applymarker(pytest.mark.xfail(strict=True,
+                                              reason=S4J_SAME_WORK.format(kind=kind)))
     live = LiveState(state)
     inject_cea(monkeypatch, live)
     spy = EnqueueSpy(monkeypatch)
@@ -520,14 +584,20 @@ def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind
             f"I1 transport violated: {kind} vs http.tasks under {state.label}")
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "s4f item 'empty-project admission': `crew enqueue --db` without --project and "
-    "`watch.run_cycle(project='')` reach the engine with project='' and it RAISES a frozen-"
-    "contract violation ($.project non-empty) instead of writing a P2 BLOCK audit receipt; "
-    "the adapter surfaces an exception (cli exit 1 / watch 'enqueue failed') with no receipt"))
+#: s4j: the two ingresses that carry a *caller-supplied* project — `crew
+#: enqueue --db` and `watch.run_cycle(project=...)`. They do not back-fill it
+#: (unlike the §7 adapters that synthesise their own TaskRequest), so an empty
+#: one here is the caller's, and the contract is that it is refused rather than
+#: silently given a project the caller did not choose.
 @pytest.mark.parametrize("kind", ["cli", "cron_watch"])
 def test_empty_project_is_a_refusal_with_an_audit_receipt_not_an_exception(
         tmp_path, monkeypatch, kind):
+    """Was ``xfail(strict=True)`` through s4i: the engine RAISED a frozen-contract
+    violation (``$.project`` non-empty) out of ``_record`` instead of writing the
+    P2 BLOCK audit row, so the adapter surfaced an exception with no receipt.
+    s4j refuses in ``_canonicalize`` with ``PROJECT_REQUIRED``, and the marker
+    comes off in the same commit — a strict xfail that starts passing fails the
+    suite, so leaving it would hide the fix."""
     from agent_crew.queue import AdmissionRefused, TaskQueue
     live = LiveState(AuthorityState("active"))
     inject_cea(monkeypatch, live)
@@ -535,25 +605,16 @@ def test_empty_project_is_a_refusal_with_an_audit_receipt_not_an_exception(
     ingress = {"cli": "cli.enqueue", "cron_watch": "cron.watch"}[kind]
     with pytest.raises(AdmissionRefused) as exc:
         q.enqueue(task("e1", project=""), ingress=ingress)
-    assert persisted_receipt(q._db_path, exc.value.receipt_id) is not None
-
-
-@pytest.mark.xfail(strict=True, reason=(
-    "s4f item 'empty-project admission': `crew enqueue --db` without --project and "
-    "`watch.run_cycle(project='')` reach the engine with project='' and it RAISES a frozen-"
-    "contract violation ($.project non-empty) instead of writing a P2 BLOCK audit receipt; "
-    "the adapter surfaces an exception (cli exit 1 / watch 'enqueue failed') with no receipt"))
-@pytest.mark.parametrize("kind", ["cli", "cron_watch"])
-def test_empty_project_is_a_refusal_with_an_audit_receipt_not_an_exception(
-        tmp_path, monkeypatch, kind):
-    from agent_crew.queue import AdmissionRefused, TaskQueue
-    live = LiveState(AuthorityState("active"))
-    inject_cea(monkeypatch, live)
-    q = TaskQueue(str(tmp_path / "e.db"))
-    ingress = {"cli": "cli.enqueue", "cron_watch": "cron.watch"}[kind]
-    with pytest.raises(AdmissionRefused) as exc:
-        q.enqueue(task("e1", project=""), ingress=ingress)
-    assert persisted_receipt(q._db_path, exc.value.receipt_id) is not None
+    got = persisted_receipt(q._db_path, exc.value.receipt_id)
+    assert got is not None
+    assert not validate_receipt(got), validate_receipt(got)
+    assert got["decision"] == "BLOCK"
+    assert got["reason"]["code"] == "PROJECT_REQUIRED"
+    # §3 freezes `project` as non-empty, so the refusal names the sentinel
+    # rather than the caller's empty string — and the sentinel cannot be a
+    # real project (a project name is a directory basename).
+    assert got["project"] == UNNAMED_PROJECT
+    assert "/" in UNNAMED_PROJECT
 
 
 def test_http_refusal_is_a_4xx_carrying_the_receipt_id(tmp_path, monkeypatch):

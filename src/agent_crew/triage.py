@@ -294,8 +294,14 @@ def run(
     return {"gate_id": gate_id, "parsed": parsed, "branch": branch}
 
 
-def enqueue_task(queue, triage_result: dict) -> str:
-    """Enqueue an implement task from an approved triage result."""
+def enqueue_task(queue, triage_result: dict, *, project: str = "") -> str:
+    """Enqueue an implement task from an approved triage result.
+
+    ``project`` names the project the task is admitted under; a triage result
+    carries an issue and a branch but no project, so it otherwise comes from
+    the queue's own identity (``<base>/<project>/tasks.db``, §7.1 step 2, s4j).
+    Before s4j this adapter named none and admission raised out of it.
+    """
     parsed = triage_result["parsed"]
     branch = triage_result.get("branch", "main")
     req = TaskRequest(
@@ -304,6 +310,9 @@ def enqueue_task(queue, triage_result: dict) -> str:
         description=parsed["description"],
         branch=branch,
         context={"issue": parsed["issue"]},
+        project=(str(project or "").strip()
+                 or str(triage_result.get("project") or "").strip()
+                 or getattr(queue, "project_identity", "") or ""),
     )
     return queue.enqueue(req, ingress="cron.triage")
 

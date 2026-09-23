@@ -21,6 +21,10 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
         "branch": req.branch,
         "priority": req.priority,
         "context": req.context,
+        # s4j: the project rides over the wire too. Dropping it here made the
+        # `--port` variant of these helpers admit project-less through
+        # `http.tasks` even once the in-process variant named one.
+        "project": req.project,
     }).encode()
     http_req = urllib.request.Request(
         f"http://127.0.0.1:{port}/tasks",
@@ -48,13 +52,29 @@ _REVIEW_CONTEXT = {
 }
 
 
-def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, port: int = 0) -> str:
+def _adapter_project(queue, project: str = "") -> str:
+    """The project a loop task is admitted under (§7.1 step 2).
+
+    The caller's own name wins — `crew run` knows it from `--project`/state.
+    Otherwise it is the queue's own identity (`<base>/<project>/tasks.db`).
+    Before s4j these three helpers named no project at all and admission raised
+    a frozen-contract violation out of every one of them.
+    """
+    named = str(project or "").strip()
+    if named:
+        return named
+    return getattr(queue, "project_identity", "") or ""
+
+
+def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, port: int = 0,
+                      project: str = "") -> str:
     req = TaskRequest(
         task_id=f"impl-{uuid.uuid4().hex[:8]}",
         task_type="implement",
         description=task_desc,
         branch=branch,
         context={**_TDD_CONTEXT, **context},
+        project=_adapter_project(queue, project),
     )
     if port:
         return _post_task_http(port, req)
@@ -86,7 +106,8 @@ def next_review_action(outcome: str, attempts: int,
     return "retry" if attempts < max_attempts else "give_up"
 
 
-def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {}, port: int = 0) -> str:
+def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {},
+                   port: int = 0, project: str = "") -> str:
     # Check if a review task already exists for this impl task (auto-transition case).
     # This makes enqueue_review idempotent when the server has auto-created a review.
     try:
@@ -122,13 +143,15 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
         description=task_desc,
         branch=branch,
         context={**_REVIEW_CONTEXT, "prev_task_id": prev_task_id, **context},
+        project=_adapter_project(queue, project),
     )
     if port:
         return _post_task_http(port, req)
     return queue.enqueue(req, ingress="loop.review")
 
 
-def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", context: dict = {}, port: int = 0) -> str:
+def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", context: dict = {},
+                 port: int = 0, project: str = "") -> str:
     # Check if a test task already exists for this review task (auto-transition case).
     # This makes enqueue_test idempotent when the server has auto-created a test.
     if prev_task_id:
@@ -148,6 +171,7 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
         description=task_desc,
         branch=branch,
         context=merged_context,
+        project=_adapter_project(queue, project),
     )
     if port:
         return _post_task_http(port, req)

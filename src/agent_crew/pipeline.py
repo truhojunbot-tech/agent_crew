@@ -1093,7 +1093,7 @@ def auto_enqueue_fix(
                 description="\n".join(parts),
                 branch=review_task.branch,
                 context=fix_context,
-                project=review_project,
+                project=_successor_project(queue, review_task, server_project),
             ),
                           ingress="cascade.fix")
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
@@ -1275,6 +1275,25 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
                 )
         except Exception:  # noqa: BLE001
             pass
+
+
+def _successor_project(queue, parent_task, server_project: Optional[str] = None) -> str:
+    """The project a cascade successor is admitted under (§7.1 step 2, s4j).
+
+    The parent row is the queue identity that actually applies: a successor
+    belongs to the same project as the task that produced it, which is also
+    what the cross-project guards above compare against. The queue's own
+    directory identity is the fallback for a parent row admitted before
+    ``project`` was populated; the server's project is preferred over that
+    because it was configured rather than inferred.
+    """
+    for candidate in (getattr(parent_task, "project", "") or "",
+                      str(server_project or ""),
+                      getattr(queue, "project_identity", "") or ""):
+        named = str(candidate).strip()
+        if named:
+            return named
+    return ""
 
 
 def auto_enqueue_review(
@@ -1497,7 +1516,7 @@ def auto_enqueue_review(
             description=compact_desc,
             branch=impl_task.branch,
             context=review_context,
-            project=impl_project,
+            project=_successor_project(queue, impl_task, server_project),
         )
         try:
             queue.enqueue(review_req, ingress="cascade.review")
@@ -1619,6 +1638,7 @@ def auto_enqueue_test(
             description=compact_desc,
             branch=review_task.branch,
             context=test_context,
+            project=_successor_project(queue, review_task),
         )
         try:
             queue.enqueue(test_req, ingress="cascade.test")
@@ -1811,6 +1831,9 @@ def auto_fallback_failed_task(
                 branch=original.branch,
                 priority=original.priority,
                 context=new_ctx,
+                # s4j: a fallback is the same work on another provider, so it is
+                # the same project. Naming none admitted project-less.
+                project=_successor_project(queue, original),
             )
             try:
                 queue.enqueue(fallback_req, ingress="cascade.fallback")
