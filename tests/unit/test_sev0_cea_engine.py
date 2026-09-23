@@ -141,7 +141,7 @@ def intent(task_id="t1", *, ident=None, **kw) -> Intent:
 def caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON) -> Caller:
     """Minted the only way a Caller can be minted: an authenticator matched a
     credential (J9). There is no ``status`` parameter because there is nowhere
-    to put one — :func:`agent_crew.cea.intent._mint_caller` derives
+    to put one — :func:`agent_crew.cea._caller_mint.mint_caller` derives
     ``identity_status`` and it is UNVERIFIED until the O21b broker exists."""
     token = f"test-token::{principal}"
     authenticated = StaticTokenAuthenticator(

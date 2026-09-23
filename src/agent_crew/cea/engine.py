@@ -52,9 +52,10 @@ import uuid
 from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
+from agent_crew.cea._caller_mint import is_authenticated_caller
 from agent_crew.cea.intent import (
     IDENTITY_DEPENDENT_WORK_CLASSES, Caller, IdentityStatus, Intent, IntentIdentity,
-    InvalidScopeAnchor, Target, WorkClass, canonical_identity, is_authenticated_caller)
+    InvalidScopeAnchor, Target, WorkClass, canonical_identity)
 from agent_crew.cea.providers import (
     CapabilityLookup, PolicySnapshotRef, SignatureStatus)
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
@@ -365,10 +366,17 @@ class AuthorizationEngine:
         #       receipt as caller_identity_status=VERIFIED, although
         #       agent_crew.cea.auth has no broker producer at all (codex P1 #4,
         #       re-review of cb01d49).
-        #   The test is now *provenance of the object itself*: was it minted by
-        #   an authenticator, which happens only after a presented credential
-        #   matched. A forgery cannot set that by copying fields, and `Caller`
-        #   is sealed so the literal above no longer constructs.
+        #   The test is now *provenance of the object itself*: was it produced
+        #   by an authenticator, which happens only after a presented credential
+        #   matched. A forgery cannot set that by copying fields.
+        #
+        #   ⛔It is still not an authentication boundary and is not claimed as
+        #     one (codex, re-review of f1aee1d): in-process code can import
+        #     `_caller_mint.mint_caller`, or add an `object.__new__` instance to
+        #     the registry via `is_authenticated_caller.__closure__`. Both
+        #     produce a caller this test accepts. What makes that worthless is
+        #     below — no judgement differs by principal while identity is
+        #     UNVERIFIED — and the ENFORCE boundary check that follows.
         if caller is None:
             raise UnauthenticatedCaller(
                 "authorize() requires an authenticated Caller; adapters authenticate first (§7.1)")
@@ -770,7 +778,7 @@ class AuthorizationEngine:
         #   promoter was reachable from the public entry point by anyone willing
         #   to name the kind (codex P1 #4 r2). It is gone. Both statuses are
         #   unconditional here, and the authenticator derives identity_status on
-        #   the other side of the boundary (intent._mint_caller), so there is no
+        #   the other side of the boundary (_caller_mint.mint_caller), so there is no
         #   input anywhere that yields VERIFIED in this build.
         caller_status = IdentityStatus.UNVERIFIED
         executor_status = IdentityStatus.UNVERIFIED

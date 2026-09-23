@@ -663,8 +663,17 @@ def test_a_token_file_authenticator_mints_an_unverified_caller(tmp_path):
 
 def test_the_broker_credential_kind_still_has_no_producer():
     """`CREDENTIAL_KIND_BROKER` is a reserved name, not a capability. If a
-    producer ever appears it must arrive with the O21b verification evidence,
-    and this test is what makes that arrival visible."""
+    producer ever appears it must arrive with the O21b verification evidence.
+
+    ⛔This is a **lint**, not a security property, and it no longer claims to be
+      one. It greps ``auth.py`` for mint call sites, which cannot stop an
+      ``import agent_crew.cea._caller_mint`` from anywhere else in the
+      interpreter — codex's re-review of ``f1aee1d`` made exactly that point.
+      What it does do is make a *second, in-repo* producer of a Caller visible
+      in review, and make the arrival of a BROKER producer loud. The security
+      properties are tested in ``test_sev0_cea_s2a_fix_r3.py``: the forgeries
+      are reproduced there and shown to buy nothing.
+    """
     import inspect
 
     from agent_crew.cea import auth as auth_module
@@ -672,8 +681,8 @@ def test_the_broker_credential_kind_still_has_no_producer():
     source = inspect.getsource(auth_module)
     assert "CREDENTIAL_KIND_BROKER" in source, "the reserved name should still be documented"
     call_sites = [line.strip() for line in source.splitlines()
-                  if "_mint_caller(" in line and not line.strip().startswith("from ")]
-    assert len(call_sites) == 1, f"the mint must have exactly one call site, found {call_sites}"
+                  if "mint_caller(" in line and not line.strip().startswith(("from ", "import "))]
+    assert len(call_sites) == 1, f"auth.py should hold one mint call site, found {call_sites}"
     assert "CREDENTIAL_KIND_ADAPTER_TOKEN" in call_sites[0]
     assert "BROKER" not in call_sites[0]
 
