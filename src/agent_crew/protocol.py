@@ -118,6 +118,10 @@ class TaskResult:
     commit: str = ""
     retry_count: int = 0  # Track number of retry attempts
     error_info: Optional[dict] = None  # Structured error payload for debugging (#167)
+    #: #374: the non-commit artifact a declared contract hands back — for a
+    #: `report`, ``{"sha256": ..., "body": ...}`` or ``{"sha256": ..., "path": ...}``.
+    #: Optional and ignored unless the task declared `context.artifact_kind`.
+    artifact: Optional[dict] = None
 
     def __post_init__(self):
         # #305: keep the SPELLING honest without ever throwing the result away.

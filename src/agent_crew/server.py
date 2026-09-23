@@ -43,7 +43,10 @@ from agent_crew.pipeline import (
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     hold_mismatched_pr_result,
+    artifact_gate_applies,
+    declared_artifact_kind,
     no_artifact_result,
+    verify_task_artifact,
     resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
     stale_review_task_id,
@@ -4898,19 +4901,25 @@ def create_app(
             # its established fail-closed cascade handling (#313).
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
+        _artifact_verified = None
         if (not _runtime_paused and not _REPLAYING.get() and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
+                and declared_artifact_kind(_task) is None
                 and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
             logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
+        # #374: the check follows the task's declared contract; undeclared
+        # tasks keep #353's commit rule exactly (artifact_gate_applies).
         if (not _runtime_paused and not _REPLAYING.get()
-                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))
-                and _task is not None
-                and _task.task_type == "implement" and result.status == "completed"):
-            _ok, _detail = verify_implement_artifact(
-                _task, result, repo_cwd=_any_worktree_path())
+                and artifact_gate_applies(_task, result)):
+            _ok, _detail = verify_task_artifact(
+                _task, result, repo_cwd=_any_worktree_path(),
+                commit_verifier=verify_implement_artifact)
             if not _ok:
                 _artifact_held = _detail
                 result = no_artifact_result(result, _detail)
+            else:
+                _artifact_verified = {"kind": declared_artifact_kind(_task) if declared_artifact_kind(_task) is not None else "commit",
+                                      "detail": _detail}
         # #268: does this result even claim to be about the PR we dispatched
         # it for? Must happen before the row is written, so what lands in the
         # DB is the held form — a human reading the row later sees the
@@ -4936,6 +4945,7 @@ def create_app(
                 key: value for key, value in (
                     (RESULT_BRANCH_CONTEXT_KEY, result.branch),
                     (RESULT_COMMIT_CONTEXT_KEY, result.commit),
+                    ("result_artifact", _artifact_verified),
                 ) if value
             }
             if _result_ref:

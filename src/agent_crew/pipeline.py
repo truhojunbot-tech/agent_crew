@@ -18,8 +18,10 @@ functions, run them first, and *then* call ``_try_push_next``.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import sqlite3
 import json
 import subprocess
@@ -170,6 +172,211 @@ def verify_implement_artifact(
         return False, f"artifact verification unavailable: {type(exc).__name__}"
 
 
+#: Declared completion contracts (#374; owner ruling alfred#51 c5776940407 §4).
+#: The artifact a task must hand back depends on what it was asked to do: a
+#: rebase rewrites history, so its commit cannot descend from the old dispatch
+#: base; a read-only investigation must not commit at all. One commit rule for
+#: every task rejected both structurally. `none` is deliberately absent — a
+#: task with no artifact has nothing a gate can prove.
+ARTIFACT_KIND_CONTEXT_KEY = "artifact_kind"
+ARTIFACT_KINDS = ("commit", "rebase", "report", "review")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+#: A ref name git will not read as an option, a range or a path escape.
+_SAFE_REF_RE = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$")
+
+
+def declared_artifact_kind(task: Optional[TaskRequest]) -> Optional[str]:
+    """The contract the task declared, or None when it declared none.
+
+    Returned verbatim — an unsupported value is still "declared", so the gate
+    applies and refuses it rather than treating a typo as "no contract".
+    """
+    context = task.context if task is not None and isinstance(task.context, dict) else {}
+    if ARTIFACT_KIND_CONTEXT_KEY not in context:
+        return None
+    return str(context.get(ARTIFACT_KIND_CONTEXT_KEY) or "").strip().lower()
+
+
+def artifact_gate_applies(task: Optional[TaskRequest], result: TaskResult) -> bool:
+    """Whether a completion must prove its artifact before it is accepted.
+
+    * A declared contract is always checked, whatever the task_type.
+    * An undeclared task keeps exactly the #353 rule: an implement task with a
+      recorded dispatch base must prove a commit. This change adds contracts;
+      it does not loosen the default for anyone who did not declare one.
+    """
+    if task is None or result.status != "completed":
+        return False
+    if declared_artifact_kind(task) is not None:
+        return True
+    context = task.context if isinstance(task.context, dict) else {}
+    return task.task_type == "implement" and bool(
+        context.get("worktree_base_sha") or context.get("reviewed_sha"))
+
+
+def verify_task_artifact(
+    task: TaskRequest, result: TaskResult, *, repo_cwd: str,
+    commit_verifier=None,
+) -> tuple[bool, str]:
+    """Check a completion against its declared contract (#374). Fail-closed.
+
+    ``commit_verifier`` is the #353 check; callers pass the name they imported
+    so the commit contract stays the one existing function, unchanged.
+    """
+    kind = declared_artifact_kind(task)
+    if kind is None:            # undeclared → the #353 default; "" is declared, and refused
+        kind = "commit"
+    if kind == "commit":
+        return (commit_verifier or verify_implement_artifact)(task, result, repo_cwd=repo_cwd)
+    if kind == "rebase":
+        return verify_rebase_artifact(task, result, repo_cwd=repo_cwd)
+    if kind == "report":
+        return verify_report_artifact(task, result, repo_cwd=repo_cwd)
+    if kind == "review":
+        return verify_review_artifact(task, result)
+    return False, (f"unsupported artifact_kind {kind!r}; declare one of "
+                   f"{', '.join(ARTIFACT_KINDS)}")
+
+
+def _git(repo_cwd: str, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", repo_cwd, *args],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def verify_rebase_artifact(
+    task: TaskRequest, result: TaskResult, *, repo_cwd: str,
+) -> tuple[bool, str]:
+    """A rebase is proven by where it landed, not by where it started.
+
+    Requires: a declared ``context.rebase_onto``; the rebased branch pushed to
+    origin; the reported (or origin-derived) commit on that pushed branch; the
+    declared target's origin tip as its ancestor; and not the target tip itself
+    or the old dispatch base — both of those mean nothing was rewritten.
+    Ancestry is still required, only against the right ref (#374 option 1).
+    """
+    context = task.context if isinstance(task.context, dict) else {}
+    target = str(context.get("rebase_onto") or "").strip()
+    branch = (result.branch or task.branch or "").strip()
+    commit = (result.commit or "").strip()
+    base = str(context.get("worktree_base_sha") or context.get("reviewed_sha") or "").strip()
+    if not repo_cwd:
+        return False, "artifact repository unavailable"
+    if not target:
+        return False, "rebase contract requires context.rebase_onto"
+    if not branch:
+        return False, "rebase contract requires the rebased branch"
+    if not (_SAFE_REF_RE.match(target) and _SAFE_REF_RE.match(branch)):
+        return False, "rebase target or branch is not a plain ref name"
+    if branch == target:
+        return False, "rebased branch is the rebase target"
+    try:
+        if _git(repo_cwd, "fetch", "origin", target, "--quiet", timeout=60).returncode != 0:
+            return False, f"rebase target origin/{target} unavailable"
+        # Fetching the branch first is what #374's second case lacked: after a
+        # force-push the new head is not local until it is fetched.
+        if _git(repo_cwd, "fetch", "origin", branch, "--quiet", timeout=60).returncode != 0:
+            return False, f"rebased branch origin/{branch} is not pushed"
+        head = _git(repo_cwd, "rev-parse", "--verify", f"origin/{branch}^{{commit}}")
+        tip = _git(repo_cwd, "rev-parse", "--verify", f"origin/{target}^{{commit}}")
+        if head.returncode != 0 or tip.returncode != 0:
+            return False, "rebase refs are not resolvable after fetch"
+        head_sha, tip_sha = head.stdout.strip(), tip.stdout.strip()
+        if not commit:
+            commit = head_sha
+            result.commit = commit
+        if _git(repo_cwd, "rev-parse", "--verify", f"{commit}^{{commit}}").returncode != 0:
+            return False, "reported commit is not resolvable after fetching the pushed branch"
+        if commit != head_sha and _git(
+                repo_cwd, "merge-base", "--is-ancestor", commit, head_sha).returncode != 0:
+            return False, f"reported commit is not on the pushed branch origin/{branch}"
+        if commit == tip_sha:
+            return False, f"reported commit is the origin/{target} tip (no artifact)"
+        if base and commit == base:
+            return False, "reported commit is the dispatch base (nothing was rewritten)"
+        if _git(repo_cwd, "merge-base", "--is-ancestor", tip_sha, commit).returncode != 0:
+            return False, f"reported commit does not descend from origin/{target}"
+        return True, f"rebased onto origin/{target} ({tip_sha[:12]}) and pushed to origin/{branch}"
+    except Exception as exc:  # git availability is evidence, not a bypass.
+        return False, f"artifact verification unavailable: {type(exc).__name__}"
+
+
+def verify_report_artifact(
+    task: TaskRequest, result: TaskResult, *, repo_cwd: str,
+) -> tuple[bool, str]:
+    """A report is proven by content the server can hash, not by prose.
+
+    ``result.artifact`` must carry ``sha256`` and either ``body`` (inline) or
+    ``path`` (read at the reported commit from git, never from the
+    filesystem). The content must be non-empty, match its hash, and match
+    ``context.report_format`` (``text`` default, ``markdown``, ``json``).
+    """
+    context = task.context if isinstance(task.context, dict) else {}
+    artifact = result.artifact if isinstance(result.artifact, dict) else None
+    if artifact is None:
+        return False, "report contract requires result.artifact {body|path, sha256}"
+    sha = str(artifact.get("sha256") or "").strip().lower()
+    if not _SHA256_RE.match(sha):
+        return False, "report artifact requires a 64-hex sha256"
+    body = artifact.get("body")
+    path = str(artifact.get("path") or "").strip()
+    if isinstance(body, str) and body:
+        content, source = body, "inline body"
+    elif path:
+        commit = (result.commit or "").strip()
+        branch = (result.branch or task.branch or "").strip()
+        if not commit:
+            return False, "report path requires the commit it was written at"
+        if path.startswith("/") or ".." in path.split("/"):
+            return False, "report path must be repository-relative"
+        if not repo_cwd:
+            return False, "artifact repository unavailable"
+        try:
+            if branch and _SAFE_REF_RE.match(branch):
+                _git(repo_cwd, "fetch", "origin", branch, "--quiet", timeout=60)
+            shown = _git(repo_cwd, "show", f"{commit}:{path}")
+        except Exception as exc:
+            return False, f"artifact verification unavailable: {type(exc).__name__}"
+        if shown.returncode != 0:
+            return False, f"report path {path!r} is not present at the reported commit"
+        content, source = shown.stdout, f"{path}@{commit[:12]}"
+    else:
+        return False, "report artifact requires a non-empty body or a path"
+    if not content.strip():
+        return False, "report is empty"
+    if "\x00" in content:
+        return False, "report is not text"
+    fmt = str(context.get("report_format") or "text").strip().lower()
+    if fmt == "markdown":
+        if not any(line.lstrip().startswith("#") for line in content.splitlines()):
+            return False, "markdown report has no heading"
+    elif fmt == "json":
+        try:
+            json.loads(content)
+        except ValueError:
+            return False, "json report does not parse"
+    elif fmt != "text":
+        return False, f"unsupported report_format {fmt!r}"
+    if hashlib.sha256(content.encode("utf-8")).hexdigest() != sha:
+        return False, "report sha256 does not match its content"
+    return True, f"report {len(content)} chars sha256={sha} ({source})"
+
+
+def verify_review_artifact(task: TaskRequest, result: TaskResult) -> tuple[bool, str]:
+    """A review is proven by a verdict bound to a PR.
+
+    request_changes must say what to change, or the fix cascade has nothing
+    to act on — that is the empty review the gate exists to catch.
+    """
+    context = task.context if isinstance(task.context, dict) else {}
+    if result.verdict not in ("approve", "request_changes"):
+        return False, "review contract requires verdict approve or request_changes"
+    if result.pr_number is None and context.get("pr_number") in (None, "", False):
+        return False, "review contract requires the reviewed pr_number"
+    if result.verdict == "request_changes" and not [f for f in result.findings if str(f).strip()]:
+        return False, "request_changes review has no findings"
+    return True, f"review verdict {result.verdict}"
+
+
 def no_artifact_result(result: TaskResult, detail: str) -> TaskResult:
     """Preserve the worker report while making the absent artifact terminal."""
     return TaskResult(
@@ -177,7 +384,7 @@ def no_artifact_result(result: TaskResult, detail: str) -> TaskResult:
         summary=f"[no_artifact] {detail}; worker summary: {result.summary}",
         verdict=result.verdict, findings=result.findings, pr_number=result.pr_number,
         branch=result.branch, commit=result.commit,
-        error_info={"reason": "no_artifact", "detail": detail},
+        error_info={"reason": "no_artifact", "detail": detail}, artifact=result.artifact,
     )
 
 
