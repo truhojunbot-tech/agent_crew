@@ -163,14 +163,29 @@ class LiveState:
 
 
 def inject_cea(monkeypatch, live: LiveState, *, mode: str = "test") -> None:
+    """Every ``TaskQueue`` built in-process gets ``mode`` + the fixture providers.
+
+    ⛔4d-r3: *forced*, not ``setdefault``. Since the s4e merge (``b6be8d2``)
+      ``create_app`` builds its queue with ``cea_providers=wiring.providers`` from
+      :func:`agent_crew.cea.wiring.install_from_env`, so a ``setdefault`` lost and
+      every HTTP drive silently ran in ``mode=shadow`` against the LIVE alfred
+      governance files (snapshot, registry, quota dir, ``admission_inputs.py``)
+      and set the process-global runtime authority. ``install_from_env`` is
+      stubbed for the same reason: a test harness must neither read production
+      inputs nor mutate process-global authority.
+    """
+    import types
+    from agent_crew.cea import wiring as cea_wiring
     orig = TaskQueue.__init__
 
     def _init(self, db_path, *a, **kw):
-        kw.setdefault("cea_config", EngineConfig(mode=mode))
-        kw.setdefault("cea_providers", providers(live))
+        kw["cea_config"] = EngineConfig(mode=mode)
+        kw["cea_providers"] = providers(live)
         orig(self, db_path, *a, **kw)
 
     monkeypatch.setattr(TaskQueue, "__init__", _init)
+    monkeypatch.setattr(cea_wiring, "install_from_env", lambda *a, **k: types.SimpleNamespace(
+        providers=providers(live), authority=None, mode=mode, statuses=()))
 
 
 class EnqueueSpy:
