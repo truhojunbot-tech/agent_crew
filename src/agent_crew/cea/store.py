@@ -158,6 +158,28 @@ existing enqueue path fail on a live DB."""
 LIVE_STATES = ("ISSUED", "QUEUED", "CLAIMED", "RUNNING", "HELD")
 TERMINAL_STATES = ("CONSUMED", "SUPERSEDED", "REVOKED")
 
+LIFECYCLE_GRAPH: dict[str, frozenset[str]] = {
+    # §3 lifecycle: ISSUED → QUEUED → CLAIMED → RUNNING → CONSUMED, with HELD as
+    # the deferral the validator returns to the engine, and SUPERSEDED/REVOKED
+    # reachable from any live state (re-admission, revocation).
+    "ISSUED":     frozenset({"ISSUED", "QUEUED", "HELD", "SUPERSEDED", "REVOKED"}),
+    "QUEUED":     frozenset({"QUEUED", "CLAIMED", "HELD", "SUPERSEDED", "REVOKED"}),
+    # CLAIMED → CONSUMED is legal: the validator's RESULT point accepts a receipt
+    # still in CLAIMED, because a one-shot agent can finish without ever posting
+    # /start. Requiring RUNNING first would refuse real results.
+    "CLAIMED":    frozenset({"CLAIMED", "RUNNING", "CONSUMED", "HELD", "SUPERSEDED", "REVOKED"}),
+    "RUNNING":    frozenset({"RUNNING", "CONSUMED", "SUPERSEDED", "REVOKED"}),
+    "HELD":       frozenset({"HELD", "QUEUED", "CLAIMED", "SUPERSEDED", "REVOKED"}),
+    # terminal states are final — P4 replay refusal is only a fact if nothing
+    # can walk a receipt back out of one.
+    "CONSUMED":   frozenset(),
+    "SUPERSEDED": frozenset(),
+    "REVOKED":    frozenset(),
+}
+"""Which lifecycle transitions ``append_lifecycle`` will record. Self-transitions
+are permitted because a revision may carry only a ``mutate`` (minting a dispatch
+nonce on a CLAIMED receipt appends a new CLAIMED row)."""
+
 
 class ReceiptStoreError(Exception):
     """A receipt was rejected before it reached the table (contract violation)."""
@@ -224,10 +246,58 @@ def append_lifecycle(conn: sqlite3.Connection, receipt_id: str, state: str, *,
     Reads the current receipt, applies ``state`` (plus any ``mutate`` fields the
     transition legitimately changes, e.g. ``dispatch_nonces`` after a mint), and
     appends it at the next ``seq``. Returns the new receipt body.
+
+    The transition must be one :data:`LIFECYCLE_GRAPH` names, checked against the
+    current head **inside the caller's transaction**, so a concurrent writer
+    cannot interleave a second successor onto the same head. Terminal states have
+    no successors: without this, ``ISSUED → CONSUMED → RUNNING`` was accepted and
+    ``current_receipt`` then answered RUNNING, which defeats the P4 replay refusal
+    the append-only table exists to support (codex review of 10153bf, P1 #3).
     """
+    state = (state or "").strip().upper()
+    if state not in LIFECYCLE_GRAPH:
+        raise ReceiptStoreError(
+            f"unknown lifecycle state {state!r}; expected one of {tuple(LIFECYCLE_GRAPH)}")
+    # Read the head and append under one write lock, so two callers cannot both
+    # read the same head and both append a successor to it. When the caller is
+    # already inside a transaction (the ENQUEUE path holds one), we join theirs.
+    own_txn = not conn.in_transaction
+    if own_txn:
+        conn.execute("BEGIN IMMEDIATE")
+    try:
+        updated = _append_lifecycle_in_txn(conn, receipt_id, state,
+                                           recorded_by=recorded_by, note=note, mutate=mutate)
+    except BaseException:
+        if own_txn:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+        raise
+    if own_txn:
+        conn.execute("COMMIT")
+    return updated
+
+
+def _append_lifecycle_in_txn(conn: sqlite3.Connection, receipt_id: str, state: str, *,
+                             recorded_by: Optional[str], note: Optional[str],
+                             mutate: Optional[dict]) -> dict:
+    """The graph check and the append itself; the caller holds the write lock."""
     current = current_receipt(conn, receipt_id)
     if current is None:
         raise ReceiptStoreError(f"unknown receipt_id {receipt_id!r}")
+    frm = str(current.get("state") or "")
+    allowed = LIFECYCLE_GRAPH.get(frm)
+    if allowed is None:
+        raise ReceiptStoreError(
+            f"receipt {receipt_id!r} is in unknown state {frm!r}; refusing to move it")
+    if state not in allowed:
+        if frm in TERMINAL_STATES:
+            raise ReceiptStoreError(
+                f"{frm} is terminal: receipt {receipt_id!r} may not become {state} (§3, P4)")
+        raise ReceiptStoreError(
+            f"{frm} → {state} is not a lifecycle transition for receipt {receipt_id!r} "
+            f"(§3 permits {sorted(allowed)})")
     updated = dict(current)
     updated["state"] = state
     if mutate:

@@ -198,6 +198,72 @@ class TestReceiptStore:
         assert [h["seq"] for h in history] == [0, 1, 2]
         assert cea_store.current_receipt(store_conn, r["receipt_id"])["state"] == "CLAIMED"
 
+    def test_terminal_receipts_have_no_successors(self, store_conn):
+        """Codex review of 10153bf, P1 #3 — the exact reproduction: ISSUED →
+        CONSUMED → RUNNING was accepted, and ``current_receipt`` then answered
+        RUNNING, defeating the P4 replay refusal the append-only table supports."""
+        r = make_receipt()
+        cea_store.record_receipt(store_conn, r)
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "QUEUED")
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "CLAIMED")
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "RUNNING")
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "CONSUMED")
+        for revived in ("RUNNING", "QUEUED", "CLAIMED", "ISSUED", "HELD"):
+            with pytest.raises(cea_store.ReceiptStoreError, match="terminal"):
+                cea_store.append_lifecycle(store_conn, r["receipt_id"], revived)
+        assert cea_store.current_receipt(store_conn, r["receipt_id"])["state"] == "CONSUMED"
+        assert [h["state"] for h in cea_store.receipt_history(store_conn, r["receipt_id"])] == \
+               ["ISSUED", "QUEUED", "CLAIMED", "RUNNING", "CONSUMED"]
+
+    def test_issued_cannot_jump_straight_to_consumed(self, store_conn):
+        r = make_receipt()
+        cea_store.record_receipt(store_conn, r)
+        with pytest.raises(cea_store.ReceiptStoreError, match="not a lifecycle transition"):
+            cea_store.append_lifecycle(store_conn, r["receipt_id"], "CONSUMED")
+        with pytest.raises(cea_store.ReceiptStoreError, match="not a lifecycle transition"):
+            cea_store.append_lifecycle(store_conn, r["receipt_id"], "RUNNING")
+        assert cea_store.current_receipt(store_conn, r["receipt_id"])["state"] == "ISSUED"
+        assert len(cea_store.receipt_history(store_conn, r["receipt_id"])) == 1
+
+    def test_refused_transition_writes_no_row(self, store_conn):
+        r = make_receipt()
+        cea_store.record_receipt(store_conn, r)
+        before = store_conn.execute("SELECT COUNT(*) FROM authorization_receipts").fetchone()[0]
+        with pytest.raises(cea_store.ReceiptStoreError):
+            cea_store.append_lifecycle(store_conn, r["receipt_id"], "CONSUMED")
+        assert store_conn.execute(
+            "SELECT COUNT(*) FROM authorization_receipts").fetchone()[0] == before
+
+    def test_unknown_lifecycle_state_is_refused(self, store_conn):
+        r = make_receipt()
+        cea_store.record_receipt(store_conn, r)
+        with pytest.raises(cea_store.ReceiptStoreError, match="unknown lifecycle state"):
+            cea_store.append_lifecycle(store_conn, r["receipt_id"], "PARTY_MODE")
+
+    def test_held_returns_to_the_queue_and_revocation_is_always_available(self, store_conn):
+        """§3: HELD goes back to the engine, and a live receipt may always be
+        superseded or revoked."""
+        r = make_receipt()
+        cea_store.record_receipt(store_conn, r)
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "QUEUED")
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "HELD")
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "CLAIMED")
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "SUPERSEDED")
+        with pytest.raises(cea_store.ReceiptStoreError, match="terminal"):
+            cea_store.append_lifecycle(store_conn, r["receipt_id"], "RUNNING")
+
+    def test_self_transition_is_allowed_so_a_mutate_can_be_recorded(self, store_conn):
+        """Minting a dispatch nonce appends a new CLAIMED row — same state, new body."""
+        r = make_receipt()
+        cea_store.record_receipt(store_conn, r)
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "QUEUED")
+        cea_store.append_lifecycle(store_conn, r["receipt_id"], "CLAIMED")
+        nonce = {"nonce": "n-1", "attempt": 1, "issued_at": "2026-09-23T10:00:00Z", "used_at": None}
+        out = cea_store.append_lifecycle(store_conn, r["receipt_id"], "CLAIMED",
+                                         mutate={"dispatch_nonces": [nonce]})
+        assert out["dispatch_nonces"] == [nonce]
+        assert cea_store.current_receipt(store_conn, r["receipt_id"])["state"] == "CLAIMED"
+
     def test_nonce_is_single_use(self, store_conn):
         cea_store.mint_nonce(store_conn, "rid", 1, "nonce-a", "2026-09-23T10:00:00Z")
         assert cea_store.consume_nonce(store_conn, "nonce-a", used_by="claude") is True
