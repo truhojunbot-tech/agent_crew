@@ -5038,6 +5038,82 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def _promote_tokenomics_canary_receipt_in_txn(
+        self, conn, task_id: str, *, decision_source: str, recommendation: dict,
+        counterfactual: str, reason: str, cea_receipt_id: Optional[str], now: float,
+    ) -> None:
+        """Write the applied canary evidence on the caller's transaction."""
+        conn.execute(
+            """UPDATE tokenomics_shadow_receipts
+               SET canary_decision_source=?, canary_recommendation_json=?,
+                   canary_applied=1, canary_counterfactual=?, canary_reason=?,
+                   canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?
+               WHERE task_id=?""",
+            (decision_source, json.dumps(recommendation), counterfactual or None,
+             reason, cea_receipt_id, now, now, task_id),
+        )
+
+    def suppress_review_atomically(
+        self, task_id: str, result: TaskResult, *, decision_source: str,
+        recommendation: dict, counterfactual: str, reason: str,
+    ) -> bool:
+        """Commit a canary suppression and its evidence as one durable fact.
+
+        The dispatcher must never see a terminal reused verdict without its
+        applied receipt (or vice versa).  CEA's internal claim is bookkeeping:
+        no provider is invoked, but it makes the consumed terminal receipt an
+        auditable consequence of this same suppression transaction.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, receipt_id FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.rollback()
+                return False
+            now = time.time()
+            conn.execute(
+                """UPDATE tasks SET status=?, summary=?, verdict=?, findings=?, pr_number=?,
+                   status_changed_at=? WHERE task_id=?""",
+                (result.status, result.summary, result.verdict, json.dumps(result.findings),
+                 result.pr_number, now, task_id),
+            )
+            conn.execute(
+                "UPDATE task_attribution SET status=?, outcome=?, completed_at=?, updated_at=? "
+                "WHERE task_id=?",
+                (result.status, result.status, now, now, task_id),
+            )
+            self._record_end_on(conn, task_id, now, "result", posted=True,
+                                status=result.status, outcome=result.status)
+            receipt_id = row["receipt_id"] or None
+            if receipt_id:
+                receipt = _cea_store.current_receipt(conn, receipt_id)
+                state = (receipt or {}).get("state")
+                engine = self.cea_engine()
+                if state == "QUEUED":
+                    engine.transition(conn, receipt_id, "CLAIMED",
+                                      note="canary suppression internal claim")
+                engine.transition(conn, receipt_id, "CONSUMED",
+                                  note="canary suppression")
+            self._promote_tokenomics_canary_receipt_in_txn(
+                conn, task_id, decision_source=decision_source,
+                recommendation=recommendation, counterfactual=counterfactual,
+                reason=reason, cea_receipt_id=receipt_id, now=now,
+            )
+            conn.commit()
+            return True
+        except Exception:
+            logger.exception("tokenomics canary: atomic suppression failed for %s", task_id)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return False
+        finally:
+            conn.close()
+
     def get_tokenomics_shadow_receipt(self, task_id: str) -> Optional[dict]:
         """Return the main-branch shadow decision receipt for one task, if any."""
         conn = self._connect()

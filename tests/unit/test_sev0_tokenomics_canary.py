@@ -594,6 +594,70 @@ def test_exactly_one_applied_canary_receipt_per_suppression(monkeypatch, tmp_db)
     assert rows == 1, rows
 
 
+def test_failed_canary_promotion_rolls_back_suppression_and_dispatches(monkeypatch, tmp_db):
+    """Promotion failure leaves no terminal verdict or spent receipt behind."""
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    _seed_standing_request_changes(tmp_db)
+    monkeypatch.setenv(canary.CANARY_ENV, "impl-77")
+    push = _RecordingPush()
+    monkeypatch.setattr(
+        TaskQueue, "_promote_tokenomics_canary_receipt_in_txn",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("promotion failed")),
+    )
+    app = create_app(db_path=tmp_db, pane_map={"reviewer": "%200"}, port=9999,
+                     push_fn=push)
+    with TestClient(app) as client:
+        assert _post_rereview(client).status_code == 201
+
+    assert len(push.calls) == 1
+    queue = TaskQueue(tmp_db)
+    assert queue.get_result("review-impl-77-r1") is None
+    row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
+    assert row["canary_applied"] == 0
+    assert row["canary_reason"] == "suppression_transaction_failed"
+
+
+def test_post_commit_side_effect_failure_cannot_unsuppress(monkeypatch, tmp_db):
+    from fastapi.testclient import TestClient
+    from agent_crew import server as sv
+
+    _seed_standing_request_changes(tmp_db)
+    monkeypatch.setenv(canary.CANARY_ENV, "impl-77")
+    push = _RecordingPush()
+    monkeypatch.setattr(sv, "record_context_event",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("jsonl gone")))
+    app = sv.create_app(db_path=tmp_db, pane_map={"reviewer": "%200"}, port=9999,
+                        push_fn=push)
+    with TestClient(app) as client:
+        assert _post_rereview(client).status_code == 201
+
+    assert push.calls == []
+    row = TaskQueue(tmp_db).get_tokenomics_shadow_receipt("review-impl-77-r1")
+    assert row["canary_applied"] == 1
+
+
+def test_shadow_recommendation_is_byte_identical_to_the_decision(monkeypatch, tmp_db):
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    _seed_standing_request_changes(tmp_db)
+    monkeypatch.delenv(canary.CANARY_ENV, raising=False)
+    task = _review("review-impl-77-r1", parent="impl-77", sha=SHA_A)
+    expected = json.dumps(canary.evaluate_review_dispatch(
+        task, reviewed_sha=SHA_A,
+        standing_lookup=TaskQueue(tmp_db).standing_request_changes_review,
+    ).recommendation())
+    app = create_app(db_path=tmp_db, pane_map={"reviewer": "%200"}, port=9999,
+                     push_fn=_RecordingPush())
+    with TestClient(app) as client:
+        assert _post_rereview(client).status_code == 201
+
+    row = TaskQueue(tmp_db).get_tokenomics_shadow_receipt("review-impl-77-r1")
+    assert row["canary_recommendation_json"] == expected
+
+
 def test_unset_env_pushes_the_same_rereview_and_records_shadow(monkeypatch, tmp_db):
     from fastapi.testclient import TestClient
     from agent_crew.server import create_app

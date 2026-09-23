@@ -2845,44 +2845,30 @@ def create_app(
         findings = _canary.reuse_findings(
             getattr(decision, "standing_findings", None) or [],
             decision.standing_review_task_id)
+        result = TaskResult(
+            task_id=task.task_id, status="completed", summary=_canary.SUPPRESSED_REASON,
+            verdict="request_changes", findings=findings, pr_number=pr_number,
+        )
+        if not q().suppress_review_atomically(
+            task.task_id, result, decision_source=decision.decision_source,
+            recommendation=decision.recommendation(),
+            counterfactual=decision.counterfactual, reason=decision.reason,
+        ):
+            return False
+        # These audit sinks are deliberately post-commit best effort.  They
+        # cannot turn a committed suppression into a provider dispatch.
         try:
-            q().submit_result(
-                task.task_id,
-                TaskResult(task_id=task.task_id, status="completed",
-                           summary=_canary.SUPPRESSED_REASON,
-                           verdict="request_changes", findings=findings,
-                           pr_number=pr_number),
-            )
             _attr = q().get_attribution(task.task_id)
             record_context_event(
                 _context_events_path, "task_completed",
                 task_id=task.task_id, reason=_canary.SUPPRESSED_REASON,
-                project=(_attr or {}).get("project"),
-                role=(_attr or {}).get("role"),
-                agent=(_attr or {}).get("agent"),
-                context_id=(_attr or {}).get("context_id"),
+                project=(_attr or {}).get("project"), role=(_attr or {}).get("role"),
+                agent=(_attr or {}).get("agent"), context_id=(_attr or {}).get("context_id"),
             )
             if _attr:
                 append_attribution_jsonl(_attr_jsonl_path, _attr)
         except Exception:
-            logger.exception(
-                "tokenomics canary: could not record the suppressed verdict for %s",
-                task.task_id)
-            return False
-        if q().get_task_status(task.task_id) != "completed":
-            return False
-        # ⛔The result write tried to CONSUME the receipt and §3 refused it: a
-        #   suppressed review is decided at dispatch, so nothing ever CLAIMED
-        #   it and CONSUMED is not reachable from QUEUED. Left there, the task
-        #   is terminal while its authorization is still open. Settle it
-        #   explicitly as REVOKED — the reviewer invocation it authorized was
-        #   withdrawn, never spent.
-        try:
-            q().settle_unused_task_receipt(
-                task.task_id, note=f"canary: {_canary.SUPPRESSED_REASON}")
-        except Exception:
-            logger.exception(
-                "tokenomics canary: could not settle the receipt for %s", task.task_id)
+            logger.exception("tokenomics canary: post-commit audit failed for %s", task.task_id)
         # ⛔The cascade lives on the HTTP result endpoint, and this result never
         #   goes through it — the suppression writes it from inside dispatch. So
         #   drive the same transition here, or the reused verdict is recorded and
@@ -2924,8 +2910,9 @@ def create_app(
         # Persist an intent-only receipt first. ``applied=true`` is written
         # only after the terminal transition below is observable in the DB.
         _recommendation = decision.recommendation()
-        _recommendation["applied"] = False
-        _recommendation["transition_pending"] = bool(decision.applied)
+        if decision.applied:
+            _recommendation["applied"] = False
+            _recommendation["transition_pending"] = True
         try:
             q().record_tokenomics_canary_receipt(
                 task.task_id,
@@ -2952,26 +2939,23 @@ def create_app(
                     f"@ {(decision.reviewed_sha or '?')[:9]}")
             return False
         if not _complete_suppressed_review(task, decision):
+            try:
+                _recommendation["transition_pending"] = False
+                q().record_tokenomics_canary_receipt(
+                    task.task_id, decision_source=decision.decision_source,
+                    recommendation=_recommendation, applied=False,
+                    counterfactual=decision.counterfactual,
+                    reason="suppression_transaction_failed",
+                    cea_receipt_id=q().task_receipt_id(task.task_id),
+                )
+            except Exception:
+                logger.exception("tokenomics canary: could not record failed suppression for %s",
+                                 task.task_id)
             logger.error(
                 "tokenomics canary: could not confirm suppression for %s — dispatching",
                 task.task_id,
             )
             return False
-        try:
-            q().record_tokenomics_canary_receipt(
-                task.task_id,
-                decision_source=decision.decision_source,
-                recommendation=decision.recommendation(),
-                applied=True,
-                counterfactual=decision.counterfactual,
-                reason=decision.reason,
-                cea_receipt_id=q().task_receipt_id(task.task_id),
-            )
-        except Exception:
-            logger.exception(
-                "tokenomics canary: terminal suppression receipt update failed for %s",
-                task.task_id,
-            )
         logger.warning(
             f"tokenomics canary APPLIED: not dispatching review {task.task_id} — "
             f"{decision.standing_review_task_id} already stands as request_changes "
