@@ -434,13 +434,25 @@ class AuthorizationEngine:
 
     def transition(self, conn: sqlite3.Connection, receipt_id: str, state: str, *,
                    note: Optional[str] = None) -> dict:
-        """Append a lifecycle row and keep the P4 lineage claim in step with it."""
-        current = receipt_store.current_receipt(conn, receipt_id)
-        if current is None:
-            raise EngineError(f"unknown receipt_id {receipt_id!r}")
-        updated = self._resign(dict(current, state=state))
-        receipt_store.record_receipt(conn, updated, recorded_by="engine", note=note)
-        receipt_store.set_lineage_state(conn, updated["intent_hash"], receipt_id, state)
+        """Append a lifecycle row and keep the P4 lineage claim in step with it.
+
+        ⛔Goes through :func:`receipt_store.append_lifecycle`, which is where the
+          §3 graph and the terminal-state rule live. Calling ``record_receipt``
+          here instead put the guard on a road nobody drove down: the store-level
+          test passed while ``authorize → transition(CONSUMED) → transition(RUNNING)``
+          still succeeded through the engine and ``current_receipt`` answered
+          RUNNING — a consumed receipt walked back out of a terminal state by the
+          only route the engine actually offers (codex re-review of 4f79ce4, P1 #2).
+
+        The lineage claim is updated **after** the append, so a refused transition
+        leaves the lineage describing the state the receipt is really in.
+        """
+        try:
+            updated = receipt_store.append_lifecycle(
+                conn, receipt_id, state, recorded_by="engine", note=note, sign=self._resign)
+        except receipt_store.ReceiptStoreError as exc:
+            raise EngineError(str(exc)) from exc
+        receipt_store.set_lineage_state(conn, updated["intent_hash"], receipt_id, updated["state"])
         return updated
 
     # ── J1: an existing lineage ─────────────────────────────────────────

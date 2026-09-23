@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from agent_crew.cea.schema import canonical_json, schema_required_fields, validate_receipt
 
@@ -259,7 +259,8 @@ def record_receipt(conn: sqlite3.Connection, receipt: dict, *,
 
 def append_lifecycle(conn: sqlite3.Connection, receipt_id: str, state: str, *,
                      recorded_by: Optional[str] = None, note: Optional[str] = None,
-                     mutate: Optional[dict] = None) -> dict:
+                     mutate: Optional[dict] = None,
+                     sign: Optional[Callable[[dict], dict]] = None) -> dict:
     """Record a lifecycle transition as a **new row** (append-only, §3).
 
     Reads the current receipt, applies ``state`` (plus any ``mutate`` fields the
@@ -272,6 +273,12 @@ def append_lifecycle(conn: sqlite3.Connection, receipt_id: str, state: str, *,
     no successors: without this, ``ISSUED → CONSUMED → RUNNING`` was accepted and
     ``current_receipt`` then answered RUNNING, which defeats the P4 replay refusal
     the append-only table exists to support (codex review of 10153bf, P1 #3).
+
+    ``sign`` re-signs the revised body after ``state``/``mutate`` are applied and
+    before it is written. A signature covers the state it was made over, so a
+    caller that must re-sign has to do it *inside* this guard; passing the signing
+    step is what lets the engine stop calling :func:`record_receipt` directly and
+    losing the graph check with it (codex re-review of 4f79ce4, P1 #2).
     """
     state = (state or "").strip().upper()
     if state not in LIFECYCLE_GRAPH:
@@ -285,7 +292,8 @@ def append_lifecycle(conn: sqlite3.Connection, receipt_id: str, state: str, *,
         conn.execute("BEGIN IMMEDIATE")
     try:
         updated = _append_lifecycle_in_txn(conn, receipt_id, state,
-                                           recorded_by=recorded_by, note=note, mutate=mutate)
+                                           recorded_by=recorded_by, note=note, mutate=mutate,
+                                           sign=sign)
     except BaseException:
         if own_txn:
             try:
@@ -300,7 +308,8 @@ def append_lifecycle(conn: sqlite3.Connection, receipt_id: str, state: str, *,
 
 def _append_lifecycle_in_txn(conn: sqlite3.Connection, receipt_id: str, state: str, *,
                              recorded_by: Optional[str], note: Optional[str],
-                             mutate: Optional[dict]) -> dict:
+                             mutate: Optional[dict],
+                             sign: Optional[Callable[[dict], dict]] = None) -> dict:
     """The graph check and the append itself; the caller holds the write lock."""
     current = current_receipt(conn, receipt_id)
     if current is None:
@@ -321,6 +330,8 @@ def _append_lifecycle_in_txn(conn: sqlite3.Connection, receipt_id: str, state: s
     updated["state"] = state
     if mutate:
         updated.update(mutate)
+    if sign is not None:
+        updated = sign(updated)
     record_receipt(conn, updated, recorded_by=recorded_by, note=note)
     return updated
 

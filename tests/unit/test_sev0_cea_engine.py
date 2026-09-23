@@ -33,6 +33,23 @@ from agent_crew.cea.schema import validate_receipt
 from agent_crew.cea.validator import CurrentInputs, ValidationOutcome, ValidationPoint, validate
 
 
+def run_to(eng, conn, receipt_id, state):
+    """Walk the §3 lifecycle to ``state`` instead of jumping to it.
+
+    ``transition()`` now goes through the guarded append, so ISSUED → CONSUMED is
+    refused as the non-transition it always was. Tests that only need a receipt
+    *in* a state walk there the way the runtime does.
+    """
+    steps = {"CONSUMED": ("QUEUED", "CLAIMED", "CONSUMED"),
+             "RUNNING": ("QUEUED", "CLAIMED", "RUNNING"),
+             "SUPERSEDED": ("SUPERSEDED",)}[state]
+    out = None
+    for step in steps:
+        out = eng.transition(conn, receipt_id, step)
+    return out
+
+
+
 # ---------------------------------------------------------------------------
 # fixture writers — every provider answers, so a test that wants a missing input
 # has to say so explicitly. The failure mode this avoids is a test passing
@@ -406,7 +423,7 @@ def test_a_different_idempotency_key_on_a_live_intent_is_409(conn):
 def test_a_completed_lineage_refuses_re_admission(conn):
     eng = engine()
     first = eng.authorize(conn, intent("adm-r1"), caller())
-    eng.transition(conn, first.receipt_id, "CONSUMED")
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
     again = eng.authorize(conn, intent("adm-r2"), caller())
     assert again.http_status == 409 and again.code == "ALREADY_COMPLETED"
 
@@ -421,7 +438,7 @@ def test_a_superseding_decision_re_admits_completed_work(conn):
     the caller controls the hash inputs, so "the hash changed" proves nothing."""
     eng = engine()
     first = eng.authorize(conn, intent("adm-r1"), caller())
-    eng.transition(conn, first.receipt_id, "CONSUMED")
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING))
     superseding = intent("adm-r2", ident=identity(authority=("T0-1234", "T0-9999")))
@@ -665,6 +682,6 @@ def test_receipt_history_is_append_only_across_a_lifecycle(conn):
 def test_lineage_state_tracks_the_receipt(conn):
     eng = engine()
     auth = eng.authorize(conn, intent(), caller())
-    eng.transition(conn, auth.receipt_id, "RUNNING")
+    run_to(eng, conn, auth.receipt_id, "RUNNING")
     lineage = receipt_store.lineage_for_intent(conn, auth.receipt["intent_hash"])
     assert lineage["state"] == "RUNNING" and lineage["receipt_id"] == auth.receipt_id

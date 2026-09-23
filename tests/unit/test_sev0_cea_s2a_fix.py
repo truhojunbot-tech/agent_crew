@@ -30,7 +30,7 @@ from agent_crew.cea.schema import validate_receipt
 from agent_crew.cea.service import EngineService, UnixSocketEngineClient, encode_intent
 
 from tests.unit.test_sev0_cea_engine import (  # the step-2a fixture writers, unchanged
-    DECISION, FakeBudget, FakeGate, FakeRegistry, FakeRuntime, FakeSnapshot, caller,
+    DECISION, FakeBudget, FakeGate, FakeRegistry, FakeRuntime, FakeSnapshot, caller, run_to,
     engine, identity, intent)
 
 
@@ -375,7 +375,7 @@ def test_the_exact_review_bypass_of_already_completed(conn):
     eng = engine()
     first = eng.authorize(conn, _ops("j2-1"), caller())
     assert first.decision == "ALLOW"
-    eng.transition(conn, first.receipt_id, "CONSUMED")
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
 
     attack = eng.authorize(conn, _ops("j2-2", authority=("T0-1234", "ATTACKER-ID")), caller())
     assert attack.http_status == 409, "the completed work was re-admitted"
@@ -391,7 +391,7 @@ def test_a_real_id_that_does_not_supersede_is_also_refused(conn):
                             in_scope=(DECISION, DecisionRev("T0-5555", "d" * 32)))
     eng = engine(snapshots=snapshot)
     first = eng.authorize(conn, _ops("j2-3"), caller())
-    eng.transition(conn, first.receipt_id, "CONSUMED")
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
     again = eng.authorize(conn, _ops("j2-4", authority=("T0-1234", "T0-5555")), caller())
     assert again.code == "ALREADY_COMPLETED"
 
@@ -400,7 +400,7 @@ def test_an_explicit_superseding_record_in_the_snapshot_does_re_admit(conn):
     """The exception is real — it just has to be a record, not a claim."""
     plain = engine()
     first = plain.authorize(conn, _ops("j2-5"), caller())
-    plain.transition(conn, first.receipt_id, "CONSUMED")
+    run_to(plain, conn, first.receipt_id, "CONSUMED")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING))
     again = engine(snapshots=snapshot).authorize(
@@ -415,7 +415,7 @@ def test_a_superseding_record_the_caller_did_not_ask_under_is_not_enough(conn):
     every completed lineage it happens to name."""
     plain = engine()
     first = plain.authorize(conn, _ops("j2-7"), caller())
-    plain.transition(conn, first.receipt_id, "CONSUMED")
+    run_to(plain, conn, first.receipt_id, "CONSUMED")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING))
     again = engine(snapshots=snapshot).authorize(conn, _ops("j2-8", authority=("T0-1234",)),
@@ -428,7 +428,7 @@ def test_a_supersession_we_cannot_verify_is_not_one(conn, status):
     """P5 + P7 together: an unsigned snapshot cannot grant the exception either."""
     plain = engine()
     first = plain.authorize(conn, _ops(f"j2-sig-{status.value}"), caller())
-    plain.transition(conn, first.receipt_id, "CONSUMED")
+    run_to(plain, conn, first.receipt_id, "CONSUMED")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING), signature=status)
     again = engine(snapshots=snapshot).authorize(
@@ -456,3 +456,92 @@ def test_the_work_hash_is_the_identity_without_the_authority_ids(conn):
     assert work_hash(a) == work_hash(b)
     c = identity(work_class=WorkClass.OPS, authority=("T0-1234",), anchors=("ops/other.py",))
     assert work_hash(a) != work_hash(c), "different work is still different work"
+
+
+# ---------------------------------------------------------------------------
+# s1-fix re-review P1 #2 — the guard was on a road nobody drove down
+#
+# 4f79ce4 put the §3 graph in ``store.append_lifecycle`` and proved it with a
+# store-level test. The engine never called it: ``AuthorizationEngine.transition``
+# re-signed the body and called ``record_receipt`` directly, so every lifecycle
+# move the runtime actually makes skipped the guard entirely.
+# ---------------------------------------------------------------------------
+
+def test_the_engine_route_refuses_terminal_resurrection(conn):
+    """The exact repro from the review: authorize → CONSUMED → RUNNING.
+
+    Before the fix this succeeded and ``current_receipt`` answered RUNNING — a
+    consumed receipt walked back out of a terminal state and the P4 replay
+    refusal, which reads that same head, went with it.
+    """
+    eng = engine()
+    auth = eng.authorize(conn, intent("resurrect-1"), caller())
+    run_to(eng, conn, auth.receipt_id, "CONSUMED")
+    assert receipt_store.current_receipt(conn, auth.receipt_id)["state"] == "CONSUMED"
+
+    with pytest.raises(EngineError, match="CONSUMED is terminal"):
+        eng.transition(conn, auth.receipt_id, "RUNNING")
+
+    # the refusal is a refusal: the head did not move, and nothing was appended.
+    assert receipt_store.current_receipt(conn, auth.receipt_id)["state"] == "CONSUMED"
+    assert [h["receipt"]["state"] for h in receipt_store.receipt_history(conn, auth.receipt_id)] == [
+        "ISSUED", "QUEUED", "CLAIMED", "CONSUMED"]
+
+
+@pytest.mark.parametrize("to_state", ["RUNNING", "QUEUED", "CLAIMED", "ISSUED", "CONSUMED"])
+def test_a_completed_receipt_may_not_become_anything(conn, to_state):
+    """COMPLETED → anything is refused, through the engine route."""
+    eng = engine()
+    auth = eng.authorize(conn, intent(f"terminal-{to_state}"), caller())
+    run_to(eng, conn, auth.receipt_id, "CONSUMED")
+    with pytest.raises(EngineError, match="terminal"):
+        eng.transition(conn, auth.receipt_id, to_state)
+    assert receipt_store.current_receipt(conn, auth.receipt_id)["state"] == "CONSUMED"
+
+
+def test_the_engine_route_refuses_a_non_transition_too(conn):
+    """Not only terminal states: the whole §3 graph now applies to the engine."""
+    eng = engine()
+    auth = eng.authorize(conn, intent("skip-1"), caller())
+    with pytest.raises(EngineError, match="not a lifecycle transition"):
+        eng.transition(conn, auth.receipt_id, "CONSUMED")   # ISSUED → CONSUMED
+    assert receipt_store.current_receipt(conn, auth.receipt_id)["state"] == "ISSUED"
+
+
+def test_a_refused_transition_does_not_move_the_lineage(conn):
+    """The lineage claim is updated after the guarded append, never before.
+
+    A lineage left saying RUNNING for a receipt the store still calls CONSUMED
+    would re-admit work P4 refuses, using the engine's own bookkeeping as the
+    licence.
+    """
+    eng = engine()
+    auth = eng.authorize(conn, intent("lineage-1"), caller())
+    run_to(eng, conn, auth.receipt_id, "CONSUMED")
+    with pytest.raises(EngineError):
+        eng.transition(conn, auth.receipt_id, "RUNNING")
+    lineage = receipt_store.lineage_for_intent(conn, auth.receipt["intent_hash"])
+    assert lineage["state"] == "CONSUMED"
+
+
+def test_the_guarded_append_still_re_signs_the_body(conn):
+    """The signature has to cover the state it was made over.
+
+    Routing through ``append_lifecycle`` moved the signing step inside the guard;
+    if it had been dropped, every transitioned receipt would carry the previous
+    state's signature and validate as tampered.
+    """
+    import hashlib
+    import hmac as _hmac
+    from agent_crew.cea.schema import canonical_json
+
+    eng = engine()
+    auth = eng.authorize(conn, intent("resign-1"), caller())
+    moved = eng.transition(conn, auth.receipt_id, "QUEUED")
+    sig = moved["signature"]
+    if sig.get("value") is None:            # unkeyed engine: explicitly UNVERIFIED
+        assert sig["status"] == "UNVERIFIED"
+        return
+    body = {k: v for k, v in moved.items() if k != "signature"}
+    expected = _hmac.new(eng._key, canonical_json(body).encode("utf-8"), hashlib.sha256).hexdigest()
+    assert sig["value"] == expected
