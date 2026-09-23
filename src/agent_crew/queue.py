@@ -148,6 +148,55 @@ _DDL_MIGRATE_LAST_ACTIVITY = (
 _DDL_MIGRATE_PUSH_AT = "ALTER TABLE tasks ADD COLUMN push_at REAL NOT NULL DEFAULT 0"
 _DDL_MIGRATE_ERROR_INFO = "ALTER TABLE tasks ADD COLUMN error_info TEXT DEFAULT NULL"
 
+# G12 / D6: execution state per task (alfred#51 c5777790815 §2). The tasks
+# table could not say who claimed a task, where it was sent, whether it was
+# still alive or what build handed it out: `push_at` was 0 on 6801/6806
+# preserved rows, because only the tmux path ever wrote it.
+#
+# ⛔Every column defaults to NULL, as #278 does: a row written before this
+#   migration has no claim record, and 0 / '' would read as a claim nobody
+#   made. NULL is the only value that says "not recorded".
+#
+# These columns are the latest snapshot. The history — every claim, dispatch,
+# requeue and end, in order — is `task_exec_events`, which is append-only.
+_EXEC_STATE_COLUMN_TYPES = (
+    ("claimed_at", "REAL"),
+    ("claimed_by_role", "TEXT"),
+    ("claimed_by_agent", "TEXT"),
+    ("claimed_via", "TEXT"),
+    ("claim_build_commit", "TEXT"),
+    ("claim_code_fingerprint", "TEXT"),
+    ("dispatched_at", "REAL"),
+    ("dispatch_channel", "TEXT"),
+    ("dispatch_agent", "TEXT"),
+    ("dispatch_target", "TEXT"),
+    ("dispatch_attempt", "INTEGER"),
+    ("lease_owner", "TEXT"),
+    ("lease_expires_at", "REAL"),
+    ("last_heartbeat_at", "REAL"),
+    ("last_heartbeat_source", "TEXT"),
+    ("result_posted_at", "REAL"),
+)
+_DDL_MIGRATE_EXEC_STATE_COLUMNS = tuple(
+    f"ALTER TABLE tasks ADD COLUMN {name} {sql_type} DEFAULT NULL"
+    for name, sql_type in _EXEC_STATE_COLUMN_TYPES)
+
+#: What GET /tasks/{id} reports under `execution`, in this order.
+EXEC_STATE_COLUMNS = ("push_at",) + tuple(name for name, _ in _EXEC_STATE_COLUMN_TYPES)
+
+_DDL_TASK_EXEC_EVENTS = """
+CREATE TABLE IF NOT EXISTS task_exec_events (
+    event_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id   TEXT NOT NULL,
+    event     TEXT NOT NULL,
+    at        REAL NOT NULL,
+    fields    TEXT NOT NULL DEFAULT '{}'
+)
+"""
+_DDL_TASK_EXEC_EVENTS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_task_exec_events_task ON task_exec_events(task_id, event_id)"
+)
+
 _DDL_ATTRIBUTION = """
 CREATE TABLE IF NOT EXISTS task_attribution (
     task_id          TEXT PRIMARY KEY,
@@ -588,6 +637,14 @@ class TaskQueue:
             conn.execute(_DDL_MIGRATE_ERROR_INFO)
         except Exception:
             pass  # column already exists
+        # G12 / D6: execution-state snapshot columns + append-only history.
+        for _stmt in _DDL_MIGRATE_EXEC_STATE_COLUMNS:
+            try:
+                conn.execute(_stmt)
+            except Exception:
+                pass  # column already exists
+        conn.execute(_DDL_TASK_EXEC_EVENTS)
+        conn.execute(_DDL_TASK_EXEC_EVENTS_INDEX)
         # #202: durable context identity + lineage columns on task_attribution.
         for _stmt in _DDL_MIGRATE_ATTRIBUTION_COLUMNS:
             try:
@@ -1917,6 +1974,28 @@ class TaskQueue:
         try:
             row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
             return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def get_exec_state(self, task_id: str) -> Optional[dict]:
+        """Snapshot columns plus the ordered event history, for GET /tasks/{id}."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                f"SELECT {', '.join(EXEC_STATE_COLUMNS)} FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            out = {key: row[key] for key in EXEC_STATE_COLUMNS}
+            out["events"] = [
+                {"event_id": e["event_id"], "event": e["event"], "at": e["at"],
+                 **json.loads(e["fields"] or "{}")}
+                for e in conn.execute(
+                    "SELECT event_id, event, at, fields FROM task_exec_events"
+                    " WHERE task_id = ? ORDER BY event_id", (task_id,))
+            ]
+            return out
         finally:
             conn.close()
 

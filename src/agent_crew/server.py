@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import json
 import logging
 import os
@@ -4882,7 +4883,9 @@ def create_app(
         tasks = q().list_tasks()
         for t in tasks:
             if t.task_id == task_id:
-                return t
+                # G12 / D6: additive — every field a client already reads is
+                # unchanged; `execution` is the claim/dispatch/lease record.
+                return {**dataclasses.asdict(t), "execution": q().get_exec_state(task_id)}
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
 
     @app.post("/tasks/{task_id}/result", status_code=200)
