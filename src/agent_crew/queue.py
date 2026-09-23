@@ -4858,6 +4858,12 @@ class TaskQueue:
         finally:
             conn.close()
 
+    #: When a completed task's verdict landed. ``status_changed_at`` moves only
+    #: on a real status transition (#265), so for a completed review it is the
+    #: moment the verdict was recorded. Rows written before that column existed
+    #: carry its ``DEFAULT 0``, hence ``NULLIF`` before the legacy fallback.
+    _VERDICT_AT_SQL = "COALESCE(NULLIF(status_changed_at, 0), last_activity_at, created_at)"
+
     def standing_request_changes_review(
         self, *, pr_number: Optional[int] = None, branch: str = "",
         reviewed_sha: str = "", exclude_task_id: str = "",
@@ -4873,6 +4879,18 @@ class TaskQueue:
         Reviews that failed, timed out or were themselves suppressed carry no
         verdict and are skipped — they produced no judgement to supersede
         anything with.
+
+        ⛔"Latest" is the *verdict* time, not the claim time. Ordering by
+          ``last_activity_at`` ordered the rows by when each reviewer was
+          dispatched, which is not when it answered: claim A then B on the same
+          commit, then have B answer ``request_changes`` before A answers
+          ``approve``, and the row claimed later wins even though its verdict is
+          the older one — the withdrawn premise suppresses the next review
+          anyway. ``status_changed_at`` is stamped when the status actually
+          moves (#265), i.e. when the verdict landed, so that is the ordering
+          key. Rows predating that column store 0, so they fall back to
+          ``last_activity_at`` rather than sorting to the bottom; ``created_at``
+          breaks exact ties.
         """
         if not reviewed_sha:
             return None
@@ -4883,19 +4901,19 @@ class TaskQueue:
             if pr_number is not None:
                 rows = conn.execute(
                     "SELECT task_id, verdict, findings, pr_number, branch, context, "
-                    "       status, last_activity_at, created_at "
+                    "       status, last_activity_at, created_at, status_changed_at "
                     "FROM tasks WHERE task_type='review' AND status='completed' "
                     "  AND pr_number=? AND task_id<>? "
-                    "ORDER BY last_activity_at DESC, created_at DESC",
+                    f"ORDER BY {self._VERDICT_AT_SQL} DESC, created_at DESC",
                     (int(pr_number), exclude_task_id),
                 ).fetchall()
             else:
                 rows = conn.execute(
                     "SELECT task_id, verdict, findings, pr_number, branch, context, "
-                    "       status, last_activity_at, created_at "
+                    "       status, last_activity_at, created_at, status_changed_at "
                     "FROM tasks WHERE task_type='review' AND status='completed' "
                     "  AND branch=? AND pr_number IS NULL AND task_id<>? "
-                    "ORDER BY last_activity_at DESC, created_at DESC",
+                    f"ORDER BY {self._VERDICT_AT_SQL} DESC, created_at DESC",
                     (branch, exclude_task_id),
                 ).fetchall()
         finally:

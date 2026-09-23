@@ -172,6 +172,56 @@ def test_a_later_approve_on_the_same_sha_supersedes_the_request_changes(tmp_db):
         pr_number=7, reviewed_sha=SHA_A)["verdict"] == "approve"
 
 
+def test_the_later_verdict_wins_when_the_reviews_complete_out_of_order(tmp_db):
+    """Claim order is not verdict order.
+
+    Two reviewers are dispatched on the same commit; the one claimed second
+    answers first. Ordering by ``last_activity_at`` (claim time) returned that
+    row, so a ``request_changes`` already withdrawn by the later ``approve``
+    suppressed the next review. The standing verdict is the newest *verdict*.
+    """
+    queue = TaskQueue(tmp_db)
+    for task_id in ("rev-a", "rev-b"):
+        queue.enqueue(TaskRequest(
+            task_id=task_id, task_type="review", description="r", branch="feat/x",
+            context={"pr_number": 7, "reviewed_sha": SHA_A}))
+
+    # claimed A first, then B — so B holds the later `last_activity_at`
+    assert queue.dequeue(role="reviewer").task_id == "rev-a"
+    assert queue.dequeue(role="reviewer").task_id == "rev-b"
+
+    # ...but B answers first, and A's `approve` is the later verdict
+    queue.submit_result("rev-b", TaskResult(
+        task_id="rev-b", status="completed", summary="r", verdict="request_changes",
+        findings=["f1"], pr_number=7))
+    queue.submit_result("rev-a", TaskResult(
+        task_id="rev-a", status="completed", summary="r", verdict="approve",
+        findings=[], pr_number=7))
+
+    hit = queue.standing_request_changes_review(pr_number=7, reviewed_sha=SHA_A)
+    assert hit["task_id"] == "rev-a", (
+        "ordered by claim time, not verdict time — the superseded "
+        "request_changes would suppress the next review")
+    assert hit["verdict"] == "approve"
+
+
+def test_a_legacy_row_without_a_verdict_timestamp_still_orders(tmp_db):
+    """Rows predating `status_changed_at` store its DEFAULT 0. They must fall
+    back to `last_activity_at` rather than sorting behind everything."""
+    import sqlite3
+
+    queue = TaskQueue(tmp_db)
+    _finish_review(queue, "rev-legacy", verdict="request_changes", pr=7, sha=SHA_A)
+    conn = sqlite3.connect(tmp_db)
+    conn.execute("UPDATE tasks SET status_changed_at = 0, last_activity_at = ? "
+                 "WHERE task_id = 'rev-legacy'", (1_000.0,))
+    conn.commit()
+    conn.close()
+
+    hit = queue.standing_request_changes_review(pr_number=7, reviewed_sha=SHA_A)
+    assert hit["task_id"] == "rev-legacy" and hit["verdict"] == "request_changes"
+
+
 # ── the receipt row ────────────────────────────────────────────────────────
 
 def test_applied_receipt_carries_every_field_the_canary_is_judged_on(tmp_db):
