@@ -247,8 +247,13 @@ def _drifted_fields(was: dict, now: dict) -> tuple[str, ...]:
             changed.append(field_name)
     if _revs(was) != _revs(now):
         changed.append("source_decision_revs")
-    if (was.get("capability_registry") or {}).get("generation") != \
-            (now.get("capability_registry") or {}).get("generation"):
+    was_reg, now_reg = was.get("capability_registry") or {}, now.get("capability_registry") or {}
+    # ⛔Both fields, not just the generation. Registries in the field publish a
+    #   dated generation the frozen schema types as integer|null, so the engine
+    #   folds it into ``hash`` and leaves ``generation`` null — comparing only
+    #   the generation would then make registry drift permanently invisible,
+    #   which is the opposite of what this check is for.
+    if was_reg.get("generation") != now_reg.get("generation") or was_reg.get("hash") != now_reg.get("hash"):
         changed.append("capability_registry")
     was_cap, now_cap = was.get("matched_capability") or {}, now.get("matched_capability") or {}
     if was_cap.get("owner") != now_cap.get("owner") or was_cap.get("id") != now_cap.get("id"):

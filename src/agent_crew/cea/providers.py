@@ -11,7 +11,7 @@ reports *unavailable / stale* explicitly instead of guessing.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional, Protocol, runtime_checkable
 
@@ -59,6 +59,15 @@ class PolicySnapshotRef:
     signature: SignatureStatus = SignatureStatus.UNSIGNED
     age_seconds: Optional[float] = None    # vs snapshot_max_age (O20) when the SSOT is unreachable
     available: bool = True
+    tier: Optional[str] = None             # §3 ``authority_source.tier`` the snapshot assigns this intent
+    review_test_matrix: dict = field(default_factory=dict)
+    """J7 — ``{work_class: {"reviewer": ..., "tester": ...}}`` from the snapshot (§11.1 row 13,
+    O10). This is the **only** review/test decision after the fold: ``risk_tier.py`` stops
+    being one. The snapshot may only *tighten* :data:`~agent_crew.cea.engine.REVIEW_FLOOR`;
+    ``coordinator_managed`` never reduces it (§7.2)."""
+    human_gate_predicates: tuple[dict, ...] = ()
+    """J8 — the snapshot's gate predicates. A gate exists only if a record here says so;
+    a self-asserted flag on the request is never an input."""
 
 
 @runtime_checkable

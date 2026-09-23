@@ -127,6 +127,29 @@ CREATE TABLE IF NOT EXISTS dispatch_nonces (
 )
 """
 
+# P4: "a unique partial index on ``intent_hash`` for live lineages". The receipt
+# table is append-only, so one live lineage legitimately has many rows
+# (ISSUED → QUEUED → CLAIMED → …) and a partial index over it cannot express
+# "at most one". The constraint therefore lives in its own claim table, where
+# ``intent_hash`` is the PRIMARY KEY: a second admission of the same intent loses
+# the INSERT rather than losing a race. ⛔Not check-then-act — two adapters both
+# reading "no live lineage" and both inserting is exactly the duplicate E10 4c
+# found, and only the database can arbitrate it.
+#
+# A CONSUMED lineage keeps its row: that is what makes ALREADY_COMPLETED
+# answerable (P4). SUPERSEDED/REVOKED release it, because re-admission is the
+# intended outcome there.
+_DDL_INTENT_LINEAGES = """
+CREATE TABLE IF NOT EXISTS intent_lineages (
+    intent_hash TEXT PRIMARY KEY,
+    receipt_id  TEXT NOT NULL,
+    project     TEXT NOT NULL,
+    state       TEXT NOT NULL,
+    claimed_at  REAL NOT NULL,
+    updated_at  REAL NOT NULL
+)
+"""
+
 _DDL_MIGRATE_TASKS_RECEIPT_ID = "ALTER TABLE tasks ADD COLUMN receipt_id TEXT"
 """Step 1: nullable. Step 2 enforces ``NOT NULL`` + FK once every ingress mints a
 receipt — adding the constraint before the ingresses are wired would make every
@@ -149,6 +172,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     for stmt in _DDL_AUTHORIZATION_RECEIPTS_TRIGGERS:
         conn.execute(stmt)
     conn.execute(_DDL_DISPATCH_NONCES)
+    conn.execute(_DDL_INTENT_LINEAGES)
     try:
         conn.execute(_DDL_MIGRATE_TASKS_RECEIPT_ID)
     except sqlite3.OperationalError:
@@ -265,6 +289,73 @@ def nonce_row(conn: sqlite3.Connection, nonce: str) -> Optional[dict]:
         return None
     keys = ("nonce", "receipt_id", "attempt", "issued_at", "used_at", "used_by")
     return {k: (row[k] if isinstance(row, sqlite3.Row) else row[i]) for i, k in enumerate(keys)}
+
+
+# ── P4 lineage claims ───────────────────────────────────────────────────────
+
+def claim_lineage(conn: sqlite3.Connection, intent_hash: str, receipt_id: str,
+                  project: str, state: str) -> tuple[bool, Optional[str]]:
+    """Atomically claim ``intent_hash`` for this receipt.
+
+    Returns ``(True, receipt_id)`` for the winner and ``(False, holder)`` for a
+    caller that lost the race, naming the receipt that holds the lineage so the
+    adapter can answer ``409 DUPLICATE_INTENT`` with a usable id.
+    """
+    now = time.time()
+    cur = conn.execute(
+        "INSERT INTO intent_lineages (intent_hash, receipt_id, project, state, claimed_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(intent_hash) DO NOTHING",
+        (intent_hash, receipt_id, project, state, now, now))
+    if cur.rowcount == 1:
+        return True, receipt_id
+    return False, _lineage_holder(conn, intent_hash)
+
+
+def _lineage_holder(conn: sqlite3.Connection, intent_hash: str) -> Optional[str]:
+    row = conn.execute("SELECT receipt_id FROM intent_lineages WHERE intent_hash = ?",
+                       (intent_hash,)).fetchone()
+    if row is None:
+        return None
+    return row["receipt_id"] if isinstance(row, sqlite3.Row) else row[0]
+
+
+def lineage_for_intent(conn: sqlite3.Connection, intent_hash: str) -> Optional[dict]:
+    """The lineage currently occupying ``intent_hash``, or ``None``."""
+    row = conn.execute(
+        "SELECT intent_hash, receipt_id, project, state, claimed_at, updated_at "
+        "FROM intent_lineages WHERE intent_hash = ?", (intent_hash,)).fetchone()
+    if row is None:
+        return None
+    keys = ("intent_hash", "receipt_id", "project", "state", "claimed_at", "updated_at")
+    return {k: (row[k] if isinstance(row, sqlite3.Row) else row[i]) for i, k in enumerate(keys)}
+
+
+def set_lineage_state(conn: sqlite3.Connection, intent_hash: str, receipt_id: str,
+                      state: str) -> None:
+    """Keep the claim in step with the receipt's lifecycle.
+
+    SUPERSEDED and REVOKED release the claim so the intent can be re-admitted;
+    every other state — including CONSUMED — keeps it, because "this work already
+    completed" is a fact a later request has to be told (P4).
+    """
+    if state in ("SUPERSEDED", "REVOKED"):
+        release_lineage(conn, intent_hash, receipt_id)
+        return
+    conn.execute("UPDATE intent_lineages SET state = ?, updated_at = ? "
+                 "WHERE intent_hash = ? AND receipt_id = ?",
+                 (state, time.time(), intent_hash, receipt_id))
+
+
+def release_lineage(conn: sqlite3.Connection, intent_hash: str, receipt_id: str) -> bool:
+    """Free the claim, but only for the receipt that holds it.
+
+    The ``receipt_id`` predicate matters: without it a late transition on a
+    superseded receipt would release the *successor's* claim and reopen the
+    duplicate window this table exists to close.
+    """
+    cur = conn.execute("DELETE FROM intent_lineages WHERE intent_hash = ? AND receipt_id = ?",
+                       (intent_hash, receipt_id))
+    return cur.rowcount == 1
 
 
 def _now_rfc3339() -> str:

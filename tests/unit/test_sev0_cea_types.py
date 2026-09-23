@@ -126,19 +126,35 @@ def test_input_providers_return_data_not_decisions():
 
 
 # ---------------------------------------------------------------------------
-# No wiring, no DB, no routes (freeze rule) — delete when the engine lineage wires it.
+# Which runtime modules may reach into `cea` (the freeze rule, after step 1 wired it)
 # ---------------------------------------------------------------------------
 
-def test_nothing_in_the_runtime_imports_cea():
-    offenders = []
+# Step 1 (`4b62f32`) wired `queue.py → cea.store`, which made the original
+# "nothing in the runtime imports cea" guard red the moment it landed — it was
+# still failing at `10153bf`. A guard that asserts a state the tree has already
+# left is not a freeze rule, it is noise that trains people to ignore the suite.
+#
+# The invariant that is actually worth holding is the *direction*: the runtime
+# reaches into `cea` only at known, reviewed points, and `cea` never reaches back
+# (`test_cea_imports_no_db_http_or_queue_code`, below). This list is the review
+# gate — adding a call site means editing it, which is the point.
+CEA_IMPORTERS = {
+    "queue.py",        # step 1: the receipt store rides on the tasks DB connection
+}
+
+
+def test_only_the_declared_runtime_modules_import_cea():
+    found = set()
     for path in SRC.rglob("*.py"):
         if path.is_relative_to(SRC / "cea"):
             continue
         text = path.read_text(encoding="utf-8")
         if re.search(r"^\s*(from|import)\s+agent_crew\.cea\b|^\s*from\s+\.\s*cea\b|from agent_crew import .*\bcea\b",
                      text, re.MULTILINE):
-            offenders.append(path.relative_to(SRC).as_posix())
-    assert offenders == [], f"cea is wired before freeze: {offenders}"
+            found.add(path.relative_to(SRC).as_posix())
+    assert found == CEA_IMPORTERS, (
+        f"undeclared cea call sites: {sorted(found - CEA_IMPORTERS)}; "
+        f"declared but gone: {sorted(CEA_IMPORTERS - found)}")
 
 
 def test_cea_imports_no_db_http_or_queue_code():
