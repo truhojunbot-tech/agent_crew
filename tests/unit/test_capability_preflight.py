@@ -91,9 +91,13 @@ class LiveContract(unittest.TestCase):
         self.assertIn("quota-core.tokenomics-shadow-policy-v1", d.matches)
 
     def test_unrelated_work_is_allowed(self):
-        d = cp.check_admission("Fix the pagination of the Halla order-book viewer widget", "halla",
+        d = cp.check_admission("Fix the pagination of the order-book viewer widget", "agent_crew",
                                command=self.cmd())
         self.assertTrue(d.allow, d)
+
+    def test_uncovered_project_is_not_allowed(self):
+        d = cp.check_admission("Fix the pagination of the order-book viewer widget", "halla", command=self.cmd())
+        self.assertEqual((d.allow, d.reason), (False, "PROJECT_NOT_COVERED"))
 
 
 if __name__ == "__main__":
