@@ -3087,7 +3087,7 @@ class TaskQueue:
             # needs the reason as badly as one that sees "it failed", and leaving
             # the field null there is exactly what made the cause unreadable.
             error_info_json = None
-            if result.status in ("failed", "timed_out") and result.error_info:
+            if result.status in ("failed", "timed_out", "blocked") and result.error_info:
                 error_info_json = json.dumps(result.error_info)
             # ⛔`status_changed_at` moves only when the status actually moves.
             #   Stamping it on every submission made a duplicate same-status

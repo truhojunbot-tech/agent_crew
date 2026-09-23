@@ -3,6 +3,7 @@ import urllib.request
 import uuid
 
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+from agent_crew.tokenomics_canary import SUPPRESSED_REASON
 
 DEFAULT_MAX_ITER: int = 5
 
@@ -229,6 +230,12 @@ def handle_review_result(
     #
     #   It must not consume an escalation round either: `iteration >= max_iter`
     #   would turn an infrastructure fault into a verdict about the work.
+    # A canary suppression is an intentional terminal policy outcome, not a
+    # reviewer crash.  Retrying it manufactures fresh review ids, each of
+    # which would be suppressed and counted again.
+    if (getattr(result, "status", None) == "blocked"
+            and getattr(result, "summary", None) == SUPPRESSED_REASON):
+        return "review_suppressed"
     if getattr(result, "status", None) not in (None, "completed"):
         return "review_failed"
 

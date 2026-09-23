@@ -2827,12 +2827,17 @@ def create_app(
             logger.exception(
                 f"tokenomics canary: evaluation failed for {task.task_id} — dispatching")
             return False
+        # Persist an intent-only receipt first. ``applied=true`` is written
+        # only after the terminal transition below is observable in the DB.
+        _recommendation = decision.recommendation()
+        _recommendation["applied"] = False
+        _recommendation["transition_pending"] = bool(decision.applied)
         try:
             q().record_tokenomics_canary_receipt(
                 task.task_id,
                 decision_source=decision.decision_source,
-                recommendation=decision.recommendation(),
-                applied=decision.applied,
+                recommendation=_recommendation,
+                applied=False,
                 counterfactual=decision.counterfactual,
                 reason=decision.reason,
                 cea_receipt_id=q().task_receipt_id(task.task_id),
@@ -2852,13 +2857,33 @@ def create_app(
                     f"{decision.standing_review_task_id} on {decision.target} "
                     f"@ {(decision.reviewed_sha or '?')[:9]}")
             return False
+        if not _fail_if_active(task.task_id, _canary.SUPPRESSED_REASON, status="blocked"):
+            logger.error(
+                "tokenomics canary: could not confirm suppression for %s — dispatching",
+                task.task_id,
+            )
+            return False
+        try:
+            q().record_tokenomics_canary_receipt(
+                task.task_id,
+                decision_source=decision.decision_source,
+                recommendation=decision.recommendation(),
+                applied=True,
+                counterfactual=decision.counterfactual,
+                reason=decision.reason,
+                cea_receipt_id=q().task_receipt_id(task.task_id),
+            )
+        except Exception:
+            logger.exception(
+                "tokenomics canary: terminal suppression receipt update failed for %s",
+                task.task_id,
+            )
         logger.warning(
             f"tokenomics canary APPLIED: not dispatching review {task.task_id} — "
             f"{decision.standing_review_task_id} already stands as request_changes "
             f"on {decision.target} @ {(decision.reviewed_sha or '?')[:9]}. "
             f"Counterfactual: {decision.counterfactual}. "
             f"Roll back by unsetting {_canary.CANARY_ENV} (no restart).")
-        _fail_if_active(task.task_id, _canary.SUPPRESSED_REASON, status="blocked")
         return True
 
     # Expose watchdog tick on app.state so tests can drive it deterministically
@@ -3545,7 +3570,7 @@ def create_app(
     # instead of just inferrable (#202 acceptance criterion).
     _seen_context_keys_this_process: set[str] = set()
 
-    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed") -> None:
+    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed") -> bool:
         """End a task only when it is still in_progress (agent may have submitted first).
 
         `status` distinguishes two things the dispatcher used to conflate (#265):
@@ -3582,8 +3607,10 @@ def create_app(
                 # can see this task actually failed.
                 if _attr:
                     append_attribution_jsonl(_attr_jsonl_path, _attr)
+                return q().get_task_status(task_id) == status
             except Exception:
                 logger.exception(f"_fail_if_active: could not fail task {task_id}")
+        return False
 
     def _resolve_dispatch_target(task: TaskRequest, role: str) -> tuple[str, Optional[str]]:
         """Resolve the (agent, worktree_path) a task will actually dispatch

@@ -2536,6 +2536,13 @@ def run_cmd(task: str, db: str, project: str, base: str,
             )
             return
 
+        if outcome == "review_suppressed":
+            click.echo(
+                f"[{iteration}/{max_iter}] ⏸️ Review deliberately suppressed by "
+                "the tokenomics canary; stopping this lineage."
+            )
+            return
+
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] ✅ Review approved ({review_elapsed}s)")
             # Auto-resolve any pending gates before proceeding
@@ -2999,6 +3006,10 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
                     f"(status={getattr(review_result, 'status', '?')}). Stopping "
                     f"rather than re-implementing against empty feedback."
                 )
+                return
+
+            if outcome == "review_suppressed":
+                click.echo("Review deliberately suppressed by the tokenomics canary; stopping.")
                 return
 
             feedback = build_feedback(review_result)

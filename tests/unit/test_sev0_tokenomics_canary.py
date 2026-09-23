@@ -12,6 +12,7 @@ import json
 import pytest
 
 from agent_crew import tokenomics_canary as canary
+from agent_crew.loop import handle_review_result
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 
@@ -79,12 +80,14 @@ def test_applied_for_the_pinned_task_when_the_condition_holds(monkeypatch):
     assert decision.standing_review_task_id == "review-impl-1-r0"
 
 
-def test_the_review_tasks_own_id_also_arms_exactly_one_task(monkeypatch):
+def test_the_review_tasks_own_id_does_not_expand_the_owner_pinned_lineage(monkeypatch):
+    """§11 arms the parent implement task, never a review task id."""
     monkeypatch.setenv(canary.CANARY_ENV, "review-impl-1-r1")
     decision = canary.evaluate_review_dispatch(
         _review("review-impl-1-r1", parent="impl-1", sha=SHA_A),
         reviewed_sha=SHA_A, standing_lookup=_standing("request_changes"))
-    assert decision.applied is True
+    assert decision.applied is False
+    assert decision.reason == "condition_holds_not_the_pinned_task"
 
 
 # ── the condition ──────────────────────────────────────────────────────────
@@ -282,6 +285,42 @@ def test_the_canary_never_overwrites_the_342_shadow_columns(tmp_db):
                    "shadow_decision_source", "shadow_recommendation_json",
                    "shadow_reason", "actual_execution_json"):
         assert after[column] == before[column]
+
+
+def test_completion_shadow_refresh_never_erases_the_canary_measurement(tmp_db):
+    """Completion refresh owns ``shadow_*`` only, never the canary evidence."""
+    queue = TaskQueue(tmp_db)
+    task = _review("review-impl-canary-r1", parent="impl-canary", sha=SHA_A)
+    queue.enqueue(task)
+    queue.record_tokenomics_canary_receipt(
+        task.task_id, decision_source="quota_core_contract",
+        recommendation={"kind": canary.RECOMMENDATION_KIND, "applied": True},
+        applied=True, counterfactual="would dispatch", reason="standing")
+    queue.submit_result(task.task_id, TaskResult(
+        task_id=task.task_id, status="blocked", summary=canary.SUPPRESSED_REASON))
+
+    row = queue.get_tokenomics_shadow_receipt(task.task_id)
+    assert row["canary_applied"] == 1
+    assert json.loads(row["canary_recommendation_json"])["kind"] == canary.RECOMMENDATION_KIND
+    assert row["canary_reason"] == "standing"
+
+
+def test_suppressed_review_is_not_retried_as_a_failed_review():
+    """A deliberate canary suppression ends the logical review lineage once."""
+    suppressed = TaskResult(
+        task_id="review-impl-3-r1", status="blocked",
+        summary=canary.SUPPRESSED_REASON)
+    assert handle_review_result(suppressed, iteration=1, max_iter=5, no_tester=True) == (
+        "review_suppressed")
+
+
+def test_both_cli_review_loops_stop_on_deliberate_suppression():
+    """Neither loop may fall through to a feedback implementation round."""
+    import inspect
+
+    from agent_crew import cli
+
+    assert inspect.getsource(cli).count('outcome == "review_suppressed"') == 2
 
 
 def test_a_suppressed_review_is_terminal_and_readable(tmp_db):

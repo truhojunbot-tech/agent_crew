@@ -130,14 +130,13 @@ def _target_of(task) -> tuple[str, Optional[int], str]:
 def _is_pinned(task, pin: str) -> bool:
     """Does the pin name this review's lineage?
 
-    The pin is the IMPLEMENT task id (``context.prev_task_id``). The review's
-    own id is accepted too so that arming is not a guessing game about which
-    of the two identities the operator has in hand — either way the pin holds
-    exactly one value, so at most one lineage is ever affected.
+    The pin is the IMPLEMENT task id (``context.prev_task_id``).  The owner
+    named that identity explicitly; accepting the review id would create a
+    second, undocumented armed surface.
     """
     ctx = task.context if isinstance(getattr(task, "context", None), dict) else {}
     parent = (ctx.get("prev_task_id") or "").strip()
-    return pin in {parent, (getattr(task, "task_id", "") or "").strip()} and bool(pin)
+    return pin == parent and bool(pin)
 
 
 def evaluate_review_dispatch(
