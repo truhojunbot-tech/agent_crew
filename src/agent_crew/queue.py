@@ -1169,26 +1169,55 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def _authorize_legacy_loosening_in_txn(self, conn, *, frm: str, to: str, who: str,
+                                           decision_id: Optional[str], api: str) -> None:
+        """P6 authority for the #314-era entry points, which predate the state machine.
+
+        A legacy caller may still *tighten* freely. Loosening is the same decision
+        wherever it is made, so it goes through the same predicate the P6 path uses —
+        owner principal, a named T0 decision, and the containment check that refuses
+        to loosen a DRAINING/quarantine the runtime entered by itself. Before this,
+        ``set_stop_epoch(False)`` and ``resume_stop()`` wrote ACTIVE straight into the
+        row with ``decision_id=None``: an unauthenticated resume path around P6.
+        """
+        if _RUNTIME_TIGHTNESS[to] >= _RUNTIME_TIGHTNESS[frm]:
+            return
+        entered_by, quarantine_entry = self._last_draining_entry(conn)
+        refusal = self._transition_refusal(frm, to, who, decision_id, entered_by, quarantine_entry)
+        if refusal:
+            raise RuntimeTransitionRefused(f"{api}: {refusal}")
+
     def set_stop_epoch(self, paused: bool, incident: Optional[str] = None,
-                       note: Optional[str] = None) -> int:
+                       note: Optional[str] = None, *,
+                       who: str = "legacy:set_stop_epoch",
+                       decision_id: Optional[str] = None) -> int:
         """STOP 권위 전이. **DB에서 epoch를 먼저 +1 할당·commit**한다(§1: DB가 linearization point).
         cli pause/resume는 이 반환 epoch로 pause.json을 미러링해 두 소스의 generation을 일치시킨다.
-        반환: 새 epoch."""
+        반환: 새 epoch.
+
+        ``paused=False`` is a P6 loosening and carries P6's authority requirement:
+        pass ``who="owner…"`` and the ``decision_id`` of the T0 decision, or the call
+        raises :class:`RuntimeTransitionRefused`. Tightening is unchanged.
+        """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             cur = self._read_stop_row(conn)
             new_epoch = int(cur["epoch"]) + 1
             new_state = "STOPPED" if paused else "ACTIVE"
+            self._authorize_legacy_loosening_in_txn(
+                conn, frm=cur["state"], to=new_state, who=who, decision_id=decision_id,
+                api="legacy set_stop_epoch(paused=False)")
             conn.execute(
-                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state) "
-                "VALUES (1, ?, ?, ?, ?, ?, ?) "
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state, "
+                "decision_id) VALUES (1, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=excluded.paused, "
                 "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
-                "state=excluded.state",
-                (new_epoch, 1 if paused else 0, incident, note, time.time(), new_state))
+                "state=excluded.state, decision_id=excluded.decision_id",
+                (new_epoch, 1 if paused else 0, incident, note, time.time(), new_state,
+                 decision_id))
             self._record_runtime_event_on(conn, frm=cur["state"], to=new_state, epoch=new_epoch,
-                                          who="legacy:set_stop_epoch", reason=note,
+                                          who=who, reason=note, decision_id=decision_id,
                                           incident=incident, note=note)
             conn.execute("COMMIT")
             return new_epoch
@@ -1201,10 +1230,15 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def resume_stop(self, generation: int, incident: Optional[str] = None) -> dict:
+    def resume_stop(self, generation: int, incident: Optional[str] = None, *,
+                    who: str = "legacy:resume_stop",
+                    decision_id: Optional[str] = None) -> dict:
         """generation-aware resume (DB 권위 CAS). `generation`은 새 epoch 목표이며 **현재 epoch보다
         커야** 한다 — 그렇지 않으면 stale resume으로 거부(그 사이 새 STOP이 epoch를 올렸을 수 있음).
-        cli는 이 결과 epoch로 pause.json을 미러링한다. 반환: {resumed, epoch, reason}."""
+        cli는 이 결과 epoch로 pause.json을 미러링한다. 반환: {resumed, epoch, reason}.
+
+        P6: resume loosens the runtime, so it requires an owner principal in ``who``
+        and the T0 ``decision_id``; otherwise :class:`RuntimeTransitionRefused`."""
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1219,18 +1253,23 @@ class TaskQueue:
                 return {"resumed": False, "epoch": cur["epoch"],
                         "reason": f"stale resume gen {generation} <= current epoch {cur['epoch']} — 거부",
                         "incident": cur["incident"], "still_paused": True}
+            # P6: unpausing is a loosening. Same predicate as transition_runtime_state —
+            # owner + a named T0 decision + the containment check — or refuse.
+            self._authorize_legacy_loosening_in_txn(
+                conn, frm=cur["state"], to="ACTIVE", who=who, decision_id=decision_id,
+                api="legacy resume_stop()")
             # DB는 resume 후에도 incident를 provenance로 보존한다(명시 incident 없으면 기존 유지).
             _kept_incident = incident if incident is not None else cur["incident"]
             conn.execute(
-                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state) "
-                "VALUES (1, ?, 0, ?, ?, ?, 'ACTIVE') "
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state, "
+                "decision_id) VALUES (1, ?, 0, ?, ?, ?, 'ACTIVE', ?) "
                 "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=0, "
                 "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
-                "state='ACTIVE'",
-                (int(generation), _kept_incident, "resumed via cli", time.time()))
+                "state='ACTIVE', decision_id=excluded.decision_id",
+                (int(generation), _kept_incident, "resumed via cli", time.time(), decision_id))
             self._record_runtime_event_on(conn, frm=cur["state"], to="ACTIVE", epoch=int(generation),
-                                          who="legacy:resume_stop", reason="resumed via cli",
-                                          incident=_kept_incident)
+                                          who=who, reason="resumed via cli",
+                                          decision_id=decision_id, incident=_kept_incident)
             conn.execute("COMMIT")
             # cli는 이 incident를 pause.json에도 mirror해 두 소스의 provenance를 일치시킨다.
             return {"resumed": True, "epoch": int(generation), "reason": "resumed",

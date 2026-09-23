@@ -362,13 +362,66 @@ class TestRuntimeStateTransitions:
         assert q.get_stop_epoch()["paused"] is False
         assert q._stop_active_precheck() is False
 
-    def test_legacy_set_stop_epoch_still_moves_the_state(self, q):
+    def test_legacy_set_stop_epoch_still_tightens(self, q):
+        """Tightening through the #314 entry point is unchanged and recorded."""
         q.set_stop_epoch(True, incident="SEV-0")
         assert q.get_runtime_state()["state"] == "STOPPED"
-        q.set_stop_epoch(False)
+        assert q.runtime_state_events()[0]["who"] == "legacy:set_stop_epoch"
+        assert q.runtime_state_events()[0]["direction"] == "tighten"
+
+    def test_legacy_set_stop_epoch_cannot_loosen_without_owner(self, q):
+        """The #314 API is not a way around P6. Codex review of 10153bf: this call
+        used to write ACTIVE with ``decision_id=None`` and no owner check."""
+        q.set_stop_epoch(True, incident="SEV-0")
+        with pytest.raises(RuntimeTransitionRefused, match="owner only"):
+            q.set_stop_epoch(False)
+        assert q.get_runtime_state()["state"] == "STOPPED"
+        assert q.get_runtime_state()["decision_id"] is None
+        assert [e["to_state"] for e in q.runtime_state_events()] == ["STOPPED"]
+
+    def test_legacy_set_stop_epoch_owner_still_needs_a_t0_decision(self, q):
+        q.set_stop_epoch(True, incident="SEV-0")
+        with pytest.raises(RuntimeTransitionRefused, match="decision_id"):
+            q.set_stop_epoch(False, who="owner:hojun")
+        assert q.get_runtime_state()["state"] == "STOPPED"
+
+    def test_legacy_set_stop_epoch_loosens_with_owner_and_decision(self, q):
+        q.set_stop_epoch(True, incident="SEV-0")
+        q.set_stop_epoch(False, who="owner:hojun", decision_id="D-51-9")
+        state = q.get_runtime_state()
+        assert state["state"] == "ACTIVE" and state["decision_id"] == "D-51-9"
+        assert q.runtime_state_events()[0]["who"] == "owner:hojun"
+        assert q.runtime_state_events()[0]["decision_id"] == "D-51-9"
+
+    def test_legacy_set_stop_epoch_respects_the_containment_check(self, q):
+        """Even the owner may not loosen a DRAINING the runtime entered itself —
+        the containment trigger outranks the legacy path too."""
+        q.transition_runtime_state("DRAINING", who="runtime",
+                                   reason="quarantine trigger: checkout_moved_since_start")
+        with pytest.raises(RuntimeTransitionRefused, match="quarantine trigger"):
+            q.set_stop_epoch(False, who="owner:hojun", decision_id="D-51-9")
+        assert q.get_runtime_state()["state"] == "DRAINING"
+
+    def test_legacy_resume_stop_cannot_loosen_without_owner_and_decision(self, q):
+        """Reproduction from the review: ``STOPPED -> resume_stop(epoch+1)`` yielded
+        ACTIVE with ``decision_id=None``."""
+        q.set_stop_epoch(True, incident="SEV-0")
+        epoch = q.get_stop_epoch()["epoch"]
+        with pytest.raises(RuntimeTransitionRefused, match="owner only"):
+            q.resume_stop(generation=epoch + 1)
+        with pytest.raises(RuntimeTransitionRefused, match="decision_id"):
+            q.resume_stop(generation=epoch + 1, who="owner:hojun")
+        assert q.get_runtime_state()["state"] == "STOPPED"
+        res = q.resume_stop(generation=epoch + 1, who="owner:hojun", decision_id="D-51-9")
+        assert res["resumed"] is True
         assert q.get_runtime_state()["state"] == "ACTIVE"
-        assert [e["who"] for e in q.runtime_state_events()][:2] == \
-               ["legacy:set_stop_epoch", "legacy:set_stop_epoch"]
+        assert q.get_runtime_state()["decision_id"] == "D-51-9"
+
+    def test_legacy_resume_of_an_unpaused_runtime_needs_no_authority(self, q):
+        """No loosening happens, so nothing is demanded — and nothing is written."""
+        res = q.resume_stop(generation=99)
+        assert res["resumed"] is True and res["reason"] == "not paused"
+        assert q.runtime_state_events() == []
 
     def test_draining_and_quarantine_gate_enqueue_and_claim(self, q):
         """P6: DRAINING and QUARANTINED BLOCK enqueue and refuse claim, which the

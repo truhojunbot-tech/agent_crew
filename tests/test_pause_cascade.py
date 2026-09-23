@@ -148,7 +148,7 @@ class TestResumeReplay(Base):
         # resume_stop(DB)+pause.json 미러를 함께 수행한다 — 여기서도 동일하게 둘 다 해제한다.
         cur = pause._load(os.path.join(self.sd, "pause.json"))
         pause.resume(self.sd, generation=cur["generation"] + 1, source="test")
-        self.q.resume_stop(generation=self.q.get_stop_epoch()["epoch"] + 1)
+        self.q.resume_stop(generation=self.q.get_stop_epoch()["epoch"] + 1, who="owner:test", decision_id="D-51-9")
         self.assertFalse(pause.is_paused(self.sd))
         self.assertFalse(self.q.get_stop_epoch()["paused"])
         # replay
@@ -187,7 +187,7 @@ class TestReplaySideEffectBoundary(Base):
         # resume (pause.json + DB 권위)
         cur = pause._load(os.path.join(self.sd, "pause.json"))
         pause.resume(self.sd, generation=cur["generation"] + 1, source="test")
-        self.q.resume_stop(generation=self.q.get_stop_epoch()["epoch"] + 1)
+        self.q.resume_stop(generation=self.q.get_stop_epoch()["epoch"] + 1, who="owner:test", decision_id="D-51-9")
 
         rr = c.post("/admin/replay-suppressed")
         self.assertEqual(rr.status_code, 200)
@@ -443,7 +443,8 @@ class TestMcpTransportParity(Base):
 
         # Valid resume → the stored result replays and the lineage advances ONCE.
         q2 = TaskQueue(self.db)
-        q2.resume_stop(generation=int(q2.get_stop_epoch()["epoch"]) + 1)
+        q2.resume_stop(generation=int(q2.get_stop_epoch()["epoch"]) + 1,
+                       who="owner:test", decision_id="D-51-9")
         c = self._client()
         self.assertEqual(c.post("/admin/replay-suppressed").status_code, 200)
         self.assertEqual(self._review_count(), 1,

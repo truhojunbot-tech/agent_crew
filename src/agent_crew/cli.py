@@ -1526,8 +1526,11 @@ def pause(project: str, base: str, reason: str, source: str, incident: str, scop
 @click.option("--generation", type=int, required=True,
               help="Must be > current pause generation; stale resume is rejected")
 @click.option("--source", default="cli")
+@click.option("--decision-id", default="", metavar="T0-ID",
+              help="The owner (T0) decision authorising this resume. Required for project "
+                   "scope: P6 makes loosening owner-only and the requester does not self-attest.")
 @click.option("--scope", type=click.Choice(["project", "global"]), default="project", show_default=True)
-def resume(project: str, base: str, generation: int, source: str, scope: str):
+def resume(project: str, base: str, generation: int, source: str, decision_id: str, scope: str):
     """#311/#314 generation-aware resume. 오래된(stale) generation resume은 최신 STOP을 덮지 못한다.
 
     #314 §1: project scope는 **DB(runtime_stop) CAS가 권위**다 — `--generation`이 현재 DB epoch보다
@@ -1536,10 +1539,24 @@ def resume(project: str, base: str, generation: int, source: str, scope: str):
     from agent_crew import pause as pausemod
     state_dir = os.path.join(base, project) if scope == "project" else ""
     if scope == "project" and state_dir:
-        from agent_crew.queue import TaskQueue
+        from agent_crew.queue import TaskQueue, RuntimeTransitionRefused
         db_path = os.path.join(state_dir, "tasks.db")
         # (1) DB CAS resume (권위). 거부되면 pause.json 미변경.
-        res = TaskQueue(db_path).resume_stop(generation=generation)
+        # P6: resume is a loosening — owner principal + T0 decision_id, or the queue
+        # refuses. `crew resume` is the owner's own terminal, so it presents
+        # `owner:<source>`; the decision id is what makes that claim auditable.
+        if not decision_id.strip():
+            click.echo(json.dumps(
+                {"resumed": False, "reason": "P6: resume requires --decision-id naming the "
+                                             "owner (T0) decision that authorises it"},
+                ensure_ascii=False))
+            raise SystemExit(1)
+        try:
+            res = TaskQueue(db_path).resume_stop(
+                generation=generation, who=f"owner:{source}", decision_id=decision_id.strip())
+        except RuntimeTransitionRefused as exc:
+            click.echo(json.dumps({"resumed": False, "reason": str(exc)}, ensure_ascii=False))
+            raise SystemExit(1)
         if res.get("resumed"):
             # (2) pause.json 미러 — DB가 unpause를 승인한 epoch로만. #canary#1 fix: DB가 보존한
             # incident를 pause.json에도 명시적으로 mirror한다(None으로 만들지 않음). 그래야 부팅
