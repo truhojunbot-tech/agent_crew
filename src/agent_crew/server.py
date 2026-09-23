@@ -13,7 +13,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
@@ -2148,7 +2148,8 @@ def _default_push(pane_id: str, text: str) -> None:
     )
 
 
-def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mcp_mode: bool = False) -> str:
+def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, project: str = "",
+                             mcp_mode: bool = False) -> str:
     """Watchdog nudge: agent has been silent past the heartbeat threshold.
 
     In MCP mode (#162) emits a short one-liner — agents already have
@@ -2176,6 +2177,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
         f"\n"
         f"1) FINISHED — POST status=\"completed\":\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"    -H 'X-Agent-Crew-Project: {project}' \\\n"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"completed\","
         f"\"summary\":\"...\",\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
@@ -2184,6 +2186,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
         f"   status=\"failed\". The fallback policy will reroute this task\n"
         f"   to the next agent in the chain automatically:\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"    -H 'X-Agent-Crew-Project: {project}' \\\n"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"failed\","
         f"\"summary\":\"API stream timeout — partial response, no recovery\","
@@ -2232,7 +2235,7 @@ def _guard_description(task: TaskRequest) -> str:
     return f"{guard}\n\n{task.description}"
 
 
-def _format_task_message(task: TaskRequest, port: int) -> str:
+def _format_task_message(task: TaskRequest, port: int, *, project: str = "") -> str:
     ctx = json.dumps(task.context, ensure_ascii=False)
     description = _guard_description(task)
     return (
@@ -2246,6 +2249,7 @@ def _format_task_message(task: TaskRequest, port: int) -> str:
         f"=== END TASK ===\n"
         f"Do the work described above, then POST result: "
         f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
+        f"-H 'X-Agent-Crew-Project: {project}' "
         f"-H 'Content-Type: application/json' "
         f"-d '{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\",\"summary\":\"...\",\"findings\":[]}}'"
     )
@@ -2272,6 +2276,7 @@ def create_app(
     memory_provider: Optional[MemoryProvider] = None,
     shadow_memory_enabled: Optional[bool] = None,
     shadow_memory_timeout_seconds: Optional[float] = None,
+    identity_required: Optional[bool] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -2301,6 +2306,9 @@ def create_app(
         it. Falls back to _load_worktree_map(state_path) if omitted.
     memory_provider: optional project-local historical-memory provider. Its
         retrieval is shadow telemetry only and can never alter dispatch.
+    identity_required: require the project assertion header for worker HTTP
+        transport. Defaults on for the environment-backed production launcher;
+        in-process callers opt in explicitly.
     shadow_memory_enabled: explicit opt-in for shadow retrieval. Disabled by
         default, so even an injected provider receives zero calls until enabled.
     """
@@ -2348,6 +2356,8 @@ def create_app(
         fallback_disabled = os.getenv("AGENT_CREW_FALLBACK_DISABLED", "").lower() in (
             "1", "true", "yes",
         )
+    if identity_required is None:
+        identity_required = bool(os.getenv("AGENT_CREW_PROJECT"))
 
     # Phase 6a of the tmux→MCP cutover (Issue #119). The flag selects
     # whether the server actively pushes new tasks via tmux paste-buffer
@@ -2777,7 +2787,9 @@ def create_app(
         # or deleted task block to an otherwise healthy owned pane.
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        push_fn(guarded_pane_id, _format_task_message(
+            task, port, project=_server_identity()["project"],
+        ))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id)
@@ -2873,7 +2885,9 @@ def create_app(
             )
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        push_fn(guarded_pane_id, _format_task_message(
+            task, port, project=_server_identity()["project"],
+        ))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id)
 
@@ -3068,7 +3082,9 @@ def create_app(
                         logger.warning(f"watchdog: failed to send Ctrl+C to {pane_id}")
                 else:
                     try:
-                        push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
+                        push_fn(pane_id, _format_reminder_message(
+                            task_id, port, idle_for, project=_server_identity()["project"],
+                            mcp_mode=not _push_enabled))
                     except Exception:
                         logger.exception(
                             f"watchdog: failed to push reminder for {task_id}"
@@ -3729,7 +3745,7 @@ def create_app(
             logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
 
 
-        message = _format_task_message(task, port)
+        message = _format_task_message(task, port, project=_server_identity()["project"])
         # #239: assemble a bounded, provenance-linked Context Pack from durable
         # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
         # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
@@ -4661,6 +4677,36 @@ def create_app(
         return {"project": name, "db_path": db_path, "port": port or 0,
                 "state_path": state_path or ""}
 
+    def _require_project_identity(client_project: Optional[str]) -> None:
+        """Reject task transport unless the caller names this exact project.
+
+        The header is intentionally mandatory: a stale protocol that predates
+        #362 is no safer than a mismatched one when a recycled port is serving
+        another project's queue.
+        """
+        # In-process callers retain the historical unguarded API; the official
+        # environment-backed launcher always sets this gate on.
+        if not identity_required:
+            return
+        server_project = _server_identity()["project"]
+        if client_project == server_project and server_project:
+            return
+        logger.error(
+            "#362 project identity rejected task transport: expected project=%r, "
+            "server project=%r", client_project, server_project,
+        )
+        if not client_project:
+            raise HTTPException(
+                status_code=428,
+                detail=("project identity required: X-Agent-Crew-Project is missing; "
+                        f"server project={server_project!r}"),
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(f"project identity mismatch: expected project={client_project!r}, "
+                    f"server project={server_project!r}"),
+        )
+
     @app.get("/health")
     def health():
         """Liveness plus the build this process is actually running (#248).
@@ -4854,7 +4900,9 @@ def create_app(
         return {"task_id": task_id, "in_flight_for_issue": _in_flight}
 
     @app.get("/tasks/next")
-    def get_next_task(role: str = "", agent: str = ""):
+    def get_next_task(role: str = "", agent: str = "",
+                      x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         # #172: in MCP-only mode the LLM must use the get_next_task MCP tool,
         # not curl-poll this HTTP endpoint — block to prevent idle token burn.
         if not _push_enabled:
@@ -4883,7 +4931,9 @@ def create_app(
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
 
     @app.post("/tasks/{task_id}/result", status_code=200)
-    def submit_result(task_id: str, result: TaskResult):
+    def submit_result(task_id: str, result: TaskResult,
+                      x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
@@ -5442,5 +5492,6 @@ app = create_app(
     db_path=os.path.expanduser(os.getenv("AGENT_CREW_DB", "~/.agent_crew/default.db")),
     pane_map=_load_pane_map(),
     port=int(os.getenv("AGENT_CREW_PORT", "0") or 0),
+    project=os.getenv("AGENT_CREW_PROJECT") or None,
     state_path=os.path.expanduser(os.getenv("AGENT_CREW_STATE", "")) or None,
 )
