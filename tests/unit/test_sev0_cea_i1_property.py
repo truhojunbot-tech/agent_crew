@@ -223,7 +223,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 from click.testing import CliRunner  # noqa: E402
 
 from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
-    EnqueueSpy, LiveState, inject_cea, persisted_receipt)
+    EnqueueSpy, LiveState, dispatch_and_start, inject_cea, persisted_receipt,
+    seed_finished_parent)
 
 #: Every mutating FastAPI route, frozen. ``POST /tasks`` is the only one that is
 #: an ingress (http.tasks); retry.failed_task and watchdog.stale_review are
@@ -248,7 +249,12 @@ DOCUMENTED_MCP_TOOLS = {"get_next_task", "get_next_discuss_task", "submit_result
 #: here are the remaining sub-items (reported, not silently passed).
 TRANSPORTS = {"http.tasks": "http", "cli.enqueue": "cli", "loop.implement": "loop",
               "cli.discuss": "discussion", "cascade.review": "cascade_review",
-              "cron.watch": "cron_watch"}
+              "cron.watch": "cron_watch",
+              # 4d-r3: the eight the s4d-r2 result listed as remaining
+              "cascade.test": "cascade_test", "cascade.fix": "cascade_fix",
+              "cascade.fallback": "cascade_fallback", "cron.triage": "cron_triage",
+              "loop.review": "loop_review", "loop.test": "loop_test",
+              "retry.failed_task": "retry_http", "watchdog.stale_review": "stale_review_http"}
 NOT_YET_TRANSPORT_DRIVEN = sorted(set(DOCUMENTED) - set(TRANSPORTS))
 
 
@@ -277,9 +283,9 @@ def test_every_registered_adapter_is_transport_driven_or_listed_as_remaining():
     assert set(TRANSPORTS) <= set(adapters.BY_ID)
     # the remaining ids are reported in the step result; this pins the list so it
     # can only shrink knowingly.
-    assert NOT_YET_TRANSPORT_DRIVEN == sorted({
-        "cascade.fallback", "cascade.fix", "cascade.test", "cron.triage",
-        "loop.review", "loop.test", "retry.failed_task", "watchdog.stale_review"})
+    # 4d-r3: every documented ingress is now driven through its real entry point.
+    assert NOT_YET_TRANSPORT_DRIVEN == []
+    assert set(TRANSPORTS) == DOCUMENTED == set(adapters.BY_ID)
 
 
 def _via_http(tmp_path, req, name):
@@ -349,6 +355,71 @@ def _drive(kind, tmp_path, live):
                   repo="example/agent_crew", gh=_Gh(), owner="t", project="agent_crew")
 
 
+def _drive_r3(kind, db, live, monkeypatch):
+    """4d-r3 transports. Parents are seeded under ACTIVE by the helpers; the
+    transport itself runs under the target authority state."""
+    from agent_crew.queue import AdmissionRefused, TaskQueue
+    if kind == "cascade_test":
+        from agent_crew.pipeline import auto_enqueue_test
+        seed_finished_parent(db, live, task("rev-p", task_type="review", branch="feat/x"),
+                             verdict="approve")
+        auto_enqueue_test(TaskQueue(db), "rev-p", pr_state_fn=lambda *a, **k: "OPEN")
+    elif kind == "cascade_fix":
+        from agent_crew.pipeline import auto_enqueue_fix
+        seed_finished_parent(db, live, task("rev-p", task_type="review", branch="feat/x"),
+                             verdict="request_changes", findings=["P1: flag is ignored"])
+        auto_enqueue_fix(TaskQueue(db), "rev-p", pr_state_fn=lambda *a, **k: "OPEN",
+                         comment_fn=lambda *a, **k: None, suppress_side_effects=True)
+    elif kind == "cascade_fallback":
+        from agent_crew.pipeline import auto_fallback_failed_task
+        from agent_crew.protocol import TaskResult
+        seed_finished_parent(db, live, task("impl-f", context={"agent_override": "claude"}),
+                             status="failed", summary="rate limit exceeded (429)")
+        auto_fallback_failed_task(
+            TaskQueue(db), "impl-f",
+            TaskResult(task_id="impl-f", status="failed", summary="rate limit exceeded (429)"),
+            "implement", state_path=str(db) + ".state.json", suppress_side_effects=True)
+    elif kind == "cron_triage":
+        from agent_crew.triage import enqueue_task
+        try:
+            enqueue_task(TaskQueue(db), {"parsed": {"issue": 7, "description": "add a --json flag"},
+                                         "branch": "main"})
+        except AdmissionRefused:
+            pass
+    elif kind in ("loop_review", "loop_test"):
+        from agent_crew import loop
+        fn = loop.enqueue_review if kind == "loop_review" else loop.enqueue_test
+        try:
+            fn(TaskQueue(db), "add a --json flag", "feat/x", "impl-1")
+        except AdmissionRefused:
+            pass
+    elif kind == "retry_http":
+        nonce = dispatch_and_start(db, live, task("impl-r", context={"authority_decision_ids":
+                                                                     ["T0-1234"]}),
+                                   role="implementer")
+        with TestClient(_app(db), raise_server_exceptions=False) as c:
+            c.post("/tasks/impl-r/result", json={
+                "task_id": "impl-r", "status": "failed", "summary": "tests failed",
+                "executor_binding": {"nonce": nonce, "presenter": "claude"}})
+    elif kind == "stale_review_http":
+        from agent_crew import server as server_mod
+        from agent_crew.pipeline import ReviewPublication
+        monkeypatch.setattr(server_mod, "review_publication_decision",
+                            lambda *a, **k: ReviewPublication(
+                                publish=False, status="stale_head", reason="head moved",
+                                requeue_head="a" * 40))
+        nonce = dispatch_and_start(db, live, task("rev-s", task_type="review", branch="feat/x",
+                                                  context={"pr_number": 42}),
+                                   role="reviewer", agent="codex")
+        with TestClient(_app(db), raise_server_exceptions=False) as c:
+            c.post("/tasks/rev-s/result", json={
+                "task_id": "rev-s", "status": "completed", "verdict": "approve",
+                "summary": "lgtm", "pr_number": 42,
+                "executor_binding": {"nonce": nonce, "presenter": "codex"}})
+    else:
+        raise AssertionError(f"no driver for {kind}")
+
+
 def _view(admitted, r):
     return (admitted, r["decision"], json.dumps(r["reason"], sort_keys=True), r["intent_hash"])
 
@@ -364,17 +435,65 @@ S4F_EMPTY_PROJECT = ("s4f item 'empty-project admission': {kind} builds its Task
                      "adapter crashes and nothing is persisted")
 
 
+#: Transports whose adapter builds its TaskRequest with no ``project`` (checked by
+#: ``test_every_transport_reaches_admission_as_its_own_ingress`` below: they reach
+#: admission and the engine raises). 4d-r3 adds six to the s4d-r2 two.
+EMPTY_PROJECT_KINDS = {"loop", "discussion", "cascade_test", "cascade_fallback", "cron_triage",
+                       "loop_review", "loop_test", "retry_http", "stale_review_http"}
+
+S4F_EMPTY_PROJECT = S4F_EMPTY_PROJECT.replace(
+    "(loop.enqueue_* / discussion.enqueue_panel_tasks)",
+    "(loop.enqueue_* / discussion.enqueue_panel_tasks / pipeline.auto_enqueue_test / "
+    "pipeline.auto_fallback_failed_task / triage.enqueue_task / server _auto_retry_failed_task "
+    "/ server _requeue_review_at_head)")
+
+
+def _run(kind, tmp_path, live, monkeypatch):
+    if kind in {"http", "cli", "loop", "discussion", "cascade_review", "cron_watch"}:
+        _drive(kind, tmp_path, live)
+    else:
+        _drive_r3(kind, str(tmp_path / f"{kind}.db"), live, monkeypatch)
+
+
+@pytest.mark.parametrize("kind", sorted(set(TRANSPORTS.values())))
+def test_every_transport_reaches_admission_as_its_own_ingress(tmp_path, monkeypatch, kind):
+    """Not xfailed for any transport: the driver is real, whatever admission then does.
+
+    Separates "the entry point reaches the one admission entry under its own
+    ingress id" (asserted for all fourteen) from "and the decision equals HTTP"
+    (strict-xfailed where the s4f item is open). For the empty-project kinds it
+    also pins *why* they fail, so the strict xfail cannot be failing for a
+    different reason (a broken driver) without this test going red."""
+    live = LiveState(AuthorityState("active"))
+    inject_cea(monkeypatch, live)
+    spy = EnqueueSpy(monkeypatch)
+    try:
+        _run(kind, tmp_path, live, monkeypatch)
+    except Exception:
+        pass  # the loop/discussion helpers let the engine's raise escape
+    ingress_id = next(k for k, v in TRANSPORTS.items() if v == kind)
+    mine = [c for c in spy.calls if c[0] == ingress_id]
+    assert mine, f"{kind}: never reached admission as {ingress_id}; " \
+                 f"calls={[c[0] for c in spy.calls]}"
+    empty = [c for c in mine if not c[1].project]
+    if kind in EMPTY_PROJECT_KINDS:
+        assert empty and all(c[2] is None for c in empty), (
+            f"{kind}: expected the empty-project raise; got {[(c[1].project, c[2]) for c in mine]}")
+    else:
+        assert not empty, f"{kind}: builds a project-less request but is not listed as such"
+
+
 @pytest.mark.parametrize("state", TRANSPORT_STATES, ids=lambda s: s.label)
 @pytest.mark.parametrize("kind", sorted(set(TRANSPORTS.values())))
 def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind, state,
                                                      request):
-    if kind in ("loop", "discussion"):
+    if kind in EMPTY_PROJECT_KINDS:
         request.applymarker(pytest.mark.xfail(strict=True, raises=Exception,
                                               reason=S4F_EMPTY_PROJECT.format(kind=kind)))
     live = LiveState(state)
     inject_cea(monkeypatch, live)
     spy = EnqueueSpy(monkeypatch)
-    _drive(kind, tmp_path, live)
+    _run(kind, tmp_path, live, monkeypatch)
     ingress_id = next(k for k, v in TRANSPORTS.items() if v == kind)
     mine = [c for c in spy.calls if c[0] == ingress_id]
     assert mine, f"{kind}: the real entry point never reached admission as {ingress_id}; " \
