@@ -5015,12 +5015,22 @@ def create_app(
                                   "reason": "runtime_state_unreadable", "decision_id": None,
                                   "incident": None, "pause_json_tightening": None,
                                   "read_failed": True}
+        # s4i item 2: how many rows are still in the queue with no receipt at
+        # all. Under `shadow` they claim and dispatch and are REPORTed; under
+        # `enforce` claim refuses them. "Is this project ready for enforce?" is
+        # that number reaching zero, so it rides on the endpoint an operator
+        # already polls rather than living only in a log nobody greps.
+        try:
+            _cea_out = {"legacy_rows": q().cea_legacy_rows()}
+        except Exception as exc:
+            _cea_out = {"legacy_rows": {"error": f"{type(exc).__name__}: {exc}"}}
         return {
             "status": "ok",
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,
             "runtime_state": _runtime_state_out,
+            "cea": _cea_out,
             # G_DT: pushes refused because the target pane runs no agent CLI.
             "delivery_guard": {"delivery": _delivery_raw,
                                "refusals": dict(delivery_guard_refusals)},

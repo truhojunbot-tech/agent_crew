@@ -1857,12 +1857,10 @@ class TaskQueue:
           re-resolving from the environment underneath them would make the
           override advisory.
 
-        ⛔Threading `project` through the four *post-admission* call sites is
-          deliberately not done by passing it down from each caller: they must
-          use the project on the task's own **receipt**, so a task admitted
-          under one project's mode cannot be claimed or finished under another's.
-          Until that is wired (REMAINING, step 4c), those sites call this with no
-          argument and get the process-wide mode, exactly as before.
+        ⛔The four *post-admission* call sites do not pass their caller's idea of
+          the project down: they go through :meth:`cea_config_for_receipt`, which
+          reads the project off the task's own **receipt**. A task admitted under
+          one project's mode must not be claimable or finishable under another's.
         """
         if self._cea_config_override is not None:
             return self._cea_config_override
@@ -1872,6 +1870,31 @@ class TaskQueue:
             cached = _CeaEngineConfig.from_env(project=key)
             self._cea_config_by_project[key] = cached
         return cached
+
+    def cea_config_for_receipt(self, receipt: Optional[dict]) -> "_CeaEngineConfig":
+        """The rollout mode in force for the project **named on this receipt** (T3).
+
+        The four post-admission call sites — claim, dispatch, execute_start,
+        result — and the §8 re-admission gate all resolve their mode here, so a
+        lineage is decided end-to-end by one project's rollout setting.
+
+        ⛔Before this, they read the process-wide mode. A process serving a
+          project pinned to ``shadow`` while ``AGENT_CREW_CEA_MODE=enforce``
+          therefore *enforced* on it: s4c saw ``POST /result`` answer 409 from
+          the RESULT nonce rule (``NONCE_MISSING``, which is exactly what
+          ``shadow`` exists to record rather than refuse) before the T5 artifact
+          gate ever ran. Half-enforced is the one state rollout must not have.
+
+        The receipt's ``project`` is the right source and the row's is not: the
+        receipt is what admission signed, the row's ``project`` column is what a
+        caller wrote. A receipt with no project (or none at all) falls back to
+        the process-wide mode — see :meth:`_cea_legacy_row_report_on` for what
+        happens to a row that has no receipt to ask.
+        """
+        project = ""
+        if isinstance(receipt, dict):
+            project = str(receipt.get("project") or "").strip()
+        return self.cea_config(project or None)
 
     def cea_engine(self):
         """The T1 engine (in-process, or a socket client when one is configured).
@@ -2142,6 +2165,88 @@ class TaskQueue:
         conn.execute("UPDATE tasks SET context = ? WHERE task_id = ?",
                      (json.dumps(ctx), task_id))
 
+    #: The exec-event name for "a row with no receipt reached a P2 call site".
+    #: One vocabulary, so ``/health`` counts the same thing the log line says.
+    CEA_LEGACY_ROW_EVENT = "cea_legacy_row"
+
+    def _cea_report_legacy_row_on(self, conn, task_id: str, *, point: str,
+                                  config, at: Optional[float] = None) -> None:
+        """REPORT a receipt-less row at a P2 call site: one log line, one event.
+
+        A row admitted before step 2c has no receipt, so the gate cannot be
+        asked (:meth:`_cea_receipt_for_task_on` returns ``(None, None)`` and
+        stays honest about it). Under ``enforce`` claim already refuses such a
+        row; under ``shadow`` it runs — and the number a deployment actually
+        needs before it turns enforcement on is *how many of these are left*,
+        which a log line alone cannot answer after the fact.
+
+        So the measurement is a durable row in ``task_exec_events``, counted by
+        :meth:`cea_legacy_rows` and reported at ``/health`` under
+        ``cea.legacy_rows``. Recording only, in the same transaction as the
+        mutation it describes but under its own SAVEPOINT: a lost audit row is a
+        gap in the evidence, a raised exception here would be a changed claim.
+
+        ⛔The mode recorded is the **process-wide** one. There is no receipt, so
+          there is no signed project to key a per-project override off, and
+          trusting the row's own ``project`` column for that would let a caller
+          pick which rollout mode applies to it — the one thing
+          :meth:`cea_config_for_receipt` exists to prevent.
+        """
+        ts = time.time() if at is None else at
+        logger.warning(
+            "cea: REPORT legacy-row task_id=%s point=%s mode=%s enforced=%s — "
+            "no receipt (admitted before step 2c); enforce refuses, shadow counts",
+            task_id, point, config.mode, config.enforcing)
+        try:
+            conn.execute("SAVEPOINT cea_legacy_report")
+            self._append_exec_event_on(
+                conn, task_id, self.CEA_LEGACY_ROW_EVENT, ts, point=point,
+                mode=config.mode, enforced=config.enforcing, reason="NO_RECEIPT")
+            conn.execute("RELEASE SAVEPOINT cea_legacy_report")
+        except Exception:
+            logger.exception("cea: legacy-row report failed task_id=%s point=%s",
+                             task_id, point)
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK TO SAVEPOINT cea_legacy_report")
+                conn.execute("RELEASE SAVEPOINT cea_legacy_report")
+
+    def cea_legacy_rows(self) -> dict:
+        """How many receipt-less rows are left, and where they were seen.
+
+        ``total`` / ``open`` come from the rows themselves — the ground truth,
+        including rows no call site has touched yet. ``reported`` counts
+        *distinct tasks* seen at each P2 point, so a row that was claimed twice
+        is one legacy row and not two.
+
+        Read-only, and it never raises: ``/health`` is what a poller uses to
+        find out the server is wrong, so it must not be the thing that breaks.
+        """
+        out = {"total": 0, "open": 0, "by_status": {}, "reported": {},
+               "event": self.CEA_LEGACY_ROW_EVENT}
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT status, COUNT(*) AS n FROM tasks"
+                " WHERE receipt_id IS NULL OR receipt_id = '' GROUP BY status").fetchall()
+            for row in rows:
+                status = row["status"] or ""
+                out["by_status"][status] = int(row["n"])
+                out["total"] += int(row["n"])
+                if status in ("pending", "in_progress"):
+                    out["open"] += int(row["n"])
+            seen = conn.execute(
+                "SELECT json_extract(fields, '$.point') AS point,"
+                " COUNT(DISTINCT task_id) AS n FROM task_exec_events"
+                " WHERE event = ? GROUP BY point", (self.CEA_LEGACY_ROW_EVENT,)).fetchall()
+            for row in seen:
+                out["reported"][row["point"] or "unknown"] = int(row["n"])
+        except Exception as exc:
+            out["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            with contextlib.suppress(Exception):
+                conn.close()
+        return out
+
     def _cea_claim_gate(self, conn, task_id: str, *, agent: str = "", role: str = ""):
         """P2 CLAIM — ``None`` for a pre-2c row that has no receipt at all.
 
@@ -2163,7 +2268,7 @@ class TaskQueue:
         return _cea_callsites.gate_claim(
             receipt, claimant=claimant,
             current=_cea_callsites.current_inputs(engine, receipt, claimant=claimant),
-            config=self.cea_config())
+            config=self.cea_config_for_receipt(receipt))
 
     #: Every ``pending -> in_progress`` mutation names itself here. The static
     #: test in ``tests/unit/test_sev0_cea_s2b_adapters.py`` asserts that the set
@@ -2197,11 +2302,13 @@ class TaskQueue:
             # that is missing as for one that is refused. Under `shadow` it runs
             # and is *reported*, which is the count that says how many such rows
             # are still out there before a deployment turns enforcement on.
-            if _cea_callsites.enforcing(self.cea_config()):
+            legacy_config = self.cea_config()
+            if _cea_callsites.enforcing(legacy_config):
                 logger.warning("cea: claim refused for %s — NO_RECEIPT under enforce", task_id)
                 return False, None
-            logger.info("cea: claiming %s with no receipt (shadow; enforce would refuse)",
-                        task_id)
+            if legacy_config.recording:
+                self._cea_report_legacy_row_on(conn, task_id, point="claim",
+                                               config=legacy_config, at=now)
         if gate is not None and not gate.proceed:
             # P6/P3 say what happens next (HELD returns to the engine, BLOCK
             # stays put). Either way it is not claimed now, and the row is left
@@ -2259,7 +2366,9 @@ class TaskQueue:
         """
         receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
         engine = self.cea_engine()
-        config = self.cea_config()
+        # The §8 gate is not one of P2's five, but it decides on the same
+        # receipt in the same lineage, so it reads the same project's mode.
+        config = self.cea_config_for_receipt(receipt)
         if receipt is None:
             # A pre-receipt legacy row. Same asymmetry as the claim gate: under
             # enforcement "no receipt" is not "no objection".
@@ -2650,7 +2759,7 @@ class TaskQueue:
                         nonce_unused=(None if _nrow is None else _nrow.get("used_at") is None),
                         nonce_consumed_by=(None if _nrow is None else _nrow.get("used_by")),
                         nonce_attempt=(None if _nrow is None else _nrow.get("attempt"))),
-                    config=self.cea_config())
+                    config=self.cea_config_for_receipt(_receipt))
                 self._last_cea_result_gate = result_gate
                 if not result_gate.proceed:
                     conn.execute("ROLLBACK")
@@ -3255,13 +3364,22 @@ class TaskQueue:
         conn = self._connect()
         try:
             receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
-            if receipt is not None:
+            if receipt is None:
+                # A pre-2c row: there is no receipt, so DISPATCH cannot be asked
+                # and no nonce is minted — the two later call sites will have
+                # nothing to check. Say so once, durably (#s4i item 2). The
+                # refusal for such a row lives at claim; dispatch only counts.
+                legacy_config = self.cea_config()
+                if legacy_config.recording:
+                    self._cea_report_legacy_row_on(conn, task_id, point="dispatch",
+                                                   config=legacy_config, at=at)
+            else:
                 engine = self.cea_engine()
                 gate = _cea_callsites.gate_dispatch(
                     receipt, attempt=receipt.get("attempt"),
                     current=_cea_callsites.current_inputs(
                         engine, receipt, already_claimed=True),
-                    config=self.cea_config())
+                    config=self.cea_config_for_receipt(receipt))
                 if not gate.proceed:
                     logger.warning("cea: dispatch refused for %s — %s", task_id, gate.reason)
                     raise AdmissionRefused(gate)
@@ -3360,7 +3478,7 @@ class TaskQueue:
                 current=_cea_callsites.current_inputs(
                     engine, receipt, presenter=presenter, already_dispatched=True,
                     nonce_unused=(None if row is None else row.get("used_at") is None)),
-                config=self.cea_config())
+                config=self.cea_config_for_receipt(receipt))
             spent = False
             if gate.proceed and nonce:
                 # ⛔Tag *who* spent it. RESULT reads this back to tell
