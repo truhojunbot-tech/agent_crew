@@ -89,3 +89,24 @@ Consequence (`tests/unit/test_sev0_cea_i2_static_dynamic.py`):
 
 - **empty-project admission:** `loop.enqueue_*` and `discussion.enqueue_panel_tasks` build a `TaskRequest` with no `project`, and `crew enqueue --db` without `--project` and `watch.run_cycle(project="")` do the same. The engine then raises `EngineError` (`$.project` must be non-empty) instead of writing a P2 BLOCK audit receipt, so the adapter crashes and nothing is persisted.
 - **http refusal mapping:** `POST /tasks` catches only `TaskAlreadyExistsError`. A refused admission (`AdmissionRefused`) escapes as an unhandled 500, and the response carries no `receipt_id`.
+
+## 7. I1 transports, all fourteen (4d-r3) — code lane s4f
+
+`result` — agent_crew `c2de6db` on `sev0/cea-lineage-s4d` (after merging `sev0/cea-lineage` `b6be8d2`, s4e wiring). `TRANSPORTS == DOCUMENTED == adapters.BY_ID`; nothing is left undriven.
+
+| Ingress | Real entry point driven | Equality with HTTP (3 authority states) |
+|---|---|---|
+| `http.tasks`, `cli.enqueue`, `cascade.review`, `cron.watch` | (4d-r2) | PASS |
+| `cascade.fix` | `pipeline.auto_enqueue_fix` on a `request_changes` review | PASS |
+| `cascade.test` | `pipeline.auto_enqueue_test` on an `approve` review | strict xfail — empty-project |
+| `cascade.fallback` | `pipeline.auto_fallback_failed_task` on a 429-shaped failure | strict xfail — empty-project |
+| `cron.triage` | `triage.enqueue_task` | strict xfail — empty-project |
+| `loop.implement`, `loop.review`, `loop.test`, `cli.discuss` | `loop.enqueue_*`, `discussion.enqueue_panel_tasks` | strict xfail — empty-project |
+| `retry.failed_task` | `POST /tasks/{id}/result` `status=failed` after dispatch → `/start` | strict xfail — empty-project |
+| `watchdog.stale_review` | `POST /tasks/{id}/result` on a review whose PR head moved (`review_publication_decision` stubbed to requeue) | strict xfail — empty-project |
+
+`test_every_transport_reaches_admission_as_its_own_ingress` (not xfailed, 14 PASS) pins that each driver reaches the admission entry under its own ingress id. For the nine project-less adapters, it also pins that admission raised on `project=""`. A strict xfail therefore cannot pass for the wrong reason, such as a broken driver.
+
+- **empty-project admission (extended):** the same defect now also covers `pipeline.auto_enqueue_test`, `pipeline.auto_fallback_failed_task`, `triage.enqueue_task`, server `_auto_retry_failed_task` and server `_requeue_review_at_head`. Each builds its `TaskRequest` without `project`. In the pipeline/server paths the resulting exception is swallowed by the cascade's own `try`, so the successor is silently never created and no receipt exists.
+- **MCP `submit_result` (P2 RESULT, not an ingress):** `get_next_task` (nonce) → HTTP `/start` → MCP `submit_result(executor_binding)` persists the same `(status, decision, reason, intent_hash, state, nonce spent)` as the all-HTTP flow. Without `/start`, both are refused `NONCE_NOT_STARTED`, the row stays `in_progress` and the nonce is not spent (2 PASS, `test_sev0_cea_i1_mcp_result.py`).
+- **Harness finding (fixed in the test lane):** since s4e, `create_app` passes `install_from_env` providers explicitly. The r2 `inject_cea` used `setdefault`, so every HTTP drive after the merge ran `mode=shadow` against the live alfred governance inputs and set the process-global runtime authority. `inject_cea` now forces mode + fixture providers and stubs `install_from_env`.
