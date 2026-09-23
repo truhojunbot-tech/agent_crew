@@ -221,6 +221,23 @@ _DDL_MIGRATE_SHADOW_COLUMNS = (
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN evidence_json TEXT",
 )
 
+#: SEV-0 §11 ONE-TASK tokenomics canary (issue #51).
+#:
+#: ⛔Its own columns, NOT the ``shadow_*`` set. `_refresh_shadow_after_commit`
+#:   rewrites every ``shadow_*`` column when a task completes, and a suppressed
+#:   review completes immediately — writing the canary record there would erase
+#:   it microseconds later, leaving the one measurement the canary exists to
+#:   produce permanently unreadable.
+_DDL_MIGRATE_CANARY_COLUMNS = (
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN canary_decision_source TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN canary_recommendation_json TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN canary_applied INTEGER",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN canary_counterfactual TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN canary_reason TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN canary_cea_receipt_id TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN canary_resolved_at REAL",
+)
+
 _DDL = """
 CREATE TABLE IF NOT EXISTS tasks (
     task_id          TEXT PRIMARY KEY,
@@ -930,7 +947,7 @@ class TaskQueue:
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
         conn.execute(_DDL_TOKENOMICS_SHADOW)
-        for _stmt in _DDL_MIGRATE_SHADOW_COLUMNS:
+        for _stmt in _DDL_MIGRATE_SHADOW_COLUMNS + _DDL_MIGRATE_CANARY_COLUMNS:
             try:
                 conn.execute(_stmt)
             except Exception:
@@ -4297,7 +4314,13 @@ class TaskQueue:
                 "FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
-            if row is None or row["status"] not in ("completed", "failed", "needs_human"):
+            # ⛔`blocked` is terminal and belongs here. A task that was never
+            #   dispatched will never POST, so omitting it left a waiting
+            #   client polling a result that could not arrive until its own
+            #   timeout fired — the opposite of what suppressing the dispatch
+            #   is for (SEV-0 §11 canary).
+            if row is None or row["status"] not in (
+                "completed", "failed", "needs_human", "blocked"):
                 return None
             context = json.loads(row["context"] or "{}")
             return TaskResult(
@@ -4832,6 +4855,112 @@ class TaskQueue:
                 "SELECT * FROM task_attribution WHERE task_id = ?", (task_id,)
             ).fetchone()
             return dict(row) if row else None
+        finally:
+            conn.close()
+
+    def standing_request_changes_review(
+        self, *, pr_number: Optional[int] = None, branch: str = "",
+        reviewed_sha: str = "", exclude_task_id: str = "",
+    ) -> Optional[dict]:
+        """The most recent VERDICT-BEARING review of this exact commit, if any.
+
+        "Stands" means latest, not merely present: an ``approve`` recorded
+        after a ``request_changes`` on the identical commit supersedes it, and
+        returning the older row would let the canary suppress a re-review whose
+        premise had already been withdrawn. So the newest completed review with
+        a real verdict wins, and the caller decides what that verdict means.
+
+        Reviews that failed, timed out or were themselves suppressed carry no
+        verdict and are skipped — they produced no judgement to supersede
+        anything with.
+        """
+        if not reviewed_sha:
+            return None
+        if pr_number is None and not branch:
+            return None
+        conn = self._connect()
+        try:
+            if pr_number is not None:
+                rows = conn.execute(
+                    "SELECT task_id, verdict, findings, pr_number, branch, context, "
+                    "       status, last_activity_at, created_at "
+                    "FROM tasks WHERE task_type='review' AND status='completed' "
+                    "  AND pr_number=? AND task_id<>? "
+                    "ORDER BY last_activity_at DESC, created_at DESC",
+                    (int(pr_number), exclude_task_id),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT task_id, verdict, findings, pr_number, branch, context, "
+                    "       status, last_activity_at, created_at "
+                    "FROM tasks WHERE task_type='review' AND status='completed' "
+                    "  AND branch=? AND pr_number IS NULL AND task_id<>? "
+                    "ORDER BY last_activity_at DESC, created_at DESC",
+                    (branch, exclude_task_id),
+                ).fetchall()
+        finally:
+            conn.close()
+        for row in rows:
+            if (row["verdict"] or "") not in ("approve", "request_changes"):
+                continue
+            try:
+                ctx = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(ctx, dict) or (ctx.get("reviewed_sha") or "") != reviewed_sha:
+                continue
+            try:
+                findings = json.loads(row["findings"]) if row["findings"] else []
+            except (TypeError, ValueError):
+                findings = []
+            return {"task_id": row["task_id"], "verdict": row["verdict"],
+                    "status": row["status"], "pr_number": row["pr_number"],
+                    "branch": row["branch"], "reviewed_sha": reviewed_sha,
+                    "findings_count": len(findings) if isinstance(findings, list) else None}
+        return None
+
+    def task_receipt_id(self, task_id: str) -> Optional[str]:
+        """The task's §3 authorization receipt id, or None if it has none."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT receipt_id FROM tasks WHERE task_id=?", (task_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        return (row["receipt_id"] if row is not None else None) or None
+
+    def record_tokenomics_canary_receipt(
+        self, task_id: str, *, decision_source: str, recommendation: dict,
+        applied: bool, counterfactual: str, reason: str,
+        cea_receipt_id: Optional[str] = None,
+    ) -> None:
+        """Persist one canary evaluation. Never raises into the dispatcher.
+
+        Upsert, because the enqueue path already wrote this task's row: the
+        canary adds a dispatch-time observation to it rather than competing
+        with it for the primary key.
+        """
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT OR IGNORE INTO tokenomics_shadow_receipts
+                   (task_id, decision_source, policy_version, recommendation_json,
+                    actual_execution_json, created_at, updated_at)
+                   VALUES (?, 'baseline', NULL, NULL, ?, ?, ?)""",
+                (task_id, json.dumps({"cascade": "baseline", "task_type": "review"}), now, now),
+            )
+            conn.execute(
+                """UPDATE tokenomics_shadow_receipts
+                   SET canary_decision_source=?, canary_recommendation_json=?,
+                       canary_applied=?, canary_counterfactual=?, canary_reason=?,
+                       canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?
+                   WHERE task_id=?""",
+                (decision_source, json.dumps(recommendation), int(bool(applied)),
+                 counterfactual or None, reason, cea_receipt_id, now, now, task_id),
+            )
+            conn.commit()
         finally:
             conn.close()
 

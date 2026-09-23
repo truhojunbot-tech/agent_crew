@@ -36,6 +36,7 @@ from agent_crew.context_identity import (
     record_context_event,
 )
 from agent_crew.fallback import is_rate_limit_error
+from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
@@ -2802,6 +2803,64 @@ def create_app(
         except Exception:
             logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
 
+    def _tokenomics_canary_gate(task: TaskRequest, reviewed_sha: str) -> bool:
+        """SEV-0 §11 ONE-TASK canary. ``True`` means this review was suppressed.
+
+        The only behaviour change the matched evidence (quota-core
+        ``sev0/phaseb-80-contract-emitter`` 869a3cf) supports: do not send a
+        reviewer to a commit that a standing ``request_changes`` already
+        describes. Every other review is evaluated, recorded and dispatched
+        exactly as before.
+
+        ⛔Fails open, in three places. An evaluation error, a receipt-write
+          error, or an unarmed pin all end in a normal dispatch. Suppression is
+          the narrow path and it only runs when everything about it is known
+          and written down — a suppression nobody can read afterwards would be
+          indistinguishable from the dispatcher silently losing the task.
+        """
+        try:
+            decision = _canary.evaluate_review_dispatch(
+                task, reviewed_sha=reviewed_sha or "",
+                standing_lookup=q().standing_request_changes_review,
+            )
+        except Exception:
+            logger.exception(
+                f"tokenomics canary: evaluation failed for {task.task_id} — dispatching")
+            return False
+        try:
+            q().record_tokenomics_canary_receipt(
+                task.task_id,
+                decision_source=decision.decision_source,
+                recommendation=decision.recommendation(),
+                applied=decision.applied,
+                counterfactual=decision.counterfactual,
+                reason=decision.reason,
+                cea_receipt_id=q().task_receipt_id(task.task_id),
+            )
+        except Exception:
+            # ⛔Dispatch anyway. The receipt IS the canary's output; applying a
+            #   suppression we could not record would spend the experiment and
+            #   produce no measurement.
+            logger.exception(
+                f"tokenomics canary: receipt write failed for {task.task_id} — dispatching")
+            return False
+        if not decision.applied:
+            if decision.extra.get("condition_holds"):
+                logger.info(
+                    f"tokenomics canary (shadow): {task.task_id} would be suppressed "
+                    f"— {decision.reason}; standing request_changes "
+                    f"{decision.standing_review_task_id} on {decision.target} "
+                    f"@ {(decision.reviewed_sha or '?')[:9]}")
+            return False
+        logger.warning(
+            f"tokenomics canary APPLIED: not dispatching review {task.task_id} — "
+            f"{decision.standing_review_task_id} already stands as request_changes "
+            f"on {decision.target} @ {(decision.reviewed_sha or '?')[:9]}. "
+            f"Counterfactual: {decision.counterfactual}. "
+            f"Roll back by unsetting {_canary.CANARY_ENV} (no restart).")
+        _fail_if_active(task.task_id, _canary.SUPPRESSED_REASON, status="blocked")
+        return True
+
     # Expose watchdog tick on app.state so tests can drive it deterministically
     # without the asyncio loop. Production code never reads this attribute.
     app.state.reminded_task_ids = reminded_task_ids
@@ -2902,6 +2961,16 @@ def create_app(
                         f"_try_push_next: worktree prep failed for {role} "
                         f"task_id={task.task_id} — continuing with dispatch"
                     )
+
+        # SEV-0 §11 ONE-TASK tokenomics canary — the last gate before the
+        # provider is spent. Placed AFTER worktree prep because the commit the
+        # reviewer would read is only known once it is prepared, and BEFORE the
+        # protocol/pane work because everything past this point costs provider
+        # tokens. Prep itself costs none.
+        if task.task_type == "review" and _tokenomics_canary_gate(
+            task, (task.context or {}).get("reviewed_sha") or ""
+        ):
+            return
 
         _push_worktree = worktree_map.get(role) if worktree_map else ""
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
@@ -3877,6 +3946,17 @@ def create_app(
                 logger.exception(
                     f"dispatcher: worktree prep failed for {role} task_id={task.task_id} — continuing"
                 )
+
+        # SEV-0 §11 ONE-TASK tokenomics canary — the last gate before the
+        # provider is spent. Placed AFTER worktree prep because the commit the
+        # reviewer would read is only known once it is prepared, and BEFORE the
+        # protocol/pane work because everything past this point costs provider
+        # tokens. Prep itself costs none.
+        if task.task_type == "review" and _tokenomics_canary_gate(
+            task, (task.context or {}).get("reviewed_sha") or ""
+        ):
+            _lock_stack.close()
+            return
 
         if not _ensure_role_protocol(
             role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent, port=port,
