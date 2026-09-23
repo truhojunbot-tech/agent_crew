@@ -1349,22 +1349,43 @@ class TaskQueue:
         return "STOPPED"
 
     def reconcile_pause_signal(self) -> str:
-        """:meth:`_reconcile_pause_signal_in_txn` with its own transaction.
-        Fail-closed: if the write cannot be made, report STOPPED rather than guess."""
+        """:meth:`_reconcile_pause_signal_in_txn` with its own transaction, and the
+        row's state afterwards.
+
+        The write lock is taken **only when there is something to fold in** — an
+        armed, readable pause.json above a looser row. Every other call is the
+        plain row read it was before, because this runs on the enqueue/claim
+        prechecks and a ``BEGIN IMMEDIATE`` per gate check would turn ordinary
+        write contention into spurious fail-closed refusals.
+
+        Fail-closed: when a pause is armed and the fold cannot be written, report
+        STOPPED rather than guess.
+        """
+        armed, readable = self._pausejson_signal()
         try:
             conn = self._connect()
         except Exception:
             return "STOPPED"
         try:
-            conn.execute("BEGIN IMMEDIATE")
-            state = self._reconcile_pause_signal_in_txn(conn)
-            conn.execute("COMMIT")
-            return state
-        except Exception:
+            if not armed:
+                return self._read_stop_row(conn)["state"]
+            if not readable:
+                return "STOPPED"        # unjudgeable input: fail closed, write nothing (P7)
+            row = self._read_stop_row(conn)
+            if _RUNTIME_TIGHTNESS[row["state"]] >= _RUNTIME_TIGHTNESS["STOPPED"]:
+                return row["state"]     # already folded in, or tighter
             try:
-                conn.execute("ROLLBACK")
+                conn.execute("BEGIN IMMEDIATE")
+                state = self._reconcile_pause_signal_in_txn(conn)
+                conn.execute("COMMIT")
+                return state
             except Exception:
-                pass
+                try:
+                    conn.execute("ROLLBACK")
+                except Exception:
+                    pass
+                return "STOPPED"
+        except Exception:
             return "STOPPED"
         finally:
             conn.close()
