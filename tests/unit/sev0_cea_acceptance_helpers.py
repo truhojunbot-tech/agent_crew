@@ -163,18 +163,34 @@ class LiveState:
 
 
 def inject_cea(monkeypatch, live: LiveState, *, mode: str = "test") -> None:
+    """Every ``TaskQueue`` built in-process gets ``mode`` + the fixture providers.
+
+    ⛔4d-r3: *forced*, not ``setdefault``. Since the s4e merge (``b6be8d2``)
+      ``create_app`` builds its queue with ``cea_providers=wiring.providers`` from
+      :func:`agent_crew.cea.wiring.install_from_env`, so a ``setdefault`` lost and
+      every HTTP drive silently ran in ``mode=shadow`` against the LIVE alfred
+      governance files (snapshot, registry, quota dir, ``admission_inputs.py``)
+      and set the process-global runtime authority. ``install_from_env`` is
+      stubbed for the same reason: a test harness must neither read production
+      inputs nor mutate process-global authority.
+    """
+    import types
+    from agent_crew.cea import wiring as cea_wiring
     orig = TaskQueue.__init__
 
     def _init(self, db_path, *a, **kw):
-        kw.setdefault("cea_config", EngineConfig(mode=mode))
-        kw.setdefault("cea_providers", providers(live))
+        kw["cea_config"] = EngineConfig(mode=mode)
+        kw["cea_providers"] = providers(live)
         orig(self, db_path, *a, **kw)
 
     monkeypatch.setattr(TaskQueue, "__init__", _init)
+    monkeypatch.setattr(cea_wiring, "install_from_env", lambda *a, **k: types.SimpleNamespace(
+        providers=providers(live), authority=None, mode=mode, statuses=()))
 
 
 class EnqueueSpy:
-    """Wraps ``TaskQueue.enqueue``; records ``(ingress, req, admitted, receipt_id, db)``."""
+    """Wraps ``TaskQueue.enqueue``; records ``(ingress, req, admitted, receipt_id, db)``.
+    ``admitted`` is ``None`` when admission raised instead of deciding."""
 
     def __init__(self, monkeypatch):
         self.calls: list = []
@@ -186,6 +202,12 @@ class EnqueueSpy:
                 out = orig(q, req, *a, **kw)
             except AdmissionRefused as exc:
                 spy.calls.append((kw.get("ingress"), req, False, exc.receipt_id, q._db_path))
+                raise
+            except Exception:
+                # 4d-r3: an adapter that reached admission and crashed there is
+                # recorded too (admitted=None, no receipt) — "reached" and
+                # "decided" are separate claims and the tests assert them apart.
+                spy.calls.append((kw.get("ingress"), req, None, None, q._db_path))
                 raise
             conn = sqlite3.connect(q._db_path)
             try:
@@ -208,3 +230,48 @@ def persisted_receipt(db_path: str, receipt_id: Optional[str]) -> Optional[dict]
         return receipt_store.current_receipt(conn, receipt_id)
     finally:
         conn.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4d-r3: parents for the cascade / server-internal transports. Each builds its
+# parent under ACTIVE (so the parent itself is admitted) and hands control back
+# before the transport runs, so the transport's own admission sees the target
+# authority state. Fixture writers only — nothing here asserts.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def seed_finished_parent(db_path: str, live: LiveState, req: TaskRequest, *, verdict=None,
+                         findings=(), summary="done", status="completed") -> None:
+    """Admit ``req`` under ACTIVE, then write its terminal result columns directly
+    (the cascade functions read the parent row, not the transport that finished it)."""
+    import json as _json
+    target, live.s = live.s, AuthorityState("active")
+    try:
+        TaskQueue(db_path).enqueue(req, ingress="http.tasks")
+    finally:
+        live.s = target
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute("UPDATE tasks SET status=?, verdict=?, findings=?, summary=? "
+                     "WHERE task_id=?", (status, verdict, _json.dumps(list(findings)),
+                                         summary, req.task_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def dispatch_and_start(db_path: str, live: LiveState, req: TaskRequest, *, role: str,
+                       agent: str = "claude", start: bool = True) -> str:
+    """ACTIVE: enqueue → dequeue → record_dispatch (→ start_execution). Returns the nonce."""
+    target, live.s = live.s, AuthorityState("active")
+    try:
+        q = TaskQueue(db_path)
+        q.enqueue(req, ingress="http.tasks")
+        got = q.dequeue(agent=agent, role=role)
+        assert got is not None and got.task_id == req.task_id, got
+        nonce = q.record_dispatch(req.task_id, channel="api", agent=agent,
+                                  target=f"test:{agent}")
+        if start:
+            q.start_execution(req.task_id, nonce, presenter=agent)
+        return nonce
+    finally:
+        live.s = target
