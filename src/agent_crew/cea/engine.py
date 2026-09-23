@@ -49,10 +49,12 @@ import secrets
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
-from agent_crew.cea.intent import Caller, IdentityStatus, Intent, IntentIdentity, WorkClass
+from agent_crew.cea.intent import (
+    Caller, IdentityStatus, Intent, IntentIdentity, InvalidScopeAnchor, WorkClass,
+    canonical_identity)
 from agent_crew.cea.providers import (
     CapabilityLookup, PolicySnapshotRef, SignatureStatus)
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
@@ -72,25 +74,44 @@ def intent_hash(identity: IntentIdentity) -> str:
     rewording work or minting a new opid does not make it new work (P4; E10 4c,
     fixture CX-4c).
 
-    ``scope_anchors`` and ``authority_decision_ids`` are sorted and de-duplicated
-    before hashing. Identity is a set question — the same three files named in a
+    ``scope_anchors`` are **canonicalised** (:func:`~agent_crew.cea.intent.canonical_scope_anchor`),
+    then sorted and de-duplicated, as are ``authority_decision_ids``. Sorting
+    alone was not enough: ``src/x.py`` and ``src/./x.py`` are one file and used
+    to hash differently, which opened two live lineages for it (codex P1 #5). Identity is a set question — the same three files named in a
     different order are the same target — and leaving the order in would give a
     caller a trivial way to mint a "different" intent for identical work, which
     is the very evasion P4 exists to close.
     """
+    return _hash_identity(identity, anchors=list(
+        canonical_identity(identity).target.scope_anchors))
+
+
+def _hash_identity(identity: IntentIdentity, *, anchors) -> str:
     body = {
         "project": identity.project,
         "work_class": _work_class_value(identity.work_class),
         "target": {
             "repo": identity.target.repo,
             "base_ref": identity.target.base_ref,
-            "scope_anchors": sorted(set(identity.target.scope_anchors)),
+            "scope_anchors": anchors,
         },
         "capability_id": identity.capability_id,
         "authority_decision_ids": sorted(set(identity.authority_decision_ids)),
     }
     digest = hashlib.sha256(canonical_json(body).encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
+
+
+def uncanonical_intent_hash(identity: IntentIdentity) -> str:
+    """The hash of an identity whose anchors have **no** canonical form.
+
+    A refusal receipt still needs an ``intent_hash`` — P2 wants the audit row
+    even when the answer is "this intent is malformed" — and inventing one would
+    be worse than hashing what was actually sent. It can never collide with a
+    real lineage: an identity that reaches :func:`intent_hash` has anchors that
+    already canonicalised.
+    """
+    return _hash_identity(identity, anchors=sorted(set(identity.target.scope_anchors)))
 
 
 def _work_class_value(work_class) -> str:
@@ -315,7 +336,6 @@ class AuthorizationEngine:
         ``401`` no caller credential.
         """
         receipt_store.ensure_schema(conn)
-        ih = intent_hash(intent.identity)
 
         # J9 — who is asking. 401 before anything else is read: an
         # unauthenticated caller does not get to learn the policy state, and it
@@ -338,6 +358,18 @@ class AuthorizationEngine:
                 f"caller {caller.principal!r} presents credential_kind "
                 f"{getattr(caller, 'credential_kind', None)!r}, which no authenticator issues; "
                 f"a Caller must come from agent_crew.cea.auth, never from a request body (J9)")
+
+        # P4/§5.2: one spelling per target, fixed *before* the hash and before
+        # the E4 registry sees the intent — so identity and matching can never
+        # disagree about which file was named.
+        try:
+            intent = replace(intent, identity=canonical_identity(intent.identity))
+        except InvalidScopeAnchor as exc:
+            return Authorization(
+                receipt=self._refusal(intent, caller, uncanonical_intent_hash(intent.identity),
+                                      "INVALID_SCOPE_ANCHOR", str(exc), conn=conn),
+                http_status=400, code="INVALID_SCOPE_ANCHOR")
+        ih = intent_hash(intent.identity)
 
         # J1 — lineage. Answered before the expensive inputs so a replay costs a
         # single indexed read, which is what makes idempotency cheap enough to be

@@ -264,3 +264,90 @@ def test_the_key_does_not_change_the_verdict_either(conn, tmp_path):
         conn, intent("keyed-2b", ident=identity(anchors=("src/keyed.py",))), caller())
     assert unkeyed.decision == keyed.decision == "REVIEW"
     assert keyed.receipt["reason"]["code"] == "IDENTITY_UNVERIFIED_REVIEW_REQUIRED"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 #5 — canonical scope anchors before hashing and matching (engine.py:81-91)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("spelling", [
+    "src/./x.py", "src//x.py", "./src/x.py", "src/a/../x.py", "src/x.py/",
+    "src///./x.py", "  src/x.py  ",
+])
+def test_equivalent_spellings_are_one_intent(spelling):
+    """codex P1 #5, verbatim: `src/x.py` and `src/./x.py` hashed differently and
+    created two live lineages for the same path. Sorting a set of strings the
+    caller chose is not identity."""
+    assert intent_hash(identity(anchors=(spelling,))) == \
+        intent_hash(identity(anchors=("src/x.py",)))
+
+
+def test_two_spellings_in_one_declaration_collapse_to_one_anchor():
+    """De-duplication has to happen *after* canonicalisation, or both survive."""
+    from agent_crew.cea.intent import canonical_anchors
+    assert canonical_anchors(("src/x.py", "src/./x.py", "./src//x.py")) == ("src/x.py",)
+
+
+def test_the_second_spelling_is_refused_as_a_duplicate_intent(conn):
+    """The end-to-end consequence: one target, one live lineage."""
+    eng = engine()
+    first = eng.authorize(conn, intent("anchor-1", ident=identity(anchors=("src/x.py",))),
+                          caller())
+    assert first.http_status in (201, 403)
+    second = eng.authorize(conn, intent("anchor-2", ident=identity(anchors=("src/./x.py",))),
+                           caller())
+    assert second.http_status == 409 and second.code == "DUPLICATE_INTENT"
+    assert second.existing_receipt_id == first.receipt_id
+
+
+def test_distinct_paths_stay_distinct():
+    """Canonicalisation must not merge anchors that are genuinely different."""
+    assert intent_hash(identity(anchors=("src/x.py",))) != \
+        intent_hash(identity(anchors=("/src/x.py",))), "absolute is not relative"
+    assert intent_hash(identity(anchors=("src/X.py",))) != \
+        intent_hash(identity(anchors=("src/x.py",))), "POSIX paths are case-sensitive"
+
+
+@pytest.mark.parametrize("anchor,expected", [
+    ("HTTPS://Example.COM/A/./b", "https://example.com/A/b"),
+    ("Config:Server.Port", "config:Server.Port"),
+    ("URN:acme:Thing", "urn:acme:Thing"),
+])
+def test_non_path_anchors_lowercase_only_what_is_case_insensitive(anchor, expected):
+    """The documented rule: scheme (and authority, when there is one) are
+    case-insensitive per RFC 3986; the opaque remainder is the namespace's
+    business and guessing would silently merge two distinct config keys."""
+    from agent_crew.cea.intent import canonical_scope_anchor
+    assert canonical_scope_anchor(anchor) == expected
+
+
+@pytest.mark.parametrize("anchor", ["../x.py", "a/../../x.py", "..", ".", "", "config:"])
+def test_parent_traversal_and_empty_anchors_are_rejected(anchor):
+    from agent_crew.cea.intent import InvalidScopeAnchor, canonical_scope_anchor
+    with pytest.raises(InvalidScopeAnchor):
+        canonical_scope_anchor(anchor)
+
+
+def test_an_untraversable_anchor_blocks_with_a_receipt_not_an_exception(conn):
+    """P2 wants the audit row even for "this intent is malformed"; P7 wants the
+    refusal. An escaping ValueError would give neither."""
+    auth = engine().authorize(
+        conn, intent("trav-1", ident=identity(anchors=("../../etc/passwd",))), caller())
+    assert auth.http_status == 400 and auth.code == "INVALID_SCOPE_ANCHOR"
+    assert auth.decision == "BLOCK"
+    assert validate_receipt(auth.receipt) == []
+    assert conn.execute("SELECT COUNT(*) FROM authorization_receipts").fetchone()[0] == 1
+
+
+def test_the_registry_is_asked_about_the_canonical_anchor(conn):
+    """§5.2 matching must see the same spelling the hash did, or the two disagree."""
+    seen = []
+
+    class RecordingRegistry(FakeRegistry):
+        def lookup(self, intent):
+            seen.append(intent.identity.target.scope_anchors)
+            return super().lookup(intent)
+
+    engine(capabilities=RecordingRegistry()).authorize(
+        conn, intent("reg-1", ident=identity(anchors=("./src//y.py", "src/y.py"))), caller())
+    assert seen == [("src/y.py",)]

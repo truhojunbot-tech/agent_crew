@@ -7,7 +7,9 @@ the engine has one place to hash.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import posixpath
+import re
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Optional
 
@@ -116,3 +118,95 @@ class Caller:
     provenance: CallerProvenance
     identity_status: IdentityStatus = IdentityStatus.UNVERIFIED
     credential_kind: Optional[str] = None  # "adapter_token" | "broker_registered" | None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# scope-anchor canonicalisation (P4 identity, §5.2 registry matching)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class InvalidScopeAnchor(ValueError):
+    """A scope anchor that has no canonical form. Admission refuses it (P7)."""
+
+
+_SCHEME = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):(//)?")
+"""``scheme:`` / ``scheme://`` — the only thing that makes an anchor a non-path."""
+
+
+def canonical_scope_anchor(anchor: str) -> str:
+    """One spelling per target, so one target is one lineage.
+
+    ⛔``intent_hash`` used to sort and de-duplicate anchors but never
+      *canonicalise* them, so ``src/x.py`` and ``src/./x.py`` hashed differently
+      and opened two live lineages for the same file (codex P1 #5). Set
+      semantics do not help if the members are spelled freely: de-duplication
+      compares the strings a caller chose.
+
+    The rule, in two cases:
+
+    **Paths** (no ``scheme:`` prefix) are normalised with :mod:`posixpath` —
+    ``./`` dropped, repeated separators collapsed, ``a/../b`` resolved, a
+    trailing ``/`` removed. A leading ``/`` is *preserved*: an absolute path and
+    a relative one are genuinely different anchors and folding them would create
+    collisions rather than remove them. Case is preserved, because POSIX paths
+    are case-sensitive and lowercasing would alias two real files.
+
+    **Non-path anchors** (``scheme:rest`` — config keys, module URNs, service
+    refs) keep ``rest`` byte-for-byte and lowercase only the scheme, which RFC
+    3986 already defines as case-insensitive. For the ``scheme://authority/path``
+    form the authority is lowercased too (also case-insensitive) and the path
+    part goes through the path rule. Anything after the scheme in the opaque
+    form is the namespace's business, not ours — a config key may well be
+    case-sensitive, and guessing would silently merge two distinct anchors.
+
+    Parent traversal that escapes the anchor root (``../x``, ``a/../../x``) is
+    rejected rather than clamped: it names something outside the declared scope,
+    and clamping it to ``x`` would let a caller point at one path and have the
+    registry match another.
+    """
+    if not isinstance(anchor, str) or not anchor.strip():
+        raise InvalidScopeAnchor(f"scope anchor {anchor!r} is empty")
+    raw = anchor.strip()
+    m = _SCHEME.match(raw)
+    if m is None:
+        return _canonical_path(raw, raw)
+    scheme, slashes = m.group(1).lower(), m.group(2)
+    rest = raw[m.end():]
+    if not slashes:
+        # opaque form: `config:server.port`, `urn:acme:thing`
+        if not rest:
+            raise InvalidScopeAnchor(f"scope anchor {anchor!r} has a scheme and nothing else")
+        return f"{scheme}:{rest}"
+    authority, _, path = rest.partition("/")
+    canonical_path = _canonical_path(path, raw) if path else ""
+    return f"{scheme}://{authority.lower()}" + (f"/{canonical_path}" if canonical_path else "")
+
+
+def _canonical_path(path: str, original: str) -> str:
+    normalised = posixpath.normpath(path)
+    # POSIX keeps exactly two leading slashes meaningful and normpath preserves
+    # them; nothing in a repo anchor means that, and leaving it in would be one
+    # more spelling of one path.
+    if normalised.startswith("//") and not normalised.startswith("///"):
+        normalised = normalised[1:]
+    if normalised in (".", "") :
+        raise InvalidScopeAnchor(f"scope anchor {original!r} normalises to nothing")
+    if normalised == ".." or normalised.startswith("../"):
+        raise InvalidScopeAnchor(
+            f"scope anchor {original!r} traverses above its own root; an anchor must name "
+            f"what it declares (§5.2)")
+    return normalised
+
+
+def canonical_anchors(anchors) -> tuple[str, ...]:
+    """Canonicalise, de-duplicate and sort — in that order. Order matters:
+    de-duplicating first would keep both spellings of one anchor."""
+    return tuple(sorted({canonical_scope_anchor(a) for a in (anchors or ())}))
+
+
+def canonical_identity(identity: "IntentIdentity") -> "IntentIdentity":
+    """The identity as the engine and the E4 registry must both see it.
+
+    Applied *before* hashing and before registry matching, so the two never
+    disagree about which file was named."""
+    target = replace(identity.target, scope_anchors=canonical_anchors(identity.target.scope_anchors))
+    return replace(identity, target=target)
