@@ -81,11 +81,24 @@ class GateOutcome:
                 "changed_fields": list(self.result.changed_fields)}
 
 
-def enforcing(config: Optional[EngineConfig] = None) -> bool:
+def enforcing(config: Optional[EngineConfig] = None, *,
+              project: Optional[str] = None) -> bool:
     """``test`` enforces exactly as ``enforce`` does — the two differ only in
     whether the engine may run embedded (:data:`agent_crew.cea.engine.EMBEDDED_MODES`),
-    which is a deployment question and not a question about this gate."""
-    return (config or EngineConfig.from_env()).mode in (ENFORCE, TEST)
+    which is a deployment question and not a question about this gate.
+
+    ``project`` selects the per-project rollout override
+    (:func:`agent_crew.cea.engine.resolve_mode`) and is ignored when an explicit
+    ``config`` is given — a caller holding a config has already resolved the
+    question, and re-resolving it here would silently override them.
+    """
+    return (config or EngineConfig.from_env(project=project)).mode in (ENFORCE, TEST)
+
+
+def recording(config: Optional[EngineConfig] = None, *,
+              project: Optional[str] = None) -> bool:
+    """Is a gate answer computed at all for this project? ``off`` says no."""
+    return (config or EngineConfig.from_env(project=project)).recording
 
 
 def _gate(point: ValidationPoint, result: ValidationResult,
@@ -172,4 +185,5 @@ CALL_SITES = {
 
 
 __all__ = ["CALL_SITES", "GateOutcome", "VALIDATOR", "current_inputs", "enforcing",
+           "recording",
            "gate_claim", "gate_dispatch", "gate_enqueue", "gate_execute_start", "gate_result"]

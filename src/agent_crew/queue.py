@@ -891,6 +891,7 @@ class TaskQueue:
         # a receipt naming what was missing. Tests and a future `crew-authz`
         # deployment inject; nothing here guesses.
         self._cea_config_override = cea_config
+        self._cea_config_by_project: dict = {}
         self._cea_providers = dict(cea_providers or {})
         self._cea_engine_cache = None
         # P6: who may loosen this runtime. Fail-closed by default — a runtime with
@@ -1838,16 +1839,39 @@ class TaskQueue:
             context.pop("issue")
         return context
 
-    def cea_config(self) -> "_CeaEngineConfig":
-        """This runtime's engine config — ``shadow`` unless the env says otherwise.
+    def cea_config(self, project: Optional[str] = None) -> "_CeaEngineConfig":
+        """The engine config in force — ``shadow`` unless the env says otherwise.
 
-        Read once per queue instance and cached: the five call sites ask for it
-        on every enqueue, claim, dispatch and result, and a mode that could
-        change between two of them would mean one task was half-enforced.
+        Cached: the five call sites ask for it on every enqueue, claim, dispatch
+        and result, and a mode that could change between two of them would mean
+        one task was half-enforced.
+
+        ``project`` selects the per-project rollout override
+        (:func:`agent_crew.cea.engine.resolve_mode`), cached per project for the
+        same reason. Rollout is per-project because a single process-wide switch
+        makes the fleet cross the shadow→enforce boundary together, so the first
+        project ready to move waits on the last — and nobody moves.
+
+        ⛔An explicit config passed to the constructor still wins for every
+          project. A test or an operator who pinned the mode pinned it; silently
+          re-resolving from the environment underneath them would make the
+          override advisory.
+
+        ⛔Threading `project` through the four *post-admission* call sites is
+          deliberately not done by passing it down from each caller: they must
+          use the project on the task's own **receipt**, so a task admitted
+          under one project's mode cannot be claimed or finished under another's.
+          Until that is wired (REMAINING, step 4c), those sites call this with no
+          argument and get the process-wide mode, exactly as before.
         """
-        if self._cea_config_override is None:
-            self._cea_config_override = _CeaEngineConfig.from_env()
-        return self._cea_config_override
+        if self._cea_config_override is not None:
+            return self._cea_config_override
+        key = (project or "").strip() or None
+        cached = self._cea_config_by_project.get(key)
+        if cached is None:
+            cached = _CeaEngineConfig.from_env(project=key)
+            self._cea_config_by_project[key] = cached
+        return cached
 
     def cea_engine(self):
         """The T1 engine (in-process, or a socket client when one is configured).
@@ -1918,10 +1942,13 @@ class TaskQueue:
         """
         context = dict(self._enqueue_context(task) if context is None else context)
         engine = self.cea_engine()
+        # ENQUEUE is the one call site that resolves rollout from the *task*:
+        # it is where the project first becomes known, and the receipt it writes
+        # is what the four post-admission sites will read it back from.
         gate = _cea_callsites.gate_enqueue(
             receipt, task_id=task.task_id,
             current=_cea_callsites.current_inputs(engine, receipt),
-            config=self.cea_config())
+            config=self.cea_config(getattr(task, "project", None)))
         context["cea_enqueue"] = gate.as_record()
         if not gate.proceed:
             raise AdmissionRefused(gate)

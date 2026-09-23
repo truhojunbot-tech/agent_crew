@@ -32,7 +32,7 @@ import pytest
 from agent_crew.cea import store as receipt_store
 from agent_crew.cea._caller_mint import is_authenticated_caller, mint_caller
 from agent_crew.cea.engine import (
-    EMBEDDED_MODES, ENFORCE, SHADOW, TEST, AuthorizationEngine, EngineConfig)
+    EMBEDDED_MODES, ENFORCE, OFF, SHADOW, TEST, AuthorizationEngine, EngineConfig)
 from agent_crew.cea.intent import (
     IDENTITY_DEPENDENT_WORK_CLASSES, Caller, CallerProvenance, IdentityStatus, WorkClass)
 
@@ -232,10 +232,17 @@ def test_enforce_refuses_embedded_direct_authorization(conn):
 @pytest.mark.parametrize("mode", list(EMBEDDED_MODES))
 def test_shadow_and_test_may_still_run_embedded(conn, mode):
     """`shadow` stops nothing, so embedding it withholds nothing. `test` says
-    what it is in its name."""
+    what it is in its name. `off` withholds nothing either — it is the rollout
+    escape hatch, and a mode that produces no verdict cannot use one to refuse.
+
+    ⛔Asserted against `EMBEDDED_MODES` itself and then pinned to the exact set,
+      so adding a *fourth* embedded mode is a test failure rather than a silent
+      widening of where the engine may decide."""
     auth = _engine(mode).authorize(conn, intent(f"emb-{mode}"), caller())
     assert auth.code != "CREDENTIAL_BOUNDARY_UNAVAILABLE"
-    assert (mode in EMBEDDED_MODES) and mode in (TEST, SHADOW)
+    assert mode in EMBEDDED_MODES and mode in (TEST, SHADOW, OFF)
+    assert ENFORCE not in EMBEDDED_MODES, \
+        "enforce is the one mode whose verdict withholds work; it needs the socket"
 
 
 def test_no_public_declaration_can_turn_enforce_authorization_on(tmp_path, conn):
