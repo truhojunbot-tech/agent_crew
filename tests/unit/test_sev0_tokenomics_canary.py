@@ -462,7 +462,7 @@ def test_a_suppression_settles_its_authorization_receipt(monkeypatch, tmp_db):
         state = (cea_store.current_receipt(conn, receipt_id) or {}).get("state")
     finally:
         conn.close()
-    assert state in cea_store.TERMINAL_STATES, state
+    assert state == "CONSUMED", state
 
 
 def test_settling_an_unclaimed_receipt_revokes_it_once(tmp_db):
@@ -617,6 +617,13 @@ def test_failed_canary_promotion_rolls_back_suppression_and_dispatches(monkeypat
     row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_applied"] == 0
     assert row["canary_reason"] == "suppression_transaction_failed"
+    from agent_crew.cea import store as cea_store
+    receipt_id = queue.task_receipt_id("review-impl-77-r1")
+    conn = queue._connect()
+    try:
+        assert (cea_store.current_receipt(conn, receipt_id) or {}).get("state") != "CONSUMED"
+    finally:
+        conn.close()
 
 
 def test_post_commit_side_effect_failure_cannot_unsuppress(monkeypatch, tmp_db):
