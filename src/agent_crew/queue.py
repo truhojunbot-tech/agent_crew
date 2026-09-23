@@ -1,4 +1,5 @@
 import json
+import contextlib
 import hashlib
 import logging
 import os
@@ -1297,7 +1298,8 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def dequeue(self, agent: str = "", role: str = "") -> Optional[TaskRequest]:
+    def dequeue(self, agent: str = "", role: str = "", *,
+                skip_deferred: bool = False) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
         Resolution order (Issue #106 phase 3 — supports dynamic role
@@ -1313,7 +1315,16 @@ class TaskQueue:
            agent from stealing a task explicitly routed to another
            agent. Stage 2 only runs after stage 1 has no candidate.
         3. Neither given: any pending task, ordered by priority.
+
+        ``skip_deferred`` (G_DT): the tmux push path passes True so a task
+        backed off after a refused push (`defer_push_delivery`) does not keep
+        winning the ORDER BY and starving the tasks behind it. Other consumers
+        (dispatcher, MCP) leave it False — the backoff is about a pane, not
+        the task.
         """
+        _now = time.time()
+        _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "
+                      + repr(_now)) if skip_deferred else ""
         # #311/#314 STOP 전파: 런타임 STOP 활성이면 어떤 task도 claim/start하지 않는다.
         # 이 한 지점이 tmux push(_try_push_next)와 MCP GET /tasks/next를 모두 덮어
         # 큐 드레인·successor/retry stage 시작을 막는다. in-flight는 자기 원자단위까지만.
@@ -1336,7 +1347,7 @@ class TaskQueue:
                     """
                     SELECT * FROM tasks
                     WHERE status = 'pending'
-                      AND json_extract(context, '$.agent_override') = ?
+                      AND json_extract(context, '$.agent_override') = ?""" + _defer_sql + """
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                     """,
@@ -1357,7 +1368,7 @@ class TaskQueue:
                           AND (
                             json_extract(context, '$.agent_override') IS NULL
                             OR json_extract(context, '$.agent_override') = ?
-                          )
+                          )""" + _defer_sql + """
                         ORDER BY priority ASC, created_at ASC
                         LIMIT 1
                         """,
@@ -1367,7 +1378,7 @@ class TaskQueue:
                     row = conn.execute(
                         """
                         SELECT * FROM tasks
-                        WHERE status = 'pending' AND task_type = ?
+                        WHERE status = 'pending' AND task_type = ?""" + _defer_sql + """
                         ORDER BY priority ASC, created_at ASC
                         LIMIT 1
                         """,
@@ -1378,7 +1389,7 @@ class TaskQueue:
                 row = conn.execute(
                     """
                     SELECT * FROM tasks
-                    WHERE status = 'pending'
+                    WHERE status = 'pending'""" + _defer_sql + """
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                     """
@@ -1920,6 +1931,45 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def defer_push_delivery(self, task_id: str, pane_id: str, reason: str, *,
+                            max_refusals: int, backoff_s: float) -> Optional[int]:
+        """Back off a task whose tmux push was refused by its pane (G_DT).
+
+        Counts refusals per pane in the task context (`push_refusals`), sets
+        `push_not_before` (exponential: ``backoff_s * 2**(n-1)``), and puts the
+        task back to pending — in one transaction, so the count and the
+        requeue cannot disagree. Returns the count for this pane.
+
+        At ``max_refusals`` the task is left in_progress and NOT requeued: the
+        caller ends it visibly. Returns None if the task was not in_progress.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, context FROM tasks WHERE task_id = ?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.execute("ROLLBACK")
+                return None
+            ctx = json.loads(row["context"] or "{}")
+            refusals = dict(ctx.get("push_refusals") or {})
+            count = int(refusals.get(pane_id, 0)) + 1
+            refusals[pane_id] = count
+            ctx["push_refusals"] = refusals
+            ctx["push_refusal_reason"] = reason
+            ctx["push_not_before"] = time.time() + backoff_s * (2 ** (count - 1))
+            status = "in_progress" if count >= max_refusals else "pending"
+            conn.execute("UPDATE tasks SET context = ?, status = ? WHERE task_id = ?",
+                         (json.dumps(ctx), status, task_id))
+            conn.execute("COMMIT")
+            return count
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def requeue(self, task_id: str) -> None:
         """Roll an in_progress task back to pending so it can be dequeued again."""
         conn = self._connect()
@@ -2056,7 +2106,8 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def dequeue_discuss_for_agent(self, agent: str) -> Optional[TaskRequest]:
+    def dequeue_discuss_for_agent(self, agent: str, *,
+                                  skip_deferred: bool = False) -> Optional[TaskRequest]:
         """Atomic pending→in_progress for the oldest pending discuss task whose
         context.agent matches `agent`. Context is stored as JSON, so filtering
         happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
@@ -2083,6 +2134,8 @@ class TaskQueue:
                     ctx = json.loads(row["context"]) if row["context"] else {}
                 except Exception:
                     continue
+                if skip_deferred and float(ctx.get("push_not_before") or 0) > time.time():
+                    continue            # G_DT backoff — see dequeue()
                 if ctx.get("agent") == agent:
                     chosen = row
                     break

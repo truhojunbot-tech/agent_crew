@@ -6,6 +6,7 @@ under the dispatcher, while AGENT_CREW_DELIVERY still defaults to `both`.
 """
 
 import json
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -239,3 +240,130 @@ def test_watchdog_reminder_is_refused_without_requeueing_the_running_task(
     assert _status(tmp_db, "running") == "in_progress"
     assert app.state.delivery_guard_refusals == {"pane_not_agent_log_viewer": 1}
     assert "task_id=running target=%101 resolved=%101 reason=pane_not_agent_log_viewer" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (review of addc29e, P1): a refused pane must not hot-loop the
+# oldest task claim→requeue and starve the tasks queued behind it.
+# ---------------------------------------------------------------------------
+
+def _panes(kinds):
+    """Probe answering per pane: {"%101": "agent", "%201": "log_viewer"}."""
+    return lambda pane: (kinds[pane], f"current_command=probe-{pane}")
+
+
+def _two_pane_app(db, tmp_path, push):
+    state = tmp_path / "two-pane-state.json"
+    state.write_text(json.dumps({"project": "owned", "pane_ids": ["%101", "%201"]}))
+    # `codex` is an agent_override target living in its own owned pane.
+    return create_app(db, pane_map={"implementer": "%101", "codex": "%201"},
+                      state_path=str(state), port=8100, push_fn=push,
+                      watchdog_disabled=True, anomaly_disabled=True)
+
+
+def _context(db, task_id):
+    return TaskQueue(db).get_task_context(task_id)
+
+
+def test_blocked_oldest_task_does_not_starve_a_later_same_role_task(
+    tmp_db, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr("agent_crew.server._pane_process_kind",
+                        _panes({"%101": "agent", "%201": "log_viewer"}))
+    monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "0")
+    push = RecordingPush()
+    app = _two_pane_app(tmp_db, tmp_path, push)
+    blocked = {**_payload("blocked"), "priority": 1, "context": {"agent_override": "codex"}}
+
+    with TestClient(app) as client:
+        client.post("/tasks", json=blocked)                   # refused on %201
+        client.post("/tasks", json={**_payload("later"), "priority": 3})
+        for tick in range(20):                                # the stale-pending loop
+            app.state.watchdog_tick(now=time.time() + 60 + tick)
+
+    assert [target for target, _ in push.calls] == ["%101"]   # `later` was delivered
+    assert "later" in push.calls[0][1]
+    assert _status(tmp_db, "later") == "in_progress"
+    # No hot loop: twenty re-dispatch passes, one refusal — the backoff held.
+    assert _context(tmp_db, "blocked")["push_refusals"] == {"%201": 1}
+    assert _status(tmp_db, "blocked") == "pending"
+    assert app.state.delivery_guard_refusals == {"pane_not_agent_log_viewer": 1}
+
+
+def test_persistent_non_agent_pane_ends_the_task_as_needs_human_after_n(
+    tmp_db, project_state, monkeypatch, caplog,
+):
+    monkeypatch.setattr("agent_crew.server._pane_process_kind",
+                        lambda _pane: ("log_viewer", "current_command=python"))
+    monkeypatch.setattr("agent_crew.server._PUSH_REFUSAL_BACKOFF_S", 0.0)
+    monkeypatch.setattr("agent_crew.server._PUSH_REFUSAL_MAX", 3)
+    monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "0")
+    push = RecordingPush()
+    app = _app(tmp_db, project_state, push)
+
+    with TestClient(app) as client:
+        client.post("/tasks", json=_payload("stuck"))
+        for tick in range(10):
+            app.state.watchdog_tick(now=time.time() + 60 + tick)
+
+    assert push.calls == []
+    row = next(r for r in TaskQueue(tmp_db).list_all_with_status() if r["task_id"] == "stuck")
+    assert row["status"] == "needs_human"
+    # needs_human rows keep the reason in summary (queue persists error_info
+    # only for failed/timed_out); the refusal record itself is in the context.
+    import sqlite3
+    with sqlite3.connect(tmp_db) as conn:
+        summary = conn.execute("SELECT summary FROM tasks WHERE task_id='stuck'").fetchone()[0]
+    assert summary == "push_refused_pane_not_agent_log_viewer"
+    ctx = _context(tmp_db, "stuck")
+    assert ctx["push_refusals"] == {"%101": 3}                        # bounded: stops at N
+    assert ctx["push_refusal_reason"] == "pane_not_agent_log_viewer"
+    assert app.state.delivery_guard_refusals == {"pane_not_agent_log_viewer": 3}
+    assert "tmux push refused 3 times task_id=stuck" in caplog.text
+
+
+def test_transient_non_agent_pane_delivers_once_the_agent_is_back(
+    tmp_db, project_state, monkeypatch,
+):
+    kinds = {"%101": "shell"}
+    monkeypatch.setattr("agent_crew.server._pane_process_kind", _panes(kinds))
+    monkeypatch.setattr("agent_crew.server._PUSH_REFUSAL_BACKOFF_S", 0.0)
+    monkeypatch.setenv("AGENT_CREW_STALE_PENDING_SECONDS", "0")
+    push = RecordingPush()
+    app = _app(tmp_db, project_state, push)
+
+    with TestClient(app) as client:
+        client.post("/tasks", json=_payload("flaky"))
+        assert push.calls == [] and _status(tmp_db, "flaky") == "pending"
+        kinds["%101"] = "agent"                               # the agent CLI restarted
+        app.state.watchdog_tick(now=time.time() + 60)
+
+    assert [target for target, _ in push.calls] == ["%101"]
+    assert _status(tmp_db, "flaky") == "in_progress"
+    assert _context(tmp_db, "flaky")["push_refusals"] == {"%101": 1}   # the history stays
+
+
+def test_backoff_binds_only_the_push_path_not_other_consumers(tmp_db):
+    """The dispatcher and MCP dequeue without skip_deferred: a pane's refusal
+    never holds the task back from a consumer that does not use that pane."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="d", task_type="implement", description="w"))
+    q.dequeue(role="implementer")
+    assert q.defer_push_delivery("d", "%101", "pane_not_agent_log_viewer",
+                                 max_refusals=3, backoff_s=600) == 1
+    assert q.dequeue(role="implementer", skip_deferred=True) is None
+    assert q.dequeue(role="implementer").task_id == "d"
+
+
+def test_defer_backoff_doubles_per_refusal_on_the_same_pane(tmp_db, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr("agent_crew.queue.time.time", lambda: clock[0])
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="b", task_type="implement", description="w"))
+    waits = []
+    for _ in range(3):
+        q.dequeue(role="implementer")
+        q.defer_push_delivery("b", "%101", "r", max_refusals=10, backoff_s=30)
+        waits.append(q.get_task_context("b")["push_not_before"] - clock[0])
+    assert waits == [30, 60, 120]
+    assert q.defer_push_delivery("b", "%101", "r", max_refusals=10, backoff_s=30) is None  # pending
