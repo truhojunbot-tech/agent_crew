@@ -5416,16 +5416,22 @@ def create_app(
             # Auto-transition: impl task completed → auto-enqueue review task.
             # Pass through the PR number from the impl result so the reviewer
             # task description nails down which PR head to diff (#86).
-            # Skip when coordinator_managed=True — `crew run` drives transitions itself
-            # to avoid duplicate tasks and _wait() blocking on the wrong task_id.
+            #
+            # ⛔`coordinator_managed` is **provenance only** and no longer decides
+            #   anything here. It used to suppress this transition, which made the
+            #   admission question ("may this successor exist?") answerable by a
+            #   flag the submitter of the parent task chose — a caller-asserted
+            #   string, exactly the shape §7/J9 refuses everywhere else. The
+            #   bounding of successors is the engine's job (P1: one component
+            #   decides), and it is the engine that can see round caps, terminal
+            #   PRs and duplicate lineage; a boolean in a task context can see
+            #   none of those. It stays in the context because knowing *who* drove
+            #   a transition is worth recording.
             _task_ctx = ctx if isinstance(ctx, dict) else {}
             if task_type == "implement" and result.status == "completed":
-                if _task_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto review enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
-                    _auto_enqueue_review(task_id, pr_number=result.pr_number,
-                                         result=result)
+                logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
+                _auto_enqueue_review(task_id, pr_number=result.pr_number,
+                                     result=result)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
             # review counts as approved (#100). Skip when the review task was
@@ -5569,10 +5575,8 @@ def create_app(
                 if review_ctx.get("no_tester"):
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
                     # #171: no tester stage → merge immediately on review approval
-                    if pr_number and not review_ctx.get("coordinator_managed"):
+                    if pr_number:
                         _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt)
-                elif review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto test enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id, repo=_review_repo)
@@ -5584,19 +5588,15 @@ def create_app(
             elif (task_type == "review" and _resolve_verdict(result) == "request_changes"
                     and _review_result_is_actionable(result)):
                 review_ctx = ctx if isinstance(ctx, dict) else {}
-                if review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto fix enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
-                    _auto_enqueue_fix(task_id, repo=_review_repo)
+                logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
+                _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
             if task_type == "test" and result.status == "completed":
-                if not _task_ctx.get("coordinator_managed"):
-                    test_pr = result.pr_number or _task_ctx.get("pr_number")
-                    if test_pr:
-                        _test_wt = _any_worktree_path()
-                        _test_repo = _task_ctx.get("repo") or ""
-                        _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
+                test_pr = result.pr_number or _task_ctx.get("pr_number")
+                if test_pr:
+                    _test_wt = _any_worktree_path()
+                    _test_repo = _task_ctx.get("repo") or ""
+                    _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")

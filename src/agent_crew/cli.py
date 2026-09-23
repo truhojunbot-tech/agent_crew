@@ -2424,10 +2424,13 @@ def run_cmd(task: str, db: str, project: str, base: str,
         else:
             raise click.ClickException("Failed to create GitHub issue")
 
-    # coordinator_managed tells the server to skip auto-transitions (impl→review,
-    # review→test). Without this flag the server and coordinator both enqueue the
-    # next phase independently, creating duplicate tasks and causing _wait() to
-    # block on the coordinator's copy while the agent completes the server's copy.
+    # coordinator_managed records *who drove* the transitions of this run. It no
+    # longer suppresses the server-side cascade: a flag the submitter writes into
+    # a context dict cannot be the thing that decides whether a successor task may
+    # exist (§7.2 — it is provenance, and "never reduces the contract"). Duplicate
+    # successors are prevented where they can actually be seen — the engine's
+    # lineage/idempotency answer and the deterministic successor task ids — not by
+    # asking the caller to promise it will behave.
     # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the
     # implementer always branches off the most recent merged state.

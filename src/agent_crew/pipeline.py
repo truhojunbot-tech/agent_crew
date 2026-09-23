@@ -903,7 +903,6 @@ def auto_enqueue_fix(
         findings, and the failure path already retries or falls back. Spawning
         a fix here would double-handle it AND hand an agent nothing to do;
       * the reviewer requested changes without stating anything actionable;
-      * `coordinator_managed` — `crew run` drives its own loop;
       * cross-project, as in `auto_enqueue_review`;
       * the round cap is reached;
       * a fix task for this review round already exists. The transition is
@@ -936,16 +935,15 @@ def auto_enqueue_fix(
             return None
 
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-        # Same guard as the other two transitions: `crew run`'s foreground loop
-        # enqueues its own follow-ups, and a second one here would race it.
-        # Checked here rather than only in the caller so the MCP transport gets
-        # the guard too (#123 — both transports run the same cascade).
-        if review_ctx.get("coordinator_managed"):
-            logger.info(
-                f"auto_enqueue_fix: review {review_task_id} is coordinator_managed "
-                f"— skipping"
-            )
-            return None
+        # ⛔`coordinator_managed` is provenance only; it does not decide whether
+        #   this successor may exist. It used to skip the transition here and in
+        #   the two server-side ones, which put the admission question in the
+        #   hands of a flag the parent task's submitter wrote. Bounding
+        #   successors is the engine's decision (P1), and the things that
+        #   actually bound them — the review↔fix round cap, a terminal PR,
+        #   duplicate lineage — are not visible to a boolean in a context dict.
+        #   Removed on both transports at once, for the same reason the guard was
+        #   duplicated here in the first place (#123).
 
         review_project = review_task.project
         if review_project and server_project and review_project != server_project:

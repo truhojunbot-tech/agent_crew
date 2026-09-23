@@ -181,13 +181,18 @@ def test_cx_4a_admission_always_carries_a_receipt(crew, tmp_path, monkeypatch):
         assert client.get("/tasks/cx4a").json().get("receipt_id") == receipt["receipt_id"]
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "CX-4b: coordinator_managed suppresses the review cascade "
-    "(b574308 server.py:5082-5091); §7.2 makes it provenance only"))
 def test_cx_4b_coordinator_managed_completion_still_yields_review(crew):
     """4b: `admitted_trigger.py:262` stamps coordinator_managed on every admitted
     task and nothing drives review for adm-* tasks. Completing such a task must
-    still produce the required review (J7 — the flag never reduces the contract)."""
+    still produce the required review (J7 — the flag never reduces the contract).
+
+    ⛔No longer xfail. The three suppression branches it was pinned to
+      (b574308 server.py:5082-5091, 5237-5241, 5247-5254, plus the matching one
+      in pipeline.auto_enqueue_fix so both transports moved together) are
+      removed: `coordinator_managed` is provenance and decides nothing. Bounding
+      successors belongs to the engine, which can see the round cap, terminal
+      PRs and duplicate lineage — none of which a boolean in a context dict
+      can."""
     make, push, db = crew
     with make() as client:
         r = post(client, request("adm-impl-cm", "Implement work-class gate",
@@ -585,3 +590,42 @@ def test_control_shadow_work_is_admitted_regardless_of_asserted_caller_class(cre
                  headers={"X-Agent-Crew-Adapter": "cron:admitted_trigger"})
     assert r.status_code == 201
     assert [t for t, _ in push.calls] == [PANES["implementer"]]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# the removed bypasses, proven gone
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_coordinator_managed_is_provenance_and_gates_nothing():
+    """Static complement to CX-4b: no module may branch on
+    ``coordinator_managed`` to decide whether a successor exists.
+
+    CX-4b proves the review appears for one scenario. This proves there is no
+    *second* suppression branch left elsewhere for a scenario nobody wrote a
+    fixture for — the three server branches and the pipeline one were four
+    copies of the same idea (#123 duplicated it deliberately so both transports
+    behaved alike), so removing three and keeping one would have been invisible
+    to any end-to-end test that only drives HTTP.
+    """
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
+    offenders = []
+    for path in sorted(src.rglob("*.py")):
+        if path.relative_to(src).as_posix().startswith("cea/"):
+            continue        # the engine MAY read it: §7.2 turns it into coordinator_id
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.If, ast.IfExp)):
+                continue
+            for sub in ast.walk(node.test):
+                named = (isinstance(sub, ast.Constant) and sub.value == "coordinator_managed") \
+                    or (isinstance(sub, ast.Attribute) and sub.attr == "coordinator_managed") \
+                    or (isinstance(sub, ast.Name) and sub.id == "coordinator_managed")
+                if named:
+                    offenders.append(f"{path.relative_to(src).as_posix()}:{node.lineno}")
+                    break
+    assert offenders == [], (
+        f"coordinator_managed is provenance (§7.2) and must not decide a transition; "
+        f"still branched on at: {offenders}")
