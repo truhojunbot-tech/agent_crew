@@ -36,16 +36,16 @@ P1: after the fold, the raw INSERT is private to `enqueue_with_receipt`, and eac
 
 ## 2. `runtime_stop` (P6 store to generalise, not duplicate)
 
-| Anchor (`queue.py`) | Role today | Under P6 |
-|---|---|---|
-| `:360-369` `_DDL_RUNTIME_STOP` (`id=1, epoch, paused, incident, note, updated_at`) | the #314 single row | `paused` → `state ∈ {ACTIVE, DRAINING, QUARANTINED, STOPPED}` + `reason` + `decision_id`; `epoch` kept; append-only `runtime_state_events` |
-| `:603`, `:912-1001` boot reconcile (`pause.json` vs row, higher generation wins; fail-closed write `:993-1001`) | two stores reconciled at boot | `pause.json` = tighten-only input reconciled into the row (P6; fixture CX-P6b) |
-| `:785` `_stop_dir`, `:787` `_read_stop_row`, `:799` `get_stop_epoch`, `:806` `set_stop_epoch` (epoch+1, `BEGIN IMMEDIATE`), `:830` `resume_stop` (generation CAS) | read/transition API | `RuntimeStateProvider.current()`; transitions gain `who` (P6 table: anyone tightens, owner loosens) |
-| `:873` `_pausejson_active` (additive, fail-closed) | second gate-time store | removed from gate time (§11.2 #13 → T3) |
-| `:889` `_stop_active_in_txn`, `:902` `_stop_active_precheck` | the gate predicate | becomes `validate_*` reading the one row |
-| gates: enqueue `:1034-1038`, dequeue `:1326-1330`, cascade outbox `:1518-1529` (`_suppressed` `:1521`), `external_op_reserve` `:1856`, discuss `:2069` | STOP linearisation points | the same transactions host the T3 call points (P2 table "where") |
-| `server.py:4679-4686` `/health.stop` | exposes `{epoch, paused, incident}` | `/health.runtime_state` (fixture CX-4j asserts `QUARANTINED`) |
-| `cli.py:1502`, `:1533` pause/resume | mirror `pause.json` from the DB epoch | unchanged direction (DB is the linearisation point) |
+| Anchor (`queue.py`) | Role today | Under P6 | Status |
+|---|---|---|---|
+| `:360-369` `_DDL_RUNTIME_STOP` (`id=1, epoch, paused, incident, note, updated_at`) | the #314 single row | `paused` → `state ∈ {ACTIVE, DRAINING, QUARANTINED, STOPPED}` + `reason` + `decision_id`; `epoch` kept; append-only `runtime_state_events` | **DONE** (step 1, `4b62f32`): additive ALTERs + backfill `paused=1 → STOPPED`; `runtime_state_events` with UPDATE/DELETE triggers |
+| `:603`, `:912-1001` boot reconcile (`pause.json` vs row, higher generation wins; fail-closed write `:993-1001`) | two stores reconciled at boot | `pause.json` = tighten-only input reconciled into the row (P6; fixture CX-P6b) | **PARTIAL**: the reconciled verdict now writes `state` and appends an event; the #314 higher-generation rule is unchanged, so a higher `pause.json` generation can still resume. Gate-time `pause.json` remains additive (tighten-only) and is folded into `effective_state` |
+| `:785` `_stop_dir`, `:787` `_read_stop_row`, `:799` `get_stop_epoch`, `:806` `set_stop_epoch` (epoch+1, `BEGIN IMMEDIATE`), `:830` `resume_stop` (generation CAS) | read/transition API | `RuntimeStateProvider.current()`; transitions gain `who` (P6 table: anyone tightens, owner loosens) | **DONE** (step 1): `get_runtime_state()` + `transition_runtime_state(to, who=, decision_id=)`; `set_stop_epoch`/`resume_stop` keep working and now record `who='legacy:*'` events — see the gap note below |
+| `:873` `_pausejson_active` (additive, fail-closed) | second gate-time store | removed from gate time (§11.2 #13 → T3) | **PARTIAL**: still read at gate time, but only as a tightening (`_runtime_state_in_txn`). Removing it outright regresses global/direct pause on a live server; it goes when T3 owns the gate (step 2) |
+| `:889` `_stop_active_in_txn`, `:902` `_stop_active_precheck` | the gate predicate | becomes `validate_*` reading the one row | **DONE** (step 1) as `_runtime_state_in_txn(conn) != 'ACTIVE'` — DRAINING and QUARANTINED now gate enqueue/claim, which the boolean could not express. `validate_*` wiring is step 2 |
+| gates: enqueue `:1034-1038`, dequeue `:1326-1330`, cascade outbox `:1518-1529` (`_suppressed` `:1521`), `external_op_reserve` `:1856`, discuss `:2069` | STOP linearisation points | the same transactions host the T3 call points (P2 table "where") | step 2 |
+| `server.py:4679-4686` `/health.stop` | exposes `{epoch, paused, incident}` | `/health.runtime_state` (fixture CX-4j asserts `QUARANTINED`) | **DONE** (step 1): `/health.runtime_state` = `{state, effective_state, epoch, reason, decision_id, incident, pause_json_tightening, read_failed}`; `/health.stop` kept for #314 callers |
+| `cli.py:1502`, `:1533` pause/resume | mirror `pause.json` from the DB epoch | unchanged direction (DB is the linearisation point) | unchanged |
 
 ## 3. Lane rebases onto b574308 — measured, not resolved
 
@@ -90,8 +90,54 @@ Method: throwaway detached worktree at `b574308`, `git cherry-pick -x` per lane 
 - **`_auto_enqueue_test` in `server.py` (`:4351-4399`) has its own `q().enqueue`**, separate from `pipeline.auto_enqueue_test` (`:1231`); the HTTP and MCP test cascades are two code paths for one invariant (same class as §11.3).
 - **`_requeue_orphans` runs before the dispatcher loop starts** (`server.py:2430`) with no re-validation — exactly the P7 recovery point; it is the natural first caller of `validate_claim` on restart.
 
+## 6. Step 1 — what landed, what did not (`result`)
+
+Task `sev0-cea-lineage-s1-state-validator`, commit `4b62f32` on `sev0/cea-lineage`
+(base `d073a59`). Contract frozen at alfred `6cbce565`; receipt schema copied
+byte-identically from alfred `e1063eb` (blob `41e7ebf`, asserted by a test).
+
+| Item | State | Where |
+|---|---|---|
+| P6 state + epoch + reason + decision_id on the `runtime_stop` row | **done** | `queue.py` `_DDL_MIGRATE_RUNTIME_STOP_P6`, `_DDL_BACKFILL_RUNTIME_STOP_STATE` |
+| append-only `runtime_state_events` (+ UPDATE/DELETE triggers) | **done** | `queue.py` `_DDL_RUNTIME_STATE_EVENTS*` |
+| transition rules / who-may-transition | **done** | `queue.transition_runtime_state`, `_transition_refusal` |
+| `/health.runtime_state` | **done** | `server.py` `/health` |
+| `authorization_receipts` = the frozen schema, append-only | **done** | `cea/store.py` |
+| `dispatch_nonces` single-use | **done** | `cea/store.py` `mint_nonce`/`consume_nonce` |
+| `tasks.receipt_id` (nullable) | **done** | `cea/store.py` `_DDL_MIGRATE_TASKS_RECEIPT_ID` |
+| one validator: P3 table, P6 matrix, P7, O18, O20 | **done** | `cea/validator.py` `validate()` |
+| the five validator call sites | **not started — step 2** | — |
+| `tasks.receipt_id` `NOT NULL` + FK | **not started — step 2** | — |
+| P4 unique partial index on `intent_hash` | **not started** | needs the "current state" view over the append-only rows; lands with the engine |
+
+**Honest gaps in step 1** (they are not hidden behind a green test):
+
+1. `set_stop_epoch(False)` and `resume_stop(...)` still loosen the runtime without
+   an owner `decision_id`. They are the #314 CLI/fleet paths and breaking them
+   would break `b574308`; they now record `who='legacy:set_stop_epoch'` /
+   `'legacy:resume_stop'` events so the bypass is visible in the audit trail. The
+   P6 authority rule is enforced on `transition_runtime_state`, which is the API
+   step 2 routes the transition endpoint through.
+2. `pause.json` is still read at gate time (as a tightening only). P6 wants it
+   read at boot only; removing the gate-time read now regresses global/direct
+   pause on a live server (the #314 reviewer note at `queue.py:_pausejson_active`).
+3. The validator's signature check reads `signature.status`; there is no engine
+   key yet (O3), so every receipt is `UNVERIFIED` and admissible only with a
+   `downgrade_reason`. That is P2a's stated position, not an oversight.
+
+**Verification** (`tests/test_cea_step1_state_and_validator.py`, 127 tests): schema
+blob identity; the dependency-free fallback checker agreeing with `jsonschema` on
+every fixture; trigger rejection of UPDATE/DELETE on both append-only tables;
+migration idempotence over three opens of a copy of the committed fixture DB **and**
+of a copy of the live `~/.agent_crew/agent_crew/tasks.db`; the P6 transition table
+row by row; all 20 cells of the P6 enforcement matrix; every row of the P3 outcome
+table; each O18 immediate-invalidation field against a one-minute-old receipt; and
+the O20 window on both sides. No live server, DB or GitHub state was touched — the
+live DB is copied into `tmp_path` and opened there.
+
 ## §P Provenance
 
 - Provider Claude, model `claude-fable-5-1`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-prep-r1` on :8105, branch `sev0/cea-lineage`.
+- Step 1 (§6): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s1-state-validator` on :8105, same branch, base `d073a59`, 2026-09-23.
 - Read-only inputs: agent_crew `b574308`, `5efea31`, `4c123fc`, `37cb8af`, `846d13c`, `addc29e`, `4df04aa`, `b46bda4`, `3b8598f`, `9c90da1` (git objects); alfred `6cbce56` (E11 ADR), `sev0/e10-claude-redteam` E10 report + repro; `GET /tasks/sev0-e10-codex-challenge-r1` and `GET /tasks/sev0-cea-lineage` on :8105 (read-only, 2026-09-23).
 - Merge trials: temporary detached worktree under `/tmp`, cherry-pick only, removed; no branch other than `sev0/cea-lineage` was created or moved. No live server, DB, GitHub or Telegram mutation.
