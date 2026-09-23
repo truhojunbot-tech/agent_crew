@@ -36,6 +36,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import secrets
 import stat
 from dataclasses import dataclass
 from typing import Optional
@@ -176,6 +177,58 @@ def authenticator_from_env(env: Optional[dict] = None):
     return TokenFileAuthenticator(path) if path else DenyAllAuthenticator()
 
 
+# ── the in-process adapter (step 2c, temporary) ─────────────────────────────
+
+def _seal_in_process():
+    """Mint one loopback credential per ingress provenance, at import.
+
+    ⛔This is **not** a credential boundary and nothing here pretends it is.
+      The token is generated in this process and presented to an engine running
+      in this same process: it proves that the code holding it is this process,
+      which is a tautology, not authentication. It exists for one reason — J9
+      refuses a Caller nobody minted, and the step-2c adapters (``queue.enqueue``
+      and the legacy ``POST /tasks`` behind it) are in-process callers that have
+      no token file yet. Minting here keeps ``authorize`` on its single
+      authenticated entry path instead of growing a second, unauthenticated one.
+
+    Two properties make it honest rather than a hole:
+
+    * it grants nothing. Anything that can call :func:`in_process_caller`
+      already has the engine object and could call ``authorize`` directly;
+    * it does not cross the boundary. With ``AGENT_CREW_CEA_ENGINE_ENDPOINT``
+      set, the engine is another process whose token table does not contain
+      this secret, so the loopback caller gets 401 and fails closed — which is
+      the correct answer, because out of process the claim really is unproven.
+
+    The receipt says so either way: ``caller_identity_status`` is UNVERIFIED
+    with ``downgrade_reason SHARED_UID_NO_CREDENTIAL_BOUNDARY`` (P2a), because
+    :func:`~agent_crew.cea.intent._mint_caller` derives that and takes no
+    argument for it. §7 replaces this with per-adapter tokens in step 2b.
+    """
+    tokens = {secrets.token_hex(32): AdapterIdentity(
+        principal=f"agent_crew.in_process:{prov.value}", provenance=prov)
+        for prov in CallerProvenance}
+    authenticator = StaticTokenAuthenticator(tokens)
+    by_provenance = {identity.provenance: token for token, identity in tokens.items()}
+
+    def caller(provenance: CallerProvenance = CallerProvenance.DIRECT) -> Caller:
+        """The minted Caller for an in-process ingress of this provenance."""
+        if not isinstance(provenance, CallerProvenance):
+            raise AuthenticationError(
+                f"{provenance!r} is not a CallerProvenance; the ingress names itself from the "
+                f"enum, never from a request field (§3)")
+        minted = authenticator.authenticate(by_provenance[provenance])
+        if minted is None:                      # pragma: no cover — the table is built here
+            raise AuthenticationError("the in-process token table did not authenticate its own token")
+        return minted
+
+    return authenticator, caller
+
+
+in_process_authenticator, in_process_caller = _seal_in_process()
+
+
 __all__ = ["AdapterIdentity", "AuthenticationError", "CREDENTIAL_KIND_ADAPTER_TOKEN",
            "CREDENTIAL_KIND_BROKER", "DenyAllAuthenticator", "StaticTokenAuthenticator",
-           "TokenFileAuthenticator", "authenticator_from_env", "parse_token_table"]
+           "TokenFileAuthenticator", "authenticator_from_env", "in_process_authenticator",
+           "in_process_caller", "parse_token_table"]

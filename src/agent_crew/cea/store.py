@@ -15,10 +15,11 @@ Properties this module owns, all of them stated in the contract:
   consuming a nonce is one conditional ``UPDATE`` (``used_at IS NULL``), so two
   racing consumers cannot both win (P2 dispatch/execute-start rows).
 
-Not here, on purpose (step 2+ of the fold): the five ``validate_*`` call sites,
-``enqueue_with_receipt`` as the sole ``QUEUED`` writer, ``tasks.receipt_id``
-``NOT NULL`` + FK, and the P4 unique partial index on ``intent_hash`` (it needs
-the "current state" view over the append-only rows, which lands with the engine).
+Step 2c added the ``tasks.receipt_id`` requirement (``_DDL_TASKS_RECEIPT_REQUIRED``);
+the sole-writer property and the five ``validate_*`` call sites live in
+:mod:`agent_crew.queue` and :mod:`agent_crew.cea.callsites`. Still not here: the
+foreign key onto ``authorization_receipts`` (the receipt table is append-only, so
+the FK target is not a unique column), and the §7 ingress adapters (step 2b).
 """
 from __future__ import annotations
 
@@ -165,9 +166,38 @@ _DDL_LINEAGE_WORK_HASH_INDEX = (
     "ON intent_lineages (work_hash, state)")
 
 _DDL_MIGRATE_TASKS_RECEIPT_ID = "ALTER TABLE tasks ADD COLUMN receipt_id TEXT"
-"""Step 1: nullable. Step 2 enforces ``NOT NULL`` + FK once every ingress mints a
-receipt — adding the constraint before the ingresses are wired would make every
-existing enqueue path fail on a live DB."""
+"""Step 1 added the column nullable. Step 2c makes it required — see below."""
+
+_DDL_TASKS_RECEIPT_REQUIRED = (
+    "CREATE TRIGGER IF NOT EXISTS trg_tasks_receipt_id_required\n"
+    "BEFORE INSERT ON tasks\n"
+    "WHEN NEW.receipt_id IS NULL OR TRIM(NEW.receipt_id) = '' BEGIN\n"
+    "    SELECT RAISE(ABORT, 'tasks.receipt_id is required (ADR P2): a task row is the "
+    "physical form of an admission decision, so it may not exist without the receipt that "
+    "made it');\n"
+    "END",
+    "CREATE TRIGGER IF NOT EXISTS trg_tasks_receipt_id_immutable\n"
+    "BEFORE UPDATE OF receipt_id ON tasks\n"
+    "WHEN NEW.receipt_id IS NULL OR TRIM(NEW.receipt_id) = ''\n"
+    "  OR (OLD.receipt_id IS NOT NULL AND NEW.receipt_id <> OLD.receipt_id) BEGIN\n"
+    "    SELECT RAISE(ABORT, 'tasks.receipt_id is fixed at admission (ADR P2): clearing or "
+    "repointing it would detach a live row from the decision that admitted it');\n"
+    "END",
+)
+"""``tasks.receipt_id NOT NULL``, expressed the only way SQLite allows in place.
+
+``ALTER TABLE ... SET NOT NULL`` does not exist in SQLite, and the alternative —
+rebuild ``tasks`` into a new table and swap — rewrites the live queue of a
+running server to add a constraint. A ``BEFORE INSERT`` trigger enforces the same
+property at the same place (the database, not the application) and is additive
+and idempotent on a live DB.
+
+⛔It is deliberately an INSERT trigger, not a backfill. Rows written before this
+  step have no receipt and there is no honest value to give them: inventing one
+  would put a receipt_id in the audit trail that names a decision nobody made.
+  They keep ``NULL``, the property holds from here forward, and the second
+  trigger stops a later ``UPDATE`` from clearing or repointing a row that has one.
+"""
 
 LIVE_STATES = ("ISSUED", "QUEUED", "CLAIMED", "RUNNING", "HELD")
 TERMINAL_STATES = ("CONSUMED", "SUPERSEDED", "REVOKED")
@@ -218,6 +248,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(_DDL_MIGRATE_TASKS_RECEIPT_ID)
     except sqlite3.OperationalError:
         pass  # column already exists, or `tasks` not created yet on this connection
+    for stmt in _DDL_TASKS_RECEIPT_REQUIRED:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # `tasks` is not on this connection (receipt-store-only DBs)
 
 
 def _encode(receipt: dict) -> dict:

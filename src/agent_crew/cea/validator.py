@@ -73,32 +73,44 @@ class ValidationResult:
 
 @runtime_checkable
 class ReceiptValidator(Protocol):
-    """T3 — the single validator implementation, invoked from five call sites."""
+    """T3 — the single validator implementation, invoked from five call sites.
 
-    def validate_enqueue(self, receipt: Receipt, *, task_id: str) -> ValidationResult:
+    Every method takes ``current``: the validator does no I/O, so the current
+    values it compares against are read by the caller (P1 input providers) and
+    handed in. A protocol without it described an implementation that cannot
+    check anything — the call sites in :mod:`agent_crew.cea.callsites` all pass it.
+    """
+
+    def validate_enqueue(self, receipt: Receipt, *, task_id: str,
+                         current: Optional["CurrentInputs"] = None) -> ValidationResult:
         """P2 Enqueue: receipt exists, signature valid, ``decision=ALLOW`` (or
         ``REVIEW`` with the reviewer task created in the same transaction),
         ``task_id`` matches, binding current. Runs inside the caller's
         ``BEGIN IMMEDIATE``; on failure no row is written."""
         ...
 
-    def validate_claim(self, receipt: Receipt, *, claimant: str) -> ValidationResult:
+    def validate_claim(self, receipt: Receipt, *, claimant: Optional[str] = None,
+                       current: Optional["CurrentInputs"] = None) -> ValidationResult:
         """P2 Claim: signature; not REVOKED/CONSUMED; ``executor_binding`` matches
         the claimant's *asserted* identity (UNVERIFIED under P2a); binding
         current; runtime state permits claim (P6)."""
         ...
 
-    def validate_dispatch(self, receipt: Receipt, *, attempt: int) -> ValidationResult:
+    def validate_dispatch(self, receipt: Receipt, *, attempt: Optional[int] = None,
+                          current: Optional["CurrentInputs"] = None) -> ValidationResult:
         """P2 Dispatch: as claim, re-read; mints a fresh single-use dispatch
         nonce bound to ``(receipt_id, attempt)`` and returns it in ``nonce``."""
         ...
 
-    def validate_execute_start(self, receipt: Receipt, *, nonce: str) -> ValidationResult:
+    def validate_execute_start(self, receipt: Receipt, *, nonce: Optional[str] = None,
+                               current: Optional["CurrentInputs"] = None) -> ValidationResult:
         """P2 Execute start: as dispatch; the nonce is unused and matches.
         One-shot: pre-spawn. Pane: ``POST /tasks/{id}/start {nonce}`` → go/no-go."""
         ...
 
-    def validate_result(self, receipt: Receipt, *, nonce: str, presenter: str) -> ValidationResult:
+    def validate_result(self, receipt: Receipt, *, nonce: Optional[str] = None,
+                        presenter: Optional[str] = None,
+                        current: Optional["CurrentInputs"] = None) -> ValidationResult:
         """§2.2 / P2 last paragraph: ``/result`` accepted only with the dispatch
         nonce presented under ``executor_binding``; a second result on a terminal
         task is 409 (P4). Identity-dependent verdicts under UNVERIFIED binding

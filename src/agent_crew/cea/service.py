@@ -140,6 +140,17 @@ class UnixSocketEngineClient:
                              code=str(reply["code"]), reused=bool(reply.get("reused")),
                              existing_receipt_id=reply.get("existing_receipt_id"))
 
+    def current_binding(self, receipt: dict) -> tuple[None, tuple[str, ...]]:
+        """P7: an adapter on this side of the socket cannot compute ``B′``.
+
+        The remote engine owns the input providers; this client has none. It
+        says so rather than answering with a binding it assembled from nothing,
+        because a fabricated B′ compares equal to the receipt's and turns every
+        drift check into a no-op. Recomputing B′ remotely is a ``crew-authz``
+        endpoint, not something to fake here.
+        """
+        return None, ("remote_engine_binding",)
+
     def credential(self) -> Optional[str]:
         """This adapter's own token: the constructor override, else the config file."""
         if self._credential is not None:

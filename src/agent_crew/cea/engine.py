@@ -53,7 +53,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from agent_crew.cea.intent import (
-    Caller, IdentityStatus, Intent, IntentIdentity, InvalidScopeAnchor, WorkClass,
+    Caller, IdentityStatus, Intent, IntentIdentity, InvalidScopeAnchor, Target, WorkClass,
     canonical_identity, is_authenticated_caller)
 from agent_crew.cea.providers import (
     CapabilityLookup, PolicySnapshotRef, SignatureStatus)
@@ -460,6 +460,27 @@ class AuthorizationEngine:
             raise EngineError(str(exc)) from exc
         receipt_store.set_lineage_state(conn, updated["intent_hash"], receipt_id, updated["state"])
         return updated
+
+    def current_binding(self, receipt: dict) -> tuple[Optional[dict], tuple[str, ...]]:
+        """``(B′, unavailable_inputs)`` for a receipt already in flight (P3, P7).
+
+        The post-admission call sites (claim, dispatch, execute-start, result)
+        have a receipt, not an intent, and B′ has to be computed over the scope
+        admission used — so it is read back from ``provenance.intent_identity``
+        and the providers are asked again. Any input that did not answer makes B′
+        ``None`` with the names attached: the validator then fails closed at
+        admission and *holds* work already authorised, which is P7's asymmetry
+        and not something an adapter gets to reinterpret.
+        """
+        intent = intent_from_receipt(receipt)
+        if intent is None:
+            return None, ("intent_identity",)
+        executor = receipt.get("executor_binding") or self._executor_binding(intent)
+        snapshot, registry, runtime, budget, gate, raised = self._read_inputs(intent, executor)
+        unavailable = self._unavailable_inputs(snapshot, registry, runtime) + raised
+        if unavailable:
+            return None, unavailable
+        return self._binding(snapshot, registry, runtime, budget, gate, _matched(registry)), ()
 
     # ── J1: an existing lineage ─────────────────────────────────────────
 
@@ -1025,17 +1046,70 @@ def _gate_json(gate):
 
 def _provenance(intent: Intent, snapshot, unavailable) -> dict:
     """§7.2 — ``coordinator_managed`` becomes a named coordinator here and nothing
-    more. Provenance is recorded and never read as an admission input."""
+    more. Provenance is recorded and never read as an admission input.
+
+    ``intent_identity`` is the P4 tuple this receipt was issued over, recorded so
+    a later call site can recompute ``B′`` against the *same* scope the engine
+    used. ⛔It is recorded, not trusted: it is an input to a provider *lookup*,
+    never to a verdict, and it is only as good as the receipt's signature — which
+    is why every call site passes ``signature_verification`` alongside it
+    (:mod:`agent_crew.cea.callsites`). Without it a validator at CLAIM would have
+    to either guess the scope or declare B′ uncomputable for every task, and a
+    guessed scope is a B′ that can silently disagree with the one admission used.
+    """
     prov: dict = {
         "snapshot_signature_status": (getattr(snapshot.signature, "value", None)
                                       if snapshot is not None else None),
         "coordinator": intent.coordinator_id,
+        "intent_identity": _identity_json(intent.identity),
     }
     if unavailable:
         prov["unavailable_inputs"] = list(unavailable)
     if intent.task_type:
         prov["task_type"] = intent.task_type
     return prov
+
+
+def _identity_json(identity: IntentIdentity) -> dict:
+    """The P4 tuple as plain JSON (provenance only — never an admission input)."""
+    return {
+        "project": identity.project,
+        "work_class": _work_class_value(identity.work_class),
+        "target": {"repo": identity.target.repo, "base_ref": identity.target.base_ref,
+                   "scope_anchors": list(identity.target.scope_anchors)},
+        "capability_id": identity.capability_id,
+        "authority_decision_ids": list(identity.authority_decision_ids),
+    }
+
+
+def intent_from_receipt(receipt: dict) -> Optional[Intent]:
+    """Rebuild the :class:`Intent` a receipt was issued over, or ``None``.
+
+    ``None`` is the honest answer for a receipt that predates
+    ``provenance.intent_identity`` (or carries a malformed one): the caller then
+    reports the input as unavailable rather than computing ``B′`` over a scope it
+    invented. A guessed scope produces a B′ that differs from the admitted one
+    for reasons that have nothing to do with drift.
+    """
+    ident = ((receipt or {}).get("provenance") or {}).get("intent_identity")
+    if not isinstance(ident, dict):
+        return None
+    target = ident.get("target") or {}
+    try:
+        identity = IntentIdentity(
+            project=str(ident["project"]),
+            work_class=WorkClass(ident["work_class"]),
+            target=Target(repo=str(target.get("repo") or ""),
+                          base_ref=str(target.get("base_ref") or ""),
+                          scope_anchors=tuple(target.get("scope_anchors") or ())),
+            capability_id=ident.get("capability_id"),
+            authority_decision_ids=tuple(ident.get("authority_decision_ids") or ()))
+    except (KeyError, TypeError, ValueError):
+        return None
+    return Intent(identity=identity, task_id=str(receipt.get("task_id") or ""),
+                  task_type=str(((receipt.get("provenance") or {}).get("task_type")) or ""),
+                  description="", coordinator_id=(receipt.get("provenance") or {}).get("coordinator"),
+                  parent_receipt_id=receipt.get("parent_receipt_id"))
 
 
 def _rfc3339(epoch: float) -> str:
@@ -1091,7 +1165,8 @@ def reset_engine() -> None:
 
 __all__ = [
     "Authorization", "AuthorizationEngine", "DEFAULT_ROLE_AGENTS", "ENFORCE", "EngineConfig",
-    "EngineError", "REVIEW_FLOOR", "SHADOW", "SnapshotHumanGate", "UnavailableBudget",
-    "UnavailableCapabilityRegistry", "UnavailablePolicySnapshot", "UnavailableRuntimeState",
-    "get_engine", "intent_hash", "reset_engine",
+    "EngineError", "REVIEW_FLOOR", "SHADOW", "SnapshotHumanGate", "UnauthenticatedCaller",
+    "UnavailableBudget", "UnavailableCapabilityRegistry", "UnavailablePolicySnapshot",
+    "UnavailableRuntimeState", "get_engine", "intent_from_receipt", "intent_hash",
+    "reset_engine", "work_hash",
 ]
