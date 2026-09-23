@@ -204,7 +204,7 @@ def build_mcp_server(
         _artifact_held = None
         _task = next((item for item in queue.list_tasks() if item.task_id == task_id), None)
         try:
-            _runtime_paused = bool(queue.get_stop_epoch().get("paused")) or queue._pausejson_active()
+            _runtime_paused = queue.get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}

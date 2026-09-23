@@ -423,6 +423,54 @@ class TestRuntimeStateTransitions:
         assert res["resumed"] is True and res["reason"] == "not paused"
         assert q.runtime_state_events() == []
 
+    def test_pause_json_is_reconciled_into_the_row_not_read_at_gate_time(self, tmp_path, monkeypatch):
+        """P6 gives the runtime one state store. Codex review of 10153bf, P1 #2:
+        an armed pause.json made the gate say STOPPED while ``runtime_stop.state``
+        still said ACTIVE — row, event log, /health and gate disagreed about the
+        same instant. Now the signal is folded into the row inside the gate's own
+        transaction, and every reader agrees."""
+        armed = {"value": True}
+        monkeypatch.setattr("agent_crew.pause.is_paused", lambda *a, **k: armed["value"])
+        qq = TaskQueue(str(tmp_path / "tasks.db"))
+        assert qq._stop_active_precheck() is True                     # gate
+        state = qq.get_runtime_state()
+        assert state["state"] == "STOPPED"                            # row
+        assert state["effective_state"] == "STOPPED"                  # health
+        assert state["paused"] is True
+        events = qq.runtime_state_events()
+        assert events[0]["to_state"] == "STOPPED"                     # event log
+        assert events[0]["who"] == "pause.json"
+        assert events[0]["direction"] == "tighten"
+        epoch_after_reconcile = state["epoch"]
+
+        # Reconciliation is idempotent: a second gate check writes no second event.
+        assert qq._stop_active_precheck() is True
+        assert len(qq.runtime_state_events()) == len(events)
+        assert qq.get_runtime_state()["epoch"] == epoch_after_reconcile
+
+        # Tighten-only: disarming pause.json does not loosen the row. Leaving
+        # STOPPED is an owner decision with a T0 record behind it (P6).
+        armed["value"] = False
+        assert qq.get_runtime_state()["state"] == "STOPPED"
+        assert qq._stop_active_precheck() is True
+        qq.transition_runtime_state("ACTIVE", who="owner:hojun", decision_id="D-51-9")
+        assert qq._stop_active_precheck() is False
+
+    def test_unjudgeable_pause_json_fails_closed_without_latching_the_row(self, tmp_path, monkeypatch):
+        """An input that cannot be read is fail-closed for *this* decision (P7) but
+        is never written into the row — a transient read error must not leave the
+        fleet in a state only an owner T0 decision can leave."""
+        def boom(*a, **k):
+            raise OSError("pause.json unreadable")
+        monkeypatch.setattr("agent_crew.pause.is_paused", boom)
+        qq = TaskQueue(str(tmp_path / "tasks.db"))
+        assert qq._stop_active_precheck() is True
+        assert qq.get_runtime_state()["effective_state"] == "STOPPED"
+        monkeypatch.setattr("agent_crew.pause.is_paused", lambda *a, **k: False)
+        assert qq.get_runtime_state()["state"] == "ACTIVE"
+        assert qq.runtime_state_events() == []
+        assert qq._stop_active_precheck() is False
+
     def test_draining_and_quarantine_gate_enqueue_and_claim(self, q):
         """P6: DRAINING and QUARANTINED BLOCK enqueue and refuse claim, which the
         #314 boolean could not express."""
@@ -434,18 +482,27 @@ class TestRuntimeStateTransitions:
             fresh.transition_runtime_state("ACTIVE", who="owner", decision_id="D-51-9")
 
     def test_pause_json_is_tighten_only(self, tmp_path, monkeypatch):
-        """pause.json may raise the effective state, never lower it (P6)."""
+        """pause.json may raise the stored state, never lower it (P6).
+
+        It raises the *row* — it is reconciled in, not unioned at gate time — so
+        ``state`` and ``effective_state`` agree afterwards.
+        """
         monkeypatch.setattr("agent_crew.pause.is_paused", lambda *a, **k: False)
         qq = TaskQueue(str(tmp_path / "t.db"))
         assert qq.get_runtime_state()["effective_state"] == "ACTIVE"
         monkeypatch.setattr("agent_crew.pause.is_paused", lambda *a, **k: True)
         state = qq.get_runtime_state()
-        assert state["state"] == "ACTIVE"            # the stored row is untouched
-        assert state["effective_state"] == "STOPPED"  # the gates see the tightening
-        # and it cannot loosen a stored QUARANTINED
-        qq.transition_runtime_state("QUARANTINED", who="operator")
+        assert state["state"] == "STOPPED"            # folded into the one row
+        assert state["effective_state"] == "STOPPED"  # and the gates see the same value
+        # and it cannot loosen a stored QUARANTINED: only an owner T0 decision can,
+        # so a disarmed pause.json leaves the stored state where it is.
+        qq.transition_runtime_state("ACTIVE", who="owner", decision_id="D-51-9")
         monkeypatch.setattr("agent_crew.pause.is_paused", lambda *a, **k: False)
+        qq.transition_runtime_state("QUARANTINED", who="operator")
         assert qq.get_runtime_state()["effective_state"] == "QUARANTINED"
+        # re-arming tightens QUARANTINED the rest of the way to STOPPED, never back
+        monkeypatch.setattr("agent_crew.pause.is_paused", lambda *a, **k: True)
+        assert qq.get_runtime_state()["state"] == "STOPPED"
 
     def test_unreadable_state_is_treated_as_stopped(self, q, monkeypatch):
         """P7: "Runtime state unreadable ⇒ treated as STOPPED"."""

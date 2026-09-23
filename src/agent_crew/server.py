@@ -5125,7 +5125,7 @@ def create_app(
         _artifact_held = None
         _task = next((item for item in q().list_tasks() if item.task_id == task_id), None)
         try:
-            _runtime_paused = bool(q().get_stop_epoch().get("paused")) or q()._pausejson_active()
+            _runtime_paused = q().get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
             # STOP state is safety authority.  Do not rewrite an in-flight
             # result while its state cannot be read; submit_result will retain

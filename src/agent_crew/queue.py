@@ -978,13 +978,16 @@ class TaskQueue:
         """The P6 row as one value: ``{state, epoch, reason, decision_id, paused,
         incident, note, updated_at, effective_state, pause_json_tightening}``.
 
-        ``effective_state`` is what the gates act on: the row, tightened by the
-        ``pause.json`` signal if that is armed. P6 makes ``pause.json`` a
+        The pause.json signal is reconciled into the row first, so what this
+        reports is what the gates decided on: ``effective_state == state`` unless
+        the signal could not be judged at all, in which case both read STOPPED
+        without that being written down (P7 fail-closed). P6 keeps pause.json a
         *tighten-only input* — it can raise the state, never lower it — so the row
         remains the single store and no union of two sources can loosen anything.
         A read failure is reported as STOPPED (P7: "runtime state unreadable ⇒
         treated as STOPPED", already the #314 behaviour).
         """
+        reconciled = self.reconcile_pause_signal()
         try:
             conn = self._connect()
         except Exception:
@@ -1001,9 +1004,10 @@ class TaskQueue:
                     "pause_json_tightening": None, "read_failed": True}
         finally:
             conn.close()
-        tightening = self._pausejson_active()
-        row["pause_json_tightening"] = tightening
-        row["effective_state"] = self._tighten(row["state"], "STOPPED" if tightening else "ACTIVE")
+        row["pause_json_tightening"] = self._pausejson_signal()[0]
+        # The row is authoritative; `reconciled` only differs from it when the
+        # signal was unreadable (tighten-only, never written) or a writer raced us.
+        row["effective_state"] = self._tighten(row["state"], reconciled)
         row["read_failed"] = False
         return row
 
@@ -1151,15 +1155,17 @@ class TaskQueue:
             logger.warning("runtime_state_events 기록 실패 (%s → %s)", frm, to)
 
     def _runtime_state_in_txn(self, conn) -> str:
-        """Effective P6 state under the caller's write lock. Read failure ⇒ STOPPED."""
+        """The P6 state the gates act on, under the caller's write lock.
+
+        One source: the ``runtime_stop`` row. The external pause.json signal is
+        reconciled **into** that row (row + event, same transaction) before it is
+        read, so a gate decision and the audit trail can never describe different
+        states. Read failure ⇒ STOPPED (P7).
+        """
         try:
-            row = self._read_stop_row(conn)
+            return self._reconcile_pause_signal_in_txn(conn)
         except Exception:
             return "STOPPED"  # P7: unreadable state is treated as STOPPED
-        state = row["state"]
-        if state == "ACTIVE" and self._pausejson_active():
-            return "STOPPED"
-        return state
 
     def get_stop_epoch(self) -> dict:
         """현재 STOP 권위 상태 {epoch, paused, incident, note, updated_at} (관측/미러용)."""
@@ -1283,21 +1289,85 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def _pausejson_active(self) -> bool:
-        """pause.json/global 외부 STOP 신호(additive). runtime_stop과 별개로, 직접 arm되거나
-        global scope로 걸린 pause를 재시작 없이 라이브 큐에도 반영한다.
+    def _pausejson_signal(self) -> tuple[bool, bool]:
+        """The external pause.json/global STOP signal as ``(armed, readable)``.
 
-        ⛔이 신호는 **강화 전용(additive)** 이다 — 차단만 하고 admit은 못 한다. 따라서 원자
-          linearization point는 여전히 runtime_stop(DB) 단독이고(unpause/admit은 DB로만 결정),
-          pause.json을 여기서 읽어도 STOP을 약화시키는 원자성 구멍이 생기지 않는다.
-          (리뷰어 v2 §2는 pause.json in-txn 제거를 요청했으나, 완전 제거 시 global/직접 pause가
-           라이브 서버에 안 먹히는 회귀가 생긴다. DB 권위는 유지하되 이 신호는 additive로 남긴다 — 보고에 명시.)
-        판정 불가는 fail-closed(=차단)."""
+        P6 gives the runtime **one** state store. pause.json is an *input* to it —
+        an operator or another project can arm a pause without going through this
+        DB — not a second authority the gates consult at decision time. It is read
+        here and reconciled into ``runtime_stop`` (see
+        :meth:`_reconcile_pause_signal_in_txn`); nothing else reads it.
+
+        ``readable`` is False when the file could not be judged. That is still
+        fail-closed for the current decision, but it is deliberately **not**
+        latched into the row: a transient read error must not leave the fleet in a
+        STOPPED state only an owner T0 decision can leave.
+        """
         try:
             from agent_crew import pause as _p
-            return bool(_p.is_paused(self._stop_dir()))
+            return bool(_p.is_paused(self._stop_dir())), True
         except Exception:
-            return True  # fail-closed
+            return True, False  # fail-closed for this decision, not written down
+
+    def _pausejson_active(self) -> bool:
+        """Back-compat shim for #314 callers. Prefer the reconciled row."""
+        return self._pausejson_signal()[0]
+
+    def _reconcile_pause_signal_in_txn(self, conn) -> str:
+        """Fold the pause.json signal into the one row **and** the event log, inside
+        the caller's ``BEGIN IMMEDIATE``. Returns the row's state afterwards.
+
+        This is what makes "the gates read the row" true. Before it, the gate path
+        returned STOPPED while ``runtime_stop.state`` still said ACTIVE, so the row,
+        the event log, ``/health`` and the gates could all disagree about the same
+        instant (codex review of 10153bf, P1 #2).
+
+        Tighten-only, as P6 requires: an armed pause.json raises the state; a
+        disarmed one never lowers it, because loosening is an owner decision with a
+        T0 record behind it.
+        """
+        armed, readable = self._pausejson_signal()
+        if not armed:
+            return self._read_stop_row(conn)["state"]
+        if not readable:
+            # Unjudgeable input: fail closed for this decision only (P7), no write.
+            return "STOPPED"
+        cur = self._read_stop_row(conn)
+        if _RUNTIME_TIGHTNESS[cur["state"]] >= _RUNTIME_TIGHTNESS["STOPPED"]:
+            return cur["state"]
+        epoch = int(cur["epoch"]) + 1
+        conn.execute(
+            "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state, "
+            "reason, decision_id) VALUES (1, ?, 1, ?, ?, ?, 'STOPPED', ?, NULL) "
+            "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=1, "
+            "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
+            "state='STOPPED', reason=excluded.reason, decision_id=NULL",
+            (epoch, cur["incident"], cur["note"], time.time(), "pause.json armed externally"))
+        self._record_runtime_event_on(conn, frm=cur["state"], to="STOPPED", epoch=epoch,
+                                      who="pause.json", reason="pause.json armed externally",
+                                      incident=cur["incident"], note=cur["note"])
+        return "STOPPED"
+
+    def reconcile_pause_signal(self) -> str:
+        """:meth:`_reconcile_pause_signal_in_txn` with its own transaction.
+        Fail-closed: if the write cannot be made, report STOPPED rather than guess."""
+        try:
+            conn = self._connect()
+        except Exception:
+            return "STOPPED"
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            state = self._reconcile_pause_signal_in_txn(conn)
+            conn.execute("COMMIT")
+            return state
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            return "STOPPED"
+        finally:
+            conn.close()
 
     def _stop_active_in_txn(self, conn) -> bool:
         """호출자가 BEGIN IMMEDIATE로 write-lock을 쥔 상태에서 STOP을 확인.
@@ -1306,15 +1376,12 @@ class TaskQueue:
         return self._runtime_state_in_txn(conn) != "ACTIVE"
 
     def _stop_active_precheck(self) -> bool:
-        """트랜잭션 밖 빠른 사전확인(권위 아님 — in-txn 재확인이 최종). 실패는 fail-closed."""
-        try:
-            conn = self._connect()
-        except Exception:
-            return True
-        try:
-            return self._runtime_state_in_txn(conn) != "ACTIVE"
-        finally:
-            conn.close()
+        """트랜잭션 밖 빠른 사전확인(권위 아님 — in-txn 재확인이 최종). 실패는 fail-closed.
+
+        Takes its own short write transaction so the pause.json signal is
+        reconciled into the row here too; the answer is then the row's.
+        """
+        return self.reconcile_pause_signal() != "ACTIVE"
 
     def _reconcile_stop_on_boot(self) -> None:
         """§1 부팅 화해: pause.json(미러/외부신호) vs runtime_stop(DB권위).
@@ -1955,9 +2022,10 @@ class TaskQueue:
             # 서버는 outbox state만 보면 되어 pause 재확인 divergence가 사라진다.
             # INSERT OR IGNORE: 이미 있으면(replay 재호출) 기존 state 보존(pending/applied 안 뒤집음).
             # ⛔실패를 삼키지 않는다 — insert 실패 시 txn 전체 rollback되어 result도 미저장(원자성).
+            # 게이트와 동일한 판단: pause.json을 이 txn 안에서 행으로 화해시킨 뒤 **행만** 읽는다.
+            _state = self._runtime_state_in_txn(conn)
             _stop = self._read_stop_row(conn)
-            # 게이트와 동일한 union: runtime_stop(원자 권위) OR pause.json(additive fail-closed).
-            _suppressed = bool(_stop["paused"]) or self._pausejson_active()
+            _suppressed = _state != "ACTIVE"
             self._last_cascade_suppressed = _suppressed
             self._last_stop_epoch = int(_stop["epoch"])
             conn.execute(
@@ -2305,8 +2373,11 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            stop = self._read_stop_row(conn)   # 같은 txn: STOP이 먼저 commit됐으면 반드시 보인다
-            if stop["paused"] or self._pausejson_active():
+            # 같은 txn: STOP이 먼저 commit됐으면 반드시 보인다. pause.json은 여기서
+            # 행으로 화해되고, 판단은 그 행만 본다(P6: 게이트-타임 2차 권위 없음).
+            state = self._runtime_state_in_txn(conn)
+            stop = self._read_stop_row(conn)
+            if state != "ACTIVE":
                 conn.execute("ROLLBACK")
                 return {"admitted": False, "state": "stop_blocked", "reserved": False,
                         "reason": f"runtime STOP epoch={stop['epoch']}"}
