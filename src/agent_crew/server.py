@@ -2803,6 +2803,100 @@ def create_app(
         except Exception:
             logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
 
+    def _complete_suppressed_review(task: TaskRequest, decision) -> bool:
+        """End a suppressed review as a COMPLETED review carrying the standing verdict.
+
+        ⛔Not `blocked`, and not `failed`. A suppression is "the review was
+          deliberately skipped because a verdict already stands", which is a
+          *reused judgement*, not an absent one. Every consumer that reads a
+          terminal review reads it as a failure otherwise, and each of them
+          then spends exactly what the canary exists to save:
+
+          * `loop.handle_review_result` mapped it to `review_failed`, so
+            `next_review_action` retried it twice and then gave up;
+          * `blocked` is in `loop._DEAD_REVIEW_STATUSES`, so `enqueue_review`
+            refused to reuse the task and minted a fresh `review-<uuid8>` at the
+            identical head — which the canary suppressed again, one more canary
+            receipt each time round;
+          * the server-side cascade (`auto_enqueue_fix`) drops any review whose
+            status is not `completed`, so the fix round never happened and the
+            lineage simply stopped.
+
+          Writing the standing verdict and its findings instead makes both
+          paths take the ordinary `request_changes` branch: the fix step runs
+          exactly as it would have after a real re-review, and the only thing
+          that did not happen is the reviewer invocation.
+
+        Returns ``True`` only once the terminal state is readable in the DB —
+        the caller dispatches normally otherwise, so an unrecordable
+        suppression can never silently swallow a review.
+        """
+        if not any(t.task_id == task.task_id
+                   for t in q().list_tasks(status="in_progress")):
+            return False
+        ctx = task.context if isinstance(task.context, dict) else {}
+        pr_number = ctx.get("pr_number", getattr(task, "pr_number", None))
+        try:
+            pr_number = (int(pr_number)
+                         if pr_number is not None and not isinstance(pr_number, bool)
+                         else None)
+        except (TypeError, ValueError):
+            pr_number = None
+        findings = _canary.reuse_findings(
+            getattr(decision, "standing_findings", None) or [],
+            decision.standing_review_task_id)
+        try:
+            q().submit_result(
+                task.task_id,
+                TaskResult(task_id=task.task_id, status="completed",
+                           summary=_canary.SUPPRESSED_REASON,
+                           verdict="request_changes", findings=findings,
+                           pr_number=pr_number),
+            )
+            _attr = q().get_attribution(task.task_id)
+            record_context_event(
+                _context_events_path, "task_completed",
+                task_id=task.task_id, reason=_canary.SUPPRESSED_REASON,
+                project=(_attr or {}).get("project"),
+                role=(_attr or {}).get("role"),
+                agent=(_attr or {}).get("agent"),
+                context_id=(_attr or {}).get("context_id"),
+            )
+            if _attr:
+                append_attribution_jsonl(_attr_jsonl_path, _attr)
+        except Exception:
+            logger.exception(
+                "tokenomics canary: could not record the suppressed verdict for %s",
+                task.task_id)
+            return False
+        if q().get_task_status(task.task_id) != "completed":
+            return False
+        # ⛔The result write tried to CONSUME the receipt and §3 refused it: a
+        #   suppressed review is decided at dispatch, so nothing ever CLAIMED
+        #   it and CONSUMED is not reachable from QUEUED. Left there, the task
+        #   is terminal while its authorization is still open. Settle it
+        #   explicitly as REVOKED — the reviewer invocation it authorized was
+        #   withdrawn, never spent.
+        try:
+            q().settle_unused_task_receipt(
+                task.task_id, note=f"canary: {_canary.SUPPRESSED_REASON}")
+        except Exception:
+            logger.exception(
+                "tokenomics canary: could not settle the receipt for %s", task.task_id)
+        # ⛔The cascade lives on the HTTP result endpoint, and this result never
+        #   goes through it — the suppression writes it from inside dispatch. So
+        #   drive the same transition here, or the reused verdict is recorded and
+        #   nothing acts on it, which is the lineage stall from the other
+        #   direction. `auto_enqueue_fix` is idempotent per review round and
+        #   swallows its own errors (#244).
+        try:
+            _auto_enqueue_fix(task.task_id, repo=str(ctx.get("repo") or ""))
+        except Exception:
+            logger.exception(
+                "tokenomics canary: fix cascade failed for suppressed review %s",
+                task.task_id)
+        return True
+
     def _tokenomics_canary_gate(task: TaskRequest, reviewed_sha: str) -> bool:
         """SEV-0 §11 ONE-TASK canary. ``True`` means this review was suppressed.
 
@@ -2857,7 +2951,7 @@ def create_app(
                     f"{decision.standing_review_task_id} on {decision.target} "
                     f"@ {(decision.reviewed_sha or '?')[:9]}")
             return False
-        if not _fail_if_active(task.task_id, _canary.SUPPRESSED_REASON, status="blocked"):
+        if not _complete_suppressed_review(task, decision):
             logger.error(
                 "tokenomics canary: could not confirm suppression for %s — dispatching",
                 task.task_id,

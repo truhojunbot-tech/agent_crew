@@ -30,6 +30,7 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
+from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
 from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
 from agent_crew.risk_tier import RISK_DECLARATION_FIELDS, risk_declaration
 
@@ -4900,7 +4901,7 @@ class TaskQueue:
         try:
             if pr_number is not None:
                 rows = conn.execute(
-                    "SELECT task_id, verdict, findings, pr_number, branch, context, "
+                    "SELECT task_id, verdict, findings, pr_number, branch, context, summary, "
                     "       status, last_activity_at, created_at, status_changed_at "
                     "FROM tasks WHERE task_type='review' AND status='completed' "
                     "  AND pr_number=? AND task_id<>? "
@@ -4909,7 +4910,7 @@ class TaskQueue:
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT task_id, verdict, findings, pr_number, branch, context, "
+                    "SELECT task_id, verdict, findings, pr_number, branch, context, summary, "
                     "       status, last_activity_at, created_at, status_changed_at "
                     "FROM tasks WHERE task_type='review' AND status='completed' "
                     "  AND branch=? AND pr_number IS NULL AND task_id<>? "
@@ -4920,6 +4921,14 @@ class TaskQueue:
             conn.close()
         for row in rows:
             if (row["verdict"] or "") not in ("approve", "request_changes"):
+                continue
+            # ⛔A suppressed review now completes carrying the verdict it
+            #   reused (SEV-0 §11 item B), so it passes the verdict filter — but
+            #   it ran no reviewer and made no judgement of its own. Returning
+            #   it would make `standing_review_task_id` point at a task nobody
+            #   reviewed, and each suppression would re-attribute the next one
+            #   a hop further from the review that actually spoke.
+            if (row["summary"] or "") == _CANARY_SUPPRESSED_REASON:
                 continue
             try:
                 ctx = json.loads(row["context"] or "{}")
@@ -4934,8 +4943,55 @@ class TaskQueue:
             return {"task_id": row["task_id"], "verdict": row["verdict"],
                     "status": row["status"], "pr_number": row["pr_number"],
                     "branch": row["branch"], "reviewed_sha": reviewed_sha,
+                    # The findings themselves, not only their count: a
+                    # suppression has to reproduce this verdict in full, and a
+                    # count cannot be handed to a fix agent.
+                    "findings": findings if isinstance(findings, list) else [],
                     "findings_count": len(findings) if isinstance(findings, list) else None}
         return None
+
+    def settle_unused_task_receipt(self, task_id: str, *, note: str) -> Optional[str]:
+        """Drive a never-executed task's receipt to a TERMINAL state. Returns it.
+
+        ``submit_result`` ends a receipt at ``CONSUMED``, which §3 reaches only
+        from ``CLAIMED``/``RUNNING`` — i.e. from a task an executor actually
+        ran. A canary-suppressed review never reaches either: it is decided at
+        dispatch time, so its receipt is still ``QUEUED`` when the result is
+        written, the ``CONSUMED`` transition is refused, and the authorization
+        sits open forever against a task that is already terminal.
+
+        ``REVOKED`` is the honest name for what happened — the authorization to
+        spend a reviewer was withdrawn, not used up. ``SUPERSEDED`` would claim
+        another admission replaced this one, and none did.
+
+        Best-effort like every other lifecycle write (a history row must not
+        roll back recorded work), and a no-op on a receipt that is already
+        terminal, so a repeated call cannot rewrite how a receipt ended.
+        """
+        receipt_id = self.task_receipt_id(task_id)
+        if not receipt_id:
+            return None
+        conn = self._connect()
+        try:
+            receipt = _cea_store.current_receipt(conn, receipt_id)
+            state = (receipt or {}).get("state")
+            if state in _cea_store.TERMINAL_STATES:
+                return state
+            conn.execute("BEGIN IMMEDIATE")
+            self._cea_transition_in_txn(conn, self.cea_engine(), receipt_id,
+                                        "REVOKED", note=note)
+            conn.commit()
+            return ((_cea_store.current_receipt(conn, receipt_id) or {}).get("state"))
+        except Exception:
+            logger.warning("cea: receipt %s for %s could not be settled",
+                           receipt_id, task_id, exc_info=True)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return None
+        finally:
+            conn.close()
 
     def task_receipt_id(self, task_id: str) -> Optional[str]:
         """The task's §3 authorization receipt id, or None if it has none."""

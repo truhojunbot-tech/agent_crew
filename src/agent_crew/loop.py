@@ -3,7 +3,7 @@ import urllib.request
 import uuid
 
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
-from agent_crew.tokenomics_canary import SUPPRESSED_REASON
+from agent_crew.tokenomics_canary import REUSED_FROM_KEY, SUPPRESSED_REASON
 
 DEFAULT_MAX_ITER: int = 5
 
@@ -230,13 +230,22 @@ def handle_review_result(
     #
     #   It must not consume an escalation round either: `iteration >= max_iter`
     #   would turn an infrastructure fault into a verdict about the work.
-    # A canary suppression is an intentional terminal policy outcome, not a
-    # reviewer crash.  Retrying it manufactures fresh review ids, each of
-    # which would be suppressed and counted again.
-    if (getattr(result, "status", None) == "blocked"
-            and getattr(result, "summary", None) == SUPPRESSED_REASON):
-        return "review_suppressed"
-    if getattr(result, "status", None) not in (None, "completed"):
+    # A canary suppression is an intentional policy outcome, not a reviewer
+    # crash: the review was skipped because a `request_changes` already stands
+    # on this exact commit, and the suppression carries that verdict and its
+    # findings forward. So it takes the ORDINARY `request_changes` path — the
+    # fix round runs exactly as it would have after a real re-review, and the
+    # only thing that did not happen is the reviewer invocation.
+    #
+    # ⛔Never `review_failed`. That retried the suppression twice and then gave
+    #   up, and `enqueue_review` treats the retry's dead task as unusable and
+    #   mints a fresh `review-<uuid8>` at the same head — suppressed again,
+    #   another canary receipt each round. The status test is skipped rather
+    #   than the verdict: a suppression written before §11 item B landed is
+    #   `blocked` with no verdict, and `_resolve_verdict` reads a non-completed
+    #   status as `request_changes`, so both shapes agree here.
+    _suppressed = getattr(result, "summary", None) == SUPPRESSED_REASON
+    if not _suppressed and getattr(result, "status", None) not in (None, "completed"):
         return "review_failed"
 
     verdict = _resolve_verdict(result)
@@ -271,17 +280,29 @@ def handle_test_result(result: TaskResult) -> str:
     return "failed"
 
 
+def _split_text_finding(text: str) -> tuple[str, str]:
+    parts = str(text).split(":", 1)
+    layer = parts[0].strip() if len(parts) == 2 and parts[0].strip() in _KNOWN_LAYERS else "unknown"
+    return layer, (parts[1].strip() if layer != "unknown" else str(text))
+
+
 def build_feedback(result: TaskResult) -> str:
     lines = [f"Review feedback (task {result.task_id}):"]
     for finding in result.findings:
         if isinstance(finding, dict):
             layer = finding.get("layer", "unknown")
-            if layer not in _KNOWN_LAYERS:
-                layer = "unknown"
             issue = finding.get("issue", str(finding))
+            if layer not in _KNOWN_LAYERS:
+                # A dict without a layer of its own may still carry the
+                # "<layer>: issue" text — a canary-reused string finding is
+                # wrapped in a dict so the provenance stamp has somewhere to
+                # live, and dropping to "unknown" would lose what the original
+                # reviewer said about it.
+                layer, issue = _split_text_finding(
+                    issue if isinstance(issue, str) else str(finding))
         else:
-            parts = str(finding).split(":", 1)
-            layer = parts[0].strip() if len(parts) == 2 and parts[0].strip() in _KNOWN_LAYERS else "unknown"
-            issue = parts[1].strip() if layer != "unknown" else str(finding)
-        lines.append(f"- [{layer}] {issue}")
+            layer, issue = _split_text_finding(finding)
+        reused_from = finding.get(REUSED_FROM_KEY) if isinstance(finding, dict) else None
+        origin = f" (standing finding reused from {reused_from})" if reused_from else ""
+        lines.append(f"- [{layer}] {issue}{origin}")
     return "\n".join(lines)

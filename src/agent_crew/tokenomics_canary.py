@@ -43,11 +43,41 @@ DECISION_SOURCE = "quota_core_contract"
 #: Terminal reason recorded on a suppressed review task.
 SUPPRESSED_REASON = "tokenomics_canary_suppressed_identical_sha_rereview"
 
+#: Stamped on every finding a suppression copies forward, naming the review
+#: that actually produced it. Without it a fix agent reads findings whose
+#: ``task_id`` provenance points at a task no reviewer ever ran, and the
+#: measurement of what the canary reused stops being reconstructible.
+REUSED_FROM_KEY = "canary_reused_from"
+
 #: A full git object id — 40 hex for sha1, 64 for sha256. Deliberately not a
 #: prefix match, for the same reason ``protocol._OBJECT_ID_RE`` is not: an
 #: abbreviation cannot be compared for identity, and identity is the whole
 #: condition here.
 _OBJECT_ID_RE = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
+
+
+def reuse_findings(findings, standing_review_task_id: str) -> list:
+    """Copy a standing review's findings forward, tagging each with its origin.
+
+    A suppressed review is a review that was deliberately not run, so it has
+    nothing of its own to say. What it carries instead is the judgement that
+    already stands on the identical commit — copied verbatim, never
+    paraphrased, and each item stamped with :data:`REUSED_FROM_KEY` so a reader
+    (or a fix agent) can always get back to the review that made it.
+
+    Non-dict findings are wrapped rather than dropped: the stamp needs
+    somewhere to live, and losing a finding to make room for its provenance
+    would defeat the point. ``loop.build_feedback`` parses the wrapped text the
+    same way it parses a bare string.
+    """
+    reused = []
+    for finding in findings or []:
+        if isinstance(finding, dict):
+            reused.append({**finding, REUSED_FROM_KEY: standing_review_task_id})
+        else:
+            reused.append({"issue": str(finding),
+                           REUSED_FROM_KEY: standing_review_task_id})
+    return reused
 
 
 def canary_pin(env: Optional[dict] = None) -> str:
@@ -75,6 +105,10 @@ class CanaryDecision:
     target: str = ""
     pinned_task_id: str = ""
     standing_review_task_id: str = ""
+    #: The standing review's verdict and findings, carried so the suppression
+    #: can be recorded as that verdict instead of as a failure.
+    standing_verdict: str = ""
+    standing_findings: list = field(default_factory=list)
     counterfactual: str = ""
     kind: str = RECOMMENDATION_KIND
     decision_source: str = DECISION_SOURCE
@@ -220,6 +254,8 @@ def evaluate_review_dispatch(
         applied=True,
         reason="standing_request_changes_on_identical_sha",
         standing_review_task_id=standing_id,
+        standing_verdict=verdict,
+        standing_findings=list(standing.get("findings") or []),
         counterfactual=counterfactual,
         extra=extra,
         **base,
