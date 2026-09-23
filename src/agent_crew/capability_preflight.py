@@ -8,8 +8,11 @@ a thin, standalone (agent_crew#310) client of that CLI:
 
 * configured by ``AGENT_CREW_CAPABILITY_LOOKUP`` (the command prefix, e.g.
   ``python3 /path/to/alfred/tools/contract_registry.py``); no import of alfred code;
-* the output contract is ``schema: capability-lookup/v1``; exit 0 = ALLOW,
-  exit 10 = STOP_AND_REVIEW;
+* the output contract is ``schema: capability-admission/v2``; exit 0 = ALLOW
+  (including shadow/warn rollout modes, where the raw decision is only
+  recorded), exit 10 = blocked (STOP_AND_REVIEW, enforce mode only);
+* the rollout mode (off/shadow/warn/enforce, default shadow) is decided by the
+  registry, not here; ``warn`` and ``mode`` are surfaced for logging;
 * anything else — not configured, timeout, non-zero rc, bad JSON, unknown
   schema, rc/decision disagreement — is **fail-closed**: STOP_AND_REVIEW.
 
@@ -27,7 +30,7 @@ import subprocess
 from typing import Callable, Mapping, Optional
 
 ENV_COMMAND = "AGENT_CREW_CAPABILITY_LOOKUP"
-SCHEMA = "capability-lookup/v1"
+SCHEMA = "capability-admission/v2"
 EXIT_ALLOW, EXIT_STOP = 0, 10
 
 
@@ -39,6 +42,9 @@ class AdmissionDecision:
     matches: tuple = ()
     registry_status: Optional[str] = None
     registry_source: Optional[str] = None
+    mode: Optional[str] = None           # off | shadow | warn | enforce (registry-decided)
+    warn: bool = False                   # raw STOP seen but not enforced -> surface it
+    raw_decision: Optional[str] = None
 
 
 def _closed(reason: str, **kw) -> AdmissionDecision:
@@ -65,7 +71,10 @@ def check_admission(description: str, project: str, *, command: Optional[str] = 
         return _closed(f"LOOKUP_FAILED: unexpected schema {out.get('schema') if isinstance(out, dict) else None!r}")
     decision = out.get("decision")
     common = dict(matches=tuple(m.get("capability_id") for m in out.get("matches") or []),
-                  registry_status=out.get("registry_status"), registry_source=out.get("registry_source"))
+                  registry_status=out.get("registry_status"), registry_source=out.get("registry_source"),
+                  mode=out.get("mode"), warn=bool(out.get("warn")), raw_decision=out.get("raw_decision"))
+    if bool(out.get("blocked")) != (decision == "STOP_AND_REVIEW"):
+        return _closed("LOOKUP_FAILED: blocked flag disagrees with decision", **common)
     if p.returncode == EXIT_ALLOW and decision == "ALLOW":
         return AdmissionDecision(allow=True, decision="ALLOW", reason=out.get("reason", "NO_MATCH"), **common)
     if p.returncode == EXIT_STOP and decision == "STOP_AND_REVIEW":
