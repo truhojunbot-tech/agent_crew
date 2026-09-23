@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from agent_crew.cea.engine import ENFORCE, EngineConfig
+from agent_crew.cea.engine import ENFORCE, TEST, EngineConfig
 from agent_crew.cea.validator import (
     ContractReceiptValidator, CurrentInputs, ReceiptValidator, ValidationOutcome,
     ValidationPoint, ValidationResult)
@@ -82,7 +82,10 @@ class GateOutcome:
 
 
 def enforcing(config: Optional[EngineConfig] = None) -> bool:
-    return (config or EngineConfig.from_env()).mode == ENFORCE
+    """``test`` enforces exactly as ``enforce`` does — the two differ only in
+    whether the engine may run embedded (:data:`agent_crew.cea.engine.EMBEDDED_MODES`),
+    which is a deployment question and not a question about this gate."""
+    return (config or EngineConfig.from_env()).mode in (ENFORCE, TEST)
 
 
 def _gate(point: ValidationPoint, result: ValidationResult,

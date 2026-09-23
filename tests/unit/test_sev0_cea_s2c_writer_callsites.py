@@ -278,7 +278,7 @@ def test_enforce_refuses_the_row_that_shadow_writes(tmp_path):
     shadow.enqueue(task())
     assert row(shadow) is not None
 
-    enforced = queue(tmp_path, mode="enforce", name="enforce.db")
+    enforced = queue(tmp_path, mode="test", name="enforce.db")
     with pytest.raises(AdmissionRefused) as exc:
         enforced.enqueue(task())
     assert exc.value.point == "enqueue"
@@ -288,7 +288,7 @@ def test_enforce_refuses_the_row_that_shadow_writes(tmp_path):
 def test_a_refused_enqueue_still_leaves_the_audit_row(tmp_path):
     """P2: the receipt exists even when the task row does not. Without it a
     refusal is indistinguishable from a request nobody made."""
-    q = queue(tmp_path, mode="enforce")
+    q = queue(tmp_path, mode="test")
     with pytest.raises(AdmissionRefused):
         q.enqueue(task())
     conn = sqlite3.connect(q._db_path)
@@ -299,10 +299,10 @@ def test_a_refused_enqueue_still_leaves_the_audit_row(tmp_path):
     assert n >= 1
 
 
-def test_wired_inputs_admit_ops_work_under_enforce(tmp_path):
+def test_wired_inputs_admit_review_work_under_enforcement(tmp_path):
     """The gate is not simply "always refuse": with every input answering and an
     authority the snapshot carries, admission proceeds and the row is written."""
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
     stored = receipt_of(q)
     assert stored["decision"] == "ALLOW", stored["reason"]
@@ -342,7 +342,7 @@ def test_an_unknown_task_type_takes_the_strictest_work_class():
 
 
 def test_the_same_intent_under_a_new_task_id_is_refused_as_a_duplicate(tmp_path):
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task("t1", task_type="review", context=admitted()))
     with pytest.raises(AdmissionRefused) as exc:
         q.enqueue(task("t2", task_type="review", context=admitted()))
@@ -361,7 +361,7 @@ def test_the_same_idempotency_key_returns_the_existing_receipt(tmp_path):
 
 
 def test_completed_work_is_not_re_admitted(tmp_path):
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     ctx = admitted()
     q.enqueue(task("t1", task_type="review", context=ctx))
     q.dequeue(agent="codex", role="reviewer")
@@ -381,7 +381,7 @@ def test_completed_work_is_not_re_admitted(tmp_path):
 def test_claim_refuses_a_claimant_that_is_not_the_bound_executor(tmp_path):
     """P2a: an asserted identity is tamper-evident, not proven — but a claimant
     that does not even match the binding is caught before it holds the row."""
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
     assert receipt_of(q)["executor_binding"] == "codex"
     assert q.dequeue(agent="gemini", role="reviewer") is None
@@ -407,7 +407,7 @@ def test_dispatch_mints_one_single_use_nonce_per_attempt(tmp_path):
 
 
 def test_execute_start_spends_the_nonce_exactly_once(tmp_path):
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
     q.dequeue(agent="codex", role="reviewer")
     nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
@@ -418,7 +418,7 @@ def test_execute_start_spends_the_nonce_exactly_once(tmp_path):
 
 
 def test_execute_start_refuses_a_nonce_nobody_minted(tmp_path):
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
     q.dequeue(agent="codex", role="reviewer")
     q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
@@ -429,7 +429,7 @@ def test_execute_start_refuses_a_nonce_nobody_minted(tmp_path):
 def test_result_without_a_nonce_is_refused_under_enforce(tmp_path):
     """The pane protocol does not carry a nonce yet (step 2b). Under enforce
     that is a refusal, not a pass — which is exactly why enforce must wait."""
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
     q.dequeue(agent="codex", role="reviewer")
     nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
@@ -441,7 +441,7 @@ def test_result_without_a_nonce_is_refused_under_enforce(tmp_path):
 
 
 def test_result_refuses_a_presenter_that_is_not_the_bound_executor(tmp_path):
-    q = queue(tmp_path, mode="enforce", wired=True)
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
     q.dequeue(agent="codex", role="reviewer")
     nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")

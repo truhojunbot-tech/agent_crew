@@ -112,7 +112,10 @@ class FakeGate:
 
 def engine(**kw) -> AuthorizationEngine:
     """An engine whose inputs all answer unless a test replaces one."""
-    config = kw.pop("config", None) or EngineConfig(mode="enforce")
+    # mode=test: enforcing, but permitted to run embedded. `enforce` refuses
+    # in-process authorization outright (engine.EMBEDDED_MODES) — that refusal
+    # has its own tests; here it would only mask every other assertion.
+    config = kw.pop("config", None) or EngineConfig(mode="test")
     return AuthorizationEngine(
         config=config,
         capabilities=kw.pop("capabilities", None) or FakeRegistry(),
@@ -303,7 +306,7 @@ def test_a_missing_input_blocks_and_names_itself(conn, kw, missing):
 def test_the_default_engine_has_no_providers_and_therefore_blocks(conn):
     """"Providers that do not exist yet return UNAVAILABLE" — the default engine
     is the honest degraded one, not an open door."""
-    auth = AuthorizationEngine(config=EngineConfig(mode="enforce")).authorize(
+    auth = AuthorizationEngine(config=EngineConfig(mode="test")).authorize(
         conn, intent(), caller())
     assert auth.decision == "BLOCK" and auth.code == "INPUTS_UNAVAILABLE"
 
@@ -313,7 +316,7 @@ def test_shadow_mode_does_not_change_the_verdict(conn):
     shadow deployment would measure a policy nobody is going to enforce."""
     shadow = engine(config=EngineConfig(mode="shadow"),
                     snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s1"), caller())
-    enforce = engine(config=EngineConfig(mode="enforce"),
+    enforce = engine(config=EngineConfig(mode="test"),
                      snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s2"), caller())
     assert shadow.decision == enforce.decision == "BLOCK"
     assert shadow.code == enforce.code == "INPUTS_UNAVAILABLE"
@@ -418,7 +421,7 @@ def test_the_snapshot_gate_provider_ignores_a_self_asserted_flag(conn):
     """J8: a gate exists because a snapshot predicate says so. A flag on the
     request is not a gate — and is not the absence of one either."""
     snap = FakeSnapshot(human_gate_predicates=({"project": "agent_crew", "state": "PENDING"},))
-    auth = AuthorizationEngine(config=EngineConfig(mode="enforce"), snapshots=snap,
+    auth = AuthorizationEngine(config=EngineConfig(mode="test"), snapshots=snap,
                                capabilities=FakeRegistry(), runtime=FakeRuntime(),
                                budgets=FakeBudget()).authorize(
         conn, intent(extra={"human_gate": "granted"}), caller())
@@ -512,7 +515,7 @@ def test_releasing_a_lineage_requires_owning_it(conn):
 
 
 def test_a_retry_reuses_the_receipt_while_b_is_unchanged(conn):
-    eng = engine(config=EngineConfig(mode="enforce", default_max_attempts=3))
+    eng = engine(config=EngineConfig(mode="test", default_max_attempts=3))
     first = eng.authorize(conn, intent("adm-r1"), caller())
     retried = eng.authorize(conn, intent("adm-r1"), caller(), retry=True)
     assert retried.reused and retried.receipt_id == first.receipt_id
@@ -521,7 +524,7 @@ def test_a_retry_reuses_the_receipt_while_b_is_unchanged(conn):
 
 
 def test_a_retry_past_max_attempts_re_admits(conn):
-    eng = engine(config=EngineConfig(mode="enforce", default_max_attempts=1))
+    eng = engine(config=EngineConfig(mode="test", default_max_attempts=1))
     first = eng.authorize(conn, intent("adm-r1"), caller())
     retried = eng.authorize(conn, intent("adm-r1"), caller(), retry=True)
     assert not retried.reused
@@ -532,7 +535,7 @@ def test_a_retry_past_max_attempts_re_admits(conn):
 def test_a_retry_after_binding_drift_re_admits(conn):
     """P4: "retries reuse the receipt iff B unchanged". A drifted B is a new
     decision, not a second attempt at the old one."""
-    cfg = EngineConfig(mode="enforce", default_max_attempts=5)
+    cfg = EngineConfig(mode="test", default_max_attempts=5)
     first = engine(config=cfg).authorize(conn, intent("adm-r1"), caller())
     moved = engine(config=cfg, snapshots=FakeSnapshot(generation=8))
     retried = moved.authorize(conn, intent("adm-r1"), caller(), retry=True)
@@ -584,7 +587,7 @@ def test_an_unsigned_receipt_says_so_instead_of_carrying_a_digest(conn):
 def test_a_keyed_engine_signs_and_verifies(conn, tmp_path):
     key = tmp_path / "engine.key"
     key.write_bytes(b"not-a-real-key-but-a-real-boundary")
-    eng = engine(config=EngineConfig(mode="enforce", key_path=str(key)))
+    eng = engine(config=EngineConfig(mode="test", key_path=str(key)))
     auth = eng.authorize(conn, intent(), caller())
     assert auth.receipt["signature"]["status"] == "VERIFIED"
     assert eng.verify(auth.receipt) is True
@@ -593,7 +596,7 @@ def test_a_keyed_engine_signs_and_verifies(conn, tmp_path):
 def test_tampering_with_a_signed_receipt_is_detected(conn, tmp_path):
     key = tmp_path / "engine.key"
     key.write_bytes(b"not-a-real-key-but-a-real-boundary")
-    eng = engine(config=EngineConfig(mode="enforce", key_path=str(key)))
+    eng = engine(config=EngineConfig(mode="test", key_path=str(key)))
     auth = eng.authorize(conn, intent(), caller())
     tampered = dict(auth.receipt, decision="ALLOW", required_reviewer=None)
     assert eng.verify(tampered) is False
@@ -611,7 +614,7 @@ def test_an_authenticated_caller_still_degrades_without_an_engine_key(conn):
 
 
 def test_an_unreadable_key_degrades_rather_than_crashing(conn, tmp_path):
-    eng = engine(config=EngineConfig(mode="enforce", key_path=str(tmp_path / "missing.key")))
+    eng = engine(config=EngineConfig(mode="test", key_path=str(tmp_path / "missing.key")))
     auth = eng.authorize(conn, intent(), caller())
     assert auth.receipt["signature"]["status"] == "UNVERIFIED"
 

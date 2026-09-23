@@ -244,7 +244,7 @@ def _keyed_config(tmp_path) -> EngineConfig:
     key = tmp_path / "engine.key"
     key.write_bytes(b"k" * 32)
     key.chmod(0o600)
-    return EngineConfig(mode="enforce", key_path=str(key))
+    return EngineConfig(mode="test", key_path=str(key))
 
 
 def test_a_keyed_engine_does_not_promote_a_caller_supplied_verified_status(conn, tmp_path):

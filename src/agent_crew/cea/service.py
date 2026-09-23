@@ -232,6 +232,13 @@ class EngineService(socketserver.ThreadingUnixStreamServer):
         super().__init__(path, _Handler)
         os.chmod(path, 0o600)
         self.engine = engine
+        # This is the credential boundary `enforce` requires: from here on every
+        # caller has presented a secret that *this* process validated, in a
+        # process the caller does not run in. An engine that is not told this
+        # refuses to authorize in `enforce` mode (engine.EMBEDDED_MODES).
+        attach = getattr(engine, "attach_credential_boundary", None)
+        if attach is not None:
+            attach(path)
         self.connect = connect
         self.path = path
         # Deny-all by default: an engine started without a caller token table

@@ -167,18 +167,53 @@ _WORK_CLASS_ROLE = {
 
 SHADOW = "shadow"
 ENFORCE = "enforce"
+TEST = "test"
+
+MODES = (TEST, SHADOW, ENFORCE)
+
+EMBEDDED_MODES = (TEST, SHADOW)
+"""The modes in which :meth:`AuthorizationEngine.authorize` may run embedded.
+
+⛔Codex, re-reviewing ``f1aee1d``: an in-process Python construct is not an
+  authentication boundary, so the engine must "keep [itself] behind the
+  credential-validating service/process boundary (or refuse embedded direct
+  authorization) until an actual broker capability boundary exists". This is
+  that refusal, and it is what makes the choice a *deployment* decision rather
+  than a claim about class privacy.
+
+  ``shadow`` may run embedded because it stops nothing: it measures. ``test``
+  may run embedded because it is a test harness and says so in its name. In
+  ``enforce`` — the only mode where the engine's verdict withholds work — the
+  engine must be reached across the unix socket in :mod:`agent_crew.cea.service`,
+  where the credential is checked by a peer that is not the caller. Same-uid
+  peers are still untrusted and ``caller_identity_status`` is still UNVERIFIED
+  by contract until the O21b broker (see ``src/agent_crew/cea/README.md``); the
+  socket is a process boundary, not a verified identity.
+"""
 
 
 @dataclass(frozen=True)
 class EngineConfig:
     """How this runtime reaches the engine, and what the adapters do with it.
 
-    ``mode`` is read by the **adapters**, never by :meth:`AuthorizationEngine.authorize`.
-    In ``shadow`` an adapter records the receipt and proceeds as it does today; in
-    ``enforce`` a non-ALLOW receipt stops the work. The engine's verdict is
-    identical either way — that is what makes the shadow measurement worth
+    ``mode`` is read by the **adapters** to decide whether a non-ALLOW receipt
+    stops the work: in ``shadow`` they record it and proceed as they do today; in
+    ``test`` and ``enforce`` only PROCEED proceeds. The engine's verdict is
+    identical in all three — that is what makes the shadow measurement worth
     anything, and it is why "shadow-ALLOW because an input was missing" cannot
     happen: the engine has no shadow branch to take.
+
+    ``mode`` is read by :meth:`AuthorizationEngine.authorize` for exactly one
+    thing, and it is not a verdict: whether this deployment is allowed to
+    authorize *embedded* at all (:data:`EMBEDDED_MODES`). ``enforce`` is not,
+    because the credential that would make a caller mean anything is checked at
+    the socket, not in this interpreter.
+
+    ``test`` is ``enforce`` minus that deployment requirement — enforcement in a
+    harness, where there is no socket and no production consequence. ⛔Setting
+    ``AGENT_CREW_CEA_MODE=test`` in a real deployment gets enforcement without a
+    credential boundary. That is a named, explicit choice rather than a silent
+    default, which is the only honest way to offer it.
     """
     mode: str = SHADOW
     endpoint: Optional[str] = None          # unix socket path; None ⇒ in-process
@@ -198,7 +233,7 @@ class EngineConfig:
     def from_env(cls, env: Optional[dict] = None) -> "EngineConfig":
         e = os.environ if env is None else env
         mode = (e.get("AGENT_CREW_CEA_MODE") or SHADOW).strip().lower()
-        if mode not in (SHADOW, ENFORCE):
+        if mode not in MODES:
             mode = SHADOW
         return cls(
             mode=mode,
@@ -210,7 +245,14 @@ class EngineConfig:
 
     @property
     def enforcing(self) -> bool:
-        return self.mode == ENFORCE
+        """Does a non-PROCEED answer stop the work? ``test`` enforces like
+        ``enforce``; they differ only in where the engine is allowed to run."""
+        return self.mode in (ENFORCE, TEST)
+
+    @property
+    def embedded_authorization_permitted(self) -> bool:
+        """May ``authorize()`` run in this process? See :data:`EMBEDDED_MODES`."""
+        return self.mode in EMBEDDED_MODES
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -335,6 +377,25 @@ class AuthorizationEngine:
         self.gates = gates or SnapshotHumanGate()
         self._clock = clock or time.time
         self._key = _load_key(self.config.key_path)
+        self._credential_boundary: Optional[str] = None
+
+    def attach_credential_boundary(self, name: str) -> None:
+        """Declare that this engine is reached only across a credential boundary.
+
+        Called by :class:`~agent_crew.cea.service.EngineService` with its socket
+        path: the engine object then lives in the serving process, and every
+        caller has already presented a credential that a *different* process
+        validated. That is what ``enforce`` requires before it will authorize.
+
+        ⛔Not a permission check. In-process code can call this method as easily
+          as it can call :func:`~agent_crew.cea._caller_mint.mint_caller`, and
+          pretending otherwise would repeat the mistake this whole change is
+          about. It records a deployment fact so a misconfiguration — an
+          ``enforce`` engine wired straight into an adapter, with no socket in
+          front of it — fails closed and loudly instead of enforcing on
+          unauthenticated callers.
+        """
+        self._credential_boundary = name
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -397,6 +458,25 @@ class AuthorizationEngine:
                                       "INVALID_SCOPE_ANCHOR", str(exc), conn=conn),
                 http_status=400, code="INVALID_SCOPE_ANCHOR")
         ih = intent_hash(intent.identity)
+
+        # P7 applied to the *deployment*: in `enforce` the engine will not decide
+        # from inside a caller's own process. The credential that makes J9 mean
+        # anything is checked at the unix socket by a peer that is not the caller
+        # (service.EngineService), and nothing in this interpreter can stand in
+        # for that — codex's `_mint_caller` and `__closure__` reproductions are
+        # the proof. So an embedded `enforce` engine reports the caller
+        # credential boundary as an unavailable input and fails closed, rather
+        # than enforcing a verdict it reached over a caller it could not check.
+        if self.config.mode == ENFORCE and self._credential_boundary is None:
+            return Authorization(
+                receipt=self._refusal(
+                    intent, caller, ih, "CREDENTIAL_BOUNDARY_UNAVAILABLE",
+                    "P7/P2a: mode=enforce refuses embedded in-process authorization. The caller "
+                    "credential boundary is the unix-socket service (AGENT_CREW_CEA_ENGINE_ENDPOINT), "
+                    "not this interpreter; an in-process caller object is not authentication. Use "
+                    "mode=shadow to measure, mode=test in a harness, or deploy crew-authz",
+                    conn=conn, unavailable=("caller_credential_boundary",)),
+                http_status=403, code="CREDENTIAL_BOUNDARY_UNAVAILABLE")
 
         # J1 — lineage. Answered before the expensive inputs so a replay costs a
         # single indexed read, which is what makes idempotency cheap enough to be
@@ -923,7 +1003,7 @@ class AuthorizationEngine:
         return ("ALLOW", "OK", "every input answered and the contract is satisfiable")
 
     def _refusal(self, intent: Intent, caller: Caller, ih: str, code: str, text: str,
-                 *, conn) -> dict:
+                 *, conn, unavailable: tuple = ()) -> dict:
         """A BLOCK receipt for a lineage refusal (P2: the audit row exists either way).
 
         It is deliberately built from the refusal alone and not from the full
@@ -960,7 +1040,7 @@ class AuthorizationEngine:
                         "budget_class": "EXHAUSTED"},
             "idempotency_key": intent.idempotency_key or ih,
             "attempt": 1, "max_attempts": 1, "dispatch_nonces": [], "supersedes": [],
-            "provenance": _provenance(intent, None, ()),
+            "provenance": _provenance(intent, None, unavailable),
         }
         receipt = self._resign(receipt)
         receipt_store.record_receipt(conn, receipt, recorded_by="engine", note=code)
@@ -1204,7 +1284,8 @@ def reset_engine() -> None:
 
 
 __all__ = [
-    "Authorization", "AuthorizationEngine", "DEFAULT_ROLE_AGENTS", "ENFORCE", "EngineConfig",
+    "Authorization", "AuthorizationEngine", "DEFAULT_ROLE_AGENTS", "EMBEDDED_MODES",
+    "ENFORCE", "MODES", "TEST", "EngineConfig",
     "EngineError", "REVIEW_FLOOR", "SHADOW", "SnapshotHumanGate", "UnauthenticatedCaller",
     "UnavailableBudget", "UnavailableCapabilityRegistry", "UnavailablePolicySnapshot",
     "UnavailableRuntimeState", "get_engine", "intent_from_receipt", "intent_hash",
