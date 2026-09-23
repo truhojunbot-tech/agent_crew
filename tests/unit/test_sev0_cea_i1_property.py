@@ -394,10 +394,17 @@ def _drive_r3(kind, db, live, monkeypatch):
         except AdmissionRefused:
             pass
     elif kind == "retry_http":
-        nonce = dispatch_and_start(db, live, task("impl-r", context={"authority_decision_ids":
-                                                                     ["T0-1234"]}),
-                                   role="implementer")
+        # ⛔The dispatch happens INSIDE the client context on purpose. `_requeue_orphans`
+        #   runs at startup and, since s4h, a requeue is a re-admission that SUPERSEDEs
+        #   the receipt — so a task dispatched before the app boots is an orphan at
+        #   startup and its own result comes back 409 RECEIPT_SUPERSEDED, never reaching
+        #   the retry enqueue this test is about. The scenario under test is an agent
+        #   dispatched by the server that is already running.
         with TestClient(_app(db), raise_server_exceptions=False) as c:
+            nonce = dispatch_and_start(db, live, task("impl-r",
+                                                      context={"authority_decision_ids":
+                                                               ["T0-1234"]}),
+                                       role="implementer")
             c.post("/tasks/impl-r/result", json={
                 "task_id": "impl-r", "status": "failed", "summary": "tests failed",
                 "executor_binding": {"nonce": nonce, "presenter": "claude"}})
@@ -408,10 +415,12 @@ def _drive_r3(kind, db, live, monkeypatch):
                             lambda *a, **k: ReviewPublication(
                                 publish=False, status="stale_head", reason="head moved",
                                 requeue_head="a" * 40))
-        nonce = dispatch_and_start(db, live, task("rev-s", task_type="review", branch="feat/x",
-                                                  context={"pr_number": 42}),
-                                   role="reviewer", agent="codex")
+        # Dispatched inside the client context for the same reason as ``retry_http``.
         with TestClient(_app(db), raise_server_exceptions=False) as c:
+            nonce = dispatch_and_start(db, live, task("rev-s", task_type="review",
+                                                      branch="feat/x",
+                                                      context={"pr_number": 42}),
+                                       role="reviewer", agent="codex")
             c.post("/tasks/rev-s/result", json={
                 "task_id": "rev-s", "status": "completed", "verdict": "approve",
                 "summary": "lgtm", "pr_number": 42,
