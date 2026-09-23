@@ -3973,13 +3973,26 @@ def create_app(
                 #   The ADR removes that module as a decision (§11.1 row 13,
                 #   O10) and gives the review/test contract to the policy
                 #   snapshot's J7 `review_test_matrix`, read once at admission.
-                #   What survives at dispatch is honouring a `test_scope` the
-                #   row already carries, and naming where it came from.
-                if (isinstance(task.context, dict)
-                        and task.context.get("test_scope") == "targeted"):
+                #   What survives at dispatch is honouring a reduction the
+                #   task's ADMISSION RECEIPT carries, and naming where it came
+                #   from.
+                # ⛔Not `task.context["test_scope"]`. The context is whatever the
+                #   request supplied, so honouring it let any ingress lower the
+                #   test gate — invariant 7, §7.2 (codex [0] at c18e092). A
+                #   request-side reduction is logged and ignored; with no J7
+                #   field on the receipt the task keeps its full scope.
+                _admitted = q().cea_admitted_test_scope(task.task_id)
+                if _admitted is not None:
                     _scope = {**_scope, "full_suite": False,
-                              "source": task.context.get("test_scope_source") or "task",
-                              "source_kind": task.context.get("test_scope_source") or "task"}
+                              "source": _admitted["source_kind"],
+                              "source_kind": _admitted["source_kind"]}
+                elif (isinstance(task.context, dict)
+                        and task.context.get("test_scope") not in (None, "")):
+                    logger.warning(
+                        "dispatcher: ingress test_scope ignored (§7.2) task_id=%s "
+                        "requested=%r source=%r", task.task_id,
+                        task.context.get("test_scope"),
+                        task.context.get("test_scope_source"))
                 _scope_name = _effective_scope(_scope)
                 _scope_hash = _scope_fingerprint(_scope)
                 q().record_test_economics(
