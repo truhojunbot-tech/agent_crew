@@ -135,9 +135,69 @@ table; each O18 immediate-invalidation field against a one-minute-old receipt; a
 the O20 window on both sides. No live server, DB or GitHub state was touched — the
 live DB is copied into `tmp_path` and opened there.
 
+## 7. Step 4b — what landed, what did not (`result`)
+
+Task `sev0-cea-lineage-s4b-folds-acceptance-guards-r1`, branch `sev0/cea-lineage`,
+base `ba1d71d` (4a's head). Contract frozen at alfred `6cbce565`.
+
+### DONE in this step
+
+| Item | Where | Evidence |
+|---|---|---|
+| FOLD-IN 3 P1 — RESULT requires that EXECUTE_START consumed the nonce | `cea/store.py` (`EXECUTE_START_CONSUMER`, `consumer_tag`, `consumed_by_execute_start`), `cea/validator.py` (`nonce_consumed_by`/`nonce_attempt`, `_nonce_started`, three RESULT refusals), `queue.py` (`start_execution` tags the spend; `submit_result` reads the nonce row), `server.py` (`/result` → 409), `mcp_server.py` (same refusal) | `tests/unit/test_sev0_cea_s4b_result_requires_start.py` (13 tests); step-1 suite updated (147); CEA unit files 190 passed / 31 xfailed |
+
+The reproduction, run against `ba1d71d` in a throwaway copy of the tree before
+the fix (`mode=test`, `start_execution` omitted): task `completed`, nonce
+`used_at=None`, receipt `CLAIMED → CONSUMED` — never `RUNNING`. After the fix
+the same sequence is refused `NONCE_NOT_STARTED`, nothing is written, and the
+nonce stays unspent.
+
+### Guard inventory as measured on this branch (ADR §11.2, item (g))
+
+`discovery` — this is what the code contains today, not a claim that the count
+is already at or under the ADR's ceiling of six.
+
+| Guard | Implementation on this branch | Status |
+|---|---|---|
+| T3 validator (the five points) | `cea/callsites.py` — one `VALIDATOR`, five `gate_*` | the one decision surface |
+| G11 artifact contract | `pipeline.artifact_gate_applies` + `/result`, `mcp_server.py:234` | present; **not yet** invoked *from* the validator at T5, and "dispatch base absent" still skips rather than FAILs — item (a), REMAINING |
+| G_DT dispatch topology | `server._guard_agent_process`, `_guard_task_existence`, `queue.defer_push_delivery` | present; the #362 unknown-task refusal is **not yet** subsumed by "no receipt ⇒ no dispatch" — item (b), REMAINING |
+| G12 execution events | `queue.record_dispatch`/`_record_claim_on`/`_record_end_on`, `task_exec_events` | present; `receipt_id` on the rows, `cancel()` single-txn terminal event, `GET /tasks/{id}` redaction and the append-only trigger — item (c), REMAINING (unverified here) |
+| #294 lexical duplicate advisory | `server.py:5093` `active_tasks_for_issue` | **to remove** (§11.1 row 14) — REMAINING |
+| risk-tier decision | `risk_tier.risk_tier_enforcement_enabled` read at `pipeline.py:981/1296/1542`, `server.py:3931` | **to remove as a decision** (§11.1 row 13, O10) — REMAINING |
+
+### REMAINING after this step (nothing below was started)
+
+Carried from 4a's s2b remainder:
+
+1. Remove the #294 lexical duplicate advisory (`server.py:5093`).
+2. Remove `risk_tier.py` as a decision; J7 reads the snapshot `review_test_matrix`.
+3. Receipt-less legacy rows: not runnable under `enforce`, counted under `shadow`
+   (the claim path already refuses them under `enforce` — `queue.py:2172`; the
+   *report* under shadow is not built).
+4. Rollout config: engine mode `off|shadow|enforce|test` **per project** (today
+   the mode is process-wide, `AGENT_CREW_CEA_MODE`). Default `shadow` for live.
+5. E8 §11 scenarios flipping from xfail to pass under `enforce` (31 xfail today).
+
+This step's own list:
+
+- (a) G11 invoked from the validator at T5; "dispatch base absent" ⇒ FAIL.
+- (b) G_DT invoked after the validator at T6, topology only.
+- (c) G12 `receipt_id` on `task_exec_events`, single-txn `cancel()`, public
+  redaction, append-only triggers.
+- (d) I1 property test (static exhaustiveness over adapters + generated fixtures
+  through every adapter ⇒ identical `(decision, reason, intent_hash)`).
+- (e) I2 static + dynamic (no receipt / CONSUMED / stale per O18 field /
+  DRAINING, QUARANTINED, STOPPED / past the O20 window).
+- (f) Permanent fixtures: E10 4a–4j, the Codex six, same-uid executor/caller —
+  BLOCKED vs expected-red.
+- (g) Guard count reduced to ≤ 6 with the removals above; the table in this
+  section is the *starting* inventory, not the finished count.
+
 ## §P Provenance
 
 - Provider Claude, model `claude-fable-5-1`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-prep-r1` on :8105, branch `sev0/cea-lineage`.
+- Step 4b (§7): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4b-folds-acceptance-guards-r1` on :8105, branch `sev0/cea-lineage`, base `ba1d71d`, 2026-09-23. Read-only inputs: `GET /tasks/sev0-cea-lineage-s4a-merge-remainder-p1s` on :8105. The pre-fix reproduction ran in a throwaway copy of the tree under `/tmp` (removed); no live server, DB, GitHub or Telegram mutation.
 - Step 1 (§6): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s1-state-validator` on :8105, same branch, base `d073a59`, 2026-09-23.
 - Read-only inputs: agent_crew `b574308`, `5efea31`, `4c123fc`, `37cb8af`, `846d13c`, `addc29e`, `4df04aa`, `b46bda4`, `3b8598f`, `9c90da1` (git objects); alfred `6cbce56` (E11 ADR), `sev0/e10-claude-redteam` E10 report + repro; `GET /tasks/sev0-e10-codex-challenge-r1` and `GET /tasks/sev0-cea-lineage` on :8105 (read-only, 2026-09-23).
 - Merge trials: temporary detached worktree under `/tmp`, cherry-pick only, removed; no branch other than `sev0/cea-lineage` was created or moved. No live server, DB, GitHub or Telegram mutation.
