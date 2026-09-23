@@ -15,8 +15,10 @@ queue adapter) block the scenario today?** — and reports one of:
   credential boundary (O3/O21/O21b) exists; the fixture asserts the *honest
   degraded* outcome (``UNVERIFIED`` recorded, no identity-dependent ALLOW)
   instead of hiding the gap;
-* ``OPEN`` — not blocked yet; ``xfail(strict=False)`` with the reason, for the
-  concurrent 4c lane or acceptance to flip.
+* ``OPEN`` — not blocked yet. Only a named ``DEFERRED`` item may be non-BLOCKED,
+  and it is strict-red (``xfail(strict=True)``); the report-gate tests fail on
+  any undeclared OPEN/EXPECTED_RED and keep the acceptance verdict red while
+  ``DEFERRED`` is non-empty (4d-r2).
 
 Every scenario runs under ``mode=test`` (enforcing, embedded permitted), on a
 fresh SQLite per test. No server, no tmux, no network, no live DB.
@@ -309,31 +311,70 @@ FIXTURES = {
     "CX-P2b": (cx_p2b, EXPECTED_RED), "CX-P2c": (cx_p2c, EXPECTED_RED),
 }
 
-#: Filled from the first run at bd58092: fixtures whose CEA component does not
-#: block yet. xfail(strict=False) so a fix in 4c flips them without editing here.
-KNOWN_OPEN: dict[str, str] = {
-    "CXC-5": "the HTTP-level E8 suite (test_sev0_e8_adversarial.py) still carries xfail "
-             "markers; they flip when the server path is enforcing end-to-end (4c/acceptance)",
-    "CXC-6": "task_exec_events has no append-only trigger at bd58092 (authorization_receipts "
-             "does); UPDATE ... SET event='rewritten' succeeds — lease/end-event half not probed",
+#: 4d-r2 (Codex P1): no ``xfail(strict=False)``. A fixture is either PASS —
+#: BLOCKED with its exact reason — or **strict-red**: asserted BLOCKED under
+#: ``xfail(strict=True)`` naming the deferred item. A fix is then an XPASS that
+#: fails the run until the entry is removed here; nothing is silently green.
+#: EXPECTED_RED (honest UNVERIFIED, no identity-dependent ALLOW) is still not
+#: BLOCKED, so the P2b/P2c fixtures are strict-red on the O21 broker too.
+DEFERRED: dict[str, str] = {
+    "CX-P2b": "O21c broker VERIFIED executor identity (P2b needs executor_binding_status="
+              "VERIFIED to refuse a co-resident nonce holder)",
+    "CX-P2c": "O21b/O21c broker VERIFIED caller identity (403 UNREGISTERED_CALLER)",
+    "CXC-5": "E8 HTTP: test_sev0_e8_adversarial.py still carries xfail markers; flips when "
+             "the server path enforces end-to-end",
+    "CXC-6": "task_exec_events append-only trigger (authorization_receipts has one; "
+             "UPDATE ... SET event='rewritten' succeeds on task_exec_events)",
 }
 
 
 def _params():
     for fid in FIXTURES:
         marks = ()
-        if fid in KNOWN_OPEN:
-            marks = (pytest.mark.xfail(strict=False, reason=f"{fid}: {KNOWN_OPEN[fid]}"),)
+        if fid in DEFERRED:
+            marks = (pytest.mark.xfail(strict=True, reason=f"{fid} deferred: {DEFERRED[fid]}"),)
         yield pytest.param(fid, id=fid, marks=marks)
 
 
 @pytest.mark.parametrize("fid", list(_params()))
 def test_permanent_fixture(tmp_path, fid, record_property):
-    scenario, expected = FIXTURES[fid]
+    scenario, _ = FIXTURES[fid]
     status, reason = scenario(tmp_path)
     record_property("cea_fixture", f"{fid}: {status} — {reason}")
     print(f"\n[{fid}] {status}: {reason}")
-    assert status == expected, f"{fid}: expected {expected}, got {status} — {reason}"
+    assert status == BLOCKED, f"{fid}: expected BLOCKED, got {status} — {reason}"
+
+
+def _report(tmp_path) -> dict:
+    out = {}
+    for fid, (scenario, _) in FIXTURES.items():
+        d = tmp_path / fid
+        d.mkdir()
+        out[fid] = scenario(d)
+    return out
+
+
+def test_report_gate_no_undeclared_open_result(tmp_path):
+    """Hard gate: any fixture that is not BLOCKED must be a named DEFERRED item.
+    A new OPEN (regression) or an undeclared EXPECTED_RED fails here, always."""
+    rep = _report(tmp_path)
+    bad = {f: r for f, r in rep.items() if r[0] != BLOCKED and f not in DEFERRED}
+    assert not bad, bad
+
+
+def test_report_gate_deferred_list_is_exactly_what_is_still_not_blocked(tmp_path):
+    """A DEFERRED entry whose fixture now BLOCKs must be removed (it would
+    otherwise keep a strict xfail around a passing fixture — caught as XPASS too)."""
+    rep = _report(tmp_path)
+    assert {f for f, r in rep.items() if r[0] != BLOCKED} == set(DEFERRED), rep
+
+
+@pytest.mark.xfail(strict=True, reason="acceptance verdict is BLOCKED while DEFERRED is "
+                   "non-empty: " + ", ".join(sorted(DEFERRED)))
+def test_report_gate_acceptance_verdict_requires_every_fixture_blocked(tmp_path):
+    rep = _report(tmp_path)
+    assert all(r[0] == BLOCKED for r in rep.values()), {f: r for f, r in rep.items()
+                                                        if r[0] != BLOCKED}
 
 
 def test_every_e10_and_codex_finding_has_a_fixture():
