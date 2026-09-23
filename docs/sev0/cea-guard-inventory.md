@@ -67,13 +67,13 @@ A later step can turn the §3 count into a `CX-G` fixture. It is not one yet: th
 
 ## 5. Paths back to pending (4d-r2, Codex P1) — not in §11.2, but I2 call sites
 
-`result`/`discovery` — code read at agent_crew `10bf4a1` (s4d merged with `sev0/cea-lineage` `caf5644`). Each of these moves an `in_progress` task back to `pending`, i.e. back to claim/dispatch. None goes through the receipt lifecycle today.
+`result`/`discovery` — code read at agent_crew `10bf4a1`/`5436e30` (s4d merged with `sev0/cea-lineage` `caf5644`). Each of these moves an `in_progress` task back to `pending`, i.e. back to claim/dispatch. None goes through the receipt lifecycle today.
 
 | Path | Where | Receipt effect (measured, mode=test and shadow) |
 |---|---|---|
 | `TaskQueue.requeue` | `queue.py:3412` (literal `SET status = 'pending'` at `:3417`) | receipt stays **CLAIMED**, no lifecycle row |
 | `TaskQueue.reset_stale_to_pending` | `queue.py:3469` (write at `:3487`) | same |
-| `TaskQueue.defer_push_delivery` (G_DT backoff) | `queue.py:3373` (bound-parameter `"pending"` at `:3400`) | same |
+| `TaskQueue.defer_push_delivery` (G_DT backoff) | `queue.py:3373` (bound-parameter `"pending"` at `:3400`); caller `server.py:2675` | same |
 | server startup `_requeue_orphans` | `server.py:2528` → `requeue` at `:2556` | same |
 | other `requeue` callers (push/delivery failure paths) | `server.py:2723`, `:2730`, `:2915`, `:2925`, `:3594`, `:4336`, `:4515`, `:4549` | same |
 | `crew recover --reset-stale` | `cli.py:1657` → `reset_stale_to_pending` at `:1898` | same |
