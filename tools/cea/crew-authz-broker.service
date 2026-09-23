@@ -1,0 +1,25 @@
+# SEV-0 CEA P2a Option B — authz broker (template; not installed by this repo).
+# Install: copy to /etc/systemd/system/crew-authz-broker.service after the
+# launcher is at /home/truhojun/alfred/tools/cea/broker-launch.sh and the
+# agent_crew source is at a path crew-authz can read (see broker-launch.sh).
+[Unit]
+Description=agent_crew CEA executor-binding authz broker (crew-authz)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=crew-authz
+Group=crew-authz
+ExecStartPre=/home/truhojun/alfred/tools/cea/broker-launch.sh --check
+ExecStart=/home/truhojun/alfred/tools/cea/broker-launch.sh
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+PrivateDevices=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
