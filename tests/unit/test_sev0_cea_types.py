@@ -140,6 +140,7 @@ def test_input_providers_return_data_not_decisions():
 # gate — adding a call site means editing it, which is the point.
 CEA_IMPORTERS = {
     "queue.py",        # step 1: the receipt store rides on the tasks DB connection
+    "server.py",       # step 4c: T5 reads the project's rollout mode at /result
 }
 
 

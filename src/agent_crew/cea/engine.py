@@ -45,6 +45,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -165,13 +166,55 @@ _WORK_CLASS_ROLE = {
 # config — the service boundary is a switch, not a rewrite
 # ═══════════════════════════════════════════════════════════════════════════
 
+OFF = "off"
 SHADOW = "shadow"
 ENFORCE = "enforce"
 TEST = "test"
 
-MODES = (TEST, SHADOW, ENFORCE)
+MODES = (OFF, TEST, SHADOW, ENFORCE)
 
-EMBEDDED_MODES = (TEST, SHADOW)
+EMBEDDED_MODES = (OFF, TEST, SHADOW)
+
+
+def project_mode_env_var(project: str) -> str:
+    """The per-project override's environment variable name.
+
+    ``AGENT_CREW_CEA_MODE__<PROJECT>``, project upper-cased with every run of
+    non-alphanumeric characters folded to one underscore. One function, because
+    the writer (an operator, or `crew setup`) and the reader must agree on the
+    spelling and a second copy of this rule would be a silent no-op override.
+    """
+    key = re.sub(r"[^A-Za-z0-9]+", "_", (project or "").strip()).strip("_").upper()
+    return f"AGENT_CREW_CEA_MODE__{key}" if key else "AGENT_CREW_CEA_MODE"
+
+
+def resolve_mode(env: dict, project: Optional[str] = None) -> str:
+    """Rollout config: the engine mode in force for ``project``.
+
+    Precedence: the per-project variable, then the process-wide
+    ``AGENT_CREW_CEA_MODE``, then :data:`SHADOW`.
+
+    ⛔Per-project, because rollout is per-project. A single process-wide switch
+      forces the whole fleet across the shadow→enforce boundary at once, which
+      means the first project that is ready cannot move until the last one is —
+      so in practice nobody moves. An unrecognised value falls back to
+      :data:`SHADOW` rather than raising: a typo in an operator's environment
+      must not be able to take admission down, and shadow is the mode that
+      changes nothing while still measuring.
+
+    ⛔The fallback direction is deliberately *not* fail-closed. That asymmetry
+      is only sound because this setting decides whether the engine's verdict
+      **stops work**, never what the verdict is (P7: the engine has no shadow
+      branch). Failing a typo closed would refuse real work over a misspelling.
+    """
+    for name in (project_mode_env_var(project) if project else None,
+                 "AGENT_CREW_CEA_MODE"):
+        if not name:
+            continue
+        raw = (env.get(name) or "").strip().lower()
+        if raw:
+            return raw if raw in MODES else SHADOW
+    return SHADOW
 """The modes in which :meth:`AuthorizationEngine.authorize` may run embedded.
 
 ⛔Codex, re-reviewing ``f1aee1d``: an in-process Python construct is not an
@@ -229,14 +272,19 @@ class EngineConfig:
     ``None`` means this adapter has no credential, so a remote engine answers 401.
     """
 
+    project: Optional[str] = None
+    """Which project's rollout setting produced :attr:`mode` — provenance, so a
+    recorded gate answer can be read back against the config that produced it."""
+
     @classmethod
-    def from_env(cls, env: Optional[dict] = None) -> "EngineConfig":
+    def from_env(cls, env: Optional[dict] = None,
+                 project: Optional[str] = None) -> "EngineConfig":
+        """``project`` selects the per-project rollout override (:func:`resolve_mode`)."""
         e = os.environ if env is None else env
-        mode = (e.get("AGENT_CREW_CEA_MODE") or SHADOW).strip().lower()
-        if mode not in MODES:
-            mode = SHADOW
+        mode = resolve_mode(e, project)
         return cls(
             mode=mode,
+            project=project or None,
             endpoint=(e.get("AGENT_CREW_CEA_ENGINE_ENDPOINT") or "").strip() or None,
             key_path=(e.get("AGENT_CREW_CEA_ENGINE_KEY") or "").strip() or None,
             issuer=(e.get("AGENT_CREW_CEA_ISSUER") or "").strip() or cls.issuer,
@@ -246,8 +294,18 @@ class EngineConfig:
     @property
     def enforcing(self) -> bool:
         """Does a non-PROCEED answer stop the work? ``test`` enforces like
-        ``enforce``; they differ only in where the engine is allowed to run."""
+        ``enforce``; they differ only in where the engine is allowed to run.
+        ``off`` and ``shadow`` both proceed — they differ in whether the answer
+        is computed and recorded at all."""
         return self.mode in (ENFORCE, TEST)
+
+    @property
+    def recording(self) -> bool:
+        """Is a gate answer worth computing here? ``off`` is the rollout escape
+        hatch: no verdict is produced, so nothing is recorded and nothing is
+        measured. It exists so "turn the engine off for this project" is a
+        config change rather than a deploy, and it is never the default."""
+        return self.mode != OFF
 
     @property
     def embedded_authorization_permitted(self) -> bool:

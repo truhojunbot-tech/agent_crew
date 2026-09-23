@@ -194,8 +194,74 @@ This step's own list:
 - (g) Guard count reduced to ≤ 6 with the removals above; the table in this
   section is the *starting* inventory, not the finished count.
 
+## 8. Step 4c — what landed, what did not (`result`)
+
+Task `sev0-cea-lineage-s4c-remainder-folds`, branch `sev0/cea-lineage`, base
+`bd58092` (4b's head). Contract frozen at alfred `6cbce565`. A parallel lane 4d
+owns the new I1/I2/fixture test files and the guard inventory doc; nothing here
+touches them.
+
+### DONE in this step
+
+| # | Item | Where | Evidence |
+|---|------|-------|----------|
+| 1 | #294 lexical duplicate advisory **removed** (§7 REMAINING 1) | `server.py` `post_task` (lookup, warning and the `in_flight_for_issue` response key), `watch.py` (`active_tasks_for_issue` deleted) | `tests/unit/test_issue_294_inflight_issue_advisory.py` rewritten as the removal record, 6 tests |
+| 2 | risk-tier decision **removed from the dispatch path** (§7 REMAINING 2, §11.1 row 13 — *server half only*) | `server.py` test-scope block now honours the stored `context.test_scope` and names `test_scope_source` instead of re-asking the module | CXC-1 flips xfail → pass; a new standing red holds the pipeline half |
+| 3 | Rollout config **per project** (§7 REMAINING 4) | `cea/engine.py` `OFF`, `project_mode_env_var`, `resolve_mode`, `EngineConfig.from_env(project=)`, `.recording`; `cea/callsites.py` `enforcing(project=)`, `recording()`; `queue.cea_config(project)` cached per project; ENQUEUE passes `task.project` | `tests/unit/test_sev0_cea_s4c_rollout_mode.py`, 23 tests |
+| 4 | (a) T5 "dispatch base absent" ⇒ **FAIL**, never "not applied" | `server.py` `/result`, held as `no_artifact` with the reason in `error_info.detail`, under the project's rollout mode | `tests/unit/test_sev0_cea_s4c_dispatch_base_absent.py`, 6 tests |
+
+`pytest tests/unit -k cea` → **272 passed, 21 xfailed**. `pytest tests/unit -k
+"353 or 374"` → 10 failures, identical in count and name at `bd58092` before
+this step (verified by stashing the work tree); they are pre-existing and are
+**not** fixed here. `pytest tests/unit -k "scope or tier"` → 49 passed, 9 failed,
+same 9 at base (`$.project: '' should be non-empty` — the engine's contract check
+on receipts minted for project-less fixtures).
+
+### `discovery` — the rollout mode is read in two different ways right now
+
+Driving the new T5 refusal with the process-wide `AGENT_CREW_CEA_MODE=enforce`
+returns **409 from the s4b RESULT rule** (a nonce proves a start happened)
+before the artifact gate is reached. The artifact check reads the *task's*
+project; the four post-admission T3 call sites still read the process-wide mode.
+Both behaviours are correct in isolation and the combination is the half-wired
+state below. The fix is not to pass the project down from each caller — it is
+for those sites to take it from the task's **receipt**, so a task admitted under
+one project's mode cannot be claimed or finished under another's.
+
+### REMAINING after step 4c
+
+Carried, unstarted:
+
+1. ~~#294 advisory~~ — done above.
+2. risk-tier **pipeline half**: `pipeline.py` still branches on
+   `risk_tier_enforcement_enabled()` at `:981`, `:1296`, `:1542` for the
+   review/test/fix cascades, including the TIER_0 skip and the TIER_3 gate. The
+   cascades must take reviewer/tester from the receipt's J7 contract instead.
+   Standing red: `test_cxc_1_pipeline_still_decides_by_risk_tier`.
+3. Receipt-less legacy rows: the `enforce` refusal exists (`queue.py:2172`); the
+   **shadow report** is still not built.
+4. ~~Per-project rollout config~~ — done above, **except** threading the
+   project into the four post-admission call sites from the receipt (see the
+   `discovery` note). `TaskQueue.cea_config()` called with no argument there is
+   the marker.
+5. E8 §11 scenarios still xfail under `enforce` (21 xfail in the cea selection).
+
+This step's own list, unstarted:
+
+- (b) G_DT invoked after the validator at T6, topology only; the #362
+  unknown-task refusal subsumed by "no receipt ⇒ no dispatch".
+- (c) G12: `receipt_id` on `task_exec_events`, single-txn `cancel()` terminal
+  event + lease clear, public `GET /tasks/{id}` redaction of pid/pane/lease,
+  append-only triggers on `task_exec_events`. **Unverified** — not inspected in
+  this step, so the 4b table's "REMAINING (unverified here)" still stands.
+- (d) I1, (e) I2, (f) permanent fixtures — lane 4d.
+- (g) Guard count: two removals landed (#294 advisory; the risk-tier read in
+  `server.py`). The count is **not** yet at the ADR's ceiling of six, because
+  the pipeline risk-tier branches remain.
+
 ## §P Provenance
 
+- Step 4c (§8): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4c-remainder-folds` on :8105, branch `sev0/cea-lineage`, base `bd58092`, 2026-09-23. Baselines for the pre-existing failures were taken by stashing the work tree at each commit's parent and re-running the same selection. No live server, DB, GitHub or Telegram mutation.
 - Provider Claude, model `claude-fable-5-1`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-prep-r1` on :8105, branch `sev0/cea-lineage`.
 - Step 4b (§7): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4b-folds-acceptance-guards-r1` on :8105, branch `sev0/cea-lineage`, base `ba1d71d`, 2026-09-23. Read-only inputs: `GET /tasks/sev0-cea-lineage-s4a-merge-remainder-p1s` on :8105. The pre-fix reproduction ran in a throwaway copy of the tree under `/tmp` (removed); no live server, DB, GitHub or Telegram mutation.
 - Step 1 (§6): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s1-state-validator` on :8105, same branch, base `d073a59`, 2026-09-23.

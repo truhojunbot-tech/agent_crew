@@ -58,10 +58,9 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import AdmissionRefused, TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
+from agent_crew.queue import AdmissionRefused, TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
-from agent_crew.risk_tier import risk_tier_enforcement_enabled
-from agent_crew.watch import active_tasks_for_issue
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
     load_scope as _load_test_scope,
@@ -3928,11 +3927,21 @@ def create_app(
                 # operator-configured full-suite override. The cascade stores
                 # this decision on the task so replay/restart cannot infer it
                 # from a provider or project name.
-                if (risk_tier_enforcement_enabled()
-                        and isinstance(task.context, dict)
+                # ⛔This reads the decision the cascade already STORED; it does
+                #   not make one. It used to re-ask the risk-tier module
+                #   whether tiering applied, which meant the same question was
+                #   answered twice — once when the cascade created this task and
+                #   again here, against config that may have changed in between.
+                #   The ADR removes that module as a decision (§11.1 row 13,
+                #   O10) and gives the review/test contract to the policy
+                #   snapshot's J7 `review_test_matrix`, read once at admission.
+                #   What survives at dispatch is honouring a `test_scope` the
+                #   row already carries, and naming where it came from.
+                if (isinstance(task.context, dict)
                         and task.context.get("test_scope") == "targeted"):
                     _scope = {**_scope, "full_suite": False,
-                              "source": "risk_tier", "source_kind": "risk_tier"}
+                              "source": task.context.get("test_scope_source") or "task",
+                              "source_kind": task.context.get("test_scope_source") or "task"}
                 _scope_name = _effective_scope(_scope)
                 _scope_hash = _scope_fingerprint(_scope)
                 q().record_test_economics(
@@ -5078,26 +5087,20 @@ def create_app(
         one endpoint's error shape unique — and
         ``tests/unit/test_issue_273_duplicate_task_id.py`` asserts the whole
         body so the description cannot drift from it again.
+
+        ⛔No ``in_flight_for_issue``. #294's lexical in-flight advisory — match
+        the issue number, log a warning, return the colliding ids — was a
+        *second* duplicate matcher living beside admission, and the ADR removes
+        it (§11.1 row 14, fixture CXC-1). Matching on an issue number is
+        matching on a label: two tasks that mean the same thing under different
+        issue numbers were never flagged, and four tasks that legitimately share
+        one issue were. Duplicate suppression belongs to the engine's
+        ``intent_hash`` (Π P4), which is computed from what the task *is*, and
+        it decides rather than advises. Until that index lands, admission does
+        not pretend to answer the question at all — an advisory nobody can act
+        on is worse than a stated gap.
         """
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
-        # #294: gathered BEFORE the enqueue, so the task being created can
-        # never appear in its own collision list.
-        # ⛔Resolved the same way `enqueue` will resolve it moments later.
-        #   Reading `context.issue` alone here meant a direct enqueue whose
-        #   issue lives only in its description reported no collision and was
-        #   then stored under that very issue (review of PR #295).
-        _issue_number = task_issue_number(task)
-        _in_flight: list = []
-        if isinstance(_issue_number, int) and not isinstance(_issue_number, bool):
-            try:
-                _in_flight = active_tasks_for_issue(
-                    q(), _issue_number, task_type=task.task_type)
-            except Exception:
-                # The whole feature is advisory; it must never cost a task.
-                logger.exception(
-                    f"POST /tasks: in-flight lookup failed for issue "
-                    f"#{_issue_number} — enqueueing anyway")
-                _in_flight = []
         try:
             task_id = q().enqueue(task, ingress="http.tasks")
         except TaskAlreadyExistsError as e:
@@ -5110,18 +5113,6 @@ def create_app(
                 },
             )
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
-        if _in_flight:
-            # ⛔Advisory, never a gate. Several tasks legitimately share one
-            #   issue — implement, its review, its fix rounds, its test — so
-            #   refusing by issue would break the cascade. What was missing is
-            #   only that nobody was TOLD: #294 measured a direct enqueue
-            #   duplicating a watch task that was still in flight, 15 minutes
-            #   before the first one's PR existed.
-            logger.warning(
-                f"POST /tasks: {task_id} is a second {task.task_type!r} task for "
-                f"issue #{_issue_number} while {_in_flight} is still in flight. "
-                f"Enqueued anyway — this is a heads-up, not a block (#294)."
-            )
         if not _push_enabled:
             logger.warning(
                 f"POST /tasks: AGENT_CREW_DELIVERY={_delivery_raw!r} — task {task_id} enqueued "
@@ -5139,9 +5130,7 @@ def create_app(
                 _try_push_next(role)
             else:
                 logger.warning(f"POST /tasks: no role found for task_type={task.task_type}")
-        # Always a list, never absent: a consumer should not have to tell "no
-        # collision" from "this server does not report collisions".
-        return {"task_id": task_id, "in_flight_for_issue": _in_flight}
+        return {"task_id": task_id}
 
     @app.get("/tasks/next")
     def get_next_task(role: str = "", agent: str = ""):
@@ -5226,11 +5215,33 @@ def create_app(
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
         _artifact_verified = None
+        # T5, ADR §11.1 row 10 / fixture CXC-6a: "dispatch base absent" is a
+        # FAIL, never a pass. An implement task that completes with no declared
+        # artifact contract and no `worktree_base_sha`/`reviewed_sha` gives the
+        # gate nothing to check the completion against — so the honest answer is
+        # that the artifact is unproven, not that the rule did not apply. Logging
+        # "not applied" and accepting `completed` made an *absent input* read as
+        # a passing check, which is the one thing P7 forbids a gate to do.
+        #
+        # ⛔Held under the project's rollout mode, not unconditionally: under
+        #   `shadow`/`off` this is recorded and the result stands, because the
+        #   whole point of shadow is to measure how many live tasks this would
+        #   have caught before it catches any.
         if (not _runtime_paused and not _REPLAYING.get() and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
                 and declared_artifact_kind(_task) is None
                 and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
-            logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
+            _no_base = ("dispatch base absent: this implement task declares no "
+                        "artifact contract and carries no worktree_base_sha or "
+                        "reviewed_sha, so its completion cannot be verified")
+            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
+                logger.warning("POST /tasks/%s/result: artifact gate FAILED — %s",
+                               task_id, _no_base)
+                _artifact_held = _no_base
+                result = no_artifact_result(result, _no_base)
+            else:
+                logger.info("POST /tasks/%s/result: artifact gate would FAIL under "
+                            "enforce — %s (shadow: result stands)", task_id, _no_base)
         # #374: the check follows the task's declared contract; undeclared
         # tasks keep #353's commit rule exactly (artifact_gate_applies).
         if (not _runtime_paused and not _REPLAYING.get()
