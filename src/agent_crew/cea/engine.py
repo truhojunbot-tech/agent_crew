@@ -53,8 +53,8 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from agent_crew.cea.intent import (
-    Caller, IdentityStatus, Intent, IntentIdentity, InvalidScopeAnchor, Target, WorkClass,
-    canonical_identity, is_authenticated_caller)
+    IDENTITY_DEPENDENT_WORK_CLASSES, Caller, IdentityStatus, Intent, IntentIdentity,
+    InvalidScopeAnchor, Target, WorkClass, canonical_identity, is_authenticated_caller)
 from agent_crew.cea.providers import (
     CapabilityLookup, PolicySnapshotRef, SignatureStatus)
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
@@ -411,7 +411,7 @@ class AuthorizationEngine:
 
         unavailable = self._unavailable_inputs(snapshot, registry, runtime) + raised
         reviewer, tester = self._j7_contract(intent, snapshot, executor)
-        reuse = self._j5_reuse(intent, caller, registry)
+        reuse = self._j5_reuse(intent, registry)
 
         receipt = self._build(
             intent=intent, caller=caller, intent_hash_value=ih, snapshot=snapshot,
@@ -686,20 +686,37 @@ class AuthorizationEngine:
                              if r != "implementer" and a != executor), None)
         return reviewer, tester
 
-    def _j5_reuse(self, intent: Intent, caller: Caller, registry: CapabilityLookup):
+    def _j5_reuse(self, intent: Intent, registry: CapabilityLookup):
         """J4/J5 — the registry matched something someone else owns (§6.2, CX-4i).
 
         Reuse is only ever *recorded* here. Approval is an owner act with a
         verified identity; under P2a nothing in this process can verify one, so
         ``approver_identity_verified`` is False and the decision path treats the
         receipt as identity-dependent — which is exactly why it cannot be ALLOW.
+
+        ⛔There is deliberately **no caller argument**. This test used to read
+          ``owner != caller.principal``, so "am I the owner?" was answered by the
+          name the caller arrived under — and under an UNVERIFIED identity that
+          name is a claim, not a fact. The consequence was a real principal-
+          dependent difference: a caller that named itself ``quota-core`` got
+          EXTEND (REVIEW, once a reviewer is named) where everyone else got
+          REUSE (HUMAN_GATE, OWNER_CONFLICT). A forged or registry-poisoned
+          Caller could therefore *downgrade an owner decision to a review* just
+          by choosing a string (codex P1, re-review of f1aee1d).
+
+          The ownership question is now answered only from intent scope —
+          ``identity.project``, which is part of ``intent_hash`` and is scope,
+          not an identity claim. Every principal gets the same answer for the
+          same intent, which is what P2a requires while identity is UNVERIFIED.
+          When the O21b broker can verify an owner, *that* is what restores the
+          distinction — a verified approval recorded in ``approved_by``.
         """
         from agent_crew.cea.receipt import Reuse, ReuseDecision
         matches = tuple(registry.matches) + tuple(registry.anchor_matches)
         if not matches:
             return Reuse(ReuseDecision.NEW) if registry.available else None
         owner = matches[0].owner
-        if owner and owner != caller.principal and owner != intent.identity.project:
+        if owner and owner != intent.identity.project:
             return Reuse(ReuseDecision.REUSE, approved_by=None, approver_identity_verified=False)
         return Reuse(ReuseDecision.EXTEND, approved_by=None, approver_identity_verified=False)
 
@@ -875,7 +892,17 @@ class AuthorizationEngine:
                     "J5: this intent reuses a capability owned elsewhere with no verified owner "
                     "approval (§6.2); the owner decides, the engine does not")
 
-        if degraded and _is_identity_dependent(reviewer, gate_name, reuse):
+        work_class = _work_class_value(intent.identity.work_class)
+        if degraded and _is_identity_dependent(work_class, reviewer, gate_name, reuse):
+            if work_class in IDENTITY_DEPENDENT_WORK_CLASSES:
+                # J9 asks *who* may do this. A reviewer does not answer that
+                # question — an independent reviewer checks the work, not the
+                # entitlement — so this branch does not fall through to REVIEW
+                # even when one is named. The owner answers it, or nothing does.
+                return ("HUMAN_GATE", "IDENTITY_UNVERIFIED_WHO_MAY_ACT",
+                        f"J9/P2a: {work_class} admission is a judgement about which principal "
+                        f"may act, and caller_identity_status is UNVERIFIED under a shared uid; "
+                        f"the engine has no principal-invariant answer, so the owner decides")
             if reviewer:
                 return ("REVIEW", "IDENTITY_UNVERIFIED_REVIEW_REQUIRED",
                         "P2a: the review/test contract is an identity claim and the executor/caller "
@@ -991,9 +1018,14 @@ class AuthorizationEngine:
 # helpers
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _is_identity_dependent(reviewer, gate_name, reuse) -> bool:
+def _is_identity_dependent(work_class, reviewer, gate_name, reuse) -> bool:
     """Mirrors :func:`agent_crew.cea.validator._identity_dependent` on the issue
     side: what the engine may not ALLOW is exactly what the validator refuses."""
+    if work_class in IDENTITY_DEPENDENT_WORK_CLASSES:
+        # J9 who-may-do-OPS. The one judgement whose entire content is the
+        # principal, so it has no principal-invariant answer to give while
+        # identity is UNVERIFIED (P2a).
+        return True
     if reviewer:
         return True
     if gate_name != "NOT_REQUIRED":

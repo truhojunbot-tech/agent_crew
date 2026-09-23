@@ -197,7 +197,13 @@ def test_a_valid_signature_is_the_only_one_that_admits(conn):
                                              anchors=("ops/valid.py",)))
     auth = engine(snapshots=FakeSnapshot(signature=SignatureStatus.VALID)).authorize(
         conn, ops, caller())
-    assert auth.decision == "ALLOW"
+    # Not ALLOW — OPS is J9's who-may-act question and P2a forbids ALLOW on it
+    # while identity is UNVERIFIED (s2a-fix r3). What this test is about is the
+    # *signature*: a VALID one is not an unavailable input, so the decision is
+    # reached on the policy rather than refused before it is read.
+    assert auth.decision == "HUMAN_GATE"
+    assert auth.receipt["reason"]["code"] == "IDENTITY_UNVERIFIED_WHO_MAY_ACT"
+    assert not auth.receipt["provenance"].get("unavailable_inputs")
 
 
 class ExplodingSnapshot:
@@ -379,7 +385,10 @@ def test_the_exact_review_bypass_of_already_completed(conn):
     authorisation."""
     eng = engine()
     first = eng.authorize(conn, _ops("j2-1"), caller())
-    assert first.decision == "ALLOW"
+    # HUMAN_GATE rather than ALLOW since s2a-fix r3 — OPS is J9's who-may-act
+    # question. The lineage is claimed either way (only BLOCK claims nothing),
+    # which is what this test needs: completed work that must not re-admit.
+    assert first.decision == "HUMAN_GATE"
     run_to(eng, conn, first.receipt_id, "CONSUMED")
 
     attack = eng.authorize(conn, _ops("j2-2", authority=("T0-1234", "ATTACKER-ID")), caller())
@@ -411,7 +420,11 @@ def test_an_explicit_superseding_record_in_the_snapshot_does_re_admit(conn):
     again = engine(snapshots=snapshot).authorize(
         conn, _ops("j2-6", authority=("T0-1234", "T0-9999")), caller())
     assert again.code != "ALREADY_COMPLETED"
-    assert again.decision == "ALLOW"
+    # Re-admitted: the request reached the J9/P2a rule, which is past J1's
+    # completed-lineage refusal. It is not ALLOW because this is OPS work and
+    # no principal is verified — a different judgement from "already done".
+    assert again.decision == "HUMAN_GATE"
+    assert again.receipt["reason"]["code"] == "IDENTITY_UNVERIFIED_WHO_MAY_ACT"
 
 
 def test_a_superseding_record_the_caller_did_not_ask_under_is_not_enough(conn):

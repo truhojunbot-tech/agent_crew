@@ -28,6 +28,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Optional, Protocol, runtime_checkable
 
+from agent_crew.cea.intent import IDENTITY_DEPENDENT_WORK_CLASSES
 from agent_crew.cea.receipt import DispatchNonce, Receipt
 from agent_crew.cea.schema import validate_receipt
 
@@ -228,7 +229,19 @@ def _identity_dependent(receipt: dict) -> bool:
     required reviewer or tester (role separation is an identity claim), when a
     human gate is involved at all, or when a reuse approval was recorded without
     a verified approver (§6.2).
+
+    ⛔And when the work class is one J9 answers by principal — OPS. That
+      judgement is *about* the caller, so an ALLOW on it under an UNVERIFIED
+      identity would be the engine asserting an entitlement nobody checked.
+      Kept in step with :func:`agent_crew.cea.engine._is_identity_dependent`
+      through the shared
+      :data:`~agent_crew.cea.intent.IDENTITY_DEPENDENT_WORK_CLASSES`: the two
+      sides used to duplicate the predicate, and a predicate duplicated by hand
+      is one that eventually disagrees with itself.
     """
+    work_class = ((receipt.get("provenance") or {}).get("intent_identity") or {}).get("work_class")
+    if work_class in IDENTITY_DEPENDENT_WORK_CLASSES:
+        return True
     if receipt.get("required_reviewer") or receipt.get("required_tester"):
         return True
     if _gate_state(receipt.get("human_gate_state")) != "NOT_REQUIRED":

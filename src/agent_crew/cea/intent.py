@@ -30,6 +30,26 @@ class WorkClass(str, Enum):
     OPS = "ops"
 
 
+IDENTITY_DEPENDENT_WORK_CLASSES = frozenset({WorkClass.OPS.value})
+"""Work classes whose admission is a question about *who is asking* (§2.3 J9).
+
+J9 asks who may do OPS. That judgement has no principal-invariant answer: the
+whole content of it is which principal is entitled to act. So while
+``caller_identity_status`` is ``UNVERIFIED`` — unconditionally, until the O21b
+broker exists (P2a) — the engine has nothing to decide it with, and P2a's rule
+applies: REVIEW or HUMAN_GATE, never ALLOW.
+
+⛔This is the load-bearing half of the answer to codex's ``_mint_caller`` /
+  registry-poisoning reproductions. An in-process Python closure is **not** an
+  authentication boundary and this repo does not claim it is: a forged caller
+  can be minted or injected into the mint registry by anything already running
+  in this interpreter. What closes the hole is that a caller who does so gains
+  nothing — the decision is identical for every principal while identity is
+  unverified, so the forgery buys exactly what an honest UNVERIFIED caller
+  already had.
+"""
+
+
 class CallerProvenance(str, Enum):
     """§3 ``caller_provenance``: the ingress adapter id (§2.2, §7.1).
 

@@ -260,12 +260,26 @@ def test_the_engine_never_issues_what_the_validator_would_refuse(conn):
     assert result.outcome is ValidationOutcome.PROCEED, result.reason
 
 
-def test_ops_work_with_no_identity_dependence_is_allowed(conn):
-    ident = identity(work_class=WorkClass.OPS)
-    auth = engine().authorize(conn, intent("ops1", ident=ident, task_type="discuss"), caller())
+def test_work_with_no_identity_dependence_is_allowed(conn):
+    """ALLOW is still reachable — that is what makes the refusals above mean
+    something. REVIEW work names no reviewer of its own (REVIEW_FLOOR) and J9
+    does not ask who may do it, so nothing about it turns on the principal."""
+    ident = identity(work_class=WorkClass.REVIEW)
+    auth = engine().authorize(conn, intent("rev1", ident=ident, task_type="review"), caller())
     assert auth.decision == "ALLOW"
     assert auth.http_status == 201
     assert auth.receipt["required_reviewer"] is None
+
+
+def test_ops_is_never_allowed_while_the_caller_identity_is_unverified(conn):
+    """J9 asks who may do OPS. Under P2a that has no principal-invariant answer,
+    and a decision the engine cannot make on the inputs it has is the owner's."""
+    ident = identity(work_class=WorkClass.OPS)
+    auth = engine().authorize(conn, intent("ops1", ident=ident, task_type="discuss"), caller())
+    assert auth.decision == "HUMAN_GATE"
+    assert auth.receipt["reason"]["code"] == "IDENTITY_UNVERIFIED_WHO_MAY_ACT"
+    assert auth.http_status == 403
+    assert auth.receipt["caller_identity_status"] == "UNVERIFIED"
 
 
 # ---------------------------------------------------------------------------
