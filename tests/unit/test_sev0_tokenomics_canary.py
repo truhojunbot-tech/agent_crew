@@ -6,6 +6,7 @@ re-dispatch a review for a commit a standing `request_changes` already
 describes. These tests hold that line — one task affected, everything else
 shadow, and `unset` as the whole rollback.
 """
+import contextlib
 import json
 
 import pytest
@@ -400,3 +401,158 @@ def test_armed_canary_still_pushes_when_the_sha_moved(monkeypatch, tmp_db):
     row = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
     assert row["canary_applied"] == 0
     assert row["canary_reason"] == "no_prior_verdict_on_this_sha"
+
+
+# ── C1: the completion-time refresh leaves canary_* alone ──────────────────
+
+_CANARY_COLUMNS = (
+    "canary_decision_source", "canary_recommendation_json", "canary_applied",
+    "canary_counterfactual", "canary_reason", "canary_cea_receipt_id",
+    "canary_resolved_at",
+)
+
+
+def test_refresh_shadow_after_commit_never_touches_a_canary_column(tmp_db):
+    """The direction that motivated separate columns: the canary writes at
+    dispatch, then the review completes and `_refresh_shadow_after_commit`
+    rewrites the `shadow_*` set. Had the canary shared those columns, its one
+    measurement would be erased microseconds after it was taken."""
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(_review("review-impl-5-r1", parent="impl-5", sha=SHA_A))
+    decision = canary.evaluate_review_dispatch(
+        _review("review-impl-5-r1", parent="impl-5", sha=SHA_A),
+        reviewed_sha=SHA_A, standing_lookup=_standing("request_changes"),
+        pin="impl-5")
+    queue.record_tokenomics_canary_receipt(
+        "review-impl-5-r1", decision_source=decision.decision_source,
+        recommendation=decision.recommendation(), applied=decision.applied,
+        counterfactual=decision.counterfactual, reason=decision.reason,
+        cea_receipt_id="cea-receipt-5")
+    before = queue.get_tokenomics_shadow_receipt("review-impl-5-r1")
+    assert before["canary_applied"] == 1 and before["shadow_resolved_at"] is None
+
+    queue.submit_result("review-impl-5-r1", TaskResult(
+        task_id="review-impl-5-r1", status="completed", summary="reviewed",
+        verdict="request_changes", findings=["f1"], pr_number=7))
+    # and once more directly, so a refresh that runs twice is covered too
+    queue._refresh_shadow_after_commit("review-impl-5-r1", "completed")
+
+    after = queue.get_tokenomics_shadow_receipt("review-impl-5-r1")
+    assert after["shadow_resolved_at"] is not None, (
+        "the refresh never ran — this test would prove nothing")
+    for column in _CANARY_COLUMNS:
+        assert after[column] == before[column], column
+        assert type(after[column]) is type(before[column]), column
+
+
+# ── C2: the `_dispatch_task` copy of the gate ──────────────────────────────
+
+class _RecordingExitStack(contextlib.ExitStack):
+    instances = []
+
+    def __init__(self):
+        super().__init__()
+        self.closed = False
+        _RecordingExitStack.instances.append(self)
+
+    def close(self):
+        self.closed = True
+        super().close()
+
+
+def _dispatch_review(tmp_path, monkeypatch, *, pin):
+    """Drive `app.state.dispatch_task` — the dispatcher path, not `_try_push_next`."""
+    import asyncio
+    import types
+
+    from fastapi.testclient import TestClient
+
+    from agent_crew import server as sv
+
+    spawned = []
+
+    async def _fake_exec(*cmd, **kwargs):
+        spawned.append(list(cmd))
+
+        class _P:
+            returncode, pid = 0, 1
+
+            async def wait(self):
+                return 0
+
+            async def communicate(self, *a, **k):
+                return b"", b""
+        return _P()
+
+    wt = tmp_path / "codex-wt"
+    wt.mkdir()
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"port": 9999, "worktrees": {"codex": str(wt)}}))
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_BASE", str(tmp_path / "lockbase"))
+    monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
+    monkeypatch.setattr(sv, "_WORKTREE_SYNC_DISABLED", False)
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task", lambda *a, **k: SHA_A)
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
+    if pin is None:
+        monkeypatch.delenv(canary.CANARY_ENV, raising=False)
+    else:
+        monkeypatch.setenv(canary.CANARY_ENV, pin)
+
+    _RecordingExitStack.instances = []
+    proxy = types.SimpleNamespace(
+        **{k: getattr(contextlib, k) for k in dir(contextlib) if not k.startswith("__")})
+    proxy.ExitStack = _RecordingExitStack
+    monkeypatch.setattr(sv, "contextlib", proxy)
+
+    db = str(tmp_path / "tasks.db")
+    _seed_standing_request_changes(db)
+    app = sv.create_app(db_path=db, pane_map={}, port=9999, state_path=str(state),
+                        project="demo", watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        queue = TaskQueue(db)
+        queue.enqueue(TaskRequest(
+            task_id="review-impl-77-r1", task_type="review",
+            description="Review PR #7 for task impl-77.", branch="feat/x",
+            context={"prev_task_id": "impl-77", "pr_number": 7, "reviewed_sha": SHA_A}))
+        task = queue.dequeue(role="reviewer")
+        assert task is not None and task.task_id == "review-impl-77-r1"
+        _RecordingExitStack.instances = []
+        asyncio.run(app.state.dispatch_task(task, "reviewer"))
+        row = {t.task_id: t for t in queue.list_tasks()}["review-impl-77-r1"]
+        receipt = queue.get_tokenomics_shadow_receipt("review-impl-77-r1")
+        result = queue.get_result("review-impl-77-r1")
+    return spawned, row, receipt, result, list(_RecordingExitStack.instances), wt
+
+
+def test_dispatcher_path_suppresses_the_pinned_rereview_and_releases_the_lock(
+        tmp_path, monkeypatch):
+    spawned, row, receipt, result, stacks, wt = _dispatch_review(
+        tmp_path, monkeypatch, pin="impl-77")
+
+    assert spawned == [], "a provider was launched on an unchanged sha"
+    assert row.status == "blocked", row.status
+    assert result is not None and result.summary == canary.SUPPRESSED_REASON
+    assert receipt["canary_applied"] == 1
+    assert receipt["canary_reason"] == "standing_request_changes_on_identical_sha"
+
+    # the gate's early return must close `_lock_stack` — no leaked lock
+    assert len(stacks) == 1, f"expected one _lock_stack, saw {len(stacks)}"
+    assert stacks[0].closed, "_lock_stack left open on the suppression return"
+    assert not stacks[0]._exit_callbacks, "a lock is still registered"
+
+    from agent_crew.server import test_stage_lock
+    with test_stage_lock(str(wt)) as acquired:
+        assert acquired, "the worktree lock is still held after suppression"
+
+
+def test_dispatcher_path_dispatches_an_unpinned_rereview_normally(
+        tmp_path, monkeypatch):
+    spawned, row, receipt, result, stacks, wt = _dispatch_review(
+        tmp_path, monkeypatch, pin=None)
+
+    assert len(spawned) == 1, "the unpinned review was not dispatched"
+    assert row.status != "blocked", row.status
+    assert receipt["canary_applied"] == 0
+    assert receipt["canary_reason"] == "condition_holds_canary_unarmed"
+    assert all(s.closed for s in stacks), "_lock_stack left open after dispatch"
