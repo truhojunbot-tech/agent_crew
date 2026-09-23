@@ -2661,6 +2661,17 @@ def create_app(
                 logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
                 return
 
+        # ⭐override 까지 해석한 **최종 pane** 이 이미 바쁘면 되돌린다.
+        #   잠금 키는 task_type 이 아니라 실행 자원(pane)이다 — 같은 pane 에
+        #   두 task 를 밀어넣지 않는다(test_u_sp02 가 이 줄을 지킨다).
+        if pane_id in _panes_with_in_progress(exclude_task_id=task.task_id):
+            logger.debug(
+                f"_try_push_next: pane {pane_id} is busy — requeueing {task.task_id} "
+                f"(role={role}, task_type={task.task_type})"
+            )
+            q().requeue(task.task_id)
+            return
+
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
             wt_path = worktree_map.get(role)
