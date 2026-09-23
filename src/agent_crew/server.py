@@ -1751,6 +1751,112 @@ def _pane_has_bash_prompt(pane_id: str) -> bool:
 #: Foreground commands that mean the agent CLI exited (#195 crash signature).
 _DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
 
+#: Executable names of the agent CLIs a task block may be pushed into (G_DT).
+#: Matched against argv[0] — or argv[1] under an interpreter, because the
+#: codex/gemini CLIs run as `node <path>/codex` and the claude quota wrapper as
+#: `python3 <path>/claude`.
+_AGENT_CLI_NAMES = frozenset({"claude", "codex", "gemini", "agy"})
+#: The native claude binary is `~/.local/share/claude/versions/<semver>`, so
+#: tmux reports `#{pane_current_command}` as e.g. `2.1.185`.
+_CLAUDE_NATIVE_BINARY = re.compile(r"/claude/versions/[^/]+$")
+_INTERPRETER_NAME = re.compile(r"^(python[0-9.]*|node|bun|deno)$")
+#: `crew-log-viewer` (#182) — the process owned panes run in dispatcher mode.
+_LOG_VIEWER_NAMES = frozenset({"crew-log-viewer"})
+_LOG_VIEWER_MODULE = "agent_crew.log_viewer"
+
+
+def _process_identity(args: str) -> str:
+    """``agent`` | ``log_viewer`` | ``""`` for one process command line."""
+    argv = args.split()
+    if not argv:
+        return ""
+    names = [argv[0]]
+    if _INTERPRETER_NAME.match(os.path.basename(argv[0])):
+        if argv[1:3] == ["-m", _LOG_VIEWER_MODULE]:
+            return "log_viewer"
+        if len(argv) > 1:
+            names.append(argv[1])
+    for name in names:
+        base = os.path.basename(name)
+        if base in _LOG_VIEWER_NAMES:
+            return "log_viewer"
+        if base in _AGENT_CLI_NAMES or _CLAUDE_NATIVE_BINARY.search(name):
+            return "agent"
+    return ""
+
+
+def _pane_process_kind(pane_id: str) -> tuple[str, str]:
+    """Classify what a tmux push into ``pane_id`` would land in (G_DT).
+
+    Returns ``(verdict, detail)``; ``verdict`` is one of
+
+    * ``agent`` — an agent CLI runs in the pane's process tree;
+    * ``log_viewer`` — ``crew-log-viewer`` does (dispatcher-mode owned pane);
+    * ``shell`` — only a shell is left (the #195 crash signature);
+    * ``unknown`` — anything else, including a probe that failed.
+
+    Only ``agent`` may receive a push. The caller fails closed on the rest:
+    a task block typed into a log viewer or a bare shell is not delivered —
+    it is lost, or executed as shell input.
+
+    The whole process tree is read, not just ``#{pane_current_command}``:
+    that name alone is ambiguous — ``python3`` is both the log viewer and the
+    claude quota wrapper, ``node`` is codex, gemini, or an unrelated tool.
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p",
+             "#{pane_pid}\t#{pane_current_command}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001 — a probe failure refuses, never raises
+        return "unknown", f"tmux_probe_error:{type(exc).__name__}"
+    if r.returncode != 0:
+        return "unknown", "tmux_probe_failed"
+    pane_pid, _, current = r.stdout.strip().partition("\t")
+    if not pane_pid.isdigit():
+        return "unknown", "pane_pid_unavailable"
+    try:
+        ps = subprocess.run(
+            ["ps", "-e", "-o", "pid=,ppid=,args="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", f"ps_error:{type(exc).__name__}"
+    if ps.returncode != 0:
+        return "unknown", "ps_failed"
+    children: dict[str, list[str]] = {}
+    args_by_pid: dict[str, str] = {}
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        pid, ppid = parts[0], parts[1]
+        args_by_pid[pid] = parts[2] if len(parts) > 2 else ""
+        children.setdefault(ppid, []).append(pid)
+    if pane_pid not in args_by_pid:
+        return "unknown", f"pane_pid_{pane_pid}_not_running"
+    kinds: set[str] = set()
+    stack, seen = [pane_pid], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        kind = _process_identity(args_by_pid.get(pid, ""))
+        if kind:
+            kinds.add(kind)
+        stack.extend(children.get(pid, []))
+    detail = f"current_command={current or '?'}"
+    # A log viewer anywhere in the tree wins over an agent: ambiguity refuses.
+    if "log_viewer" in kinds:
+        return "log_viewer", detail
+    if "agent" in kinds:
+        return "agent", detail
+    if current in _DEAD_PANE_COMMANDS:
+        return "shell", detail
+    return "unknown", detail
+
 
 def _pane_liveness(pane_id: str) -> str:
     """``alive`` | ``dead`` | ``unknown`` for the process in ``pane_id`` (#231).
@@ -2368,6 +2474,8 @@ def create_app(
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
+    #: G_DT: tmux pushes refused because the pane runs no agent, by verdict.
+    delivery_guard_refusals: dict[str, int] = {}
 
     def _requeue_orphans() -> None:
         """On startup, reset in_progress tasks to pending and clean their worktrees.
@@ -2484,8 +2592,42 @@ def create_app(
             return False
         return True
 
-    def _guard_tmx_push(task_id: str, target: str) -> str:
-        """Return a live, project-owned pane id or refuse the dispatch."""
+    def _guard_agent_process(task_id: str, target: str, pane_id: str, *,
+                             requeue: bool) -> bool:
+        """Refuse a push into an owned pane that is not running an agent CLI (G_DT).
+
+        #373 answers "is this pane ours?", not "is anything there to read the
+        block?". With AGENT_CREW_DELIVERY=both (the default) and the
+        dispatcher on, owned panes run `crew-log-viewer`, and a push typed
+        there is lost. Fail-closed: only a recognised agent is pushed to.
+
+        The task is requeued, never failed: under the dispatcher it is still
+        deliverable, and the refusal is about this pane, not the task.
+        ``requeue=False`` is for callers holding a task that is already
+        running elsewhere (watchdog reminders).
+        """
+        verdict, detail = _pane_process_kind(pane_id)
+        if verdict == "agent":
+            return True
+        reason = f"pane_not_agent_{verdict}"
+        delivery_guard_refusals[reason] = delivery_guard_refusals.get(reason, 0) + 1
+        logger.warning(
+            "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=%s "
+            "detail=%s refusals=%d delivery=%s",
+            task_id, target, pane_id, reason, detail,
+            delivery_guard_refusals[reason], _delivery_raw,
+        )
+        if requeue:
+            q().requeue(task_id)
+        return False
+
+    def _guard_tmx_push(task_id: str, target: str, *, require_agent: bool = True) -> str:
+        """Return a live, project-owned pane id or refuse the dispatch.
+
+        ``require_agent=False`` is only for callers that inspect a pane rather
+        than type into it (the watchdog's busy/timeout probe): refusing those
+        would stop a task in a crashed pane from ever timing out.
+        """
         if not _guard_task_existence(task_id, target):
             return ""
         pane_id = _resolve_tmux_pane_target(target)
@@ -2526,11 +2668,14 @@ def create_app(
             )
             q().requeue(task_id)
             return ""
+        if require_agent and not _guard_agent_process(task_id, target, pane_id, requeue=True):
+            return ""
         return pane_id
 
     # Expose the exact push boundary for state-backed guard tests; production
     # dispatch still reaches it only through _try_push_next/_try_push_discuss.
     app.state.guard_tmx_push = _guard_tmx_push
+    app.state.delivery_guard_refusals = delivery_guard_refusals
 
     def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
                               caller: str) -> None:
@@ -2919,7 +3064,7 @@ def create_app(
             # Every watchdog tmux interaction, including permission dismissal
             # and timeout Ctrl+C, must use the same live ownership boundary as
             # task delivery. Never inspect or interrupt a foreign pane.
-            guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+            guarded_pane_id = _guard_tmx_push(task_id, pane_id, require_agent=False)
             if not guarded_pane_id:
                 continue
             pane_id = guarded_pane_id
@@ -3047,7 +3192,7 @@ def create_app(
                                     f"watchdog: failed to push next task for role {role}"
                                 )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
-                guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+                guarded_pane_id = _guard_tmx_push(task_id, pane_id, require_agent=False)
                 if not guarded_pane_id:
                     continue
                 pane_id = guarded_pane_id
@@ -3066,6 +3211,10 @@ def create_app(
                         )
                     except Exception:
                         logger.warning(f"watchdog: failed to send Ctrl+C to {pane_id}")
+                elif not _guard_agent_process(task_id, pane_id, pane_id, requeue=False):
+                    # G_DT: the reminder is a push too, but this task is
+                    # already running; refuse the text, leave the task alone.
+                    continue
                 else:
                     try:
                         push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
@@ -4687,6 +4836,9 @@ def create_app(
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,
+            # G_DT: pushes refused because the target pane runs no agent CLI.
+            "delivery_guard": {"delivery": _delivery_raw,
+                               "refusals": dict(delivery_guard_refusals)},
             "build": {
                 "commit": snap["commit"],
                 "commit_short": snap["commit_short"],

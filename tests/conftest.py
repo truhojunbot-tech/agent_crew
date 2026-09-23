@@ -421,6 +421,38 @@ def _mock_pane_alive_for_push(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _mock_pane_process_kind(request):
+    """Default the G_DT pane-process probe to "an agent is running".
+
+    Fixture pane ids are not real panes, so the real probe would fail closed
+    and refuse every push. Tests of the guard itself opt out with
+    `@pytest.mark.real_pane_process_kind` or monkeypatch the probe.
+    """
+    if "real_pane_process_kind" in request.keywords:
+        yield
+        return
+    with patch("agent_crew.server._pane_process_kind",
+               return_value=("agent", "current_command=claude")):
+        yield
+
+
+@pytest.fixture(autouse=True)
+def _mock_pane_process_kind(request):
+    """Default the G_DT pane-process probe to "an agent is running".
+
+    Fixture pane ids are not real panes, so the real probe would fail closed
+    and refuse every push. Tests of the guard itself opt out with
+    `@pytest.mark.real_pane_process_kind` or monkeypatch the probe.
+    """
+    if "real_pane_process_kind" in request.keywords:
+        yield
+        return
+    with patch("agent_crew.server._pane_process_kind",
+               return_value=("agent", "current_command=claude")):
+        yield
+
+
 @pytest.fixture
 def tmux_injections():
     """Every pane write the suite attempted, as argv tuples."""
