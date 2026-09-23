@@ -162,6 +162,13 @@ class CurrentInputs:
     already_dispatched: bool = False              # P6 DRAINING: execute only what was already dispatched
     max_receipt_age_seconds: float = O18_MAX_RECEIPT_AGE_SECONDS
     snapshot_max_age_seconds: float = O20_SNAPSHOT_MAX_AGE_SECONDS
+    # ── verifier evidence (P2a: VERIFIED is the broker's/engine's word, not the
+    #    caller's). The receipt is caller-controlled data at every one of the five
+    #    points, so its own ``signature.status`` and ``*_status`` fields are
+    #    claims, not findings. These two carry what a *trusted verifier* produced.
+    signature_verification: Optional[bool] = None  # engine.verify()/broker result; None = nobody checked
+    attested_identities: tuple[str, ...] = ()     # claims a verifier proved:
+                                                  # "executor_binding", "caller_identity"
 
 
 # P6 enforcement matrix, verbatim. Value is the outcome when the *current*
@@ -219,6 +226,32 @@ def _identity_dependent(receipt: dict) -> bool:
             and not reuse.get("approver_identity_verified"):
         return True
     return False
+
+
+ATTESTABLE_IDENTITIES = ("executor_binding", "caller_identity")
+"""The identity claims a verifier can attest to, each naming the receipt field
+minus its ``_status`` suffix."""
+
+
+def _verified_signature(receipt: dict, cur: "CurrentInputs") -> bool:
+    """Is the signature VERIFIED *as a finding*, not as a claim?
+
+    Both have to agree: the receipt says VERIFIED **and** a verifier the runtime
+    trusts (``engine.verify()``, or a broker attestation) said so in
+    ``CurrentInputs``. Either one alone is a caller assertion about itself.
+    """
+    claimed = (receipt.get("signature") or {}).get("status") == "VERIFIED"
+    return claimed and cur.signature_verification is True
+
+
+def _verified_identity(receipt: dict, cur: "CurrentInputs", field: str) -> bool:
+    """P2a: ``VERIFIED`` on an identity binding is reserved for broker/engine.
+
+    A receipt asserting ``executor_binding_status: VERIFIED`` proves nothing —
+    the forged receipt in the review of 10153bf asserted all three. The status
+    counts only when a verifier attested to that same field.
+    """
+    return receipt.get(f"{field}_status") == "VERIFIED" and field in tuple(cur.attested_identities)
 
 
 def _parse_rfc3339(value: str) -> Optional[float]:
@@ -285,7 +318,9 @@ def validate(receipt, point, current: Optional[CurrentInputs] = None) -> Validat
     2. **Lifecycle state** — terminal receipts never re-enter (P4 replay refusal).
     3. **Signature / P2a** — an unverified signature is admissible only where the
        ADR says it is; an identity-dependent ALLOW under an unverified binding is
-       exactly what P2a forbids.
+       exactly what P2a forbids. "Verified" means *a verifier said so*
+       (``CurrentInputs.signature_verification`` / ``attested_identities``); the
+       receipt's own status fields are only the caller's claim about itself.
     4. **Verdict** — BLOCK/HUMAN_GATE receipts do not authorise anything.
     5. **Nonce** — reuse is a tamper signal and outranks every deferrable outcome.
     6. **P7** — if B′ could not be computed, fail closed at admission and hold
@@ -328,15 +363,29 @@ def validate(receipt, point, current: Optional[CurrentInputs] = None) -> Validat
         return _result(point, ValidationOutcome.BLOCK, "RECEIPT_STATE_INVALID",
                        f"state {state} is not one of {allowed_states} at {point.value}", receipt_id=rid)
 
-    # 3. signature status and the P2a rules
+    # 3. signature status and the P2a rules.
+    #
+    # ⛔The receipt is caller-controlled data at all five points. Its own
+    #   ``signature.status`` / ``*_status`` fields are *claims*; what counts is
+    #   what a trusted verifier produced, which arrives in CurrentInputs. Before
+    #   this, a receipt forged with every status set to VERIFIED, an arbitrary
+    #   signature value, required_reviewer=codex and decision=ALLOW returned
+    #   PROCEED — P2a was being enforced against the attacker's own answer
+    #   (codex review of 10153bf, P1 #4).
     sig_status = (receipt.get("signature") or {}).get("status")
-    if sig_status != "VERIFIED":
+    if not _verified_signature(receipt, cur):
+        if sig_status == "VERIFIED":
+            return _result(point, ValidationOutcome.BLOCK, "SIGNATURE_UNVERIFIED_AT_BOUNDARY",
+                           "signature.status says VERIFIED but no verifier did; P2a reserves "
+                           "VERIFIED for the broker/engine, so the claim is treated as UNVERIFIED "
+                           "— and an UNVERIFIED receipt must carry a downgrade_reason (§3)",
+                           receipt_id=rid)
         if not receipt.get("downgrade_reason"):
             return _result(point, ValidationOutcome.BLOCK, "RECEIPT_UNSIGNED",
                            "signature.status is UNVERIFIED with no downgrade_reason; §3 integrity "
                            "requires the receipt to state why it is unverified", receipt_id=rid)
-    unverified_identity = (receipt.get("executor_binding_status") != "VERIFIED"
-                           or receipt.get("caller_identity_status") != "VERIFIED")
+    unverified_identity = not (_verified_identity(receipt, cur, "executor_binding")
+                               and _verified_identity(receipt, cur, "caller_identity"))
     if unverified_identity and receipt.get("decision") == "ALLOW" and _identity_dependent(receipt):
         return _result(point, ValidationOutcome.BLOCK, "IDENTITY_DEPENDENT_ALLOW_UNVERIFIED",
                        "P2a: an identity-dependent decision may not be ALLOW while "

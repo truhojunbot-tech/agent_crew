@@ -47,7 +47,7 @@ from agent_crew.cea.receipt import (
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
 from agent_crew.cea.schema import SCHEMA_BLOB, SCHEMA_PATH, SCHEMA_SOURCE, validate_receipt
 from agent_crew.cea.validator import (
-    ContractReceiptValidator, CurrentInputs, O18_IMMEDIATE_INVALIDATION_FIELDS,
+    ATTESTABLE_IDENTITIES, ContractReceiptValidator, CurrentInputs, O18_IMMEDIATE_INVALIDATION_FIELDS,
     O18_MAX_RECEIPT_AGE_SECONDS, O20_SNAPSHOT_MAX_AGE_SECONDS, ReceiptValidator,
     ValidationOutcome, ValidationPoint, ValidationResult, validate)
 
@@ -74,7 +74,8 @@ __all__ = [
     # schema (the frozen contract)
     "SCHEMA_BLOB", "SCHEMA_PATH", "SCHEMA_SOURCE", "validate_receipt",
     # validator
-    "ContractReceiptValidator", "CurrentInputs", "O18_IMMEDIATE_INVALIDATION_FIELDS",
+    "ATTESTABLE_IDENTITIES", "ContractReceiptValidator", "CurrentInputs",
+    "O18_IMMEDIATE_INVALIDATION_FIELDS",
     "O18_MAX_RECEIPT_AGE_SECONDS", "O20_SNAPSHOT_MAX_AGE_SECONDS", "ReceiptValidator",
     "ValidationOutcome", "ValidationPoint", "ValidationResult", "validate",
 ]
