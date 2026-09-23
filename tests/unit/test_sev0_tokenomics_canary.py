@@ -628,6 +628,26 @@ def test_failed_canary_promotion_rolls_back_suppression_and_dispatches(monkeypat
         conn.close()
 
 
+def test_atomic_suppression_never_overwrites_an_already_completed_review(tmp_db):
+    queue = TaskQueue(tmp_db)
+    task = _review("review-impl-race-r1", parent="impl-race", sha=SHA_A)
+    queue.enqueue(task)
+    queue.submit_result(task.task_id, TaskResult(
+        task_id=task.task_id, status="completed", summary="reviewed for real",
+        verdict="approve", findings=[], pr_number=7,
+    ))
+    assert not queue.suppress_review_atomically(
+        task.task_id, TaskResult(
+            task_id=task.task_id, status="completed", summary=canary.SUPPRESSED_REASON,
+            verdict="request_changes", findings=[], pr_number=7,
+        ), decision_source="test", recommendation={"applied": True},
+        counterfactual="would dispatch", reason="test",
+    )
+    result = queue.get_result(task.task_id)
+    assert result.summary == "reviewed for real"
+    assert result.verdict == "approve"
+
+
 def test_post_commit_side_effect_failure_cannot_unsuppress(monkeypatch, tmp_db):
     from fastapi.testclient import TestClient
     from agent_crew import server as sv

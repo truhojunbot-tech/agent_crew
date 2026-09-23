@@ -56,6 +56,9 @@ class AdmissionRefused(Exception):
         super().__init__(f"{gate.point.value} refused: {gate.reason}")
 
 
+ResultBeforeCommit = Callable[[sqlite3.Connection, object, float], None]
+
+
 #: queue ``task_type`` → P4 ``work_class``. ⛔Unknown types map to ``implement``,
 #: the strictest row of ``REVIEW_FLOOR`` — a work class nobody declared must not
 #: be the one that needs neither reviewer nor tester. §7 (step 2b) replaces this
@@ -3022,8 +3025,9 @@ class TaskQueue:
     def submit_result(self, task_id: str, result: TaskResult, *,
                       nonce: Optional[str] = None,
                       presenter: Optional[str] = None,
-                      before_commit: Optional[Callable] = None,
-                      consume_receipt: bool = True) -> str:
+                      before_commit: Optional[ResultBeforeCommit] = None,
+                      consume_receipt: bool = True,
+                      expected_status: Optional[str] = None) -> str:
         """Submit a task result. Returns the task_type of the completed task
         (so push-model callers can decide what to push next).
 
@@ -3037,8 +3041,16 @@ class TaskQueue:
           reading of the contract and the reason ``enforce`` must not be turned
           on before 2b lands. Under ``shadow`` the answer is recorded on the
           row (``context.cea_result``) and the result is accepted, which is the
-          measurement we are here to take. What it must never be is a gate that
-          reports PROCEED because nobody presented anything.
+        measurement we are here to take. What it must never be is a gate that
+        reports PROCEED because nobody presented anything.
+
+        ``expected_status`` is an in-transaction compare-and-set guard; a
+        caller can refuse to overwrite a concurrently terminal result.
+        ``before_commit`` runs after all normal result writes but before their
+        commit, so companion evidence can be atomic with the result.  Set
+        ``consume_receipt=False`` only for a terminal result that truthfully
+        withdraws authorization (such as a canary suppression) rather than
+        spending an executor invocation.
         """
         conn = self._connect()
         try:
@@ -3057,6 +3069,11 @@ class TaskQueue:
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
+            if expected_status is not None and row["status"] != expected_status:
+                conn.execute("ROLLBACK")
+                raise RuntimeError(
+                    f"task {task_id!r} status is {row['status']!r}, expected {expected_status!r}"
+                )
             task_type = row["task_type"]
             self._last_previous_status = row["status"]
             # ── P2 RESULT call site ──────────────────────────────────────
@@ -5093,7 +5110,7 @@ class TaskQueue:
             )
         try:
             self.submit_result(task_id, result, before_commit=_promote,
-                               consume_receipt=False)
+                               consume_receipt=False, expected_status="in_progress")
             return True
         except Exception:
             logger.exception("tokenomics canary: atomic suppression failed for %s", task_id)
