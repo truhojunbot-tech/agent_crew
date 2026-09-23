@@ -228,3 +228,39 @@ def test_a_provider_that_raises_becomes_a_named_unavailable_input(conn, kw, name
     assert auth.receipt["reason"]["code"] == "INPUTS_UNAVAILABLE"
     assert named in " ".join(auth.receipt["provenance"]["unavailable_inputs"])
     assert validate_receipt(auth.receipt) == []
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 #4 — a signing key is not an authentication key (engine.py:526-534,572-577)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _keyed_config(tmp_path) -> EngineConfig:
+    key = tmp_path / "engine.key"
+    key.write_bytes(b"k" * 32)
+    key.chmod(0o600)
+    return EngineConfig(mode="enforce", key_path=str(key))
+
+
+def test_a_keyed_engine_does_not_promote_a_caller_supplied_verified_status(conn, tmp_path):
+    """codex P1 #4, verbatim: supplying any engine signing key promoted
+    `caller.identity_status` straight from the request, so a keyed engine with a
+    caller-created VERIFIED Caller emitted caller_identity_status=VERIFIED."""
+    forged = Caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON,
+                    identity_status=IdentityStatus.VERIFIED, credential_kind="adapter_token")
+    eng = engine(config=_keyed_config(tmp_path))
+    auth = eng.authorize(conn, intent("keyed-1"), forged)
+    assert auth.receipt["caller_identity_status"] == "UNVERIFIED"
+    assert auth.receipt["executor_binding_status"] == "UNVERIFIED"
+    assert auth.receipt["downgrade_reason"] == "SHARED_UID_NO_CREDENTIAL_BOUNDARY"
+    # the key still does the one job it has: the receipt is signed and verifies
+    assert auth.receipt["signature"]["status"] == "VERIFIED" and eng.verify(auth.receipt)
+
+
+def test_the_key_does_not_change_the_verdict_either(conn, tmp_path):
+    """An implement intent is REVIEW under an UNVERIFIED binding whether or not a
+    signing key exists — otherwise 'configure a key' would be a way to buy ALLOW."""
+    unkeyed = engine().authorize(conn, intent("keyed-2a"), caller())
+    keyed = engine(config=_keyed_config(tmp_path)).authorize(
+        conn, intent("keyed-2b", ident=identity(anchors=("src/keyed.py",))), caller())
+    assert unkeyed.decision == keyed.decision == "REVIEW"
+    assert keyed.receipt["reason"]["code"] == "IDENTITY_UNVERIFIED_REVIEW_REQUIRED"

@@ -596,12 +596,21 @@ class AuthorizationEngine:
                budget, gate, executor, reviewer, tester, reuse, unavailable) -> dict:
         matched = _matched(registry)
         binding = self._binding(snapshot, registry, runtime, budget, gate, matched)
-        signed_by_key = self._key is not None
 
-        # P2a. The engine key is what makes a status meaningful at all: with no
-        # key there is no boundary to report, so both statuses degrade regardless
-        # of what the adapter asserted about the caller.
-        caller_status = (caller.identity_status if signed_by_key else IdentityStatus.UNVERIFIED)
+        # P2a. ⛔The engine's *receipt-signing* key has nothing to say about who
+        #   the caller is. It said so before this fix: with any key configured,
+        #   `caller.identity_status` was copied through from the request, so a
+        #   keyed engine handed a caller-created VERIFIED Caller a receipt
+        #   reading `caller_identity_status: VERIFIED` (codex P1 #4). Signing
+        #   proves the engine wrote the receipt. It does not authenticate a
+        #   shared-uid caller, and conflating the two is how a receipt starts
+        #   asserting an identity nobody checked.
+        #
+        #   VERIFIED is reserved for the O21b broker's spawn/registration path,
+        #   which does not exist yet — so in this build both statuses are always
+        #   UNVERIFIED, and `_broker_verified` is the single place that will
+        #   change when the broker lands.
+        caller_status = _broker_verified(caller)
         executor_status = IdentityStatus.UNVERIFIED
         degraded = (caller_status is not IdentityStatus.VERIFIED
                     or executor_status is not IdentityStatus.VERIFIED)
@@ -832,6 +841,21 @@ def _is_identity_dependent(reviewer, gate_name, reuse) -> bool:
             and not reuse.approver_identity_verified:
         return True
     return False
+
+
+def _broker_verified(caller: Caller) -> IdentityStatus:
+    """P2a: VERIFIED only from independently verified broker evidence (O21b).
+
+    Two conditions, both required, neither satisfiable by anything a caller
+    sends: the credential must be the broker's registration kind, and only
+    :mod:`agent_crew.cea.auth` issues credential kinds. A token file is
+    tamper-evident under one uid, which is not the same claim.
+    """
+    from agent_crew.cea.auth import CREDENTIAL_KIND_BROKER
+    if (getattr(caller, "credential_kind", None) == CREDENTIAL_KIND_BROKER
+            and caller.identity_status is IdentityStatus.VERIFIED):
+        return IdentityStatus.VERIFIED
+    return IdentityStatus.UNVERIFIED
 
 
 def _signature_name(status) -> str:
