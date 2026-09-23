@@ -360,7 +360,11 @@ class TestRuntimeStateTransitions:
         ("DRAINING", "STOPPED", "runtime", None, True),              # tighten (in-flight = 0)
         ("DRAINING", "ACTIVE", "operator:alfred", None, True),       # the principal that set it
         ("DRAINING", "ACTIVE", "operator:someone-else", None, False),
-        ("DRAINING", "ACTIVE", "owner", None, True),
+        # An "owner" that names no decision record is a string, not the owner: after
+        # the s1-fix re-review every loosening claim is verified against the signed
+        # snapshot, and DRAINING is not exempt from that just because it is mild.
+        ("DRAINING", "ACTIVE", "owner", None, False),
+        ("DRAINING", "ACTIVE", "owner", "D-51-9", True),
         ("QUARANTINED", "ACTIVE", "operator:alfred", "D-1", False),  # owner only
         ("QUARANTINED", "ACTIVE", "owner", None, False),             # owner, but no T0 record
         ("QUARANTINED", "ACTIVE", "owner", "D-51-9", True),

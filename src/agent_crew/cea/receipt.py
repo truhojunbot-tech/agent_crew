@@ -91,6 +91,24 @@ class DecisionRev:
     ``{decision_id, body_hash}`` pair — because it is an input to admission, not
     a field of the binding.
     """
+    principals: tuple[str, ...] = ()
+    """The principals this record authorises, as the **snapshot** names them.
+
+    P6 loosening asks "may this principal loosen the runtime now?", and the
+    answer may not come from the requester. ``who="owner:anyone"`` satisfied a
+    prefix test and nothing else, so the string a caller typed was the authority
+    (codex re-review of the s1-fix, P1 #1). A principal is authorised only if a
+    signed record says so, which is here. Snapshot-only, for the same reason
+    ``supersedes`` is.
+    """
+    build_commits: tuple[str, ...] = ()
+    """The build commits this record is a decision *about* (the containment-build
+    check). A decision to lift containment is a decision about the build that was
+    contained; replaying it against a later build re-authorises code nobody
+    reviewed under it. Empty ⇒ the record names no build ⇒ it cannot loosen."""
+    runtimes: tuple[str, ...] = ()
+    """The runtimes this record covers. Empty ⇒ covers none: a decision that does
+    not name the runtime it loosens is not a decision about this runtime."""
 
 
 @dataclass(frozen=True)

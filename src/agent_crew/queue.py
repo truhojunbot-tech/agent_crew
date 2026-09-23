@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from dataclasses import dataclass
 from typing import List, Optional
 
 from agent_crew.cea.store import ensure_schema as _cea_ensure_schema
@@ -495,6 +496,150 @@ class RuntimeTransitionRefused(Exception):
     more restrictive state.
     """
 
+
+# ── P6 loosening authority ────────────────────────────────────────────────────
+#
+# ⛔A string the caller chose is not authority.
+#
+#   `_is_owner()` matched the prefix `owner:`, and `_transition_refusal()` asked
+#   only that `decision_id` be non-empty. So this, from a STOPPED runtime:
+#
+#       set_stop_epoch(False, who="owner:attacker", decision_id="not-a-t0-record")
+#
+#   returned ACTIVE. Both fields came from the requester; neither was checked
+#   against anything. The requester was attesting to its own authority, which is
+#   the one thing P6 says it may not do (codex re-review of the s1-fix, P1 #1).
+#
+# Authority is now an *answer from a verifier*: the decision id must name a record
+# in the current **signed** policy snapshot, that record must name the requesting
+# principal, must cover this runtime, and must name the build commit the runtime
+# is running (the containment-build check). Anything less — including a snapshot
+# we cannot read or verify — is a refusal, because an authority we cannot verify
+# is not one (P7: unavailable inputs fail closed, and loosening is where that bites).
+
+
+_DEFAULT_RUNTIME_AUTHORITY = None
+"""Process-wide P6 loosening verifier, or ``None`` ⇒ :class:`RefuseAllLoosening`.
+
+Set once at startup by whoever *has* a verified snapshot reader (the server), so
+that every :class:`TaskQueue` opened in the process asks the same verifier. The
+initial value is the fail-closed one: a process that never wires a verifier
+refuses every loosening instead of falling back to trusting the requester."""
+
+
+def set_default_runtime_authority(authority) -> None:
+    """Wire the process-wide P6 loosening verifier. ``None`` restores fail-closed."""
+    global _DEFAULT_RUNTIME_AUTHORITY
+    _DEFAULT_RUNTIME_AUTHORITY = authority
+
+
+@dataclass(frozen=True)
+class LooseningVerdict:
+    """Why a loosening was granted or refused. ``reason`` is written to the event."""
+    granted: bool
+    reason: str
+
+
+class RefuseAllLoosening:
+    """The default authority: no verifier configured ⇒ nothing may loosen.
+
+    This is the fail-closed direction and it is deliberate. A runtime that cannot
+    check a decision record cannot tell an owner's resume from an attacker's, so
+    it refuses both and says so. Tightening is unaffected — it never asks.
+    """
+
+    def verify(self, *, frm: str, to: str, who: str,
+               decision_id: Optional[str]) -> LooseningVerdict:
+        return LooseningVerdict(
+            False,
+            f"{frm} → {to} needs a verified T0 decision record and this runtime has no "
+            f"authority verifier configured; a caller-supplied principal ({who!r}) and "
+            f"decision_id ({decision_id!r}) are claims, not authority (P6, P7)")
+
+
+class SnapshotLooseningAuthority:
+    """Verify a loosening against the current signed policy snapshot (P6, §5.3).
+
+    ``snapshots`` is a :class:`~agent_crew.cea.providers.PolicySnapshotProvider`;
+    ``build_commit`` is the commit this process is running (defaults to the frozen
+    build provenance, which is captured at startup and never recomputed).
+
+    All four conditions must hold, and each one exists because dropping it lets a
+    caller's own string back in as authority:
+
+    1. the snapshot is available and its signature **VALID** — an unverified
+       snapshot is an unavailable input, not a lenient one;
+    2. ``decision_id`` names a record in it, in scope for this runtime (T0 record
+       present) — not merely a non-empty string;
+    3. that record names ``who`` in ``principals`` — the requester does not
+       self-attest;
+    4. that record names the running build in ``build_commits`` — the containment
+       check. A decision to lift containment is a decision about the build that
+       was contained; a later build was never reviewed under it.
+    """
+
+    def __init__(self, snapshots, *, build_commit: Optional[str] = None, runtime: str = ""):
+        self._snapshots = snapshots
+        self._build_commit = build_commit
+        self._runtime = runtime
+
+    def _build(self) -> Optional[str]:
+        if self._build_commit is not None:
+            return self._build_commit
+        try:
+            from agent_crew import provenance
+            return provenance.build().get("commit") or None
+        except Exception:
+            return None            # unknown build ⇒ condition 4 cannot hold ⇒ refuse
+
+    def verify(self, *, frm: str, to: str, who: str,
+               decision_id: Optional[str]) -> LooseningVerdict:
+        from agent_crew.cea.providers import SignatureStatus
+
+        did = (decision_id or "").strip()
+        if not did:
+            return LooseningVerdict(False, f"{frm} → {to} requires a T0 decision_id (P6); none was given")
+        try:
+            snap = self._snapshots.current()
+        except Exception as exc:
+            return LooseningVerdict(False, f"policy snapshot unreadable ({exc!r}); loosening refused (P7)")
+        if snap is None or not getattr(snap, "available", False):
+            return LooseningVerdict(False, "policy snapshot unavailable; loosening refused (P7)")
+        if getattr(snap, "signature", None) is not SignatureStatus.VALID:
+            return LooseningVerdict(
+                False, f"policy snapshot signature is {getattr(snap, 'signature', None)}, not VALID; "
+                       f"an unverified snapshot is an unavailable input (P7)")
+
+        records = tuple(snap.in_scope or ()) or tuple(snap.decisions or ())
+        rec = next((r for r in records if r.decision_id == did), None)
+        if rec is None:
+            return LooseningVerdict(
+                False, f"decision_id {did!r} names no record in the signed snapshot "
+                       f"(generation {snap.generation}); a caller-supplied id is a nonce, not an "
+                       f"authorisation (P6)")
+        if who not in (rec.principals or ()):
+            return LooseningVerdict(
+                False, f"decision {did!r} does not authorise principal {who!r} "
+                       f"(it names {list(rec.principals or ())}); the requester does not self-attest (P6)")
+        if self._runtime and self._runtime not in (rec.runtimes or ()):
+            return LooseningVerdict(
+                False, f"decision {did!r} does not cover runtime {self._runtime!r} "
+                       f"(it names {list(rec.runtimes or ())})")
+        build = self._build()
+        if build is None:
+            return LooseningVerdict(
+                False, f"the running build commit is unknown, so the containment-build check on "
+                       f"decision {did!r} cannot be made; loosening refused (P7)")
+        if build not in (rec.build_commits or ()):
+            return LooseningVerdict(
+                False, f"decision {did!r} is about build(s) {list(rec.build_commits or ())}, not the "
+                       f"running build {build}; containment is lifted for the build it was decided "
+                       f"about, never for a later one (P6)")
+        return LooseningVerdict(
+            True, f"decision {did!r} in signed snapshot generation {snap.generation} authorises "
+                  f"{who!r} to move {frm} → {to} on build {build}")
+
+
 # #314 §3/§4: cascade outbox. result 저장과 **항상 같은 txn**에 기록되는 durable continuation
 # 레코드(result_json 전체). pause 여부와 무관하게 submit_result가 원자적으로 넣는다 → result 저장과
 # suppression 기록 사이 crash로 continuation을 잃는 B3-b를 제거. §4: pause-aware executor가 lease
@@ -660,9 +805,15 @@ def task_issue_number(task) -> Optional[int]:
 
 class TaskQueue:
     def __init__(self, db_path: str, *, telemetry_adapter: Optional[TaskTelemetryAdapter] = None,
-                 read_only: bool = False):
+                 read_only: bool = False, runtime_authority=None):
         self._db_path = db_path
         self._telemetry_adapter = telemetry_adapter or default_telemetry_adapter()
+        # P6: who may loosen this runtime. Fail-closed by default — a runtime with
+        # no verifier refuses every loosening rather than trusting the requester's
+        # own account of its authority. Wire a :class:`SnapshotLooseningAuthority`
+        # to grant them against the signed snapshot.
+        self._runtime_authority = (runtime_authority or _DEFAULT_RUNTIME_AUTHORITY
+                                   or RefuseAllLoosening())
         conn = self._connect()
         if read_only:
             # Status/reporting must not acquire schema/STOP authority merely
@@ -1017,7 +1168,14 @@ class TaskQueue:
         return a if _RUNTIME_TIGHTNESS.get(a, 3) >= _RUNTIME_TIGHTNESS.get(b, 3) else b
 
     @staticmethod
-    def _is_owner(who: str) -> bool:
+    def _looks_like_owner(who: str) -> bool:
+        """A *shape* test, never an authority test.
+
+        ⛔This used to be called ``_is_owner`` and was the only thing standing
+          between ``who="owner:attacker"`` and an ACTIVE runtime. It is kept as a
+          cheap early refusal for calls that do not even claim to be the owner;
+          the claim itself is decided by :attr:`_runtime_authority`.
+        """
         w = (who or "").strip().lower()
         return w == "owner" or w.startswith("owner:")
 
@@ -1036,22 +1194,42 @@ class TaskQueue:
         if _RUNTIME_TIGHTNESS[to] >= _RUNTIME_TIGHTNESS[frm]:
             return None
         if frm in ("QUARANTINED", "STOPPED"):
-            if not self._is_owner(who):
+            if not self._looks_like_owner(who):
                 return (f"{frm} → {to} is a loosening transition: owner only (P6). "
                         f"requester={who!r}")
-            if not (decision_id or "").strip():
-                return (f"{frm} → {to} requires a T0 owner decision_id naming runtime and build "
-                        f"commit (P6); none was given")
-            return None
+            return self._authority_refusal(frm, to, who, decision_id)
         if frm == "DRAINING":
             if quarantine_entry:
                 return ("DRAINING was entered via a quarantine trigger; it may not be loosened "
                         "without an owner decision (P6)")
-            if self._is_owner(who) or (entered_by and who == entered_by):
+            if entered_by and who == entered_by:
+                # P6 gives the principal that set DRAINING the right to undo its
+                # own drain. That is not the owner authority below and does not
+                # borrow it: it can only reverse a state that same principal
+                # chose, and a quarantine entry was already refused above.
                 return None
+            if self._looks_like_owner(who):
+                return self._authority_refusal(frm, to, who, decision_id)
             return (f"DRAINING → {to} may be made by the principal that set DRAINING "
                     f"({entered_by!r}) or the owner; requester={who!r}")
         return None
+
+    def _authority_refusal(self, frm: str, to: str, who: str,
+                           decision_id: Optional[str]) -> Optional[str]:
+        """Ask the verifier whether this owner claim is one. ``None`` = granted.
+
+        A verifier that raises is a verifier that did not grant. P7's fail
+        direction applies to loosening without exception: the one thing worse
+        than refusing a real owner is admitting a fake one.
+        """
+        try:
+            verdict = self._runtime_authority.verify(frm=frm, to=to, who=who, decision_id=decision_id)
+        except Exception as exc:
+            return (f"{frm} → {to}: the P6 authority verifier failed ({exc!r}); "
+                    f"loosening refused (P7)")
+        if getattr(verdict, "granted", False):
+            return None
+        return f"{frm} → {to}: {getattr(verdict, 'reason', 'loosening refused (P6)')}"
 
     def _last_draining_entry(self, conn) -> tuple[Optional[str], bool]:
         """Who put the runtime into DRAINING last, and whether a quarantine trigger did it."""
@@ -1474,9 +1652,34 @@ class TaskQueue:
             # *tighten* here — a higher pause.json generation that says paused wins,
             # but the row's own non-ACTIVE state (QUARANTINED/DRAINING, which
             # pause.json cannot express) is never lowered by it.
+            #
+            # ⛔Tighten-only has to mean STOPPED stays STOPPED as well.
+            #   The two lines that used to follow read:
+            #
+            #       if not win_paused and db["state"] == "STOPPED":
+            #           win_state = "ACTIVE"
+            #
+            #   so a pause.json file carrying a higher generation and `paused:
+            #   false` loosened a STOPPED runtime to ACTIVE at boot, with
+            #   `decision_id=None` and no principal at all — around the very
+            #   authority check `set_stop_epoch`/`resume_stop` were just made to
+            #   enforce (codex re-review of the s1-fix, P1 #1, second half). A file
+            #   on disk is a *signal*, not a decision record: it names no owner, no
+            #   T0 decision and no build. It may raise the drawbridge; it may not
+            #   lower it.
+            loosening_refused = None
             win_state = "STOPPED" if win_paused else db["state"]
             if not win_paused and db["state"] == "STOPPED":
-                win_state = "ACTIVE"
+                loosening_refused = (
+                    f"boot-reconcile REFUSED: pause.json (generation {pj_epoch}) is unpaused but the "
+                    f"row is STOPPED. pause.json may only tighten (P6): it carries no principal, no "
+                    f"T0 decision record and no build commit, so it cannot authorise a loosening. "
+                    f"Runtime stays STOPPED — resume via `resume_stop(who=..., decision_id=...)`.")
+                logger.critical(loosening_refused)
+                win_paused, win_state = True, "STOPPED"
+                win_epoch = db_epoch          # a refused signal does not get to set the generation
+                win_incident = db_incident
+                note = loosening_refused if note is None else f"{note} | {loosening_refused}"
             conn.execute(
                 "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state) "
                 "VALUES (1, ?, ?, ?, ?, ?, ?) "
@@ -1484,7 +1687,10 @@ class TaskQueue:
                 "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
                 "state=excluded.state",
                 (int(win_epoch), 1 if win_paused else 0, win_incident, note, time.time(), win_state))
-            if win_state != db["state"]:
+            if win_state != db["state"] or loosening_refused:
+                # A refusal is recorded too (frm == to). "The runtime declined to
+                # come back up and here is why" is exactly the thing an operator
+                # needs to find afterwards; a silent refusal reads as a hang.
                 self._record_runtime_event_on(conn, frm=db["state"], to=win_state,
                                               epoch=int(win_epoch), who="boot-reconcile",
                                               reason=note or "pause.json reconciled into the row",

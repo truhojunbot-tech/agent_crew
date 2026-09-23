@@ -525,3 +525,63 @@ def stub_agents(tmp_path):
         script.chmod(0o755)
         scripts[agent] = str(script)
     return scripts
+
+
+# ── P6 loosening authority for the suites ────────────────────────────────────
+#
+# A runtime with no verifier refuses every loosening (`RefuseAllLoosening`), which
+# is the fail-closed default and is tested directly in
+# `tests/unit/test_sev0_runtime_authority.py`. Suites that legitimately resume a
+# runtime need a *verifier that grants*, not a bypass — so they get a real
+# `SnapshotLooseningAuthority` over a signed fake snapshot carrying the decision
+# record they cite. The verification path under test is the production one; only
+# the snapshot is a fixture.
+
+TEST_BUILD_COMMIT = "b" * 40
+TEST_DECISION_ID = "D-51-9"
+TEST_OWNER_PRINCIPALS = ("owner", "owner:test", "owner:hojun", "owner:alfred", "owner:cli")
+
+
+def signed_snapshot(*, decision_ids=(TEST_DECISION_ID,), principals=TEST_OWNER_PRINCIPALS,
+                    build_commits=(TEST_BUILD_COMMIT,), runtimes=(), generation=7):
+    """A `PolicySnapshotProvider` whose snapshot verifies as VALID."""
+    from agent_crew.cea.providers import PolicySnapshotRef, SignatureStatus
+    from agent_crew.cea.receipt import DecisionRev
+
+    records = tuple(
+        DecisionRev(decision_id=d, body_hash="a" * 32, principals=tuple(principals),
+                    build_commits=tuple(build_commits), runtimes=tuple(runtimes))
+        for d in decision_ids)
+
+    class _Snapshots:
+        def current(self, intent=None):
+            return PolicySnapshotRef(generation=generation, hash="h" * 16, produced_at=None,
+                                     decisions=records, in_scope=records,
+                                     signature=SignatureStatus.VALID)
+
+    return _Snapshots()
+
+
+def granting_authority(**kw):
+    """The production verifier, pointed at a snapshot that does grant."""
+    from agent_crew.queue import SnapshotLooseningAuthority
+    build = kw.pop("build_commit", TEST_BUILD_COMMIT)
+    return SnapshotLooseningAuthority(signed_snapshot(**kw), build_commit=build)
+
+
+@pytest.fixture(autouse=True)
+def _p6_runtime_authority():
+    """Install the granting verifier for the duration of each test.
+
+    Autouse because 54 `TaskQueue(...)` call sites across the suites resume a
+    runtime as a *precondition* of what they actually test; without a verifier
+    every one of them would be refused, which would test the refusal 54 times and
+    the thing they are about zero times.
+    """
+    from agent_crew import queue as _queue
+
+    _queue.set_default_runtime_authority(granting_authority())
+    try:
+        yield
+    finally:
+        _queue.set_default_runtime_authority(None)
