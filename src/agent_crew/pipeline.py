@@ -451,13 +451,24 @@ def verify_review_artifact(task: TaskRequest, result: TaskResult) -> tuple[bool,
 
 
 def no_artifact_result(result: TaskResult, detail: str) -> TaskResult:
-    """Preserve the worker report while making the absent artifact terminal."""
+    """Preserve the worker report while making the absent artifact terminal.
+
+    ⛔``executor_binding`` rides along. This rebuilds the result field by field
+      instead of :func:`dataclasses.replace`, so every field it forgets is a
+      field the held result loses — and the nonce is the one the P2 RESULT gate
+      needs. Dropping it made ``/result`` answer 409 ``NONCE_MISSING`` under
+      enforcement, so the held row was never written and the artifact finding
+      the gate had just made was thrown away with it. Invisible until step 4i,
+      because until then RESULT read the process-wide mode and the projects
+      that enforce this gate were enforcing it alone.
+    """
     return TaskResult(
         task_id=result.task_id, status="failed",
         summary=f"[no_artifact] {detail}; worker summary: {result.summary}",
         verdict=result.verdict, findings=result.findings, pr_number=result.pr_number,
         branch=result.branch, commit=result.commit,
         error_info={"reason": "no_artifact", "detail": detail}, artifact=result.artifact,
+        executor_binding=result.executor_binding,
     )
 
 

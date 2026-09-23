@@ -284,3 +284,23 @@ def test_health_reports_the_legacy_row_count(tmp_path, monkeypatch):
     assert body["cea"]["legacy_rows"]["total"] == 1, body["cea"]
     assert body["cea"]["legacy_rows"]["by_status"] == {"pending": 1}
     assert body["cea"]["legacy_rows"]["reported"] == {}
+
+
+def test_a_held_result_keeps_the_nonce_the_result_gate_needs():
+    """Found by item 1, and only findable by it.
+
+    `no_artifact_result` rebuilds the result field by field and forgot
+    `executor_binding`. Under enforcement that turned a held completion into
+    409 `NONCE_MISSING` at the P2 RESULT gate — so the row was never written
+    and the artifact finding that produced the hold was discarded with it.
+    Invisible while RESULT read the process-wide mode, because the projects
+    that enforce the T5 artifact gate were the only ones enforcing at all.
+    """
+    from agent_crew.pipeline import no_artifact_result
+
+    binding = {"nonce": "n-1", "presenter": "claude"}
+    held = no_artifact_result(
+        TaskResult(task_id="t1", status="completed", summary="green",
+                   executor_binding=dict(binding)), "dispatch base absent")
+    assert held.status == "failed"
+    assert held.executor_binding == binding, "a held result must still be submittable"

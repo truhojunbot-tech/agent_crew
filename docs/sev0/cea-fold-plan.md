@@ -162,7 +162,7 @@ is already at or under the ADR's ceiling of six.
 | T3 validator (the five points) | `cea/callsites.py` — one `VALIDATOR`, five `gate_*` | the one decision surface |
 | G11 artifact contract | `pipeline.artifact_gate_applies` + `/result`, `mcp_server.py:234` | present; **not yet** invoked *from* the validator at T5, and "dispatch base absent" still skips rather than FAILs — item (a), REMAINING |
 | G_DT dispatch topology | `server._guard_agent_process`, `_guard_task_existence`, `queue.defer_push_delivery` | present; the #362 unknown-task refusal is **not yet** subsumed by "no receipt ⇒ no dispatch" — item (b), REMAINING |
-| G12 execution events | `queue.record_dispatch`/`_record_claim_on`/`_record_end_on`, `task_exec_events` | present; `receipt_id` on the rows, `cancel()` single-txn terminal event, `GET /tasks/{id}` redaction and the append-only trigger — item (c), REMAINING (unverified here) |
+| G12 execution events | `queue.record_dispatch`/`_record_claim_on`/`_record_end_on`, `task_exec_events` | present; `receipt_id` on the rows, `cancel()` single-txn terminal event, `GET /tasks/{id}` redaction and the append-only trigger — item (c), REMAINING (**verified absent** in step 4i, §11) |
 | #294 lexical duplicate advisory | `server.py:5093` `active_tasks_for_issue` | **to remove** (§11.1 row 14) — REMAINING |
 | risk-tier decision | `risk_tier.risk_tier_enforcement_enabled` read at `pipeline.py:981/1296/1542`, `server.py:3931` | **to remove as a decision** (§11.1 row 13, O10) — REMAINING |
 
@@ -238,12 +238,9 @@ Carried, unstarted:
    review/test/fix cascades, including the TIER_0 skip and the TIER_3 gate. The
    cascades must take reviewer/tester from the receipt's J7 contract instead.
    Standing red: `test_cxc_1_pipeline_still_decides_by_risk_tier`.
-3. Receipt-less legacy rows: the `enforce` refusal exists (`queue.py:2172`); the
-   **shadow report** is still not built.
-4. ~~Per-project rollout config~~ — done above, **except** threading the
-   project into the four post-admission call sites from the receipt (see the
-   `discovery` note). `TaskQueue.cea_config()` called with no argument there is
-   the marker.
+3. ~~Receipt-less legacy rows~~ — shadow report built in step 4i (§11).
+4. ~~Per-project rollout config~~ — done above; the post-admission threading
+   that was carved out here landed in step 4i (§11).
 5. E8 §11 scenarios still xfail under `enforce` (21 xfail in the cea selection).
 
 This step's own list, unstarted:
@@ -252,8 +249,8 @@ This step's own list, unstarted:
   unknown-task refusal subsumed by "no receipt ⇒ no dispatch".
 - (c) G12: `receipt_id` on `task_exec_events`, single-txn `cancel()` terminal
   event + lease clear, public `GET /tasks/{id}` redaction of pid/pane/lease,
-  append-only triggers on `task_exec_events`. **Unverified** — not inspected in
-  this step, so the 4b table's "REMAINING (unverified here)" still stands.
+  append-only triggers on `task_exec_events`. Not inspected in this step;
+  **verified absent** in step 4i (§11), which is where the 4b hedge is resolved.
 - (d) I1, (e) I2, (f) permanent fixtures — lane 4d.
 - (g) Guard count: two removals landed (#294 advisory; the risk-tier read in
   `server.py`). The count is **not** yet at the ADR's ceiling of six, because
@@ -428,6 +425,106 @@ reads; #14 `risk_tier` into the O10 snapshot matrix) are unstarted.
 `test_report_gate_acceptance_verdict_requires_every_fixture_blocked` is itself a
 strict xfail while DEFERRED is non-empty (CX-P2b, CX-P2c, CXC-5, CXC-6). The
 suite is green; the acceptance gate is not open.
+
+## 11. Step 4i — the mode comes off the receipt; legacy rows get counted (`result`)
+
+Two items. Both landed; everything else this step was asked to *check* is
+recorded below as DEFERRED with the evidence for why, not silently dropped.
+
+### DONE — item 1: the four post-admission call sites read the receipt's project
+
+`result`. Step 4c made rollout per-project and wired ENQUEUE (which holds the
+`TaskRequest`) and the T5 artifact gate (which reads the task row). The four
+post-admission points did not: `claim`, `dispatch`, `execute_start` and
+`result` all called `TaskQueue.cea_config()` with no argument, i.e. the
+process-wide mode. §8's `discovery` recorded the consequence and this step
+reproduces it as a test: with `AGENT_CREW_CEA_MODE=enforce` and a project held
+at `shadow`, `POST /result` answered **409 from the s4b RESULT nonce rule**
+(`NONCE_MISSING`) before the T5 artifact gate was reached. A task was admitted
+under one project's mode and finished under another's.
+
+| Where | Change |
+|---|---|
+| `queue.py` `cea_config_for_receipt(receipt)` | resolves the mode from the receipt's own `project`, falling back to the process-wide value when there is none |
+| `_cea_claim_gate`, `record_dispatch`, `start_execution`, `submit_result` | each passes the receipt it is deciding on |
+| `requeue_through_gate` (§8) | not one of P2's five, but it decides on the same receipt in the same lineage, so it reads the same project's mode |
+
+⛔The **receipt's** project, not the row's. The receipt is what admission
+  signed; `tasks.project` is what a caller wrote. Keying the rollout mode off
+  caller-supplied data would let a caller choose which mode applies to it.
+
+A pinned `cea_config=` still wins for every project (s4c's rule is unchanged: a
+caller holding a config already answered the question).
+
+### DONE — item 2: receipt-less legacy rows are REPORTed and counted
+
+`result`. A row written before step 2c has no receipt, so the gate cannot be
+asked. Under `enforce` the claim is refused already (`claim_through_gate`,
+formerly cited as `queue.py:2172`). Under `shadow` it ran and said so in a log
+line — which cannot answer *how many are left*, the number a deployment needs
+before it turns enforcement on.
+
+- One REPORT line **and** one durable `cea_legacy_row` event per row, at claim
+  and at dispatch (`_cea_report_legacy_row_on`, under its own SAVEPOINT:
+  recording only, a lost audit row must never change a claim).
+- `GET /health` → `cea.legacy_rows`: `total` / `open` / `by_status` from the
+  rows themselves (ground truth, including rows no call site has touched), and
+  `reported` counting **distinct tasks** per point — a row claimed twice is one
+  legacy row, not two.
+- `off` records nothing; the `enforce` refusal is unchanged. Shadow counts,
+  enforce stops.
+- ⛔The legacy report records the **process-wide** mode on purpose: with no
+  receipt there is no signed project to key an override off, and reading the
+  row's own column there would reopen the hole item 1 just closed.
+
+Dispatch of such a row mints no nonce, so EXECUTE_START and RESULT will have
+nothing to check — which is why dispatch gets a row of its own rather than
+being folded into the claim one.
+
+### Evidence
+
+`tests/unit/test_sev0_cea_s4i_project_scope_and_legacy.py` — **19 passed**,
+including the s4c discovery in both directions (a shadow project not enforced
+by a process-wide `enforce`; an enforce project enforced inside a shadow
+process), two projects decided separately in one process, and a static check
+that no post-admission site reads the process-wide mode again.
+
+### `discovery` — a consistently enforced lineage found a dropped nonce
+
+Wiring item 1 turned two green tests red, and the cause was a real defect, not
+the tests. `pipeline.no_artifact_result` rebuilds the `TaskResult` field by
+field rather than with `dataclasses.replace`, and it did not carry
+`executor_binding`. So under enforcement a completion held by the T5 artifact
+gate arrived at the P2 RESULT gate with no nonce and was refused **409
+`NONCE_MISSING`** — the row was never written, and the artifact finding that
+produced the hold was discarded with it. `hold_mismatched_pr_result`, the other
+holder on that path, uses `replace()` and was never affected.
+
+This was unreachable before: RESULT read the process-wide mode, so a project
+that had moved to `enforce` for the artifact gate was still in `shadow` at
+RESULT and the missing nonce never mattered. Fixed in the same commit, with a
+unit test naming the rule (`test_a_held_result_keeps_the_nonce_the_result_gate_needs`).
+
+`test_sev0_cea_s4c_dispatch_base_absent.py` was rewritten to drive claim →
+dispatch → start before posting, because that is now the only way to isolate the
+T5 gate: a result for a row that was never claimed is refused by P2 first. The
+same change makes that file hermetic — it was wiring itself from the live
+`~/alfred/governance` snapshot (the s4g leak, in a file s4g did not touch).
+
+### DEFERRED — checked in this step, with the reason
+
+| Item | State at this head | Why deferred |
+|---|---|---|
+| **G_DT at T6** (§8 list (b)) | `_guard_agent_process` runs inside `_guard_tmx_push`, i.e. while the pane is being resolved — **before** `record_dispatch` (the T6 validator) in both `_try_push_next` (`server.py:3029`) and `_try_push_discuss` (`server.py:3132`) | Topology only, but moving it is a change to the live dispatch ordering, not a bounded fold. Not attempted in a step whose two items are elsewhere. |
+| **G12 verification** (§8 list (c)) | `task_exec_events` has **no** `receipt_id` column and **no** append-only trigger (greps: no `trg_task_exec_events*` anywhere in `src/`); `cancel()` at `queue.py:3647` is not a single-txn terminal event + lease clear; `GET /tasks/{id}` redaction not inspected | Now *verified absent* rather than "unverified" — the 4b table's hedge can be dropped. The work itself is a schema migration plus a dispatch-path change; out of scope here. |
+| **pipeline risk-tier branches** | `pipeline.py:981`, `:1296`, `:1542` still call `risk_tier_enforcement_enabled()` — unchanged from §8 | The cascades must take reviewer/tester from the receipt's J7 contract. This is guard #14, the one holding the §11.2 count at 7. Standing red `test_cxc_1_pipeline_still_decides_by_risk_tier` is doing its job. |
+| **remaining E8 §11 xfails** | unchanged from §10's table of 60 | All 60 are blocked on E5(a), on the alfred-side policy snapshot, or on the O21b/O21c identity broker — none of which is this repo's code lane. |
+
+### The guard count is unchanged
+
+**7** (5 target components + 2 extra judgements) against ADR §11.2's ≤ 6.
+Nothing in 4h or 4i removed a guard; #14 (`risk_tier` into the O10 snapshot
+matrix) is still unstarted.
 
 ## §P Provenance
 
