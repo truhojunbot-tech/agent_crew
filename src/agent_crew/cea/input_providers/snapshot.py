@@ -4,6 +4,8 @@ One JSON document per generation::
 
     {"generation": 12, "produced_at": "2026-09-23T13:00:00Z", "tier": "T0",
      "decisions": [{"decision_id": "T0-1234", "body_hash": "...", "supersedes": [],
+                    "principals": ["owner:hojun"], "build_commits": ["<sha>"],
+                    "runtimes": ["agent_crew"],
                     "scope": {"project": "agent_crew", "work_class": "implement"}}],
      "review_test_matrix": {"implement": {"reviewer": true, "tester": true}},
      "human_gate_predicates": [{"project": "...", "state": "PENDING"}],
@@ -55,6 +57,13 @@ def _epoch(ts) -> Optional[float]:
     return None
 
 
+def _strs(value) -> tuple[str, ...]:
+    """A JSON list of ids as a tuple of strings; anything else is empty, never partial."""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(v) for v in value)
+
+
 def _in_scope(scope: dict, intent: Optional[Intent]) -> bool:
     if intent is None:
         return True
@@ -104,8 +113,18 @@ class CanonicalPolicySnapshotReader:
         for d in doc.get("decisions") or ():
             if not isinstance(d, dict) or not d.get("decision_id") or not d.get("body_hash"):
                 return self._unavailable()      # a malformed record is not a partial snapshot
+            # ⛔`principals`, `build_commits` and `runtimes` are not decoration.
+            #   Without them every record this reader produces has empty tuples,
+            #   and `SnapshotLooseningAuthority` refuses conditions 3 and 4 for
+            #   *every* record — so a correctly signed T0 restoration could never
+            #   be granted through the production reader, only through a test
+            #   fake that built DecisionRev directly. A verifier that structurally
+            #   cannot say yes is not a verifier.
             rev = DecisionRev(decision_id=str(d["decision_id"]), body_hash=str(d["body_hash"]),
-                              supersedes=tuple(str(s) for s in d.get("supersedes") or ()))
+                              supersedes=_strs(d.get("supersedes")),
+                              principals=_strs(d.get("principals")),
+                              build_commits=_strs(d.get("build_commits")),
+                              runtimes=_strs(d.get("runtimes")))
             decisions.append(rev)
             if _in_scope(d.get("scope") or {}, intent):
                 in_scope.append(rev)
