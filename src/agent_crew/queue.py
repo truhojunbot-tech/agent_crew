@@ -11,7 +11,15 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
+from agent_crew.cea import callsites as _cea_callsites
+from agent_crew.cea import store as _cea_store
+from agent_crew.cea.auth import in_process_caller as _cea_in_process_caller
+from agent_crew.cea.engine import EngineConfig as _CeaEngineConfig, get_engine as _cea_get_engine
+from agent_crew.cea.intent import (
+    CallerProvenance as _CeaProvenance, Intent as _CeaIntent,
+    IntentIdentity as _CeaIdentity, Target as _CeaTarget, WorkClass as _CeaWorkClass)
 from agent_crew.cea.store import ensure_schema as _cea_ensure_schema
+from agent_crew.cea.validator import ValidationOutcome as _CeaOutcome
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
@@ -26,6 +34,73 @@ class PausedError(Exception):
     """#314 P0-1: runtime STOP 활성 시 실행생성 mutation(enqueue)이 원자적으로 거부됐음을 알림.
     호출측(result cascade 등)은 이를 잡아 successor 생성 대신 suppression으로 처리한다."""
     pass
+
+class AdmissionRefused(Exception):
+    """ADR P2: a call site's receipt check refused, and the runtime is enforcing.
+
+    Carries the validator's own answer rather than a re-phrasing of it, so the
+    adapter that catches this reports what the contract said and not what the
+    adapter guessed it meant.
+    """
+
+    def __init__(self, gate):
+        self.gate = gate
+        self.point = gate.point.value
+        self.outcome = gate.outcome.value
+        self.receipt_id = gate.receipt_id
+        super().__init__(f"{gate.point.value} refused: {gate.reason}")
+
+
+#: queue ``task_type`` → P4 ``work_class``. ⛔Unknown types map to ``implement``,
+#: the strictest row of ``REVIEW_FLOOR`` — a work class nobody declared must not
+#: be the one that needs neither reviewer nor tester. §7 (step 2b) replaces this
+#: guess with the adapter declaring its own work class.
+_TASK_TYPE_WORK_CLASS = {
+    "implement": _CeaWorkClass.IMPLEMENT,
+    "fix": _CeaWorkClass.FIX,
+    "review": _CeaWorkClass.REVIEW,
+    "test": _CeaWorkClass.TEST,
+    "merge": _CeaWorkClass.MERGE,
+    "discuss": _CeaWorkClass.OPS,
+    "ops": _CeaWorkClass.OPS,
+}
+
+
+def _cea_str_tuple(value) -> tuple:
+    """A tuple of non-empty strings, or ``()``. Anything else was not a list of anchors."""
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(v) for v in value if isinstance(v, str) and v.strip())
+
+
+def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None) -> "_CeaIntent":
+    """The P4 intent a queue task represents (§7.1 step 2, temporary form).
+
+    ⛔Everything here is read from what the task already carries; nothing is
+      invented. In particular ``authority_decision_ids`` stays empty unless the
+      context names decisions, because a decision id this function made up would
+      be free text with a ticket-shaped name (§1.4) — and J2 refuses ids the
+      signed snapshot does not carry, which is the behaviour we want to see in
+      the shadow measurement rather than paper over.
+    """
+    ctx = dict(context if context is not None else (task.context or {}))
+    work_class = _TASK_TYPE_WORK_CLASS.get((task.task_type or "").strip().lower(),
+                                           _CeaWorkClass.IMPLEMENT)
+    identity = _CeaIdentity(
+        project=task.project or "",
+        work_class=work_class,
+        target=_CeaTarget(repo=str(ctx.get("repo") or ""),
+                          base_ref=str(task.branch or ""),
+                          scope_anchors=_cea_str_tuple(ctx.get("scope_anchors"))),
+        capability_id=(str(ctx["capability_id"]) if ctx.get("capability_id") else None),
+        authority_decision_ids=_cea_str_tuple(ctx.get("authority_decision_ids")))
+    return _CeaIntent(
+        identity=identity, task_id=task.task_id, task_type=task.task_type or "",
+        description=task.description or "",
+        coordinator_id=(str(ctx["coordinator_id"]) if ctx.get("coordinator_id") else None),
+        idempotency_key=(str(ctx["idempotency_key"]) if ctx.get("idempotency_key") else None),
+        parent_receipt_id=(str(ctx["parent_receipt_id"]) if ctx.get("parent_receipt_id") else None))
+
 
 logger = logging.getLogger(__name__)
 
@@ -805,9 +880,18 @@ def task_issue_number(task) -> Optional[int]:
 
 class TaskQueue:
     def __init__(self, db_path: str, *, telemetry_adapter: Optional[TaskTelemetryAdapter] = None,
-                 read_only: bool = False, runtime_authority=None):
+                 read_only: bool = False, runtime_authority=None,
+                 cea_config=None, cea_providers=None):
         self._db_path = db_path
         self._telemetry_adapter = telemetry_adapter or default_telemetry_adapter()
+        # ADR P1/P7: the T1 engine and its input providers. ``None`` means "read
+        # the environment" and "no providers wired", and no-providers is not a
+        # silent pass — every input reports unavailable and admission BLOCKs with
+        # a receipt naming what was missing. Tests and a future `crew-authz`
+        # deployment inject; nothing here guesses.
+        self._cea_config_override = cea_config
+        self._cea_providers = dict(cea_providers or {})
+        self._cea_engine_cache = None
         # P6: who may loosen this runtime. Fail-closed by default — a runtime with
         # no verifier refuses every loosening rather than trusting the requester's
         # own account of its authority. Wire a :class:`SnapshotLooseningAuthority`
@@ -1717,7 +1801,18 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def enqueue(self, task: TaskRequest) -> str:
+    # ══════════════════════════════════════════════════════════════════
+    # ADR P2 — admission. `enqueue_with_receipt` is the ONLY writer of a
+    # task row, and every task row names the receipt that admitted it.
+    # ══════════════════════════════════════════════════════════════════
+
+    def _enqueue_context(self, task: TaskRequest) -> dict:
+        """The context the row will carry — resolved once, before admission.
+
+        Split out of :meth:`enqueue` so the intent the engine sees and the row
+        that gets written are built from the *same* dict. Resolving the issue
+        number twice would let the receipt describe a task the row does not.
+        """
         # #276: make the structured field true at the choke point. Every path —
         # HTTP, MCP, pipeline, cli — arrives here, so backfilling once means
         # the read-side fallback in `watch.active_issue_numbers` rarely has to
@@ -1740,6 +1835,96 @@ class TaskQueue:
             context["issue"] = resolved
         elif "issue" in context and not _is_issue_number(context["issue"]):
             context.pop("issue")
+        return context
+
+    def cea_config(self) -> "_CeaEngineConfig":
+        """This runtime's engine config — ``shadow`` unless the env says otherwise.
+
+        Read once per queue instance and cached: the five call sites ask for it
+        on every enqueue, claim, dispatch and result, and a mode that could
+        change between two of them would mean one task was half-enforced.
+        """
+        if self._cea_config_override is None:
+            self._cea_config_override = _CeaEngineConfig.from_env()
+        return self._cea_config_override
+
+    def cea_engine(self):
+        """The T1 engine (in-process, or a socket client when one is configured).
+
+        Cached per queue for the same reason, plus a practical one: constructing
+        it re-reads the signing key from disk, and the claim path runs on every
+        poll of an idle queue.
+        """
+        if self._cea_engine_cache is None:
+            self._cea_engine_cache = _cea_get_engine(config=self.cea_config(),
+                                                     **(self._cea_providers or {}))
+        return self._cea_engine_cache
+
+    def authorize_task(self, task: TaskRequest, *, context: Optional[dict] = None,
+                       provenance: "_CeaProvenance" = _CeaProvenance.DIRECT,
+                       retry: bool = False):
+        """Run T1 admission for a task and record the receipt (ADR §7.1 step 2).
+
+        ⛔Temporary, and temporary in a specific way: step 2b replaces this with
+          the §7 ingress adapters, each authenticating with its own token and
+          declaring its own work class. What it must not become is a *bypass* —
+          the legacy ``POST /tasks`` path reaches the engine through this method
+          rather than around it, which is why the sole-writer test can assert
+          that no task row exists without a receipt.
+
+        The receipt is committed on its own connection before the row is
+        written. The asymmetry is deliberate: a receipt without a task row is
+        exactly what P2 asks for when admission refuses ("the audit row exists
+        either way"), while a task row without a receipt is the thing the
+        ``tasks.receipt_id`` trigger makes impossible.
+        """
+        engine = self.cea_engine()
+        caller = _cea_in_process_caller(provenance)
+        intent = intent_for_task(task, context=context)
+        conn = self._connect()
+        try:
+            auth = engine.authorize(conn, intent, caller, retry=retry)
+            conn.commit()
+        finally:
+            conn.close()
+        return auth
+
+    def enqueue_with_receipt(self, task: TaskRequest, receipt: dict, *,
+                             context: Optional[dict] = None) -> str:
+        """Write the task row for an admitted intent. **The only writer there is.**
+
+        P2: "without a valid receipt there is no enqueue". That is a property of
+        the queue, not of the callers, so there is exactly one ``INSERT INTO
+        tasks`` in the product and it is here, behind the ENQUEUE call site. A
+        second writer is a test failure
+        (``tests/unit/test_sev0_cea_s2c_writer_callsites.py``), because a second
+        writer is how the check gets skipped by accident a year from now.
+
+        Inside one ``BEGIN IMMEDIATE``, in this order:
+
+        1. the #313/#314 STOP gate (unchanged — it is the safety authority);
+        2. the ENQUEUE validator call site (:mod:`agent_crew.cea.callsites`);
+        3. the row, carrying ``receipt_id``;
+        4. the receipt's ``ISSUED → QUEUED`` lifecycle row.
+
+        So the row and the receipt that admitted it commit together or not at
+        all, which is what makes "every QUEUED row has a live receipt" a fact
+        about the database rather than a convention.
+
+        In ``shadow`` mode a refusal is recorded on the row
+        (``context.cea_enqueue``) and the task proceeds; in ``enforce`` it
+        raises :class:`AdmissionRefused` and nothing is written.
+        """
+        context = dict(self._enqueue_context(task) if context is None else context)
+        engine = self.cea_engine()
+        gate = _cea_callsites.gate_enqueue(
+            receipt, task_id=task.task_id,
+            current=_cea_callsites.current_inputs(engine, receipt),
+            config=self.cea_config())
+        context["cea_enqueue"] = gate.as_record()
+        if not gate.proceed:
+            raise AdmissionRefused(gate)
+        receipt_id = receipt.get("receipt_id")
         conn = self._connect()
         try:
             # #313/#314 P0-1: 실행생성 mutation(INSERT) 자체를 pause와 원자적으로 admission.
@@ -1753,8 +1938,8 @@ class TaskQueue:
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
             conn.execute(
                 """
-                INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+                INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project, receipt_id)
+                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -1765,8 +1950,14 @@ class TaskQueue:
                     json.dumps(context),
                     time.time(),
                     task.project,
+                    receipt_id,
                 ),
             )
+            # §3: the row exists, so the receipt is QUEUED. Inside the same
+            # transaction, through the engine's guarded transition — which is
+            # where the lifecycle graph and the lineage claim are kept in step.
+            self._cea_transition_in_txn(conn, engine, receipt_id, "QUEUED",
+                                        note=f"enqueue: {gate.outcome.value}")
             conn.commit()
         except sqlite3.IntegrityError as e:
             # #273: task_id is the primary key, so a duplicate insert raises
@@ -1836,6 +2027,97 @@ class TaskQueue:
         except Exception:
             logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
         return task.task_id
+
+    def enqueue(self, task: TaskRequest, *,
+                provenance: "_CeaProvenance" = _CeaProvenance.DIRECT) -> str:
+        """Admit a task and write its row — the path every legacy ingress takes.
+
+        ⛔Not a bypass and not a shortcut: it mints a receipt through the T1
+          engine (:meth:`authorize_task`) and then goes through the one writer
+          (:meth:`enqueue_with_receipt`). Every existing caller — HTTP, MCP,
+          pipeline, cli, watch, triage — keeps working unchanged and starts
+          producing receipts, which is the whole point of the shadow phase: a
+          measurement of what admission *would* have said, taken from the real
+          traffic rather than from a reconstruction of it.
+        """
+        context = self._enqueue_context(task)
+        auth = self.authorize_task(task, context=context, provenance=provenance)
+        return self.enqueue_with_receipt(task, auth.receipt, context=context)
+
+    # ── the receipt side of a task row ────────────────────────────────
+
+    @staticmethod
+    def _cea_transition_in_txn(conn, engine, receipt_id: Optional[str], state: str,
+                               *, note: Optional[str] = None) -> None:
+        """Move a receipt's lifecycle inside the caller's transaction.
+
+        Best-effort **by design**, and only in this direction: a lifecycle row
+        that cannot be written must not roll back work the validator already
+        approved, and an engine reached over a socket keeps its receipts in its
+        own store, where this process cannot append at all. The refusal path is
+        the gate above, never a failure to record history.
+        """
+        if not receipt_id or not hasattr(engine, "transition"):
+            return
+        try:
+            engine.transition(conn, receipt_id, state, note=note)
+        except Exception:
+            logger.warning("cea: receipt %s could not be moved to %s", receipt_id, state,
+                           exc_info=True)
+
+    def _cea_receipt_for_task_on(self, conn, task_id: str) -> tuple[Optional[str], Optional[dict]]:
+        """``(receipt_id, receipt)`` for a task row, reading the receipt store.
+
+        ``(None, None)`` for a row written before step 2c: those rows have no
+        receipt and there is no honest substitute, so each call site decides what
+        to do about it rather than being handed a fabricated one.
+        """
+        row = conn.execute("SELECT receipt_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        receipt_id = (row["receipt_id"] if row is not None else None) or None
+        if not receipt_id:
+            return None, None
+        return receipt_id, _cea_store.current_receipt(conn, receipt_id)
+
+    @staticmethod
+    def _cea_patch_context_in_txn(conn, task_id: str, extra: dict) -> None:
+        """Merge keys into a row's context inside the caller's transaction.
+
+        :meth:`patch_context` opens its own connection, which would deadlock
+        against the ``BEGIN IMMEDIATE`` the result path already holds.
+        """
+        row = conn.execute("SELECT context FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+        if row is None:
+            return
+        try:
+            ctx = json.loads(row["context"] or "{}")
+        except (TypeError, ValueError):
+            ctx = {}
+        ctx.update(extra)
+        conn.execute("UPDATE tasks SET context = ? WHERE task_id = ?",
+                     (json.dumps(ctx), task_id))
+
+    def _cea_claim_gate(self, conn, task_id: str, *, agent: str = "", role: str = ""):
+        """P2 CLAIM — ``None`` for a pre-2c row that has no receipt at all.
+
+        ⛔``None`` is not "PROCEED". It says the question could not be asked,
+          which is the honest answer for a row admitted before receipts existed;
+          the caller treats it as "no gate ran" and the row keeps behaving as it
+          did yesterday. Under ``enforce`` this is the gap step 2b closes by
+          making every ingress mint a receipt — it is not closed by pretending a
+          missing receipt passed.
+        """
+        receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
+        if receipt is None:
+            if receipt_id:
+                logger.warning("cea: task %s names receipt %s, which is not in the store",
+                               task_id, receipt_id)
+            return None
+        engine = self.cea_engine()
+        claimant = agent or role or None
+        return _cea_callsites.gate_claim(
+            receipt, claimant=claimant,
+            current=_cea_callsites.current_inputs(engine, receipt, claimant=claimant),
+            config=self.cea_config())
 
     # ── one-shot PR announcements (#250 review) ───────────────────────
     #
@@ -2114,6 +2396,19 @@ class TaskQueue:
                 conn.execute("ROLLBACK")
                 return None
 
+            # ── P2 CLAIM call site, inside the critical section ──────────
+            # The claim and the receipt check commit together: a task that fails
+            # the check is never left half-claimed, and a claim that wins the
+            # race never runs without the check having seen the same B′.
+            claim_gate = self._cea_claim_gate(conn, row["task_id"], agent=agent, role=role)
+            if claim_gate is not None and not claim_gate.proceed:
+                # P6/P3 say what happens next (HELD returns to the engine, BLOCK
+                # stays put). Either way it is not claimed now, and the row is
+                # left pending for the state that produced the answer to clear.
+                conn.execute("ROLLBACK")
+                logger.warning("cea: claim refused for %s — %s", row["task_id"], claim_gate.reason)
+                return None
+
             _now = time.time()
             conn.execute(
                 "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
@@ -2121,6 +2416,10 @@ class TaskQueue:
             )
             self._record_claim_on(conn, row["task_id"], _now, role=role or None,
                                   agent=agent or None, via=claimed_via)
+            if claim_gate is not None:
+                self._cea_transition_in_txn(conn, self.cea_engine(),
+                                            claim_gate.receipt_id, "CLAIMED",
+                                            note=f"claim: {claim_gate.outcome.value}")
             conn.execute("COMMIT")
 
             return TaskRequest(
@@ -2141,9 +2440,25 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def submit_result(self, task_id: str, result: TaskResult) -> str:
+    def submit_result(self, task_id: str, result: TaskResult, *,
+                      nonce: Optional[str] = None,
+                      presenter: Optional[str] = None) -> str:
         """Submit a task result. Returns the task_type of the completed task
-        (so push-model callers can decide what to push next)."""
+        (so push-model callers can decide what to push next).
+
+        P2's fifth call site: ``/result`` is a state transition, accepted only
+        with the single-use dispatch nonce presented under ``executor_binding``.
+
+        ⛔``nonce`` is optional **and today it is always absent**, because the
+          pane protocol does not carry one yet — the task block that would hand
+          it to the worker is step 2b (§7 adapters). So under ``enforce`` this
+          gate refuses every result for ``NONCE_MISSING``, which is the honest
+          reading of the contract and the reason ``enforce`` must not be turned
+          on before 2b lands. Under ``shadow`` the answer is recorded on the
+          row (``context.cea_result``) and the result is accepted, which is the
+          measurement we are here to take. What it must never be is a gate that
+          reports PROCEED because nobody presented anything.
+        """
         conn = self._connect()
         try:
             if result.task_id != task_id:
@@ -2163,6 +2478,23 @@ class TaskQueue:
                 raise ValueError(f"Task not found: {task_id!r}")
             task_type = row["task_type"]
             self._last_previous_status = row["status"]
+            # ── P2 RESULT call site ──────────────────────────────────────
+            # P3: drift here never kills in-flight work — the result is accepted
+            # and flagged stale, and containment is on the successors. So this
+            # gate refuses only on the tamper signals (unknown/spent nonce, a
+            # presenter that is not the bound executor, a terminal receipt).
+            result_gate = None
+            _receipt_id, _receipt = self._cea_receipt_for_task_on(conn, task_id)
+            if _receipt is not None:
+                result_gate = _cea_callsites.gate_result(
+                    _receipt, nonce=nonce, presenter=presenter,
+                    current=_cea_callsites.current_inputs(
+                        self.cea_engine(), _receipt, presenter=presenter),
+                    config=self.cea_config())
+                self._last_cea_result_gate = result_gate
+                if not result_gate.proceed:
+                    conn.execute("ROLLBACK")
+                    raise AdmissionRefused(result_gate)
             # #167: persist structured error_info for failed results so post-mortem
             # debugging has machine-readable data, not just the free-form summary.
             # #265: `timed_out` too — a consumer that sees "we stopped waiting"
@@ -2261,6 +2593,16 @@ class TaskQueue:
                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (task_id, task_type, _result_to_json(result), int(_stop["epoch"]),
                  "pending" if _suppressed else "applied", now, now))
+            if result_gate is not None:
+                # §3: the result is recorded, so the receipt is CONSUMED — the
+                # terminal state that makes P4's replay refusal a fact. In the
+                # same transaction as the result row, so a receipt never reads
+                # CONSUMED for a result that did not commit.
+                self._cea_patch_context_in_txn(conn, task_id,
+                                               {"cea_result": result_gate.as_record()})
+                self._cea_transition_in_txn(conn, self.cea_engine(), result_gate.receipt_id,
+                                            "CONSUMED",
+                                            note=f"result: {result_gate.outcome.value}")
             conn.commit()
             # Completion-time recommendations are intentionally a separate,
             # post-commit receipt.  Admission's decision fields are immutable:
@@ -2726,19 +3068,51 @@ class TaskQueue:
     def record_dispatch(self, task_id: str, *, channel: str, agent: Optional[str] = None,
                         target: Optional[str] = None, lease_owner: Optional[str] = None,
                         lease_seconds: Optional[float] = None,
-                        ts: Optional[float] = None) -> None:
-        """Record that a claimed task was handed to a worker.
+                        ts: Optional[float] = None) -> Optional[str]:
+        """Record that a claimed task was handed to a worker — the P2 DISPATCH point.
 
         ``channel`` uses D6's vocabulary: ``tmux_pane``, ``claude_p``,
         ``codex_exec``, ``gemini_cli``, ``api``. ``target`` is the pane id or
         ``pid:<n>``. ``lease_seconds`` is the bound the handing path enforces
         (the dispatcher's kill timeout); None where there is no fixed bound —
         a tmux pane task is reaped on idleness (#231), not on a deadline.
+
+        Returns the **single-use dispatch nonce** minted for this attempt, or
+        ``None`` when none was minted (no receipt, or the gate refused). The
+        worker presents it at ``POST /tasks/{id}/start`` and again with its
+        result; a return value of ``None`` therefore means the two later call
+        sites have nothing to check, which is exactly what ``enforce`` must
+        refuse and what ``shadow`` is here to count.
+
+        ⛔The nonce is minted only *after* the gate answers PROCEED. Minting
+          first would leave a live nonce behind for a dispatch that was refused,
+          and ``UNIQUE(receipt_id, attempt)`` would then refuse the legitimate
+          retry as a duplicate.
         """
         at = time.time() if ts is None else ts
         expires = at + lease_seconds if lease_seconds is not None else None
+        nonce: Optional[str] = None
         conn = self._connect()
         try:
+            receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
+            if receipt is not None:
+                engine = self.cea_engine()
+                gate = _cea_callsites.gate_dispatch(
+                    receipt, attempt=receipt.get("attempt"),
+                    current=_cea_callsites.current_inputs(
+                        engine, receipt, already_claimed=True),
+                    config=self.cea_config())
+                if not gate.proceed:
+                    logger.warning("cea: dispatch refused for %s — %s", task_id, gate.reason)
+                    raise AdmissionRefused(gate)
+                if hasattr(engine, "mint_dispatch_nonce"):
+                    try:
+                        _updated, nonce = engine.mint_dispatch_nonce(conn, receipt)
+                    except Exception:
+                        # A nonce that could not be minted is a dispatch the two
+                        # later call sites cannot check. Say so; do not invent one.
+                        logger.warning("cea: dispatch nonce mint failed for %s", task_id,
+                                       exc_info=True)
             cur = conn.execute(
                 "UPDATE tasks SET dispatched_at = ?, dispatch_channel = ?, dispatch_agent = ?,"
                 " dispatch_target = ?, dispatch_attempt = COALESCE(dispatch_attempt, 0) + 1,"
@@ -2755,8 +3129,82 @@ class TaskQueue:
                     target=target, attempt=attempt, lease_owner=lease_owner,
                     lease_expires_at=expires)
             conn.commit()
+        except AdmissionRefused:
+            # ⛔Not swallowed with the telemetry failures below. A refused
+            #   dispatch is a decision the caller has to see: logging it and
+            #   returning None would hand the push path a task it believes was
+            #   dispatched. Under `shadow` the gate never refuses, so this is
+            #   reachable only where the runtime asked to be enforced.
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         except Exception:
             logger.exception("exec-state: dispatch record failed task_id=%s", task_id)
+        finally:
+            conn.close()
+        return nonce
+
+    def start_execution(self, task_id: str, nonce: Optional[str], *,
+                        presenter: Optional[str] = None) -> dict:
+        """P2 EXECUTE_START — the one-shot go/no-go a pane asks for before it works.
+
+        Serves ``POST /tasks/{task_id}/start {"nonce": ...}``. Returns
+        ``{"go": bool, ...}``; the pane runs only on ``go``.
+
+        The nonce is spent here, atomically (``store.consume_nonce`` is a
+        conditional UPDATE), so two panes that both received the same task block
+        cannot both start: the second one's spend loses and it is told so. The
+        receipt moves ``CLAIMED → RUNNING`` in the same transaction.
+
+        ⛔``nonce_unused`` comes from the nonce table, never from the receipt's
+          own ``dispatch_nonces`` array. The receipt is caller-controlled data at
+          all five points; the claim table is not.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
+            if receipt is None:
+                conn.execute("ROLLBACK")
+                return {"go": not _cea_callsites.enforcing(self.cea_config()),
+                        "task_id": task_id, "receipt_id": receipt_id,
+                        "reason": "NO_RECEIPT: this task row predates the receipt requirement, "
+                                  "so there is nothing to check (P2)",
+                        "outcome": None, "enforced": _cea_callsites.enforcing(self.cea_config())}
+            engine = self.cea_engine()
+            row = _cea_store.nonce_row(conn, nonce) if nonce else None
+            gate = _cea_callsites.gate_execute_start(
+                receipt, nonce=nonce,
+                current=_cea_callsites.current_inputs(
+                    engine, receipt, presenter=presenter, already_dispatched=True,
+                    nonce_unused=(None if row is None else row.get("used_at") is None)),
+                config=self.cea_config())
+            spent = False
+            if gate.proceed and nonce:
+                spent = _cea_store.consume_nonce(conn, nonce, used_by=presenter or task_id)
+                if not spent and gate.enforced:
+                    # Lost the race for a single-use nonce: somebody else is
+                    # already running this attempt.
+                    conn.execute("ROLLBACK")
+                    return {"go": False, "task_id": task_id, "receipt_id": receipt_id,
+                            "outcome": "BLOCK", "enforced": True,
+                            "reason": "NONCE_REUSED: the dispatch nonce was already spent "
+                                      "(P4: single-use)"}
+            if gate.proceed:
+                self._cea_transition_in_txn(conn, engine, receipt_id, "RUNNING",
+                                            note=f"execute_start: {gate.outcome.value}")
+            conn.execute("COMMIT")
+            return {"go": bool(gate.proceed), "task_id": task_id, "receipt_id": receipt_id,
+                    "outcome": gate.outcome.value, "reason": gate.reason,
+                    "enforced": gate.enforced, "nonce_spent": spent}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 

@@ -14,7 +14,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
@@ -5115,6 +5115,30 @@ def create_app(
                 # unchanged; `execution` is the claim/dispatch/lease record.
                 return {**dataclasses.asdict(t), "execution": q().get_exec_state(task_id)}
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+
+    @app.post("/tasks/{task_id}/start", status_code=200)
+    def start_task(task_id: str, body: dict = Body(default_factory=dict)):
+        """P2 EXECUTE_START — the pane's one-shot go/no-go before it starts work.
+
+        ``{"nonce": "<the dispatch nonce from the task block>"}`` →
+        ``{"go": true|false, "reason": ...}``. The nonce is single-use: the
+        first caller spends it, and a second caller presenting the same one is
+        told no. A worker that gets ``go: false`` must not start.
+
+        ⛔This endpoint is the check, not the enforcement. Nothing stops a pane
+          from skipping the call; what step 2b adds is the task block that makes
+          calling it the only way to learn what to do. Answering honestly here
+          first is what lets that change be about the protocol rather than about
+          the decision.
+        """
+        nonce = body.get("nonce") if isinstance(body, dict) else None
+        presenter = body.get("presenter") if isinstance(body, dict) else None
+        try:
+            return q().start_execution(task_id, nonce if isinstance(nonce, str) else None,
+                                       presenter=presenter if isinstance(presenter, str) else None)
+        except Exception as exc:
+            logger.exception(f"POST /tasks/{task_id}/start failed")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
