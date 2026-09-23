@@ -2412,6 +2412,41 @@ class TaskQueue:
             return None, None
         return receipt_id, _cea_store.current_receipt(conn, receipt_id)
 
+    #: The receipt field J7 writes when the admitted review/test contract
+    #: reduces a tester's scope. Read at dispatch, never written there.
+    CEA_J7_TEST_SCOPE_KEY = "j7_test_scope"
+    CEA_J7_TEST_SCOPE_SOURCE_KEY = "j7_test_scope_source"
+
+    def cea_admitted_test_scope(self, task_id: str) -> Optional[dict]:
+        """The test-scope reduction the task's **admission receipt** carries, or ``None``.
+
+        §7.2 / invariant 7: J7 ``review_test_matrix``, read once at admission, is
+        the only review/test decision, and no ingress may reduce it. So a
+        reduced scope is honoured only when the receipt says so — the request's
+        ``context.test_scope`` is an ingress claim and does not count.
+
+        ``None`` means "no reduction admitted": no receipt row, a receipt with no
+        J7 scope field, or one that names anything but ``targeted``. Each of
+        those keeps full scope; none is an error.
+        """
+        conn = self._connect()
+        try:
+            _, receipt = self._cea_receipt_for_task_on(conn, task_id)
+        except Exception:
+            logger.warning("cea: receipt lookup for test scope failed task=%s", task_id,
+                           exc_info=True)
+            return None
+        finally:
+            conn.close()
+        if not isinstance(receipt, dict):
+            return None
+        extra = receipt.get("extra") if isinstance(receipt.get("extra"), dict) else {}
+        if extra.get(self.CEA_J7_TEST_SCOPE_KEY) != "targeted":
+            return None
+        source = str(extra.get(self.CEA_J7_TEST_SCOPE_SOURCE_KEY) or "j7").strip() or "j7"
+        return {"test_scope": "targeted", "source_kind": source,
+                "receipt_id": receipt.get("receipt_id")}
+
     @staticmethod
     def _cea_patch_context_in_txn(conn, task_id: str, extra: dict) -> None:
         """Merge keys into a row's context inside the caller's transaction.
