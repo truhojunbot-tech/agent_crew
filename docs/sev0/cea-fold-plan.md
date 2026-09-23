@@ -517,7 +517,7 @@ same change makes that file hermetic — it was wiring itself from the live
 |---|---|---|
 | **G_DT at T6** (§8 list (b)) | `_guard_agent_process` runs inside `_guard_tmx_push`, i.e. while the pane is being resolved — **before** `record_dispatch` (the T6 validator) in both `_try_push_next` (`server.py:3029`) and `_try_push_discuss` (`server.py:3132`) | Topology only, but moving it is a change to the live dispatch ordering, not a bounded fold. Not attempted in a step whose two items are elsewhere. |
 | **G12 verification** (§8 list (c)) | `task_exec_events` has **no** `receipt_id` column and **no** append-only trigger (greps: no `trg_task_exec_events*` anywhere in `src/`); `cancel()` at `queue.py:3647` is not a single-txn terminal event + lease clear; `GET /tasks/{id}` redaction not inspected | Now *verified absent* rather than "unverified" — the 4b table's hedge can be dropped. The work itself is a schema migration plus a dispatch-path change; out of scope here. |
-| **pipeline risk-tier branches** | `pipeline.py:981`, `:1296`, `:1542` still call `risk_tier_enforcement_enabled()` — unchanged from §8 | The cascades must take reviewer/tester from the receipt's J7 contract. This is guard #14, the one holding the §11.2 count at 7. Standing red `test_cxc_1_pipeline_still_decides_by_risk_tier` is doing its job. |
+| **pipeline risk-tier branches** | `pipeline.py:992`, `:1307`, `:1553` still call `risk_tier_enforcement_enabled()` — the same three branches §8 recorded at `:981`/`:1296`/`:1542`; only the line numbers moved | The cascades must take reviewer/tester from the receipt's J7 contract. This is guard #14, the one holding the §11.2 count at 7. Standing red `test_cxc_1_pipeline_still_decides_by_risk_tier` is doing its job. |
 | **remaining E8 §11 xfails** | unchanged from §10's table of 60 | All 60 are blocked on E5(a), on the alfred-side policy snapshot, or on the O21b/O21c identity broker — none of which is this repo's code lane. |
 
 ### Suite counts at this head
@@ -527,28 +527,50 @@ tests/unit/test_sev0_runtime_authority.py`, `-p no:randomly`, foreground.
 
 | | Count | vs §10 (s4g) |
 |---|---|---|
-| passed | **685** | 656 → 685 (+19 this step, +10 from s4h) |
-| failed | **2** | 0 → 2 — **pre-existing at this step's base**, see below |
+| passed | **687** | 656 → 687 |
+| failed | **0** | 0 → 0 |
 | XPASS | **0** | unchanged |
 | strict xfail | **55** | 60 → 55; s4h landed the requeue receipt lifecycle and removed its five markers |
 
-⛔`failed = 2` and the task asked for `failed = 0`. It is not 0, and saying so is
-  the point. Both failures are
+`failed = 0`, `XPASS = 0`.
+
+⛔This is the **second** measurement of this step. The first turn measured
+  `failed = 2` and reported it as such rather than rounding it away; the two
+  were real and they are now diagnosed and fixed (`a905a2e`), so the number
+  moved honestly rather than the bar moving. What they were:
+
   `test_sev0_cea_i1_property.py::test_every_transport_reaches_admission_as_its_own_ingress`
   for `retry_http` and `stale_review_http` — *"never reached admission as
-  `retry.failed_task`; calls=['http.tasks']"*. They reproduce identically at
-  this step's base `e26ae5e` (checked out clean with `git archive e26ae5e` into
-  `/tmp` and run there: same 2 failed), so nothing in step 4i caused them.
+  `retry.failed_task`; calls=['http.tasks']"*. Bisected to `e26ae5e` (s4h) and
+  first attributed to "the path reaching admission". The real cause is narrower
+  and is in the **test driver**: both called `dispatch_and_start` before
+  constructing the `TestClient`, leaving their own task `in_progress` across the
+  app's boot. `_requeue_orphans` then re-queued it at startup — and since s4h a
+  requeue is a re-admission, so it SUPERSEDEd the receipt the driver was
+  holding. The result POST came back 409 `RECEIPT_SUPERSEDED` before
+  `_auto_retry_failed_task` / `_requeue_review_at_head` could reach admission,
+  which is why the only recorded call was the driver's own setup enqueue.
+  Dispatching inside the client context restores the scenario the test names —
+  an agent dispatched by a server already running. **No production code
+  changed**, and the file now matches its own §10/s4g baseline exactly (62
+  passed, 29 xfailed, 0 failed).
 
-  **Bisected.** The same file at the §10 head `94faba6` (s4g), extracted the
-  same way, is **62 passed / 29 xfailed / 0 failed**. So the regression is
-  `e26ae5e` — step 4h, "a requeue is a re-admission". That commit touched
-  `queue.py`, `cea/callsites.py`, `cea/engine.py` and `cea/validator.py` and did
-  not touch `server.py`, so the ingress *labelling* is unchanged and what broke
-  is the path reaching it: the retry and stale-review transports no longer
-  re-enter admission under their own ingress id. §10's `failed = 0` was true
-  when it was measured. Diagnosing 4h is a separate bounded step; it is recorded
-  here rather than absorbed, and it is **not** a reason to hold 4i.
+### `discovery` — since s4h, a restart supersedes the receipt of a live dispatch
+
+Diagnosing the two reds (below) surfaced a production semantic worth stating
+plainly, because it is not this step's and it is not visible from the tests'
+names. `_requeue_orphans` (`server.py:2529`) resets every `in_progress` row at
+startup — a server restart in dispatcher mode means the agent subprocesses died,
+so the row is incomplete. Since s4h that requeue is a **re-admission**, so it
+SUPERSEDEs the receipt.
+
+Consequence: if an agent *does* survive the restart, its result now comes back
+**409 `RECEIPT_SUPERSEDED`** where before s4h it was accepted. That is arguably
+what P4 asks for — the dispatch it was answering is dead and the row has already
+been handed out again — and accepting it would write a completion for a task
+another agent may now hold. It is recorded here as a behaviour change rather
+than endorsed: nothing in this lineage decided it deliberately, and no test
+names it. Not actioned in this step (a live dispatch-path semantic, not a fold).
 
 ### The guard count is unchanged
 
@@ -558,7 +580,7 @@ matrix) is still unstarted.
 
 ## §P Provenance
 
-- Step 4i (§11): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4i-t3-project-legacy` on :8105, branch `sev0/cea-lineage`, base `e26ae5e`, 2026-09-23. The two standing failures were baselined by extracting `e26ae5e` with `git archive` into `/tmp/cea_base` and running the same two files there — read-only, no worktree or branch created. All fixtures under `tmp_path`; `test_sev0_cea_s4c_dispatch_base_absent.py` was made hermetic in this step (it had been wiring itself from the live `~/alfred/governance` snapshot). No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
+- Step 4i (§11): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4i-t3-project-legacy` on :8105, branch `sev0/cea-lineage`, base `e26ae5e`, 2026-09-23. Run in **two turns** under the same task id: the first landed the two items and pushed through `ada1814` but was cut by a context reset before POSTing; the second (base `ada1814`, `context_reset: true`) re-verified every claim in this section against the tree rather than trusting it, diagnosed the two standing reds to root cause and closed them (`a905a2e`), and refreshed the `pipeline.py` line numbers, which had drifted since §8. The two standing failures were baselined by extracting `e26ae5e` with `git archive` into `/tmp/cea_base` and running the same two files there — read-only, no worktree or branch created. All fixtures under `tmp_path`; `test_sev0_cea_s4c_dispatch_base_absent.py` was made hermetic in this step (it had been wiring itself from the live `~/alfred/governance` snapshot). No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
 - Step 4g (§10): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4g-final-merge-reconcile` on :8105, branch `sev0/cea-lineage`, base `fc857aa`, merged `origin/sev0/cea-lineage-s4d` `d7e427f`, 2026-09-23. Guard greps re-run on the merged head; xfail reasons re-verified with `--runxfail`. All fixtures under `tmp_path` — the s4b harness fix exists precisely to stop the suite reading the live `~/alfred/governance` files. No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
 - Step 4e (§9): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4e-production-wiring` on :8105, branch `sev0/cea-lineage`, base `caf5644`, 2026-09-23. All fixtures under `tmp_path`; the live `~/alfred/governance` files were read only to report what the factory finds there. No live server, DB, GitHub or Telegram mutation.
 - Step 4c (§8): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4c-remainder-folds` on :8105, branch `sev0/cea-lineage`, base `bd58092`, 2026-09-23. Baselines for the pre-existing failures were taken by stashing the work tree at each commit's parent and re-running the same selection. No live server, DB, GitHub or Telegram mutation.
