@@ -22,10 +22,10 @@ import threading
 from dataclasses import asdict
 from typing import Optional
 
+from agent_crew.cea.auth import AuthenticationError, DenyAllAuthenticator
 from agent_crew.cea.engine import (
     Authorization, AuthorizationEngine, EngineConfig, EngineError)
-from agent_crew.cea.intent import (
-    Caller, CallerProvenance, IdentityStatus, Intent, IntentIdentity, Target, WorkClass)
+from agent_crew.cea.intent import Caller, Intent, IntentIdentity, Target, WorkClass
 
 _MAX_FRAME = 1 << 20
 
@@ -34,7 +34,17 @@ _MAX_FRAME = 1 << 20
 # One JSON object per connection, length-prefixed by a trailing newline. Small
 # enough to read by eye in a tcpdump, which matters for an audit boundary.
 
-def encode_intent(intent: Intent, caller: Caller, *, retry: bool = False) -> dict:
+def encode_intent(intent: Intent, credential: Optional[str], *,
+                  retry: bool = False) -> dict:
+    """The request an adapter puts on the wire.
+
+    ⛔There is no ``caller`` object here, and there must never be one again.
+      Before this fix the payload carried ``principal``/``provenance``/
+      ``credential_kind``/``identity_status`` and the decoder turned them into a
+      :class:`Caller` verbatim, so a peer named itself and was believed (codex
+      P1 #1). What crosses the boundary now is a *credential*; who that
+      credential belongs to is the engine's answer, not the caller's claim.
+    """
     return {
         "intent": {
             "identity": {
@@ -58,17 +68,17 @@ def encode_intent(intent: Intent, caller: Caller, *, retry: bool = False) -> dic
             "parent_receipt_id": intent.parent_receipt_id,
             "extra": dict(intent.extra or {}),
         },
-        "caller": {
-            "principal": caller.principal,
-            "provenance": getattr(caller.provenance, "value", caller.provenance),
-            "identity_status": getattr(caller.identity_status, "value", caller.identity_status),
-            "credential_kind": caller.credential_kind,
-        },
+        "credential": credential,
         "retry": bool(retry),
     }
 
 
-def decode_intent(payload: dict) -> tuple[Intent, Caller, bool]:
+def decode_intent(payload: dict) -> tuple[Intent, Optional[str], bool]:
+    """Wire → ``(intent, credential, retry)``. **Never** ``(intent, caller, …)``.
+
+    The credential is returned as the opaque string it is. Only
+    :mod:`agent_crew.cea.auth` may turn it into a principal.
+    """
     i = payload["intent"]
     t = i["identity"]["target"]
     identity = IntentIdentity(
@@ -84,12 +94,10 @@ def decode_intent(payload: dict) -> tuple[Intent, Caller, bool]:
         description=i.get("description") or "", coordinator_id=i.get("coordinator_id"),
         shadow=bool(i.get("shadow")), idempotency_key=i.get("idempotency_key"),
         parent_receipt_id=i.get("parent_receipt_id"), extra=dict(i.get("extra") or {}))
-    c = payload["caller"]
-    caller = Caller(principal=c["principal"],
-                    provenance=CallerProvenance(c["provenance"]),
-                    identity_status=IdentityStatus(c.get("identity_status") or "UNVERIFIED"),
-                    credential_kind=c.get("credential_kind"))
-    return intent, caller, bool(payload.get("retry"))
+    credential = payload.get("credential")
+    if credential is not None and not isinstance(credential, str):
+        credential = None
+    return intent, credential, bool(payload.get("retry"))
 
 
 # ── client ──────────────────────────────────────────────────────────────────
@@ -103,18 +111,47 @@ class UnixSocketEngineClient:
     back as the record — not assume it can read it from the local DB.
     """
 
-    def __init__(self, config: EngineConfig):
+    def __init__(self, config: EngineConfig, *, credential: Optional[str] = None):
         self.config = config
         self.endpoint = config.endpoint
+        self._credential = credential
 
-    def authorize(self, conn, intent: Intent, caller: Caller, *,
+    def authorize(self, conn, intent: Intent, caller: Optional[Caller] = None, *,
                   retry: bool = False) -> Authorization:
-        reply = self._call({"op": "authorize", **encode_intent(intent, caller, retry=retry)})
+        """Same signature as the in-process engine — ``caller`` is *ignored*.
+
+        ⛔Deliberate: the parameter exists so the two deployments stay
+          interchangeable, and dropping it is the fix. An adapter cannot tell a
+          remote engine who it is; it can only present its own credential and let
+          the engine decide (J9). A Caller built locally and shipped over the
+          wire is exactly the forgery this boundary now refuses.
+        """
+        reply = self._call({"op": "authorize",
+                            **encode_intent(intent, self.credential(), retry=retry)})
+        if reply.get("code") == "UNAUTHENTICATED":
+            # 401 with no receipt: an unauthenticated caller does not get to
+            # learn the policy state, and it certainly does not get an audit row
+            # attributed to a principal nobody verified (§7.1, CXC-4).
+            raise EngineError("401 UNAUTHENTICATED: the engine did not recognise this "
+                              "adapter's credential (J9)")
         if "error" in reply:
             raise EngineError(str(reply["error"]))
         return Authorization(receipt=reply["receipt"], http_status=int(reply["http_status"]),
                              code=str(reply["code"]), reused=bool(reply.get("reused")),
                              existing_receipt_id=reply.get("existing_receipt_id"))
+
+    def credential(self) -> Optional[str]:
+        """This adapter's own token: the constructor override, else the config file."""
+        if self._credential is not None:
+            return self._credential
+        path = self.config.caller_token_path
+        if not path:
+            return None
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return fh.read().strip() or None
+        except OSError as exc:
+            raise EngineError(f"adapter token file {path!r} is unreadable: {exc}") from exc
 
     def _call(self, request: dict) -> dict:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -147,7 +184,17 @@ class _Handler(socketserver.StreamRequestHandler):
         raw = self.rfile.read(_MAX_FRAME)
         try:
             request = json.loads(raw.decode("utf-8"))
-            intent, caller, retry = decode_intent(request)
+            intent, credential, retry = decode_intent(request)
+            # J9 before anything else is read or written. A forged or absent
+            # credential gets 401 and **no receipt**: writing an audit row for an
+            # unauthenticated principal would put an attacker-chosen identity
+            # into the record the whole system is supposed to trust.
+            caller = self.server.authenticate(credential)   # type: ignore[attr-defined]
+            if caller is None:
+                self.wfile.write(json.dumps(
+                    {"error": "unauthenticated caller (J9)", "http_status": 401,
+                     "code": "UNAUTHENTICATED", "receipt": None}).encode("utf-8"))
+                return
             conn = self.server.connect()          # type: ignore[attr-defined]
             try:
                 auth = self.server.engine.authorize(conn, intent, caller, retry=retry)  # type: ignore[attr-defined]
@@ -167,7 +214,8 @@ class EngineService(socketserver.ThreadingUnixStreamServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, path: str, engine: AuthorizationEngine, connect):
+    def __init__(self, path: str, engine: AuthorizationEngine, connect,
+                 authenticator=None):
         if os.path.exists(path):
             os.unlink(path)
         super().__init__(path, _Handler)
@@ -175,6 +223,17 @@ class EngineService(socketserver.ThreadingUnixStreamServer):
         self.engine = engine
         self.connect = connect
         self.path = path
+        # Deny-all by default: an engine started without a caller token table
+        # authenticates nobody. The alternative — "no table configured, so
+        # everybody is fine" — is the shape of failure P7 exists to forbid.
+        self.authenticator = authenticator or DenyAllAuthenticator()
+
+    def authenticate(self, credential) -> Optional[Caller]:
+        """J9. An authenticator that cannot be consulted is a refusal, not an ALLOW."""
+        try:
+            return self.authenticator.authenticate(credential)
+        except AuthenticationError:
+            return None
 
     def serve_in_thread(self) -> threading.Thread:
         thread = threading.Thread(target=self.serve_forever, daemon=True)

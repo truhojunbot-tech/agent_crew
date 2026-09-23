@@ -151,6 +151,13 @@ class EngineConfig:
     issuer: str = "agent_crew.cea.engine"
     role_agents: dict = field(default_factory=lambda: dict(DEFAULT_ROLE_AGENTS))
     default_max_attempts: int = 1
+    caller_token_path: Optional[str] = None
+    """J9 client side: the file holding *this adapter's own* token.
+
+    An adapter proves who it is by presenting a secret the engine can check; it
+    does not get to describe itself in the request body (:mod:`agent_crew.cea.auth`).
+    ``None`` means this adapter has no credential, so a remote engine answers 401.
+    """
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> "EngineConfig":
@@ -163,6 +170,7 @@ class EngineConfig:
             endpoint=(e.get("AGENT_CREW_CEA_ENGINE_ENDPOINT") or "").strip() or None,
             key_path=(e.get("AGENT_CREW_CEA_ENGINE_KEY") or "").strip() or None,
             issuer=(e.get("AGENT_CREW_CEA_ISSUER") or "").strip() or cls.issuer,
+            caller_token_path=(e.get("AGENT_CREW_CEA_ADAPTER_TOKEN_FILE") or "").strip() or None,
         )
 
     @property
@@ -199,6 +207,19 @@ class Authorization:
 
 class EngineError(Exception):
     """The engine could not produce a receipt at all (never a policy outcome)."""
+
+
+class UnauthenticatedCaller(EngineError):
+    """J9 refused before any input was read: 401, and **no receipt** (CXC-4).
+
+    A subclass of :class:`EngineError` so every existing adapter that already
+    fails closed on an engine error keeps doing so; the distinct type is what
+    lets an adapter answer 401 rather than 500.
+    """
+
+
+_TRUSTED_CREDENTIAL_KINDS = ("adapter_token", "broker_registered")
+"""The kinds :mod:`agent_crew.cea.auth` can issue. ``None`` is not one of them."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -296,10 +317,27 @@ class AuthorizationEngine:
         receipt_store.ensure_schema(conn)
         ih = intent_hash(intent.identity)
 
-        # J9 — who is asking. No credential at all is 401 before anything else is
-        # read: an unauthenticated caller does not get to learn the policy state.
+        # J9 — who is asking. 401 before anything else is read: an
+        # unauthenticated caller does not get to learn the policy state, and it
+        # does not get an audit row in its chosen name either.
+        #
+        # ⛔A Caller is only ever a *result of authentication*
+        #   (:mod:`agent_crew.cea.auth`). Checking `caller is None` was not
+        #   authentication: the socket decoder built one from request JSON, so
+        #   `Caller(principal="attacker", provenance="direct",
+        #   credential_kind=None)` passed this line and an OPS intent under it
+        #   was ALLOWed (codex P1 #1). The credential_kind test below is the
+        #   in-process half of the fix — an object nobody authenticated has no
+        #   kind to name — and the socket half is that the wire no longer
+        #   carries a principal at all.
         if caller is None:
-            raise EngineError("authorize() requires a Caller; adapters authenticate first (§7.1)")
+            raise UnauthenticatedCaller(
+                "authorize() requires an authenticated Caller; adapters authenticate first (§7.1)")
+        if getattr(caller, "credential_kind", None) not in _TRUSTED_CREDENTIAL_KINDS:
+            raise UnauthenticatedCaller(
+                f"caller {caller.principal!r} presents credential_kind "
+                f"{getattr(caller, 'credential_kind', None)!r}, which no authenticator issues; "
+                f"a Caller must come from agent_crew.cea.auth, never from a request body (J9)")
 
         # J1 — lineage. Answered before the expensive inputs so a replay costs a
         # single indexed read, which is what makes idempotency cheap enough to be

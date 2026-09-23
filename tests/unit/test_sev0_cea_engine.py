@@ -587,20 +587,35 @@ def test_the_unix_socket_client_returns_the_same_authorization(tmp_path):
         receipt_store.ensure_schema(c)
         return c
 
+    from agent_crew.cea.auth import AdapterIdentity, StaticTokenAuthenticator
+    token = "svc-token"
+    tokens = StaticTokenAuthenticator(
+        {token: AdapterIdentity(principal="cron:admitted_trigger",
+                                provenance=CallerProvenance.CRON)})
+
     sock = str(tmp_path / "authz.sock")
-    service = EngineService(sock, engine(), connect)
+    service = EngineService(sock, engine(), connect, tokens)
     service.serve_in_thread()
     try:
-        client = get_engine(config=EngineConfig(mode="enforce", endpoint=sock))
-        auth = client.authorize(None, intent("svc-1"), caller())
+        # The adapter presents its own token; it does not describe itself (J9).
+        client = get_engine(config=EngineConfig(mode="enforce", endpoint=sock,
+                                                caller_token_path=str(_token_file(tmp_path, token))))
+        auth = client.authorize(None, intent("svc-1"))
         assert validate_receipt(auth.receipt) == []
         assert auth.receipt["intent_hash"] == intent_hash(identity())
         assert auth.decision == "REVIEW"
         # and the out-of-process engine kept its own lineage
-        dup = client.authorize(None, intent("svc-2"), caller())
+        dup = client.authorize(None, intent("svc-2"))
         assert dup.http_status == 409 and dup.code == "DUPLICATE_INTENT"
     finally:
         service.shutdown_and_close()
+
+
+def _token_file(tmp_path, token: str):
+    path = tmp_path / "adapter.token"
+    path.write_text(token)
+    path.chmod(0o600)
+    return path
 
 
 def test_an_unreachable_engine_endpoint_raises_rather_than_guessing(tmp_path):
@@ -610,7 +625,7 @@ def test_an_unreachable_engine_endpoint_raises_rather_than_guessing(tmp_path):
     client = get_engine(config=EngineConfig(mode="enforce",
                                             endpoint=str(tmp_path / "nothing.sock")))
     with pytest.raises(EngineError):
-        client.authorize(None, intent(), caller())
+        client.authorize(None, intent())
 
 
 def test_config_from_env_selects_the_boundary(monkeypatch):
