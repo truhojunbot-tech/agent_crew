@@ -2119,6 +2119,61 @@ class TaskQueue:
             current=_cea_callsites.current_inputs(engine, receipt, claimant=claimant),
             config=self.cea_config())
 
+    #: Every ``pending -> in_progress`` mutation names itself here. The static
+    #: test in ``tests/unit/test_sev0_cea_s2b_adapters.py`` asserts that the set
+    #: of methods containing that UPDATE is exactly this set, and that each one
+    #: calls :meth:`claim_through_gate`.
+    CLAIM_MUTATION_METHODS = ("dequeue", "dequeue_discuss_for_agent")
+
+    def claim_through_gate(self, conn, task_id: str, *, agent: str = "", role: str = "",
+                           claimed_via: str = "", now: Optional[float] = None):
+        """Take a row ``pending -> in_progress`` behind the P2 CLAIM gate.
+
+        The one place that mutation happens, for the same reason
+        :meth:`enqueue_with_receipt` is the one place a row is written: P2's
+        claim is about *where the code calls the validator from*, and a second
+        claim path is exactly how the gate stops running without any behavioural
+        test noticing. ``dequeue_discuss_for_agent`` was that second path — it
+        flipped the row while the receipt stayed ``QUEUED`` (codex review of
+        ``8993bdb``, P1); routing it here is what makes the property hold rather
+        than the docstring assert it.
+
+        Returns ``(claimed: bool, gate)``. ``claimed=False`` means the caller
+        must ``ROLLBACK`` and treat the task as not taken. The caller holds the
+        ``BEGIN IMMEDIATE``; nothing here commits.
+        """
+        gate = self._cea_claim_gate(conn, task_id, agent=agent, role=role)
+        if gate is None:
+            # A row with no receipt at all — admitted before step 2c, or by a
+            # writer that predates the trigger. There is nothing to validate, so
+            # under `enforce` it is not runnable: "no enqueue, no claim ...
+            # without a valid receipt" (P2) reads the same way for a receipt
+            # that is missing as for one that is refused. Under `shadow` it runs
+            # and is *reported*, which is the count that says how many such rows
+            # are still out there before a deployment turns enforcement on.
+            if _cea_callsites.enforcing(self.cea_config()):
+                logger.warning("cea: claim refused for %s — NO_RECEIPT under enforce", task_id)
+                return False, None
+            logger.info("cea: claiming %s with no receipt (shadow; enforce would refuse)",
+                        task_id)
+        if gate is not None and not gate.proceed:
+            # P6/P3 say what happens next (HELD returns to the engine, BLOCK
+            # stays put). Either way it is not claimed now, and the row is left
+            # pending for the state that produced the answer to clear.
+            logger.warning("cea: claim refused for %s — %s", task_id, gate.reason)
+            return False, gate
+        at = time.time() if now is None else now
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
+            (at, task_id),
+        )
+        self._record_claim_on(conn, task_id, at, role=role or None,
+                              agent=agent or None, via=claimed_via)
+        if gate is not None:
+            self._cea_transition_in_txn(conn, self.cea_engine(), gate.receipt_id,
+                                        "CLAIMED", note=f"claim: {gate.outcome.value}")
+        return True, gate
+
     # ── one-shot PR announcements (#250 review) ───────────────────────
     #
     # ⛔The claim is a ROW, not a check. The exhaustion notice used to do
@@ -2400,26 +2455,11 @@ class TaskQueue:
             # The claim and the receipt check commit together: a task that fails
             # the check is never left half-claimed, and a claim that wins the
             # race never runs without the check having seen the same B′.
-            claim_gate = self._cea_claim_gate(conn, row["task_id"], agent=agent, role=role)
-            if claim_gate is not None and not claim_gate.proceed:
-                # P6/P3 say what happens next (HELD returns to the engine, BLOCK
-                # stays put). Either way it is not claimed now, and the row is
-                # left pending for the state that produced the answer to clear.
+            claimed, _claim_gate = self.claim_through_gate(
+                conn, row["task_id"], agent=agent, role=role, claimed_via=claimed_via)
+            if not claimed:
                 conn.execute("ROLLBACK")
-                logger.warning("cea: claim refused for %s — %s", row["task_id"], claim_gate.reason)
                 return None
-
-            _now = time.time()
-            conn.execute(
-                "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
-                (_now, row["task_id"]),
-            )
-            self._record_claim_on(conn, row["task_id"], _now, role=role or None,
-                                  agent=agent or None, via=claimed_via)
-            if claim_gate is not None:
-                self._cea_transition_in_txn(conn, self.cea_engine(),
-                                            claim_gate.receipt_id, "CLAIMED",
-                                            note=f"claim: {claim_gate.outcome.value}")
             conn.execute("COMMIT")
 
             return TaskRequest(
@@ -3467,13 +3507,18 @@ class TaskQueue:
             if chosen is None:
                 conn.execute("ROLLBACK")
                 return None
-            _now = time.time()
-            conn.execute(
-                "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
-                (_now, chosen["task_id"]),
-            )
-            self._record_claim_on(conn, chosen["task_id"], _now, role="discuss",
-                                  agent=agent or None, via=claimed_via)
+            # ── P2 CLAIM, same call site as `dequeue` ────────────────────
+            # ⛔This used to flip the row directly. A discuss task admitted
+            #   through the engine was therefore claimed with its receipt still
+            #   QUEUED, and under `enforce` a receipt the validator would have
+            #   refused was claimed anyway — a live second claim path around the
+            #   gate (codex review of 8993bdb, P1).
+            claimed, _claim_gate = self.claim_through_gate(
+                conn, chosen["task_id"], agent=agent, role="discuss",
+                claimed_via=claimed_via)
+            if not claimed:
+                conn.execute("ROLLBACK")
+                return None
             conn.execute("COMMIT")
             return TaskRequest(
                 task_id=chosen["task_id"],
