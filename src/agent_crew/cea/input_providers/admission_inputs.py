@@ -48,7 +48,7 @@ class AdmissionInputsClient:
 
     def __init__(self, path: Optional[str] = None, *, python: Optional[str] = None,
                  timeout: float = 10.0, runner: Optional[Callable[[dict], dict]] = None,
-                 env: Optional[dict] = None):
+                 env: Optional[dict] = None, child_env: Optional[dict] = None):
         e = os.environ if env is None else env
         self.path = path or (e.get("AGENT_CREW_CEA_ADMISSION_INPUTS") or "").strip() \
             or DEFAULT_ADMISSION_INPUTS
@@ -56,6 +56,10 @@ class AdmissionInputsClient:
         self.timeout = timeout
         self._runner = runner
         self._cache: dict[str, dict] = {}
+        self._child_env = dict(child_env or {})
+        """Extra environment for the alfred script — how the wiring tells it which
+        registry / incident-memory files to read. Merged over ``os.environ`` at
+        spawn time, never consulted for our own decisions."""
 
     def provide(self, intent: Intent) -> dict:
         """The raw ``admission-inputs/v1`` answer; raises :class:`InputUnavailable`."""
@@ -75,9 +79,10 @@ class AdmissionInputsClient:
         if not os.path.isfile(self.path):
             raise InputUnavailable(f"{self.path} does not exist (L2/L3 provider path unset?)")
         try:
+            child = None if not self._child_env else {**os.environ, **self._child_env}
             proc = subprocess.run([self.python, self.path], input=json.dumps(req),
                                   capture_output=True, text=True, timeout=self.timeout,
-                                  check=False)
+                                  check=False, env=child)
         except (OSError, subprocess.SubprocessError) as exc:
             raise InputUnavailable(f"admission_inputs did not run: {exc}") from exc
         if proc.returncode != 0:

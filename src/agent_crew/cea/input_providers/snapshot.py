@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import calendar
 import hashlib
+import hmac
 import json
 import os
 import time
@@ -118,3 +119,24 @@ class CanonicalPolicySnapshotReader:
             review_test_matrix=dict(doc.get("review_test_matrix") or {}),
             human_gate_predicates=tuple(p for p in doc.get("human_gate_predicates") or ()
                                         if isinstance(p, dict)))
+
+
+def hmac_sha256_verifier(key: bytes) -> Verifier:
+    """A :data:`Verifier` for the ``hmac-sha256`` signature block the engine writes.
+
+    The snapshot producer is alfred, not this process, so this is the *reader*
+    side of a shared secret: ``value`` must be HMAC-SHA256 over the canonical
+    body under ``key``. Anything else — a different ``alg``, a missing value, a
+    mismatch — is ``INVALID``, never ``UNKEYED``: we had a key and it did not
+    check out, which is a stronger statement than "nobody checked".
+    """
+    def verify(body: bytes, signature: dict) -> SignatureStatus:
+        if not isinstance(signature, dict) or signature.get("alg") != "hmac-sha256":
+            return SignatureStatus.INVALID
+        value = signature.get("value")
+        if not isinstance(value, str) or not value:
+            return SignatureStatus.INVALID
+        expected = hmac.new(key, body, hashlib.sha256).hexdigest()
+        return SignatureStatus.VALID if hmac.compare_digest(expected, value) \
+            else SignatureStatus.INVALID
+    return verify

@@ -60,6 +60,7 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import AdmissionRefused, TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
 from agent_crew.cea import callsites as _cea_callsites
+from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
@@ -2558,7 +2559,18 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        state["queue"] = TaskQueue(db_path)
+        # ADR P1/P7 — construct the CEA inputs here, in the process that decides.
+        # Before this, production built `TaskQueue(db_path)` with no providers at
+        # all: every input reported unavailable, every receipt was BLOCK, and the
+        # P6 loosening verifier had no production call site, so a signed snapshot
+        # on disk could not restore ACTIVE through this server no matter what it
+        # said. `install_from_env` never raises and never loosens by itself — an
+        # input it cannot read stays UNAVAILABLE, which P7 turns into a recorded
+        # BLOCK inside the engine rather than an exception out here.
+        _cea_wiring = cea_wiring.install_from_env(
+            db_path=db_path, project=project, logger=logger)
+        state["cea_wiring"] = _cea_wiring
+        state["queue"] = TaskQueue(db_path, cea_providers=_cea_wiring.providers)
         # #248: stamp the build into the durable event stream at startup, so a
         # production before/after cohort can be cut on the PROCESS boundary
         # instead of on a GitHub merge time. #247 showed those are not the same
