@@ -321,3 +321,146 @@ def test_shadow_mode_never_refuses_but_records_the_truth(minted):
 def test_validator_answer_is_the_same_function_the_gate_uses(minted):
     receipt, cur = _at(minted, VP.CLAIM)
     assert validate(receipt, VP.CLAIM, cur).outcome is _gate(VP.CLAIM, receipt, cur).outcome
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 4d-r2 (Codex P1): paths BACK to pending. The sweep above counted only
+# ``INSERT INTO tasks``; every write that sets a task to pending/queued is a path
+# back to claim/dispatch and must be counted and exercised.
+# ═══════════════════════════════════════════════════════════════════════════
+
+from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
+    AuthorityState, queue_for, receipt_for_task, task)
+
+#: every product write that sets tasks.status to pending/queued, by function.
+#: ``defer_push_delivery`` writes status via a bound parameter (``status = ?``
+#: with "pending") so it is matched by name, not by literal.
+PENDING_WRITERS = {
+    "queue.py": {"enqueue (INSERT)", "requeue", "reset_stale_to_pending",
+                 "defer_push_delivery"},
+}
+#: callers of those writers that are themselves "paths back" (server/cli).
+REQUEUE_CALLERS = {"server.py": {"_requeue_orphans", "requeue"}, "cli.py": {"recover"}}
+
+
+def _pending_writes():
+    lit = re.compile(r"UPDATE\s+tasks\s+SET[^\"']*status\s*=\s*'(pending|queued)'", re.I | re.S)
+    out = {}
+    for p, body in _sources().items():
+        rel = p.relative_to(SRC).as_posix()
+        for m in lit.finditer(body):
+            ln = body[:m.start()].count("\n") + 1
+            out.setdefault(rel, []).append(ln)
+    return out
+
+
+def test_static_every_literal_pending_write_is_inventoried():
+    """Counts every ``UPDATE tasks SET ... status='pending'|'queued'`` — not just
+    INSERT. The two literal writers today are ``requeue`` and
+    ``reset_stale_to_pending``; ``defer_push_delivery`` is the bound-parameter one."""
+    writes = _pending_writes()
+    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 2, writes
+
+
+def test_static_the_bound_parameter_pending_writer_is_inventoried():
+    body = (SRC / "queue.py").read_text(encoding="utf-8")
+    hits = re.findall(r'status\s*=\s*"in_progress"\s+if\s+[^\n]+else\s+"pending"', body)
+    assert len(hits) == 1, hits  # defer_push_delivery
+
+
+def test_static_requeue_callers_are_inventoried():
+    calls = {}
+    for p, body in _sources().items():
+        rel = p.relative_to(SRC).as_posix()
+        n = len(re.findall(r"\.(requeue|reset_stale_to_pending|defer_push_delivery)\(", body))
+        if n and rel != "queue.py":
+            calls[rel] = n
+    assert set(calls) == {"server.py", "cli.py"}, calls
+
+
+def _claimed(tmp_path, name, mode):
+    q = queue_for(tmp_path, AuthorityState("active"), name=name, mode=mode)
+    q.enqueue(task("t1", context={"authority_decision_ids": ["T0-1234"]}), ingress="http.tasks")
+    t = q.dequeue(agent="claude", role="implementer")
+    assert t is not None and receipt_for_task(q, "t1")["state"] == "CLAIMED"
+    return q
+
+
+def _back_to_pending(q, how):
+    if how == "requeue":
+        q.requeue("t1")
+    elif how == "defer_push_delivery":
+        assert q.defer_push_delivery("t1", "%1", "pane refused", max_refusals=5, backoff_s=0) == 1
+    elif how in ("reset_stale_to_pending", "recover"):
+        # ``crew recover --reset-stale`` is exactly this call (cli.py recover)
+        c = sqlite3.connect(q._db_path)
+        c.execute("UPDATE tasks SET last_activity_at = 0 WHERE task_id = 't1'")
+        c.commit()
+        c.close()
+        assert q.reset_stale_to_pending(1) == ["t1"]
+    elif how == "_requeue_orphans":
+        # server startup: list in_progress -> requeue each (server.py _requeue_orphans)
+        for t in q.list_tasks(status="in_progress"):
+            q.requeue(t.task_id)
+    c = sqlite3.connect(q._db_path)
+    try:
+        return c.execute("SELECT status FROM tasks WHERE task_id='t1'").fetchone()[0]
+    finally:
+        c.close()
+
+
+REQUEUE_PATHS = ("requeue", "defer_push_delivery", "reset_stale_to_pending",
+                 "_requeue_orphans", "recover")
+S4F_REQUEUE = ("s4f item 'requeue receipt lifecycle': {how} sets tasks.status='pending' but "
+               "leaves the receipt CLAIMED with no lifecycle row (history ISSUED,QUEUED,CLAIMED; "
+               "LIFECYCLE_GRAPH has no CLAIMED->QUEUED edge). Needs: receipt back to QUEUED "
+               "(or HELD/SUPERSEDED + re-admission) in the same txn as the status write")
+
+
+@pytest.mark.parametrize("how", REQUEUE_PATHS)
+def test_requeue_moves_the_receipt_back_through_the_lifecycle(tmp_path, how, request):
+    request.applymarker(pytest.mark.xfail(strict=True, reason=S4F_REQUEUE.format(how=how)))
+    q = _claimed(tmp_path, f"{how}.db", "test")
+    assert _back_to_pending(q, how) == "pending"
+    conn = sqlite3.connect(q._db_path)
+    conn.row_factory = sqlite3.Row
+    r = receipt_for_task(q, "t1")
+    hist = [h["state"] for h in receipt_store.receipt_history(conn, r["receipt_id"])]
+    conn.close()
+    assert r["state"] in ("QUEUED", "HELD", "SUPERSEDED"), (r["state"], hist)
+    assert len(hist) > 3, hist
+
+
+@pytest.mark.parametrize("how", REQUEUE_PATHS)
+def test_requeued_task_is_not_reclaimed_on_the_stale_claimed_receipt_under_enforce(
+        tmp_path, how):
+    """Zero bypass holds today: under mode=test (enforcing) the claim gate refuses
+    a receipt that is still CLAIMED, so the requeued task is NOT re-dispatched on
+    it. (Liveness — it is stranded pending — is the s4f lifecycle item above.)"""
+    q = _claimed(tmp_path, f"enf-{how}.db", "test")
+    _back_to_pending(q, how)
+    assert q.dequeue(agent="claude", role="implementer") is None
+    assert receipt_for_task(q, "t1")["state"] == "CLAIMED"
+
+
+@pytest.mark.parametrize("how", REQUEUE_PATHS)
+def test_requeued_reclaim_under_shadow_is_reported(tmp_path, how, request):
+    """Shadow never refuses (P7), but it must REPORT the out-of-lifecycle re-claim:
+    a receipt row for the second claim. Measured at 9ef9230: the re-claim appends
+    a lifecycle row (history grows past ISSUED,QUEUED,CLAIMED) — PASS."""
+    q = _claimed(tmp_path, f"sh-{how}.db", "shadow")
+    _back_to_pending(q, how)
+    assert q.dequeue(agent="claude", role="implementer") is not None
+    conn = sqlite3.connect(q._db_path)
+    conn.row_factory = sqlite3.Row
+    r = receipt_for_task(q, "t1")
+    hist = receipt_store.receipt_history(conn, r["receipt_id"])
+    conn.close()
+    assert len(hist) > 3, [h["state"] for h in hist]
+
+
+def test_retry_is_a_new_admission_not_a_requeue():
+    """``retry.failed_task`` creates a NEW task through ``enqueue`` (its own
+    receipt), so it is an ingress (I1 registry), not a path back to pending."""
+    body = (SRC / "server.py").read_text(encoding="utf-8")
+    assert re.search(r'enqueue\(retry_req,\s*ingress="retry.failed_task"\)', body)

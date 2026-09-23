@@ -141,3 +141,70 @@ def enqueue_and_read(q: TaskQueue, req: TaskRequest, *, ingress: str):
     except AdmissionRefused as exc:
         return False, receipt_by_id(q, exc.receipt_id)
     return True, receipt_for_task(q, req.task_id)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# transport-level harness (4d-r2: Codex P1 — "I1 does not run every real §7
+# adapter/route"). Every real entry point constructs its own ``TaskQueue(db)``;
+# ``inject_cea`` makes *every* construction in the process carry the chosen
+# mode and fixture providers, and ``EnqueueSpy`` records what each adapter
+# actually handed to the one admission entry after its own decoding.
+# ═══════════════════════════════════════════════════════════════════════════
+
+class LiveState:
+    """Mutable pointer to an ``AuthorityState`` — lets a test build a parent
+    task under ACTIVE and then flip the authority state before the cascade."""
+
+    def __init__(self, s: AuthorityState):
+        self.s = s
+
+    def __getattr__(self, name):
+        return getattr(self.s, name)
+
+
+def inject_cea(monkeypatch, live: LiveState, *, mode: str = "test") -> None:
+    orig = TaskQueue.__init__
+
+    def _init(self, db_path, *a, **kw):
+        kw.setdefault("cea_config", EngineConfig(mode=mode))
+        kw.setdefault("cea_providers", providers(live))
+        orig(self, db_path, *a, **kw)
+
+    monkeypatch.setattr(TaskQueue, "__init__", _init)
+
+
+class EnqueueSpy:
+    """Wraps ``TaskQueue.enqueue``; records ``(ingress, req, admitted, receipt_id, db)``."""
+
+    def __init__(self, monkeypatch):
+        self.calls: list = []
+        orig = TaskQueue.enqueue
+        spy = self
+
+        def _enqueue(q, req, *a, **kw):
+            try:
+                out = orig(q, req, *a, **kw)
+            except AdmissionRefused as exc:
+                spy.calls.append((kw.get("ingress"), req, False, exc.receipt_id, q._db_path))
+                raise
+            conn = sqlite3.connect(q._db_path)
+            try:
+                r = conn.execute("SELECT receipt_id FROM tasks WHERE task_id = ?",
+                                 (req.task_id,)).fetchone()
+            finally:
+                conn.close()
+            spy.calls.append((kw.get("ingress"), req, True, r[0] if r else None, q._db_path))
+            return out
+
+        monkeypatch.setattr(TaskQueue, "enqueue", _enqueue)
+
+
+def persisted_receipt(db_path: str, receipt_id: Optional[str]) -> Optional[dict]:
+    if not receipt_id:
+        return None
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return receipt_store.current_receipt(conn, receipt_id)
+    finally:
+        conn.close()

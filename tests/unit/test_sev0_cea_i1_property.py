@@ -20,7 +20,20 @@ Two halves, because either alone proves nothing:
   identical across adapters. ``caller_*``, ``receipt_id``, ``issued_at`` are the
   documented exceptions (§12.1).
 
-Provenance: written against agent_crew ``bd58092`` (sev0/cea-lineage-s4d).
+* **transport equivalence** (4d-r2, Codex P1) — the half above calls
+  ``TaskQueue.enqueue`` directly, which only shows the common entry ignores the
+  ``ingress`` string. The ``TRANSPORTS`` block below drives each *real* entry
+  point (FastAPI ``POST /tasks`` via TestClient, ``crew enqueue`` via CliRunner,
+  ``loop.enqueue_*``, ``discussion.enqueue_panel_tasks``, the pipeline review
+  cascade, the ``watch.run_cycle`` cron wrapper) with every ``TaskQueue`` built
+  in-process carrying mode=test + fixture providers, spies the request each
+  adapter actually handed to admission, and compares the PERSISTED receipt's
+  ``(admitted, decision, reason, intent_hash)`` with the same request posted over
+  HTTP into a fresh DB. The route table and the MCP tool registry are frozen
+  against documented lists, so a new unlisted route/tool fails.
+
+Provenance: written against agent_crew ``bd58092`` (sev0/cea-lineage-s4d);
+transport half against ``9ef9230`` (s4d merged with sev0/cea-lineage ``caf5644``).
 """
 from __future__ import annotations
 
@@ -28,6 +41,7 @@ import ast
 import json
 import random
 import re
+import sqlite3
 
 import pytest
 
@@ -199,3 +213,227 @@ def test_the_fixture_set_is_not_degenerate(tmp_path):
                                        ingress="http.tasks")
         outcomes.add(admitted)
     assert outcomes == {True, False}, outcomes
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# transport equivalence (4d-r2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+from fastapi.testclient import TestClient  # noqa: E402
+from click.testing import CliRunner  # noqa: E402
+
+from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
+    EnqueueSpy, LiveState, inject_cea, persisted_receipt)
+
+#: Every mutating FastAPI route, frozen. ``POST /tasks`` is the only one that is
+#: an ingress (http.tasks); retry.failed_task and watchdog.stale_review are
+#: server-internal callers, not routes. A new route fails here until it is
+#: classified — ingress (add a transport below) or not.
+DOCUMENTED_MUTATING_ROUTES = {
+    ("DELETE", "/tasks/{task_id}"), ("POST", "/admin/replay-suppressed"),
+    ("POST", "/gates"), ("POST", "/gates/{gate_id}/resolve"),
+    ("POST", "/pane_map/reload"), ("POST", "/runtime/coordinator/handoff"),
+    ("POST", "/tasks"), ("POST", "/tasks/expire-stale"),
+    ("POST", "/tasks/{task_id}/checkpoint"), ("POST", "/tasks/{task_id}/result"),
+    ("POST", "/tasks/{task_id}/start"),
+}
+INGRESS_ROUTES = {("POST", "/tasks")}
+
+#: MCP exposes no task-creating tool (adapters.py: MCP deliberately absent);
+#: ``submit_result`` reaches admission only through the cascade.* adapters.
+DOCUMENTED_MCP_TOOLS = {"get_next_task", "get_next_discuss_task", "submit_result",
+                        "bump_activity", "get_task", "list_pending", "cancel_task"}
+
+#: ingress id -> the transport test below that drives it for real. Ids absent
+#: here are the remaining sub-items (reported, not silently passed).
+TRANSPORTS = {"http.tasks": "http", "cli.enqueue": "cli", "loop.implement": "loop",
+              "cli.discuss": "discussion", "cascade.review": "cascade_review",
+              "cron.watch": "cron_watch"}
+NOT_YET_TRANSPORT_DRIVEN = sorted(set(DOCUMENTED) - set(TRANSPORTS))
+
+
+def _app(db):
+    from agent_crew.server import create_app
+    return create_app(db_path=str(db), pane_map={}, port=0, watchdog_disabled=True,
+                      anomaly_disabled=True)
+
+
+def test_route_table_equals_the_documented_list():
+    routes = {(m, r.path) for r in _app(__import__("tempfile").mktemp(suffix=".db")).routes
+              if hasattr(r, "methods") for m in r.methods & {"POST", "PUT", "PATCH", "DELETE"}}
+    assert routes == DOCUMENTED_MUTATING_ROUTES, (
+        f"new: {sorted(routes - DOCUMENTED_MUTATING_ROUTES)}; "
+        f"gone: {sorted(DOCUMENTED_MUTATING_ROUTES - routes)}")
+
+
+def test_mcp_tool_registry_equals_the_documented_list(tmp_path):
+    from agent_crew.mcp_server import build_mcp_server
+    mcp = build_mcp_server(str(tmp_path / "m.db"))
+    tools = set(mcp._tool_manager._tools)
+    assert tools == DOCUMENTED_MCP_TOOLS, sorted(tools ^ DOCUMENTED_MCP_TOOLS)
+
+
+def test_every_registered_adapter_is_transport_driven_or_listed_as_remaining():
+    assert set(TRANSPORTS) <= set(adapters.BY_ID)
+    # the remaining ids are reported in the step result; this pins the list so it
+    # can only shrink knowingly.
+    assert NOT_YET_TRANSPORT_DRIVEN == sorted({
+        "cascade.fallback", "cascade.fix", "cascade.test", "cron.triage",
+        "loop.review", "loop.test", "retry.failed_task", "watchdog.stale_review"})
+
+
+def _via_http(tmp_path, req, name):
+    # raise_server_exceptions=False: observe the wire answer, as a real client does
+    with TestClient(_app(tmp_path / name), raise_server_exceptions=False) as c:
+        return c.post("/tasks", json=__import__("dataclasses").asdict(req))
+
+
+def _drive(kind, tmp_path, live):
+    """Run the real entry point for ``kind``; the spy records what reached admission."""
+    db = tmp_path / f"{kind}.db"
+    if kind == "http":
+        _via_http(tmp_path, task("h1", context={"authority_decision_ids": ["T0-1234"]}),
+                  f"{kind}.db")
+    elif kind == "cli":
+        from agent_crew.cli import crew
+        CliRunner().invoke(crew, ["enqueue", "implement", "add a --json flag", "--db", str(db),
+                                  "--task-id", "c1", "--project", "agent_crew"])
+    elif kind == "loop":
+        from agent_crew.loop import enqueue_implement
+        from agent_crew.queue import AdmissionRefused, TaskQueue
+        try:
+            enqueue_implement(TaskQueue(str(db)), "add a --json flag", "main",
+                              {"authority_decision_ids": ["T0-1234"]})
+        except AdmissionRefused:
+            pass
+    elif kind == "discussion":
+        from agent_crew.discussion import enqueue_panel_tasks
+        from agent_crew.queue import AdmissionRefused, TaskQueue
+        try:
+            enqueue_panel_tasks(TaskQueue(str(db)), ["claude"], "A vs B", {})
+        except AdmissionRefused:
+            pass
+    elif kind == "cascade_review":
+        from agent_crew.pipeline import auto_enqueue_review
+        from agent_crew.queue import TaskQueue
+        target = live.s
+        live.s = AuthorityState("active")
+        q = TaskQueue(str(db))
+        q.enqueue(task("impl-p", branch="feat/x"), ingress="http.tasks")
+        conn = sqlite3.connect(str(db))
+        conn.execute("UPDATE tasks SET status='completed' WHERE task_id='impl-p'")
+        conn.commit()
+        conn.close()
+        live.s = target
+        auto_enqueue_review(q, "impl-p", pr_number=None, pr_state_fn=lambda *a, **k: "OPEN")
+    elif kind == "cron_watch":
+        from agent_crew.queue import TaskQueue
+        from agent_crew.watch import ClaimLedger, run_cycle
+
+        class _Gh:
+            issues = [{"number": 7, "title": "add a --json flag", "body": "",
+                       "labels": [{"name": "agent-ready"}], "state": "OPEN"}]
+
+            def list_issues(self, repo):
+                return [dict(i) for i in self.issues]
+
+            def add_label(self, *a):
+                return True
+
+            def remove_label(self, *a):
+                return True
+
+            def issue_has_open_pr(self, *a):
+                return False
+        run_cycle(queue=TaskQueue(str(db)), ledger=ClaimLedger(str(db)),
+                  repo="example/agent_crew", gh=_Gh(), owner="t", project="agent_crew")
+
+
+def _view(admitted, r):
+    return (admitted, r["decision"], json.dumps(r["reason"], sort_keys=True), r["intent_hash"])
+
+
+TRANSPORT_STATES = (AuthorityState("active"),
+                    AuthorityState("quarantined", runtime=RuntimeState.QUARANTINED),
+                    AuthorityState("budget-exhausted", budget=BudgetClass.EXHAUSTED))
+
+
+S4F_EMPTY_PROJECT = ("s4f item 'empty-project admission': {kind} builds its TaskRequest with no "
+                     "project (loop.enqueue_* / discussion.enqueue_panel_tasks); the engine RAISES "
+                     "EngineError ($.project non-empty) instead of a P2 BLOCK receipt, so the "
+                     "adapter crashes and nothing is persisted")
+
+
+@pytest.mark.parametrize("state", TRANSPORT_STATES, ids=lambda s: s.label)
+@pytest.mark.parametrize("kind", sorted(set(TRANSPORTS.values())))
+def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind, state,
+                                                     request):
+    if kind in ("loop", "discussion"):
+        request.applymarker(pytest.mark.xfail(strict=True, raises=Exception,
+                                              reason=S4F_EMPTY_PROJECT.format(kind=kind)))
+    live = LiveState(state)
+    inject_cea(monkeypatch, live)
+    spy = EnqueueSpy(monkeypatch)
+    _drive(kind, tmp_path, live)
+    ingress_id = next(k for k, v in TRANSPORTS.items() if v == kind)
+    mine = [c for c in spy.calls if c[0] == ingress_id]
+    assert mine, f"{kind}: the real entry point never reached admission as {ingress_id}; " \
+                 f"calls={[c[0] for c in spy.calls]}"
+    for _, req, admitted, rid, db in mine:
+        got = persisted_receipt(db, rid)
+        assert got is not None, f"{kind}: no persisted receipt (P2 audit row missing)"
+        assert not validate_receipt(got), validate_receipt(got)
+        assert got["caller_identity_status"] == "UNVERIFIED"
+        n = len(spy.calls)
+        _via_http(tmp_path, req, f"base-{kind}-{req.task_id}.db")
+        _, _, b_adm, b_rid, b_db = spy.calls[n]
+        base = persisted_receipt(b_db, b_rid)
+        assert _view(admitted, got) == _view(b_adm, base), (
+            f"I1 transport violated: {kind} vs http.tasks under {state.label}")
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "s4f item 'empty-project admission': `crew enqueue --db` without --project and "
+    "`watch.run_cycle(project='')` reach the engine with project='' and it RAISES a frozen-"
+    "contract violation ($.project non-empty) instead of writing a P2 BLOCK audit receipt; "
+    "the adapter surfaces an exception (cli exit 1 / watch 'enqueue failed') with no receipt"))
+@pytest.mark.parametrize("kind", ["cli", "cron_watch"])
+def test_empty_project_is_a_refusal_with_an_audit_receipt_not_an_exception(
+        tmp_path, monkeypatch, kind):
+    from agent_crew.queue import AdmissionRefused, TaskQueue
+    live = LiveState(AuthorityState("active"))
+    inject_cea(monkeypatch, live)
+    q = TaskQueue(str(tmp_path / "e.db"))
+    ingress = {"cli": "cli.enqueue", "cron_watch": "cron.watch"}[kind]
+    with pytest.raises(AdmissionRefused) as exc:
+        q.enqueue(task("e1", project=""), ingress=ingress)
+    assert persisted_receipt(q._db_path, exc.value.receipt_id) is not None
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "s4f item 'empty-project admission': `crew enqueue --db` without --project and "
+    "`watch.run_cycle(project='')` reach the engine with project='' and it RAISES a frozen-"
+    "contract violation ($.project non-empty) instead of writing a P2 BLOCK audit receipt; "
+    "the adapter surfaces an exception (cli exit 1 / watch 'enqueue failed') with no receipt"))
+@pytest.mark.parametrize("kind", ["cli", "cron_watch"])
+def test_empty_project_is_a_refusal_with_an_audit_receipt_not_an_exception(
+        tmp_path, monkeypatch, kind):
+    from agent_crew.queue import AdmissionRefused, TaskQueue
+    live = LiveState(AuthorityState("active"))
+    inject_cea(monkeypatch, live)
+    q = TaskQueue(str(tmp_path / "e.db"))
+    ingress = {"cli": "cli.enqueue", "cron_watch": "cron.watch"}[kind]
+    with pytest.raises(AdmissionRefused) as exc:
+        q.enqueue(task("e1", project=""), ingress=ingress)
+    assert persisted_receipt(q._db_path, exc.value.receipt_id) is not None
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "s4f item 'http refusal mapping': POST /tasks has no `except AdmissionRefused` "
+    "(server.py create_task: only TaskAlreadyExistsError -> 409) and no app exception handler "
+    "for it, so a refused admission is an unhandled 500. Needs 4xx + receipt_id in the body"))
+def test_http_refusal_is_a_4xx_carrying_the_receipt_id(tmp_path, monkeypatch):
+    inject_cea(monkeypatch, LiveState(AuthorityState("q", runtime=RuntimeState.QUARANTINED)))
+    resp = _via_http(tmp_path, task("h1"), "r.db")
+    assert 400 <= resp.status_code < 500, resp.status_code
+    assert "receipt_id" in resp.text
