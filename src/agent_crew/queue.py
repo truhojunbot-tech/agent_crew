@@ -10,6 +10,7 @@ import time
 import uuid
 from typing import List, Optional
 
+from agent_crew.cea.store import ensure_schema as _cea_ensure_schema
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
@@ -434,6 +435,66 @@ CREATE TABLE IF NOT EXISTS runtime_stop (
 )
 """
 
+# ── P6 (ADR E11 @6cbce565): the #314 row generalised, not duplicated ────────
+# "The existing #314 runtime_stop single row ... is generalised, not duplicated:
+#  paused: bool → state ∈ {ACTIVE, DRAINING, QUARANTINED, STOPPED} + epoch +
+#  reason + decision_id."
+# `paused` stays and stays true exactly when state == STOPPED, so every caller
+# written against #314 keeps its meaning (STOPPED == paused) while the gates
+# gain the two intermediate states. The backfill below is what makes that true
+# on a DB that predates the columns.
+_DDL_MIGRATE_RUNTIME_STOP_P6 = (
+    "ALTER TABLE runtime_stop ADD COLUMN state TEXT NOT NULL DEFAULT 'ACTIVE'",
+    "ALTER TABLE runtime_stop ADD COLUMN reason TEXT",
+    "ALTER TABLE runtime_stop ADD COLUMN decision_id TEXT",
+)
+_DDL_BACKFILL_RUNTIME_STOP_STATE = (
+    "UPDATE runtime_stop SET state = 'STOPPED' WHERE paused = 1 AND state = 'ACTIVE'"
+)
+
+# P6: "Transitions go to an append-only runtime_state_events table."
+_DDL_RUNTIME_STATE_EVENTS = """
+CREATE TABLE IF NOT EXISTS runtime_state_events (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    epoch       INTEGER NOT NULL,
+    from_state  TEXT NOT NULL,
+    to_state    TEXT NOT NULL,
+    direction   TEXT NOT NULL,
+    who         TEXT NOT NULL,
+    reason      TEXT,
+    decision_id TEXT,
+    incident    TEXT,
+    note        TEXT,
+    evidence    TEXT,
+    created_at  REAL NOT NULL
+)
+"""
+_DDL_RUNTIME_STATE_EVENTS_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_runtime_state_events_epoch ON runtime_state_events(epoch)"
+)
+_DDL_RUNTIME_STATE_EVENTS_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS trg_runtime_state_events_no_update\n"
+    "BEFORE UPDATE ON runtime_state_events BEGIN\n"
+    "    SELECT RAISE(ABORT, 'runtime_state_events is append-only (ADR P6)');\n"
+    "END",
+    "CREATE TRIGGER IF NOT EXISTS trg_runtime_state_events_no_delete\n"
+    "BEFORE DELETE ON runtime_state_events BEGIN\n"
+    "    SELECT RAISE(ABORT, 'runtime_state_events is append-only (ADR P6)');\n"
+    "END",
+)
+
+RUNTIME_STATES = ("ACTIVE", "DRAINING", "QUARANTINED", "STOPPED")
+_RUNTIME_TIGHTNESS = {"ACTIVE": 0, "DRAINING": 1, "QUARANTINED": 2, "STOPPED": 3}
+
+
+class RuntimeTransitionRefused(Exception):
+    """A loosening transition was attempted without the authority P6 requires.
+
+    Tightening is never refused — "A tightening can never be blocked by an
+    unavailable input" (P6) — so this is only ever raised on the way out of a
+    more restrictive state.
+    """
+
 # #314 §3/§4: cascade outbox. result 저장과 **항상 같은 txn**에 기록되는 durable continuation
 # 레코드(result_json 전체). pause 여부와 무관하게 submit_result가 원자적으로 넣는다 → result 저장과
 # suppression 기록 사이 crash로 continuation을 잃는 B3-b를 제거. §4: pause-aware executor가 lease
@@ -623,6 +684,26 @@ class TaskQueue:
         conn.execute(_DDL_COORDINATOR_RECEIPTS)
         conn.execute(_DDL_PR_ANNOUNCEMENTS)
         conn.execute(_DDL_RUNTIME_STOP)
+        # P6: generalise the #314 row in place. Additive + idempotent: the ALTERs
+        # fail once the columns exist, and the backfill only fires on the run that
+        # added them, so an existing live DB converges without a rewrite.
+        for _stmt in _DDL_MIGRATE_RUNTIME_STOP_P6:
+            try:
+                conn.execute(_stmt)
+            except Exception:
+                pass  # column already exists
+        try:
+            conn.execute(_DDL_BACKFILL_RUNTIME_STOP_STATE)
+        except Exception:
+            pass
+        conn.execute(_DDL_RUNTIME_STATE_EVENTS)
+        conn.execute(_DDL_RUNTIME_STATE_EVENTS_INDEX)
+        for _stmt in _DDL_RUNTIME_STATE_EVENTS_TRIGGERS:
+            conn.execute(_stmt)
+        # §3 receipt store: authorization_receipts (append-only) + dispatch_nonces
+        # + the nullable tasks.receipt_id column. Nothing reads them yet — step 2
+        # wires the five validator call sites (ADR P2).
+        _cea_ensure_schema(conn)
         conn.execute(_DDL_CASCADE_OUTBOX)
         conn.execute(_DDL_EXTERNAL_OP)
         try:
@@ -860,15 +941,225 @@ class TaskQueue:
 
     def _read_stop_row(self, conn) -> dict:
         """runtime_stop 단일행을 읽어 정규화. 행 없음=기본 unpaused(부팅 reconcile이 seeding).
-        읽기 예외는 호출측에서 fail-closed 처리."""
-        row = conn.execute(
-            "SELECT epoch, paused, incident, note, updated_at FROM runtime_stop WHERE id=1"
-        ).fetchone()
+        읽기 예외는 호출측에서 fail-closed 처리.
+
+        P6: the row now also carries ``state``/``reason``/``decision_id``. A DB
+        that predates the migration (read-only handle, older process) still
+        answers: the fallback SELECT reads the #314 columns and derives the state
+        from ``paused``, because STOPPED == paused is the compatibility rule.
+        """
+        try:
+            row = conn.execute(
+                "SELECT epoch, paused, incident, note, updated_at, state, reason, decision_id "
+                "FROM runtime_stop WHERE id=1").fetchone()
+            has_p6 = True
+        except sqlite3.OperationalError:
+            row = conn.execute(
+                "SELECT epoch, paused, incident, note, updated_at FROM runtime_stop WHERE id=1"
+            ).fetchone()
+            has_p6 = False
         if row is None:
-            return {"epoch": 0, "paused": False, "incident": None, "note": None, "updated_at": 0.0}
-        return {"epoch": int(row["epoch"] or 0), "paused": bool(row["paused"]),
+            return {"epoch": 0, "paused": False, "incident": None, "note": None,
+                    "updated_at": 0.0, "state": "ACTIVE", "reason": None, "decision_id": None}
+        paused = bool(row["paused"])
+        state = (row["state"] if has_p6 else None) or ("STOPPED" if paused else "ACTIVE")
+        if state not in RUNTIME_STATES:
+            state = "STOPPED"  # unknown value ⇒ fail-closed (P7 "runtime state unreadable")
+        return {"epoch": int(row["epoch"] or 0), "paused": paused,
                 "incident": row["incident"], "note": row["note"],
-                "updated_at": row["updated_at"] or 0.0}
+                "updated_at": row["updated_at"] or 0.0,
+                "state": state,
+                "reason": (row["reason"] if has_p6 else None),
+                "decision_id": (row["decision_id"] if has_p6 else None)}
+
+    # ── P6 runtime state (ADR E11 @6cbce565 Π P6, §4) ───────────────────────
+
+    def get_runtime_state(self) -> dict:
+        """The P6 row as one value: ``{state, epoch, reason, decision_id, paused,
+        incident, note, updated_at, effective_state, pause_json_tightening}``.
+
+        ``effective_state`` is what the gates act on: the row, tightened by the
+        ``pause.json`` signal if that is armed. P6 makes ``pause.json`` a
+        *tighten-only input* — it can raise the state, never lower it — so the row
+        remains the single store and no union of two sources can loosen anything.
+        A read failure is reported as STOPPED (P7: "runtime state unreadable ⇒
+        treated as STOPPED", already the #314 behaviour).
+        """
+        try:
+            conn = self._connect()
+        except Exception:
+            return {"state": "STOPPED", "effective_state": "STOPPED", "epoch": None,
+                    "paused": True, "reason": "runtime_state_unreadable", "decision_id": None,
+                    "incident": None, "note": None, "updated_at": None,
+                    "pause_json_tightening": None, "read_failed": True}
+        try:
+            row = self._read_stop_row(conn)
+        except Exception:
+            return {"state": "STOPPED", "effective_state": "STOPPED", "epoch": None,
+                    "paused": True, "reason": "runtime_state_unreadable", "decision_id": None,
+                    "incident": None, "note": None, "updated_at": None,
+                    "pause_json_tightening": None, "read_failed": True}
+        finally:
+            conn.close()
+        tightening = self._pausejson_active()
+        row["pause_json_tightening"] = tightening
+        row["effective_state"] = self._tighten(row["state"], "STOPPED" if tightening else "ACTIVE")
+        row["read_failed"] = False
+        return row
+
+    @staticmethod
+    def _tighten(a: str, b: str) -> str:
+        """"the more restrictive value wins" (P6, on the `fleet_runtimes.json` mirror)."""
+        return a if _RUNTIME_TIGHTNESS.get(a, 3) >= _RUNTIME_TIGHTNESS.get(b, 3) else b
+
+    @staticmethod
+    def _is_owner(who: str) -> bool:
+        w = (who or "").strip().lower()
+        return w == "owner" or w.startswith("owner:")
+
+    def _transition_refusal(self, frm: str, to: str, who: str, decision_id, entered_by,
+                            quarantine_entry: bool) -> Optional[str]:
+        """The P6 transition table as one predicate. ``None`` = permitted.
+
+        Tightening is always permitted, for any authenticated principal. Loosening
+        is where authority lives:
+
+        * QUARANTINED/STOPPED → looser: **owner only**, naming a T0 decision_id —
+          "the requester does not self-attest".
+        * DRAINING → ACTIVE: the principal that set DRAINING, or the owner, and
+          only if that DRAINING was not entered by a quarantine trigger.
+        """
+        if _RUNTIME_TIGHTNESS[to] >= _RUNTIME_TIGHTNESS[frm]:
+            return None
+        if frm in ("QUARANTINED", "STOPPED"):
+            if not self._is_owner(who):
+                return (f"{frm} → {to} is a loosening transition: owner only (P6). "
+                        f"requester={who!r}")
+            if not (decision_id or "").strip():
+                return (f"{frm} → {to} requires a T0 owner decision_id naming runtime and build "
+                        f"commit (P6); none was given")
+            return None
+        if frm == "DRAINING":
+            if quarantine_entry:
+                return ("DRAINING was entered via a quarantine trigger; it may not be loosened "
+                        "without an owner decision (P6)")
+            if self._is_owner(who) or (entered_by and who == entered_by):
+                return None
+            return (f"DRAINING → {to} may be made by the principal that set DRAINING "
+                    f"({entered_by!r}) or the owner; requester={who!r}")
+        return None
+
+    def _last_draining_entry(self, conn) -> tuple[Optional[str], bool]:
+        """Who put the runtime into DRAINING last, and whether a quarantine trigger did it."""
+        row = conn.execute(
+            "SELECT who, reason FROM runtime_state_events WHERE to_state='DRAINING' "
+            "ORDER BY id DESC LIMIT 1").fetchone()
+        if row is None:
+            return None, False
+        who = row["who"] if isinstance(row, sqlite3.Row) else row[0]
+        reason = (row["reason"] if isinstance(row, sqlite3.Row) else row[1]) or ""
+        return who, ("quarantine" in reason.lower() or who == "runtime")
+
+    def transition_runtime_state(self, to_state: str, *, who: str, reason: Optional[str] = None,
+                                 decision_id: Optional[str] = None, incident: Optional[str] = None,
+                                 note: Optional[str] = None,
+                                 evidence: Optional[str] = None) -> dict:
+        """Move the runtime to ``to_state`` and record the transition (P6).
+
+        One ``BEGIN IMMEDIATE`` covers read, authority check, row write and event
+        append, so the epoch a caller is told about is the epoch the gates will
+        read. ``epoch`` increments on every accepted transition, including the ones
+        that only change ``reason``/``decision_id``… except a no-op to the same
+        state, which is recorded but does not burn an epoch.
+
+        Raises :class:`RuntimeTransitionRefused` when P6 does not grant the
+        requester the authority to loosen. Tightening never raises.
+        """
+        to_state = (to_state or "").strip().upper()
+        if to_state not in RUNTIME_STATES:
+            raise ValueError(f"unknown runtime state {to_state!r}; expected one of {RUNTIME_STATES}")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = self._read_stop_row(conn)
+            frm = cur["state"]
+            entered_by, quarantine_entry = self._last_draining_entry(conn)
+            refusal = self._transition_refusal(frm, to_state, who, decision_id,
+                                               entered_by, quarantine_entry)
+            if refusal:
+                conn.execute("ROLLBACK")
+                raise RuntimeTransitionRefused(refusal)
+            same = (frm == to_state)
+            new_epoch = int(cur["epoch"]) if same else int(cur["epoch"]) + 1
+            paused = 1 if to_state == "STOPPED" else 0
+            kept_incident = incident if incident is not None else cur["incident"]
+            conn.execute(
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, "
+                "state, reason, decision_id) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=excluded.paused, "
+                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
+                "state=excluded.state, reason=excluded.reason, decision_id=excluded.decision_id",
+                (new_epoch, paused, kept_incident, note, time.time(), to_state, reason, decision_id))
+            direction = ("same" if same
+                         else "tighten" if _RUNTIME_TIGHTNESS[to_state] > _RUNTIME_TIGHTNESS[frm]
+                         else "loosen")
+            conn.execute(
+                "INSERT INTO runtime_state_events (epoch, from_state, to_state, direction, who, "
+                "reason, decision_id, incident, note, evidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (new_epoch, frm, to_state, direction, who, reason, decision_id, kept_incident,
+                 note, evidence, time.time()))
+            conn.execute("COMMIT")
+            return {"state": to_state, "from_state": frm, "epoch": new_epoch,
+                    "direction": direction, "paused": bool(paused), "reason": reason,
+                    "decision_id": decision_id, "incident": kept_incident}
+        except Exception:
+            try:
+                conn.execute("ROLLBACK")
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
+    def runtime_state_events(self, limit: int = 50) -> List[dict]:
+        """The append-only transition log, newest first (P6 audit trail)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT id, epoch, from_state, to_state, direction, who, reason, decision_id, "
+                "incident, note, evidence, created_at FROM runtime_state_events "
+                "ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+    def _record_runtime_event_on(self, conn, *, frm: str, to: str, epoch: int, who: str,
+                                 reason: Optional[str] = None, decision_id: Optional[str] = None,
+                                 incident: Optional[str] = None, note: Optional[str] = None) -> None:
+        """Append a transition event inside a caller's transaction (legacy paths)."""
+        direction = ("same" if frm == to
+                     else "tighten" if _RUNTIME_TIGHTNESS.get(to, 3) > _RUNTIME_TIGHTNESS.get(frm, 0)
+                     else "loosen")
+        try:
+            conn.execute(
+                "INSERT INTO runtime_state_events (epoch, from_state, to_state, direction, who, "
+                "reason, decision_id, incident, note, evidence, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)",
+                (epoch, frm, to, direction, who, reason, decision_id, incident, note, time.time()))
+        except Exception:
+            logger.warning("runtime_state_events 기록 실패 (%s → %s)", frm, to)
+
+    def _runtime_state_in_txn(self, conn) -> str:
+        """Effective P6 state under the caller's write lock. Read failure ⇒ STOPPED."""
+        try:
+            row = self._read_stop_row(conn)
+        except Exception:
+            return "STOPPED"  # P7: unreadable state is treated as STOPPED
+        state = row["state"]
+        if state == "ACTIVE" and self._pausejson_active():
+            return "STOPPED"
+        return state
 
     def get_stop_epoch(self) -> dict:
         """현재 STOP 권위 상태 {epoch, paused, incident, note, updated_at} (관측/미러용)."""
@@ -888,12 +1179,17 @@ class TaskQueue:
             conn.execute("BEGIN IMMEDIATE")
             cur = self._read_stop_row(conn)
             new_epoch = int(cur["epoch"]) + 1
+            new_state = "STOPPED" if paused else "ACTIVE"
             conn.execute(
-                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, ?) "
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=excluded.paused, "
-                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at",
-                (new_epoch, 1 if paused else 0, incident, note, time.time()))
+                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
+                "state=excluded.state",
+                (new_epoch, 1 if paused else 0, incident, note, time.time(), new_state))
+            self._record_runtime_event_on(conn, frm=cur["state"], to=new_state, epoch=new_epoch,
+                                          who="legacy:set_stop_epoch", reason=note,
+                                          incident=incident, note=note)
             conn.execute("COMMIT")
             return new_epoch
         except Exception:
@@ -926,11 +1222,15 @@ class TaskQueue:
             # DB는 resume 후에도 incident를 provenance로 보존한다(명시 incident 없으면 기존 유지).
             _kept_incident = incident if incident is not None else cur["incident"]
             conn.execute(
-                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
-                "VALUES (1, ?, 0, ?, ?, ?) "
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state) "
+                "VALUES (1, ?, 0, ?, ?, ?, 'ACTIVE') "
                 "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=0, "
-                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at",
+                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
+                "state='ACTIVE'",
                 (int(generation), _kept_incident, "resumed via cli", time.time()))
+            self._record_runtime_event_on(conn, frm=cur["state"], to="ACTIVE", epoch=int(generation),
+                                          who="legacy:resume_stop", reason="resumed via cli",
+                                          incident=_kept_incident)
             conn.execute("COMMIT")
             # cli는 이 incident를 pause.json에도 mirror해 두 소스의 provenance를 일치시킨다.
             return {"resumed": True, "epoch": int(generation), "reason": "resumed",
@@ -964,23 +1264,18 @@ class TaskQueue:
         """호출자가 BEGIN IMMEDIATE로 write-lock을 쥔 상태에서 STOP을 확인.
         권위=runtime_stop(원자 linearization point) + additive pause.json 신호.
         읽기 실패(테이블 손상 등)는 fail-closed(=paused, 차단)."""
-        try:
-            row = conn.execute("SELECT paused FROM runtime_stop WHERE id=1").fetchone()
-            db_paused = bool(row["paused"]) if row is not None else False
-        except Exception:
-            return True  # fail-closed
-        if db_paused:
-            return True
-        return self._pausejson_active()
+        return self._runtime_state_in_txn(conn) != "ACTIVE"
 
     def _stop_active_precheck(self) -> bool:
         """트랜잭션 밖 빠른 사전확인(권위 아님 — in-txn 재확인이 최종). 실패는 fail-closed."""
         try:
-            if bool(self.get_stop_epoch()["paused"]):
-                return True
+            conn = self._connect()
         except Exception:
             return True
-        return self._pausejson_active()
+        try:
+            return self._runtime_state_in_txn(conn) != "ACTIVE"
+        finally:
+            conn.close()
 
     def _reconcile_stop_on_boot(self) -> None:
         """§1 부팅 화해: pause.json(미러/외부신호) vs runtime_stop(DB권위).
@@ -1048,12 +1343,25 @@ class TaskQueue:
                     # (3) 둘 다 unpaused(incident mismatch 무해) 또는 둘 다 paused+incident 일치 →
                     #     정상. DB incident를 provenance 기준으로 유지.
                     win_paused, win_epoch, win_incident = db_paused, db_epoch, db_incident
+            # P6: the reconciled verdict lands in `state` too. pause.json can only
+            # *tighten* here — a higher pause.json generation that says paused wins,
+            # but the row's own non-ACTIVE state (QUARANTINED/DRAINING, which
+            # pause.json cannot express) is never lowered by it.
+            win_state = "STOPPED" if win_paused else db["state"]
+            if not win_paused and db["state"] == "STOPPED":
+                win_state = "ACTIVE"
             conn.execute(
-                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at) "
-                "VALUES (1, ?, ?, ?, ?, ?) "
+                "INSERT INTO runtime_stop (id, epoch, paused, incident, note, updated_at, state) "
+                "VALUES (1, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch, paused=excluded.paused, "
-                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at",
-                (int(win_epoch), 1 if win_paused else 0, win_incident, note, time.time()))
+                "incident=excluded.incident, note=excluded.note, updated_at=excluded.updated_at, "
+                "state=excluded.state",
+                (int(win_epoch), 1 if win_paused else 0, win_incident, note, time.time(), win_state))
+            if win_state != db["state"]:
+                self._record_runtime_event_on(conn, frm=db["state"], to=win_state,
+                                              epoch=int(win_epoch), who="boot-reconcile",
+                                              reason=note or "pause.json reconciled into the row",
+                                              incident=win_incident, note=note)
             conn.execute("COMMIT")
         except Exception:
             # 화해 자체가 실패 → fail-closed로 paused 행을 남기려 시도(최후의 안전장치).

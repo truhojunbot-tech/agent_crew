@@ -4886,11 +4886,34 @@ def create_app(
                          "incident": _stop.get("incident")}
         except Exception:
             _stop_out = {"epoch": None, "paused": True, "incident": None, "error": "read_failed"}
+        # P6 (ADR E11 @6cbce565): "/health.runtime_state exposes it." A state that
+        # is not in the runtime row does not exist — CX-4j is a runtime that was
+        # "quarantined" by record while its own row said otherwise, so the row is
+        # what this endpoint reports. `effective_state` folds in the tighten-only
+        # pause.json signal; `state` is the stored row.
+        try:
+            _rs = q().get_runtime_state()
+            _runtime_state_out = {
+                "state": _rs.get("state"),
+                "effective_state": _rs.get("effective_state"),
+                "epoch": _rs.get("epoch"),
+                "reason": _rs.get("reason"),
+                "decision_id": _rs.get("decision_id"),
+                "incident": _rs.get("incident"),
+                "pause_json_tightening": _rs.get("pause_json_tightening"),
+                "read_failed": bool(_rs.get("read_failed")),
+            }
+        except Exception:
+            _runtime_state_out = {"state": "STOPPED", "effective_state": "STOPPED", "epoch": None,
+                                  "reason": "runtime_state_unreadable", "decision_id": None,
+                                  "incident": None, "pause_json_tightening": None,
+                                  "read_failed": True}
         return {
             "status": "ok",
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,
+            "runtime_state": _runtime_state_out,
             # G_DT: pushes refused because the target pane runs no agent CLI.
             "delivery_guard": {"delivery": _delivery_raw,
                                "refusals": dict(delivery_guard_refusals)},
