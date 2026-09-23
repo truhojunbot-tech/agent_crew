@@ -59,6 +59,7 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import AdmissionRefused, TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
@@ -5214,11 +5215,33 @@ def create_app(
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
         _artifact_verified = None
+        # T5, ADR §11.1 row 10 / fixture CXC-6a: "dispatch base absent" is a
+        # FAIL, never a pass. An implement task that completes with no declared
+        # artifact contract and no `worktree_base_sha`/`reviewed_sha` gives the
+        # gate nothing to check the completion against — so the honest answer is
+        # that the artifact is unproven, not that the rule did not apply. Logging
+        # "not applied" and accepting `completed` made an *absent input* read as
+        # a passing check, which is the one thing P7 forbids a gate to do.
+        #
+        # ⛔Held under the project's rollout mode, not unconditionally: under
+        #   `shadow`/`off` this is recorded and the result stands, because the
+        #   whole point of shadow is to measure how many live tasks this would
+        #   have caught before it catches any.
         if (not _runtime_paused and not _REPLAYING.get() and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
                 and declared_artifact_kind(_task) is None
                 and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
-            logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
+            _no_base = ("dispatch base absent: this implement task declares no "
+                        "artifact contract and carries no worktree_base_sha or "
+                        "reviewed_sha, so its completion cannot be verified")
+            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
+                logger.warning("POST /tasks/%s/result: artifact gate FAILED — %s",
+                               task_id, _no_base)
+                _artifact_held = _no_base
+                result = no_artifact_result(result, _no_base)
+            else:
+                logger.info("POST /tasks/%s/result: artifact gate would FAIL under "
+                            "enforce — %s (shadow: result stands)", task_id, _no_base)
         # #374: the check follows the task's declared contract; undeclared
         # tasks keep #353's commit rule exactly (artifact_gate_applies).
         if (not _runtime_paused and not _REPLAYING.get()
