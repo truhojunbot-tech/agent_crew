@@ -243,22 +243,69 @@ def _git(repo_cwd: str, *args: str, timeout: int = 30) -> subprocess.CompletedPr
                           capture_output=True, text=True, timeout=timeout)
 
 
+def _patch_ids(repo_cwd: str, rev_range: str) -> Optional[list]:
+    """Stable patch-ids of every commit in ``rev_range``, oldest first.
+
+    ``None`` if git cannot say. An empty commit has no patch-id, so it shows
+    up as a *missing* id — which is exactly how the equivalence check below
+    notices one being added or a real one being dropped.
+    """
+    revs = _git(repo_cwd, "rev-list", "--reverse", "--no-merges", rev_range)
+    if revs.returncode != 0:
+        return None
+    ids = []
+    for sha in revs.stdout.split():
+        show = _git(repo_cwd, "show", "--format=", sha)
+        if show.returncode != 0:
+            return None
+        pid = subprocess.run(["git", "-C", repo_cwd, "patch-id", "--stable"],
+                             input=show.stdout, capture_output=True, text=True, timeout=30)
+        if pid.returncode != 0:
+            return None
+        ids.append(pid.stdout.split()[0] if pid.stdout.strip() else None)
+    return ids
+
+
+def _diff_patch_id(repo_cwd: str, old: str, new: str) -> Optional[str]:
+    """Stable patch-id of the whole change ``old..new`` (None if empty/unknown)."""
+    diff = _git(repo_cwd, "diff", old, new)
+    if diff.returncode != 0 or not diff.stdout.strip():
+        return None
+    pid = subprocess.run(["git", "-C", repo_cwd, "patch-id", "--stable"],
+                         input=diff.stdout, capture_output=True, text=True, timeout=30)
+    return pid.stdout.split()[0] if pid.returncode == 0 and pid.stdout.strip() else None
+
+
 def verify_rebase_artifact(
     task: TaskRequest, result: TaskResult, *, repo_cwd: str,
 ) -> tuple[bool, str]:
-    """A rebase is proven by where it landed, not by where it started.
+    """A rebase is proven by carrying the SAME change onto the declared target.
 
-    Requires: a declared ``context.rebase_onto``; the rebased branch pushed to
-    origin; the reported (or origin-derived) commit on that pushed branch; the
-    declared target's origin tip as its ancestor; and not the target tip itself
-    or the old dispatch base — both of those mean nothing was rewritten.
-    Ancestry is still required, only against the right ref (#374 option 1).
+    Location alone is not proof (review of 37cb8af, P1): any new commit on
+    top of main passes "descends from origin/main and is pushed", including
+    a force-push that threw the dispatched feature away. So:
+
+    * the dispatched head — ``context.rebase_source_sha`` if the coordinator
+      pinned one, else ``worktree_base_sha``, which dispatch records as the
+      branch head it handed out — defines the change: its commits since it
+      forked from the target;
+    * the submitted commit must be pushed on ``origin/<branch>``, descend from
+      ``origin/<rebase_onto>``, and add commits of its own;
+    * and those commits must be patch-equivalent to the dispatched ones, one
+      for one (``git patch-id --stable``), or — for a squash — the whole
+      change must be. An added empty commit or a dropped one breaks the
+      one-for-one match; a changed or unrelated diff breaks both.
+
+    A rebase that needed conflict resolution changes the patch and fails
+    here. That is deliberate: this gate cannot tell a resolution from a
+    rewrite, and a human can.
     """
     context = task.context if isinstance(task.context, dict) else {}
     target = str(context.get("rebase_onto") or "").strip()
     branch = (result.branch or task.branch or "").strip()
     commit = (result.commit or "").strip()
-    base = str(context.get("worktree_base_sha") or context.get("reviewed_sha") or "").strip()
+    source = str(context.get("rebase_source_sha") or context.get("worktree_base_sha")
+                 or "").strip()
     if not repo_cwd:
         return False, "artifact repository unavailable"
     if not target:
@@ -291,11 +338,37 @@ def verify_rebase_artifact(
             return False, f"reported commit is not on the pushed branch origin/{branch}"
         if commit == tip_sha:
             return False, f"reported commit is the origin/{target} tip (no artifact)"
-        if base and commit == base:
+        if source and commit == source:
             return False, "reported commit is the dispatch base (nothing was rewritten)"
         if _git(repo_cwd, "merge-base", "--is-ancestor", tip_sha, commit).returncode != 0:
             return False, f"reported commit does not descend from origin/{target}"
-        return True, f"rebased onto origin/{target} ({tip_sha[:12]}) and pushed to origin/{branch}"
+
+        # ── same content ────────────────────────────────────────────────
+        if not source:
+            return False, "rebase contract requires the dispatched head (worktree_base_sha)"
+        if _git(repo_cwd, "rev-parse", "--verify", f"{source}^{{commit}}").returncode != 0:
+            return False, "dispatched head is not resolvable; cannot prove the same content"
+        fork = _git(repo_cwd, "merge-base", source, tip_sha)
+        if fork.returncode != 0 or not fork.stdout.strip():
+            return False, f"dispatched head shares no history with origin/{target}"
+        fork_sha = fork.stdout.strip()
+        before = _patch_ids(repo_cwd, f"{fork_sha}..{source}")
+        after = _patch_ids(repo_cwd, f"{tip_sha}..{commit}")
+        if before is None or after is None:
+            return False, "patch-ids unavailable; cannot prove the same content"
+        if not before or all(p is None for p in before):
+            return False, f"dispatched head has no changes beyond origin/{target} to rebase"
+        if not after or None in after:
+            return False, "rebased range is empty or contains an empty commit"
+        if after == [p for p in before if p is not None]:
+            return True, (f"rebased {len(after)} commit(s) onto origin/{target} ({tip_sha[:12]}), "
+                          f"patch-equivalent to dispatched {source[:12]}; pushed to origin/{branch}")
+        whole_before = _diff_patch_id(repo_cwd, fork_sha, source)
+        whole_after = _diff_patch_id(repo_cwd, tip_sha, commit)
+        if whole_before and whole_before == whole_after and len(after) < len(before):
+            return True, (f"squashed {len(before)}→{len(after)} commit(s) onto origin/{target}; "
+                          f"same total change as dispatched {source[:12]}")
+        return False, "rebased commits are not patch-equivalent to the dispatched change"
     except Exception as exc:  # git availability is evidence, not a bypass.
         return False, f"artifact verification unavailable: {type(exc).__name__}"
 
