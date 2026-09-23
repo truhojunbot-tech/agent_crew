@@ -2567,6 +2567,12 @@ def create_app(
         # said. `install_from_env` never raises and never loosens by itself — an
         # input it cannot read stays UNAVAILABLE, which P7 turns into a recorded
         # BLOCK inside the engine rather than an exception out here.
+        #
+        # The schema-creating construction happens first and on purpose: the P6
+        # runtime row the runtime provider reads lives in that database, so
+        # wiring before it exists would leave the runtime slot UNAVAILABLE for
+        # the whole life of a first-ever start.
+        TaskQueue(db_path)
         _cea_wiring = cea_wiring.install_from_env(
             db_path=db_path, project=project, logger=logger)
         state["cea_wiring"] = _cea_wiring

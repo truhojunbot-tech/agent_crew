@@ -259,8 +259,99 @@ This step's own list, unstarted:
   `server.py`). The count is **not** yet at the ADR's ceiling of six, because
   the pipeline risk-tier branches remain.
 
+## 9. Step 4e — production wiring (`result`)
+
+Codex's review of alfred's `CEA-LIVE-DEPLOY-PLAN.md` (P1) found that no CEA
+input provider was constructed anywhere in production at `bd58092`.
+`TaskQueue` defaulted to none, so every input reported unavailable and every
+receipt was `BLOCK`; `set_default_runtime_authority()` had no production call
+site at all — only tests — so an `ACTIVE` restoration was always refused. The
+plan's proofs 3/4/5 could therefore not be run against a live uvicorn server,
+only against the injected test harness.
+
+### DONE in this step
+
+- `src/agent_crew/cea/wiring.py` — the single production factory.
+  `build_wiring()` / `build_engine_from_env()` / `install_from_env()`. One
+  question per slot ("is this input readable?"), and the answer is either a
+  real provider or nothing at all; absence stays the engine's `Unavailable*`
+  stub so P7 turns it into a recorded `BLOCK` rather than an exception.
+- `server.create_app`'s lifespan now calls `install_from_env(...)` and hands
+  the result to `TaskQueue(db_path, cea_providers=...)`. That is the call site
+  the finding was about — a passing provider test proves the factory works,
+  only the construction site proves production uses it. Asserted statically in
+  `test_the_server_constructs_its_queue_with_the_wired_providers`.
+- One startup log line naming every slot `WIRED`/`UNAVAILABLE` **with a reason**,
+  plus the engine mode and whether the loosening authority was installed.
+- `CanonicalPolicySnapshotReader` now carries `principals`, `build_commits` and
+  `runtimes` off each decision record. It dropped all three before, so
+  `SnapshotLooseningAuthority` failed conditions 3 and 4 for *every* record the
+  production reader produced: the authority was structurally incapable of
+  granting, and only a hand-built `DecisionRev` in `conftest` could satisfy it.
+- `hmac_sha256_verifier(key)` — the reader side of the snapshot signature.
+  Wired from `AGENT_CREW_CEA_SNAPSHOT_KEY_FILE`; absent ⇒ the snapshot stays
+  `UNKEYED`/`UNSIGNED` ⇒ an unverified input ⇒ `BLOCK`, exactly as before.
+- `AdmissionInputsClient(child_env=...)` so the wiring can tell the alfred
+  script which registry / incident-memory files to read.
+
+### Env contract
+
+| env | default | absent ⇒ |
+|-----|---------|----------|
+| `AGENT_CREW_CEA_REGISTRY_PATH` | `~/alfred/governance/capability_registry.json` | capabilities UNAVAILABLE |
+| `AGENT_CREW_CEA_SNAPSHOT_PATH` | `~/alfred/governance/control_policy_snapshot.json` | snapshots UNAVAILABLE |
+| `AGENT_CREW_CEA_SNAPSHOT_KEY_FILE` | — | snapshot UNKEYED ⇒ unverified input ⇒ BLOCK; `RefuseAllLoosening` stays |
+| `AGENT_CREW_CEA_MEMORY_CMD` | `python3 ~/alfred/tools/admission_inputs.py` | L3 + capabilities UNAVAILABLE |
+| `AGENT_CREW_CEA_QUOTA_CACHE_DIR` | `~/alfred/quota` | budgets UNAVAILABLE |
+| `AGENT_CREW_CEA_COOLDOWN_FILE` | — | no cooldown recorded (not an error) |
+| `AGENT_CREW_CEA_CREDIT_CLASS` | `{}` | unknown credit class = the costly one (O9) |
+
+The step-3 spellings (`AGENT_CREW_CEA_POLICY_SNAPSHOT`,
+`AGENT_CREW_CEA_CAPABILITY_REGISTRY`, `AGENT_CREW_CEA_ADMISSION_INPUTS`) are
+accepted as aliases. `AGENT_CREW_CEA_ENGINE_ENDPOINT` /
+`AGENT_CREW_CEA_ADAPTER_TOKEN_FILE` stay **unset** in this deployment, so
+`get_engine()` returns the in-process engine and these providers are the ones it
+reads; with an endpoint set, `build_wiring()` wires nothing and says so, because
+the deciding process is `crew-authz`.
+
+### `discovery` — what the live box actually reports today
+
+Run against this machine with no CEA env set at all:
+
+```
+snapshots=WIRED (…/control_policy_snapshot.json; unkeyed — AGENT_CREW_CEA_SNAPSHOT_KEY_FILE
+  unset, so the snapshot is an unverified input and admission BLOCKs (P7))
+capabilities=UNAVAILABLE (L2/L3 command unavailable, so E4 cannot be queried)
+gates=WIRED   runtime=UNAVAILABLE (db not created yet)   budgets=WIRED (…/alfred/quota)
+l3_memory=UNAVAILABLE (no readable L2/L3 command script at …/alfred/tools/admission_inputs.py)
+loosening_authority=RefuseAllLoosening (snapshot unverifiable)
+```
+
+Two facts follow, and neither is a claim about a future state:
+
+1. `~/alfred/tools/admission_inputs.py` **does not exist on this box**, so the
+   E4 and L3 inputs cannot be wired here today regardless of configuration.
+   That is alfred's side of the contract (`sev0/cea-alfred-lineage` @ `ca8b1e8`).
+2. no snapshot signing key exists either, so the snapshot is present but
+   unverified. Admission therefore still BLOCKs live, and `RefuseAllLoosening`
+   still stands. **This step wires the path; it does not make the live proofs
+   pass, and nothing here should be read as saying it does.**
+
+### REMAINING after step 4e
+
+- alfred must ship `tools/admission_inputs.py` and a signed snapshot before the
+  plan's proofs 3/4/5 can run against a live server rather than the injected
+  harness. Until then those proofs must be labelled non-live, as codex's P1 asks.
+- `cli.py` still constructs `TaskQueue` without the wiring; only the server does.
+  The dispatcher is the process that admits, so this is the load-bearing site,
+  but the gap is real and named here rather than glossed.
+- `install_from_env` is per-process, so a snapshot that gains a signature while
+  the dispatcher is running does not take effect until it restarts. P7 makes
+  that direction safe (stale ⇒ refuse), but there is no reload path yet.
+
 ## §P Provenance
 
+- Step 4e (§9): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4e-production-wiring` on :8105, branch `sev0/cea-lineage`, base `caf5644`, 2026-09-23. All fixtures under `tmp_path`; the live `~/alfred/governance` files were read only to report what the factory finds there. No live server, DB, GitHub or Telegram mutation.
 - Step 4c (§8): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4c-remainder-folds` on :8105, branch `sev0/cea-lineage`, base `bd58092`, 2026-09-23. Baselines for the pre-existing failures were taken by stashing the work tree at each commit's parent and re-running the same selection. No live server, DB, GitHub or Telegram mutation.
 - Provider Claude, model `claude-fable-5-1`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-prep-r1` on :8105, branch `sev0/cea-lineage`.
 - Step 4b (§7): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4b-folds-acceptance-guards-r1` on :8105, branch `sev0/cea-lineage`, base `ba1d71d`, 2026-09-23. Read-only inputs: `GET /tasks/sev0-cea-lineage-s4a-merge-remainder-p1s` on :8105. The pre-fix reproduction ran in a throwaway copy of the tree under `/tmp` (removed); no live server, DB, GitHub or Telegram mutation.
