@@ -150,6 +150,20 @@ CREATE TABLE IF NOT EXISTS intent_lineages (
 )
 """
 
+_DDL_MIGRATE_LINEAGE_WORK_HASH = "ALTER TABLE intent_lineages ADD COLUMN work_hash TEXT"
+"""P4's completed-work question is asked of the *work*, not of the exact intent.
+
+``intent_hash`` includes ``authority_decision_ids``, so adding an id to a request
+changes the hash and the completed lineage is simply not found. ``work_hash`` is
+the same identity with the authority ids removed, which is what "this work
+already completed" actually ranges over. Nullable and additive: rows written
+before this column exists read back as ``NULL`` and are only invisible to the
+supersession check, never mis-answered by it."""
+
+_DDL_LINEAGE_WORK_HASH_INDEX = (
+    "CREATE INDEX IF NOT EXISTS idx_intent_lineages_work_hash "
+    "ON intent_lineages (work_hash, state)")
+
 _DDL_MIGRATE_TASKS_RECEIPT_ID = "ALTER TABLE tasks ADD COLUMN receipt_id TEXT"
 """Step 1: nullable. Step 2 enforces ``NOT NULL`` + FK once every ingress mints a
 receipt — adding the constraint before the ingresses are wired would make every
@@ -195,6 +209,11 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute(stmt)
     conn.execute(_DDL_DISPATCH_NONCES)
     conn.execute(_DDL_INTENT_LINEAGES)
+    try:
+        conn.execute(_DDL_MIGRATE_LINEAGE_WORK_HASH)
+    except sqlite3.OperationalError:
+        pass  # column already exists
+    conn.execute(_DDL_LINEAGE_WORK_HASH_INDEX)
     try:
         conn.execute(_DDL_MIGRATE_TASKS_RECEIPT_ID)
     except sqlite3.OperationalError:
@@ -364,7 +383,8 @@ def nonce_row(conn: sqlite3.Connection, nonce: str) -> Optional[dict]:
 # ── P4 lineage claims ───────────────────────────────────────────────────────
 
 def claim_lineage(conn: sqlite3.Connection, intent_hash: str, receipt_id: str,
-                  project: str, state: str) -> tuple[bool, Optional[str]]:
+                  project: str, state: str,
+                  work_hash: Optional[str] = None) -> tuple[bool, Optional[str]]:
     """Atomically claim ``intent_hash`` for this receipt.
 
     Returns ``(True, receipt_id)`` for the winner and ``(False, holder)`` for a
@@ -373,9 +393,9 @@ def claim_lineage(conn: sqlite3.Connection, intent_hash: str, receipt_id: str,
     """
     now = time.time()
     cur = conn.execute(
-        "INSERT INTO intent_lineages (intent_hash, receipt_id, project, state, claimed_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(intent_hash) DO NOTHING",
-        (intent_hash, receipt_id, project, state, now, now))
+        "INSERT INTO intent_lineages (intent_hash, receipt_id, project, state, claimed_at, "
+        "updated_at, work_hash) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(intent_hash) DO NOTHING",
+        (intent_hash, receipt_id, project, state, now, now, work_hash))
     if cur.rowcount == 1:
         return True, receipt_id
     return False, _lineage_holder(conn, intent_hash)
@@ -397,6 +417,29 @@ def lineage_for_intent(conn: sqlite3.Connection, intent_hash: str) -> Optional[d
     if row is None:
         return None
     keys = ("intent_hash", "receipt_id", "project", "state", "claimed_at", "updated_at")
+    return {k: (row[k] if isinstance(row, sqlite3.Row) else row[i]) for i, k in enumerate(keys)}
+
+
+def completed_lineage_for_work(conn: sqlite3.Connection, work_hash: str,
+                               *, exclude_intent_hash: Optional[str] = None) -> Optional[dict]:
+    """A CONSUMED lineage for the same *work*, whatever authority it ran under.
+
+    This is what makes P4's ALREADY_COMPLETED answerable when the request's
+    ``authority_decision_ids`` differ from the completed run's: the exact-hash
+    lookup misses by construction, and missing is indistinguishable from "never
+    happened" unless something ranges over the work itself.
+    """
+    if not work_hash:
+        return None
+    row = conn.execute(
+        "SELECT intent_hash, receipt_id, project, state, claimed_at, updated_at, work_hash "
+        "FROM intent_lineages WHERE work_hash = ? AND state = 'CONSUMED' "
+        "AND intent_hash IS NOT ? ORDER BY updated_at DESC LIMIT 1",
+        (work_hash, exclude_intent_hash)).fetchone()
+    if row is None:
+        return None
+    keys = ("intent_hash", "receipt_id", "project", "state", "claimed_at", "updated_at",
+            "work_hash")
     return {k: (row[k] if isinstance(row, sqlite3.Row) else row[i]) for i, k in enumerate(keys)}
 
 

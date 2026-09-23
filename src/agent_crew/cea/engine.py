@@ -102,6 +102,19 @@ def _hash_identity(identity: IntentIdentity, *, anchors) -> str:
     return f"sha256:{digest}"
 
 
+def work_hash(identity: IntentIdentity) -> str:
+    """``intent_hash`` with ``authority_decision_ids`` emptied — the *work* itself.
+
+    P4 makes the authority ids part of the intent so a superseding decision
+    record yields a new lineage. The cost is that "has this work already
+    completed?" can no longer be asked of ``intent_hash`` alone: adding any id
+    changes the hash, the completed lineage is not found, and a miss looks
+    exactly like work that never ran (codex P1 #2). This hash is what that
+    question ranges over.
+    """
+    return intent_hash(replace(identity, authority_decision_ids=()))
+
+
 def uncanonical_intent_hash(identity: IntentIdentity) -> str:
     """The hash of an identity whose anchors have **no** canonical form.
 
@@ -384,6 +397,12 @@ class AuthorizationEngine:
         executor = self._executor_binding(intent)
         snapshot, registry, runtime, budget, gate, raised = self._read_inputs(intent, executor)
 
+        # P4's completed-work exception, asked of the work and not of the hash.
+        completed = self._completed_work_refusal(conn, intent, caller, ih, snapshot,
+                                                 unavailable=bool(raised))
+        if completed is not None:
+            return completed
+
         unavailable = self._unavailable_inputs(snapshot, registry, runtime) + raised
         reviewer, tester = self._j7_contract(intent, snapshot, executor)
         reuse = self._j5_reuse(intent, caller, registry)
@@ -394,7 +413,7 @@ class AuthorizationEngine:
             executor=executor, reviewer=reviewer, tester=tester, reuse=reuse,
             unavailable=unavailable)
 
-        return self._record(conn, receipt, ih, new_lineage=True)
+        return self._record(conn, receipt, ih, new_lineage=True, wh=work_hash(intent.identity))
 
     def mint_dispatch_nonce(self, conn: sqlite3.Connection, receipt: dict) -> tuple[dict, str]:
         """P2 dispatch: a fresh single-use nonce bound to ``(receipt_id, attempt)``.
@@ -479,6 +498,56 @@ class AuthorizationEngine:
                                   f"new work (P4)", conn=conn),
             http_status=409, code="DUPLICATE_INTENT",
             existing_receipt_id=lineage["receipt_id"])
+
+    def _completed_work_refusal(self, conn, intent: Intent, caller: Caller, ih: str,
+                                snapshot, *, unavailable: bool) -> Optional[Authorization]:
+        """P4: completed work is re-admitted only by a **verified superseding record**.
+
+        ⛔The old code left this to ``intent_hash`` alone: "a newer decision
+          produces a different hash and lands as a new lineage". So did an older
+          one, and so did a made-up one. After an OPS lineage completed under
+          T0-1234, the caller-supplied tuple ``(T0-1234, ATTACKER-ID)`` changed
+          the hash, missed ALREADY_COMPLETED entirely and was ALLOWed — while the
+          signed snapshot still contained only T0-1234 (codex P1 #2). A hash
+          input a caller controls is a nonce, not an authorisation.
+
+        The exception is granted only when the *signed snapshot* carries a
+        decision record that (a) is one of the ids this request asks to act
+        under, and (b) explicitly names the completed run's authority in its
+        ``supersedes``. Everything else — including an unreadable snapshot — is
+        the refusal, because a supersession we cannot verify is not one.
+        """
+        wh = work_hash(intent.identity)
+        prior = receipt_store.completed_lineage_for_work(conn, wh, exclude_intent_hash=ih)
+        if prior is None:
+            return None
+        prior_receipt = receipt_store.current_receipt(conn, prior["receipt_id"])
+        prior_ids = tuple((prior_receipt or {}).get("authority_source", {}).get("decision_ids") or ())
+        if not unavailable and self._supersession_record(intent, snapshot, prior_ids) is not None:
+            return None
+        return Authorization(
+            receipt=self._refusal(
+                intent, caller, ih, "ALREADY_COMPLETED",
+                f"this work completed as receipt {prior['receipt_id']} under authority "
+                f"{list(prior_ids)}; re-admission requires a decision record in the signed "
+                f"snapshot that explicitly supersedes it, not a caller-supplied id (P4)",
+                conn=conn),
+            http_status=409, code="ALREADY_COMPLETED",
+            existing_receipt_id=prior["receipt_id"])
+
+    @staticmethod
+    def _supersession_record(intent: Intent, snapshot, prior_ids):
+        """The snapshot record that supersedes ``prior_ids``, or ``None``."""
+        if not prior_ids or snapshot is None or not getattr(snapshot, "available", False):
+            return None
+        if snapshot.signature is not SignatureStatus.VALID:
+            return None
+        requested = set(intent.identity.authority_decision_ids)
+        wanted = set(prior_ids)
+        for rev in (snapshot.in_scope or snapshot.decisions or ()):
+            if rev.decision_id in requested and wanted.issubset(set(rev.supersedes or ())):
+                return rev
+        return None
 
     def _binding_drifted(self, intent: Intent, prior: dict) -> bool:
         """Is B′ different from the B this receipt was issued under?"""
@@ -728,10 +797,24 @@ class AuthorizationEngine:
             return ("BLOCK", "RUNTIME_STATE_FORBIDS",
                     f"P6: runtime state is {rs}; enqueue is refused in every non-ACTIVE state")
 
-        if not (snapshot.in_scope or snapshot.decisions):
+        authorised = {rev.decision_id for rev in (snapshot.in_scope or snapshot.decisions or ())}
+        if not authorised:
             return ("BLOCK", "NO_AUTHORITY",
                     "J2: the policy snapshot lists no decision in scope for this intent; "
                     "free text in a task description is not authority (§1.4)")
+
+        # ⛔J2 never checked that the ids the request claims to act under are ids
+        #   the snapshot actually authorises for this scope; it only checked that
+        #   *some* decision was in scope. So `authority_decision_ids` was an
+        #   unvalidated caller string that nonetheless entered `intent_hash`
+        #   (codex P1 #2). An id the snapshot does not carry is not authority —
+        #   it is free text with a ticket-shaped name (§1.4).
+        unknown = sorted(set(intent.identity.authority_decision_ids) - authorised)
+        if unknown:
+            return ("BLOCK", "AUTHORITY_NOT_IN_SNAPSHOT",
+                    f"J2: {', '.join(unknown)} is not authorised by the signed policy snapshot "
+                    f"for this scope; a decision id a caller invents is not a decision record "
+                    f"(§1.4, §5.3)")
 
         if binding["budget_class"] == "EXHAUSTED":
             return ("BLOCK", "BUDGET_EXHAUSTED",
@@ -806,7 +889,8 @@ class AuthorizationEngine:
 
     # ── persistence ─────────────────────────────────────────────────────
 
-    def _record(self, conn, receipt: dict, ih: str, *, new_lineage: bool) -> Authorization:
+    def _record(self, conn, receipt: dict, ih: str, *, new_lineage: bool,
+                wh: Optional[str] = None) -> Authorization:
         errors = validate_receipt(receipt)
         if errors:
             raise EngineError(f"engine produced a receipt that violates the frozen contract: "
@@ -817,7 +901,8 @@ class AuthorizationEngine:
             # intent both reach here, and the PRIMARY KEY decides which one owns
             # the lineage. The loser is told DUPLICATE_INTENT with the winner's id.
             won, holder = receipt_store.claim_lineage(conn, ih, receipt["receipt_id"],
-                                                      receipt["project"], receipt["state"])
+                                                      receipt["project"], receipt["state"],
+                                                      work_hash=wh)
             if not won:
                 return Authorization(receipt=receipt, http_status=409, code="DUPLICATE_INTENT",
                                      existing_receipt_id=holder)

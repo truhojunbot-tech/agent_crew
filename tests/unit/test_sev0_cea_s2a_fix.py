@@ -25,6 +25,7 @@ from agent_crew.cea.engine import (
 from agent_crew.cea.intent import (
     Caller, CallerProvenance, IdentityStatus, Intent, IntentIdentity, Target, WorkClass)
 from agent_crew.cea.providers import SignatureStatus
+from agent_crew.cea.receipt import DecisionRev
 from agent_crew.cea.schema import validate_receipt
 from agent_crew.cea.service import EngineService, UnixSocketEngineClient, encode_intent
 
@@ -351,3 +352,107 @@ def test_the_registry_is_asked_about_the_canonical_anchor(conn):
     engine(capabilities=RecordingRegistry()).authorize(
         conn, intent("reg-1", ident=identity(anchors=("./src//y.py", "src/y.py"))), caller())
     assert seen == [("src/y.py",)]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 #2 — authority ids are bound to the signed snapshot (engine.py:617-620,549-551)
+# ═══════════════════════════════════════════════════════════════════════════
+
+SUPERSEDING = DecisionRev(decision_id="T0-9999", body_hash="c" * 32, supersedes=("T0-1234",))
+
+
+def _ops(task_id, *, authority=("T0-1234",), anchors=("ops/rotate.py",)):
+    return intent(task_id, ident=identity(work_class=WorkClass.OPS, anchors=anchors,
+                                          authority=authority))
+
+
+def test_the_exact_review_bypass_of_already_completed(conn):
+    """codex P1 #2, verbatim: after consuming an OPS lineage authorised by
+    T0-1234, the caller-supplied tuple (T0-1234, ATTACKER-ID) produced ALLOW —
+    the changed hash bypassed ALREADY_COMPLETED although the snapshot still
+    contained only T0-1234. A hash input the caller controls is a nonce, not an
+    authorisation."""
+    eng = engine()
+    first = eng.authorize(conn, _ops("j2-1"), caller())
+    assert first.decision == "ALLOW"
+    eng.transition(conn, first.receipt_id, "CONSUMED")
+
+    attack = eng.authorize(conn, _ops("j2-2", authority=("T0-1234", "ATTACKER-ID")), caller())
+    assert attack.http_status == 409, "the completed work was re-admitted"
+    assert attack.code == "ALREADY_COMPLETED"
+    assert attack.decision == "BLOCK"
+    assert attack.existing_receipt_id == first.receipt_id
+
+
+def test_a_real_id_that_does_not_supersede_is_also_refused(conn):
+    """Not just made-up ids: an id the snapshot *does* carry still does not
+    re-admit completed work unless it explicitly supersedes the run's authority."""
+    snapshot = FakeSnapshot(decisions=(DECISION, DecisionRev("T0-5555", "d" * 32)),
+                            in_scope=(DECISION, DecisionRev("T0-5555", "d" * 32)))
+    eng = engine(snapshots=snapshot)
+    first = eng.authorize(conn, _ops("j2-3"), caller())
+    eng.transition(conn, first.receipt_id, "CONSUMED")
+    again = eng.authorize(conn, _ops("j2-4", authority=("T0-1234", "T0-5555")), caller())
+    assert again.code == "ALREADY_COMPLETED"
+
+
+def test_an_explicit_superseding_record_in_the_snapshot_does_re_admit(conn):
+    """The exception is real — it just has to be a record, not a claim."""
+    plain = engine()
+    first = plain.authorize(conn, _ops("j2-5"), caller())
+    plain.transition(conn, first.receipt_id, "CONSUMED")
+    snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
+                            in_scope=(DECISION, SUPERSEDING))
+    again = engine(snapshots=snapshot).authorize(
+        conn, _ops("j2-6", authority=("T0-1234", "T0-9999")), caller())
+    assert again.code != "ALREADY_COMPLETED"
+    assert again.decision == "ALLOW"
+
+
+def test_a_superseding_record_the_caller_did_not_ask_under_is_not_enough(conn):
+    """(a) the record must be in the snapshot AND (b) among the ids this request
+    acts under. Otherwise any unrelated supersession in the snapshot reopens
+    every completed lineage it happens to name."""
+    plain = engine()
+    first = plain.authorize(conn, _ops("j2-7"), caller())
+    plain.transition(conn, first.receipt_id, "CONSUMED")
+    snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
+                            in_scope=(DECISION, SUPERSEDING))
+    again = engine(snapshots=snapshot).authorize(conn, _ops("j2-8", authority=("T0-1234",)),
+                                                 caller())
+    assert again.code == "ALREADY_COMPLETED"
+
+
+@pytest.mark.parametrize("status", [SignatureStatus.UNSIGNED, SignatureStatus.INVALID])
+def test_a_supersession_we_cannot_verify_is_not_one(conn, status):
+    """P5 + P7 together: an unsigned snapshot cannot grant the exception either."""
+    plain = engine()
+    first = plain.authorize(conn, _ops(f"j2-sig-{status.value}"), caller())
+    plain.transition(conn, first.receipt_id, "CONSUMED")
+    snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
+                            in_scope=(DECISION, SUPERSEDING), signature=status)
+    again = engine(snapshots=snapshot).authorize(
+        conn, _ops(f"j2-sig2-{status.value}", authority=("T0-1234", "T0-9999")), caller())
+    assert again.code == "ALREADY_COMPLETED"
+
+
+def test_an_authority_id_the_snapshot_does_not_carry_blocks_on_its_own(conn):
+    """J2 proper, with no completed lineage in play: an invented decision id is
+    free text with a ticket-shaped name (§1.4)."""
+    auth = engine().authorize(conn, _ops("j2-9", authority=("T0-1234", "ATTACKER-ID"),
+                                         anchors=("ops/fresh.py",)), caller())
+    assert auth.decision == "BLOCK"
+    assert auth.receipt["reason"]["code"] == "AUTHORITY_NOT_IN_SNAPSHOT"
+    assert "ATTACKER-ID" in auth.receipt["reason"]["text"]
+
+
+def test_the_work_hash_is_the_identity_without_the_authority_ids(conn):
+    """The mechanism, stated once: authority ids move intent_hash and must not
+    move the question 'did this work already complete?'."""
+    from agent_crew.cea.engine import work_hash
+    a = identity(work_class=WorkClass.OPS, authority=("T0-1234",))
+    b = identity(work_class=WorkClass.OPS, authority=("T0-1234", "T0-9999"))
+    assert intent_hash(a) != intent_hash(b)
+    assert work_hash(a) == work_hash(b)
+    c = identity(work_class=WorkClass.OPS, authority=("T0-1234",), anchors=("ops/other.py",))
+    assert work_hash(a) != work_hash(c), "different work is still different work"

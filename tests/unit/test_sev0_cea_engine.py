@@ -411,14 +411,21 @@ def test_a_completed_lineage_refuses_re_admission(conn):
     assert again.http_status == 409 and again.code == "ALREADY_COMPLETED"
 
 
+SUPERSEDING = DecisionRev(decision_id="T0-9999", body_hash="c" * 32, supersedes=("T0-1234",))
+
+
 def test_a_superseding_decision_re_admits_completed_work(conn):
-    """The P4 exception, in the only form it can take: a newer decision record is
-    a different intent_hash, so it claims its own lineage."""
+    """The P4 exception, in the only form it may take after 2a-fix: the *signed
+    snapshot* carries a record that explicitly supersedes the completed run's
+    authority. A different intent_hash is the consequence, never the licence —
+    the caller controls the hash inputs, so "the hash changed" proves nothing."""
     eng = engine()
     first = eng.authorize(conn, intent("adm-r1"), caller())
     eng.transition(conn, first.receipt_id, "CONSUMED")
+    snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
+                            in_scope=(DECISION, SUPERSEDING))
     superseding = intent("adm-r2", ident=identity(authority=("T0-1234", "T0-9999")))
-    again = eng.authorize(conn, superseding, caller())
+    again = engine(snapshots=snapshot).authorize(conn, superseding, caller())
     assert again.http_status in (201, 403)
     assert again.code != "ALREADY_COMPLETED"
 

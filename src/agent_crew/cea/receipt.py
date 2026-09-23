@@ -83,6 +83,14 @@ class DecisionRev:
     """§3 ``source_decision_revs: [{decision_id, body_hash}]`` — edits invalidate (§1.4, CX-4g)."""
     decision_id: str
     body_hash: str
+    supersedes: tuple[str, ...] = ()
+    """Decision ids this record **explicitly** supersedes (P4's ALREADY_COMPLETED exception).
+
+    Only the signed snapshot fills this. It is deliberately not part of the
+    ``source_decision_revs`` the receipt emits — that stays the frozen
+    ``{decision_id, body_hash}`` pair — because it is an input to admission, not
+    a field of the binding.
+    """
 
 
 @dataclass(frozen=True)
