@@ -275,10 +275,10 @@ def test_strand_b_control_unenqueued_task_is_not_verifiable(crew):
         assert client.get("/tasks/w1-claimed-dispatched").status_code == 404
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "Strand-B red baseline: GET /tasks/{id} carries no claim/heartbeat record, so "
-    "CLAIMED and RUNNING cannot be proven from the queue (G12 / D6)"))
 def test_strand_b_claimed_and_running_are_provable_from_the_queue(crew):
+    """Green since G12 (9c90da1) landed on this lineage: the claim record is
+    written in the dequeue transaction and the dispatch record on push (ADR
+    §11.1 row 21: xfail markers are removed as lanes land)."""
     make, push, db = crew
     with make() as client:
         assert client.post("/tasks", json=request("sb", "genuinely new work")).status_code == 201
