@@ -1952,9 +1952,15 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def expire_stale(self, older_than_seconds: float = 600.0) -> List[str]:
+    def expire_stale(self, older_than_seconds: float = 600.0,
+                     dry_run: bool = False) -> List[str]:
         """Cancel in_progress tasks whose last_activity_at is older than
-        ``older_than_seconds``. Returns list of cancelled task_ids."""
+        ``older_than_seconds``. Returns list of cancelled task_ids.
+
+        ``dry_run=True`` returns the same candidate set **without cancelling** —
+        the preview and the sweep share one predicate, so a preview can never
+        list a task the sweep would spare, or spare one it would cancel.
+        """
         cutoff = time.time() - older_than_seconds
         conn = self._connect()
         try:
@@ -1963,6 +1969,8 @@ class TaskQueue:
                 (cutoff,),
             ).fetchall()
             task_ids = [r["task_id"] for r in rows]
+            if dry_run:
+                return task_ids
             if task_ids:
                 placeholders = ",".join("?" * len(task_ids))
                 conn.execute(

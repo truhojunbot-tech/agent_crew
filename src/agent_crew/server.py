@@ -5366,12 +5366,15 @@ def create_app(
         candidates = q().expire_stale(older_than_seconds=older_than, dry_run=True) \
             if _expire_stale_supports_dry_run(q()) else None
         if candidates is None:
-            # Queue backends without a preview mode: compute the candidate set the
-            # same way the sweep does, without touching anything.
-            candidates = [
-                t.task_id for t in q().list_tasks()
-                if getattr(t, "status", None) == "in_progress"
-            ]
+            # ⛔A backend without a preview mode cannot tell us what the sweep
+            #   would take. Guessing (every in_progress task, ignoring
+            #   ``older_than``) over-reports the preview and lets a scoped call
+            #   cancel a live task — fail closed instead.
+            raise HTTPException(
+                status_code=501,
+                detail="queue backend has no expire_stale(dry_run=...) — "
+                       "refusing to guess the stale set",
+            )
         if task_id is not None:
             candidates = [t for t in candidates if t == task_id]
             if not candidates:
@@ -5385,7 +5388,7 @@ def create_app(
             return {"would_cancel": candidates, "dry_run": True,
                     "scope": task_id or "global"}
         if task_id is not None:
-            q().cancel_task(task_id)
+            q().cancel(task_id)
             logger.info(f"POST /tasks/expire-stale: cancelled scoped task {task_id}")
             return {"cancelled": [task_id], "dry_run": False, "scope": task_id}
         cancelled = q().expire_stale(older_than_seconds=older_than)
