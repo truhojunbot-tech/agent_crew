@@ -550,3 +550,158 @@ def test_the_guarded_append_still_re_signs_the_body(conn):
     body = {k: v for k, v in moved.items() if k != "signature"}
     expected = _hmac.new(eng._key, canonical_json(body).encode("utf-8"), hashlib.sha256).hexdigest()
     assert sig["value"] == expected
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 #4 r2 — a Caller is unforgeable in-process (engine.py:255,360-372,963-976)
+#
+# The re-review of cb01d49: P1 #1/2/3/5 closed, #4 did not. `credential_kind`
+# and `identity_status` were still caller-controlled fields and the engine's J9
+# test read one of them, so the *public in-process entry point* — not some
+# internal helper — accepted a hand-built Caller. Every test in this section is
+# the reported attack, run through `engine().authorize(...)`.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _ops_intent(task_id):
+    return intent(task_id, ident=identity(work_class=WorkClass.OPS,
+                                          anchors=("ops/rotate.py",)))
+
+
+def test_the_exact_repro_no_longer_even_constructs():
+    """codex P1 #4 r2, verbatim: ``Caller(principal='attacker',
+    provenance=DIRECT, identity_status=VERIFIED,
+    credential_kind='broker_registered')``. The literal is the attack, so the
+    literal is what has to stop working."""
+    with pytest.raises(TypeError, match="minted by agent_crew.cea.auth"):
+        Caller(principal="attacker", provenance=CallerProvenance.DIRECT,
+               identity_status=IdentityStatus.VERIFIED,
+               credential_kind="broker_registered")
+
+
+def test_a_forged_broker_kind_caller_is_refused_by_the_public_entry_point(conn):
+    """The same attack forced past the sealed constructor: ALLOW for an OPS
+    intent with caller_identity='attacker', caller_identity_status='VERIFIED'.
+    Now UnauthenticatedCaller, and nothing is written in the attacker's name."""
+    forged = forged_caller(principal="attacker", provenance=CallerProvenance.DIRECT,
+                           credential_kind="broker_registered",
+                           status=IdentityStatus.VERIFIED)
+    with pytest.raises(UnauthenticatedCaller, match="not minted by an authenticator"):
+        engine().authorize(conn, _ops_intent("forge-broker-1"), forged)
+    rows = conn.execute("SELECT caller_identity, caller_identity_status "
+                        "FROM authorization_receipts").fetchall()
+    assert rows == [], "a caller nobody authenticated must not reach the receipt store"
+
+
+def test_a_forged_adapter_token_kind_is_refused_by_the_same_entry_point(conn):
+    """"The same public in-process entry point also accepts a forged
+    `adapter_token` kind as authenticated" — naming the kind an authenticator
+    *does* issue is not the same as having been issued one."""
+    forged = forged_caller(principal="cron:admitted_trigger",
+                           provenance=CallerProvenance.CRON,
+                           credential_kind="adapter_token",
+                           status=IdentityStatus.UNVERIFIED)
+    with pytest.raises(UnauthenticatedCaller, match="not minted by an authenticator"):
+        engine().authorize(conn, intent("forge-adapter-1"), forged)
+    assert conn.execute("SELECT COUNT(*) FROM authorization_receipts").fetchone()[0] == 0
+
+
+def test_a_forged_caller_that_copies_a_real_principal_field_for_field_is_still_refused(conn):
+    """Identity, not value. A forgery that mirrors an authenticated caller
+    exactly still was not minted, and `authorize` compares provenance of the
+    object rather than its contents."""
+    real = caller()
+    twin = forged_caller(principal=real.principal, provenance=real.provenance,
+                         credential_kind=real.credential_kind,
+                         status=real.identity_status)
+    assert (twin.principal, twin.provenance, twin.credential_kind,
+            twin.identity_status) == (real.principal, real.provenance,
+                                      real.credential_kind, real.identity_status)
+    with pytest.raises(UnauthenticatedCaller):
+        engine().authorize(conn, intent("forge-twin-1"), twin)
+    assert engine().authorize(conn, intent("forge-twin-1"), real).receipt is not None
+
+
+def test_no_public_entry_point_can_produce_a_verified_identity_status(conn):
+    """"until a real broker producer exists BOTH identity statuses are
+    unconditionally UNVERIFIED". `_broker_verified()` promoted on two
+    caller-set fields; it is gone rather than guarded."""
+    import agent_crew.cea.engine as engine_module
+
+    assert not hasattr(engine_module, "_broker_verified")
+    auth = engine().authorize(conn, intent("unverified-1"), caller())
+    assert auth.receipt["caller_identity_status"] == "UNVERIFIED"
+    assert auth.receipt["executor_binding_status"] == "UNVERIFIED"
+    assert auth.receipt["downgrade_reason"] == "SHARED_UID_NO_CREDENTIAL_BOUNDARY"
+
+
+def test_a_token_file_authenticator_mints_an_unverified_caller(tmp_path):
+    """P2a: a 0600 file under a shared uid is tamper-evident, not verified. The
+    authenticator derives the status; no caller supplies it."""
+    path = tmp_path / "tokens.json"
+    path.write_text(json.dumps({"adapters": {TOKEN: {"principal": "cron:admitted_trigger",
+                                                     "provenance": "cron"}}}))
+    os.chmod(path, 0o600)
+    authenticated = TokenFileAuthenticator(str(path)).authenticate(TOKEN)
+    assert authenticated is not None
+    assert authenticated.identity_status is IdentityStatus.UNVERIFIED
+    assert authenticated.credential_kind == "adapter_token"
+    assert authenticated.principal == "cron:admitted_trigger"
+
+
+def test_the_broker_credential_kind_still_has_no_producer():
+    """`CREDENTIAL_KIND_BROKER` is a reserved name, not a capability. If a
+    producer ever appears it must arrive with the O21b verification evidence,
+    and this test is what makes that arrival visible."""
+    import inspect
+
+    from agent_crew.cea import auth as auth_module
+
+    source = inspect.getsource(auth_module)
+    assert "CREDENTIAL_KIND_BROKER" in source, "the reserved name should still be documented"
+    call_sites = [line.strip() for line in source.splitlines()
+                  if "_mint_caller(" in line and not line.strip().startswith("from ")]
+    assert len(call_sites) == 1, f"the mint must have exactly one call site, found {call_sites}"
+    assert "CREDENTIAL_KIND_ADAPTER_TOKEN" in call_sites[0]
+    assert "BROKER" not in call_sites[0]
+
+
+def test_receipt_signing_stays_independent_of_caller_authentication(conn, tmp_path):
+    """"Receipt signing must remain independent of caller authentication."" The
+    key proves the engine wrote the receipt; it says nothing about who asked.
+    Both directions: a signed receipt over an UNVERIFIED caller still verifies,
+    and a refused caller gets no receipt to sign at all."""
+    eng = engine(config=_keyed_config(tmp_path))
+    auth = eng.authorize(conn, intent("sign-indep-1"), caller())
+    assert auth.receipt["signature"]["status"] == "VERIFIED" and eng.verify(auth.receipt)
+    assert auth.receipt["caller_identity_status"] == "UNVERIFIED"
+
+    with pytest.raises(UnauthenticatedCaller):
+        eng.authorize(conn, intent("sign-indep-2"), forged_caller())
+    assert conn.execute("SELECT COUNT(*) FROM authorization_receipts "
+                        "WHERE task_id = 'sign-indep-2'").fetchone()[0] == 0
+
+
+def test_a_caller_cannot_be_copied_or_pickled_back_into_existence():
+    """A round trip through a serialiser would hand back an object that reads as
+    authenticated everywhere except the one place that checks. Fail at the copy,
+    not three layers later."""
+    import copy
+    import pickle
+
+    real = caller()
+    with pytest.raises(TypeError):
+        pickle.dumps(real)
+    with pytest.raises(TypeError):
+        copy.copy(real)
+
+
+def test_a_minted_caller_is_immutable(conn):
+    """Authentication that can be edited after the fact is not authentication:
+    an adapter holding a real Caller must not be able to rename its principal."""
+    real = caller()
+    with pytest.raises(AttributeError):
+        real.principal = "attacker"
+    with pytest.raises(AttributeError):
+        real.identity_status = IdentityStatus.VERIFIED
+    auth = engine().authorize(conn, intent("immutable-1"), real)
+    assert auth.receipt["caller_identity"] == "cron:admitted_trigger"
