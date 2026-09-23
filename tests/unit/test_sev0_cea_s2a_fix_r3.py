@@ -238,22 +238,112 @@ def test_shadow_and_test_may_still_run_embedded(conn, mode):
     assert (mode in EMBEDDED_MODES) and mode in (TEST, SHADOW)
 
 
-def test_the_service_is_the_credential_boundary_enforce_requires(tmp_path, conn):
-    """An engine served by :class:`EngineService` authorizes under enforce: every
-    caller reaching it presented a credential that a different process checked."""
-    from agent_crew.cea.service import EngineService
+def test_no_public_declaration_can_turn_enforce_authorization_on(tmp_path, conn):
+    """codex review-sev0-cea-lineage-s2a-fix-r3-x P1, the exact reproduction.
+
+    Before: ``eng.attach_credential_boundary('/not-a-socket')`` then a forged
+    mint reached **ALLOW / OK, caller_identity=attacker,
+    caller_identity_status=UNVERIFIED** — no socket created, no credential
+    checked. The declaration was a public mutable string, so the attacker set
+    it. Now there is no such attribute at all, and the public entry point in
+    ``enforce`` decides nothing regardless of what anybody declares.
+    """
+    eng = _engine(ENFORCE)
+
+    # 1. the attribute the attack used is gone, and assigning one changes nothing.
+    assert not hasattr(eng, "attach_credential_boundary")
+    assert not hasattr(eng, "_credential_boundary")
+    eng._credential_boundary = str(tmp_path / "not-a-socket")   # the declaration, verbatim
+    eng.attach_credential_boundary = lambda name: None          # and the method, re-added
+    eng.attach_credential_boundary(str(tmp_path / "not-a-socket"))
+    assert not (tmp_path / "not-a-socket").exists()
+
+    # 2. the forged caller of the finding, minted the way the finding mints it.
+    forged = mint_caller("attacker", CallerProvenance.DIRECT, "x")
+    assert is_authenticated_caller(forged) and forged.principal == "attacker"
+
+    # 3. a REVIEW intent — the finding's work class — reaches no ALLOW path.
+    auth = eng.authorize(conn, intent("fold2-p1", ident=identity(work_class=WorkClass.REVIEW)),
+                         forged)
+    assert (auth.decision, auth.code) == ("BLOCK", "CREDENTIAL_BOUNDARY_UNAVAILABLE")
+    assert auth.http_status == 403
+    assert auth.receipt["provenance"]["unavailable_inputs"] == ["caller_credential_boundary"]
+    # the audit row still exists, and still does not call the forgery verified.
+    assert auth.receipt["caller_identity"] == "attacker"
+    assert auth.receipt["caller_identity_status"] == "UNVERIFIED"
+
+
+def test_enforce_has_no_public_path_that_is_not_fail_closed(conn):
+    """Every public spelling of "authorize this" is the fail-closed one. The
+    enforcing path is a different, non-public method the socket handler calls."""
+    eng = _engine(ENFORCE)
+    public = [n for n in dir(eng) if not n.startswith("_") and "author" in n.lower()]
+    assert public == ["authorize"], public
+    assert eng.authorize(conn, intent("pub-1"), caller()).code == "CREDENTIAL_BOUNDARY_UNAVAILABLE"
+    assert hasattr(eng, "_authorize_authenticated")
+
+
+def test_the_service_is_the_credential_boundary_enforce_requires(tmp_path):
+    """An engine served by :class:`EngineService` authorizes under enforce — but
+    only for a caller that presented a credential *this* service matched, over
+    the socket, in a process the caller does not run in.
+
+    Asserted end to end through :class:`UnixSocketEngineClient` rather than by
+    calling ``eng.authorize()`` after construction. The old version of this test
+    did exactly that and so encoded the bypass: it asserted only that
+    ``CREDENTIAL_BOUNDARY_UNAVAILABLE`` disappeared from an in-process call once
+    a service object existed somewhere (codex P1).
+    """
+    import sqlite3 as _sqlite3
+
+    from agent_crew.cea.auth import AdapterIdentity, StaticTokenAuthenticator
+    from agent_crew.cea.service import EngineError, EngineService, UnixSocketEngineClient
+
+    db = tmp_path / "receipts.db"
+
+    def connect():
+        c = _sqlite3.connect(db)
+        c.row_factory = _sqlite3.Row
+        receipt_store.ensure_schema(c)
+        return c
 
     eng = _engine(ENFORCE)
-    refused = eng.authorize(conn, intent("svc-0"), caller())
-    assert refused.code == "CREDENTIAL_BOUNDARY_UNAVAILABLE"
-
-    service = EngineService(str(tmp_path / "authz.sock"), eng, lambda: conn)
+    sock = str(tmp_path / "authz.sock")
+    auth_table = StaticTokenAuthenticator(
+        {"tok-good": AdapterIdentity("adapter:server", CallerProvenance.DIRECT)})
+    service = EngineService(sock, eng, connect, authenticator=auth_table)
+    thread = service.serve_in_thread()
     try:
-        admitted = eng.authorize(conn, intent("svc-1", ident=identity(anchors=("svc/a.py",))),
-                                 caller())
+        config = EngineConfig(mode=ENFORCE, endpoint=sock)
+
+        # in-process, same engine object, same moment: still refused.
+        local = connect()
+        try:
+            refused = eng.authorize(local, intent("svc-0"), caller())
+            assert refused.code == "CREDENTIAL_BOUNDARY_UNAVAILABLE"
+        finally:
+            local.close()
+
+        # across the socket with a credential the service matched: decided.
+        admitted = UnixSocketEngineClient(config, credential="tok-good").authorize(
+            None, intent("svc-1", ident=identity(anchors=("svc/a.py",))))
         assert admitted.code != "CREDENTIAL_BOUNDARY_UNAVAILABLE"
+        assert admitted.receipt["caller_identity"] == "adapter:server"
+
+        # across the socket with a credential it did not: 401, and no receipt.
+        with pytest.raises(EngineError) as exc:
+            UnixSocketEngineClient(config, credential="tok-forged").authorize(
+                None, intent("svc-2", ident=identity(anchors=("svc/b.py",))))
+        assert "401 UNAUTHENTICATED" in str(exc.value)
+        seen = connect()
+        try:
+            assert seen.execute("SELECT COUNT(*) FROM authorization_receipts "
+                                "WHERE task_id = 'svc-2'").fetchone()[0] == 0
+        finally:
+            seen.close()
     finally:
-        service.server_close()
+        service.shutdown_and_close()
+        thread.join(timeout=5)
 
 
 def test_enforce_still_records_the_audit_row_for_the_refusal(conn):

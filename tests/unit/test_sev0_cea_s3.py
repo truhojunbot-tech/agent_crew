@@ -91,6 +91,18 @@ def engine_with(client, **kw):
                                **{k: v for k, v in prov.items() if k not in ("snapshots",)})
 
 
+# ⛔`_authorize_authenticated`, not `authorize`. These are `mode=enforce`
+#   decision tests, and under enforce the *public* `authorize()` is
+#   unconditionally fail-closed — it is the entry point any in-process caller
+#   can reach, so it can never be the one that enforces (codex
+#   review-sev0-cea-lineage-s2a-fix-r3-x P1). In the real deployment only
+#   `service.EngineService` reaches this method, after the presented credential
+#   matched by `hmac.compare_digest`, over a socket, in another process. Here
+#   the harness stands in for that boundary so the *judgements* below can be
+#   exercised; that the boundary itself cannot be faked is asserted in
+#   tests/unit/test_sev0_cea_s2a_fix_r3.py, not here.
+
+
 def mem_conn():
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
@@ -106,7 +118,7 @@ def _raise(_req):
 
 def test_e4_provider_unavailable_blocks():
     client = AdmissionInputsClient(runner=_raise)
-    auth = engine_with(client).authorize(mem_conn(), intent(), caller("cron:a", CallerProvenance.CRON))
+    auth = engine_with(client)._authorize_authenticated(mem_conn(), intent(), caller("cron:a", CallerProvenance.CRON))
     assert auth.decision == "BLOCK" and auth.code == "INPUTS_UNAVAILABLE"
     assert "capability_registry" in auth.receipt["reason"]["text"]
     assert not validate_receipt(auth.receipt)
@@ -131,7 +143,7 @@ def test_registry_unavailable_status_and_degraded_stale():
 def test_l3_memory_unavailable_blocks_even_when_e4_answers():
     doc = json.loads(FIXTURE.read_text())
     doc["incident_memory"] = {"provider": "incident_memory", "status": "UNAVAILABLE", "matches": []}
-    auth = engine_with(fixture_client(doc)).authorize(mem_conn(), intent(),
+    auth = engine_with(fixture_client(doc))._authorize_authenticated(mem_conn(), intent(),
                                                       caller("cron:a", CallerProvenance.CRON))
     assert auth.decision == "BLOCK" and auth.code == "INPUTS_UNAVAILABLE"
 
@@ -157,7 +169,7 @@ def test_snapshot_reader_missing_unkeyed_stale(tmp_path):
                               snapshots=CanonicalPolicySnapshotReader(str(p), clock=time.time),
                               capabilities=E4CapabilityProvider(fixture_client()),
                               runtime=Runtime(), budgets=Budget())
-    auth = eng.authorize(mem_conn(), intent(), caller("cron:a", CallerProvenance.CRON))
+    auth = eng._authorize_authenticated(mem_conn(), intent(), caller("cron:a", CallerProvenance.CRON))
     assert auth.decision == "BLOCK" and "policy_snapshot_signature:UNKEYED" in auth.receipt["reason"]["text"]
 
 
@@ -218,7 +230,7 @@ def _enforcing_adapter(eng, db, it, who):
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
     try:
-        auth = eng.authorize(conn, it, caller(*who))
+        auth = eng._authorize_authenticated(conn, it, caller(*who))
         conn.commit()
     finally:
         conn.close()
@@ -260,7 +272,7 @@ def test_known_duplicate_one_db_second_adapter_refused_no_task(tmp_path):
 def test_memory_block_disposition_denies_and_snapshot_supersession_lifts():
     doc = json.loads(FIXTURE.read_text())
     doc["incident_memory"]["matches"][0].update(recorded_disposition="BLOCK", kind="counterexample")
-    auth = engine_with(fixture_client(doc)).authorize(mem_conn(), intent(), caller(*ADAPTERS[0]))
+    auth = engine_with(fixture_client(doc))._authorize_authenticated(mem_conn(), intent(), caller(*ADAPTERS[0]))
     assert auth.decision == "BLOCK" and auth.code == "HUMAN_GATE_DENIED"
     lifted = DecisionRev(decision_id="T0-1234", body_hash="b" * 32, supersedes=("DW-ALFRED-USAGE-METER",))
     gate = MemoryGate(SnapshotRecordGate(), fixture_client(doc)).state(

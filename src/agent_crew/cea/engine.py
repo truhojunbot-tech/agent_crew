@@ -377,25 +377,63 @@ class AuthorizationEngine:
         self.gates = gates or SnapshotHumanGate()
         self._clock = clock or time.time
         self._key = _load_key(self.config.key_path)
-        self._credential_boundary: Optional[str] = None
 
-    def attach_credential_boundary(self, name: str) -> None:
-        """Declare that this engine is reached only across a credential boundary.
+    # ── caller + identity preconditions, shared by both entry points ────
 
-        Called by :class:`~agent_crew.cea.service.EngineService` with its socket
-        path: the engine object then lives in the serving process, and every
-        caller has already presented a credential that a *different* process
-        validated. That is what ``enforce`` requires before it will authorize.
+    def _require_authenticated(self, caller: Caller) -> None:
+        """J9 — who is asking. Raise before anything is read: an unauthenticated
+        caller does not get to learn the policy state, and it does not get an
+        audit row in its chosen name either.
 
-        ⛔Not a permission check. In-process code can call this method as easily
-          as it can call :func:`~agent_crew.cea._caller_mint.mint_caller`, and
-          pretending otherwise would repeat the mistake this whole change is
-          about. It records a deployment fact so a misconfiguration — an
-          ``enforce`` engine wired straight into an adapter, with no socket in
-          front of it — fails closed and loudly instead of enforcing on
-          unauthenticated callers.
+        ⛔A Caller is only ever a *result of authentication*
+          (:mod:`agent_crew.cea.auth`). Two earlier versions of this test were
+          not authentication:
+            `caller is None` — the socket decoder built a Caller from request
+              JSON, so `Caller(principal="attacker", ...)` walked through and an
+              OPS intent under it was ALLOWed (codex P1 #1);
+            `credential_kind in (...)` — a *string the caller chose*, so
+              `Caller(principal="attacker", provenance=DIRECT,
+              identity_status=VERIFIED, credential_kind="broker_registered")`
+              walked through the same public entry point and reached the receipt
+              as caller_identity_status=VERIFIED, although agent_crew.cea.auth
+              has no broker producer at all (codex P1 #4, re-review of cb01d49).
+          The test is now *provenance of the object itself*: was it produced by
+          an authenticator, which happens only after a presented credential
+          matched. A forgery cannot set that by copying fields.
+
+          ⛔It is still not an authentication boundary and is not claimed as one
+            (codex, re-review of f1aee1d): in-process code can import
+            `_caller_mint.mint_caller`, or add an `object.__new__` instance to
+            the registry via `is_authenticated_caller.__closure__`. What makes
+            that worthless is that no judgement differs by principal while
+            identity is UNVERIFIED — and that under `enforce` the public entry
+            point decides nothing at all.
         """
-        self._credential_boundary = name
+        if caller is None:
+            raise UnauthenticatedCaller(
+                "authorize() requires an authenticated Caller; adapters authenticate first (§7.1)")
+        if not is_authenticated_caller(caller):
+            raise UnauthenticatedCaller(
+                f"caller {getattr(caller, 'principal', None)!r} was not minted by an "
+                f"authenticator; a Caller comes from agent_crew.cea.auth after a credential "
+                f"matched, never from a request body or a constructor (J9, P2a)")
+
+    def _canonicalize(self, conn: sqlite3.Connection, intent: Intent, caller: Caller):
+        """P4/§5.2: one spelling per target, fixed *before* the hash and before
+        the E4 registry sees the intent — so identity and matching can never
+        disagree about which file was named.
+
+        Returns ``(intent, intent_hash)``, or an :class:`Authorization` refusal
+        when the anchors do not canonicalize.
+        """
+        try:
+            intent = replace(intent, identity=canonical_identity(intent.identity))
+        except InvalidScopeAnchor as exc:
+            return Authorization(
+                receipt=self._refusal(intent, caller, uncanonical_intent_hash(intent.identity),
+                                      "INVALID_SCOPE_ANCHOR", str(exc), conn=conn),
+                http_status=400, code="INVALID_SCOPE_ANCHOR")
+        return intent, intent_hash(intent.identity)
 
     # ── public API ──────────────────────────────────────────────────────
 
@@ -407,7 +445,59 @@ class AuthorizationEngine:
         answer: ``201`` newly admitted, ``200`` the same receipt returned for an
         idempotent replay, ``409`` ``DUPLICATE_INTENT``, ``403`` blocked/held,
         ``401`` no caller credential.
+
+        ⛔In ``mode=enforce`` this method is **unconditionally fail-closed**. It
+          is the entry point any in-process caller can reach, so under P7 it can
+          never be the one that enforces. The only enforcing path is
+          :meth:`_authorize_authenticated`, which
+          :class:`~agent_crew.cea.service.EngineService` calls after the
+          credential it was handed matched a token by ``hmac.compare_digest`` —
+          in a process the caller does not run in.
         """
+        if self.config.mode == ENFORCE:
+            return self._enforce_boundary_refusal(conn, intent, caller)
+        return self._authorize_authenticated(conn, intent, caller, retry=retry)
+
+    def _enforce_boundary_refusal(self, conn: sqlite3.Connection, intent: Intent,
+                                  caller: Caller) -> Authorization:
+        """P7/P2a: ``enforce`` reached without a credential boundary, so nothing
+        is decided and the refusal is recorded as an unavailable input.
+
+        Previously this depended on ``self._credential_boundary is None`` — a
+        public mutable flag any caller could set (``eng.attach_credential_boundary
+        ('/not-a-socket')``), after which a forged mint reached ALLOW with
+        ``caller_identity=attacker`` and no socket in existence at all (codex
+        review-sev0-cea-lineage-s2a-fix-r3-x P1). A declaration is not proof of
+        process topology; being a different method than the one the boundary
+        calls is.
+        """
+        receipt_store.ensure_schema(conn)
+        self._require_authenticated(caller)
+        prepared = self._canonicalize(conn, intent, caller)
+        if isinstance(prepared, Authorization):
+            return prepared
+        intent, ih = prepared
+        return Authorization(
+            receipt=self._refusal(
+                intent, caller, ih, "CREDENTIAL_BOUNDARY_UNAVAILABLE",
+                "P7/P2a: mode=enforce refuses embedded in-process authorization. The caller "
+                "credential boundary is the unix-socket service (AGENT_CREW_CEA_ENGINE_ENDPOINT), "
+                "not this interpreter; an in-process caller object is not authentication. Use "
+                "mode=shadow to measure, mode=test in a harness, or deploy crew-authz",
+                conn=conn, unavailable=("caller_credential_boundary",)),
+            http_status=403, code="CREDENTIAL_BOUNDARY_UNAVAILABLE")
+
+    # ── boundary-internal API ───────────────────────────────────────────
+    # ⛔Reachable only from the credential boundary. It is a private name, not a
+    #   permission check: in-process code can still import and call it, exactly
+    #   as it can import `_caller_mint.mint_caller`. That residue is the P2a
+    #   same-uid limitation and is documented in cea/README.md as such — what
+    #   changed is that no *public* enforce path exists to walk through any more.
+
+    def _authorize_authenticated(self, conn: sqlite3.Connection, intent: Intent,
+                                 caller: Caller, *, retry: bool = False) -> Authorization:
+        """The real decision. Called by :class:`EngineService` once the presented
+        credential matched, and directly by the non-enforcing modes."""
         receipt_store.ensure_schema(conn)
 
         # J9 — who is asking. 401 before anything else is read: an
@@ -438,45 +528,12 @@ class AuthorizationEngine:
         #     produce a caller this test accepts. What makes that worthless is
         #     below — no judgement differs by principal while identity is
         #     UNVERIFIED — and the ENFORCE boundary check that follows.
-        if caller is None:
-            raise UnauthenticatedCaller(
-                "authorize() requires an authenticated Caller; adapters authenticate first (§7.1)")
-        if not is_authenticated_caller(caller):
-            raise UnauthenticatedCaller(
-                f"caller {getattr(caller, 'principal', None)!r} was not minted by an "
-                f"authenticator; a Caller comes from agent_crew.cea.auth after a credential "
-                f"matched, never from a request body or a constructor (J9, P2a)")
+        self._require_authenticated(caller)
 
-        # P4/§5.2: one spelling per target, fixed *before* the hash and before
-        # the E4 registry sees the intent — so identity and matching can never
-        # disagree about which file was named.
-        try:
-            intent = replace(intent, identity=canonical_identity(intent.identity))
-        except InvalidScopeAnchor as exc:
-            return Authorization(
-                receipt=self._refusal(intent, caller, uncanonical_intent_hash(intent.identity),
-                                      "INVALID_SCOPE_ANCHOR", str(exc), conn=conn),
-                http_status=400, code="INVALID_SCOPE_ANCHOR")
-        ih = intent_hash(intent.identity)
-
-        # P7 applied to the *deployment*: in `enforce` the engine will not decide
-        # from inside a caller's own process. The credential that makes J9 mean
-        # anything is checked at the unix socket by a peer that is not the caller
-        # (service.EngineService), and nothing in this interpreter can stand in
-        # for that — codex's `_mint_caller` and `__closure__` reproductions are
-        # the proof. So an embedded `enforce` engine reports the caller
-        # credential boundary as an unavailable input and fails closed, rather
-        # than enforcing a verdict it reached over a caller it could not check.
-        if self.config.mode == ENFORCE and self._credential_boundary is None:
-            return Authorization(
-                receipt=self._refusal(
-                    intent, caller, ih, "CREDENTIAL_BOUNDARY_UNAVAILABLE",
-                    "P7/P2a: mode=enforce refuses embedded in-process authorization. The caller "
-                    "credential boundary is the unix-socket service (AGENT_CREW_CEA_ENGINE_ENDPOINT), "
-                    "not this interpreter; an in-process caller object is not authentication. Use "
-                    "mode=shadow to measure, mode=test in a harness, or deploy crew-authz",
-                    conn=conn, unavailable=("caller_credential_boundary",)),
-                http_status=403, code="CREDENTIAL_BOUNDARY_UNAVAILABLE")
+        prepared = self._canonicalize(conn, intent, caller)
+        if isinstance(prepared, Authorization):
+            return prepared
+        intent, ih = prepared
 
         # J1 — lineage. Answered before the expensive inputs so a replay costs a
         # single indexed read, which is what makes idempotency cheap enough to be

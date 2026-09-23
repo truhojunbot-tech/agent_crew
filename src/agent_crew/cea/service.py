@@ -208,7 +208,20 @@ class _Handler(socketserver.StreamRequestHandler):
                 return
             conn = self.server.connect()          # type: ignore[attr-defined]
             try:
-                auth = self.server.engine.authorize(conn, intent, caller, retry=retry)  # type: ignore[attr-defined]
+                # ⛔`_authorize_authenticated`, not `authorize`. Under
+                #   `mode=enforce` the public `authorize()` is unconditionally
+                #   fail-closed, because it is the entry point every in-process
+                #   caller can already reach. This line is the credential
+                #   boundary: it runs only after `self.server.authenticate`
+                #   matched the presented credential with
+                #   `hmac.compare_digest`, in this process, over a socket the
+                #   caller had to connect to. The previous design instead let
+                #   the engine be *told* it was behind a boundary
+                #   (`attach_credential_boundary`) — a public mutable string a
+                #   forged caller could set itself (codex
+                #   review-sev0-cea-lineage-s2a-fix-r3-x P1).
+                auth = self.server.engine._authorize_authenticated(  # type: ignore[attr-defined]
+                    conn, intent, caller, retry=retry)
                 conn.commit()
             finally:
                 conn.close()
@@ -232,13 +245,10 @@ class EngineService(socketserver.ThreadingUnixStreamServer):
         super().__init__(path, _Handler)
         os.chmod(path, 0o600)
         self.engine = engine
-        # This is the credential boundary `enforce` requires: from here on every
-        # caller has presented a secret that *this* process validated, in a
-        # process the caller does not run in. An engine that is not told this
-        # refuses to authorize in `enforce` mode (engine.EMBEDDED_MODES).
-        attach = getattr(engine, "attach_credential_boundary", None)
-        if attach is not None:
-            attach(path)
+        # ⛔Nothing is "attached" to the engine here, deliberately. This object
+        #   *is* the credential boundary `enforce` requires — see `_Handler` —
+        #   and a boundary that can be announced by assignment is a boundary an
+        #   attacker can announce too.
         self.connect = connect
         self.path = path
         # Deny-all by default: an engine started without a caller token table

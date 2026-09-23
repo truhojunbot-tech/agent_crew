@@ -88,3 +88,34 @@ A process boundary with a validated credential is still not a *verified
 identity* under one uid — the receipts keep saying `UNVERIFIED` across the socket
 too. It is a boundary a misconfigured neighbour trips over, and it is the seam
 O21b replaces.
+
+**2a. How `enforce` refuses, and exactly what that is not.**
+
+The refusal above used to be conditional: the engine carried a public
+`attach_credential_boundary(name)` method writing a `_credential_boundary`
+string, and `enforce` authorized whenever that string was non-`None`. Codex
+(`review-sev0-cea-lineage-s2a-fix-r3-x`, P1) reproduced the obvious consequence
+— `eng.attach_credential_boundary('/not-a-socket')`, then a forged
+`mint_caller('attacker', DIRECT, 'x')`, then a REVIEW intent: **ALLOW / OK**,
+`caller_identity=attacker`, with no socket in existence and no credential ever
+checked. A mutable declaration is not proof of process topology.
+
+There is now no such attribute. Instead there are two methods:
+
+| method | who calls it | `enforce` behaviour |
+|--------|--------------|---------------------|
+| `authorize()` — public | adapters, anything in-process | **unconditionally** `BLOCK` / `CREDENTIAL_BOUNDARY_UNAVAILABLE` |
+| `_authorize_authenticated()` — boundary-internal | `service.EngineService._Handler`, only after `authenticate()` matched the presented credential with `hmac.compare_digest` | decides |
+
+⛔This is **not** an in-process access control, and is not claimed as one.
+  Python has no way to stop code in the same interpreter from writing
+  `eng._authorize_authenticated(...)`, exactly as it can import
+  `_caller_mint.mint_caller`. That residue is the P2a same-uid limitation (§P2a,
+  O21b) and nothing here repairs it. What changed is narrower and real: there is
+  no longer a *public, supported* enforce path, and no declaration a caller can
+  make that turns one on. The regressions are
+  `tests/unit/test_sev0_cea_s2a_fix_r3.py::test_no_public_declaration_can_turn_enforce_authorization_on`
+  and `::test_the_service_is_the_credential_boundary_enforce_requires`, the
+  latter asserted end-to-end through `UnixSocketEngineClient` rather than by
+  calling the engine in-process after a service object happened to exist — which
+  is what the superseded test did, and is how it encoded the bypass.
