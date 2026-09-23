@@ -997,6 +997,13 @@ def _detect_transient_error_in_log(
     return None
 
 
+#: G12 / D6 `dispatch_channel` for a dispatcher subprocess, by agent.
+_DISPATCH_CHANNEL = {"claude": "claude_p", "codex": "codex_exec", "gemini": "gemini_cli"}
+
+#: Seconds between process-alive heartbeats for a dispatcher subprocess (G12).
+_HEARTBEAT_INTERVAL_S = float(os.getenv("AGENT_CREW_HEARTBEAT_INTERVAL", "30"))
+
+
 def _dispatch_timeout_for_role(role: str) -> float:
     """Hard wall-clock timeout (seconds) for a dispatched subprocess.
 
@@ -2593,7 +2600,7 @@ def create_app(
         if q().has_in_progress(task_type):
             logger.debug(f"_try_push_next: task_type {task_type} already in progress")
             return  # agent busy; will get pushed when current task completes
-        task = q().dequeue(role=role)
+        task = q().dequeue(role=role, claimed_via="tmux_push")
         if task is None:
             logger.debug(f"_try_push_next: no pending task for role {role}")
             return  # nothing pending
@@ -2782,6 +2789,9 @@ def create_app(
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id)
+        # G12: no lease deadline — a pane task is reaped on idleness (#231).
+        q().record_dispatch(task.task_id, channel="tmux_pane", agent=_target_agent or None,
+                            target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
 
     #: How many times a push path found no pane to deliver to. Keyed by path so
     #: a persistent misconfiguration is loud once and then periodic (#260).
@@ -2827,7 +2837,7 @@ def create_app(
         if q().has_discuss_in_progress_for_agent(agent):
             logger.debug(f"_try_push_discuss: discuss task in progress for agent {agent}")
             return
-        task = q().dequeue_discuss_for_agent(agent)
+        task = q().dequeue_discuss_for_agent(agent, claimed_via="tmux_push")
         if task is None:
             logger.debug(f"_try_push_discuss: no pending discuss task for agent {agent}")
             return
@@ -2877,6 +2887,8 @@ def create_app(
         push_fn(guarded_pane_id, _format_task_message(task, port))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id)
+        q().record_dispatch(task.task_id, channel="tmux_pane", agent=agent,
+                            target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
 
     def _resolve_pane_for_row(row: dict) -> Optional[str]:
         """Find the pane assigned to an in_progress task row. Mirrors the routing
@@ -2930,6 +2942,7 @@ def create_app(
                 _pane_dismiss_permission_prompt(pane_id)
                 if pane_busy_fn(pane_id):
                     q().bump_activity(task_id, ts=now)
+                    q().record_heartbeat(task_id, source="pane_busy", ts=now)
                     actions["bumped"].append(task_id)
                     # Busy pane resets the reminder cycle — agent is alive.
                     reminded_task_ids.discard(task_id)
@@ -3281,6 +3294,17 @@ def create_app(
                 agent = _override
         wt = wt_override or worktree_map.get(role)
         return agent, wt
+
+    async def _process_heartbeat(task_id: str, proc) -> None:
+        """Record, while `proc` runs, that the dispatcher still sees it alive (G12).
+
+        Observation only: it reads `proc.returncode` and writes one column. It
+        ends by itself when the process exits, so a path that forgets to
+        cancel it cannot leave it running.
+        """
+        while proc.returncode is None:
+            q().record_heartbeat(task_id, source="process_alive")
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
 
     async def _dispatch_task(task: TaskRequest, role: str) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
@@ -3972,6 +3996,12 @@ def create_app(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                     start_new_session=True,
                 )
+            # G12: the lease is the kill timeout enforced just below.
+            q().record_dispatch(
+                task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
+                agent=agent, target=f"pid:{proc.pid}",
+                lease_owner=f"{agent}:pid:{proc.pid}", lease_seconds=timeout_secs)
+            _heartbeat = asyncio.create_task(_process_heartbeat(task.task_id, proc))
             _timed_out = False
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout_secs)
@@ -3987,6 +4017,7 @@ def create_app(
                 except ProcessLookupError:
                     pass
                 logger.error(f"dispatcher: timeout {timeout_secs}s task={task.task_id}")
+            _heartbeat.cancel()
             # Inspect the dispatch log tail for upstream errors — applies to
             # both clean exit AND timeout (#190). Claude can return rc=0 with
             # api_error_status:429; gemini-cli often hangs on retry loops past
@@ -4226,7 +4257,7 @@ def create_app(
                     for role in ("implementer", "reviewer", "tester"):
                         if role in active_roles:
                             continue
-                        task = q().dequeue(role=role)
+                        task = q().dequeue(role=role, claimed_via="dispatcher")
                         if task is None:
                             continue
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
@@ -4265,7 +4296,7 @@ def create_app(
                         slot_key = f"discuss_{agent}"
                         if slot_key in active_roles:
                             continue
-                        task = q().dequeue_discuss_for_agent(agent)
+                        task = q().dequeue_discuss_for_agent(agent, claimed_via="dispatcher")
                         if task is None:
                             continue
                         role = _AGENT_TO_ROLE.get(agent, "implementer")
@@ -4866,9 +4897,11 @@ def create_app(
                     "Use the MCP get_next_task tool instead of curl-polling this endpoint."
                 ),
             )
-        task = q().dequeue(agent=agent, role=role)
+        task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
         if task is None:
             return None
+        q().record_dispatch(task.task_id, channel="api", agent=agent or None,
+                            target=f"http_poll:{agent or 'anonymous'}")
         return task
 
     @app.get("/tasks")
@@ -5372,6 +5405,7 @@ def create_app(
         state = checkpoint.get("state", {})
         try:
             checkpoint_id = q().save_checkpoint(task_id, checkpoint_num, state)
+            q().record_heartbeat(task_id, source="worker_checkpoint")
             logger.info(f"POST /tasks/{task_id}/checkpoint: saved checkpoint {checkpoint_num}")
             return {"checkpoint_id": checkpoint_id}
         except Exception as e:

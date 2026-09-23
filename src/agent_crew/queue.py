@@ -1,4 +1,5 @@
 import json
+import contextlib
 import hashlib
 import logging
 import os
@@ -193,6 +194,22 @@ CREATE TABLE IF NOT EXISTS task_exec_events (
     fields    TEXT NOT NULL DEFAULT '{}'
 )
 """
+def _claim_build() -> tuple:
+    """The build of the process making the claim, as `/health` reports it.
+
+    `provenance.build()` is frozen at first call — the server makes that call
+    at startup — so this is the code that is running, not what is on disk
+    (RECONCILIATION F5: disk HEAD and running code differed by 6 commits).
+    Unknown is (None, None), never a guess.
+    """
+    try:
+        from agent_crew import provenance
+        b = provenance.build()
+        return (b.get("commit") or None), (b.get("code_fingerprint") or None)
+    except Exception:
+        return None, None
+
+
 _DDL_TASK_EXEC_EVENTS_INDEX = (
     "CREATE INDEX IF NOT EXISTS idx_task_exec_events_task ON task_exec_events(task_id, event_id)"
 )
@@ -1354,7 +1371,8 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def dequeue(self, agent: str = "", role: str = "") -> Optional[TaskRequest]:
+    def dequeue(self, agent: str = "", role: str = "", *,
+                claimed_via: str = "") -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
         Resolution order (Issue #106 phase 3 — supports dynamic role
@@ -1445,10 +1463,13 @@ class TaskQueue:
                 conn.execute("ROLLBACK")
                 return None
 
+            _now = time.time()
             conn.execute(
                 "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
-                (time.time(), row["task_id"]),
+                (_now, row["task_id"]),
             )
+            self._record_claim_on(conn, row["task_id"], _now, role=role or None,
+                                  agent=agent or None, via=claimed_via)
             conn.execute("COMMIT")
 
             return TaskRequest(
@@ -1548,6 +1569,10 @@ class TaskQueue:
                 "UPDATE task_attribution SET status=?, outcome=?, completed_at=?, updated_at=? WHERE task_id=?",
                 (result.status, outcome, now, now, task_id),
             )
+            # G12 / D6: same funnel, same transaction — agent POSTs and
+            # internal failures (_fail_if_active) both end the lease here.
+            self._record_end_on(conn, task_id, now, "result", posted=True,
+                                status=result.status, outcome=outcome)
             self._store_task_telemetry(conn, task_id, telemetry, now)
             # #204: completed_at >= started_at is expected to always hold —
             # started_at is set once at first dispatch and never rewritten
@@ -1977,6 +2002,131 @@ class TaskQueue:
         finally:
             conn.close()
 
+    # ── G12 / D6: execution-state instrumentation ─────────────────────────
+    #
+    # ⛔Recording only. Nothing in dispatch reads these columns or events, and
+    #   every recorder swallows its own failure: a lost audit row is a gap in
+    #   the evidence, a raised exception here would be a changed dispatch.
+
+    @staticmethod
+    def _append_exec_event_on(conn, task_id: str, event: str, at: float, **fields) -> None:
+        conn.execute(
+            "INSERT INTO task_exec_events (task_id, event, at, fields) VALUES (?, ?, ?, ?)",
+            (task_id, event, at,
+             json.dumps({k: v for k, v in fields.items() if v is not None}, sort_keys=True)),
+        )
+
+    def _record_claim_on(self, conn, task_id: str, at: float, *, role: Optional[str],
+                         agent: Optional[str], via: str) -> None:
+        """Stamp a claim inside the dequeue transaction that made it.
+
+        Same transaction on purpose — a claim that committed without its
+        record is the state D6 exists to rule out — but under a SAVEPOINT, so
+        a failed record rolls back alone and the claim still commits.
+        `via` names the claiming path (`tmux_push`, `dispatcher`, `mcp`,
+        `http_poll`); the provider is often resolved only after the claim and
+        is recorded by `record_dispatch`.
+        """
+        commit, fingerprint = _claim_build()
+        try:
+            conn.execute("SAVEPOINT exec_claim")
+            conn.execute(
+                "UPDATE tasks SET claimed_at = ?, claimed_by_role = ?, claimed_by_agent = ?,"
+                " claimed_via = ?, claim_build_commit = ?, claim_code_fingerprint = ?"
+                " WHERE task_id = ?",
+                (at, role, agent, via or None, commit, fingerprint, task_id),
+            )
+            self._append_exec_event_on(
+                conn, task_id, "claimed", at, role=role, agent=agent, via=via or None,
+                build_commit=commit, code_fingerprint=fingerprint)
+            conn.execute("RELEASE SAVEPOINT exec_claim")
+        except Exception:
+            logger.exception("exec-state: claim record failed task_id=%s", task_id)
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK TO SAVEPOINT exec_claim")
+                conn.execute("RELEASE SAVEPOINT exec_claim")
+
+    def _record_end_on(self, conn, task_id: str, at: float, event: str, *,
+                       posted: bool, **fields) -> None:
+        """End the lease and log how the task ended, inside the caller's txn.
+
+        ``posted`` is True only for `submit_result` — a result that exists. A
+        server-side force-fail ends the lease too, but no result was posted,
+        and `result_posted_at` must not say one was.
+        """
+        try:
+            conn.execute("SAVEPOINT exec_end")
+            conn.execute(
+                "UPDATE tasks SET lease_owner = NULL, lease_expires_at = NULL"
+                + (", result_posted_at = ?" if posted else "") + " WHERE task_id = ?",
+                ((at, task_id) if posted else (task_id,)))
+            self._append_exec_event_on(conn, task_id, event, at, **fields)
+            conn.execute("RELEASE SAVEPOINT exec_end")
+        except Exception:
+            logger.exception("exec-state: %s record failed task_id=%s", event, task_id)
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK TO SAVEPOINT exec_end")
+                conn.execute("RELEASE SAVEPOINT exec_end")
+
+    def record_dispatch(self, task_id: str, *, channel: str, agent: Optional[str] = None,
+                        target: Optional[str] = None, lease_owner: Optional[str] = None,
+                        lease_seconds: Optional[float] = None,
+                        ts: Optional[float] = None) -> None:
+        """Record that a claimed task was handed to a worker.
+
+        ``channel`` uses D6's vocabulary: ``tmux_pane``, ``claude_p``,
+        ``codex_exec``, ``gemini_cli``, ``api``. ``target`` is the pane id or
+        ``pid:<n>``. ``lease_seconds`` is the bound the handing path enforces
+        (the dispatcher's kill timeout); None where there is no fixed bound —
+        a tmux pane task is reaped on idleness (#231), not on a deadline.
+        """
+        at = time.time() if ts is None else ts
+        expires = at + lease_seconds if lease_seconds is not None else None
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET dispatched_at = ?, dispatch_channel = ?, dispatch_agent = ?,"
+                " dispatch_target = ?, dispatch_attempt = COALESCE(dispatch_attempt, 0) + 1,"
+                " lease_owner = ?, lease_expires_at = ?"
+                " WHERE task_id = ?",
+                (at, channel, agent, target, lease_owner, expires, task_id),
+            )
+            if cur.rowcount:
+                attempt = conn.execute(
+                    "SELECT dispatch_attempt FROM tasks WHERE task_id = ?", (task_id,)
+                ).fetchone()[0]
+                self._append_exec_event_on(
+                    conn, task_id, "dispatched", at, channel=channel, agent=agent,
+                    target=target, attempt=attempt, lease_owner=lease_owner,
+                    lease_expires_at=expires)
+            conn.commit()
+        except Exception:
+            logger.exception("exec-state: dispatch record failed task_id=%s", task_id)
+        finally:
+            conn.close()
+
+    def record_heartbeat(self, task_id: str, *, source: str, ts: Optional[float] = None) -> None:
+        """Latest observed sign of life. Snapshot only — a heartbeat every
+        tick in the history would bury the transitions it exists for.
+
+        ``source`` says who observed it (`pane_busy`, `process_alive`,
+        `worker_checkpoint`). None of the three is the agent asserting
+        progress, and the column must not be read as if it were.
+        """
+        at = time.time() if ts is None else ts
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET last_heartbeat_at = ?, last_heartbeat_source = ?"
+                " WHERE task_id = ? AND status = 'in_progress'",
+                (at, source, task_id),
+            )
+            conn.commit()
+        except Exception:
+            logger.exception("exec-state: heartbeat record failed task_id=%s", task_id)
+        finally:
+            conn.close()
+
     def get_exec_state(self, task_id: str) -> Optional[dict]:
         """Snapshot columns plus the ordered event history, for GET /tasks/{id}."""
         conn = self._connect()
@@ -2003,10 +2153,13 @@ class TaskQueue:
         """Roll an in_progress task back to pending so it can be dequeued again."""
         conn = self._connect()
         try:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE tasks SET status = 'pending' WHERE task_id = ? AND status = 'in_progress'",
                 (task_id,),
             )
+            if cur.rowcount:
+                # G12: the lease ends with the claim; the history keeps both.
+                self._record_end_on(conn, task_id, time.time(), "requeued", posted=False)
             conn.commit()
         finally:
             conn.close()
@@ -2135,7 +2288,8 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def dequeue_discuss_for_agent(self, agent: str) -> Optional[TaskRequest]:
+    def dequeue_discuss_for_agent(self, agent: str, *,
+                                  claimed_via: str = "") -> Optional[TaskRequest]:
         """Atomic pending→in_progress for the oldest pending discuss task whose
         context.agent matches `agent`. Context is stored as JSON, so filtering
         happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
@@ -2168,10 +2322,13 @@ class TaskQueue:
             if chosen is None:
                 conn.execute("ROLLBACK")
                 return None
+            _now = time.time()
             conn.execute(
                 "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
-                (time.time(), chosen["task_id"]),
+                (_now, chosen["task_id"]),
             )
+            self._record_claim_on(conn, chosen["task_id"], _now, role="discuss",
+                                  agent=agent or None, via=claimed_via)
             conn.execute("COMMIT")
             return TaskRequest(
                 task_id=chosen["task_id"],
@@ -2442,10 +2599,15 @@ class TaskQueue:
             ts = time.time()
         conn = self._connect()
         try:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE tasks SET push_at = ? WHERE task_id = ? AND status = 'in_progress'",
                 (ts, task_id),
             )
+            if cur.rowcount:
+                try:
+                    self._append_exec_event_on(conn, task_id, "pushed", ts)
+                except Exception:
+                    logger.exception("exec-state: push record failed task_id=%s", task_id)
             conn.commit()
         finally:
             conn.close()
@@ -2949,6 +3111,11 @@ class TaskQueue:
                 "UPDATE tasks SET status = 'failed', summary = ?, error_info = ? WHERE task_id = ?",
                 (summary, json.dumps(error_info) if error_info is not None else None, task_id),
             )
+            # G12: a watchdog timeout ends the lease without a result.
+            self._record_end_on(
+                conn, task_id, time.time(), "force_failed", posted=False,
+                from_status=row["status"],
+                reason=error_info.get("reason") if isinstance(error_info, dict) else None)
             conn.execute("COMMIT")
             return row["task_type"]
         except Exception:
@@ -2980,6 +3147,11 @@ class TaskQueue:
                 "UPDATE tasks SET status = 'failed', summary = ?, error_info = ? WHERE task_id = ?",
                 (summary, json.dumps(error_info) if error_info is not None else None, task_id),
             )
+            # G12: a watchdog timeout ends the lease without a result.
+            self._record_end_on(
+                conn, task_id, time.time(), "force_failed", posted=False,
+                from_status=row["status"],
+                reason=error_info.get("reason") if isinstance(error_info, dict) else None)
             conn.execute("COMMIT")
             return row["task_type"]
         except Exception:
