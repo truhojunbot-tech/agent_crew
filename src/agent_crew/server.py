@@ -60,7 +60,6 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import AdmissionRefused, TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
-from agent_crew.risk_tier import risk_tier_enforcement_enabled
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
     load_scope as _load_test_scope,
@@ -3927,11 +3926,21 @@ def create_app(
                 # operator-configured full-suite override. The cascade stores
                 # this decision on the task so replay/restart cannot infer it
                 # from a provider or project name.
-                if (risk_tier_enforcement_enabled()
-                        and isinstance(task.context, dict)
+                # ⛔This reads the decision the cascade already STORED; it does
+                #   not make one. It used to re-ask the risk-tier module
+                #   whether tiering applied, which meant the same question was
+                #   answered twice — once when the cascade created this task and
+                #   again here, against config that may have changed in between.
+                #   The ADR removes that module as a decision (§11.1 row 13,
+                #   O10) and gives the review/test contract to the policy
+                #   snapshot's J7 `review_test_matrix`, read once at admission.
+                #   What survives at dispatch is honouring a `test_scope` the
+                #   row already carries, and naming where it came from.
+                if (isinstance(task.context, dict)
                         and task.context.get("test_scope") == "targeted"):
                     _scope = {**_scope, "full_suite": False,
-                              "source": "risk_tier", "source_kind": "risk_tier"}
+                              "source": task.context.get("test_scope_source") or "task",
+                              "source_kind": task.context.get("test_scope_source") or "task"}
                 _scope_name = _effective_scope(_scope)
                 _scope_hash = _scope_fingerprint(_scope)
                 q().record_test_economics(

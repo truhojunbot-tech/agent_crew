@@ -383,16 +383,32 @@ def _server_source() -> str:
     return inspect.getsource(server_module)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "CXC-1: duplicate control plane — #294 lexical advisory and risk_tier decision "
-    "still live in server.py (ADR §11.1 rows 13/14 REMOVE)"))
 def test_cxc_1_static_no_second_matcher_or_risk_decision_in_server():
     """Codex #1 (= CX-1): two matchers, two registries. On the agent_crew side the
-    duplicates are the #294 lexical in-flight advisory (server.py:4797-4836) and
-    the risk_tier classifier path (server.py:3691). Static: both gone."""
+    duplicates were the #294 lexical in-flight advisory and the risk_tier
+    classifier read on the dispatch path. Static: both gone from `server.py`.
+
+    ⛔Green here does **not** mean the ADR rows are finished. Row 13 also owns
+      the risk-tier branches still in `pipeline.py`; this asserts only what it
+      says — that the *server* no longer hosts a second matcher or a second risk
+      decision. `test_cxc_1_pipeline_still_decides_by_risk_tier` below is the
+      standing red for the half that remains."""
     src = _server_source()
     assert "active_tasks_for_issue(" not in src, "#294 lexical advisory still in server.py"
     assert "risk_tier_enforcement_enabled" not in src, "risk_tier decision still in server.py"
+
+
+@pytest.mark.xfail(strict=True, reason=(
+    "CXC-1 remainder: pipeline.py still branches on risk_tier_enforcement_enabled() "
+    "for review/test/fix cascades (ADR §11.1 row 13); J7 review_test_matrix is read "
+    "by the engine but the cascades do not consume the receipt's contract yet"))
+def test_cxc_1_pipeline_still_decides_by_risk_tier():
+    """The other half of row 13, kept visible instead of implied by a passing
+    server-only assertion. Flips to green when the cascades take reviewer/tester
+    from the receipt's J7 contract."""
+    import agent_crew.pipeline as pipeline_module
+    assert "risk_tier_enforcement_enabled" not in inspect.getsource(pipeline_module), \
+        "pipeline.py still makes its own risk-tier decision"
 
 
 @pytest.mark.xfail(strict=True, reason=f"CXC-2: E4 shadow ALLOW on OWNER_CONFLICT; adapter unwired; {NO_ENGINE}")
