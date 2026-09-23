@@ -520,6 +520,30 @@ same change makes that file hermetic — it was wiring itself from the live
 | **pipeline risk-tier branches** | `pipeline.py:981`, `:1296`, `:1542` still call `risk_tier_enforcement_enabled()` — unchanged from §8 | The cascades must take reviewer/tester from the receipt's J7 contract. This is guard #14, the one holding the §11.2 count at 7. Standing red `test_cxc_1_pipeline_still_decides_by_risk_tier` is doing its job. |
 | **remaining E8 §11 xfails** | unchanged from §10's table of 60 | All 60 are blocked on E5(a), on the alfred-side policy snapshot, or on the O21b/O21c identity broker — none of which is this repo's code lane. |
 
+### Suite counts at this head
+
+Same selection as §10: `tests/unit/test_sev0_cea_*.py tests/test_cea_*.py
+tests/unit/test_sev0_runtime_authority.py`, `-p no:randomly`, foreground.
+
+| | Count | vs §10 (s4g) |
+|---|---|---|
+| passed | **685** | 656 → 685 (+19 this step, +10 from s4h) |
+| failed | **2** | 0 → 2 — **pre-existing at this step's base**, see below |
+| XPASS | **0** | unchanged |
+| strict xfail | **55** | 60 → 55; s4h landed the requeue receipt lifecycle and removed its five markers |
+
+⛔`failed = 2` and the task asked for `failed = 0`. It is not 0, and saying so is
+  the point. Both failures are
+  `test_sev0_cea_i1_property.py::test_every_transport_reaches_admission_as_its_own_ingress`
+  for `retry_http` and `stale_review_http` — *"never reached admission as
+  `retry.failed_task`; calls=['http.tasks']"*. They reproduce identically at
+  this step's base `e26ae5e` (checked out clean with `git archive e26ae5e` into
+  `/tmp` and run there: same 2 failed, 66 passed), so nothing in step 4i caused
+  them. They are in `server.py`'s retry/stale-review ingress labelling, which
+  this step did not touch, and they postdate §10's `failed = 0` — i.e. they
+  arrived with s4h or its environment. Diagnosing them is a separate step; it is
+  recorded here rather than absorbed.
+
 ### The guard count is unchanged
 
 **7** (5 target components + 2 extra judgements) against ADR §11.2's ≤ 6.
@@ -528,6 +552,7 @@ matrix) is still unstarted.
 
 ## §P Provenance
 
+- Step 4i (§11): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4i-t3-project-legacy` on :8105, branch `sev0/cea-lineage`, base `e26ae5e`, 2026-09-23. The two standing failures were baselined by extracting `e26ae5e` with `git archive` into `/tmp/cea_base` and running the same two files there — read-only, no worktree or branch created. All fixtures under `tmp_path`; `test_sev0_cea_s4c_dispatch_base_absent.py` was made hermetic in this step (it had been wiring itself from the live `~/alfred/governance` snapshot). No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
 - Step 4g (§10): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4g-final-merge-reconcile` on :8105, branch `sev0/cea-lineage`, base `fc857aa`, merged `origin/sev0/cea-lineage-s4d` `d7e427f`, 2026-09-23. Guard greps re-run on the merged head; xfail reasons re-verified with `--runxfail`. All fixtures under `tmp_path` — the s4b harness fix exists precisely to stop the suite reading the live `~/alfred/governance` files. No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
 - Step 4e (§9): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4e-production-wiring` on :8105, branch `sev0/cea-lineage`, base `caf5644`, 2026-09-23. All fixtures under `tmp_path`; the live `~/alfred/governance` files were read only to report what the factory finds there. No live server, DB, GitHub or Telegram mutation.
 - Step 4c (§8): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4c-remainder-folds` on :8105, branch `sev0/cea-lineage`, base `bd58092`, 2026-09-23. Baselines for the pre-existing failures were taken by stashing the work tree at each commit's parent and re-running the same selection. No live server, DB, GitHub or Telegram mutation.
