@@ -386,6 +386,23 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 | `verdict` | reviewers only | `approve` \\| `request_changes` \\| `null` |
 | `findings` | reviewers only | Actionable issues. Empty list for non-reviewers. |
 | `pr_number` | if opened | GitHub PR number, otherwise `null`. |
+| `executor_binding` | if your task block had a `dispatch_nonce` | `{"nonce": "<it>", "presenter": "<your agent name>"}` |
+
+### The dispatch nonce (ADR P2, §2.2)
+
+If your task block carries a `dispatch_nonce:` line, it is a **single-use**
+proof that this task was dispatched to you, and it is checked twice:
+
+1. **Before you start**, present it once for a go/no-go. The block gives you the
+   exact call (`POST /tasks/<id>/start`, or pass it to the equivalent MCP tool).
+   It answers `{"go": true|false}`. **On `go: false`, stop** — somebody else is
+   already running this attempt, or the authorisation no longer holds.
+2. **With your result**, as `executor_binding={"nonce": ..., "presenter": ...}`.
+
+⛔Do not invent one, and do not reuse another task's. A block with no
+  `dispatch_nonce` line means none was minted for you: submit the result without
+  the field rather than making one up. A fabricated nonce is refused, and a
+  result refused at the gate is a result nobody reads.
 
 **Never skip `submit_result`.** POST `status: failed` or `status: needs_human`
 with an honest summary rather than staying silent.

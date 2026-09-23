@@ -190,3 +190,190 @@ def test_a_receiptless_row_is_not_claimable_under_enforce(tmp_path):
                          cea_providers=dict(WIRED))
     assert enforced.dequeue(role="implementer") is None
     assert _status(q, "legacy") == "pending"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# transport — the dispatch nonce reaches the worker and comes back
+# (codex review of 8993bdb, P1 #2)
+# ═══════════════════════════════════════════════════════════════════════════
+
+PANE = "%crew-s2b"
+
+
+class RecordingPush:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, target, message):
+        self.calls.append((target, message))
+
+
+@pytest.fixture
+def push():
+    return RecordingPush()
+
+
+@pytest.fixture
+def client(tmp_path, push):
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+    db = str(tmp_path / "srv.db")
+    TaskQueue(db)                                   # schema, before the app binds
+    app = create_app(db, pane_map={"implementer": PANE}, port=8105, push_fn=push,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    # The app builds its queue on startup, so the context manager is load-bearing.
+    with TestClient(app) as api:
+        yield api, db
+
+
+def _enqueue(db, task_id="t-nonce", **kw):
+    q = TaskQueue(db, cea_config=EngineConfig(mode="shadow"), cea_providers=dict(WIRED))
+    q.enqueue(task(task_id, context=admitted(), **kw))
+    return q
+
+
+def test_the_tmux_task_block_carries_the_nonce(client, push, tmp_path):
+    """The block the pane actually receives names the nonce and the /start call.
+
+    Before this, ``record_dispatch`` minted a nonce and ``_try_push_next``
+    dropped it — so the worker had nothing to present and the two later call
+    sites had nothing to check.
+    """
+    from agent_crew.server import _format_task_message
+
+    _, db = client
+    q = _enqueue(db)
+    got = q.dequeue(role="implementer")
+    nonce = q.record_dispatch(got.task_id, channel="tmux_pane", agent="claude",
+                              target=PANE)
+    assert nonce, "a dispatch through an admitted receipt mints a nonce"
+
+    block = _format_task_message(got, 8105, nonce=nonce)
+
+    assert f"dispatch_nonce: {nonce}" in block
+    assert f"/tasks/{got.task_id}/start" in block
+    assert f'"executor_binding":{{"nonce":"{nonce}"}}' in block
+
+
+def test_a_task_with_no_nonce_gets_the_unchanged_block(client):
+    """``nonce=None`` reproduces the pre-2b block: no /start step, no binding.
+
+    A block that told a worker to present a nonce it was never given would move
+    the same lie one hop downstream.
+    """
+    from agent_crew.server import _format_task_message
+
+    _, db = client
+    q = _enqueue(db, task_id="t-plain")
+    got = q.dequeue(role="implementer")
+
+    block = _format_task_message(got, 8105, nonce=None)
+
+    assert "dispatch_nonce" not in block
+    assert "/start" not in block
+    assert "executor_binding" not in block
+
+
+def test_http_poll_hands_the_nonce_to_the_worker(client):
+    """``GET /tasks/next`` returns ``dispatch_nonce`` alongside the task."""
+    api, db = client
+    _enqueue(db, task_id="t-http")
+
+    body = api.get("/tasks/next", params={"role": "implementer"}).json()
+
+    assert body["task_id"] == "t-http"
+    assert body["dispatch_nonce"], "the poller cannot present what it was not given"
+
+
+def test_http_result_presents_the_nonce_and_it_is_not_persisted(client):
+    """End to end over HTTP: poll → start → result, with the same nonce.
+
+    Two properties at once. The RESULT gate must *see* the nonce — until now it
+    saw ``None`` on every result, so ``enforce`` refused everything for
+    ``NONCE_MISSING``. And the spent credential must not land in ``result_json``.
+    """
+    api, db = client
+    _enqueue(db, task_id="t-e2e")
+
+    handed = api.get("/tasks/next", params={"role": "implementer"}).json()
+    nonce = handed["dispatch_nonce"]
+
+    go = api.post("/tasks/t-e2e/start", json={"nonce": nonce, "presenter": "claude"}).json()
+    assert go["go"] is True
+    assert go["nonce_spent"] is True
+
+    api.post("/tasks/t-e2e/result", json={
+        "task_id": "t-e2e", "status": "completed", "summary": "done",
+        "executor_binding": {"nonce": nonce, "presenter": "claude"}})
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id='t-e2e'").fetchone()
+    finally:
+        conn.close()
+    gate = json.loads(row["context"])["cea_result"]
+    assert gate["point"] == "result"
+    assert "NONCE_MISSING" not in gate["reason"], gate
+    stored = " ".join(str(row[k]) for k in row.keys())
+    assert nonce not in stored, "a spent credential stayed in the task row"
+
+
+def test_mcp_hands_out_and_accepts_the_same_nonce(tmp_path):
+    """The MCP transport carries the nonce both ways, like the HTTP one.
+
+    ⛔Both transports or neither. A gate that only one transport can pass is a
+      gate an agent walks around by changing how it polls (#123).
+    """
+    from agent_crew import mcp_server
+
+    db = str(tmp_path / "mcp.db")
+    TaskQueue(db)
+    _enqueue(db, task_id="t-mcp")
+    queue = TaskQueue(db)
+
+    got = queue.dequeue(agent="claude", role="implementer", claimed_via="mcp")
+    nonce = queue.record_dispatch(got.task_id, channel="api", agent="claude",
+                                  target="mcp:claude")
+    payload = mcp_server._task_to_dict(got, nonce=nonce)
+    assert payload["dispatch_nonce"] == nonce
+
+    # ...and the result side accepts it and strips it.
+    from agent_crew.protocol import TaskResult
+    result = TaskResult(task_id="t-mcp", status="completed", summary="done",
+                        executor_binding={"nonce": nonce, "presenter": "claude"})
+    seen_nonce, seen_presenter = result.take_executor_binding()
+    assert (seen_nonce, seen_presenter) == (nonce, "claude")
+    assert result.executor_binding is None
+    queue.submit_result("t-mcp", result, nonce=seen_nonce, presenter=seen_presenter)
+
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id='t-mcp'").fetchone()
+    finally:
+        conn.close()
+    assert "NONCE_MISSING" not in json.loads(row["context"])["cea_result"]["reason"]
+    assert nonce not in " ".join(str(row[k]) for k in row.keys())
+
+
+def test_every_dispatch_caller_carries_the_nonce_somewhere():
+    """Static: no caller may discard ``record_dispatch``'s return value.
+
+    The reviewer's finding was not that one caller forgot — it was that *every*
+    caller forgot, so the mint had no consumer anywhere in the product and no
+    behavioural test could notice. A bare expression-statement call is exactly
+    that shape.
+    """
+    offenders = []
+    for path in (SRC / "server.py", SRC / "mcp_server.py", SRC / "pipeline.py",
+                 SRC / "watch.py"):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)
+                    and isinstance(node.value.func, ast.Attribute)
+                    and node.value.func.attr == "record_dispatch"):
+                offenders.append(f"{path.name}:{node.lineno}")
+    assert offenders == [], (
+        "record_dispatch's nonce is discarded at " + ", ".join(offenders)
+        + " — the worker cannot present what it was never handed (P2 RESULT)")

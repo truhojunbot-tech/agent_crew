@@ -46,7 +46,7 @@ from agent_crew.pipeline import (
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import PausedError as _PausedError, TaskQueue
+from agent_crew.queue import AdmissionRefused, PausedError as _PausedError, TaskQueue
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +62,16 @@ _DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
 }
 
 
-def _task_to_dict(task: TaskRequest) -> dict[str, Any]:
+def _task_to_dict(task: TaskRequest, *, nonce: Optional[str] = None) -> dict[str, Any]:
     """Serialize a TaskRequest dataclass to a JSON-friendly dict.
 
     Applies the same task-type guard that the tmux push path uses
     (`server._guard_description`), so MCP-pull and tmux-push deliver
     semantically identical messages — Issue #110 phase 4-b.
+
+    ``dispatch_nonce`` is part of "semantically identical": the tmux block
+    carries it, so this transport carries it too. A nonce on one transport and
+    not the other is a gate an agent passes by changing how it polls (#123).
     """
     # Local import to avoid an import cycle: server imports from queue
     # and queue does not import server, but mcp_server is a sibling
@@ -76,6 +80,7 @@ def _task_to_dict(task: TaskRequest) -> dict[str, Any]:
     from agent_crew.server import _guard_description
 
     payload = asdict(task)
+    payload["dispatch_nonce"] = nonce
     try:
         payload["description"] = _guard_description(task)
     except Exception:
@@ -133,9 +138,12 @@ def build_mcp_server(
         task = queue.dequeue(agent=agent, role=resolved_role, claimed_via="mcp")
         if task is None:
             return None
-        queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
-                              target=f"mcp:{agent or 'anonymous'}")
-        return _task_to_dict(task)
+        try:
+            nonce = queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
+                                          target=f"mcp:{agent or 'anonymous'}")
+        except AdmissionRefused as exc:
+            return {"task_id": task.task_id, "dispatch_refused": str(exc)}
+        return _task_to_dict(task, nonce=nonce)
 
     @mcp.tool()
     def get_next_discuss_task(agent: str) -> Optional[dict[str, Any]]:
@@ -143,9 +151,12 @@ def build_mcp_server(
         task = queue.dequeue_discuss_for_agent(agent, claimed_via="mcp")
         if task is None:
             return None
-        queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
-                              target=f"mcp:{agent or 'anonymous'}")
-        return _task_to_dict(task)
+        try:
+            nonce = queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
+                                          target=f"mcp:{agent or 'anonymous'}")
+        except AdmissionRefused as exc:
+            return {"task_id": task.task_id, "dispatch_refused": str(exc)}
+        return _task_to_dict(task, nonce=nonce)
 
     @mcp.tool()
     def submit_result(
@@ -171,6 +182,11 @@ def build_mcp_server(
         # #374: a declared `report` contract is proven by this object; without
         # the argument the contract was satisfiable over HTTP only.
         artifact: Optional[dict] = None,
+        # ADR §2.2 / P2 RESULT — {"nonce": ..., "presenter": ...}, the nonce
+        # handed to this worker in `get_next_task`'s `dispatch_nonce`. Both
+        # transports or neither: without it an MCP worker could never pass the
+        # RESULT gate, so `enforce` would have refused the whole transport.
+        executor_binding: Optional[dict] = None,
     ) -> dict[str, Any]:
         """Mark a task done and store its result.
 
@@ -192,6 +208,7 @@ def build_mcp_server(
                 branch=branch,
                 commit=commit,
                 artifact=artifact,
+                executor_binding=executor_binding,
             )
         except (ValueError, TypeError) as e:
             return {"acknowledged": False, "error": str(e)}
@@ -229,8 +246,12 @@ def build_mcp_server(
             else:
                 _artifact_verified = {"kind": declared_artifact_kind(_task) if declared_artifact_kind(_task) is not None else "commit",
                                       "detail": _detail}
+        # Popped before the row is written — a spent credential does not belong
+        # in `result_json` (see `TaskResult.executor_binding`).
+        _nonce, _presenter = result.take_executor_binding()
         try:
-            task_type = queue.submit_result(task_id, result)
+            task_type = queue.submit_result(task_id, result, nonce=_nonce,
+                                            presenter=_presenter)
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
         # #348: mirror HTTP's post-commit, fail-soft persistence. This is

@@ -3186,6 +3186,26 @@ class TaskQueue:
             conn.close()
         return nonce
 
+    def bind_dispatch_target(self, task_id: str, *, target: str,
+                             lease_owner: Optional[str] = None) -> None:
+        """Name the executor of a dispatch that was already decided.
+
+        The DISPATCH gate answers before a subprocess exists, because the nonce
+        it mints has to be *in* the prompt that spawns it. So the pid is bound
+        afterwards. Telemetry only: it records who the already-authorised
+        dispatch went to, and it never re-opens the decision.
+        """
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE tasks SET dispatch_target = ?, lease_owner = COALESCE(?, lease_owner)"
+                " WHERE task_id = ?", (target, lease_owner, task_id))
+            conn.commit()
+        except Exception:
+            logger.exception("exec-state: dispatch target bind failed task_id=%s", task_id)
+        finally:
+            conn.close()
+
     def start_execution(self, task_id: str, nonce: Optional[str], *,
                         presenter: Optional[str] = None) -> dict:
         """P2 EXECUTE_START — the one-shot go/no-go a pane asks for before it works.

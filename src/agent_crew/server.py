@@ -58,7 +58,7 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
+from agent_crew.queue import AdmissionRefused, TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
 from agent_crew.risk_tier import risk_tier_enforcement_enabled
 from agent_crew.watch import active_tasks_for_issue
@@ -2354,22 +2354,55 @@ def _guard_description(task: TaskRequest) -> str:
     return f"{guard}\n\n{task.description}"
 
 
-def _format_task_message(task: TaskRequest, port: int) -> str:
+def _format_task_message(task: TaskRequest, port: int,
+                         nonce: Optional[str] = None) -> str:
+    """The block a worker receives — and, when one was minted, its dispatch nonce.
+
+    ADR P4/§2.2: the nonce is single-use, presented once at ``/start`` for a
+    go/no-go and once with the result under ``executor_binding``. Handing it to
+    the worker is what makes EXECUTE_START and RESULT *gates* rather than
+    helpers: ``record_dispatch`` minted one from the first day of step 2c, every
+    caller dropped it on the floor, and so under ``enforce`` every result was
+    refused for ``NONCE_MISSING`` while under ``shadow`` the gate recorded a
+    proof nobody had presented (codex cross-repo review of ``8993bdb``, P1 #2).
+
+    ``nonce=None`` reproduces the pre-2b block byte for byte. That is the honest
+    shape for a task with no receipt, and for a runtime whose engine minted
+    nothing: a block that told the worker to present a nonce it was never given
+    would just move the lie one hop downstream.
+    """
     ctx = json.dumps(task.context, ensure_ascii=False)
     description = _guard_description(task)
+    result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
+                   f"\"summary\":\"...\",\"findings\":[]}}")
+    start_step = ""
+    if nonce:
+        result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
+                       f"\"summary\":\"...\",\"findings\":[],"
+                       f"\"executor_binding\":{{\"nonce\":\"{nonce}\"}}}}")
+        start_step = (
+            f"FIRST, before any work, ask for the go/no-go — the nonce is single-use "
+            f"and this call spends it:\n"
+            f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/start "
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{\"nonce\":\"{nonce}\"}}'\n"
+            f"It answers {{\"go\": true|false}}. On go:false, STOP — do not start the work.\n"
+        )
     return (
         f"=== AGENT_CREW TASK ===\n"
         f"task_id: {task.task_id}\n"
         f"task_type: {task.task_type}\n"
         f"branch: {task.branch}\n"
         f"priority: {task.priority}\n"
-        f"context: {ctx}\n"
+        + (f"dispatch_nonce: {nonce}\n" if nonce else "")
+        + f"context: {ctx}\n"
         f"description: {description}\n"
         f"=== END TASK ===\n"
-        f"Do the work described above, then POST result: "
+        + start_step
+        + f"Do the work described above, then POST result: "
         f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
         f"-H 'Content-Type: application/json' "
-        f"-d '{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\",\"summary\":\"...\",\"findings\":[]}}'"
+        f"-d '{result_body}'"
     )
 
 
@@ -2951,13 +2984,21 @@ def create_app(
         # or deleted task block to an otherwise healthy owned pane.
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        # ⛔DISPATCH answers before the block is built, not after it was sent.
+        #   The nonce only exists once the gate said PROCEED, and a worker that
+        #   already has the block cannot be un-handed it — so a refused dispatch
+        #   must be refused here, while there is still a decision to make.
+        try:
+            _nonce = q().record_dispatch(
+                task.task_id, channel="tmux_pane", agent=_target_agent or None,
+                target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
+        except AdmissionRefused as exc:
+            logger.warning("_try_push_next: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        push_fn(guarded_pane_id, _format_task_message(task, port, nonce=_nonce))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id)
-        # G12: no lease deadline — a pane task is reaped on idleness (#231).
-        q().record_dispatch(task.task_id, channel="tmux_pane", agent=_target_agent or None,
-                            target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
 
     #: How many times a push path found no pane to deliver to. Keyed by path so
     #: a persistent misconfiguration is loud once and then periodic (#260).
@@ -3050,11 +3091,16 @@ def create_app(
             )
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        try:
+            _nonce = q().record_dispatch(task.task_id, channel="tmux_pane", agent=agent,
+                                         target=guarded_pane_id,
+                                         lease_owner=f"pane:{guarded_pane_id}")
+        except AdmissionRefused as exc:
+            logger.warning("_try_push_discuss: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        push_fn(guarded_pane_id, _format_task_message(task, port, nonce=_nonce))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id)
-        q().record_dispatch(task.task_id, channel="tmux_pane", agent=agent,
-                            target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
 
     def _resolve_pane_for_row(row: dict) -> Optional[str]:
         """Find the pane assigned to an in_progress task row. Mirrors the routing
@@ -3926,7 +3972,21 @@ def create_app(
             logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
 
 
-        message = _format_task_message(task, port)
+        # ⛔DISPATCH decides here, before the prompt exists, because the nonce it
+        #   mints must be *inside* that prompt — a subprocess cannot be handed
+        #   one afterwards. The pid is bound once the process exists
+        #   (`bind_dispatch_target`); binding a target is telemetry, deciding a
+        #   dispatch is not.
+        try:
+            _dispatch_nonce = q().record_dispatch(
+                task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
+                agent=agent, target=f"{agent}:pending",
+                lease_owner=f"{agent}:pending",
+                lease_seconds=_dispatch_timeout_for_role(role))
+        except AdmissionRefused as exc:
+            logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        message = _format_task_message(task, port, nonce=_dispatch_nonce)
         # #239: assemble a bounded, provenance-linked Context Pack from durable
         # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
         # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
@@ -4168,11 +4228,10 @@ def create_app(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                     start_new_session=True,
                 )
-            # G12: the lease is the kill timeout enforced just below.
-            q().record_dispatch(
-                task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
-                agent=agent, target=f"pid:{proc.pid}",
-                lease_owner=f"{agent}:pid:{proc.pid}", lease_seconds=timeout_secs)
+            # G12: the lease is the kill timeout enforced just below. The
+            # dispatch itself was decided before the prompt was built.
+            q().bind_dispatch_target(task.task_id, target=f"pid:{proc.pid}",
+                                     lease_owner=f"{agent}:pid:{proc.pid}")
             _heartbeat = asyncio.create_task(_process_heartbeat(task.task_id, proc))
             _timed_out = False
             try:
@@ -5098,9 +5157,18 @@ def create_app(
         task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
         if task is None:
             return None
-        q().record_dispatch(task.task_id, channel="api", agent=agent or None,
-                            target=f"http_poll:{agent or 'anonymous'}")
-        return task
+        try:
+            nonce = q().record_dispatch(task.task_id, channel="api", agent=agent or None,
+                                        target=f"http_poll:{agent or 'anonymous'}")
+        except AdmissionRefused as exc:
+            # The claim already committed; the dispatch did not. Say so rather
+            # than hand out a task the gate refused.
+            raise HTTPException(status_code=409, detail=str(exc))
+        # ⛔Additive: every field a poller already reads is unchanged. The nonce
+        #   is presented back at `/tasks/{id}/start` and with the result under
+        #   `executor_binding`; `None` means none was minted and the two later
+        #   call sites have nothing to check (P2).
+        return {**dataclasses.asdict(task), "dispatch_nonce": nonce}
 
     @app.get("/tasks")
     def list_tasks(status: str = ""):
@@ -5189,8 +5257,14 @@ def create_app(
         # and never learns it was revised. Capture the prior status so the
         # revision can be announced.
         _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
+        # §2.2 / P2 RESULT. Popped, not read: the nonce is a spent credential
+        # and must not reach `result_json`. `presenter` defaults to the task's
+        # dispatch agent only when the worker did not name itself — an asserted
+        # identity either way under P2a, and the receipt records that it is.
+        _nonce, _presenter = result.take_executor_binding()
         try:
-            task_type = q().submit_result(task_id, result)
+            task_type = q().submit_result(task_id, result, nonce=_nonce,
+                                          presenter=_presenter)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
             # outside submit_result's STOP-atomic transaction: a telemetry-like
