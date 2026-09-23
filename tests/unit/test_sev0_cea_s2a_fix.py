@@ -30,8 +30,8 @@ from agent_crew.cea.schema import validate_receipt
 from agent_crew.cea.service import EngineService, UnixSocketEngineClient, encode_intent
 
 from tests.unit.test_sev0_cea_engine import (  # the step-2a fixture writers, unchanged
-    DECISION, FakeBudget, FakeGate, FakeRegistry, FakeRuntime, FakeSnapshot, caller, run_to,
-    engine, identity, intent)
+    DECISION, FakeBudget, FakeGate, FakeRegistry, FakeRuntime, FakeSnapshot, caller,
+    forged_caller, run_to, engine, identity, intent)
 
 
 @pytest.fixture()
@@ -140,10 +140,9 @@ def test_an_engine_with_no_token_table_authenticates_nobody(tmp_path):
 
 
 def test_in_process_authorize_refuses_a_caller_nobody_authenticated(conn):
-    """Defence in depth for the embedded deployment: an object with no
-    credential_kind was never produced by an authenticator."""
-    forged = Caller(principal="attacker", provenance=CallerProvenance.DIRECT,
-                    identity_status=IdentityStatus.VERIFIED, credential_kind=None)
+    """Defence in depth for the embedded deployment: an object no authenticator
+    minted is not a principal, whatever its fields say."""
+    forged = forged_caller(credential_kind=None, status=IdentityStatus.VERIFIED)
     with pytest.raises(UnauthenticatedCaller):
         engine().authorize(conn, intent("inproc-forge"), forged)
     assert conn.execute("SELECT COUNT(*) FROM authorization_receipts").fetchone()[0] == 0
@@ -245,11 +244,17 @@ def _keyed_config(tmp_path) -> EngineConfig:
 def test_a_keyed_engine_does_not_promote_a_caller_supplied_verified_status(conn, tmp_path):
     """codex P1 #4, verbatim: supplying any engine signing key promoted
     `caller.identity_status` straight from the request, so a keyed engine with a
-    caller-created VERIFIED Caller emitted caller_identity_status=VERIFIED."""
-    forged = Caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON,
-                    identity_status=IdentityStatus.VERIFIED, credential_kind="adapter_token")
+    caller-created VERIFIED Caller emitted caller_identity_status=VERIFIED.
+
+    Two things close it now: the forged Caller is refused outright (r2), and an
+    authenticated one is UNVERIFIED because the authenticator derives the status."""
+    with pytest.raises(UnauthenticatedCaller):
+        engine(config=_keyed_config(tmp_path)).authorize(
+            conn, intent("keyed-0"),
+            forged_caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON,
+                          credential_kind="adapter_token"))
     eng = engine(config=_keyed_config(tmp_path))
-    auth = eng.authorize(conn, intent("keyed-1"), forged)
+    auth = eng.authorize(conn, intent("keyed-1"), caller())
     assert auth.receipt["caller_identity_status"] == "UNVERIFIED"
     assert auth.receipt["executor_binding_status"] == "UNVERIFIED"
     assert auth.receipt["downgrade_reason"] == "SHARED_UID_NO_CREDENTIAL_BOUNDARY"

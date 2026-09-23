@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import posixpath
 import re
+import weakref
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Optional
@@ -107,17 +108,107 @@ class Intent:
     extra: dict = field(default_factory=dict)  # provenance only; never an admission input
 
 
-@dataclass(frozen=True)
 class Caller:
     """The authenticated principal presented to ``authorize`` (P5, §6.5, J9).
 
-    ``identity_status`` is ``UNVERIFIED`` until O21b; a per-adapter ``0400``
-    token under one uid is tamper-evident only (P2a).
+    ⛔**Sealed: this class has no usable constructor.** ``Caller(...)`` raises,
+      and an instance forced into existence another way (``object.__new__``,
+      ``copy``, unpickling) is not *minted* — :func:`is_authenticated_caller`
+      answers ``False`` for it and :meth:`AuthorizationEngine.authorize` refuses
+      it. The only producer is :mod:`agent_crew.cea.auth`, which holds the
+      module-private :func:`_mint_caller`.
+
+    Why the earlier shape was not authentication (codex P1 #4, re-review of
+    ``cb01d49``): ``Caller`` was a plain frozen dataclass and the engine's test
+    was ``credential_kind in ("adapter_token", "broker_registered")`` — a string
+    the caller chose. So the in-process entry point accepted
+    ``Caller(principal="attacker", provenance=DIRECT,
+    identity_status=VERIFIED, credential_kind="broker_registered")`` and returned
+    ALLOW for an OPS intent, with ``caller_identity_status="VERIFIED"`` on the
+    receipt, although :mod:`agent_crew.cea.auth` has no broker producer at all.
+    A field an attacker can set is not evidence; being *minted* is, because
+    minting happens only after a credential matched.
+
+    ``identity_status`` is therefore never taken from anybody: the authenticator
+    derives it, and until the O21b broker exists it is unconditionally
+    ``UNVERIFIED`` (P2a — a ``0600`` token under one shared uid is
+    tamper-evident, not verified).
     """
-    principal: str                        # caller class + instance, e.g. "cron:admitted_trigger"
-    provenance: CallerProvenance
-    identity_status: IdentityStatus = IdentityStatus.UNVERIFIED
-    credential_kind: Optional[str] = None  # "adapter_token" | "broker_registered" | None
+
+    __slots__ = ("principal", "provenance", "identity_status", "credential_kind",
+                 "__weakref__")
+
+    def __init__(self, *args, **kwargs):
+        raise TypeError(
+            "Caller is minted by agent_crew.cea.auth after a credential matched; it "
+            "cannot be constructed. Authenticate (StaticTokenAuthenticator / "
+            "TokenFileAuthenticator) and use what you are given (J9, P2a)")
+
+    def __setattr__(self, name, value):
+        raise AttributeError("Caller is immutable once minted (J9)")
+
+    def __delattr__(self, name):
+        raise AttributeError("Caller is immutable once minted (J9)")
+
+    # Identity, not value: two callers are the same caller only if they are the
+    # same minted object. Value equality would let a forgery compare equal to a
+    # real principal — and would break the mint registry, which is a set.
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+    def __repr__(self) -> str:
+        return (f"Caller(principal={self.principal!r}, provenance={self.provenance!r}, "
+                f"identity_status={self.identity_status!r}, "
+                f"credential_kind={self.credential_kind!r})")
+
+    def __reduce__(self):
+        # Pickling would otherwise round-trip a Caller through a public API and
+        # hand the copy back unminted — which then reads as an authenticated
+        # object right up until authorize() refuses it. Fail where it happens.
+        raise TypeError("a Caller does not serialise: authenticate on the receiving side (J9)")
+
+
+def _seal_caller():
+    """Close the mint over a registry so neither can be reached by name.
+
+    The registry is weak: a Caller stops being authenticated exactly when the
+    last reference to it is dropped, and a long-lived engine does not accumulate
+    every principal that ever called it.
+    """
+    minted: "weakref.WeakSet[Caller]" = weakref.WeakSet()
+
+    def mint(principal: str, provenance: CallerProvenance, credential_kind: str) -> "Caller":
+        if not isinstance(principal, str) or not principal:
+            raise ValueError("a minted Caller needs a principal")
+        if not isinstance(provenance, CallerProvenance):
+            raise TypeError("provenance must be a CallerProvenance, not a string from a peer")
+        if not isinstance(credential_kind, str) or not credential_kind:
+            raise ValueError("a minted Caller names the credential kind that produced it")
+        caller = object.__new__(Caller)
+        setattr_ = object.__setattr__
+        setattr_(caller, "principal", principal)
+        setattr_(caller, "provenance", provenance)
+        # ⛔P2a: **derived here, never accepted.** One line, and it is the whole
+        #   O21b seam: when a broker that independently verifies a spawn exists,
+        #   it mints VERIFIED and nothing else in this file changes. Until then
+        #   every caller — every credential kind, every provenance — is
+        #   UNVERIFIED, so there is no input that produces VERIFIED anywhere.
+        setattr_(caller, "identity_status", IdentityStatus.UNVERIFIED)
+        setattr_(caller, "credential_kind", credential_kind)
+        minted.add(caller)
+        return caller
+
+    def is_minted(obj) -> bool:
+        return isinstance(obj, Caller) and obj in minted
+
+    return mint, is_minted
+
+
+_mint_caller, is_authenticated_caller = _seal_caller()
+is_authenticated_caller.__doc__ = """True only for a Caller an authenticator minted.
+
+The engine's J9 test (§7.1). Membership is by *identity*, so a forged object
+that copies every field of a real principal still answers ``False``."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -14,13 +14,22 @@ rejected ``caller is None``. So ``{"principal": "attacker", "provenance":
 was ALLOWed. "The engine authenticates" was never true: nothing had ever checked
 a credential, because nothing was ever presented.
 
+"Only place" is now enforced rather than asserted (codex P1 #4, re-review of
+``cb01d49``). :class:`Caller` is sealed — ``Caller(...)`` raises — and the sole
+producer is :func:`~agent_crew.cea.intent._mint_caller`, which this module
+holds. The engine's J9 test is
+:func:`~agent_crew.cea.intent.is_authenticated_caller`, i.e. *was this object
+minted*, not *what does its ``credential_kind`` field say*. The previous test
+read a string the caller chose, so an in-process
+``Caller(..., credential_kind="broker_registered", identity_status=VERIFIED)``
+was ALLOWed for an OPS intent although nothing here issues that kind.
+
 Under the shared uid a ``0600`` token file is **tamper-evident, not
 authentication** (P2a): any process running as this uid can read it. That is
-exactly why every Caller minted here carries
-``identity_status=UNVERIFIED``/``credential_kind="adapter_token"`` and why
-:data:`CREDENTIAL_KIND_BROKER` has no producer yet — ``VERIFIED`` is reserved
-for the O21b broker's spawn/registration path and is not something this file can
-honestly hand out.
+exactly why ``_mint_caller`` stamps ``identity_status=UNVERIFIED``
+unconditionally, and why :data:`CREDENTIAL_KIND_BROKER` has no producer —
+``VERIFIED`` is reserved for the O21b broker's spawn/registration path and is
+not something this file can honestly hand out.
 """
 from __future__ import annotations
 
@@ -31,7 +40,7 @@ import stat
 from dataclasses import dataclass
 from typing import Optional
 
-from agent_crew.cea.intent import Caller, CallerProvenance, IdentityStatus
+from agent_crew.cea.intent import Caller, CallerProvenance, _mint_caller
 
 CREDENTIAL_KIND_ADAPTER_TOKEN = "adapter_token"
 """A per-adapter secret from a ``0600`` file. Tamper-evident under one uid (P2a)."""
@@ -152,11 +161,12 @@ def _match(table: dict[str, AdapterIdentity], credential: Optional[str]) -> Opti
             found = identity
     if found is None:
         return None
-    # P2a: never VERIFIED from a token file. The broker is the only source of a
-    # verified binding, and it does not exist yet (O21b).
-    return Caller(principal=found.principal, provenance=found.provenance,
-                  identity_status=IdentityStatus.UNVERIFIED,
-                  credential_kind=CREDENTIAL_KIND_ADAPTER_TOKEN)
+    # This is the mint. It runs on exactly one condition — a presented secret
+    # matched a table entry — and the principal and provenance it stamps come
+    # from that entry, never from the request. ``identity_status`` is not an
+    # argument at all: :func:`_mint_caller` derives it, and under the shared uid
+    # it is UNVERIFIED for every kind until the O21b broker exists (P2a).
+    return _mint_caller(found.principal, found.provenance, CREDENTIAL_KIND_ADAPTER_TOKEN)
 
 
 def authenticator_from_env(env: Optional[dict] = None):

@@ -54,7 +54,7 @@ from typing import Any, Optional
 
 from agent_crew.cea.intent import (
     Caller, IdentityStatus, Intent, IntentIdentity, InvalidScopeAnchor, WorkClass,
-    canonical_identity)
+    canonical_identity, is_authenticated_caller)
 from agent_crew.cea.providers import (
     CapabilityLookup, PolicySnapshotRef, SignatureStatus)
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
@@ -252,8 +252,6 @@ class UnauthenticatedCaller(EngineError):
     """
 
 
-_TRUSTED_CREDENTIAL_KINDS = ("adapter_token", "broker_registered")
-"""The kinds :mod:`agent_crew.cea.auth` can issue. ``None`` is not one of them."""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -355,22 +353,30 @@ class AuthorizationEngine:
         # does not get an audit row in its chosen name either.
         #
         # ⛔A Caller is only ever a *result of authentication*
-        #   (:mod:`agent_crew.cea.auth`). Checking `caller is None` was not
-        #   authentication: the socket decoder built one from request JSON, so
-        #   `Caller(principal="attacker", provenance="direct",
-        #   credential_kind=None)` passed this line and an OPS intent under it
-        #   was ALLOWed (codex P1 #1). The credential_kind test below is the
-        #   in-process half of the fix — an object nobody authenticated has no
-        #   kind to name — and the socket half is that the wire no longer
-        #   carries a principal at all.
+        #   (:mod:`agent_crew.cea.auth`). Two earlier versions of this test were
+        #   not authentication:
+        #     `caller is None` — the socket decoder built a Caller from request
+        #       JSON, so `Caller(principal="attacker", ...)` walked through and
+        #       an OPS intent under it was ALLOWed (codex P1 #1);
+        #     `credential_kind in (...)` — a *string the caller chose*, so
+        #       `Caller(principal="attacker", provenance=DIRECT,
+        #       identity_status=VERIFIED, credential_kind="broker_registered")`
+        #       walked through the same public entry point and reached the
+        #       receipt as caller_identity_status=VERIFIED, although
+        #       agent_crew.cea.auth has no broker producer at all (codex P1 #4,
+        #       re-review of cb01d49).
+        #   The test is now *provenance of the object itself*: was it minted by
+        #   an authenticator, which happens only after a presented credential
+        #   matched. A forgery cannot set that by copying fields, and `Caller`
+        #   is sealed so the literal above no longer constructs.
         if caller is None:
             raise UnauthenticatedCaller(
                 "authorize() requires an authenticated Caller; adapters authenticate first (§7.1)")
-        if getattr(caller, "credential_kind", None) not in _TRUSTED_CREDENTIAL_KINDS:
+        if not is_authenticated_caller(caller):
             raise UnauthenticatedCaller(
-                f"caller {caller.principal!r} presents credential_kind "
-                f"{getattr(caller, 'credential_kind', None)!r}, which no authenticator issues; "
-                f"a Caller must come from agent_crew.cea.auth, never from a request body (J9)")
+                f"caller {getattr(caller, 'principal', None)!r} was not minted by an "
+                f"authenticator; a Caller comes from agent_crew.cea.auth after a credential "
+                f"matched, never from a request body or a constructor (J9, P2a)")
 
         # P4/§5.2: one spelling per target, fixed *before* the hash and before
         # the E4 registry sees the intent — so identity and matching can never
@@ -720,10 +726,15 @@ class AuthorizationEngine:
         #   asserting an identity nobody checked.
         #
         #   VERIFIED is reserved for the O21b broker's spawn/registration path,
-        #   which does not exist yet — so in this build both statuses are always
-        #   UNVERIFIED, and `_broker_verified` is the single place that will
-        #   change when the broker lands.
-        caller_status = _broker_verified(caller)
+        #   which does not exist yet. `_broker_verified(caller)` used to read
+        #   `caller.credential_kind == "broker_registered" and
+        #   caller.identity_status is VERIFIED` — both caller-set fields, so the
+        #   promoter was reachable from the public entry point by anyone willing
+        #   to name the kind (codex P1 #4 r2). It is gone. Both statuses are
+        #   unconditional here, and the authenticator derives identity_status on
+        #   the other side of the boundary (intent._mint_caller), so there is no
+        #   input anywhere that yields VERIFIED in this build.
+        caller_status = IdentityStatus.UNVERIFIED
         executor_status = IdentityStatus.UNVERIFIED
         degraded = (caller_status is not IdentityStatus.VERIFIED
                     or executor_status is not IdentityStatus.VERIFIED)
@@ -970,21 +981,6 @@ def _is_identity_dependent(reviewer, gate_name, reuse) -> bool:
             and not reuse.approver_identity_verified:
         return True
     return False
-
-
-def _broker_verified(caller: Caller) -> IdentityStatus:
-    """P2a: VERIFIED only from independently verified broker evidence (O21b).
-
-    Two conditions, both required, neither satisfiable by anything a caller
-    sends: the credential must be the broker's registration kind, and only
-    :mod:`agent_crew.cea.auth` issues credential kinds. A token file is
-    tamper-evident under one uid, which is not the same claim.
-    """
-    from agent_crew.cea.auth import CREDENTIAL_KIND_BROKER
-    if (getattr(caller, "credential_kind", None) == CREDENTIAL_KIND_BROKER
-            and caller.identity_status is IdentityStatus.VERIFIED):
-        return IdentityStatus.VERIFIED
-    return IdentityStatus.UNVERIFIED
 
 
 def _signature_name(status) -> str:

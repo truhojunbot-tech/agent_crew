@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from agent_crew.cea import store as receipt_store
+from agent_crew.cea.auth import AdapterIdentity, StaticTokenAuthenticator
 from agent_crew.cea.engine import (
     REVIEW_FLOOR, AuthorizationEngine, EngineConfig, intent_hash)
 from agent_crew.cea.intent import (
@@ -137,10 +138,31 @@ def intent(task_id="t1", *, ident=None, **kw) -> Intent:
                   description=kw.pop("description", "Add a --json flag"), **kw)
 
 
-def caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON,
-           status=IdentityStatus.UNVERIFIED) -> Caller:
-    return Caller(principal=principal, provenance=provenance, identity_status=status,
-                  credential_kind="adapter_token")
+def caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON) -> Caller:
+    """Minted the only way a Caller can be minted: an authenticator matched a
+    credential (J9). There is no ``status`` parameter because there is nowhere
+    to put one — :func:`agent_crew.cea.intent._mint_caller` derives
+    ``identity_status`` and it is UNVERIFIED until the O21b broker exists."""
+    token = f"test-token::{principal}"
+    authenticated = StaticTokenAuthenticator(
+        {token: AdapterIdentity(principal=principal, provenance=provenance)}
+    ).authenticate(token)
+    assert authenticated is not None, "the test authenticator must authenticate its own token"
+    return authenticated
+
+
+def forged_caller(principal="attacker", provenance=CallerProvenance.DIRECT,
+                  credential_kind="broker_registered",
+                  status=IdentityStatus.VERIFIED) -> Caller:
+    """A Caller nobody minted, built the only way one still can be: straight out
+    of ``object.__new__``, past the sealed constructor. Every field says what an
+    attacker wants it to say — which is the point. ``authorize`` must refuse it."""
+    obj = object.__new__(Caller)
+    object.__setattr__(obj, "principal", principal)
+    object.__setattr__(obj, "provenance", provenance)
+    object.__setattr__(obj, "identity_status", status)
+    object.__setattr__(obj, "credential_kind", credential_kind)
+    return obj
 
 
 @pytest.fixture()
@@ -563,10 +585,13 @@ def test_tampering_with_a_signed_receipt_is_detected(conn, tmp_path):
     assert eng.verify(tampered) is False
 
 
-def test_a_verified_caller_still_degrades_without_an_engine_key(conn):
-    """P2a: with no key there is no boundary to report, so an adapter asserting
-    VERIFIED does not make it so."""
-    auth = engine().authorize(conn, intent(), caller(status=IdentityStatus.VERIFIED))
+def test_an_authenticated_caller_still_degrades_without_an_engine_key(conn):
+    """P2a: with no key there is no boundary to report. An adapter cannot even
+    ask for VERIFIED any more — the authenticator derives the status — and the
+    receipt says UNVERIFIED either way."""
+    authenticated = caller()
+    assert authenticated.identity_status is IdentityStatus.UNVERIFIED
+    auth = engine().authorize(conn, intent(), authenticated)
     assert auth.receipt["caller_identity_status"] == "UNVERIFIED"
     assert auth.receipt["downgrade_reason"] == "SHARED_UID_NO_CREDENTIAL_BOUNDARY"
 
