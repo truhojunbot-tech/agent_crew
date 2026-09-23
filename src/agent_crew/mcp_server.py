@@ -164,6 +164,9 @@ def build_mcp_server(
         #   is true of a capability.
         branch: str = "",
         commit: str = "",
+        # #374: a declared `report` contract is proven by this object; without
+        # the argument the contract was satisfiable over HTTP only.
+        artifact: Optional[dict] = None,
     ) -> dict[str, Any]:
         """Mark a task done and store its result.
 
@@ -184,6 +187,7 @@ def build_mcp_server(
                 # nothing can compare — so both transports inherit one rule.
                 branch=branch,
                 commit=commit,
+                artifact=artifact,
             )
         except (ValueError, TypeError) as e:
             return {"acknowledged": False, "error": str(e)}

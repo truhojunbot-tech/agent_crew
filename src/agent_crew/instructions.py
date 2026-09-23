@@ -451,7 +451,9 @@ If the task context declares `artifact_kind`, the server checks that contract
 instead of the default commit rule. A result that does not satisfy it is
 stored as `failed` with `reason: no_artifact`.
 - `commit` (also the rule when nothing is declared): a new commit on top of the dispatch base, pushed.
-- `rebase`: push the rebased branch; its commit must descend from `origin/<context.rebase_onto>`.
+- `rebase`: push the rebased branch; its commit must descend from `origin/<context.rebase_onto>`
+  and carry the same change you were dispatched with (patch-equivalent commits, or one squash
+  of them). If the rebase needed conflict resolution, report `needs_human` instead.
 - `report`: do not commit. Send `"artifact": {"body": "<report>", "sha256": "<sha256 of body>"}`.
   If the report is committed, send `"path"` plus `commit` instead of `"body"`.
 - `review`: `verdict` plus the reviewed `pr_number`; `request_changes` needs findings.

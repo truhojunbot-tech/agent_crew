@@ -96,11 +96,12 @@ def test_374_declared_rebase_now_passes(rebased):
     ok, detail = verify_task_artifact(
         task, _result(branch="feat", commit=rebased["commit"]), repo_cwd=rebased["verifier"])
     assert ok, detail
-    assert "rebased onto origin/main" in detail
+    assert "onto origin/main" in detail and "patch-equivalent" in detail
 
 
 def test_rebase_derives_the_commit_from_the_pushed_branch(rebased):
-    task = _task({"artifact_kind": "rebase", "rebase_onto": "main"})
+    task = _task({"artifact_kind": "rebase", "rebase_onto": "main",
+                  "worktree_base_sha": rebased["base"]})
     result = _result(branch="feat")
     ok, _ = verify_task_artifact(task, result, repo_cwd=rebased["verifier"])
     assert ok and result.commit == rebased["commit"]
@@ -317,3 +318,194 @@ def test_http_report_task_with_a_wrong_hash_is_held(tmp_db):
     assert row["status"] == "failed"
     assert row["error_info"] == {"reason": "no_artifact",
                                  "detail": "report sha256 does not match its content"}
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (review of 37cb8af, P1): a rebase must carry the SAME change.
+# Location alone — pushed, on top of main — let a force-push of unrelated
+# content pass.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def dispatched(tmp_path):
+    """A two-commit feature dispatched at `base`; main has since moved.
+
+    Returns a callable `outcome(fn)` that lets a test play the worker: `fn`
+    gets the work clone positioned on `feat`, does whatever the worker did,
+    and the result is force-pushed. The verifier clone predates all of it.
+    """
+    origin = tmp_path / "origin.git"
+    _run(tmp_path, "init", "-q", "--bare", str(origin))
+    work = tmp_path / "work"
+    _run(tmp_path, "clone", "-q", str(origin), str(work))
+    _commit(work, "a.txt", "a\n")
+    _run(work, "push", "-q", "origin", "HEAD:main")
+    _run(work, "checkout", "-q", "-b", "feat")
+    _commit(work, "f1.txt", "one\n")
+    base = _commit(work, "f2.txt", "two\n")
+    _run(work, "push", "-q", "origin", "feat")
+    verifier = tmp_path / "verifier"
+    _run(tmp_path, "clone", "-q", str(origin), str(verifier))
+    _run(work, "checkout", "-q", "main")
+    _commit(work, "b.txt", "main moved\n")
+    _run(work, "push", "-q", "origin", "main")
+    _run(work, "checkout", "-q", "feat")
+
+    def outcome(fn):
+        fn(work)
+        _run(work, "push", "-q", "--force", "origin", "HEAD:feat")
+        return _run(work, "rev-parse", "HEAD")
+
+    return {"verifier": str(verifier), "work": work, "base": base, "outcome": outcome}
+
+
+def _rebase_task(base):
+    return _task({"worktree_base_sha": base, "artifact_kind": "rebase", "rebase_onto": "main"})
+
+
+def _verify(d, commit):
+    return verify_task_artifact(_rebase_task(d["base"]), _result(branch="feat", commit=commit),
+                                repo_cwd=d["verifier"])
+
+
+def test_same_content_rebase_passes(dispatched):
+    commit = dispatched["outcome"](lambda w: _run(w, "rebase", "-q", "main"))
+    ok, detail = _verify(dispatched, commit)
+    assert ok, detail
+    assert "patch-equivalent" in detail and "2 commit(s)" in detail
+
+
+def test_force_push_of_unrelated_content_is_refused(dispatched):
+    """The reviewer's case: feat replaced by a different change atop main."""
+    def unrelated(w):
+        _run(w, "reset", "-q", "--hard", "origin/main")
+        _commit(w, "other.txt", "something else entirely\n")
+
+    commit = dispatched["outcome"](unrelated)
+    assert _verify(dispatched, commit) == (
+        False, "rebased commits are not patch-equivalent to the dispatched change")
+
+
+def test_rebase_that_changed_the_content_is_refused(dispatched):
+    def changed(w):
+        _run(w, "rebase", "-q", "main")
+        (w / "f2.txt").write_text("two, but different\n")
+        _run(w, "commit", "-q", "--amend", "-a", "--no-edit")
+
+    commit = dispatched["outcome"](changed)
+    assert _verify(dispatched, commit)[0] is False
+
+
+def test_rebase_that_dropped_a_commit_is_refused(dispatched):
+    def dropped(w):
+        _run(w, "rebase", "-q", "--onto", "main", "HEAD~2", "HEAD~1")   # keeps f1 only
+
+    commit = dispatched["outcome"](dropped)
+    assert _verify(dispatched, commit) == (
+        False, "rebased commits are not patch-equivalent to the dispatched change")
+
+
+def test_rebase_that_added_an_empty_commit_is_refused(dispatched):
+    def padded(w):
+        _run(w, "rebase", "-q", "main")
+        _run(w, "commit", "-q", "--allow-empty", "-m", "empty")
+
+    commit = dispatched["outcome"](padded)
+    assert _verify(dispatched, commit) == (
+        False, "rebased range is empty or contains an empty commit")
+
+
+def test_squashed_rebase_with_the_same_total_change_passes(dispatched):
+    def squashed(w):
+        _run(w, "rebase", "-q", "main")
+        _run(w, "reset", "-q", "--soft", "HEAD~2")
+        _run(w, "commit", "-q", "-m", "squashed")
+
+    commit = dispatched["outcome"](squashed)
+    ok, detail = _verify(dispatched, commit)
+    assert ok, detail
+    assert detail.startswith("squashed 2→1")
+
+
+def test_rebase_without_a_dispatched_head_cannot_be_proven(dispatched):
+    commit = dispatched["outcome"](lambda w: _run(w, "rebase", "-q", "main"))
+    task = _task({"artifact_kind": "rebase", "rebase_onto": "main"})
+    assert verify_task_artifact(task, _result(branch="feat", commit=commit),
+                                repo_cwd=dispatched["verifier"]) == (
+        False, "rebase contract requires the dispatched head (worktree_base_sha)")
+
+
+def test_http_unrelated_force_push_is_held_no_artifact(tmp_db, dispatched):
+    def unrelated(w):
+        _run(w, "reset", "-q", "--hard", "origin/main")
+        _commit(w, "other.txt", "something else entirely\n")
+
+    commit = dispatched["outcome"](unrelated)
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("rb", "implement", "rebase feat", branch="feat",
+                              context={"worktree_base_sha": dispatched["base"],
+                                       "artifact_kind": "rebase", "rebase_onto": "main"}))
+    from agent_crew.server import create_app
+    app = create_app(tmp_db, pane_map={"reviewer": "%crew-test-reviewer"},
+                     watchdog_disabled=True, worktree_map={"implementer": dispatched["verifier"]})
+    with TestClient(app) as client:
+        response = client.post("/tasks/rb/result", json={
+            "task_id": "rb", "status": "completed", "summary": "rebased and pushed",
+            "branch": "feat", "commit": commit})
+    assert response.json()["held"] == "no_artifact"
+    row = _row(queue, "rb")
+    assert row["status"] == "failed"
+    assert row["error_info"]["detail"] == (
+        "rebased commits are not patch-equivalent to the dispatched change")
+    assert not [t for t in queue.list_tasks() if t.task_type == "review"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (P2): the same declared contract over MCP.
+# ---------------------------------------------------------------------------
+
+def _mcp_submit(tmp_db, **kwargs):
+    import asyncio
+    from agent_crew.mcp_server import build_mcp_server
+    tool = build_mcp_server(tmp_db)._tool_manager._tools["submit_result"].fn
+    out = tool(**kwargs)
+    return asyncio.run(out) if asyncio.iscoroutine(out) else out
+
+
+def _report_task(queue, task_id):
+    queue.enqueue(TaskRequest(task_id, "implement", "inventory", branch="main",
+                              context={"worktree_base_sha": "a" * 40, "artifact_kind": "report",
+                                       "report_format": "markdown"}))
+    assert queue.dequeue(role="implementer") is not None
+
+
+def test_mcp_report_with_the_right_hash_is_accepted_and_pinned(tmp_db):
+    queue = TaskQueue(tmp_db)
+    _report_task(queue, "m-ok")
+    out = _mcp_submit(tmp_db, task_id="m-ok", status="completed", summary="inventory done",
+                      artifact={"body": REPORT, "sha256": REPORT_SHA})
+    assert out["acknowledged"] is True and "held" not in out
+    assert _row(queue, "m-ok")["status"] == "completed"
+    pinned = queue.get_task_context("m-ok")["result_artifact"]
+    assert pinned["kind"] == "report" and REPORT_SHA in pinned["detail"]
+
+
+def test_mcp_report_with_a_wrong_hash_is_held_like_http(tmp_db):
+    queue = TaskQueue(tmp_db)
+    _report_task(queue, "m-bad")
+    out = _mcp_submit(tmp_db, task_id="m-bad", status="completed", summary="x",
+                      artifact={"body": REPORT, "sha256": "0" * 64})
+    assert out["held"] == "no_artifact"
+    assert out["detail"] == "report sha256 does not match its content"
+    row = _row(queue, "m-bad")
+    assert row["status"] == "failed"
+    assert row["error_info"] == {"reason": "no_artifact",
+                                 "detail": "report sha256 does not match its content"}
+
+
+def test_mcp_report_without_the_artifact_is_held(tmp_db):
+    queue = TaskQueue(tmp_db)
+    _report_task(queue, "m-none")
+    out = _mcp_submit(tmp_db, task_id="m-none", status="completed", summary="report in prose")
+    assert out["held"] == "no_artifact"
+    assert _row(queue, "m-none")["status"] == "failed"
