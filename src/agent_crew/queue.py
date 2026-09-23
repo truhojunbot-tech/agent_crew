@@ -1974,6 +1974,37 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def list_in_progress_activity(self) -> List[dict]:
+        """`in_progress` task 의 (id, type, last_activity_at, context) 목록.
+
+        ⭐orphan 판정용이다. `expire_stale` 은 **취소**를 하고 이 함수는 **보여주기만**
+          한다 — 전역 스윕 전에 "무엇이 몇 건 지워지는가" 를 먼저 볼 수 있어야 한다
+          (2026-09-23: 단건을 치우려다 라이브 3건을 같이 취소한 사고).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, task_type, last_activity_at, created_at, context "
+                "FROM tasks WHERE status = 'in_progress' "
+                "ORDER BY last_activity_at ASC"
+            ).fetchall()
+            out: List[dict] = []
+            for r in rows:
+                try:
+                    ctx = json.loads(r["context"]) if r["context"] else {}
+                except Exception:
+                    ctx = {}
+                out.append({
+                    "task_id": r["task_id"],
+                    "task_type": r["task_type"],
+                    "last_activity_at": float(r["last_activity_at"] or 0.0),
+                    "created_at": float(r["created_at"] or 0.0),
+                    "context": ctx if isinstance(ctx, dict) else {},
+                })
+            return out
+        finally:
+            conn.close()
+
     def reset_stale_to_pending(self, older_than_seconds: float = 600.0) -> List[str]:
         """Reset in_progress tasks idle > ``older_than_seconds`` back to pending.
 
