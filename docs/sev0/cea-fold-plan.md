@@ -538,11 +538,17 @@ tests/unit/test_sev0_runtime_authority.py`, `-p no:randomly`, foreground.
   for `retry_http` and `stale_review_http` — *"never reached admission as
   `retry.failed_task`; calls=['http.tasks']"*. They reproduce identically at
   this step's base `e26ae5e` (checked out clean with `git archive e26ae5e` into
-  `/tmp` and run there: same 2 failed, 66 passed), so nothing in step 4i caused
-  them. They are in `server.py`'s retry/stale-review ingress labelling, which
-  this step did not touch, and they postdate §10's `failed = 0` — i.e. they
-  arrived with s4h or its environment. Diagnosing them is a separate step; it is
-  recorded here rather than absorbed.
+  `/tmp` and run there: same 2 failed), so nothing in step 4i caused them.
+
+  **Bisected.** The same file at the §10 head `94faba6` (s4g), extracted the
+  same way, is **62 passed / 29 xfailed / 0 failed**. So the regression is
+  `e26ae5e` — step 4h, "a requeue is a re-admission". That commit touched
+  `queue.py`, `cea/callsites.py`, `cea/engine.py` and `cea/validator.py` and did
+  not touch `server.py`, so the ingress *labelling* is unchanged and what broke
+  is the path reaching it: the retry and stale-review transports no longer
+  re-enter admission under their own ingress id. §10's `failed = 0` was true
+  when it was measured. Diagnosing 4h is a separate bounded step; it is recorded
+  here rather than absorbed, and it is **not** a reason to hold 4i.
 
 ### The guard count is unchanged
 
