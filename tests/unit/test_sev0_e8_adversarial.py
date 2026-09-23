@@ -170,8 +170,9 @@ def test_s3_owner_not_called(crew, tmp_path, monkeypatch):
 
 
 @pytest.mark.xfail(strict=True, reason=(
-    "S4 red baseline: #294 detects the in-flight duplicate across a restart but is "
-    "advisory by design; E5 STOP_AND_REVIEW is not implemented"))
+    "S4 red baseline: the #294 advisory that used to *detect* this duplicate is "
+    "removed (ADR §11.1 row 14); the intent_hash index that replaces it as a "
+    "decision is not built, and E5 STOP_AND_REVIEW is not implemented"))
 def test_s4_session_restart_or_compaction(crew):
     """A coordinator loses its context and re-requests work already in flight."""
     make, push, db = crew
@@ -182,7 +183,10 @@ def test_s4_session_restart_or_compaction(crew):
     with make() as client:                                         # process restart, same DB
         r = client.post("/tasks", json=request(
             "s4-b", "Implement risk-tier enforcement", issue=4101))
-        assert r.json().get("in_flight_for_issue") != [] or r.status_code != 201
+        # ⛔No advisory assertion here any more. Asking whether the response
+        #   *mentioned* the collision was always the weaker question, and the
+        #   key is gone: the only thing worth asserting is that the duplicate
+        #   did not become runnable work.
         assert_duplicate_blocked(client, r, push, db, "s4-b")
 
 
