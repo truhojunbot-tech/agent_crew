@@ -93,3 +93,268 @@ def test_get_task_reports_legacy_rows_as_unrecorded(legacy_db):
     assert all(done["execution"][c] is None for c in NEW_COLUMNS)
     assert done["execution"]["events"] == []
     assert running["execution"]["push_at"] == 1234.5   # pre-existing value surfaces
+
+
+def test_migrated_legacy_rows_keep_working(legacy_db):
+    q = TaskQueue(legacy_db)
+    task = q.dequeue(role="tester")
+    assert task.task_id == "legacy-pending"
+    state = q.get_exec_state("legacy-pending")
+    assert state["claimed_by_role"] == "tester"
+    assert [e["event"] for e in state["events"]] == ["claimed"]
+
+
+# ---------------------------------------------------------------------------
+# Claim / lease / heartbeat in the queue.
+# ---------------------------------------------------------------------------
+
+def test_claim_records_role_path_and_running_build(tmp_db):
+    q = TaskQueue(tmp_db)
+    q.enqueue(_task("c1"))
+    q.dequeue(role="implementer", claimed_via="dispatcher")
+
+    state = q.get_exec_state("c1")
+    build = provenance.build()
+    assert state["claimed_at"] is not None
+    assert state["claimed_by_role"] == "implementer"
+    assert state["claimed_via"] == "dispatcher"
+    assert state["claimed_by_agent"] is None            # not known at this claim
+    assert state["claim_build_commit"] == (build["commit"] or None)
+    assert state["claim_code_fingerprint"] == (build["code_fingerprint"] or None)
+    [event] = state["events"]
+    assert event["event"] == "claimed" and event["via"] == "dispatcher"
+
+
+def test_agent_and_discuss_claims_record_the_agent(tmp_db):
+    q = TaskQueue(tmp_db)
+    q.enqueue(_task("c2", context={"agent_override": "codex"}))
+    q.enqueue(_task("d1", task_type="discuss", context={"agent": "gemini"}))
+    q.dequeue(agent="codex", role="implementer", claimed_via="mcp")
+    q.dequeue_discuss_for_agent("gemini", claimed_via="tmux_push")
+    assert q.get_exec_state("c2")["claimed_by_agent"] == "codex"
+    d = q.get_exec_state("d1")
+    assert (d["claimed_by_role"], d["claimed_by_agent"], d["claimed_via"]) == (
+        "discuss", "gemini", "tmux_push")
+
+
+def test_requeue_and_reclaim_keep_the_whole_history(tmp_db):
+    q = TaskQueue(tmp_db)
+    q.enqueue(_task("h1"))
+    q.dequeue(role="implementer", claimed_via="dispatcher")
+    q.record_dispatch("h1", channel="claude_p", agent="claude", target="pid:7",
+                      lease_owner="claude:pid:7", lease_seconds=60, ts=100.0)
+    assert q.get_exec_state("h1")["lease_expires_at"] == 160.0
+    q.requeue("h1")
+    state = q.get_exec_state("h1")
+    assert state["lease_owner"] is None and state["lease_expires_at"] is None
+    q.dequeue(role="implementer", claimed_via="dispatcher")
+    q.record_dispatch("h1", channel="claude_p", agent="claude", target="pid:8",
+                      lease_owner="claude:pid:8", lease_seconds=60, ts=200.0)
+    q.submit_result("h1", TaskResult(task_id="h1", status="completed", summary="ok",
+                                     verdict=None, findings=[], pr_number=None))
+
+    state = q.get_exec_state("h1")
+    assert [e["event"] for e in state["events"]] == [
+        "claimed", "dispatched", "requeued", "claimed", "dispatched", "result"]
+    assert [e["target"] for e in state["events"] if e["event"] == "dispatched"] == [
+        "pid:7", "pid:8"]
+    assert state["dispatch_attempt"] == 2
+    assert state["result_posted_at"] is not None
+    assert state["lease_owner"] is None                # the result ends the lease
+    assert state["events"][-1]["status"] == "completed"
+
+
+def test_force_fail_ends_the_lease_without_claiming_a_result(tmp_db):
+    q = TaskQueue(tmp_db)
+    q.enqueue(_task("ff"))
+    q.dequeue(role="implementer", claimed_via="tmux_push")
+    q.record_dispatch("ff", channel="tmux_pane", target="%1", lease_owner="pane:%1")
+    q.force_fail("ff", "watchdog timeout", error_info={"reason": "watchdog_timeout"})
+    state = q.get_exec_state("ff")
+    assert state["lease_owner"] is None
+    assert state["result_posted_at"] is None
+    last = state["events"][-1]
+    assert (last["event"], last["reason"], last["from_status"]) == (
+        "force_failed", "watchdog_timeout", "in_progress")
+
+
+def test_heartbeat_only_touches_running_tasks(tmp_db):
+    q = TaskQueue(tmp_db)
+    q.enqueue(_task("hb"))
+    q.record_heartbeat("hb", source="pane_busy", ts=5.0)       # still pending
+    assert q.get_exec_state("hb")["last_heartbeat_at"] is None
+    q.dequeue(role="implementer")
+    q.record_heartbeat("hb", source="pane_busy", ts=6.0)
+    state = q.get_exec_state("hb")
+    assert (state["last_heartbeat_at"], state["last_heartbeat_source"]) == (6.0, "pane_busy")
+    assert "heartbeat" not in [e["event"] for e in state["events"]]
+
+
+# ---------------------------------------------------------------------------
+# Population on the delivery paths.
+# ---------------------------------------------------------------------------
+
+class RecordingPush:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, target, message):
+        self.calls.append((target, message))
+
+
+def test_push_path_records_claim_push_and_dispatch(tmp_db, tmp_path):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"project": "p", "pane_ids": ["%101"]}))
+    push = RecordingPush()
+    app = create_app(tmp_db, pane_map={"implementer": "%101"}, state_path=str(state_file),
+                     port=8100, push_fn=push, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        client.post("/tasks", json={"task_id": "p1", "task_type": "implement",
+                                    "description": "w", "branch": "main", "priority": 3,
+                                    "context": {}, "project": "p"})
+        execution = client.get("/tasks/p1").json()["execution"]
+
+    assert len(push.calls) == 1
+    assert execution["claimed_via"] == "tmux_push"
+    assert execution["push_at"] > 0                    # the column #152 already had
+    assert execution["dispatch_channel"] == "tmux_pane"
+    assert execution["dispatch_target"] == "%101"
+    assert execution["lease_owner"] == "pane:%101"
+    assert execution["lease_expires_at"] is None       # no deadline on a pane task
+    assert [e["event"] for e in execution["events"]] == ["claimed", "pushed", "dispatched"]
+
+
+def test_http_poll_records_an_api_dispatch(tmp_db):
+    app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
+    TaskQueue(tmp_db).enqueue(_task("api1", context={"agent_override": "claude"}))
+    with TestClient(app) as client:
+        assert client.get("/tasks/next", params={"agent": "claude",
+                                                 "role": "implementer"}).json()
+    state = TaskQueue(tmp_db).get_exec_state("api1")
+    assert (state["claimed_via"], state["dispatch_channel"], state["dispatch_target"]) == (
+        "http_poll", "api", "http_poll:claude")
+
+
+def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    db = str(tmp_path / "t.db")
+
+    class _Proc:
+        pid = 4242
+        returncode = None
+
+        async def wait(self):
+            await asyncio.sleep(0.05)                  # long enough for a heartbeat
+            self.returncode = 0
+            return 0
+
+        async def communicate(self):
+            return b"", b""
+
+    async def _fake_exec(*cmd, **kwargs):
+        return _Proc()
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
+    monkeypatch.setattr("agent_crew.server._HEARTBEAT_INTERVAL_S", 0.01)
+    monkeypatch.setattr("agent_crew.server._dispatch_timeout_for_role", lambda _r: 600.0)
+
+    app = create_app(db_path=db, pane_map={}, port=8199, state_path=str(state_file),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(_task("disp1"))
+        task = q.dequeue(role="implementer", claimed_via="dispatcher")
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    state = TaskQueue(db).get_exec_state("disp1")
+    assert state["claimed_via"] == "dispatcher"
+    assert state["dispatch_channel"] == "claude_p"
+    assert state["dispatch_agent"] == "claude"
+    assert state["dispatch_target"] == "pid:4242"
+    dispatched = next(e for e in state["events"] if e["event"] == "dispatched")
+    assert dispatched["lease_owner"] == "claude:pid:4242"
+    assert dispatched["lease_expires_at"] == pytest.approx(dispatched["at"] + 600.0)
+    assert state["last_heartbeat_source"] == "process_alive"
+    assert state["last_heartbeat_at"] >= state["dispatched_at"]
+
+
+def test_every_claim_site_is_tagged():
+    """No untagged claim path in server or MCP."""
+    import inspect
+    import agent_crew.mcp_server as mcp_server
+    import agent_crew.server as server
+    src = inspect.getsource(server) + inspect.getsource(mcp_server)
+    for call in (".dequeue(", ".dequeue_discuss_for_agent("):
+        sites = [line for line in src.splitlines() if call in line and "def " not in line]
+        assert sites and all("claimed_via=" in line for line in sites), sites
+
+
+# ---------------------------------------------------------------------------
+# No behaviour change in dispatch decisions.
+# ---------------------------------------------------------------------------
+
+def _script(q):
+    """A fixed mix of priorities, overrides, discuss and requeues; returns what
+    every dequeue chose and the final status of every task."""
+    for tid, tt, pr, ctx in [
+        ("a", "implement", 3, {}), ("b", "implement", 1, {}),
+        ("c", "implement", 2, {"agent_override": "codex"}), ("d", "review", 2, {}),
+        ("e", "test", 1, {}), ("f", "discuss", 3, {"agent": "gemini"}),
+    ]:
+        q.enqueue(TaskRequest(task_id=tid, task_type=tt, description="d", branch="main",
+                              priority=pr, context=ctx))
+    picks = []
+
+    def pick(t):
+        picks.append(t.task_id if t else None)
+        return t
+
+    first = pick(q.dequeue(role="implementer", claimed_via="dispatcher"))
+    q.requeue(first.task_id)
+    pick(q.dequeue(role="implementer", claimed_via="tmux_push"))
+    pick(q.dequeue(agent="codex", role="implementer", claimed_via="mcp"))
+    pick(q.dequeue(role="reviewer", claimed_via="dispatcher"))
+    pick(q.dequeue_discuss_for_agent("gemini", claimed_via="dispatcher"))
+    pick(q.dequeue(role="tester"))
+    pick(q.dequeue(role="implementer"))
+    pick(q.dequeue(role="implementer"))
+    with sqlite3.connect(q._db_path) as c:
+        final = c.execute("SELECT task_id, status FROM tasks ORDER BY task_id").fetchall()
+    return picks, final
+
+
+def test_dispatch_decisions_are_identical_with_instrumentation_disabled(tmp_path, monkeypatch):
+    instrumented = _script(TaskQueue(str(tmp_path / "on.db")))
+
+    monkeypatch.setattr(TaskQueue, "_record_claim_on", lambda *a, **k: None)
+    monkeypatch.setattr(TaskQueue, "_record_end_on", lambda *a, **k: None)
+    monkeypatch.setattr(TaskQueue, "_append_exec_event_on", staticmethod(lambda *a, **k: None))
+    bare = _script(TaskQueue(str(tmp_path / "off.db")))
+
+    assert instrumented == bare
+    assert instrumented[0] == ["b", "b", "c", "d", "f", "e", "a", None]
+
+
+def test_a_failing_recorder_never_blocks_a_claim(tmp_db):
+    """Drop the history table under a live queue: claims, dispatch records,
+    requeues and results all still commit."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(_task("x"))
+    with sqlite3.connect(tmp_db) as c:
+        c.execute("DROP TABLE task_exec_events")
+
+    task = q.dequeue(role="implementer", claimed_via="dispatcher")
+    q.record_dispatch("x", channel="claude_p", target="pid:1")
+    q.requeue("x")
+    again = q.dequeue(role="implementer")
+    q.submit_result("x", TaskResult(task_id="x", status="completed", summary="ok"))
+
+    assert task.task_id == "x" and again.task_id == "x"
+    with sqlite3.connect(tmp_db) as c:
+        assert c.execute("SELECT status FROM tasks WHERE task_id='x'").fetchone()[0] == "completed"
