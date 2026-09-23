@@ -8,7 +8,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 from typing import List, Optional
 
 from agent_crew.cea import adapters as _cea_adapters
@@ -894,6 +894,7 @@ class TaskQueue:
         self._cea_config_by_project: dict = {}
         self._cea_providers = dict(cea_providers or {})
         self._cea_engine_cache: dict = {}
+        self._declared_project: Optional[str] = None
         # P6: who may loosen this runtime. Fail-closed by default — a runtime with
         # no verifier refuses every loosening rather than trusting the requester's
         # own account of its authority. Wire a :class:`SnapshotLooseningAuthority`
@@ -1875,6 +1876,123 @@ class TaskQueue:
             return ""
         return parent
 
+    @property
+    def declared_project(self) -> str:
+        """The project this queue was **declared** to serve — ``state.json``'s ``project``.
+
+        ``crew setup`` writes ``<base>/<project>/state.json`` next to
+        ``tasks.db`` with ``"project": "<name>"`` in it, and that file is the
+        same identity ``/health`` reports (``server._server_identity``). It is a
+        *declaration*, not an inference, which is the whole difference between
+        this property and :attr:`project_identity` — and the reason only this
+        one is allowed to contradict a caller (s4k, see
+        :meth:`_project_from_queue_identity`).
+
+        ``""`` when there is no state file, it is unreadable, or it names no
+        project. Read once and cached: a queue does not change which project it
+        is while the process lives, and admission would otherwise stat a file on
+        every enqueue.
+        """
+        if self._declared_project is None:
+            self._declared_project = self._read_declared_project()
+        return self._declared_project
+
+    def _read_declared_project(self) -> str:
+        """``state.json``'s ``project``, or ``""``. Never raises — an unreadable
+        state file means "not declared", not "admission is down"."""
+        path = str(self._db_path or "")
+        if not path or path == ":memory:":
+            return ""
+        state_path = os.path.join(os.path.dirname(os.path.abspath(path)), "state.json")
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                return str((json.load(fh) or {}).get("project") or "").strip()
+        except Exception:
+            return ""
+
+    @property
+    def queue_project(self) -> str:
+        """The project an ingress is admitted under when it names none (s4k).
+
+        The declaration first, the directory second. Both are "the queue's own
+        identity"; they differ only in how sure of it we are, and
+        :meth:`_project_from_queue_identity` spends that difference.
+        """
+        return self.declared_project or self.project_identity
+
+    #: s4k: an ingress named a project that is not this queue's.
+    #: Not in :mod:`agent_crew.cea.engine` with the engine's own codes on
+    #: purpose — the engine cannot detect this one, because which project a
+    #: queue *is* is a fact about the queue (``state.json``), not about the
+    #: intent. :func:`agent_crew.cea.refusal_http.status_for` maps it to 403 by
+    #: its outcome, which is the right answer: it is a decision, not a deferral.
+    PROJECT_MISMATCH = "PROJECT_MISMATCH"
+
+    def _project_from_queue_identity(self, task: TaskRequest):
+        """``(task, refusal)`` — §7's project rule, applied once for every adapter.
+
+        s4k. Two halves, and they are deliberately not symmetric:
+
+        * **Fill.** A request that names no project is admitted under
+          :attr:`queue_project`. Before s4k the HTTP ingress admitted such a
+          request with ``project=''``, which the engine refused
+          ``PROJECT_REQUIRED`` — so ``POST /tasks`` without a top-level
+          ``project`` key was a 403 against a queue that knew perfectly well
+          which project it was. Every §7 adapter reaches this method (it is on
+          :meth:`enqueue`, the one admission entry all fourteen share), so the
+          rule is the same for MCP, the CLI, cron/watch, the pipeline cascades,
+          the loop, the discussion panel and the retry/requeue/recovery paths
+          without any of them repeating it.
+
+        * **Refuse.** A request that names a *different* project than the queue
+          is refused: an ingress does not get to choose which project it is
+          admitting for, because the project selects the rollout mode
+          (:func:`agent_crew.cea.engine.resolve_mode`), the lineage namespace
+          and the policy snapshot. Choosing it from a request body is choosing
+          your own enforcement.
+
+        ⛔The refusal fires only against :attr:`declared_project`, never against
+          the directory-derived guess. Filling a gap with a guess produces a
+          working admission; *refusing* over a guess destroys work that was
+          legitimate — a queue at ``/tmp/pytest-xyz/t.db`` is not evidence that
+          the caller's ``project`` is wrong. The residue is stated rather than
+          hidden: on a queue with no ``state.json`` an ingress can still name
+          any project, and the way to close that is to give the queue a
+          declaration, not to harden the guess.
+
+        ⛔``context.project`` is not a source and never becomes one. The project
+          is read from the request's own ``project`` field or from the queue;
+          a second spelling inside a free-form dict is a second place a caller
+          could steer admission from, and :func:`intent_for_task` reads
+          ``task.project`` alone (pinned by the s4k static test).
+        """
+        named = str(getattr(task, "project", "") or "").strip()
+        declared = self.declared_project
+        if not named:
+            identity = self.queue_project
+            return (_dc_replace(task, project=identity) if identity else task), None
+        if declared and named != declared:
+            return task, (self.PROJECT_MISMATCH,
+                          f"§7.1 step 2: this queue admits for project {declared!r} "
+                          f"(state.json), and the ingress named {named!r}. An ingress "
+                          f"translates a transport; it does not choose the project its "
+                          f"task is admitted under — the project selects the rollout "
+                          f"mode, the lineage namespace and the policy snapshot (P4, §3)")
+        return task, None
+
+    def _admission_project(self, task: TaskRequest) -> Optional[str]:
+        """Whose rollout mode governs this admission (s4k).
+
+        The queue's declaration when there is one, so that a request body can
+        never select the mode it is judged under — the half-enforced state
+        :meth:`cea_config_for_receipt` exists to prevent, one call site earlier.
+        Otherwise the task's own project, which is what s4j did everywhere.
+        """
+        declared = self.declared_project
+        if declared:
+            return declared
+        return str(getattr(task, "project", "") or "").strip() or None
+
     def cea_config(self, project: Optional[str] = None) -> "_CeaEngineConfig":
         """The engine config in force — ``shadow`` unless the env says otherwise.
 
@@ -1979,7 +2097,7 @@ class TaskQueue:
         # decides under the same rollout mode `enqueue_with_receipt` then gates
         # it with. A task with no project resolves the process-wide mode and is
         # refused PROJECT_REQUIRED by the engine — a BLOCK receipt, not a raise.
-        engine = self.cea_engine(getattr(task, "project", None))
+        engine = self.cea_engine(self._admission_project(task))
         caller = _cea_in_process_caller(provenance)
         intent = intent_for_task(task, context=context)
         conn = self._connect()
@@ -2017,14 +2135,17 @@ class TaskQueue:
         raises :class:`AdmissionRefused` and nothing is written.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
-        engine = self.cea_engine(getattr(task, "project", None))
+        scope = self._admission_project(task)
+        engine = self.cea_engine(scope)
         # ENQUEUE is the one call site that resolves rollout from the *task*:
         # it is where the project first becomes known, and the receipt it writes
-        # is what the four post-admission sites will read it back from.
+        # is what the four post-admission sites will read it back from. s4k: the
+        # queue's own declaration wins over the task when there is one, so a
+        # request body cannot pick the mode it is judged under.
         gate = _cea_callsites.gate_enqueue(
             receipt, task_id=task.task_id,
             current=_cea_callsites.current_inputs(engine, receipt),
-            config=self.cea_config(getattr(task, "project", None)))
+            config=self.cea_config(scope))
         context["cea_enqueue"] = gate.as_record()
         if not gate.proceed:
             raise AdmissionRefused(gate)
@@ -2160,10 +2281,56 @@ class TaskQueue:
                 raise ValueError("pass ingress or provenance, not both — the registry "
                                  "is what maps one to the other")
             provenance = _cea_adapters.provenance_of(ingress)
+        provenance = provenance or _CeaProvenance.DIRECT
+        # s4k: the project comes from the queue's own identity when the request
+        # named none, and a request that named a different one is refused here
+        # rather than admitted under a project it chose for itself.
+        task, refusal = self._project_from_queue_identity(task)
         context = self._enqueue_context(task)
-        auth = self.authorize_task(task, context=context,
-                                   provenance=provenance or _CeaProvenance.DIRECT)
+        if refusal is None:
+            auth = self.authorize_task(task, context=context, provenance=provenance)
+        else:
+            auth = self._refuse_admission(task, context=context, provenance=provenance,
+                                          code=refusal[0], text=refusal[1])
         return self.enqueue_with_receipt(task, auth.receipt, context=context)
+
+    def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
+                          provenance: "_CeaProvenance", code: str, text: str):
+        """Mint the P2 audit row for a refusal the *queue* found (s4k).
+
+        The engine cannot find this one: which project a queue is belongs to
+        ``state.json``, not to the intent. So the queue decides and the engine
+        records, which keeps the invariant that every admission — allowed or
+        refused — leaves exactly one receipt, written by the one component that
+        signs them.
+
+        ⛔The receipt names :attr:`declared_project`, not the project the
+          request asked for. The audit row belongs to the queue that refused;
+          keying it to the requested project would file the evidence of a
+          cross-project attempt under the project it was aimed at, where the
+          queue that refused it would never find it. The requested name is not
+          lost — it is in ``reason.text`` and on the row's own ``project``
+          column.
+        """
+        scope = self._admission_project(task)
+        engine = self.cea_engine(scope)
+        if not hasattr(engine, "refuse"):
+            # A socket client speaks `authorize`, not this. A BLOCK needs no
+            # policy input and no remote judgement — it is already decided — so
+            # mint it in-process against the same config, where the receipt
+            # lands in the store `enqueue_with_receipt` reads it back from.
+            from agent_crew.cea.engine import AuthorizationEngine as _CeaEngine
+            engine = _CeaEngine(config=self.cea_config(scope))
+        scoped = _dc_replace(task, project=self.declared_project or task.project)
+        intent = intent_for_task(scoped, context=context)
+        caller = _cea_in_process_caller(provenance)
+        conn = self._connect()
+        try:
+            auth = engine.refuse(conn, intent, caller, code=code, text=text)
+            conn.commit()
+        finally:
+            conn.close()
+        return auth
 
     # ── the receipt side of a task row ────────────────────────────────
 

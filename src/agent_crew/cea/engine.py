@@ -522,6 +522,36 @@ class AuthorizationEngine:
 
     # ── public API ──────────────────────────────────────────────────────
 
+    def refuse(self, conn: sqlite3.Connection, intent: Intent, caller: Caller, *,
+               code: str, text: str) -> Authorization:
+        """Record an **adapter-side** refusal as a P2 audit row (§7.1 step 2).
+
+        Some refusals are not the engine's to discover. ``PROJECT_MISMATCH`` is
+        the first one: only the queue knows which project it *is*
+        (``<base>/<project>/state.json``), so only the queue can notice that an
+        ingress named a different one — but the receipt is still the engine's to
+        mint and record, because a refusal with no audit row is exactly the gap
+        P2 closes.
+
+        ⛔This mints a **BLOCK**, never an allowance, so it is fail-closed by
+          construction and needs no ``enforce`` boundary of its own: there is no
+          argument under which reaching it grants anything. It still requires an
+          authenticated caller, so a refusal cannot be recorded in a name nobody
+          presented a credential for (J9).
+
+        The intent handed in is what the receipt describes, so a caller that
+        wants the receipt keyed to the queue's project passes an intent naming
+        the queue's project — which is what :meth:`agent_crew.queue.TaskQueue.
+        enqueue` does, so the audit row belongs to the queue that refused rather
+        than to the project the request asked for.
+        """
+        receipt_store.ensure_schema(conn)
+        self._require_authenticated(caller)
+        receipt = self._refusal(intent, caller, uncanonical_intent_hash(intent.identity),
+                                code, text, conn=conn)
+        return Authorization(receipt=receipt, http_status=403, code=code)
+
+
     def authorize(self, conn: sqlite3.Connection, intent: Intent, caller: Caller, *,
                   retry: bool = False) -> Authorization:
         """Decide whether this intent may exist, and record the receipt.
