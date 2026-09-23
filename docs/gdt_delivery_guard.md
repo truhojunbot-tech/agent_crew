@@ -31,8 +31,15 @@ verdict is:
   reason=pane_not_agent_<verdict> detail=current_command=… refusals=N delivery=…`;
 - **counted**: `app.state.delivery_guard_refusals` and `/health` →
   `delivery_guard.refusals`, keyed by reason;
-- **requeued, not failed**: with the dispatcher on, the task can still be
-  delivered.
+- **backed off, then ended visibly**: the task goes back to pending with a
+  per-(task, pane) refusal count (`context.push_refusals`) and an
+  exponential `push_not_before` (`AGENT_CREW_PUSH_REFUSAL_BACKOFF_S`, default
+  30s, doubling). Only the tmux push dequeue honours the backoff, so the same
+  oldest task cannot hot-loop claim→requeue and starve later tasks, while the
+  dispatcher and MCP can still take it. After
+  `AGENT_CREW_PUSH_REFUSAL_MAX` (default 3) refusals on one pane, the task
+  ends as `needs_human` with summary `push_refused_<reason>` (fix round 1,
+  review of `addc29e` P1).
 
 The guard fails closed. If tmux or `ps` fails, or the process is unrecognised,
 the verdict is `unknown` and the push is refused. When the tree holds both a
@@ -42,7 +49,7 @@ Scope:
 
 | Caller | Process check | On refusal |
 |---|---|---|
-| `_try_push_next`, `_try_push_discuss` | yes | requeue |
+| `_try_push_next`, `_try_push_discuss` | yes | back off; `needs_human` after N |
 | watchdog reminder text | yes | skip; the running task is left alone |
 | watchdog busy/timeout probe | no (`require_agent=False`) | — |
 | #173 Ctrl+C recovery, timeout Ctrl+C | no | — |

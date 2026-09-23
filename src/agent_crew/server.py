@@ -1768,6 +1768,10 @@ _DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
 #: codex/gemini CLIs run as `node <path>/codex` and the claude quota wrapper as
 #: `python3 <path>/claude`.
 _AGENT_CLI_NAMES = frozenset({"claude", "codex", "gemini", "agy"})
+#: Refused pushes into one pane before the task ends as needs_human (G_DT).
+_PUSH_REFUSAL_MAX = max(1, int(os.getenv("AGENT_CREW_PUSH_REFUSAL_MAX", "3")))
+#: First backoff after a refused push; doubles per refusal on the same pane.
+_PUSH_REFUSAL_BACKOFF_S = float(os.getenv("AGENT_CREW_PUSH_REFUSAL_BACKOFF_S", "30"))
 #: The native claude binary is `~/.local/share/claude/versions/<semver>`, so
 #: tmux reports `#{pane_current_command}` as e.g. `2.1.185`.
 _CLAUDE_NATIVE_BINARY = re.compile(r"/claude/versions/[^/]+$")
@@ -2613,8 +2617,14 @@ def create_app(
         dispatcher on, owned panes run `crew-log-viewer`, and a push typed
         there is lost. Fail-closed: only a recognised agent is pushed to.
 
-        The task is requeued, never failed: under the dispatcher it is still
-        deliverable, and the refusal is about this pane, not the task.
+        The task is backed off, not failed at once: under the dispatcher it is
+        still deliverable, and the refusal is about this pane, not the task.
+        `defer_push_delivery` counts refusals per (task, pane) and sets an
+        exponential `push_not_before` that only the push path's dequeue
+        honours, so the same oldest task cannot hot-loop claim→requeue and
+        starve the ones behind it (review of addc29e, P1). After
+        ``_PUSH_REFUSAL_MAX`` refusals on one pane it ends as `needs_human`:
+        nothing will make that pane an agent without a person.
         ``requeue=False`` is for callers holding a task that is already
         running elsewhere (watchdog reminders).
         """
@@ -2630,7 +2640,14 @@ def create_app(
             delivery_guard_refusals[reason], _delivery_raw,
         )
         if requeue:
-            q().requeue(task_id)
+            count = q().defer_push_delivery(
+                task_id, pane_id, reason,
+                max_refusals=_PUSH_REFUSAL_MAX, backoff_s=_PUSH_REFUSAL_BACKOFF_S)
+            if count is not None and count >= _PUSH_REFUSAL_MAX:
+                logger.error(
+                    "tmux push refused %d times task_id=%s pane=%s reason=%s — needs_human",
+                    count, task_id, pane_id, reason)
+                _fail_if_active(task_id, f"push_refused_{reason}", status="needs_human")
         return False
 
     def _guard_tmx_push(task_id: str, target: str, *, require_agent: bool = True) -> str:
@@ -2749,7 +2766,7 @@ def create_app(
         if q().has_in_progress(task_type):
             logger.debug(f"_try_push_next: task_type {task_type} already in progress")
             return  # agent busy; will get pushed when current task completes
-        task = q().dequeue(role=role, claimed_via="tmux_push")
+        task = q().dequeue(role=role, claimed_via="tmux_push", skip_deferred=True)
         if task is None:
             logger.debug(f"_try_push_next: no pending task for role {role}")
             return  # nothing pending
@@ -2986,7 +3003,7 @@ def create_app(
         if q().has_discuss_in_progress_for_agent(agent):
             logger.debug(f"_try_push_discuss: discuss task in progress for agent {agent}")
             return
-        task = q().dequeue_discuss_for_agent(agent, claimed_via="tmux_push")
+        task = q().dequeue_discuss_for_agent(agent, claimed_via="tmux_push", skip_deferred=True)
         if task is None:
             logger.debug(f"_try_push_discuss: no pending discuss task for agent {agent}")
             return
