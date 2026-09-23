@@ -110,3 +110,57 @@ Consequence (`tests/unit/test_sev0_cea_i2_static_dynamic.py`):
 - **empty-project admission (extended):** the same defect now also covers `pipeline.auto_enqueue_test`, `pipeline.auto_fallback_failed_task`, `triage.enqueue_task`, server `_auto_retry_failed_task` and server `_requeue_review_at_head`. Each builds its `TaskRequest` without `project`. In the pipeline/server paths the resulting exception is swallowed by the cascade's own `try`, so the successor is silently never created and no receipt exists.
 - **MCP `submit_result` (P2 RESULT, not an ingress):** `get_next_task` (nonce) → HTTP `/start` → MCP `submit_result(executor_binding)` persists the same `(status, decision, reason, intent_hash, state, nonce spent)` as the all-HTTP flow. Without `/start`, both are refused `NONCE_NOT_STARTED`, the row stays `in_progress` and the nonce is not spent (2 PASS, `test_sev0_cea_i1_mcp_result.py`).
 - **Harness finding (fixed in the test lane):** since s4e, `create_app` passes `install_from_env` providers explicitly. The r2 `inject_cea` used `setdefault`, so every HTTP drive after the merge ran `mode=shadow` against the live alfred governance inputs and set the process-global runtime authority. `inject_cea` now forces mode + fixture providers and stubs `install_from_env`.
+
+## 8. FINAL state at the end of the CEA lineage (s4g)
+
+`result` — greps in §4 re-run on the merged lineage head (the s4d lane folded in
+at `4a6ca04`). This is the state the lineage ends in, not a plan.
+
+### Guard count vs ADR §11.2
+
+| | Count | Δ since §3 |
+|---|---|---|
+| Target components present in agent_crew (T1, T2, T3, T5, T6) | 5 | — |
+| Extra judgements outside T1–T6 | **2** — `runtime_stop` `_stop_active_*` (#12), `risk_tier` path (#14) | — |
+| Half-absorbed | 1 — `_guard_task_existence` (#17), still separate from T3 | — |
+| Dead definition, not a guard | `_pausejson_active` (#13), still zero callers | — |
+
+**5 + 2 = 7. ADR §11.2 wants ≤ 6, so the gap is NOT closed by this lineage.**
+The two named reductions (#12 into the P6 row T3 already reads, #14 into the O10
+snapshot matrix) are unstarted. Reporting 7 rather than 6 is the honest count;
+nothing in s4d–s4g removed a guard.
+
+Line numbers moved with the merge. Re-measured on the merged head:
+
+- #12 `runtime_stop`: **REMAINS**, 7 sites, all in `queue.py` — defs at `:1657`
+  `_stop_active_in_txn` / `:1663` `_stop_active_precheck`, called at `:1964`,
+  `:2429`, `:2437`, `:3558`, `:3564`.
+- #13 `_pausejson_active`: def at `queue.py:1576`, **still no callers**.
+- #14 `risk_tier`: **REMAINS**, now `pipeline.py:981`, `:1296`, `:1542/1543` and
+  `risk_tier.py:30/52` (+ internal `:144/162/168/176`). The `server.py` call site
+  quoted in §2 is **gone** — `grep` on `server.py` finds none.
+- #11 duplicate-in-flight, #15 `coordinator_managed`: still **REMOVED** (no hits).
+- T5 `artifact_gate_applies` `pipeline.py:200`; T6 `defer_push_delivery`
+  `queue.py:3373`, `_guard_task_existence` `server.py:2669`.
+- T3 gates: `queue.py:1948` (enqueue), `:2162` (claim), `:2579` (result).
+
+### §6 transport findings — final disposition
+
+- **empty-project admission:** still **DEFERRED**. The engine raises
+  `EngineError` (`$.project` non-empty) instead of writing a P2 BLOCK receipt.
+  Verified by running the markers with `--runxfail` on the final head: the
+  failure is that `EngineError` at `cea/engine.py:1170`, i.e. the marker's stated
+  reason, not a stale one. 41 strict xfail.
+- **http refusal mapping:** **DONE** in `fc857aa` (s4f). An app-level
+  `AdmissionRefused` handler maps the machine reason code to 401/403/409/423 and
+  carries the `receipt_id`; the marker came off in that same commit, so it is no
+  longer in the xfail list.
+- **Harness finding:** the `inject_cea` fix in `c2de6db` covered the shared
+  helpers but **not** `test_sev0_cea_s4b_result_requires_start.py`, which kept
+  its own `enforcing_queues` fixture on `kw.setdefault` and did not stub
+  `install_from_env`. Merging s4d-r3 turned the whole CEA suite red on
+  `test_http_result_before_start_is_refused` (403 `DECISION_BLOCK` from the LIVE
+  unkeyed snapshot at enqueue — P7 — not the rule under test). Fixed in s4g by
+  applying the same two changes there. No other CEA file has the pattern:
+  of the files that call `create_app`, the rest use the hermetic helpers or
+  stub `install_from_env` themselves.

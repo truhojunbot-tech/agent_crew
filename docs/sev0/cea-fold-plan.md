@@ -349,8 +349,89 @@ Two facts follow, and neither is a claim about a future state:
   the dispatcher is running does not take effect until it restarts. P7 makes
   that direction safe (stale ⇒ refuse), but there is no reload path yet.
 
+## 10. Step 4g — final merge and xfail reconciliation (`result`)
+
+The lineage's last step. `sev0/cea-lineage-s4d` (`d7e427f`, s4d-r3) was merged
+`--no-ff` into `sev0/cea-lineage` (`4a6ca04`, clean — no conflicts), then the
+whole CEA suite was reconciled against the markers.
+
+### Final suite counts
+
+Selection: `tests/unit/test_sev0_cea_*.py tests/test_cea_*.py
+tests/unit/test_sev0_runtime_authority.py`, `-p no:randomly`, foreground.
+
+| | Count |
+|---|---|
+| passed | **656** |
+| failed | **0** |
+| XPASS | **0** |
+| strict xfail | **60** |
+
+### DONE in this step
+
+- **Merged the s4d test lane.** All 14 I1 ingresses driven through their real
+  entry points, MCP `submit_result` end-to-end, guard inventory §7.
+- **Made the s4b harness hermetic.** The merge turned the suite red:
+  `test_http_result_before_start_is_refused` got 403 at `POST /tasks` because
+  `enforcing_queues` used `kw.setdefault` and did not stub `install_from_env`,
+  so after s4e the server's queue ran `mode=shadow` against the live
+  `~/alfred/governance` snapshot — unkeyed, therefore an unverified input, so
+  enqueue BLOCKs (P7). That refusal has nothing to do with the
+  RESULT-before-START rule the test pins. Same leak `c2de6db` closed in the
+  shared helpers; same fix applied here. Suite back to green.
+- **Reconciled the markers.** No marker had to be removed: XPASS was already 0,
+  so no named s4f item had silently landed. The one s4f item that did land —
+  http refusal mapping — had its marker removed in its own commit (`fc857aa`).
+- **Checked the markers are not stale.** Strict xfail + XPASS=0 proves a
+  behaviour is absent; it does not prove the marker names the *right* reason.
+  Both s4f items were re-run with `--runxfail`: empty-project fails on
+  `EngineError: $.project: '' should be non-empty` (`cea/engine.py:1170`) and
+  requeue fails on `assert 'CLAIMED' in ('QUEUED','HELD','SUPERSEDED')`. Both
+  match their marker text.
+- **Checked the markers are all strict.** No `strict=False` anywhere in the
+  suite. The three imperative `pytest.xfail()` calls in
+  `test_sev0_cea_i2_static_dynamic.py` are conditional on the gate's own answer
+  (`if not g.proceed`), so they become real PASSes when the cell lands rather
+  than masking it; none fired in this run. Its docstring still claimed
+  `strict=False` and was corrected.
+
+### DEFERRED — every remaining strict xfail, with why
+
+All 60 are marker-based and strict. Grouped by the item each names:
+
+| # | Item | Why it is genuinely deferred |
+|---|---|---|
+| 41 | **empty-project admission** (`i1_property`) | Engine raises `EngineError` instead of writing a P2 BLOCK receipt for `project=""`. A code-lane fix in `cea/engine.py` + the nine project-less adapters; not attempted in a test-reconciliation step. |
+| 5 | **requeue receipt lifecycle** (`i2_static_dynamic`) | `LIFECYCLE_GRAPH` has no CLAIMED→QUEUED edge, so the five paths back to `pending` strand the receipt in CLAIMED. Needs a lifecycle edge + a same-txn write. Zero-bypass holds; only liveness is lost. |
+| 9 | **E5(a) not landed** (CX-4a/4c/4i-a/b/c, CXC-2, CXC-3, CX-P2b, CX-P2c) | No engine/receipt at `POST /tasks` (P1/P2). |
+| 4 | **No canonical policy snapshot** (CX-4d/4e/4f/4g, §5.3) | alfred-side: `tools/admission_inputs.py` + a signed snapshot. Two are reference fixtures asserted from the consumer side only. |
+| 2 | **No caller/executor identity** (CX-4h, CXC-4, §6.5/E10 4h) | Blocked on the **O21b/O21c broker VERIFIED** identity work. |
+| 1 | **CX-4j** | Runtime row knows only `paused` (#314); no `QUARANTINED` state (P6). |
+| 1 | **CXC-1** | `pipeline.py` still branches on `risk_tier_enforcement_enabled()`; the cascades do not consume the receipt's J7 contract yet. This is guard #14, the same one keeping the §11.2 count at 7. |
+| 3 | **CXC-6 a/b/c** | G11 missing-base is a skip not a FAIL; G12 cancel; `task_exec_events` has no append-only trigger. |
+| 1 | **CXC-5** | E8 `test_sev0_e8_adversarial.py` still carries markers. |
+| 4 | **Permanent fixtures** CXC-5, CXC-6, CX-P2b, CX-P2c + the report gate | The acceptance verdict is **BLOCKED** while DEFERRED is non-empty — by design. |
+
+Only the first two are *this repo's* code lane. The rest are blocked on alfred
+(snapshot, `admission_inputs.py`), on the O21b/O21c identity broker, or on E5(a).
+
+### The lineage does not close the guard count
+
+`docs/sev0/cea-guard-inventory.md` §8: **5 target components + 2 extra
+judgements = 7**, against ADR §11.2's target of ≤ 6. Nothing in s4d–s4g removed
+a guard. The two named reductions (#12 `runtime_stop` into the P6 row T3 already
+reads; #14 `risk_tier` into the O10 snapshot matrix) are unstarted.
+
+### Acceptance verdict
+
+**BLOCKED**, and correctly so:
+`test_report_gate_acceptance_verdict_requires_every_fixture_blocked` is itself a
+strict xfail while DEFERRED is non-empty (CX-P2b, CX-P2c, CXC-5, CXC-6). The
+suite is green; the acceptance gate is not open.
+
 ## §P Provenance
 
+- Step 4g (§10): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4g-final-merge-reconcile` on :8105, branch `sev0/cea-lineage`, base `fc857aa`, merged `origin/sev0/cea-lineage-s4d` `d7e427f`, 2026-09-23. Guard greps re-run on the merged head; xfail reasons re-verified with `--runxfail`. All fixtures under `tmp_path` — the s4b harness fix exists precisely to stop the suite reading the live `~/alfred/governance` files. No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
 - Step 4e (§9): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4e-production-wiring` on :8105, branch `sev0/cea-lineage`, base `caf5644`, 2026-09-23. All fixtures under `tmp_path`; the live `~/alfred/governance` files were read only to report what the factory finds there. No live server, DB, GitHub or Telegram mutation.
 - Step 4c (§8): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4c-remainder-folds` on :8105, branch `sev0/cea-lineage`, base `bd58092`, 2026-09-23. Baselines for the pre-existing failures were taken by stashing the work tree at each commit's parent and re-running the same selection. No live server, DB, GitHub or Telegram mutation.
 - Provider Claude, model `claude-fable-5-1`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-prep-r1` on :8105, branch `sev0/cea-lineage`.

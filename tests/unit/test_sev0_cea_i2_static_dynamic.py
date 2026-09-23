@@ -24,7 +24,10 @@ Expected outcomes are read off the ADR tables, not off the implementation. A
 cell where the ADR says the work *continues* (``/result`` under drift or
 QUARANTINED — P3 last paragraph, P6 matrix) is asserted as not-BLOCK rather than
 refused. Where the implementation disagrees with the table the case is
-``xfail(strict=False)`` with the ADR cell quoted, so 4c/acceptance can flip it.
+``xfail(strict=True)`` with the ADR cell quoted: a cell that starts passing must
+break this suite, not pass silently. The three ``pytest.xfail()`` calls below are
+conditional on the gate's own answer (``if not g.proceed``), so they likewise
+disappear — into a real PASS — the moment the validator honours the cell.
 
 Provenance: written against agent_crew ``bd58092`` (sev0/cea-lineage-s4d).
 """
