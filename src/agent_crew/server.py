@@ -870,6 +870,15 @@ def _prepare_worktree_for_task_inner(
     return _worktree_head(worktree_path)
 
 
+def _expire_stale_supports_dry_run(queue) -> bool:
+    """Does this queue's ``expire_stale`` accept ``dry_run``? Probed, not assumed."""
+    import inspect
+    try:
+        return "dry_run" in inspect.signature(queue.expire_stale).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def _review_result_is_actionable(result) -> bool:
     """Did this review actually review anything?
 
@@ -883,7 +892,12 @@ def _review_result_is_actionable(result) -> bool:
       A skipped cascade is recoverable; the provider invocations those rounds
       spent are not. That asymmetry is the whole argument (#250).
     """
-    return getattr(result, "status", None) in (None, "completed")
+    if getattr(result, "status", None) not in (None, "completed"):
+        return False
+    # ⛔#5676: a completed review used to be "actionable" on status alone, so a
+    #   `request_changes` with nothing to change still enqueued a fix. A fix
+    #   round needs something to fix.
+    return bool(result.findings or [])
 
 
 _DEFAULT_ROLE_TO_AGENT = dict(DEFAULT_ROLE_TO_AGENT)
@@ -5184,6 +5198,19 @@ def create_app(
                                 logger.warning(f"POST /tasks/{task_id}/result: review comment 존재 확인 "
                                                f"불가(unknown) → fail-closed 미게시(재확인 대기)")
                                 _do_post = False
+                        # ⛔A malformed review result says nothing about the work, so it
+                        #   must not be published as a verdict. `_resolve_verdict` returns
+                        #   INVALID_REVIEW_RESULT for a missing/unknown verdict, an
+                        #   `approve` carrying findings, or a `request_changes` carrying
+                        #   none (owner decision 2026-09-23).
+                        if _do_post and _resolve_verdict(result) not in ("approve", "request_changes"):
+                            logger.warning(
+                                f"POST /tasks/{task_id}/result: review result violates the "
+                                f"contract (verdict={result.verdict!r}, findings="
+                                f"{len(result.findings or [])}) — no comment posted, no "
+                                f"transition taken"
+                            )
+                            _do_post = False
                         if _do_post:
                             _reviewer_agent = next(
                                 (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
@@ -5314,11 +5341,62 @@ def create_app(
         return {"status": "cancelled"}
 
     @app.post("/tasks/expire-stale", status_code=200)
-    def expire_stale_tasks(older_than: float = 600.0):
+    def expire_stale_tasks(
+        older_than: float = 600.0,
+        task_id: Optional[str] = None,
+        dry_run: bool = True,
+    ):
         """Cancel in_progress tasks idle longer than ``older_than`` seconds.
-        Returns list of cancelled task_ids."""
+
+        ⛔**This sweep is global and it used to run on the first call.** A
+        coordinator invoked it on 2026-09-23 meaning to clear one stuck review;
+        it cancelled three, two of which were live lanes the owner had just
+        asked to keep running. Nothing in the request said "all", and nothing in
+        the response said what would be lost before it was lost.
+
+        So the scope is now explicit and the default is a preview:
+
+        - ``task_id`` — cancel exactly that task if it qualifies. Scoped, safe.
+        - ``dry_run`` (default **True**) — report what *would* be cancelled and
+          change nothing. A global sweep must be seen before it is taken.
+        - ``dry_run=false`` without ``task_id`` — the real global sweep, and the
+          caller has now said so in the request.
+
+        Returns ``{"cancelled": [...], "dry_run": bool, "scope": ...}``;
+        on a preview the ids are under ``"would_cancel"`` instead, so a caller
+        cannot mistake a preview for a completed action.
+        """
+        candidates = q().expire_stale(older_than_seconds=older_than, dry_run=True) \
+            if _expire_stale_supports_dry_run(q()) else None
+        if candidates is None:
+            # Queue backends without a preview mode: compute the candidate set the
+            # same way the sweep does, without touching anything.
+            candidates = [
+                t.task_id for t in q().list_tasks()
+                if getattr(t, "status", None) == "in_progress"
+            ]
+        if task_id is not None:
+            candidates = [t for t in candidates if t == task_id]
+            if not candidates:
+                return {"cancelled": [], "dry_run": dry_run, "scope": task_id,
+                        "reason": "task_id not among the stale in_progress tasks"}
+        if dry_run:
+            logger.info(
+                f"POST /tasks/expire-stale: preview only — would cancel "
+                f"{len(candidates)} task(s): {candidates}"
+            )
+            return {"would_cancel": candidates, "dry_run": True,
+                    "scope": task_id or "global"}
+        if task_id is not None:
+            q().cancel_task(task_id)
+            logger.info(f"POST /tasks/expire-stale: cancelled scoped task {task_id}")
+            return {"cancelled": [task_id], "dry_run": False, "scope": task_id}
         cancelled = q().expire_stale(older_than_seconds=older_than)
-        return {"cancelled": cancelled}
+        logger.warning(
+            f"POST /tasks/expire-stale: GLOBAL sweep cancelled {len(cancelled)} "
+            f"task(s): {cancelled}"
+        )
+        return {"cancelled": cancelled, "dry_run": False, "scope": "global"}
 
     @app.post("/gates", status_code=201)
     def post_gate(gate: GateRequest):
