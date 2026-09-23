@@ -129,17 +129,21 @@ def build_mcp_server(
         atomically.
         """
         resolved_role = role or _DEFAULT_ROLE_FOR_AGENT.get(agent, "")
-        task = queue.dequeue(agent=agent, role=resolved_role)
+        task = queue.dequeue(agent=agent, role=resolved_role, claimed_via="mcp")
         if task is None:
             return None
+        queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
+                              target=f"mcp:{agent or 'anonymous'}")
         return _task_to_dict(task)
 
     @mcp.tool()
     def get_next_discuss_task(agent: str) -> Optional[dict[str, Any]]:
         """Discussion-channel variant — fan-out queue keyed on agent."""
-        task = queue.dequeue_discuss_for_agent(agent)
+        task = queue.dequeue_discuss_for_agent(agent, claimed_via="mcp")
         if task is None:
             return None
+        queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
+                              target=f"mcp:{agent or 'anonymous'}")
         return _task_to_dict(task)
 
     @mcp.tool()
