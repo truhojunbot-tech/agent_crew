@@ -61,7 +61,7 @@ def _result_payload(task_id, verdict, findings, summary="looks good"):
     }
 
 
-def test_u208_null_verdict_no_findings_posts_approve_comment(tmp_db, monkeypatch):
+def test_u208_null_verdict_no_findings_posts_no_comment(tmp_db, monkeypatch):
     calls = []
 
     def fake_post_review_comment(**kwargs):
@@ -79,11 +79,13 @@ def test_u208_null_verdict_no_findings_posts_approve_comment(tmp_db, monkeypatch
             json=_result_payload("review-208a", verdict=None, findings=[]),
         )
 
-    assert len(calls) == 1
-    assert calls[0]["verdict"] == "approve"
+    # ⛔REVERSED 2026-09-23 (owner): a null verdict is no longer inferred to be an
+    #   approval, so nothing is published. `post_review_comment` refuses to label
+    #   anything that is not one of the two contract verdicts.
+    assert calls == []
 
 
-def test_u208_null_verdict_with_findings_still_posts_request_changes(tmp_db, monkeypatch):
+def test_u208_null_verdict_with_findings_posts_no_comment(tmp_db, monkeypatch):
     calls = []
 
     def fake_post_review_comment(**kwargs):
@@ -101,8 +103,9 @@ def test_u208_null_verdict_with_findings_still_posts_request_changes(tmp_db, mon
             json=_result_payload("review-208b", verdict=None, findings=["real bug found"]),
         )
 
-    assert len(calls) == 1
-    assert calls[0]["verdict"] == "request_changes"
+    # ⛔REVERSED 2026-09-23 (owner): a null verdict carrying findings is not a
+    #   rejection either — it is a malformed result. Nothing is published.
+    assert calls == []
 
 
 def test_u208_explicit_request_changes_verdict_passed_through(tmp_db, monkeypatch):
