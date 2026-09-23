@@ -136,8 +136,7 @@ class Broker:
 
     def __init__(self, sock_dir: str, *, degraded: bool = False,
                  client_uids: tuple[int, ...] = (1000,), proc: Optional[ProcReader] = None,
-                 service_uid_override: Optional[int] = None, ptrace_scope_path: Optional[str] = None,
-                 max_spawn_age_ticks: Optional[int] = None):
+                 service_uid_override: Optional[int] = None, ptrace_scope_path: Optional[str] = None):
         self.sock_dir = sock_dir
         self.degraded = degraded
         self.client_uids = tuple(client_uids)
@@ -150,7 +149,6 @@ class Broker:
         self._poisoned: set[tuple[str, int]] = set()
         self._lock = threading.Lock()
         self._sock: Optional[socket.socket] = None
-        self.max_spawn_age_ticks = max_spawn_age_ticks
 
     # -- start-up checks -------------------------------------------------
 

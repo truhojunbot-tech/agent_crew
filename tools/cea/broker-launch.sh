@@ -7,7 +7,7 @@
 #   truhojun ALL=(crew-authz) NOPASSWD: /home/truhojun/alfred/tools/cea/broker-launch.sh
 # Do not edit sudoers. Run:  sudo -n -u crew-authz /home/truhojun/alfred/tools/cea/broker-launch.sh
 #
-# crew-authz (uid 998) is nologin with no home: nothing here reads $HOME.
+# crew-authz (uid 998) is nologin with no home: nothing here reads the home directory.
 # sudo resets the environment (env_reset), so every setting has a fixed default;
 # the AGENT_CREW_AUTHZ_* overrides only apply when run directly (e.g. --degraded).
 #
