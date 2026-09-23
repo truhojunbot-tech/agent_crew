@@ -252,6 +252,13 @@ def build_mcp_server(
         try:
             task_type = queue.submit_result(task_id, result, nonce=_nonce,
                                             presenter=_presenter)
+        except AdmissionRefused as exc:
+            # Both transports or neither: HTTP answers 409 for a refused P2
+            # RESULT, so MCP refuses the same submission rather than letting
+            # the same bypass through on the transport that has no status code.
+            return {"acknowledged": False, "refused": exc.point,
+                    "outcome": exc.outcome, "receipt_id": exc.receipt_id,
+                    "error": str(exc)}
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
         # #348: mirror HTTP's post-commit, fail-soft persistence. This is

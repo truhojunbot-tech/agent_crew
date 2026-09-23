@@ -171,6 +171,8 @@ class CurrentInputs:
     presenter: Optional[str] = None               # asserted identity at EXECUTE_START / RESULT
     presented_nonce: Optional[str] = None
     nonce_unused: Optional[bool] = None           # from the single-use nonce table (store.nonce_row)
+    nonce_consumed_by: Optional[str] = None       # nonce table ``used_by`` — who spent it ("execute_start:<presenter>")
+    nonce_attempt: Optional[int] = None           # nonce table ``attempt`` — the attempt the nonce was minted for
     already_claimed: bool = False                 # P6 DRAINING: dispatch only what was already claimed
     already_dispatched: bool = False              # P6 DRAINING: execute only what was already dispatched
     max_receipt_age_seconds: float = O18_MAX_RECEIPT_AGE_SECONDS
@@ -204,6 +206,21 @@ _POINT_STATES: dict[str, tuple[str, ...]] = {
 }
 
 _TERMINAL_STATES = ("CONSUMED", "SUPERSEDED", "REVOKED")
+
+
+def _nonce_started(cur: "CurrentInputs") -> bool:
+    """Did EXECUTE_START spend the presented nonce?
+
+    ``None`` is not "probably yes": a call site that did not read the claim
+    table has not established the fact, and at RESULT the fact is the whole
+    check. Mirrors :func:`agent_crew.cea.store.consumed_by_execute_start`,
+    which reads the same row — kept here so the validator stays I/O-free.
+    """
+    if cur.nonce_unused is not False:
+        return False
+    if cur.nonce_consumed_by is None:
+        return False
+    return str(cur.nonce_consumed_by).startswith("execute_start:")
 
 
 def _result(point: ValidationPoint, outcome: ValidationOutcome, code: str, text: str,
@@ -447,6 +464,31 @@ def validate(receipt, point, current: Optional[CurrentInputs] = None) -> Validat
         if point is ValidationPoint.EXECUTE_START and cur.nonce_unused is False:
             return _result(point, ValidationOutcome.BLOCK, "NONCE_REUSED",
                            "dispatch nonce was already spent (P4: single-use)", receipt_id=rid)
+        if point is ValidationPoint.RESULT:
+            # ⛔The nonce is proof that EXECUTE_START happened — not a bearer
+            #   token that works straight at RESULT. Before this, RESULT only
+            #   asked whether the nonce was *minted* on the receipt, so a
+            #   worker could skip ``POST /tasks/{id}/start`` entirely: the
+            #   nonce stayed unspent, the receipt never left CLAIMED, and the
+            #   task still reached a terminal result (Codex review of 4d8538d,
+            #   P1; reproduced at validator.py:434-449 / queue.py:2539-2555).
+            #   So RESULT asks the *claim table* three questions the receipt
+            #   cannot answer about itself: spent, spent by execute-start, and
+            #   spent for this attempt.
+            if not _nonce_started(cur):
+                return _result(point, ValidationOutcome.BLOCK, "NONCE_NOT_STARTED",
+                               "the dispatch nonce was never consumed by EXECUTE_START, so this "
+                               "result is presented for work that never asked for its go/no-go "
+                               "(P2 fifth point)", receipt_id=rid)
+            if cur.nonce_attempt is not None and cur.nonce_attempt != receipt.get("attempt"):
+                return _result(point, ValidationOutcome.BLOCK, "NONCE_WRONG_ATTEMPT",
+                               "the nonce EXECUTE_START consumed belongs to a different attempt",
+                               receipt_id=rid)
+            if state != "RUNNING":
+                return _result(point, ValidationOutcome.BLOCK, "RESULT_WITHOUT_EXECUTE_START",
+                               f"receipt state is {state}; RESULT is valid only while the receipt "
+                               "is RUNNING for this attempt (EXECUTE_START is what moves it there)",
+                               receipt_id=rid)
     presented = cur.claimant if point is ValidationPoint.CLAIM else cur.presenter
     if presented is not None and receipt.get("executor_binding") \
             and presented != receipt["executor_binding"]:

@@ -5307,6 +5307,13 @@ def create_app(
                 except Exception:
                     logger.exception(
                         f"POST /tasks/{task_id}/result: late-result event failed")
+        except AdmissionRefused as exc:
+            # P2 RESULT refused under enforce — nothing was written. 409, with
+            # the validator's own reason: a worker that presented an unspent
+            # nonce (never asked /start for its go/no-go) must learn that, not
+            # read a 500 and retry the same bypass.
+            logger.warning(f"POST /tasks/{task_id}/result: refused — {exc}")
+            raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")

@@ -407,6 +407,29 @@ def mint_nonce(conn: sqlite3.Connection, receipt_id: str, attempt: int, nonce: s
                  "VALUES (?, ?, ?, ?, NULL, NULL)", (nonce, receipt_id, attempt, issued_at))
 
 
+EXECUTE_START_CONSUMER = "execute_start"
+"""The only consumer P2 lets spend a dispatch nonce.
+
+``used_by`` is written as ``"execute_start:<presenter>"`` so RESULT can ask the
+claim table *who* spent the nonce, not merely whether it is spent. Without this
+the nonce was a bearer proof: a worker could present it straight at ``/result``
+and never ask for the go/no-go (Codex review of 4d8538d, P1).
+"""
+
+
+def consumer_tag(who: Optional[str], *, consumer: str = EXECUTE_START_CONSUMER) -> str:
+    """``"<consumer>:<who>"`` — the value :func:`consume_nonce` stores in ``used_by``."""
+    return f"{consumer}:{who or ''}"
+
+
+def consumed_by_execute_start(row: Optional[dict]) -> bool:
+    """Did EXECUTE_START spend this nonce row? ``False`` for unspent, unknown, or
+    spent-by-something-else — the three cases RESULT must refuse alike."""
+    if not row or not row.get("used_at"):
+        return False
+    return str(row.get("used_by") or "").startswith(EXECUTE_START_CONSUMER + ":")
+
+
 def consume_nonce(conn: sqlite3.Connection, nonce: str, *, used_by: Optional[str] = None,
                   used_at: Optional[str] = None) -> bool:
     """Atomically spend a nonce. ``True`` exactly once per nonce; ``False`` for an

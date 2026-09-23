@@ -2544,10 +2544,18 @@ class TaskQueue:
             result_gate = None
             _receipt_id, _receipt = self._cea_receipt_for_task_on(conn, task_id)
             if _receipt is not None:
+                # The nonce's row in the claim table, not the receipt's own
+                # ``dispatch_nonces`` array: the receipt is caller-controlled
+                # data here, and the question RESULT must answer is whether
+                # EXECUTE_START spent this nonce for this attempt.
+                _nrow = _cea_store.nonce_row(conn, nonce) if nonce else None
                 result_gate = _cea_callsites.gate_result(
                     _receipt, nonce=nonce, presenter=presenter,
                     current=_cea_callsites.current_inputs(
-                        self.cea_engine(), _receipt, presenter=presenter),
+                        self.cea_engine(), _receipt, presenter=presenter,
+                        nonce_unused=(None if _nrow is None else _nrow.get("used_at") is None),
+                        nonce_consumed_by=(None if _nrow is None else _nrow.get("used_by")),
+                        nonce_attempt=(None if _nrow is None else _nrow.get("attempt"))),
                     config=self.cea_config())
                 self._last_cea_result_gate = result_gate
                 if not result_gate.proceed:
@@ -3261,7 +3269,12 @@ class TaskQueue:
                 config=self.cea_config())
             spent = False
             if gate.proceed and nonce:
-                spent = _cea_store.consume_nonce(conn, nonce, used_by=presenter or task_id)
+                # ⛔Tag *who* spent it. RESULT reads this back to tell
+                #   "EXECUTE_START ran" from "somebody spent the nonce"; an
+                #   untagged spend would let a result present an unspent nonce
+                #   and look started (Codex review of 4d8538d, P1).
+                spent = _cea_store.consume_nonce(
+                    conn, nonce, used_by=_cea_store.consumer_tag(presenter or task_id))
                 if not spent and gate.enforced:
                     # Lost the race for a single-use nonce: somebody else is
                     # already running this attempt.

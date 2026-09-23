@@ -610,7 +610,18 @@ class TestValidatorHappyPath:
                        presenter="claude") is ValidationOutcome.OK
         assert outcome(make_receipt(state="RUNNING", dispatch_nonces=[nonce]),
                        ValidationPoint.RESULT, binding=make_binding(),
-                       presented_nonce="n-1", presenter="claude") is ValidationOutcome.OK
+                       presented_nonce="n-1", presenter="claude",
+                       **STARTED) is ValidationOutcome.OK
+
+
+STARTED = {"nonce_unused": False, "nonce_consumed_by": "execute_start:claude"}
+"""What the claim table says once EXECUTE_START has spent the nonce.
+
+RESULT asks for this (4b FOLD-IN 3, Codex review of ``4d8538d``): a nonce that
+is merely *minted on the receipt* proves nothing, because the receipt is
+caller-controlled data. Every RESULT case that should PROCEED therefore has to
+state that execute-start actually happened.
+"""
 
 
 class TestValidatorSchemaAndLifecycle:
@@ -774,7 +785,7 @@ class TestValidatorNonce:
         res = validate(make_receipt(state="RUNNING", dispatch_nonces=[self.NONCE]),
                        ValidationPoint.RESULT,
                        CurrentInputs(binding=make_binding(), presented_nonce="n-1",
-                                     presenter="gemini"))
+                                     presenter="gemini", **STARTED))
         assert res.reason.startswith("EXECUTOR_BINDING_MISMATCH")
 
 
@@ -807,9 +818,13 @@ class TestP6EnforcementMatrix:
         nonce = {"nonce": "n-1", "attempt": 1, "issued_at": "2026-09-23T10:00:00Z", "used_at": None}
         r = make_receipt(state=receipt_state, dispatch_nonces=[nonce],
                          binding=make_binding(runtime_state=state))
+        # RESULT is the one point that reads the nonce back as *spent by
+        # execute-start*; every other point wants it still unspent.
+        spent = STARTED if point == "result" else {"nonce_unused": True}
         res = validate(r, point, CurrentInputs(binding=make_binding(runtime_state=state),
-                                               presented_nonce="n-1", nonce_unused=True,
-                                               presenter="claude", claimant="claude"))
+                                               presented_nonce="n-1",
+                                               presenter="claude", claimant="claude",
+                                               **spent))
         assert res.outcome is expected, res.reason
 
     def test_draining_dispatches_what_was_already_claimed(self):
@@ -836,7 +851,7 @@ class TestP6EnforcementMatrix:
                          binding=make_binding(runtime_state=state))
         res = validate(r, ValidationPoint.RESULT,
                        CurrentInputs(binding=make_binding(runtime_state=state),
-                                     presented_nonce="n-1", presenter="claude"))
+                                     presented_nonce="n-1", presenter="claude", **STARTED))
         assert res.outcome is ValidationOutcome.OK
         assert "RESULT_ACCEPTED_NO_SUCCESSORS" in res.reason
 
@@ -938,7 +953,7 @@ class TestP3OutcomeTable:
         r = make_receipt(state="RUNNING", dispatch_nonces=[nonce])
         res = validate(r, ValidationPoint.RESULT,
                        CurrentInputs(binding=make_binding(policy_generation=99),
-                                     presented_nonce="n-1", presenter="claude"))
+                                     presented_nonce="n-1", presenter="claude", **STARTED))
         assert res.outcome is ValidationOutcome.OK
         assert res.reason.startswith("STALE_RECEIPT")
 
@@ -957,7 +972,8 @@ class TestP7AndO20:
         nonce = {"nonce": "n-1", "attempt": 1, "issued_at": "2026-09-23T10:00:00Z", "used_at": None}
         res = validate(make_receipt(state="RUNNING", dispatch_nonces=[nonce]),
                        ValidationPoint.RESULT,
-                       CurrentInputs(binding=None, presented_nonce="n-1", presenter="claude"))
+                       CurrentInputs(binding=None, presented_nonce="n-1", presenter="claude",
+                                     **STARTED))
         assert res.outcome is ValidationOutcome.OK
 
     def test_snapshot_inside_the_window_is_bounded_stale_not_blocked(self):
