@@ -377,3 +377,89 @@ def test_every_dispatch_caller_carries_the_nonce_somewhere():
     assert offenders == [], (
         "record_dispatch's nonce is discarded at " + ", ".join(offenders)
         + " — the worker cannot present what it was never handed (P2 RESULT)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# §7 — every ingress is a named adapter
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_every_enqueue_call_site_names_its_ingress():
+    """§7: an ingress that does not name itself is an ingress the receipt lies about.
+
+    ⛔Static, and it has to be. Before this, sixteen call sites all took the
+      default, so every receipt in the product said ``caller_provenance:
+      direct`` — about watch ingestion, about retries, about cascade
+      successors. Nothing was wrong at runtime, which is exactly why no
+      behavioural test could have found it: the field was *populated*, it was
+      just not *true*.
+    """
+    from agent_crew.cea import adapters
+
+    offenders = []
+    for path in sorted(SRC.rglob("*.py")):
+        if path.name in ("queue.py",):                 # the method itself
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "enqueue"):
+                continue
+            named = {kw.arg for kw in node.keywords}
+            if not named & {"ingress", "provenance"}:
+                offenders.append(f"{path.name}:{node.lineno}")
+                continue
+            for kw in node.keywords:
+                if kw.arg == "ingress" and isinstance(kw.value, ast.Constant):
+                    assert kw.value.value in adapters.BY_ID, (
+                        f"{path.name}:{node.lineno} names an unregistered ingress "
+                        f"{kw.value.value!r}")
+    assert offenders == [], (
+        "these enqueue call sites take the default provenance, so their receipts "
+        "will claim `direct`: " + ", ".join(offenders))
+
+
+def test_an_unregistered_ingress_is_refused_rather_than_defaulted():
+    """P7's shape applied to the registry: an unknown adapter is an error.
+
+    A fallback to ``DIRECT`` is how the uniform-``direct`` state arose — the
+    default was reachable, so nothing ever had to name itself.
+    """
+    from agent_crew.cea import adapters
+
+    with pytest.raises(KeyError):
+        adapters.provenance_of("cascade.invented")
+
+
+@pytest.mark.parametrize("ingress,expected", [
+    ("cron.watch", "cron"),
+    ("cascade.review", "cascade"),
+    ("retry.failed_task", "retry"),
+    ("watchdog.stale_review", "watchdog"),
+    ("http.tasks", "direct"),
+])
+def test_the_receipt_records_the_ingress_it_came_from(tmp_path, ingress, expected):
+    """The audit field is true per ingress, and it buys the ingress nothing.
+
+    Both halves matter. ``caller_provenance`` must distinguish a cascade
+    successor from an operator command (§3) — and, per P2a, the decision must
+    not: identity is UNVERIFIED for every one of them, so a task that names
+    itself ``cron`` obtains exactly what one that names itself ``direct`` does.
+    """
+    q = queue(tmp_path, name=f"{expected}.db")
+    q.enqueue(task(f"t-{expected}", context=admitted()), ingress=ingress)
+
+    receipt = _receipt(q, f"t-{expected}")
+    assert receipt["caller_provenance"] == expected
+    assert receipt["caller_identity_status"] == "UNVERIFIED"
+    assert receipt["downgrade_reason"] == "SHARED_UID_NO_CREDENTIAL_BOUNDARY"
+
+
+def test_naming_the_ingress_does_not_change_the_decision(tmp_path):
+    """P2a, made checkable: provenance is an audit field, not an admission input."""
+    decisions = set()
+    for i, ingress in enumerate(("http.tasks", "cron.watch", "cascade.fix",
+                                 "retry.failed_task")):
+        q = queue(tmp_path, name=f"prov{i}.db")
+        q.enqueue(task("same", context=admitted()), ingress=ingress)
+        decisions.add(_receipt(q, "same")["decision"])
+    assert len(decisions) == 1, f"the decision differed by ingress: {decisions}"

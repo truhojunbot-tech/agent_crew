@@ -305,7 +305,7 @@ def enqueue_task(queue, triage_result: dict) -> str:
         branch=branch,
         context={"issue": parsed["issue"]},
     )
-    return queue.enqueue(req)
+    return queue.enqueue(req, ingress="cron.triage")
 
 
 def check_gate_timeout(queue, timeout_seconds: float) -> list[str]:

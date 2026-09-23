@@ -58,7 +58,7 @@ def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, po
     )
     if port:
         return _post_task_http(port, req)
-    return queue.enqueue(req)
+    return queue.enqueue(req, ingress="loop.implement")
 
 
 #: How many times a review that failed to RUN is re-dispatched before the loop
@@ -125,7 +125,7 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
     )
     if port:
         return _post_task_http(port, req)
-    return queue.enqueue(req)
+    return queue.enqueue(req, ingress="loop.review")
 
 
 def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", context: dict = {}, port: int = 0) -> str:
@@ -151,7 +151,7 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
     )
     if port:
         return _post_task_http(port, req)
-    return queue.enqueue(req)
+    return queue.enqueue(req, ingress="loop.test")
 
 
 _KNOWN_LAYERS = {"test_quality", "code_quality", "business_gap"}

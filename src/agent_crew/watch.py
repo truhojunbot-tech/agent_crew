@@ -938,7 +938,8 @@ def run_cycle(
             continue
 
         try:
-            task_id = queue.enqueue(build_task(issue, repo, branch, project, rules))
+            task_id = queue.enqueue(build_task(issue, repo, branch, project, rules),
+                                    ingress="cron.watch")
         except Exception as exc:  # noqa: BLE001 — enqueue must not strand a claim
             logger.warning("watch: enqueue failed for %s#%s: %s", repo, number, exc)
             _safe_remove_label(gh, repo, number)

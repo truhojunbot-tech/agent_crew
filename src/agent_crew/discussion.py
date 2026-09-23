@@ -33,7 +33,7 @@ def enqueue_panel_tasks(
             branch=branch,
             context=ctx,
         )
-        task_id = _post_task_http(port, req) if port else queue.enqueue(req)
+        task_id = _post_task_http(port, req) if port else queue.enqueue(req, ingress="cli.discuss")
         task_ids.append(task_id)
     return task_ids
 

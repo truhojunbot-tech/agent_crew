@@ -3358,6 +3358,6 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
             raise click.ClickException(f"POST /tasks failed: {exc}") from exc
     else:
         from agent_crew.queue import TaskQueue, TaskRequest
-        TaskQueue(db).enqueue(TaskRequest(**payload))
+        TaskQueue(db).enqueue(TaskRequest(**payload), ingress="cli.enqueue")
 
     click.echo(task_id)

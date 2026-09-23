@@ -4664,7 +4664,8 @@ def create_app(
                 branch=base.get("branch") or "main",
                 priority=3,
                 context=context,
-            ))
+            ),
+                        ingress="watchdog.stale_review")
             logger.info(
                 f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
                 f"{head[:12]}, superseding {review_task_id} (#304)")
@@ -4795,7 +4796,7 @@ def create_app(
             )
             from agent_crew.queue import TaskAlreadyExistsError as _TAE
             try:
-                q().enqueue(retry_req)
+                q().enqueue(retry_req, ingress="retry.failed_task")
             except _TAE:
                 logger.info(f"_auto_retry_failed_task: {retry_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")
@@ -5098,7 +5099,7 @@ def create_app(
                     f"#{_issue_number} — enqueueing anyway")
                 _in_flight = []
         try:
-            task_id = q().enqueue(task)
+            task_id = q().enqueue(task, ingress="http.tasks")
         except TaskAlreadyExistsError as e:
             raise HTTPException(
                 status_code=409,

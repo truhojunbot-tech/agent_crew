@@ -1085,7 +1085,8 @@ def auto_enqueue_fix(
                 branch=review_task.branch,
                 context=fix_context,
                 project=review_project,
-            ))
+            ),
+                          ingress="cascade.fix")
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.
@@ -1490,7 +1491,7 @@ def auto_enqueue_review(
             project=impl_project,
         )
         try:
-            queue.enqueue(review_req)
+            queue.enqueue(review_req, ingress="cascade.review")
         except TaskAlreadyExistsError:
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
@@ -1611,7 +1612,7 @@ def auto_enqueue_test(
             context=test_context,
         )
         try:
-            queue.enqueue(test_req)
+            queue.enqueue(test_req, ingress="cascade.test")
         except TaskAlreadyExistsError:
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
         return test_id
@@ -1803,7 +1804,7 @@ def auto_fallback_failed_task(
                 context=new_ctx,
             )
             try:
-                queue.enqueue(fallback_req)
+                queue.enqueue(fallback_req, ingress="cascade.fallback")
             except TaskAlreadyExistsError:
                 logger.info(f"auto_fallback: {fallback_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(

@@ -11,6 +11,7 @@ import uuid
 from dataclasses import dataclass
 from typing import List, Optional
 
+from agent_crew.cea import adapters as _cea_adapters
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import store as _cea_store
 from agent_crew.cea.auth import in_process_caller as _cea_in_process_caller
@@ -2028,20 +2029,37 @@ class TaskQueue:
             logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
         return task.task_id
 
-    def enqueue(self, task: TaskRequest, *,
-                provenance: "_CeaProvenance" = _CeaProvenance.DIRECT) -> str:
-        """Admit a task and write its row — the path every legacy ingress takes.
+    def enqueue(self, task: TaskRequest, *, ingress: Optional[str] = None,
+                provenance: Optional["_CeaProvenance"] = None) -> str:
+        """Admit a task and write its row — the one path every §7 adapter takes.
 
-        ⛔Not a bypass and not a shortcut: it mints a receipt through the T1
-          engine (:meth:`authorize_task`) and then goes through the one writer
-          (:meth:`enqueue_with_receipt`). Every existing caller — HTTP, MCP,
-          pipeline, cli, watch, triage — keeps working unchanged and starts
-          producing receipts, which is the whole point of the shadow phase: a
-          measurement of what admission *would* have said, taken from the real
-          traffic rather than from a reconstruction of it.
+        ``ingress`` names the adapter from
+        :data:`agent_crew.cea.adapters.INGRESSES`; it resolves to the
+        provenance the receipt carries. §7's adapter is *translate →
+        authenticate → engine*, and this method is the last two thirds of it:
+        the caller translates its transport into a ``TaskRequest`` and says
+        which ingress it is, and admission happens here, once, for everyone.
+
+        ⛔Naming the ingress buys that ingress nothing. ``caller_provenance``
+          is an audit field (§3), never an admission input, and under one uid
+          identity is ``UNVERIFIED`` for all of them (P2a). What it buys is a
+          receipt that can answer "where did this task come from" — which the
+          old uniform ``direct`` default could not, because it labelled watch
+          ingestion, retries, cascades and operator commands identically.
+
+        ``provenance=`` remains for callers holding an enum directly (the unit
+        suites, and adapters not yet in the registry). Passing neither is
+        ``DIRECT``, and the static §7 test refuses that for any call site in
+        the product.
         """
+        if ingress is not None:
+            if provenance is not None:
+                raise ValueError("pass ingress or provenance, not both — the registry "
+                                 "is what maps one to the other")
+            provenance = _cea_adapters.provenance_of(ingress)
         context = self._enqueue_context(task)
-        auth = self.authorize_task(task, context=context, provenance=provenance)
+        auth = self.authorize_task(task, context=context,
+                                   provenance=provenance or _CeaProvenance.DIRECT)
         return self.enqueue_with_receipt(task, auth.receipt, context=context)
 
     # ── the receipt side of a task row ────────────────────────────────
