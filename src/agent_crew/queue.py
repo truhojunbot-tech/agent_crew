@@ -1,5 +1,6 @@
 import json
 import contextlib
+import copy
 import hashlib
 import logging
 import os
@@ -8,7 +9,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass, replace as _dc_replace
+from dataclasses import dataclass
 from typing import List, Optional
 
 from agent_crew.cea import adapters as _cea_adapters
@@ -72,6 +73,23 @@ def _cea_str_tuple(value) -> tuple:
     if not isinstance(value, (list, tuple)):
         return ()
     return tuple(str(v) for v in value if isinstance(v, str) and v.strip())
+
+
+def _with_project(task: TaskRequest, project: str) -> TaskRequest:
+    """A copy of ``task`` naming ``project``, without re-running ``__init__``.
+
+    ⛔Deliberately not :func:`dataclasses.replace`. That reconstructs the
+      dataclass, so ``TaskRequest.__post_init__`` re-validates — and a caller
+      that reached the queue with a field the constructor would have rejected
+      (a library call using ``object.__setattr__``, which is exactly what
+      ``tests/unit/test_issue_273_duplicate_task_id.py`` builds) would start
+      failing with a ``ValueError`` from admission instead of the integrity
+      error the write actually produces. Filling in a project must not change
+      what any other malformed field does.
+    """
+    clone = copy.copy(task)
+    clone.project = project
+    return clone
 
 
 def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None) -> "_CeaIntent":
@@ -1970,7 +1988,7 @@ class TaskQueue:
         declared = self.declared_project
         if not named:
             identity = self.queue_project
-            return (_dc_replace(task, project=identity) if identity else task), None
+            return (_with_project(task, identity) if identity else task), None
         if declared and named != declared:
             return task, (self.PROJECT_MISMATCH,
                           f"§7.1 step 2: this queue admits for project {declared!r} "
@@ -2321,7 +2339,7 @@ class TaskQueue:
             # lands in the store `enqueue_with_receipt` reads it back from.
             from agent_crew.cea.engine import AuthorizationEngine as _CeaEngine
             engine = _CeaEngine(config=self.cea_config(scope))
-        scoped = _dc_replace(task, project=self.declared_project or task.project)
+        scoped = _with_project(task, self.declared_project or task.project)
         intent = intent_for_task(scoped, context=context)
         caller = _cea_in_process_caller(provenance)
         conn = self._connect()

@@ -585,27 +585,58 @@ def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind
 
 
 #: s4j: the two ingresses that carry a *caller-supplied* project — `crew
-#: enqueue --db` and `watch.run_cycle(project=...)`. They do not back-fill it
-#: (unlike the §7 adapters that synthesise their own TaskRequest), so an empty
-#: one here is the caller's, and the contract is that it is refused rather than
-#: silently given a project the caller did not choose.
+#: enqueue --db` and `watch.run_cycle(project=...)`. s4j refused an empty one
+#: rather than back-filling it, so that a task could not be admitted under a
+#: rollout mode its submitter had not chosen.
+#:
+#: s4k narrows that to the case it was actually protecting. The danger was a
+#: project *guessed from somewhere else*; the queue's own identity is not a
+#: guess about the caller, it is the answer to "which project is this queue" —
+#: so an unnamed project is now filled from it, for these two ingresses and the
+#: other twelve alike (`TaskQueue.enqueue` is where the rule lives). What still
+#: refuses is a queue with no identity to lend: `PROJECT_REQUIRED` survives
+#: exactly there, which is what the second half below pins.
 @pytest.mark.parametrize("kind", ["cli", "cron_watch"])
-def test_empty_project_is_a_refusal_with_an_audit_receipt_not_an_exception(
+def test_empty_project_takes_the_queue_identity_and_is_refused_without_one(
         tmp_path, monkeypatch, kind):
-    """Was ``xfail(strict=True)`` through s4i: the engine RAISED a frozen-contract
-    violation (``$.project`` non-empty) out of ``_record`` instead of writing the
-    P2 BLOCK audit row, so the adapter surfaced an exception with no receipt.
-    s4j refuses in ``_canonicalize`` with ``PROJECT_REQUIRED``, and the marker
-    comes off in the same commit — a strict xfail that starts passing fails the
-    suite, so leaving it would hide the fix."""
+    """Was ``xfail(strict=True)`` through s4i (the engine RAISED a frozen-contract
+    violation out of ``_record`` with nothing persisted), then a
+    ``PROJECT_REQUIRED`` refusal in s4j, and now the two-branch rule of s4k.
+
+    Both branches are asserted here on purpose: "the queue lends its identity"
+    is only safe because "a queue with no identity still refuses" is true, and a
+    test that checked only the first would pass just as well against a
+    fabricated default."""
     from agent_crew.queue import AdmissionRefused, TaskQueue
     live = LiveState(AuthorityState("active"))
     inject_cea(monkeypatch, live)
-    q = TaskQueue(str(tmp_path / "e.db"))
     ingress = {"cli": "cli.enqueue", "cron_watch": "cron.watch"}[kind]
+
+    # (a) a queue that knows which project it is lends it — `<base>/<project>/`
+    home = tmp_path / "agent_crew"
+    home.mkdir()
+    (home / "state.json").write_text(json.dumps({"project": "agent_crew"}), encoding="utf-8")
+    q = TaskQueue(str(home / "tasks.db"))
+    q.enqueue(task("e1", project=""), ingress=ingress)
+    conn = sqlite3.connect(q._db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        rid = conn.execute("SELECT receipt_id FROM tasks WHERE task_id='e1'").fetchone()[0]
+    finally:
+        conn.close()
+    got = persisted_receipt(q._db_path, rid)
+    assert not validate_receipt(got), validate_receipt(got)
+    assert got["project"] == "agent_crew"
+    assert got["decision"] != "BLOCK", got["reason"]
+
+    # (b) a queue with no identity at all has nothing to lend, and says so
+    root = tmp_path / ".agent_crew"
+    root.mkdir()
+    nameless = TaskQueue(str(root / "tasks.db"))
+    assert nameless.queue_project == ""
     with pytest.raises(AdmissionRefused) as exc:
-        q.enqueue(task("e1", project=""), ingress=ingress)
-    got = persisted_receipt(q._db_path, exc.value.receipt_id)
+        nameless.enqueue(task("e2", project=""), ingress=ingress)
+    got = persisted_receipt(nameless._db_path, exc.value.receipt_id)
     assert got is not None
     assert not validate_receipt(got), validate_receipt(got)
     assert got["decision"] == "BLOCK"
