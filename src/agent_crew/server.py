@@ -2643,6 +2643,26 @@ def create_app(
             "status": "ok", "suppressed_by_pause": True, "cascade_suppressed": True,
             "detail": "runtime STOP: execution-producing mutation atomically refused"})
 
+    # SEV-0 CEA s4f (FOLD-IN 5a): a refused admission is an answer, not a crash.
+    # Without this handler `POST /tasks` had no `except AdmissionRefused` (only
+    # TaskAlreadyExistsError -> 409) and no app-level handler, so every enforced
+    # refusal left as a 500 with a traceback — indistinguishable, to a client,
+    # from the server being broken. An app-level handler rather than a try/except
+    # in one route on purpose: AdmissionRefused is raised at three call sites
+    # (enqueue/claim/result), and a per-route catch would give the same refusal a
+    # different shape depending on which door it arrived at, which is exactly the
+    # ingress-equivalence property (§12.1 I1) the ADR asks us to preserve.
+    from agent_crew.queue import AdmissionRefused as _AdmissionRefused
+    from agent_crew.cea.refusal_http import refusal_payload as _refusal_payload
+
+    @app.exception_handler(_AdmissionRefused)
+    async def _admission_refused_handler(request, exc):  # noqa: ANN001
+        status, body = _refusal_payload(exc)
+        logger.warning("admission refused at %s: %s -> HTTP %s (receipt=%s, path=%s)",
+                       body["point"], body["reason"], status, body["receipt_id"],
+                       request.url.path)
+        return _JSONResponse(status_code=status, content=body)
+
     def q() -> TaskQueue:
         return state["queue"]
 

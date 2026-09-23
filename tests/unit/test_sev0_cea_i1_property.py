@@ -428,12 +428,17 @@ def test_empty_project_is_a_refusal_with_an_audit_receipt_not_an_exception(
     assert persisted_receipt(q._db_path, exc.value.receipt_id) is not None
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "s4f item 'http refusal mapping': POST /tasks has no `except AdmissionRefused` "
-    "(server.py create_task: only TaskAlreadyExistsError -> 409) and no app exception handler "
-    "for it, so a refused admission is an unhandled 500. Needs 4xx + receipt_id in the body"))
 def test_http_refusal_is_a_4xx_carrying_the_receipt_id(tmp_path, monkeypatch):
+    """s4f FOLD-IN 5a: a refused admission leaves over the wire as a 4xx, never a 500.
+
+    Was a strict xfail until ``server.py`` grew an app-level ``AdmissionRefused``
+    handler; the marker comes off in the commit that added it, because a strict
+    xfail that starts passing fails the suite and would otherwise hide here.
+    """
     inject_cea(monkeypatch, LiveState(AuthorityState("q", runtime=RuntimeState.QUARANTINED)))
     resp = _via_http(tmp_path, task("h1"), "r.db")
     assert 400 <= resp.status_code < 500, resp.status_code
     assert "receipt_id" in resp.text
+    # the status is chosen from the machine reason code, not the prose (s4f)
+    assert resp.status_code in (401, 403, 409, 423), resp.status_code
+    assert resp.json()["receipt_id"] or resp.json()["reason"]
