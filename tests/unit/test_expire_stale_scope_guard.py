@@ -25,7 +25,25 @@ def client(tmp_path):
     # ⛔`q()` 는 `state["queue"]` 를 읽는다 — lifespan 이 돌아야 채워진다.
     #   `TestClient(app)` 를 그냥 쓰면 startup 이 안 돌아 KeyError('queue') 가 난다.
     with TestClient(app) as c:
+        c.db_path = str(tmp_path / "t.db")
         yield c
+
+
+def _seed_in_progress(client, task_id: str, task_type: str, idle_s: float) -> None:
+    """Put a task in ``in_progress`` with ``last_activity_at`` ``idle_s`` ago."""
+    import sqlite3
+    import time
+    r = client.post("/tasks", json={"task_id": task_id, "task_type": task_type,
+                                    "description": "seed", "branch": "", "priority": 3,
+                                    "project": "t", "context": {}})
+    assert r.status_code in (200, 201), r.text
+    con = sqlite3.connect(client.db_path)
+    n = con.execute(
+        "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
+        (time.time() - idle_s, task_id),
+    ).rowcount
+    con.commit(); con.close()
+    assert n == 1, f"seed {task_id}: rows updated={n}"
 
 
 def test_default_is_a_preview_and_cancels_nothing(client):
@@ -66,3 +84,36 @@ def test_a_preview_can_never_be_mistaken_for_a_completed_sweep(client):
                        params={"older_than": 0, "dry_run": "false"}).json()
     assert set(preview) & {"cancelled"} == set()
     assert "cancelled" in real
+
+
+def test_preview_applies_older_than_so_a_fresh_task_is_not_listed(client):
+    """⛔codex 리뷰(2026-09-23): 폴백이 ``older_than`` 을 무시하고 모든 in_progress 를
+    후보로 삼았다 — 미리보기가 라이브 레인을 '취소 예정' 으로 보고한다."""
+    _seed_in_progress(client, "stale-one", "implement", idle_s=7200)
+    _seed_in_progress(client, "fresh-one", "review", idle_s=0)
+    body = client.post("/tasks/expire-stale", params={"older_than": 3600}).json()
+    assert body["would_cancel"] == ["stale-one"], body
+    # 둘 다 in_progress 로 남아 있다 — 미리보기는 아무것도 바꾸지 않는다.
+    assert client.get("/tasks/stale-one").json()["status"] == "in_progress"
+    assert client.get("/tasks/fresh-one").json()["status"] == "in_progress"
+
+
+def test_scoped_real_cancel_cancels_exactly_that_task(client):
+    """⛔codex 리뷰(2026-09-23): scoped 실행이 존재하지 않는 ``cancel_task`` 를 불러 500 이었다."""
+    _seed_in_progress(client, "stale-one", "implement", idle_s=7200)
+    _seed_in_progress(client, "fresh-one", "review", idle_s=0)
+    r = client.post("/tasks/expire-stale",
+                    params={"older_than": 3600, "task_id": "stale-one", "dry_run": "false"})
+    assert r.status_code == 200, r.text
+    assert r.json()["cancelled"] == ["stale-one"]
+    assert client.get("/tasks/stale-one").json()["status"] == "cancelled"
+    assert client.get("/tasks/fresh-one").json()["status"] == "in_progress"
+
+
+def test_scoped_call_on_a_fresh_task_refuses(client):
+    """범위를 지정해도 ``older_than`` 을 못 넘긴 task 는 취소하지 않는다."""
+    _seed_in_progress(client, "fresh-one", "review", idle_s=0)
+    body = client.post("/tasks/expire-stale",
+                       params={"older_than": 3600, "task_id": "fresh-one", "dry_run": "false"}).json()
+    assert body["cancelled"] == [] and "reason" in body
+    assert client.get("/tasks/fresh-one").json()["status"] == "in_progress"
