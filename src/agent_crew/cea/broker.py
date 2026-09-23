@@ -2,9 +2,49 @@
 
 A long-running process meant to run as the ``crew-authz`` uid (998, nologin, no
 home) behind ``tools/cea/broker-launch.sh``. It is the **only** code path that
-may write ``executor_binding_status = VERIFIED``. It never writes
-``caller_identity_status = VERIFIED``: caller-role identity stays UNVERIFIED
-(ADR r3 — broker-spawned adapters are TO BUILD / DEFER).
+may write ``executor_binding_status = VERIFIED``, and — see O21c below — it does
+not currently write it at all. It never writes ``caller_identity_status =
+VERIFIED``: caller-role identity stays UNVERIFIED (ADR r3 — broker-spawned
+adapters are TO BUILD / DEFER).
+
+⛔**Registration is peer-asserted, and peer assertion cannot be authenticated
+  under one uid.** codex (``review-sev0-cea-lineage-s3-x``, P1) reproduced it
+  exactly: an arbitrary uid-1000 process forks a child, calls
+  ``register(pid=<its own child>, start_time=…, receipt_id='victim-receipt',
+  attempt=1)``, the child attests, and the answer was
+  ``executor_binding_status=VERIFIED, reason=PEER_CRED_BOUND``. Every check
+  below held while it did: ``SO_PEERCRED`` was genuine, the registered pid
+  really was a direct child of the registrant, the start_time matched. They
+  prove *the attacker spawned its own child* — not that the authorized
+  dispatcher spawned the executor. Those are different claims and only the
+  second one is worth anything, and ``SO_PEERCRED`` cannot tell them apart while
+  dispatcher and attacker share uid 1000 (ADR P2a). The socket permissions do
+  not repair it either: the whole point of the socket is that every uid-1000
+  process may reach it.
+
+So the binding tuple ``(pid, start_time, receipt_id, attempt, registered_by)``
+is recorded and returned as **evidence only**, and ``attest`` answers
+``UNVERIFIED`` with ``downgrade_reason=DISPATCHER_REGISTRATION_UNAUTHENTICATED``.
+
+**O21c — DEFERRED.** ``VERIFIED`` is reserved for a spawn the broker itself
+performed under a privilege boundary. :class:`BrokerSpawnRequest` and
+:meth:`Broker.spawn` are the interface for it and return ``UNAVAILABLE`` today.
+Landing it requires, exactly:
+
+1. the broker runs as ``crew-authz`` (998) and the dispatcher as a *different*
+   uid — the ``--degraded`` in-uid mode can never satisfy this;
+2. the broker, not the dispatcher, calls ``fork``/``exec`` for the executor, so
+   the ``(pid, start_time)`` it registers is one it observed itself and no peer
+   asserted;
+3. the dispatcher's request to spawn is authorized by something that is not
+   "being uid 1000" — a credential the broker validates, of the shape
+   :mod:`agent_crew.cea.auth` already checks with ``hmac.compare_digest``;
+4. ``kernel.yama.ptrace_scope >= 1`` still holds, or the spawned executor can be
+   ptraced after the fact and the binding is a label again.
+
+Until all four hold, nothing in this module may return ``VERIFIED``; the static
+test ``test_no_verified_promotion_path_outside_the_broker`` pins that to the one
+deferred function.
 
 Why a different uid is the whole point: under one uid, anything the executor
 could present (a bearer token, an env value, a field it fills in, a file it can
@@ -21,15 +61,20 @@ Protocol (one JSON object per line, one request per connection)::
 
     {"op": "register", "pid": P, "start_time": S, "receipt_id": R, "attempt": A}
         dispatcher → broker, right after spawn. The registered pid must be a
-        direct child of the registering peer (the dispatcher can only vouch for
-        what it spawned), must not descend from another registered executor
-        (refuse pids inside another agent's process tree), and (R, A) is
-        single-use: a second registration is a CONFLICT that poisons the pair.
+        direct child of the registering peer, must not descend from another
+        registered executor (refuse pids inside another agent's process tree),
+        and (R, A) is single-use: a second registration is a CONFLICT that
+        poisons the pair. ⛔None of that authenticates *which* uid-1000 process
+        registered; see above. The result is evidence, never a promotion.
     {"op": "attest", "receipt_id": R, "attempt": A}
-        executor → broker. VERIFIED iff the peer is exactly the registered
-        (pid, start_time) and is not being ptraced; otherwise BLOCKED with the
-        reason. Unregistered (e.g. a pane executor nobody registered at spawn)
-        ⇒ UNVERIFIED.
+        executor → broker. BLOCKED if the peer is not exactly the registered
+        (pid, start_time), or is being ptraced, or the pair is poisoned — those
+        are refusals and stay. Otherwise UNVERIFIED: either
+        NOT_REGISTERED_AT_SPAWN, or the binding held but was peer-asserted
+        (downgrade_reason=DISPATCHER_REGISTRATION_UNAUTHENTICATED, with the
+        tuple returned under ``binding_evidence``).
+    {"op": "spawn", ...}
+        dispatcher → broker, O21c. Returns UNAVAILABLE (see above).
     {"op": "status"}
 
 The per-registration nonce lives only in this process's memory and is handed to
@@ -121,6 +166,11 @@ def peer_cred(conn: socket.socket) -> tuple[int, int, int]:
 
 # ───────────────────────── the broker ─────────────────────────────────────────
 
+PEER_ASSERTED = "PEER_ASSERTED"
+BROKER_SPAWNED = "BROKER_SPAWNED"
+DISPATCHER_REGISTRATION_UNAUTHENTICATED = "DISPATCHER_REGISTRATION_UNAUTHENTICATED"
+
+
 @dataclass(frozen=True)
 class Registration:
     pid: int
@@ -129,6 +179,30 @@ class Registration:
     attempt: int
     registered_by: int
     nonce: str          # broker memory only; never persisted, never logged
+    origin: str = PEER_ASSERTED
+    # ⛔`PEER_ASSERTED` is every registration this module can currently create.
+    #   `BROKER_SPAWNED` is O21c and is reachable only from `spawn()`, which
+    #   returns UNAVAILABLE. The field exists so the distinction is in the data
+    #   model rather than in a comment somebody has to remember.
+
+
+@dataclass(frozen=True)
+class BrokerSpawnRequest:
+    """O21c — DEFERRED. The request that would let the broker spawn the executor
+    itself, which is the only way ``(pid, start_time)`` stops being a peer's
+    claim about its own child.
+
+    ``credential`` is the dispatcher's, and would be checked the way
+    :mod:`agent_crew.cea.auth` checks one: ``hmac.compare_digest`` against a
+    table the broker reads as ``crew-authz`` and uid 1000 cannot. "Is uid 1000"
+    is exactly the authorization that failed.
+    """
+    receipt_id: str
+    attempt: int
+    argv: tuple[str, ...]
+    credential: Optional[str] = None
+    cwd: Optional[str] = None
+    env: Optional[dict] = None
 
 
 class Broker:
@@ -176,6 +250,8 @@ class Broker:
             return self._register(peer_pid, req)
         if op == "attest":
             return self._attest(peer_pid, req)
+        if op == "spawn":
+            return self.spawn(req)
         if op == "status":
             return {"ok": True, "degraded": self.degraded, "registrations": len(self._regs)}
         return {"ok": False, "error": "UNKNOWN_OP"}
@@ -202,8 +278,14 @@ class Broker:
                 del self._regs[key]
                 return {"ok": False, "error": "REGISTRATION_CONFLICT"}
             self._regs[key] = Registration(pid, start, key[0], key[1], peer_pid,
-                                           secrets.token_hex(16))
-        return {"ok": True}
+                                           secrets.token_hex(16), origin=PEER_ASSERTED)
+        # ⛔`ok` means "recorded", not "authenticated". codex P1: an attacker
+        #   forks its own child and registers it against a victim receipt_id, and
+        #   every check above passes, because every check above is about the
+        #   registrant's own process tree. What the caller gets for this is an
+        #   UNVERIFIED attestation carrying the tuple as evidence.
+        return {"ok": True, "origin": PEER_ASSERTED,
+                "registration_authentication": DISPATCHER_REGISTRATION_UNAUTHENTICATED}
 
     def _descends_from_executor(self, pid: int) -> bool:
         executors = {r.pid for r in self._regs.values()}
@@ -238,9 +320,58 @@ class Broker:
         if self.proc.tracer(peer_pid) not in (0,):
             return dict(base, executor_binding_status=BLOCKED, reason="PEER_TRACED")
         if self.degraded:
-            return dict(base, executor_binding_status=UNVERIFIED, reason="BROKER_DEGRADED_SAME_UID")
-        return dict(base, executor_binding_status=VERIFIED, reason="PEER_CRED_BOUND",
+            return dict(base, executor_binding_status=UNVERIFIED, reason="BROKER_DEGRADED_SAME_UID",
+                        downgrade_reason="BROKER_DEGRADED_SAME_UID")
+        if reg.origin == BROKER_SPAWNED:
+            return self._attest_broker_spawned(reg, base)      # O21c, unreachable today
+        # The binding held. It still says only that *some* uid-1000 process
+        # registered a child of its own against this (receipt_id, attempt), and
+        # codex's reproduction is exactly an attacker doing that with a victim's
+        # receipt_id. Evidence, not a promotion.
+        return dict(base, executor_binding_status=UNVERIFIED,
+                    reason="PEER_CRED_BOUND_EVIDENCE_ONLY",
+                    downgrade_reason=DISPATCHER_REGISTRATION_UNAUTHENTICATED,
+                    binding_evidence={"pid": reg.pid, "start_time": reg.start_time,
+                                      "registered_by": reg.registered_by,
+                                      "origin": reg.origin})
+
+    # ── O21c — DEFERRED, and the only function in this module that may say
+    #    VERIFIED. Reachable only from a Registration with origin
+    #    BROKER_SPAWNED, which only `spawn()` creates, and `spawn()` returns
+    #    UNAVAILABLE. Pinned by
+    #    tests/unit/test_sev0_cea_s3.py::test_no_verified_promotion_path_outside_the_broker.
+
+    def _attest_broker_spawned(self, reg: "Registration", base: dict) -> dict:
+        """The executor is the process *this* broker forked, under a uid the
+        dispatcher does not have. Then ``(pid, start_time)`` is the broker's own
+        observation and SO_PEERCRED closes the loop."""
+        return dict(base, executor_binding_status=VERIFIED, reason="BROKER_SPAWNED_BINDING",
                     nonce=reg.nonce, pid=reg.pid, start_time=reg.start_time)
+
+    def spawn(self, req) -> dict:
+        """O21c — DEFERRED. See the module docstring for the four requirements.
+
+        It returns UNAVAILABLE rather than raising, and rather than not existing:
+        a caller that wants a real binding needs to be able to ask for one and be
+        told, in the receipt, that it could not have it. A missing method would
+        instead be an AttributeError somewhere, or a silent fallback to the
+        peer-asserted path — which is the bug.
+        """
+        if not isinstance(req, BrokerSpawnRequest):
+            try:
+                req = BrokerSpawnRequest(receipt_id=str(req["receipt_id"]),
+                                         attempt=int(req["attempt"]),
+                                         argv=tuple(req.get("argv") or ()),
+                                         credential=req.get("credential"))
+            except (KeyError, TypeError, ValueError):
+                return {"ok": False, "error": "BAD_REQUEST"}
+        return {"ok": False, "error": "BROKER_SPAWN_UNAVAILABLE", "status": "UNAVAILABLE",
+                "deferred": "O21c", "receipt_id": req.receipt_id, "attempt": req.attempt,
+                "requires": ["broker_runs_as_crew_authz_uid",
+                             "dispatcher_runs_as_a_different_uid",
+                             "broker_performs_the_fork_exec",
+                             "dispatcher_spawn_credential_checked_by_hmac",
+                             "kernel.yama.ptrace_scope>=1"]}
 
     # -- I/O -------------------------------------------------------------
 
@@ -248,21 +379,50 @@ class Broker:
     def sock_path(self) -> str:
         return os.path.join(self.sock_dir, SOCKET_NAME)
 
+    def _is_client_group(self, gid: int) -> bool:
+        """Is ``gid`` a group one of the configured client uids is actually in?"""
+        for uid in self.client_uids:
+            try:
+                ent = pwd.getpwuid(uid)
+            except KeyError:
+                continue
+            if gid == ent.pw_gid:
+                return True
+            try:
+                if gid in os.getgrouplist(ent.pw_name, ent.pw_gid):
+                    return True
+            except OSError:
+                continue
+        return False
+
     def bind(self) -> None:
         st = os.lstat(self.sock_dir)
         if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
             raise BrokerRefused(f"{self.sock_dir} is not a directory owned by euid {os.geteuid()}")
-        if stat.S_IMODE(st.st_mode) & 0o022:
-            raise BrokerRefused(f"{self.sock_dir} is group/world-writable")
+        mode = stat.S_IMODE(st.st_mode)
+        # ⛔0710 with the client group, and nothing else. The 0711 variant let
+        #   *every* uid on the host traverse to the socket inode, which is why
+        #   the socket itself then had to be 0666 — and a 0666 socket is not a
+        #   boundary, it is a formality. codex P1 named the fallback; it does not
+        #   fix the peer-assertion hole either way, so it buys nothing to keep.
+        if mode != 0o710:
+            raise BrokerRefused(
+                f"{self.sock_dir} is mode {mode:04o}; the only accepted mode is 0710 owned by "
+                f"{SERVICE_USER} with the client uid's group. 0711 + a 0666 socket admitted every "
+                f"uid on the host and was removed")
+        if not self._is_client_group(st.st_gid):
+            raise BrokerRefused(
+                f"{self.sock_dir} has gid {st.st_gid}, which is not a group of any client uid "
+                f"{self.client_uids}; 0710 to a group the clients are not in serves nobody")
         try:
             os.unlink(self.sock_path)
         except FileNotFoundError:
             pass
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.bind(self.sock_path)
-        # Connect needs write on the socket inode; the directory mode (0710 with
-        # the client group, or 0711) and SO_PEERCRED uid checks bound who that is.
-        os.chmod(self.sock_path, 0o666 if stat.S_IMODE(st.st_mode) & 0o001 else 0o660)
+        # Connect needs write on the socket inode. Group only: the directory is
+        # 0710 to the client group, so group is exactly the set that can traverse.
+        os.chmod(self.sock_path, 0o660)
         s.listen(64)
         self._sock = s
 
@@ -354,12 +514,30 @@ class BrokerClient:
             return dict(down, reason=f"BROKER_UNREACHABLE: {type(exc).__name__}")
         status = resp.get("executor_binding_status")
         if status == VERIFIED and (self.expected_uid is None or uid != self.expected_uid):
-            return dict(down, reason="BROKER_PEER_NOT_SERVICE_UID")
+            return dict(down, reason="BROKER_PEER_NOT_SERVICE_UID",
+                        downgrade_reason="BROKER_PEER_NOT_SERVICE_UID")
         if status not in (VERIFIED, BLOCKED):
             status = UNVERIFIED
         # caller-role identity is never VERIFIED (ADR r3), whatever was answered.
+        # `binding_evidence` is passed through so a receipt can record the tuple
+        # the broker observed without anyone mistaking it for a promotion — the
+        # status next to it is UNVERIFIED and says why.
         return {"executor_binding_status": status, "caller_identity_status": UNVERIFIED,
-                "reason": resp.get("reason"), "nonce": resp.get("nonce") if status == VERIFIED else None}
+                "reason": resp.get("reason"),
+                "downgrade_reason": resp.get("downgrade_reason"),
+                "binding_evidence": resp.get("binding_evidence"),
+                "nonce": resp.get("nonce") if status == VERIFIED else None}
+
+    def spawn(self, req: "BrokerSpawnRequest") -> dict:
+        """O21c — DEFERRED; the broker answers UNAVAILABLE. Present so callers
+        can ask and be refused instead of silently using the peer-asserted path."""
+        try:
+            resp, _ = self._call({"op": "spawn", "receipt_id": req.receipt_id,
+                                  "attempt": req.attempt, "argv": list(req.argv),
+                                  "credential": req.credential})
+            return resp
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "error": f"BROKER_UNREACHABLE: {exc}", "status": "UNAVAILABLE"}
 
 
 def start_time_of(pid: int, proc: Optional[ProcReader] = None) -> Optional[int]:

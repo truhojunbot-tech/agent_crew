@@ -36,3 +36,54 @@
 3. alfred `admission_inputs.py` drops `reuse_target` from incident-memory matches; the reuse target is recovered only when `match.basis` contains `capability_id`/`reuse_target`. A scope-anchor-only duplicate still gates (PENDING) but records no `matched_capability`.
 4. alfred has no `governance/control_policy_snapshot.json` yet and no producer key, so with these providers every admission BLOCKs on `policy_snapshot` (fail closed, as P7 requires).
 5. No #308 cooldown store exists in agent_crew source; the budget provider reads `AGENT_CREW_CEA_COOLDOWN_FILE` (`{provider: until_epoch}`), absent ⇒ no cooldown recorded.
+
+## s4a — codex `review-sev0-cea-lineage-s3-x` P1: the broker never says VERIFIED
+
+**Finding (verbatim).** Registration is authenticated only as "any allowed UID
+1000 peer". An arbitrary same-uid process forks child PID 201, calls
+`register(pid=201, start_time=11, receipt_id='victim-receipt', attempt=1)`, that
+child attests, and it received `executor_binding_status=VERIFIED`,
+`reason=PEER_CRED_BOUND`. Direct-child and `SO_PEERCRED` prove only that the
+attacker spawned its own child.
+
+**Why it cannot be fixed as a check.** Dispatcher and attacker share uid 1000
+(ADR P2a). Every input `SO_PEERCRED` gives is about the registrant's own process
+tree, and the attacker owns a process tree too. There is no question the broker
+can ask that the attacker answers differently. The socket permissions were never
+relevant — the socket exists to be reachable by uid-1000 clients.
+
+**Resolution (ADR P2a shared-uid truth; owner O21 B scope).**
+
+| | before | after |
+|---|---|---|
+| `register` on a peer-asserted pid | `{ok: true}` | `{ok: true, registration_authentication: DISPATCHER_REGISTRATION_UNAUTHENTICATED}` — recorded, not authenticated |
+| `attest`, binding matches | `VERIFIED` / `PEER_CRED_BOUND` + nonce | `UNVERIFIED` / `PEER_CRED_BOUND_EVIDENCE_ONLY`, `downgrade_reason=DISPATCHER_REGISTRATION_UNAUTHENTICATED`, tuple under `binding_evidence`, no nonce |
+| `attest`, pid/start_time mismatch, ptraced, poisoned | `BLOCKED` | unchanged — those are refusals and still discriminate |
+| socket dir | 0710 *or* 0711, socket 0666 in the 0711 case | 0710 + a group a client uid is in, or `bind()` refuses; socket always 0660 |
+
+The attack is not prevented — it cannot be, under one uid. Its *reward* is
+removed, and the regression
+`test_self_registration_by_a_same_uid_attacker_is_never_verified` asserts
+exactly that shape: the fork succeeds, the registration returns `ok: true`, and
+the attestation is `UNVERIFIED` with the tuple labelled `PEER_ASSERTED`.
+
+**O21c — DEFERRED.** `VERIFIED` is reserved for a spawn the broker performed
+itself. `BrokerSpawnRequest` / `Broker.spawn()` are the interface and return
+`{status: "UNAVAILABLE", deferred: "O21c"}`; `Broker._attest_broker_spawned` is
+the one function in `agent_crew/` permitted to produce
+`executor_binding_status=VERIFIED`, and it is unreachable because only a
+`BROKER_SPAWNED` registration reaches it and nothing creates one. Requirements
+to land it, exactly:
+
+1. broker runs as `crew-authz` (998), dispatcher runs as a **different** uid
+   (`--degraded` can never satisfy this);
+2. the broker, not the dispatcher, performs the `fork`/`exec`, so
+   `(pid, start_time)` is its own observation;
+3. the dispatcher's spawn request is authorized by a credential the broker
+   validates with `hmac.compare_digest` against a table uid 1000 cannot read —
+   "is uid 1000" is the authorization that failed;
+4. `kernel.yama.ptrace_scope >= 1` still holds.
+
+`test_no_verified_promotion_path_outside_the_broker` now resolves the *enclosing
+function*, not just the file. File granularity was what let the peer-asserted
+path say `VERIFIED` unnoticed inside a file that was allowed to say it.

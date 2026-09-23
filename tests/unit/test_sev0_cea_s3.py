@@ -9,6 +9,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -21,7 +22,9 @@ import pytest
 from agent_crew.cea import store as receipt_store
 from agent_crew.cea.auth import AdapterIdentity, StaticTokenAuthenticator
 from agent_crew.cea.broker import (
-    BLOCKED, Broker, BrokerClient, BrokerRefused, ProcReader, UNVERIFIED, VERIFIED, start_time_of)
+    BLOCKED, BROKER_SPAWNED, Broker, BrokerClient, BrokerRefused, BrokerSpawnRequest,
+    DISPATCHER_REGISTRATION_UNAUTHENTICATED, PEER_ASSERTED, ProcReader, UNVERIFIED, VERIFIED,
+    start_time_of)
 from agent_crew.cea.engine import AuthorizationEngine, EngineConfig
 from agent_crew.cea.input_providers import (
     AdmissionInputsClient, CanonicalPolicySnapshotReader, E4CapabilityProvider, InputUnavailable,
@@ -362,14 +365,14 @@ import json, sys
 sys.path.insert(0, {src!r})
 from agent_crew.cea.broker import BrokerClient
 sys.stdin.readline()
-print(json.dumps(BrokerClient({sock!r}, expected_uid={uid}).attest("rcpt-1", 1)), flush=True)
+print(json.dumps(BrokerClient({sock!r}, expected_uid={uid}).attest({rcpt!r}, 1)), flush=True)
 """
 
 
 @pytest.fixture()
 def live_broker(tmp_path):
     d = tmp_path / "sock"
-    d.mkdir(mode=0o700)
+    d.mkdir(mode=0o710)   # bind() accepts 0710 to the client group and nothing else
     b = Broker(str(d), service_uid_override=os.geteuid(), ptrace_scope_path=scope_file(tmp_path),
                client_uids=(os.geteuid(),))
     b.preflight()
@@ -380,8 +383,8 @@ def live_broker(tmp_path):
     b.close()
 
 
-def _spawn_attester(sock):
-    code = _ATTEST.format(src=str(SRC), sock=sock, uid=os.geteuid())
+def _spawn_attester(sock, rcpt="rcpt-1"):
+    code = _ATTEST.format(src=str(SRC), sock=sock, uid=os.geteuid(), rcpt=rcpt)
     return subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             text=True)
 
@@ -392,15 +395,19 @@ def _attest_via(p):
 
 
 def test_broker_peer_cred_binding_real_socket(live_broker):
-    """Registered executor VERIFIED; a same-uid process of a different pid naming the
-    same (receipt_id, attempt) is BLOCKED by SO_PEERCRED, not by anything it sent."""
+    """The binding still discriminates — a same-uid process of a different pid
+    naming the same (receipt_id, attempt) is BLOCKED by SO_PEERCRED, not by
+    anything it sent — but the process that *does* match is still only
+    UNVERIFIED, because matching proves the registrant's own child, not the
+    dispatcher's (codex review-sev0-cea-lineage-s3-x P1)."""
     sock = live_broker.sock_path
     executor = _spawn_attester(sock)
     impostor = _spawn_attester(sock)
     try:
         st = start_time_of(executor.pid)
         reg = BrokerClient(sock, expected_uid=os.geteuid()).register(executor.pid, st, "rcpt-1", 1)
-        assert reg == {"ok": True}
+        assert reg["ok"] is True
+        assert reg["registration_authentication"] == DISPATCHER_REGISTRATION_UNAUTHENTICATED
         bad = _attest_via(impostor)
         good = _attest_via(executor)
     finally:
@@ -408,8 +415,102 @@ def test_broker_peer_cred_binding_real_socket(live_broker):
             if p.poll() is None:
                 p.kill()
     assert bad["executor_binding_status"] == BLOCKED and bad["reason"] == "PEER_CRED_MISMATCH"
-    assert good["executor_binding_status"] == VERIFIED and good["nonce"]
+    assert good["executor_binding_status"] == UNVERIFIED
+    assert good["downgrade_reason"] == DISPATCHER_REGISTRATION_UNAUTHENTICATED
+    assert good["binding_evidence"]["pid"] == executor.pid and good["nonce"] is None
     assert good["caller_identity_status"] == UNVERIFIED and bad["caller_identity_status"] == UNVERIFIED
+
+
+# ── the exact self-registration attack from codex P1 ────────────────────────
+
+def test_self_registration_by_a_same_uid_attacker_is_never_verified(live_broker):
+    """codex review-sev0-cea-lineage-s3-x P1, verbatim reproduction.
+
+    "An arbitrary same-UID process can fork child PID 201 and call
+    register(pid=201, start_time=11, receipt_id='victim-receipt', attempt=1),
+    then that child attests and receives executor_binding_status=VERIFIED."
+
+    Nothing here is stopped: the fork succeeds, the registration succeeds
+    (``ok: true``), the child is genuinely the attacker's direct child with a
+    genuine start_time, SO_PEERCRED is genuine, and the attest matches. Every
+    one of those checks passes and always will, because they are all questions
+    about the *attacker's own* process tree. What must never happen is the
+    answer VERIFIED, and that is what is asserted.
+    """
+    sock = live_broker.sock_path
+    attacker_child = _spawn_attester(sock, "victim-receipt")   # "child PID 201"
+    try:
+        st = start_time_of(attacker_child.pid)      # "start_time=11"
+        reg = BrokerClient(sock, expected_uid=os.geteuid()).register(
+            attacker_child.pid, st, "victim-receipt", 1)
+        assert reg["ok"] is True, "the attack is not prevented; only its reward is removed"
+        out = _attest_via(attacker_child)
+    finally:
+        if attacker_child.poll() is None:
+            attacker_child.kill()
+
+    assert out["executor_binding_status"] != VERIFIED
+    assert out["executor_binding_status"] == UNVERIFIED
+    assert out["downgrade_reason"] == DISPATCHER_REGISTRATION_UNAUTHENTICATED
+    assert out["caller_identity_status"] == UNVERIFIED
+    assert out["nonce"] is None
+    # the tuple survives as evidence — the point is that it is labelled as such.
+    assert out["binding_evidence"]["origin"] == PEER_ASSERTED
+
+
+def test_no_registration_this_module_can_create_is_broker_spawned():
+    """The only origin that could reach VERIFIED is one no code path produces."""
+    b = Broker("/x", proc=FakeProc({200: (100, 5)}))
+    b.handle(100, 1000, {"op": "register", "pid": 200, "start_time": 5,
+                         "receipt_id": "r", "attempt": 1})
+    assert [r.origin for r in b._regs.values()] == [PEER_ASSERTED]
+    assert BROKER_SPAWNED not in {r.origin for r in b._regs.values()}
+
+
+def test_broker_spawn_is_the_deferred_interface_and_answers_unavailable():
+    """O21c: the interface exists so a caller can ask and be refused, instead of
+    silently falling back to the peer-asserted path."""
+    b = Broker("/x", proc=FakeProc({}))
+    out = b.spawn(BrokerSpawnRequest(receipt_id="r", attempt=1, argv=("/bin/true",)))
+    assert out["ok"] is False and out["status"] == "UNAVAILABLE" and out["deferred"] == "O21c"
+    assert "broker_performs_the_fork_exec" in out["requires"]
+    assert "dispatcher_runs_as_a_different_uid" in out["requires"]
+    # and over the wire, same answer, still no registration created.
+    wire = b.handle(100, 1000, {"op": "spawn", "receipt_id": "r", "attempt": 1, "argv": []})
+    assert wire["status"] == "UNAVAILABLE" and b._regs == {}
+
+
+def test_socket_dir_0711_is_refused_and_the_socket_is_never_0666(tmp_path):
+    """The 0666 fallback is gone: 0711 dirs no longer bind at all."""
+    wide = tmp_path / "wide"
+    wide.mkdir(mode=0o711)
+    b = Broker(str(wide), service_uid_override=os.geteuid(), client_uids=(os.geteuid(),))
+    with pytest.raises(BrokerRefused) as exc:
+        b.bind()
+    assert "0710" in str(exc.value)
+
+    tight = tmp_path / "tight"
+    tight.mkdir(mode=0o710)
+    ok = Broker(str(tight), service_uid_override=os.geteuid(), client_uids=(os.geteuid(),))
+    ok.bind()
+    try:
+        assert stat.S_IMODE(os.stat(ok.sock_path).st_mode) == 0o660
+    finally:
+        ok.close()
+
+
+def test_socket_dir_group_must_be_a_group_the_clients_are_in(tmp_path):
+    """0710 to a group no client is in is not a boundary, it is an outage
+    dressed as one — and it would be a silent one."""
+    d = tmp_path / "d"
+    d.mkdir(mode=0o710)
+    # uid 0's primary group is root(0); the test uid is not in it.
+    b = Broker(str(d), service_uid_override=os.geteuid(), client_uids=(0,))
+    if os.stat(d).st_gid == 0 or os.geteuid() == 0:
+        pytest.skip("test uid's group is root; the negative case is not expressible here")
+    with pytest.raises(BrokerRefused) as exc:
+        b.bind()
+    assert "not a group of any client uid" in str(exc.value)
 
 
 def test_client_downgrades_verified_from_a_non_service_peer(live_broker):
@@ -440,11 +541,36 @@ def _mentions_verified(node) -> bool:
     return False
 
 
+# The one function allowed to produce executor_binding_status=VERIFIED. It is
+# O21c and unreachable today (only a BROKER_SPAWNED registration reaches it, and
+# `spawn()` returns UNAVAILABLE) — but when O21c lands, this is where it lands,
+# and anything else that starts saying VERIFIED fails this test instead of
+# shipping. codex P1 asked for broker.py to be covered here too; file-level
+# granularity was what let the peer-asserted path say VERIFIED unnoticed.
+DEFERRED_VERIFIED_PATH = ("agent_crew/cea/broker.py", "_attest_broker_spawned")
+
+
+def _enclosing_functions(tree):
+    """{lineno: qualified function name} for every line inside a function body."""
+    spans = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            end = getattr(node, "end_lineno", node.lineno)
+            for line in range(node.lineno, end + 1):
+                # innermost wins: nested defs are walked after their parent only
+                # by accident, so prefer the tightest span seen.
+                prev = spans.get(line)
+                if prev is None or (end - node.lineno) < prev[1]:
+                    spans[line] = (node.name, end - node.lineno)
+    return {line: name for line, (name, _) in spans.items()}
+
+
 def test_no_verified_promotion_path_outside_the_broker():
     offenders = []
     for path in (SRC / "agent_crew").rglob("*.py"):
         rel = path.relative_to(SRC).as_posix()
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        fns = _enclosing_functions(tree)
         for node in ast.walk(tree):
             pairs = []
             if isinstance(node, ast.Dict):
@@ -461,10 +587,41 @@ def test_no_verified_promotion_path_outside_the_broker():
                     if isinstance(t, ast.Attribute) and t.attr in STATUS_FIELDS and node.value is not None:
                         pairs.append((t.attr, node.value))
             for field, value in pairs:
-                if _mentions_verified(value) and not (rel == "agent_crew/cea/broker.py"
-                                                      and field == "executor_binding_status"):
-                    offenders.append(f"{rel}:{node.lineno if hasattr(node, 'lineno') else value.lineno} {field}")
+                if not _mentions_verified(value):
+                    continue
+                line = node.lineno if hasattr(node, "lineno") else value.lineno
+                allowed = (rel, fns.get(line)) == DEFERRED_VERIFIED_PATH \
+                    and field == "executor_binding_status"
+                if not allowed:
+                    offenders.append(f"{rel}:{line} {field} in {fns.get(line)!r}")
     assert offenders == [], offenders
+
+
+def test_the_reachable_broker_attest_path_does_not_mention_verified():
+    """Complement to the static sweep: the *live* decision function. If
+    `_attest` ever grows a VERIFIED branch again, this fails whether or not it
+    is spelled as a status-field assignment."""
+    import inspect
+    import textwrap
+
+    from agent_crew.cea import broker as broker_mod
+
+    src = textwrap.dedent(inspect.getsource(broker_mod.Broker._attest))
+    tree = ast.parse(src)
+    calls = [n.func.attr for n in ast.walk(tree)
+             if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)]
+    assert "_attest_broker_spawned" in calls, "the deferred path must still be dispatched to"
+    stripped = ast.parse(src)
+    for node in ast.walk(stripped):
+        if isinstance(node, ast.Return) and node.value is not None:
+            src = ast.dump(node.value)
+            assert "'VERIFIED'" not in src and "VERIFIED" not in _names(node.value), \
+                ast.dump(node)
+
+
+def _names(node) -> set:
+    return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)} | \
+           {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
 
 
 def test_broker_never_writes_caller_identity_verified():

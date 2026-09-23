@@ -48,9 +48,13 @@ dir_report() {
   if [[ -d "$SOCK_DIR" ]]; then stat -c '%a %U:%G' "$SOCK_DIR"; else echo "absent"; fi
 }
 
-# 0710 + client group when crew-authz is in that group; else 0711 and the broker
-# enforces the client uid with SO_PEERCRED. A pre-existing dir must be ours and
-# not a symlink: /tmp is shared and a squatted dir would be someone else's socket.
+# 0710 + the client group, and nothing else. The old fallback (0711 when
+# crew-authz is not in the client group, plus a 0666 socket) let every uid on the
+# host traverse to the socket inode; codex review-sev0-cea-lineage-s3-x named it,
+# and `Broker.bind()` now refuses any mode but 0710. If crew-authz is not in
+# CLIENT_GROUP the fix is `usermod -aG`, not a wider mode. A pre-existing dir must
+# be ours and not a symlink: /tmp is shared and a squatted dir would be someone
+# else's socket.
 prepare_dir() {
   if [[ -L "$SOCK_DIR" ]]; then echo "broker-launch: $SOCK_DIR is a symlink; refusing" >&2; exit 4; fi
   if [[ -e "$SOCK_DIR" ]]; then
@@ -61,11 +65,13 @@ prepare_dir() {
   else
     (umask 077; mkdir -p "$SOCK_DIR")
   fi
-  if id -nG | tr ' ' '\n' | grep -qx "$CLIENT_GROUP"; then
-    chgrp "$CLIENT_GROUP" "$SOCK_DIR"; chmod 0710 "$SOCK_DIR"
-  else
-    chmod 0711 "$SOCK_DIR"
+  if ! id -nG | tr ' ' '\n' | grep -qx "$CLIENT_GROUP"; then
+    echo "broker-launch: $(id -un) is not in $CLIENT_GROUP, so $SOCK_DIR cannot be 0710 to the" >&2
+    echo "  clients. Refusing: the old 0711 + 0666-socket fallback admitted every uid on the host." >&2
+    echo "  Fix: usermod -aG $CLIENT_GROUP $SERVICE_USER" >&2
+    exit 4
   fi
+  chgrp "$CLIENT_GROUP" "$SOCK_DIR"; chmod 0710 "$SOCK_DIR"
 }
 
 if [[ "$MODE" == "check" ]]; then
