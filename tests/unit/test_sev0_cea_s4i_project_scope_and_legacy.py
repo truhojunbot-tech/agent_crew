@@ -49,6 +49,18 @@ def _queue(tmp_path, name="s4i.db") -> TaskQueue:
     return TaskQueue(str(tmp_path / name), cea_providers=dict(WIRED))
 
 
+def _receipt(q: TaskQueue, receipt_id) -> dict | None:
+    from agent_crew.cea import store as receipt_store
+    if not receipt_id:
+        return None
+    conn = sqlite3.connect(q._db_path)
+    conn.row_factory = sqlite3.Row
+    try:
+        return receipt_store.current_receipt(conn, receipt_id)
+    finally:
+        conn.close()
+
+
 def _events(q: TaskQueue, task_id: str, event: str) -> list:
     conn = sqlite3.connect(q._db_path)
     conn.row_factory = sqlite3.Row
@@ -135,30 +147,57 @@ def test_a_project_pinned_to_enforce_is_enforced_inside_a_shadow_process(
         tmp_path, monkeypatch):
     """The other direction, which is the one a rollout actually uses: the fleet
     is still in ``shadow`` and one project has moved. Its tasks must be enforced
-    even though the process-wide switch has not moved."""
+    even though the process-wide switch has not moved.
+
+    ⛔s4j moved **where** that bites, and the move is the point. Through s4i the
+      enforced project was still *admitted* by an engine built from the
+      process-wide mode (``cea_engine()`` ignored the project), so enforcement
+      only appeared at the post-admission gates — the receipt was produced in
+      shadow and then gated as enforce. That is the half-enforced state
+      ``cea_config_for_receipt`` exists to prevent, one call site earlier.
+      ``cea_engine(project)`` closes it, and P7 then answers first: in
+      ``enforce`` the engine refuses **embedded** authorization outright
+      (``CREDENTIAL_BOUNDARY_UNAVAILABLE``), because the credential boundary is
+      the ``crew-authz`` socket and not this interpreter. So a project pinned to
+      enforce inside a process with no broker deployed is refused at ENQUEUE.
+
+      Fail-closed and earlier is the right direction for a rollout: the
+      alternative is what s4i actually had — an enforce-pinned project admitting
+      everything in shadow and only refusing once an agent had already run.
+    """
     monkeypatch.setenv(PROCESS, SHADOW)
     monkeypatch.setenv(f"AGENT_CREW_CEA_MODE__{HOT.upper()}", ENFORCE)
     q = _queue(tmp_path)
-    q.enqueue(task("t1", task_type="review", project=HOT, context=admitted()))
-    assert q.dequeue(agent="codex", role="reviewer") is not None
-    q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
-    with pytest.raises(AdmissionRefused):
-        q.submit_result("t1", TaskResult(task_id="t1", status="completed", summary="done"))
+    with pytest.raises(AdmissionRefused) as exc:
+        q.enqueue(task("t1", task_type="review", project=HOT, context=admitted()))
+    assert exc.value.point == "enqueue", exc.value.point
+    # ...and nothing was written: P2's audit row exists, the task row does not.
+    assert not [t for t in q.list_tasks() if t.task_id == "t1"]
+    receipt = _receipt(q, exc.value.receipt_id)
+    assert receipt is not None and receipt["decision"] == "BLOCK"
+    assert receipt["reason"]["code"] == "CREDENTIAL_BOUNDARY_UNAVAILABLE"
+    assert receipt["project"] == HOT
 
 
 def test_two_projects_in_one_process_are_decided_separately(tmp_path, monkeypatch):
     """One queue, one process, two rollout modes — the thing a single
-    process-wide switch cannot express."""
+    process-wide switch cannot express.
+
+    s4j: the separation is now visible at admission (see the test above), which
+    is the earliest point at which the project is known. The cold project runs
+    its whole lineage; the hot one never gets a task row.
+    """
     monkeypatch.setenv(PROCESS, SHADOW)
     monkeypatch.setenv(f"AGENT_CREW_CEA_MODE__{HOT.upper()}", ENFORCE)
     q = _queue(tmp_path)
-    for tid, project in (("hot-1", HOT), ("cold-1", COLD)):
-        q.enqueue(task(tid, task_type="review", project=project, context=admitted()))
-        assert q.dequeue(agent="codex", role="reviewer") is not None
-        q.record_dispatch(tid, channel="tmux_pane", agent="codex", target="%1")
-    q.submit_result("cold-1", TaskResult(task_id="cold-1", status="completed", summary="ok"))
     with pytest.raises(AdmissionRefused):
-        q.submit_result("hot-1", TaskResult(task_id="hot-1", status="completed", summary="ok"))
+        q.enqueue(task("hot-1", task_type="review", project=HOT, context=admitted()))
+    q.enqueue(task("cold-1", task_type="review", project=COLD, context=admitted()))
+    assert q.dequeue(agent="codex", role="reviewer") is not None
+    q.record_dispatch("cold-1", channel="tmux_pane", agent="codex", target="%1")
+    q.submit_result("cold-1", TaskResult(task_id="cold-1", status="completed", summary="ok"))
+    rows = {t.task_id for t in q.list_tasks()}
+    assert "hot-1" not in rows and "cold-1" in rows, rows
 
 
 # ═══════════════════════════════════════════════════════════════════════════
