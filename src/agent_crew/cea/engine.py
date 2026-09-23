@@ -642,7 +642,7 @@ class AuthorizationEngine:
         return updated, nonce
 
     def transition(self, conn: sqlite3.Connection, receipt_id: str, state: str, *,
-                   note: Optional[str] = None) -> dict:
+                   note: Optional[str] = None, mutate: Optional[dict] = None) -> dict:
         """Append a lifecycle row and keep the P4 lineage claim in step with it.
 
         ⛔Goes through :func:`receipt_store.append_lifecycle`, which is where the
@@ -655,10 +655,17 @@ class AuthorizationEngine:
 
         The lineage claim is updated **after** the append, so a refused transition
         leaves the lineage describing the state the receipt is really in.
+
+        ``mutate`` carries the fields the transition itself legitimately changes
+        and is re-signed with the rest of the body — §8's re-admission bumps
+        ``attempt`` in the same row that records ``RE-QUEUED``, because an
+        attempt count written by a second, unsigned write would be a number the
+        signature does not cover.
         """
         try:
             updated = receipt_store.append_lifecycle(
-                conn, receipt_id, state, recorded_by="engine", note=note, sign=self._resign)
+                conn, receipt_id, state, recorded_by="engine", note=note, mutate=mutate,
+                sign=self._resign)
         except receipt_store.ReceiptStoreError as exc:
             raise EngineError(str(exc)) from exc
         receipt_store.set_lineage_state(conn, updated["intent_hash"], receipt_id, updated["state"])

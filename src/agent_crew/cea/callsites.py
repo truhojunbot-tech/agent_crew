@@ -42,7 +42,7 @@ from typing import Optional
 from agent_crew.cea.engine import ENFORCE, TEST, EngineConfig
 from agent_crew.cea.validator import (
     ContractReceiptValidator, CurrentInputs, ReceiptValidator, ValidationOutcome,
-    ValidationPoint, ValidationResult)
+    ValidationPoint, ValidationResult, binding_drifted)
 
 VALIDATOR: ReceiptValidator = ContractReceiptValidator()
 """T3 — the single receipt-validator instance in the product.
@@ -174,6 +174,118 @@ def gate_result(receipt: dict, *, nonce: Optional[str], presenter: Optional[str]
                  config)
 
 
+# ── re-admission: the paths that put a claimed row back in the queue ────────
+#
+# ADR §8 ("Recovery semantics"). These are NOT a sixth validation point: nothing
+# here moves a task into an execution state, so P2's five gates stay five. What
+# they decide is the question §8 asks instead — *may this row go round again on
+# the receipt it already has?* — and the answer has exactly three shapes:
+#
+#   PROCEED   B unchanged and ``attempt < max_attempts``: reuse the receipt,
+#             recording the re-admission as ``attempt + 1`` (§8 "Retry of the
+#             same task"). The receipt goes back to ``HELD`` — P3's "not claimed;
+#             task → HELD with reason" — which ``claim`` accepts, so the row is
+#             live again without a second writer of ``QUEUED``.
+#   RE_ADMIT  B drifted or the attempt budget is spent: the old receipt is
+#             SUPERSEDED and the work needs a new admission. Nothing here invents
+#             one — re-authorising is the engine's job, at the engine's entry.
+#   HELD      P7: B′ could not be computed. Work already authorised is held,
+#             never blocked and never silently reused against an unknown B′.
+#
+#: Every product path that returns a claimed row to ``pending``. A path not in
+#: this table has no §8 answer, so :func:`gate_requeue` refuses to answer for it
+#: rather than defaulting — an unregistered requeue is the bypass this registry
+#: exists to make visible.
+REQUEUE_CALL_SITES: dict[str, tuple[str, ...]] = {
+    # path (the one queue method that owns the mutation) → product entry points
+    "queue.requeue": ("server._requeue_orphans (startup: in_progress → pending)",
+                      "server push/spawn failure rollback",
+                      "cli.recover"),
+    "queue.defer_push_delivery": ("server tmux push refused by the pane (G_DT backoff)",),
+    "queue.reset_stale_to_pending": ("cli.recover --reset-stale (#155)",),
+}
+"""ADR §8 re-admission paths, registered so I2 can enumerate them.
+
+``retry`` is deliberately absent: ``server._auto_retry_failed_task`` creates a
+**new task** through ``enqueue`` (ingress ``retry.failed_task``), so it is an
+I1 ingress with its own receipt, not a path back to pending on an old one.
+"""
+
+
+@dataclass(frozen=True)
+class RequeueOutcome:
+    """What a §8 re-admission path learned, and whether it may act on it."""
+    path: str
+    receipt_id: str
+    outcome: ValidationOutcome
+    reason: str
+    attempt: Optional[int]
+    changed_fields: tuple[str, ...]
+    proceed: bool
+    enforced: bool
+
+    @property
+    def reuse(self) -> bool:
+        """May the row go round again on the receipt it already has?"""
+        return self.outcome is ValidationOutcome.PROCEED
+
+    def as_record(self) -> dict:
+        return {"path": self.path, "outcome": self.outcome.value, "reason": self.reason,
+                "receipt_id": self.receipt_id, "attempt": self.attempt,
+                "changed_fields": list(self.changed_fields),
+                "proceed": self.proceed, "enforced": self.enforced}
+
+
+def gate_requeue(receipt: Optional[dict], *, path: str, current: CurrentInputs,
+                 config: Optional[EngineConfig] = None) -> RequeueOutcome:
+    """§8: may ``path`` return this row to the queue on its existing receipt?
+
+    ⛔A missing receipt is not a pass. A row written before receipts existed has
+      nothing to re-admit, so under enforcement it is refused (and the caller
+      records a runtime event saying so); under ``shadow`` it is *reported* and
+      the requeue happens, which is the count that says how many legacy rows a
+      deployment still has to drain before it turns enforcement on.
+    """
+    if path not in REQUEUE_CALL_SITES:
+        raise KeyError(f"{path!r} is not a registered §8 re-admission path; "
+                       f"add it to REQUEUE_CALL_SITES before requeuing through it")
+    enforce = enforcing(config)
+
+    def answer(outcome: ValidationOutcome, reason: str, *, attempt: Optional[int] = None,
+               changed: tuple[str, ...] = ()) -> RequeueOutcome:
+        return RequeueOutcome(
+            path=path, receipt_id=(receipt or {}).get("receipt_id", "") if isinstance(receipt, dict) else "",
+            outcome=outcome, reason=reason, attempt=attempt, changed_fields=changed,
+            proceed=(outcome is ValidationOutcome.PROCEED) or not enforce, enforced=enforce)
+
+    if not isinstance(receipt, dict):
+        return answer(ValidationOutcome.BLOCK,
+                      "NO_RECEIPT: the row names no receipt, so there is nothing to re-admit (P2)")
+    state = str(receipt.get("state") or "")
+    if state in ("CONSUMED", "SUPERSEDED", "REVOKED"):
+        return answer(ValidationOutcome.RE_ADMIT,
+                      f"receipt state is {state}; terminal receipts never re-enter (P4) — "
+                      f"the work needs a new admission")
+    if current.binding is None or current.unavailable_inputs:
+        missing = ", ".join(current.unavailable_inputs) or "binding"
+        return answer(ValidationOutcome.HELD,
+                      f"B′ could not be computed ({missing}); P7 holds work already authorised "
+                      f"rather than re-admitting it against an unknown binding")
+    changed = binding_drifted(receipt.get("binding") or {}, current.binding)
+    if changed:
+        return answer(ValidationOutcome.RE_ADMIT,
+                      f"BINDING_DRIFT: {', '.join(changed)} changed since issue; the old receipt "
+                      f"is SUPERSEDED and admission runs again (§8, P3)", changed=changed)
+    attempt, max_attempts = int(receipt.get("attempt") or 1), int(receipt.get("max_attempts") or 1)
+    if attempt >= max_attempts:
+        return answer(ValidationOutcome.RE_ADMIT,
+                      f"ATTEMPTS_EXHAUSTED: attempt {attempt} of {max_attempts}; §8 reuses the "
+                      f"receipt only while attempt < max_attempts", attempt=attempt)
+    return answer(ValidationOutcome.PROCEED,
+                  f"RE-QUEUED: B unchanged and attempt {attempt + 1} of {max_attempts} remains (§8)",
+                  attempt=attempt + 1, changed=changed)
+
+
 CALL_SITES = {
     ValidationPoint.ENQUEUE: gate_enqueue,
     ValidationPoint.CLAIM: gate_claim,
@@ -184,6 +296,7 @@ CALL_SITES = {
 """Every :class:`ValidationPoint` has exactly one gate — checked by the I2 test."""
 
 
-__all__ = ["CALL_SITES", "GateOutcome", "VALIDATOR", "current_inputs", "enforcing",
-           "recording",
-           "gate_claim", "gate_dispatch", "gate_enqueue", "gate_execute_start", "gate_result"]
+__all__ = ["CALL_SITES", "GateOutcome", "REQUEUE_CALL_SITES", "RequeueOutcome", "VALIDATOR",
+           "current_inputs", "enforcing", "recording",
+           "gate_claim", "gate_dispatch", "gate_enqueue", "gate_execute_start", "gate_requeue",
+           "gate_result"]

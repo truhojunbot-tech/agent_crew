@@ -100,8 +100,9 @@ def providers(state: AuthorityState) -> dict:
             "runtime": _Runtime(state), "budgets": _Budget(state), "gates": _Gate(state)}
 
 
-def queue_for(tmp_path, state: AuthorityState, *, name: str, mode: str = "test") -> TaskQueue:
-    return TaskQueue(str(tmp_path / name), cea_config=EngineConfig(mode=mode),
+def queue_for(tmp_path, state: AuthorityState, *, name: str, mode: str = "test",
+              config: Optional[EngineConfig] = None) -> TaskQueue:
+    return TaskQueue(str(tmp_path / name), cea_config=config or EngineConfig(mode=mode),
                      cea_providers=providers(state))
 
 

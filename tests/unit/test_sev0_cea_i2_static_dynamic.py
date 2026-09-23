@@ -381,8 +381,8 @@ def test_static_requeue_callers_are_inventoried():
     assert set(calls) == {"server.py", "cli.py"}, calls
 
 
-def _claimed(tmp_path, name, mode):
-    q = queue_for(tmp_path, AuthorityState("active"), name=name, mode=mode)
+def _claimed(tmp_path, name, mode, *, config=None):
+    q = queue_for(tmp_path, AuthorityState("active"), name=name, mode=mode, config=config)
     q.enqueue(task("t1", context={"authority_decision_ids": ["T0-1234"]}), ingress="http.tasks")
     t = q.dequeue(agent="claude", role="implementer")
     assert t is not None and receipt_for_task(q, "t1")["state"] == "CLAIMED"
@@ -414,15 +414,22 @@ def _back_to_pending(q, how):
 
 REQUEUE_PATHS = ("requeue", "defer_push_delivery", "reset_stale_to_pending",
                  "_requeue_orphans", "recover")
-S4F_REQUEUE = ("s4f item 'requeue receipt lifecycle': {how} sets tasks.status='pending' but "
-               "leaves the receipt CLAIMED with no lifecycle row (history ISSUED,QUEUED,CLAIMED; "
-               "LIFECYCLE_GRAPH has no CLAIMED->QUEUED edge). Needs: receipt back to QUEUED "
-               "(or HELD/SUPERSEDED + re-admission) in the same txn as the status write")
 
 
 @pytest.mark.parametrize("how", REQUEUE_PATHS)
-def test_requeue_moves_the_receipt_back_through_the_lifecycle(tmp_path, how, request):
-    request.applymarker(pytest.mark.xfail(strict=True, reason=S4F_REQUEUE.format(how=how)))
+def test_requeue_moves_the_receipt_back_through_the_lifecycle(tmp_path, how):
+    """s4h item 1 (ADR §8): a requeue is a re-admission, so the receipt moves too.
+
+    Was ``xfail(strict=True)`` through s4g: all five paths set
+    ``tasks.status='pending'`` and left the receipt in ``CLAIMED`` with no
+    lifecycle row, so the row and the receipt store described different tasks.
+
+    Which of the three §8 answers lands here is the engine's, not this test's:
+    with ``max_attempts`` at its default of 1 the attempt budget is already
+    spent at the first claim, so every path takes the RE_ADMIT branch and the
+    receipt is SUPERSEDED. The reuse branch is
+    ``test_requeue_reuses_the_receipt_while_an_attempt_remains`` below.
+    """
     q = _claimed(tmp_path, f"{how}.db", "test")
     assert _back_to_pending(q, how) == "pending"
     conn = sqlite3.connect(q._db_path)
@@ -435,19 +442,44 @@ def test_requeue_moves_the_receipt_back_through_the_lifecycle(tmp_path, how, req
 
 
 @pytest.mark.parametrize("how", REQUEUE_PATHS)
-def test_requeued_task_is_not_reclaimed_on_the_stale_claimed_receipt_under_enforce(
-        tmp_path, how):
-    """Zero bypass holds today: under mode=test (enforcing) the claim gate refuses
-    a receipt that is still CLAIMED, so the requeued task is NOT re-dispatched on
-    it. (Liveness — it is stranded pending — is the s4f lifecycle item above.)"""
-    q = _claimed(tmp_path, f"enf-{how}.db", "test")
-    _back_to_pending(q, how)
-    assert q.dequeue(agent="claude", role="implementer") is None
+def test_requeue_reuses_the_receipt_while_an_attempt_remains(tmp_path, how):
+    """§8's reuse branch: B unchanged and ``attempt < max_attempts``.
+
+    The receipt comes back as ``HELD`` (P3: "not claimed; task → HELD with
+    reason") carrying ``attempt + 1``, and ``claim`` accepts ``HELD`` — so the
+    row is genuinely live again rather than stranded pending, which is the
+    liveness half of the s4f/s4h item.
+    """
+    q = _claimed(tmp_path, f"reuse-{how}.db", "test",
+                 config=EngineConfig(mode="test", default_max_attempts=3))
+    assert _back_to_pending(q, how) == "pending"
+    r = receipt_for_task(q, "t1")
+    assert (r["state"], r["attempt"]) == ("HELD", 2), r
+    # and it can actually be taken again, under enforcement, on that receipt
+    assert q.dequeue(agent="claude", role="implementer") is not None
+    assert receipt_for_task(q, "t1")["receipt_id"] == r["receipt_id"]
     assert receipt_for_task(q, "t1")["state"] == "CLAIMED"
 
 
 @pytest.mark.parametrize("how", REQUEUE_PATHS)
-def test_requeued_reclaim_under_shadow_is_reported(tmp_path, how, request):
+def test_requeued_task_is_not_reclaimed_on_a_superseded_receipt_under_enforce(
+        tmp_path, how):
+    """Zero bypass still holds after s4h, one step further along.
+
+    Through s4g the receipt stayed ``CLAIMED`` and the claim gate refused it for
+    being in the wrong state. Now the attempt budget (default ``max_attempts=1``)
+    is what refuses: the receipt is ``SUPERSEDED``, and P4's terminal-state rule
+    is what stops the re-claim. Either way the row is not re-dispatched on a
+    receipt that no longer authorises it.
+    """
+    q = _claimed(tmp_path, f"enf-{how}.db", "test")
+    _back_to_pending(q, how)
+    assert q.dequeue(agent="claude", role="implementer") is None
+    assert receipt_for_task(q, "t1")["state"] == "SUPERSEDED"
+
+
+@pytest.mark.parametrize("how", REQUEUE_PATHS)
+def test_requeued_reclaim_under_shadow_is_reported(tmp_path, how):
     """Shadow never refuses (P7), but it must REPORT the out-of-lifecycle re-claim:
     a receipt row for the second claim. Measured at 9ef9230: the re-claim appends
     a lifecycle row (history grows past ISSUED,QUEUED,CLAIMED) — PASS."""
@@ -460,6 +492,48 @@ def test_requeued_reclaim_under_shadow_is_reported(tmp_path, how, request):
     hist = receipt_store.receipt_history(conn, r["receipt_id"])
     conn.close()
     assert len(hist) > 3, [h["state"] for h in hist]
+
+
+def _legacy_in_progress_row(q, task_id="legacy-1"):
+    """A row admitted before receipts existed, caught mid-flight by the upgrade.
+
+    Written with the ``trg_tasks_receipt_id_required`` trigger dropped, because
+    that is literally what "written before the trigger was added" means; the
+    trigger is then restored so the rest of the DB behaves normally. Nulling a
+    live row's ``receipt_id`` instead is what ``trg_tasks_receipt_id_immutable``
+    exists to forbid, and deleting the receipt is what the append-only trigger
+    forbids — neither is how such a row comes to exist.
+    """
+    c = sqlite3.connect(q._db_path)
+    try:
+        c.execute("DROP TRIGGER IF EXISTS trg_tasks_receipt_id_required")
+        c.execute("INSERT INTO tasks (task_id, task_type, description, branch, priority, "
+                  "context, status, created_at, project, last_activity_at) "
+                  "VALUES (?, 'implement', 'legacy work', 'main', 3, '{}', 'in_progress', "
+                  "?, 'agent_crew', 0)", (task_id, 1.0))
+        c.commit()
+    finally:
+        c.close()
+    receipt_store.ensure_schema(sqlite3.connect(q._db_path))
+    return task_id
+
+
+@pytest.mark.parametrize("mode,expected", [("test", "in_progress"), ("shadow", "pending")])
+def test_a_legacy_row_with_no_receipt_is_refused_a_requeue_under_enforce(
+        tmp_path, mode, expected):
+    """§8 through P2: "no receipt" is not "no objection" on the way back either.
+
+    Under ``shadow`` the same row is requeued and *reported* — the count a
+    deployment needs before it turns enforcement on.
+    """
+    q = queue_for(tmp_path, AuthorityState("active"), name=f"legacy-{mode}.db", mode=mode)
+    tid = _legacy_in_progress_row(q)
+    q.requeue(tid)
+    c = sqlite3.connect(q._db_path)
+    try:
+        assert c.execute("SELECT status FROM tasks WHERE task_id=?", (tid,)).fetchone()[0] == expected
+    finally:
+        c.close()
 
 
 def test_retry_is_a_new_admission_not_a_requeue():

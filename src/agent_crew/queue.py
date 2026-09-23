@@ -2093,7 +2093,8 @@ class TaskQueue:
 
     @staticmethod
     def _cea_transition_in_txn(conn, engine, receipt_id: Optional[str], state: str,
-                               *, note: Optional[str] = None) -> None:
+                               *, note: Optional[str] = None,
+                               mutate: Optional[dict] = None) -> None:
         """Move a receipt's lifecycle inside the caller's transaction.
 
         Best-effort **by design**, and only in this direction: a lifecycle row
@@ -2105,7 +2106,7 @@ class TaskQueue:
         if not receipt_id or not hasattr(engine, "transition"):
             return
         try:
-            engine.transition(conn, receipt_id, state, note=note)
+            engine.transition(conn, receipt_id, state, note=note, mutate=mutate)
         except Exception:
             logger.warning("cea: receipt %s could not be moved to %s", receipt_id, state,
                            exc_info=True)
@@ -2217,6 +2218,72 @@ class TaskQueue:
         if gate is not None:
             self._cea_transition_in_txn(conn, self.cea_engine(), gate.receipt_id,
                                         "CLAIMED", note=f"claim: {gate.outcome.value}")
+        return True, gate
+
+    #: Every ``in_progress -> pending`` mutation names itself here, and each one
+    #: is a key of :data:`agent_crew.cea.callsites.REQUEUE_CALL_SITES`. A sixth
+    #: method that flips a claimed row back to pending without going through
+    #: :meth:`requeue_through_gate` is the §8 bypass the registry exists to
+    #: expose.
+    REQUEUE_MUTATION_METHODS = ("requeue", "defer_push_delivery", "reset_stale_to_pending")
+
+    def requeue_through_gate(self, conn, task_id: str, *, path: str,
+                             reason: str = "") -> tuple[bool, object]:
+        """Return a claimed row to the queue behind the ADR §8 re-admission rule.
+
+        Returns ``(requeue: bool, outcome)``. ``requeue=False`` means the caller
+        must leave the row where it is.
+
+        Before this, the three requeue paths set ``tasks.status='pending'`` and
+        left the receipt sitting in ``CLAIMED`` with no lifecycle row at all, so
+        the queue and the receipt store disagreed about the same task: the row
+        said "take me", the receipt said "somebody already did", and under
+        enforcement the claim gate then refused it forever — the task was
+        stranded pending with no record of why (s4h, ADR §8).
+
+        What happens to the receipt, in the same transaction as the status write:
+
+        * **reuse** (B unchanged, an attempt left) — the receipt goes to ``HELD``
+          carrying ``attempt + 1`` and a ``RE-QUEUED`` note. ``HELD`` and not
+          ``QUEUED`` because P3's answer for a claim that did not happen is
+          literally *"task → HELD with reason"*, ``claim`` accepts ``HELD``
+          (:data:`~agent_crew.cea.validator._POINT_STATES`), and the enqueue path
+          stays the one writer of ``QUEUED``.
+        * **re-admission** (drift, or the attempt budget is spent) — the old
+          receipt is ``SUPERSEDED``. The row still goes back to pending, and the
+          claim gate then refuses it under enforcement until admission runs
+          again: ⛔this method does **not** re-authorise. Minting a replacement
+          here would put a second admission entry in the product, and the
+          ``tasks.receipt_id`` trigger forbids repointing the row at it anyway.
+        * **HELD** (P7, B′ unavailable) — the receipt is held, unchanged attempt.
+        """
+        receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
+        engine = self.cea_engine()
+        config = self.cea_config()
+        if receipt is None:
+            # A pre-receipt legacy row. Same asymmetry as the claim gate: under
+            # enforcement "no receipt" is not "no objection".
+            if _cea_callsites.enforcing(config):
+                logger.warning("cea: requeue refused for %s via %s — NO_RECEIPT under enforce",
+                               task_id, path)
+                self._record_end_on(conn, task_id, time.time(), "requeue_refused_no_receipt",
+                                    posted=False)
+                return False, None
+            logger.info("cea: requeuing %s via %s with no receipt (shadow; enforce would refuse)",
+                        task_id, path)
+            return True, None
+        gate = _cea_callsites.gate_requeue(
+            receipt, path=path, current=_cea_callsites.current_inputs(engine, receipt),
+            config=config)
+        note = f"RE-QUEUED via {path}: {gate.reason}" + (f" [{reason}]" if reason else "")
+        if gate.outcome is _CeaOutcome.PROCEED:
+            self._cea_transition_in_txn(conn, engine, gate.receipt_id, "HELD", note=note,
+                                        mutate={"attempt": gate.attempt})
+        elif gate.outcome is _CeaOutcome.HELD:
+            self._cea_transition_in_txn(conn, engine, gate.receipt_id, "HELD", note=note)
+        elif gate.outcome is _CeaOutcome.RE_ADMIT:
+            self._cea_transition_in_txn(conn, engine, gate.receipt_id, "SUPERSEDED", note=note)
+        self._cea_patch_context_in_txn(conn, task_id, {"cea_requeue": gate.as_record()})
         return True, gate
 
     # ── one-shot PR announcements (#250 review) ───────────────────────
@@ -3398,6 +3465,22 @@ class TaskQueue:
             ctx["push_refusal_reason"] = reason
             ctx["push_not_before"] = time.time() + backoff_s * (2 ** (count - 1))
             status = "in_progress" if count >= max_refusals else "pending"
+            if status == "pending":
+                # §8: the receipt has to come back with the row (s4h).
+                requeued, _gate = self.requeue_through_gate(
+                    conn, task_id, path="queue.defer_push_delivery",
+                    reason=f"pane {pane_id} refused: {reason}")
+                if not requeued:
+                    conn.execute("ROLLBACK")
+                    return None
+                # ⛔Re-read: requeue_through_gate patched the row's context with
+                #   the §8 answer, and writing the stale copy back would drop it.
+                row2 = conn.execute("SELECT context FROM tasks WHERE task_id = ?",
+                                    (task_id,)).fetchone()
+                if row2 is not None:
+                    merged = json.loads(row2["context"] or "{}")
+                    merged.update(ctx)
+                    ctx = merged
             conn.execute("UPDATE tasks SET context = ?, status = ? WHERE task_id = ?",
                          (json.dumps(ctx), status, task_id))
             conn.execute("COMMIT")
@@ -3409,18 +3492,37 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def requeue(self, task_id: str) -> None:
-        """Roll an in_progress task back to pending so it can be dequeued again."""
+    def requeue(self, task_id: str, *, reason: str = "") -> None:
+        """Roll an in_progress task back to pending so it can be dequeued again.
+
+        A §8 re-admission: the receipt moves with the row
+        (:meth:`requeue_through_gate`), inside one ``BEGIN IMMEDIATE`` so the
+        two cannot end up describing different tasks.
+        """
         conn = self._connect()
         try:
-            cur = conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status FROM tasks WHERE task_id = ?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.execute("ROLLBACK")
+                return
+            requeued, _gate = self.requeue_through_gate(conn, task_id, path="queue.requeue",
+                                                        reason=reason)
+            if not requeued:
+                conn.execute("COMMIT")   # keep the refusal's runtime event
+                return
+            conn.execute(
                 "UPDATE tasks SET status = 'pending' WHERE task_id = ? AND status = 'in_progress'",
                 (task_id,),
             )
-            if cur.rowcount:
-                # G12: the lease ends with the claim; the history keeps both.
-                self._record_end_on(conn, task_id, time.time(), "requeued", posted=False)
-            conn.commit()
+            # G12: the lease ends with the claim; the history keeps both.
+            self._record_end_on(conn, task_id, time.time(), "requeued", posted=False)
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()
 
@@ -3476,11 +3578,21 @@ class TaskQueue:
         cutoff = time.time() - older_than_seconds
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             rows = conn.execute(
                 "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
                 (cutoff,),
             ).fetchall()
-            task_ids = [r["task_id"] for r in rows]
+            # §8 again, and per row: one stale task whose receipt cannot be
+            # re-admitted must not keep the others in_progress, and must not be
+            # returned as if it had been reset either.
+            task_ids = []
+            for r in rows:
+                requeued, _gate = self.requeue_through_gate(
+                    conn, r["task_id"], path="queue.reset_stale_to_pending",
+                    reason=f"idle > {older_than_seconds:.0f}s")
+                if requeued:
+                    task_ids.append(r["task_id"])
             if task_ids:
                 placeholders = ",".join("?" * len(task_ids))
                 conn.execute(
@@ -3488,8 +3600,12 @@ class TaskQueue:
                     f"WHERE task_id IN ({placeholders})",
                     [time.time()] + task_ids,
                 )
-                conn.commit()
+            conn.execute("COMMIT")
             return task_ids
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
         finally:
             conn.close()
 

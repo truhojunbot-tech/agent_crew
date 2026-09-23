@@ -314,6 +314,19 @@ def _revs(binding: dict) -> dict:
     return out
 
 
+def binding_drifted(was: dict, now: dict) -> tuple[str, ...]:
+    """Public name for the P3 drift comparison — the §8 re-admission rule needs it.
+
+    ADR §8 ("Retry of the same task": *the same receipt iff B is unchanged (P3)
+    and ``attempt < max_attempts``") asks the same question the five points ask
+    at step 8 of :func:`validate`, but outside any of them: a requeue is a
+    re-admission decision, not a claim. Exposing the comparison rather than
+    copying it keeps "B is unchanged" one definition — a second copy is how the
+    requeue path and the claim path start disagreeing about what drifted.
+    """
+    return _drifted_fields(was, now)
+
+
 def _drifted_fields(was: dict, now: dict) -> tuple[str, ...]:
     """Which of the P3 / O18 fields moved between B and B′."""
     changed: list[str] = []
