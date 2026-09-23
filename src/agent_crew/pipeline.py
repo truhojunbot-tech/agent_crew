@@ -46,10 +46,11 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
-from agent_crew.risk_tier import (
-    TIER_0, TIER_1, TIER_2, TIER_3, cascade_metadata, classify_task,
-    effective_fix_round_cap, risk_tier_enforcement_enabled, shadow_decision,
-)
+# §11.2 #14: the review/test contract comes from admission, already decided.
+# ⛔Do not import ``agent_crew.risk_tier`` here. Asking it again at cascade time
+#   is what made this file a second decision implementation; the static rule in
+#   tests/unit/test_sev0_cea_guard_count.py fails if the import comes back.
+from agent_crew.cea import cascade_contract as _cascade
 
 logger = logging.getLogger(__name__)
 
@@ -803,18 +804,12 @@ def review_fix_max_rounds() -> int:
 
 
 def _record_risk_tier_shadow(queue: TaskQueue, task, actual_action: str) -> None:
-    """Append a best-effort counterfactual receipt without changing work."""
-    try:
-        context = task.context if isinstance(task.context, dict) else {}
-        receipt = shadow_decision(
-            task.description, context, task.task_id, actual_action, review_fix_max_rounds(),
-        )
-        receipts = context.get("risk_tier_shadow")
-        receipts = list(receipts) if isinstance(receipts, list) else []
-        if receipt not in receipts:
-            queue.patch_context(task.task_id, {"risk_tier_shadow": receipts + [receipt]})
-    except Exception:
-        logger.exception("risk-tier shadow receipt failed for %s", getattr(task, "task_id", "unknown"))
+    """Append a best-effort counterfactual receipt without changing work.
+
+    A thin relay: the recorder itself lives in ``cea.cascade_contract`` so this
+    file has no reason to reach for ``risk_tier``.
+    """
+    _cascade.record_shadow(queue, task, actual_action, review_fix_max_rounds())
 
 
 def fix_task_id(review_task_id: str, fix_round: int) -> str:
@@ -989,9 +984,10 @@ def auto_enqueue_fix(
         # Council #39 A-4: the configured value remains a hard ceiling, while
         # low-risk work stops once an additional fix is less valuable than its
         # independent review/test cost.
-        if not risk_tier_enforcement_enabled():
+        contract = _cascade.stored(review_task)
+        if not contract.enforced:
             _record_risk_tier_shadow(queue, review_task, "fix_legacy_cap")
-        max_rounds = effective_fix_round_cap(review_ctx, review_fix_max_rounds())
+        max_rounds = contract.fix_round_cap(review_fix_max_rounds())
         # The lineage counter rides in the task context, so it survives a
         # server restart and counts ROUNDS rather than tasks. An in-memory
         # per-task_id counter (the transient-retry shape) could not work here:
@@ -1323,27 +1319,20 @@ def auto_enqueue_review(
             return None
         impl_task = impl_tasks[0]
         impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
-        enforce_risk_tier = risk_tier_enforcement_enabled()
-        risk = cascade_metadata(impl_task.description, impl_ctx)
-        # A review→fix lineage created before Council #39 has no tier receipt.
-        # Do not retroactively alter its already-running cap halfway through.
-        # Fresh implementation tasks receive the classification below.
-        legacy_fix_lineage = "fix_round" in impl_ctx and "risk_tier" not in impl_ctx
-        if legacy_fix_lineage:
-            risk = {}
-            tier = TIER_2
-        else:
-            tier = risk["risk_tier"]
+        # The whole review/test contract, as admission decided it (§11.2 #14).
+        # Everything below reads this; nothing below classifies anything.
+        contract = _cascade.stored(impl_task)
+        enforce_risk_tier = contract.enforced
+        risk = dict(contract.metadata)
         if not enforce_risk_tier:
             _record_risk_tier_shadow(queue, impl_task, "review_enqueued")
-        # Tier 0 is intentionally implement-only. It remains observable via
-        # its task/result and can still be manually reviewed by an operator.
-        if enforce_risk_tier and tier == TIER_0:
-            logger.info("auto_enqueue_review: Tier 0 task %s is implement-only", impl_task_id)
+        if enforce_risk_tier and not contract.needs_reviewer:
+            logger.info("auto_enqueue_review: %s needs no independent reviewer under the "
+                        "contract admission stored (tier %s)", impl_task_id, contract.tier)
             return None
-        # Tier 3 contains irreversible/external work. Do not make a new worker
-        # runnable until a human resolves the durable approval gate.
-        if enforce_risk_tier and tier == TIER_3 and not impl_ctx.get("tier3_gate_approved"):
+        # The gate itself is admission's decision; whether it has been resolved
+        # is durable state on the row, which is a read, not a judgement.
+        if enforce_risk_tier and contract.human_gate_required and not impl_ctx.get("tier3_gate_approved"):
             gate_id = f"risk-tier3-{impl_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1471,8 +1460,8 @@ def auto_enqueue_review(
             review_context.update(risk)
         if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
             review_context["tier3_gate_approved"] = True
-        if enforce_risk_tier and tier == TIER_2:
-            review_context["review_mode"] = "adversarial"
+        if enforce_risk_tier and contract.review_mode:
+            review_context["review_mode"] = contract.review_mode
             review_context["instructions"] += "\n\nTier 2: perform an adversarial independent review; actively seek regression and safety gaps."
         if implementer_agent:
             review_context["implementer_agent"] = implementer_agent
@@ -1569,16 +1558,17 @@ def auto_enqueue_test(
         # Propagate upstream agent identities so review/test fallback can
         # avoid self-review and self-test (#117).
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-        enforce_risk_tier = risk_tier_enforcement_enabled()
-        tier = classify_task(review_task.description, review_ctx)
+        contract = _cascade.stored(review_task)
+        enforce_risk_tier = contract.enforced
         if not enforce_risk_tier:
             _record_risk_tier_shadow(queue, review_task, "test_enqueued")
-        if enforce_risk_tier and tier == TIER_0:
+        if enforce_risk_tier and not contract.needs_tester:
             return None
         # An approved Tier 3 test gate replays this exact transition.  The
         # durable receipt lives on the reviewed task, so a restart/replay does
         # not create a second gate or strand the already-approved lineage.
-        if enforce_risk_tier and tier == TIER_3 and not review_ctx.get("tier3_gate_approved"):
+        if (enforce_risk_tier and contract.human_gate_required
+                and not review_ctx.get("tier3_gate_approved")):
             gate_id = f"risk-tier3-test-{review_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1604,14 +1594,15 @@ def auto_enqueue_test(
         test_context: dict = {"prev_task_id": review_task_id}
         if enforce_risk_tier:
             test_context.update({
-                "risk_tier": tier,
+                "risk_tier": contract.tier,
                 "risk_tier_source": review_ctx.get("risk_tier_source", "metadata"),
             })
-        if enforce_risk_tier and tier == TIER_1:
+        if enforce_risk_tier and contract.test_scope:
             # #272's tester consumes this as an explicit treatment rather than
-            # guessing scope from the project/provider.
-            test_context["test_scope"] = "targeted"
-            test_context["test_scope_source"] = "risk_tier"
+            # guessing scope from the project/provider. The scope is the one
+            # admission stored, not one re-derived here.
+            test_context["test_scope"] = contract.test_scope
+            test_context["test_scope_source"] = contract.test_scope_source or "risk_tier"
         if pr_number is not None:
             test_context["pr_number"] = pr_number  # #171: propagate for post-test merge
         if _test_repo:

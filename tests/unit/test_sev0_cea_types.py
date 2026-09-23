@@ -141,6 +141,11 @@ def test_input_providers_return_data_not_decisions():
 CEA_IMPORTERS = {
     "queue.py",        # step 1: the receipt store rides on the tasks DB connection
     "server.py",       # step 4c: T5 reads the project's rollout mode at /result
+    "pipeline.py",     # step 4m: the cascade READS the review/test contract
+                       # admission stored (cea.cascade_contract). It is a
+                       # consumer — the direction the freeze rule cares about is
+                       # preserved, and this replaces pipeline.py's own
+                       # risk-tier decision (§11.2 #14).
 }
 
 

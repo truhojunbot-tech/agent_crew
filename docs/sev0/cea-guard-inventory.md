@@ -164,3 +164,104 @@ Line numbers moved with the merge. Re-measured on the merged head:
   applying the same two changes there. No other CEA file has the pattern:
   of the files that call `create_app`, the rest use the hermetic helpers or
   stub `install_from_env` themselves.
+
+## 9. s4m — the two extras are gone, and the count is executable
+
+`result` — agent_crew `sev0/cea-lineage` at s4m. Codex acceptance finding [2] at
+`c18e092` (P1) was that §8 honestly reported **7** against ADR §11.2's `<= 6`.
+Both named extras are now relays to a single implementation.
+
+    GUARD_COUNT = 5
+
+That literal is not decoration: `tests/unit/test_sev0_cea_guard_count.py`
+parses it and fails if this document and the code disagree. A hand count is a
+claim about a moment; the probes in that file re-derive it on every run, which
+is what makes the acceptance checkable rather than re-argued.
+
+| | Count | Δ since §8 |
+|---|---|---|
+| Target components present in agent_crew (T1, T2, T3, T5, T6) | 5 | — |
+| Extra judgements outside T1–T6 | **0** | −2 |
+| **Total** | **5** | −2 |
+
+T4 (the snapshot producer's ack ledger) stays alfred-side and is not counted
+here — counting a component this repo does not implement would inflate the very
+number the ADR bounds (CXC-1 still finds no ack ledger in src).
+
+### #12 `runtime_stop` — the queue relays, P6 decides
+
+`queue.py` compared the row against `"ACTIVE"` itself. That comparison is one
+implementation of the subject matter T3 already owns, so it counted as a second
+guard.
+
+- `cea/validator.py` now exposes `runtime_state_verdict(state, point)` — the
+  **one** implementation of the P6 enforcement matrix. `validate()` calls it;
+  it is no longer inline there either.
+- `cea/callsites.py` `gate_runtime_state()` is the relay the queue uses.
+- `queue.TaskQueue._stop_active_in_txn` / `_stop_active_precheck` now read the
+  row (only they hold the write lock) and return **the gate's** answer. The
+  enqueue call site names `ValidationPoint.ENQUEUE`; the two claim sites use
+  the CLAIM default.
+
+Behaviour is unchanged, and pinned as such:
+`test_runtime_state_verdicts_all_come_from_one_matrix` asserts the relay
+reproduces `state != "ACTIVE"` for ENQUEUE and CLAIM across all four states plus
+an unknown one (unknown ⇒ STOPPED ⇒ refused, P7).
+
+⛔The gate is deliberately **not** conditioned on `enforcing()`. Shadow/enforce
+  governs whether a *receipt* verdict stops work; the #314 operator STOP is not
+  a receipt verdict, and coupling them would mean turning CEA off also turned
+  the fleet pause off.
+
+**Two `!= "ACTIVE"` comparisons remain in `queue.py` and are not this row:**
+`:3121` (`_suppressed` — successor suppression at RESULT) and `:3483` (the §8
+requeue path). Neither is a P2 admission gate, and neither was in the finding.
+Folding them in is not a relocation — the P6 matrix says RESULT under DRAINING
+is `ok`, where `!= "ACTIVE"` suppresses — so it would change which successors
+are created. That is a behaviour change and needs its own step. The guard-count
+probe for #12 is scoped to the `_stop_active_*` family for exactly this reason,
+and says so in its own comment rather than implying the other two do not exist.
+
+### #14 `risk_tier` — decided at admission, consumed by the cascade
+
+`pipeline.py` re-asked `risk_tier_enforcement_enabled()` and `classify_task()`
+at every cascade step. Now `cea/cascade_contract.py` `decide()` runs **once**,
+on the admission path in `TaskQueue.enqueue_with_receipt` — where T1 already is
+— and stores its answer on the row as `context["cea_cascade"]`.
+
+- `pipeline.py` imports nothing from `agent_crew.risk_tier`. `grep -nE
+  "classify_task|risk_tier_enforcement_enabled|cascade_metadata|
+  effective_fix_round_cap|shadow_decision" pipeline.py` finds nothing.
+- The cascade reads `_cascade.stored(task)` and consumes `needs_reviewer`,
+  `needs_tester`, `review_mode`, `test_scope`, `human_gate_required` and
+  `fix_round_cap(ceiling)`. Checking whether a Tier 3 gate has been *approved*
+  stays in the cascade: that is a read of durable row state, not a judgement.
+- A row with no stored contract (admitted before this step) gets the floor —
+  review and test everything, gate nothing. Under P7's asymmetry an unknown
+  contract buys *more* independent scrutiny, never less.
+- `server.py`'s dispatch path was already a pure consumer (its `test_scope`
+  comment). This makes the cascade match it.
+
+**What this step does not do:** raise the contract to the receipt's J7 floor.
+`engine._j7_contract` names a required reviewer/tester for essentially every
+`implement` work class (`REVIEW_FLOOR`), so honouring it as a floor would make
+Tier 0's implement-only cascade unreachable — a change to *which tasks get
+reviewed*, not to where the decision lives. It was measured: applying it turned
+`test_low_tiers_reduce_automatic_cascade_and_fix_budget_when_enforced` red. The
+J7 answer is therefore **recorded** on the contract (`j7_reviewer`,
+`j7_tester`) so the disagreement is visible and countable, and nothing acts on
+it yet. That is the next step, not this one.
+
+### Evidence
+
+- `tests/unit/test_sev0_cea_guard_count.py` — 13 PASS. Enumerates T1–T6 (each
+  asserted present), probes for extras, asserts `<= 6`, and cross-checks
+  `GUARD_COUNT` above.
+- CEA suites green: see the s4m commit message for counts.
+- **Pre-existing reds, not caused by s4m:**
+  `test_issue_278_test_economics.py::test_stale_risk_tier_targeted_scope_*` (2)
+  fail identically at `191f258` — verified by running them against a clean
+  `git archive HEAD` tree. They are about `server.py`'s dispatch path, which
+  s4m does not touch, and they encode the pre-consumer expectation that
+  survived the step that made `server.py` a consumer. They need their own
+  decision about expected behaviour.

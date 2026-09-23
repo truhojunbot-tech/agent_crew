@@ -14,7 +14,9 @@ from typing import List, Optional
 
 from agent_crew.cea import adapters as _cea_adapters
 from agent_crew.cea import callsites as _cea_callsites
+from agent_crew.cea import cascade_contract as _cea_cascade
 from agent_crew.cea import store as _cea_store
+from agent_crew.cea import validator as _cea_validator
 from agent_crew.cea.auth import in_process_caller as _cea_in_process_caller
 from agent_crew.cea.engine import EngineConfig as _CeaEngineConfig, get_engine as _cea_get_engine
 from agent_crew.cea.intent import (
@@ -1673,19 +1675,38 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def _stop_active_in_txn(self, conn) -> bool:
+    def _runtime_gate(self, state: str, point) -> "_cea_callsites.RuntimeGateOutcome":
+        """Relay the row's state to P6 and return **its** answer (§11.2 #12).
+
+        ⛔The queue does not decide what a runtime state permits. It reads the
+          row — it is the only thing holding the write lock that can — and
+          :func:`agent_crew.cea.callsites.gate_runtime_state` resolves it out of
+          the same P6 matrix the validator uses. Before this, these call sites
+          answered ``state != "ACTIVE"`` inline, which was a second decision
+          implementation of T3's subject matter and counted as an extra guard in
+          ``docs/sev0/cea-guard-inventory.md`` §3.
+        """
+        return _cea_callsites.gate_runtime_state(state, point=point)
+
+    def _stop_active_in_txn(self, conn, *, point=None) -> bool:
         """호출자가 BEGIN IMMEDIATE로 write-lock을 쥔 상태에서 STOP을 확인.
         권위=runtime_stop(원자 linearization point) + additive pause.json 신호.
-        읽기 실패(테이블 손상 등)는 fail-closed(=paused, 차단)."""
-        return self._runtime_state_in_txn(conn) != "ACTIVE"
+        읽기 실패(테이블 손상 등)는 fail-closed(=paused, 차단).
 
-    def _stop_active_precheck(self) -> bool:
+        The state comes from the row; the verdict comes from P6 (:meth:`_runtime_gate`).
+        """
+        point = point or _cea_validator.ValidationPoint.CLAIM
+        return not self._runtime_gate(self._runtime_state_in_txn(conn), point).proceed
+
+    def _stop_active_precheck(self, *, point=None) -> bool:
         """트랜잭션 밖 빠른 사전확인(권위 아님 — in-txn 재확인이 최종). 실패는 fail-closed.
 
         Takes its own short write transaction so the pause.json signal is
-        reconciled into the row here too; the answer is then the row's.
+        reconciled into the row here too; the answer is then the row's — and the
+        verdict on that answer is P6's, not this method's.
         """
-        return self.reconcile_pause_signal() != "ACTIVE"
+        point = point or _cea_validator.ValidationPoint.CLAIM
+        return not self._runtime_gate(self.reconcile_pause_signal(), point).proceed
 
     def _reconcile_stop_on_boot(self) -> None:
         """§1 부팅 화해: pause.json(미러/외부신호) vs runtime_stop(DB권위).
@@ -2165,6 +2186,12 @@ class TaskQueue:
             current=_cea_callsites.current_inputs(engine, receipt),
             config=self.cea_config(scope))
         context["cea_enqueue"] = gate.as_record()
+        # §11.1 row 13 / §11.2 #14: the review/test contract is decided HERE —
+        # once, on the admission path, where T1 already is — and stored on the
+        # row. ``pipeline.py`` reads it back and decides nothing, which is what
+        # stops it being a second decision implementation (guard inventory §3).
+        context[_cea_cascade.CONTEXT_KEY] = _cea_cascade.decide(
+            task.description, context, receipt).as_record()
         if not gate.proceed:
             raise AdmissionRefused(gate)
         receipt_id = receipt.get("receipt_id")
@@ -2176,7 +2203,7 @@ class TaskQueue:
             conn.execute("BEGIN IMMEDIATE")
             # #314 §2: 권위는 runtime_stop 행. 같은 write-lock 트랜잭션에서 읽으므로
             # STOP writer의 commit이 이 INSERT 전에 끝났으면 반드시 보인다(TOCTOU 제거).
-            if self._stop_active_in_txn(conn):
+            if self._stop_active_in_txn(conn, point=_cea_validator.ValidationPoint.ENQUEUE):
                 conn.execute("ROLLBACK")
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
             conn.execute(

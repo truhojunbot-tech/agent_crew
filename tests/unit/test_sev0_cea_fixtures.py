@@ -388,27 +388,29 @@ def test_cxc_1_static_no_second_matcher_or_risk_decision_in_server():
     duplicates were the #294 lexical in-flight advisory and the risk_tier
     classifier read on the dispatch path. Static: both gone from `server.py`.
 
-    ⛔Green here does **not** mean the ADR rows are finished. Row 13 also owns
-      the risk-tier branches still in `pipeline.py`; this asserts only what it
-      says — that the *server* no longer hosts a second matcher or a second risk
-      decision. `test_cxc_1_pipeline_still_decides_by_risk_tier` below is the
-      standing red for the half that remains."""
+    Row 13's other half — the risk-tier branches in `pipeline.py` — closed in
+    s4m; `test_cxc_1_pipeline_reads_the_contract_admission_stored` below is no
+    longer a standing red. This still asserts only what it says: that the
+    *server* hosts neither a second matcher nor a second risk decision."""
     src = _server_source()
     assert "active_tasks_for_issue(" not in src, "#294 lexical advisory still in server.py"
     assert "risk_tier_enforcement_enabled" not in src, "risk_tier decision still in server.py"
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "CXC-1 remainder: pipeline.py still branches on risk_tier_enforcement_enabled() "
-    "for review/test/fix cascades (ADR §11.1 row 13); J7 review_test_matrix is read "
-    "by the engine but the cascades do not consume the receipt's contract yet"))
-def test_cxc_1_pipeline_still_decides_by_risk_tier():
-    """The other half of row 13, kept visible instead of implied by a passing
-    server-only assertion. Flips to green when the cascades take reviewer/tester
-    from the receipt's J7 contract."""
+def test_cxc_1_pipeline_reads_the_contract_admission_stored():
+    """The other half of row 13, green since s4m.
+
+    It was a strict xfail while `pipeline.py` re-asked
+    `risk_tier_enforcement_enabled()` and `classify_task()` at every cascade
+    step. The decision now happens once, on the admission path, and is stored on
+    the row; the cascade reads it back through `cea.cascade_contract.stored`.
+    See `docs/sev0/cea-guard-inventory.md` §9 for the count that closes."""
     import agent_crew.pipeline as pipeline_module
-    assert "risk_tier_enforcement_enabled" not in inspect.getsource(pipeline_module), \
-        "pipeline.py still makes its own risk-tier decision"
+    source = inspect.getsource(pipeline_module)
+    assert "risk_tier_enforcement_enabled" not in source, \
+        "pipeline.py makes its own risk-tier decision again"
+    assert "from agent_crew.cea import cascade_contract" in source, \
+        "pipeline.py stopped reading the contract admission stored"
 
 
 @pytest.mark.xfail(strict=True, reason=f"CXC-2: E4 shadow ALLOW on OWNER_CONFLICT; adapter unwired; {NO_ENGINE}")

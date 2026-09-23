@@ -41,8 +41,9 @@ from typing import Optional
 
 from agent_crew.cea.engine import ENFORCE, TEST, EngineConfig
 from agent_crew.cea.validator import (
-    ContractReceiptValidator, CurrentInputs, ReceiptValidator, ValidationOutcome,
-    ValidationPoint, ValidationResult, binding_drifted)
+    ContractReceiptValidator, CurrentInputs, ReceiptValidator, RuntimeStateVerdict,
+    ValidationOutcome, ValidationPoint, ValidationResult, binding_drifted,
+    runtime_state_verdict)
 
 VALIDATOR: ReceiptValidator = ContractReceiptValidator()
 """T3 — the single receipt-validator instance in the product.
@@ -174,6 +175,59 @@ def gate_result(receipt: dict, *, nonce: Optional[str], presenter: Optional[str]
                  config)
 
 
+# ── P6 runtime state: the row is an input, not a second authority ───────────
+
+@dataclass(frozen=True)
+class RuntimeGateOutcome:
+    """What a runtime-state call site learned. It did not work it out itself."""
+    point: ValidationPoint
+    verdict: RuntimeStateVerdict
+
+    @property
+    def proceed(self) -> bool:
+        return self.verdict.permits
+
+    @property
+    def state(self) -> str:
+        return self.verdict.state
+
+    @property
+    def outcome(self) -> ValidationOutcome:
+        return self.verdict.outcome
+
+    @property
+    def reason(self) -> str:
+        return self.verdict.reason
+
+    def as_record(self) -> dict:
+        return {"point": self.point.value, "runtime_state": self.state,
+                "outcome": self.outcome.value, "code": self.verdict.code,
+                "reason": self.reason, "proceed": self.proceed}
+
+
+def gate_runtime_state(runtime_state: str, *, point: ValidationPoint,
+                       already_claimed: bool = False,
+                       already_dispatched: bool = False) -> RuntimeGateOutcome:
+    """P6: may ``point`` proceed while the runtime row says ``runtime_state``?
+
+    This is the seam that stops ``queue.py`` owning a runtime-state judgement of
+    its own. ``_stop_active_in_txn`` used to answer ``state != "ACTIVE"`` inline,
+    which is a second implementation of the subject matter T3 already covers
+    (guard inventory §11.2 #12). The queue now reads the row — it is the only
+    thing that can, inside its own ``BEGIN IMMEDIATE`` — and relays the answer
+    computed here from :data:`agent_crew.cea.validator._P6_MATRIX`.
+
+    ⛔Deliberately **not** conditioned on ``enforcing()``. Shadow/enforce decides
+      whether a *receipt* verdict stops work; the #314 operator STOP is not a
+      receipt verdict, and making it follow the CEA rollout switch would mean
+      turning CEA off also turned the fleet pause off.
+    """
+    return RuntimeGateOutcome(
+        point=point,
+        verdict=runtime_state_verdict(runtime_state, point,
+                                      already_claimed=already_claimed,
+                                      already_dispatched=already_dispatched))
+
 # ── re-admission: the paths that put a claimed row back in the queue ────────
 #
 # ADR §8 ("Recovery semantics"). These are NOT a sixth validation point: nothing
@@ -296,7 +350,8 @@ CALL_SITES = {
 """Every :class:`ValidationPoint` has exactly one gate — checked by the I2 test."""
 
 
-__all__ = ["CALL_SITES", "GateOutcome", "REQUEUE_CALL_SITES", "RequeueOutcome", "VALIDATOR",
+__all__ = ["CALL_SITES", "GateOutcome", "REQUEUE_CALL_SITES", "RequeueOutcome",
+           "RuntimeGateOutcome", "VALIDATOR",
            "current_inputs", "enforcing", "recording",
            "gate_claim", "gate_dispatch", "gate_enqueue", "gate_execute_start", "gate_requeue",
-           "gate_result"]
+           "gate_result", "gate_runtime_state"]

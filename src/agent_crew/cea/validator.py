@@ -208,6 +208,65 @@ _POINT_STATES: dict[str, tuple[str, ...]] = {
 _TERMINAL_STATES = ("CONSUMED", "SUPERSEDED", "REVOKED")
 
 
+
+@dataclass(frozen=True)
+class RuntimeStateVerdict:
+    """What P6 says about one ``(runtime_state, point)`` pair — and nothing else.
+
+    ``cell`` is the raw matrix cell, kept because RESULT distinguishes ``ok``
+    from ``flagged`` after the verdict itself is PROCEED.
+    """
+    state: str
+    point: "ValidationPoint"
+    cell: str
+    outcome: ValidationOutcome
+    code: str
+    reason: str
+
+    @property
+    def permits(self) -> bool:
+        """May the call site act? PROCEED and only PROCEED."""
+        return self.outcome is ValidationOutcome.PROCEED
+
+
+def runtime_state_verdict(runtime_state: str, point: "ValidationPoint", *,
+                          already_claimed: bool = False,
+                          already_dispatched: bool = False) -> RuntimeStateVerdict:
+    """The **one** implementation of the P6 enforcement matrix (§11.2 T3).
+
+    Every runtime-state go/no-go in the product resolves here — :func:`validate`
+    for a receipt in flight, and
+    :func:`agent_crew.cea.callsites.gate_runtime_state` for the #314 STOP
+    prechecks in ``queue.py``, which previously compared the row against
+    ``"ACTIVE"`` themselves. That comparison was a second decision
+    implementation with the same subject matter (guard inventory §3, §11.2 #12);
+    reading it out of the same table is what makes it a relay instead.
+
+    I/O-free and receipt-free on purpose: the caller supplies the state it read,
+    so this stays a pure function of the matrix.
+    """
+    cell = _P6_MATRIX.get(runtime_state, _P6_MATRIX["STOPPED"])[point.value]
+
+    def verdict(outcome: ValidationOutcome, code: str, reason: str) -> RuntimeStateVerdict:
+        return RuntimeStateVerdict(state=runtime_state, point=point, cell=cell,
+                                   outcome=outcome, code=code, reason=reason)
+
+    if cell == "BLOCK":
+        return verdict(ValidationOutcome.BLOCK, "RUNTIME_STATE_FORBIDS",
+                       f"runtime state {runtime_state} forbids {point.value} (P6)")
+    if cell == "HELD":
+        return verdict(ValidationOutcome.HELD, "RUNTIME_DRAINING",
+                       "runtime is DRAINING; queued work stays HELD (P6)")
+    if cell == "claimed" and not already_claimed:
+        return verdict(ValidationOutcome.HELD, "RUNTIME_DRAINING",
+                       "runtime is DRAINING; only already-claimed work may dispatch (P6)")
+    if cell == "dispatched" and not already_dispatched:
+        return verdict(ValidationOutcome.HELD, "RUNTIME_DRAINING",
+                       "runtime is DRAINING; only already-dispatched work may start (P6)")
+    return verdict(ValidationOutcome.PROCEED, "OK",
+                   f"runtime state {runtime_state} permits {point.value} (P6)")
+
+
 def _nonce_started(cur: "CurrentInputs") -> bool:
     """Did EXECUTE_START spend the presented nonce?
 
@@ -539,22 +598,12 @@ def validate(receipt, point, current: Optional[CurrentInputs] = None) -> Validat
 
     # 7. P6 enforcement matrix on the *current* runtime state
     runtime_state = B_now.get("runtime_state", "STOPPED")
-    cell = _P6_MATRIX.get(runtime_state, _P6_MATRIX["STOPPED"])[point.value]
-    if cell == "BLOCK":
-        return _result(point, ValidationOutcome.BLOCK, "RUNTIME_STATE_FORBIDS",
-                       f"runtime state {runtime_state} forbids {point.value} (P6)",
-                       receipt_id=rid, binding_now=B_now)
-    if cell == "HELD":
-        return _result(point, ValidationOutcome.HELD, "RUNTIME_DRAINING",
-                       "runtime is DRAINING; queued work stays HELD (P6)",
-                       receipt_id=rid, binding_now=B_now)
-    if cell == "claimed" and not cur.already_claimed:
-        return _result(point, ValidationOutcome.HELD, "RUNTIME_DRAINING",
-                       "runtime is DRAINING; only already-claimed work may dispatch (P6)",
-                       receipt_id=rid, binding_now=B_now)
-    if cell == "dispatched" and not cur.already_dispatched:
-        return _result(point, ValidationOutcome.HELD, "RUNTIME_DRAINING",
-                       "runtime is DRAINING; only already-dispatched work may start (P6)",
+    p6 = runtime_state_verdict(runtime_state, point,
+                               already_claimed=cur.already_claimed,
+                               already_dispatched=cur.already_dispatched)
+    cell = p6.cell
+    if p6.outcome is not ValidationOutcome.PROCEED:
+        return _result(point, p6.outcome, p6.code, p6.reason,
                        receipt_id=rid, binding_now=B_now)
 
     # 8. P3 binding drift
