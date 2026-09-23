@@ -434,6 +434,8 @@ def test_armed_canary_does_not_push_the_identical_sha_rereview(monkeypatch, tmp_
     assert row["canary_counterfactual"].endswith(SHA_A)
     assert json.loads(row["canary_recommendation_json"])["kind"] == (
         "suppress_identical_sha_rereview")
+    assert row["shadow_resolved_at"] is not None
+    assert queue.outbox_get("review-impl-77-r1")["state"] == "applied"
 
 
 def test_a_suppression_settles_its_authorization_receipt(monkeypatch, tmp_db):
@@ -462,7 +464,7 @@ def test_a_suppression_settles_its_authorization_receipt(monkeypatch, tmp_db):
         state = (cea_store.current_receipt(conn, receipt_id) or {}).get("state")
     finally:
         conn.close()
-    assert state == "CONSUMED", state
+    assert state == "REVOKED", state
 
 
 def test_settling_an_unclaimed_receipt_revokes_it_once(tmp_db):

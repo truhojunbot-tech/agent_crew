@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from agent_crew.cea import adapters as _cea_adapters
 from agent_crew.cea import callsites as _cea_callsites
@@ -3021,7 +3021,9 @@ class TaskQueue:
 
     def submit_result(self, task_id: str, result: TaskResult, *,
                       nonce: Optional[str] = None,
-                      presenter: Optional[str] = None) -> str:
+                      presenter: Optional[str] = None,
+                      before_commit: Optional[Callable] = None,
+                      consume_receipt: bool = True) -> str:
         """Submit a task result. Returns the task_type of the completed task
         (so push-model callers can decide what to push next).
 
@@ -3187,9 +3189,12 @@ class TaskQueue:
                 # CONSUMED for a result that did not commit.
                 self._cea_patch_context_in_txn(conn, task_id,
                                                {"cea_result": result_gate.as_record()})
-                self._cea_transition_in_txn(conn, self.cea_engine(), result_gate.receipt_id,
-                                            "CONSUMED",
-                                            note=f"result: {result_gate.outcome.value}")
+                if consume_receipt:
+                    self._cea_transition_in_txn(conn, self.cea_engine(), result_gate.receipt_id,
+                                                "CONSUMED",
+                                                note=f"result: {result_gate.outcome.value}")
+            if before_commit is not None:
+                before_commit(conn, result_gate, now)
             conn.commit()
             # Completion-time recommendations are intentionally a separate,
             # post-commit receipt.  Admission's decision fields are immutable:
@@ -5057,62 +5062,42 @@ class TaskQueue:
         self, task_id: str, result: TaskResult, *, decision_source: str,
         recommendation: dict, counterfactual: str, reason: str,
     ) -> bool:
-        """Commit a canary suppression and its evidence as one durable fact.
+        """Commit canary evidence with the ordinary result transaction.
 
-        The dispatcher must never see a terminal reused verdict without its
-        applied receipt (or vice versa).  CEA's internal claim is bookkeeping:
-        no provider is invoked, but it makes the consumed terminal receipt an
-        auditable consequence of this same suppression transaction.
+        ``submit_result`` owns result telemetry, the result gate, completion
+        shadow refresh, and the durable cascade outbox.  Its hook places the
+        applied canary evidence in that same transaction rather than creating
+        a parallel, incomplete terminal-write path.
         """
-        conn = self._connect()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
+        def _promote(conn, _result_gate, now) -> None:
             row = conn.execute(
                 "SELECT status, receipt_id FROM tasks WHERE task_id=?", (task_id,)
             ).fetchone()
-            if row is None or row["status"] != "in_progress":
-                conn.rollback()
-                return False
-            now = time.time()
-            conn.execute(
-                """UPDATE tasks SET status=?, summary=?, verdict=?, findings=?, pr_number=?,
-                   status_changed_at=? WHERE task_id=?""",
-                (result.status, result.summary, result.verdict, json.dumps(result.findings),
-                 result.pr_number, now, task_id),
-            )
-            conn.execute(
-                "UPDATE task_attribution SET status=?, outcome=?, completed_at=?, updated_at=? "
-                "WHERE task_id=?",
-                (result.status, result.status, now, now, task_id),
-            )
-            self._record_end_on(conn, task_id, now, "result", posted=True,
-                                status=result.status, outcome=result.status)
+            if row is None or row["status"] != result.status:
+                raise RuntimeError("suppressed result was not written")
             receipt_id = row["receipt_id"] or None
+            # Suppression withdraws, rather than spends, reviewer authority.
+            # Lifecycle history is intentionally best-effort: remote or
+            # terminal receipts cannot veto the already-authorized result.
             if receipt_id:
                 receipt = _cea_store.current_receipt(conn, receipt_id)
-                state = (receipt or {}).get("state")
-                engine = self.cea_engine()
-                if state == "QUEUED":
-                    engine.transition(conn, receipt_id, "CLAIMED",
-                                      note="canary suppression internal claim")
-                engine.transition(conn, receipt_id, "CONSUMED",
-                                  note="canary suppression")
+                if (receipt or {}).get("state") not in _cea_store.TERMINAL_STATES:
+                    self._cea_transition_in_txn(
+                        conn, self.cea_engine(), receipt_id, "REVOKED",
+                        note="canary suppression: reviewer invocation withdrawn",
+                    )
             self._promote_tokenomics_canary_receipt_in_txn(
                 conn, task_id, decision_source=decision_source,
                 recommendation=recommendation, counterfactual=counterfactual,
                 reason=reason, cea_receipt_id=receipt_id, now=now,
             )
-            conn.commit()
+        try:
+            self.submit_result(task_id, result, before_commit=_promote,
+                               consume_receipt=False)
             return True
         except Exception:
             logger.exception("tokenomics canary: atomic suppression failed for %s", task_id)
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             return False
-        finally:
-            conn.close()
 
     def get_tokenomics_shadow_receipt(self, task_id: str) -> Optional[dict]:
         """Return the main-branch shadow decision receipt for one task, if any."""
