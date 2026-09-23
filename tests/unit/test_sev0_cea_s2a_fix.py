@@ -171,3 +171,60 @@ def test_the_token_file_never_mints_a_verified_identity(tmp_path):
     who = TokenFileAuthenticator(str(path)).authenticate(TOKEN)
     assert who.identity_status is IdentityStatus.UNVERIFIED
     assert who.credential_kind == "adapter_token"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 #3 — only a VALID snapshot signature is usable (engine.py:314-321)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("status", [SignatureStatus.UNSIGNED, SignatureStatus.UNKEYED,
+                                    SignatureStatus.INVALID])
+def test_an_unverified_snapshot_signature_is_an_unavailable_input(conn, status):
+    """codex P1 #3: only INVALID was rejected, so an available, otherwise-valid
+    UNSIGNED snapshot produced ALLOW for OPS. §3/P5 require verification."""
+    ops = intent(f"sig-{status.value}",
+                 ident=identity(work_class=WorkClass.OPS, anchors=(f"ops/{status.value}.py",)))
+    auth = engine(snapshots=FakeSnapshot(signature=status)).authorize(conn, ops, caller())
+    assert auth.decision == "BLOCK"
+    assert auth.receipt["reason"]["code"] == "INPUTS_UNAVAILABLE"
+    assert any(u.startswith("policy_snapshot_signature")
+               for u in auth.receipt["provenance"]["unavailable_inputs"])
+    assert status.value in auth.receipt["reason"]["text"]
+
+
+def test_a_valid_signature_is_the_only_one_that_admits(conn):
+    ops = intent("sig-valid", ident=identity(work_class=WorkClass.OPS,
+                                             anchors=("ops/valid.py",)))
+    auth = engine(snapshots=FakeSnapshot(signature=SignatureStatus.VALID)).authorize(
+        conn, ops, caller())
+    assert auth.decision == "ALLOW"
+
+
+class ExplodingSnapshot:
+    def current(self, intent=None):
+        raise RuntimeError("snapshot producer is down")
+
+
+class ExplodingRegistry:
+    def lookup(self, intent):
+        raise RuntimeError("E4 registry is down")
+
+
+class ExplodingGate:
+    def state(self, intent, snapshot):
+        raise RuntimeError("gate predicates are unreadable")
+
+
+@pytest.mark.parametrize("kw,named", [
+    ({"snapshots": ExplodingSnapshot()}, "policy_snapshot"),
+    ({"capabilities": ExplodingRegistry()}, "capability_registry"),
+    ({"gates": ExplodingGate()}, "human_gate"),
+])
+def test_a_provider_that_raises_becomes_a_named_unavailable_input(conn, kw, named):
+    """Not an escaping error: an exception leaves no receipt, no audit row and a
+    500 that twelve ingresses each get to interpret. P7 decides instead."""
+    auth = engine(**kw).authorize(conn, intent(f"boom-{named}"), caller())
+    assert auth.decision == "BLOCK"
+    assert auth.receipt["reason"]["code"] == "INPUTS_UNAVAILABLE"
+    assert named in " ".join(auth.receipt["provenance"]["unavailable_inputs"])
+    assert validate_receipt(auth.receipt) == []

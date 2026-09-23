@@ -349,14 +349,10 @@ class AuthorizationEngine:
                 return decided
 
         # J2–J8
-        snapshot = self.snapshots.current(intent)
-        registry = self.capabilities.lookup(intent)
-        runtime = self.runtime.current()
         executor = self._executor_binding(intent)
-        budget = self.budgets.budget(executor or "unknown")
-        gate = self.gates.state(intent, snapshot)
+        snapshot, registry, runtime, budget, gate, raised = self._read_inputs(intent, executor)
 
-        unavailable = self._unavailable_inputs(snapshot, registry, runtime)
+        unavailable = self._unavailable_inputs(snapshot, registry, runtime) + raised
         reviewer, tester = self._j7_contract(intent, snapshot, executor)
         reuse = self._j5_reuse(intent, caller, registry)
 
@@ -455,12 +451,13 @@ class AuthorizationEngine:
     def _binding_drifted(self, intent: Intent, prior: dict) -> bool:
         """Is B′ different from the B this receipt was issued under?"""
         from agent_crew.cea.validator import _drifted_fields
-        snapshot = self.snapshots.current(intent)
-        registry = self.capabilities.lookup(intent)
-        runtime = self.runtime.current()
         executor = prior.get("executor_binding") or self._executor_binding(intent)
-        budget = self.budgets.budget(executor or "unknown")
-        gate = self.gates.state(intent, snapshot)
+        snapshot, registry, runtime, budget, gate, raised = self._read_inputs(intent, executor)
+        if raised:
+            # An input we could not read is not "unchanged". Fail closed: treat
+            # it as drift, which supersedes the receipt and re-runs admission —
+            # where P7 blocks on the same unavailable input, with a receipt.
+            return True
         now = self._binding(snapshot, registry, runtime, budget, gate,
                             _matched(registry), binding_shape=True)
         return bool(_drifted_fields(prior.get("binding") or {}, now))
@@ -472,13 +469,51 @@ class AuthorizationEngine:
 
     # ── J2–J8 helpers ───────────────────────────────────────────────────
 
+    def _read_inputs(self, intent: Intent, executor):
+        """Read every J2–J8 input, fail-closed, in one place.
+
+        ⛔A provider that raises is an **unavailable input**, not an exception
+          that escapes into the adapter. An escaping error means no receipt at
+          all: no audit row, and a 500 that each of the twelve ingresses gets to
+          interpret for itself. P7 says the engine decides truthfully when an
+          input does not answer, and "the provider threw" is the loudest way an
+          input can fail to answer (codex P1 #3, second half).
+        """
+        raised: list[str] = []
+
+        def read(name, fn, fallback):
+            try:
+                return fn()
+            except Exception:                    # noqa: BLE001 — every failure is one fact: no answer
+                raised.append(name)
+                return fallback
+
+        snapshot = read("policy_snapshot", lambda: self.snapshots.current(intent),
+                        UnavailablePolicySnapshot().current(intent))
+        registry = read("capability_registry", lambda: self.capabilities.lookup(intent),
+                        UnavailableCapabilityRegistry().lookup(intent))
+        runtime = read("runtime_state", lambda: self.runtime.current(),
+                       UnavailableRuntimeState().current())
+        budget = read("provider_budget", lambda: self.budgets.budget(executor or "unknown"),
+                      UnavailableBudget().budget(executor or "unknown"))
+        gate = read("human_gate", lambda: self.gates.state(intent, snapshot),
+                    _denied_gate())
+        return snapshot, registry, runtime, budget, gate, tuple(raised)
+
     def _unavailable_inputs(self, snapshot, registry, runtime) -> tuple[str, ...]:
         """P7: which inputs did not answer. Named, so the receipt says *what* was missing."""
         missing: list[str] = []
         if not snapshot.available:
             missing.append("policy_snapshot")
-        elif snapshot.signature is SignatureStatus.INVALID:
-            missing.append("policy_snapshot_signature")
+        elif snapshot.signature is not SignatureStatus.VALID:
+            # ⛔Only VALID is usable. Rejecting INVALID alone let UNSIGNED and
+            #   UNKEYED through, and an in-memory reproduction with an otherwise
+            #   valid UNSIGNED snapshot produced ALLOW for OPS (codex P1 #3).
+            #   §3/P5 require the engine to *verify* the snapshot before use;
+            #   "nobody signed it" and "the signature is a sha256[:16] prefix
+            #   that is not integrity" (E10 4e) are both failures to verify, and
+            #   an unverified authority record is not authority.
+            missing.append(f"policy_snapshot_signature:{_signature_name(snapshot.signature)}")
         if not registry.available:
             missing.append("capability_registry")
         elif registry.stale:
@@ -797,6 +832,19 @@ def _is_identity_dependent(reviewer, gate_name, reuse) -> bool:
             and not reuse.approver_identity_verified:
         return True
     return False
+
+
+def _signature_name(status) -> str:
+    return str(getattr(status, "value", status) or "UNSIGNED")
+
+
+def _denied_gate():
+    """A gate provider that could not be consulted is not "no gate required".
+
+    It is recorded as PENDING — an owner decision — rather than NOT_REQUIRED,
+    so the fail direction stays the same as every other unreadable input."""
+    from agent_crew.cea.receipt import HumanGate, HumanGateState
+    return HumanGate(HumanGateState.PENDING)
 
 
 def _matched(registry: CapabilityLookup):
