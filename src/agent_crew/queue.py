@@ -5116,6 +5116,49 @@ class TaskQueue:
             logger.exception("tokenomics canary: atomic suppression failed for %s", task_id)
             return False
 
+    def record_shadow_rounds_vs_cap(
+        self, task_id: str, *, recommended: Optional[int], actual_cap: int,
+    ) -> None:
+        """Note the contract's recommended round budget beside the cap in force.
+
+        EGD Step 2 is *recorded, not enforced*: by the time this runs the
+        cascade has already taken ``actual_cap`` from
+        ``CascadeContract.fix_round_cap``, and writing the pair down cannot
+        move it. ``recommended is None`` means the contract said nothing —
+        an absent observation, never a cap of zero.
+
+        Merges into the enqueue-time receipt rather than inserting its own:
+        the row already exists by the time the cascade cites it, and a second
+        writer competing for the same primary key would be the bug, not the
+        record. No row at all leaves nothing to annotate.
+        """
+        now = time.time()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT actual_execution_json FROM tokenomics_shadow_receipts WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return
+            try:
+                actual = json.loads(row["actual_execution_json"])
+            except (TypeError, ValueError):
+                actual = None
+            if not isinstance(actual, dict):
+                actual = {}
+            actual["shadow_rounds_vs_cap"] = {
+                "recommended": recommended, "actual_cap": actual_cap,
+            }
+            conn.execute(
+                """UPDATE tokenomics_shadow_receipts
+                   SET actual_execution_json=?, updated_at=? WHERE task_id=?""",
+                (json.dumps(actual), now, task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_tokenomics_shadow_receipt(self, task_id: str) -> Optional[dict]:
         """Return the main-branch shadow decision receipt for one task, if any."""
         conn = self._connect()

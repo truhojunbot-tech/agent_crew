@@ -46,6 +46,7 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
+from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
 # §11.2 #14: the review/test contract comes from admission, already decided.
 # ⛔Do not import ``agent_crew.risk_tier`` here. Asking it again at cascade time
 #   is what made this file a second decision implementation; the static rule in
@@ -812,6 +813,53 @@ def _record_risk_tier_shadow(queue: TaskQueue, task, actual_action: str) -> None
     _cascade.record_shadow(queue, task, actual_action, review_fix_max_rounds())
 
 
+def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
+    """Walk ``prev_task_id`` back to the task this lineage started from.
+
+    quota-core publishes one decision per ORIGINATING task, so every round of
+    a review↔fix lineage has to cite the same root decision — cite the review
+    instead and round 2's recommendation is simply absent, which reads as "the
+    contract said nothing" rather than "we looked in the wrong place".
+
+    ``seen`` is not defensive dressing: contexts are operator-writable JSON, so
+    a cycle is reachable without a code bug, and this runs inside the cascade.
+    """
+    current = task
+    seen = {current.task_id}
+    while True:
+        ctx = current.context if isinstance(current.context, dict) else {}
+        prev = ctx.get("prev_task_id")
+        if not isinstance(prev, str) or prev in seen or prev not in tasks_by_id:
+            return current.task_id
+        seen.add(prev)
+        current = tasks_by_id[prev]
+
+
+def _shadow_rounds_citation(tasks_by_id: dict, review_task) -> dict:
+    """What the tokenomics contract WOULD have capped this lineage at (#51).
+
+    ⛔Observation only, and fail-open by construction. The caller has already
+      taken its cap from the stored cascade contract before asking, so nothing
+      here can widen or narrow a budget. A contract that is missing, stale,
+      unreadable or silent about this lineage yields ``None`` — the cascade
+      then behaves exactly as it does with no contract at all, which is the
+      whole point of a shadow step.
+    """
+    shadow = shadow_recommendation_for_task_id(
+        _lineage_root_task_id(tasks_by_id, review_task))
+    recommendation = shadow.get("recommendation")
+    recommendation = recommendation if isinstance(recommendation, dict) else {}
+    recommended = recommendation.get("recommended_max_review_fix_rounds")
+    # `bool` is an `int` in Python; True is not a round budget.
+    if isinstance(recommended, bool) or not isinstance(recommended, int):
+        recommended = None
+    return {
+        "recommended_max_review_fix_rounds": recommended,
+        "contract_sha": shadow.get("contract_sha"),
+        "rationale": recommendation.get("rationale") or shadow.get("reason"),
+    }
+
+
 def fix_task_id(review_task_id: str, fix_round: int) -> str:
     """The task id a given review round's fix MUST have.
 
@@ -1071,6 +1119,21 @@ def auto_enqueue_fix(
         if implementer_agent:
             fix_context["implementer_agent"] = implementer_agent
 
+        # EGD Step 2 (#51): carry the contract's recommended round budget next
+        # to the cap actually in force, so the gap between them is measurable
+        # before anyone proposes enforcing it. Guarded separately from the
+        # outer handler because that one returns None — losing an observation
+        # must not read as "no fix task was created".
+        citation = None
+        try:
+            citation = _shadow_rounds_citation(
+                {t.task_id: t for t in queue.list_tasks()}, review_task)
+            fix_context["tokenomics_shadow"] = citation
+        except Exception:
+            logger.exception(
+                f"auto_enqueue_fix: shadow rounds citation failed for "
+                f"{review_task_id} — cascade continues on the stored contract")
+
         fix_id = fix_task_id(review_task_id, fix_round)
         # Cheap early-out with a legible log. It is NOT the guard — the
         # `enqueue` below is, because only the PRIMARY KEY is atomic.
@@ -1100,6 +1163,16 @@ def auto_enqueue_fix(
                 f"{review_task_id} — leaving the winner in place"
             )
             return None
+        if citation is not None:
+            try:
+                queue.record_shadow_rounds_vs_cap(
+                    fix_id,
+                    recommended=citation["recommended_max_review_fix_rounds"],
+                    actual_cap=max_rounds)
+            except Exception:
+                logger.exception(
+                    f"auto_enqueue_fix: shadow_rounds_vs_cap receipt failed for "
+                    f"{fix_id} — the fix task itself stands")
         logger.info(
             f"auto_enqueue_fix: enqueued {fix_id} for {review_task_id} "
             f"(round {fix_round}/{max_rounds})"
