@@ -39,6 +39,7 @@ _BY_REASON: tuple[tuple[str, int], ...] = (
     ("DUPLICATE_INTENT", 409),
     ("RUNTIME_", 423),
     ("BUDGET_EXHAUSTED", 423),
+    ("BUDGET_UNVERIFIED", 423),
     ("HUMAN_GATE_PENDING", 423),
 )
 

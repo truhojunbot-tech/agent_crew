@@ -356,7 +356,11 @@ def test_an_unobservable_budget_is_recorded_honestly_and_fails_closed(conn):
     assert validate_receipt(auth.receipt) == []
     assert auth.receipt["provider_budget"]["state"] == "UNVERIFIED"
     assert auth.receipt["binding"]["budget_class"] == "EXHAUSTED"
-    assert auth.decision == "BLOCK"
+    assert auth.decision == "BLOCK" and auth.code == "BUDGET_UNVERIFIED"
+    assert auth.http_status == 403
+    result = validate(auth.receipt, ValidationPoint.ENQUEUE,
+                      CurrentInputs(binding=auth.receipt["binding"]))
+    assert result.outcome is ValidationOutcome.BLOCK
 
 
 # ---------------------------------------------------------------------------

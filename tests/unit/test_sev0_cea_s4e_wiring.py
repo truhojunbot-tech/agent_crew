@@ -131,9 +131,10 @@ def write_quota(tmp_path: Path, *, utilization=0.1) -> Path:
     for provider in ("claude", "codex", "gemini"):
         d = quota / f"{provider}_monitor"
         d.mkdir(parents=True, exist_ok=True)
-        (d / "quota_cache.json").write_text(
-            json.dumps({"fetched_at": time.time(),
-                        "five_hour": {"utilization": utilization}}), encoding="utf-8")
+        cache = {"fetched_at": time.time(), "five_hour": {"utilization": utilization}}
+        if provider == "codex":
+            cache["account_fingerprint"] = "sha256:" + hashlib.sha256(b"test-account").hexdigest()[:16]
+        (d / "quota_cache.json").write_text(json.dumps(cache), encoding="utf-8")
     return quota
 
 
@@ -156,11 +157,14 @@ def absent_env(tmp_path: Path) -> dict:
 
 
 def configured_env(tmp_path: Path, *, signed=True, key=True, **snap) -> dict:
+    auth_path = tmp_path / "codex-auth.json"
+    auth_path.write_text(json.dumps({"tokens": {"account_id": "test-account"}}))
     env = {
         "AGENT_CREW_CEA_SNAPSHOT_PATH": str(write_snapshot(tmp_path, signed=signed, **snap)),
         "AGENT_CREW_CEA_REGISTRY_PATH": str(write_registry(tmp_path)),
         "AGENT_CREW_CEA_MEMORY_CMD": f"{sys.executable} {write_memory_cmd(tmp_path)}",
         "AGENT_CREW_CEA_QUOTA_CACHE_DIR": str(write_quota(tmp_path)),
+        "AGENT_CREW_CEA_CODEX_AUTH_PATH": str(auth_path),
     }
     if key:
         env["AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"] = str(write_key(tmp_path))

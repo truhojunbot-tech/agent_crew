@@ -1046,7 +1046,7 @@ class AuthorizationEngine:
 
         decision, code, text = self._decide(
             intent=intent, snapshot=snapshot, registry=registry, runtime=runtime,
-            gate=gate, binding=binding, unavailable=unavailable, reuse=reuse,
+            gate=gate, binding=binding, budget=budget, unavailable=unavailable, reuse=reuse,
             reviewer=reviewer, degraded=degraded)
 
         receipt = {
@@ -1100,7 +1100,7 @@ class AuthorizationEngine:
         }
         return self._resign(receipt)
 
-    def _decide(self, *, intent, snapshot, registry, runtime, gate, binding,
+    def _decide(self, *, intent, snapshot, registry, runtime, gate, binding, budget,
                 unavailable, reuse, reviewer, degraded) -> tuple[str, str, str]:
         """The verdict, in the order the ADR fixes the precedence.
 
@@ -1145,6 +1145,9 @@ class AuthorizationEngine:
                     f"(§1.4, §5.3)")
 
         if binding["budget_class"] == "EXHAUSTED":
+            if getattr(budget.state, "value", budget.state) == "UNVERIFIED":
+                return ("BLOCK", "BUDGET_UNVERIFIED",
+                        "J6: the provider budget could not be verified; work is refused (O9)")
             return ("BLOCK", "BUDGET_EXHAUSTED",
                     "J6: the provider budget is EXHAUSTED; the work is refused rather than "
                     "queued to fail (O9)")

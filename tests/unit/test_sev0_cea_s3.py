@@ -32,7 +32,7 @@ from agent_crew.cea.input_providers import (
 from agent_crew.cea.intent import CallerProvenance, Intent, IntentIdentity, Target, WorkClass
 from agent_crew.cea.memory import MemoryGate, memory_providers
 from agent_crew.cea.providers import PolicySnapshotRef, SignatureStatus
-from agent_crew.cea.receipt import BudgetClass, DecisionRev, HumanGate, HumanGateState, ProviderBudget
+from agent_crew.cea.receipt import BudgetClass, DecisionRev, HumanGate, HumanGateState, ProviderBudget, ProviderBudgetState
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
 from agent_crew.cea.schema import validate_receipt
 
@@ -194,10 +194,10 @@ def test_budget_o9_stale_paid_closed_plan_open_with_receipt(tmp_path):
                                                     "five_hour": {"utilization": 0.1}}))
     paid = QuotaBudgetProvider(str(tmp_path), credit_class={"claude": "paid"}, clock=lambda: now)
     plan = QuotaBudgetProvider(str(tmp_path), credit_class={"claude": "plan"}, clock=lambda: now)
-    assert paid.budget("claude").state is BudgetClass.EXHAUSTED
+    assert paid.budget("claude").state is ProviderBudgetState.UNVERIFIED
     b = plan.budget("claude")
     assert b.state is BudgetClass.CONSTRAINED and b.observed_at == now - 10 ** 5
-    assert paid.budget("codex").state is BudgetClass.EXHAUSTED          # no cache at all
+    assert paid.budget("codex").state is ProviderBudgetState.UNVERIFIED  # no cache at all
     (d / "quota_cache.json").write_text(json.dumps({"fetched_at": now, "five_hour": {"utilization": 0.95}}))
     assert plan.budget("claude").state is BudgetClass.CONSTRAINED
     cd = tmp_path / "cooldown.json"

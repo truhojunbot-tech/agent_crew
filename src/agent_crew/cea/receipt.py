@@ -66,6 +66,11 @@ class BudgetClass(str, Enum):
     EXHAUSTED = "EXHAUSTED"
 
 
+class ProviderBudgetState(str, Enum):
+    """Provider observation state; UNVERIFIED is fail-closed in the binding."""
+    UNVERIFIED = "UNVERIFIED"
+
+
 class ReuseDecision(str, Enum):
     """§3 ``reuse.decision: NEW | REUSE | EXTEND``."""
     NEW = "NEW"
@@ -138,7 +143,7 @@ class Reuse:
 class ProviderBudget:
     """§3 ``provider_budget: {provider, state, observed_at}``."""
     provider: str
-    state: BudgetClass
+    state: BudgetClass | ProviderBudgetState
     observed_at: Optional[float] = None
 
 

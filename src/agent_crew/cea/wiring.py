@@ -33,6 +33,7 @@ env                                      meaning
                                          input ⇒ BLOCK, exactly as before this module
 ``AGENT_CREW_CEA_MEMORY_CMD``            L2/L3 provider command (``python3 …/admission_inputs.py``)
 ``AGENT_CREW_CEA_QUOTA_CACHE_DIR``       Qouta ``<dir>/<provider>_monitor/quota_cache.json``
+``AGENT_CREW_CEA_CODEX_AUTH_PATH``       Codex account identity JSON (default ``~/.codex/auth.json``)
 ``AGENT_CREW_CEA_COOLDOWN_FILE``         #308 cooldown JSON ``{provider: until_epoch}``
 ``AGENT_CREW_CEA_INCIDENT_MEMORY``       L3 incident memory JSON (passed to the L3 command)
 ``AGENT_CREW_CEA_CREDIT_CLASS``          JSON ``{provider: "plan"|"paid"|"overage"}`` (O9)
