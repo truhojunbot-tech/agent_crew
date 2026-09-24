@@ -15,6 +15,9 @@ older than ``max_age_seconds``, unreadable, or an ``error`` body):
 
 A missing cooldown file means "no cooldown recorded"; an unreadable one is
 treated like a stale observation.
+
+For Codex, an absent current-account identity or a cache fingerprint mismatch
+means there is no observation for this account and is always UNVERIFIED.
 """
 from __future__ import annotations
 
@@ -22,6 +25,7 @@ import json
 import os
 import time
 import base64
+import binascii
 import hashlib
 from typing import Optional
 
@@ -63,14 +67,19 @@ class QuotaBudgetProvider:
             if id_token is not None:
                 payload = id_token.split(".")[1]
                 payload += "=" * (-len(payload) % 4)
-                claim_id = json.loads(base64.urlsafe_b64decode(payload))["chatgpt_account_id"]
-            if account_id is not None and claim_id is not None and account_id != claim_id:
+                claims = json.loads(base64.urlsafe_b64decode(payload))
+                nested_claims = claims.get("https://api.openai.com/auth", {})
+                if not isinstance(nested_claims, dict):
+                    return None
+                claim_id = (claims.get("chatgpt_account_id"),
+                            nested_claims.get("chatgpt_account_id"))
+            if not isinstance(account_id, str) or not account_id:
                 return None
-            identity = account_id if account_id is not None else claim_id
-            if not isinstance(identity, str) or not identity:
+            if claim_id is not None and any(claim is not None and claim != account_id
+                                            for claim in claim_id):
                 return None
-            return "sha256:" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:16]
-        except (OSError, ValueError, KeyError, TypeError, IndexError):
+            return "sha256:" + hashlib.sha256(account_id.encode("utf-8")).hexdigest()[:16]
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError, binascii.Error):
             return None
 
     def _cooldown_until(self, provider: str) -> Optional[float]:
@@ -103,7 +112,8 @@ class QuotaBudgetProvider:
         if provider == "codex":
             fingerprint = self._codex_fingerprint()
             if not fingerprint or cache.get("account_fingerprint") != fingerprint:
-                return self._stale(provider, observed)
+                return ProviderBudget(provider=provider, state=ProviderBudgetState.UNVERIFIED,
+                                      observed_at=observed)
         if cache.get("error") or now - observed > self.max_age_seconds:
             return self._stale(provider, observed)
         util = 0.0

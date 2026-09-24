@@ -2,7 +2,9 @@
 import base64
 import hashlib
 import json
+import os
 import sqlite3
+from unittest.mock import patch
 
 import pytest
 
@@ -23,15 +25,17 @@ def fingerprint(account=ACCOUNT):
     return "sha256:" + hashlib.sha256(account.encode()).hexdigest()[:16]
 
 
-def token(account=ACCOUNT):
-    payload = base64.urlsafe_b64encode(json.dumps({"chatgpt_account_id": account}).encode()).decode().rstrip("=")
+def token(account=ACCOUNT, *, nested=False):
+    claims = ({"https://api.openai.com/auth": {"chatgpt_account_id": account}}
+              if nested else {"chatgpt_account_id": account})
+    payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     return f"header.{payload}.signature"
 
 
-def provider(tmp_path, *, auth=True, account=ACCOUNT, claim=ACCOUNT, credit="paid"):
+def provider(tmp_path, *, auth=True, account=ACCOUNT, claim=ACCOUNT, credit="paid", nested=False):
     auth_path = tmp_path / "auth.json"
     if auth:
-        auth_path.write_text(json.dumps({"tokens": {"account_id": account, "id_token": token(claim),
+        auth_path.write_text(json.dumps({"tokens": {"account_id": account, "id_token": token(claim, nested=nested),
                                                     "access_token": SECRET}}))
     quota = tmp_path / "quota"
     (quota / "codex_monitor").mkdir(parents=True, exist_ok=True)
@@ -87,13 +91,55 @@ def test_unobservable_codex_budget_is_unverified(tmp_path, change, caplog):
     assert SECRET not in caplog.text
 
 
-def test_claim_fallback_and_plan_credit_branch(tmp_path):
+def test_missing_account_id_and_plan_account_mismatch_are_unverified(tmp_path):
     p = provider(tmp_path, account=None)
     cache(p)
-    assert p.budget("codex").state is BudgetClass.OK
+    assert p.budget("codex").state is ProviderBudgetState.UNVERIFIED
     plan = provider(tmp_path, account="different", credit="plan")
     cache(plan)
-    assert plan.budget("codex").state is BudgetClass.CONSTRAINED
+    assert plan.budget("codex").state is ProviderBudgetState.UNVERIFIED
+
+
+@pytest.mark.parametrize("change", ["mismatch", "missing_fingerprint", "missing_identity"])
+def test_plan_without_current_account_observation_blocks(tmp_path, change):
+    p = provider(tmp_path, account=None if change == "missing_identity" else ACCOUNT, credit="plan")
+    cache(p, account_fingerprint=(fingerprint("other-account") if change == "mismatch" else
+                                  None if change == "missing_fingerprint" else fingerprint()))
+    assert p.budget("codex").state is ProviderBudgetState.UNVERIFIED
+    with sqlite3.connect(":memory:") as conn:
+        conn.row_factory = sqlite3.Row
+        receipt_store.ensure_schema(conn)
+        auth = engine(budgets=p).authorize(conn, intent(task_id=change), caller())
+    assert auth.decision == "BLOCK" and auth.code == "BUDGET_UNVERIFIED"
+    assert auth.receipt["binding"]["budget_class"] == "EXHAUSTED"
+
+
+@pytest.mark.parametrize("change", ["stale", "error"])
+def test_plan_matching_stale_observation_remains_constrained(tmp_path, change):
+    p = provider(tmp_path, credit="plan")
+    cache(p, **({"fetched_at": NOW - 901} if change == "stale" else
+                {"error": "quota fetch failed"}))
+    assert p.budget("codex").state is BudgetClass.CONSTRAINED
+
+
+def test_nested_claim_fixture_matches_account_id(tmp_path):
+    p = provider(tmp_path, nested=True)
+    cache(p)
+    assert p._codex_fingerprint() == fingerprint()
+    assert p.budget("codex").state is BudgetClass.OK
+
+
+def test_writer_reader_fingerprints_match_for_nested_claim(tmp_path, monkeypatch):
+    quota_ops_path = os.environ.get("J6_QUOTA_OPS_PATH")
+    if not quota_ops_path:
+        pytest.skip("cross-repo contract test requires J6_QUOTA_OPS_PATH")
+    monkeypatch.syspath_prepend(quota_ops_path)
+    from codex_monitor import codex_monitor
+
+    p = provider(tmp_path, nested=True)
+    with patch.object(codex_monitor, "CODEX_AUTH", tmp_path / "auth.json"):
+        writer_fingerprint, _ = codex_monitor._current_account_identity()
+    assert writer_fingerprint == p._codex_fingerprint() == fingerprint()
 
 
 @pytest.mark.parametrize("credit", ["paid", "overage", "unrecognized"])
