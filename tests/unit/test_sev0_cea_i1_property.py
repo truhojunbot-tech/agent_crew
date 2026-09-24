@@ -495,42 +495,8 @@ def test_every_transport_reaches_admission_as_its_own_ingress(tmp_path, monkeypa
                            f"every §7 adapter names its project (s4j)")
 
 
-#: s4j, **new item**: the two transports whose successor is the *same work* as
-#: its parent — a retry and a provider fallback keep the task_type, branch and
-#: (now) project of the task they replace, and `intent_hash` is exactly that
-#: tuple: task_id and description are deliberately not members (P4). So once
-#: s4j made them name their parent's project, their intent hash equals their
-#: parent's and P4 answers `DUPLICATE_INTENT` — correctly. Every other cascade
-#: changes work_class on the way (review→test, review→fix) and does not collide.
-#:
-#: This is not a regression of the project-required ingress; it is the invariant
-#: underneath it becoming reachable. Closing it is §8 re-admission: a retry and
-#: a fallback are the *same lineage* re-admitted (`retry=True`, which
-#: `_existing_lineage` already implements as RETRY_SAME_RECEIPT / supersede),
-#: not a new one — and `TaskQueue.enqueue` has no `retry=` passthrough yet, and
-#: the I1 baseline would have to seed the parent lineage to compare like for
-#: like. Both are out of s4j's one bounded item.
-#:
-#: Pinned by `test_s4j_retry_and_fallback_now_collide_with_their_parent_lineage`
-#: below, so this strict xfail cannot be failing for some other reason.
-SAME_WORK_AS_PARENT = {"retry_http", "cascade_fallback"}
-
-S4J_SAME_WORK = (
-    "s4j new item 'retry/fallback re-admission': {kind}'s successor carries its parent's "
-    "project (s4j), task_type and branch, so its intent_hash equals the parent's and P4 "
-    "answers DUPLICATE_INTENT — while the HTTP baseline, in a fresh DB with no parent "
-    "lineage, is admitted. Needs §8 re-admission (retry=True through TaskQueue.enqueue) "
-    "and an I1 baseline that seeds the lineage; neither is this step's item")
-
-
 def test_s4j_retry_and_fallback_now_collide_with_their_parent_lineage(tmp_path, monkeypatch):
-    """Why the two strict xfails above fail, asserted rather than asserted-about.
-
-    Drives the fallback cascade for real and reads the receipts out of its own
-    DB: the successor's `intent_hash` equals the parent's, and the refusal is
-    P4's `DUPLICATE_INTENT`. If the cause ever changes — a different code, or
-    the hashes diverging again — this goes red and the xfail's reason stops
-    being a story about code that has moved on."""
+    """A declared fallback re-admits its parent's lineage through P4's retry path."""
     live = LiveState(AuthorityState("active"))
     inject_cea(monkeypatch, live)
     db = str(tmp_path / "collide.db")
@@ -548,10 +514,12 @@ def test_s4j_retry_and_fallback_now_collide_with_their_parent_lineage(tmp_path, 
     assert parent and child, [r["task_id"] for r in rows]
     # the s4j half: the successor names the parent's project rather than ""
     assert child[-1]["project"] == parent[-1]["project"] == "agent_crew"
-    # ...which is exactly why it collides: identity has no task_id in it (P4)
+    # It is the same work, so identity has no task_id in it (P4).
     assert child[-1]["intent_hash"] == parent[-1]["intent_hash"]
-    assert child[-1]["decision"] == "BLOCK"
-    assert child[-1]["reason"]["code"] == "DUPLICATE_INTENT"
+    # System-written fallback metadata grants retry=True: this is re-admission,
+    # not a second intent that must be refused as DUPLICATE_INTENT.
+    assert child[-1]["decision"] == "REVIEW"
+    assert child[-1]["reason"]["code"] == "IDENTITY_UNVERIFIED_REVIEW_REQUIRED"
 
 
 @pytest.mark.parametrize("state", TRANSPORT_STATES, ids=lambda s: s.label)
@@ -560,9 +528,13 @@ def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind
                                                      request):
     assert kind not in EMPTY_PROJECT_KINDS, (
         f"{kind} is listed project-less; s4j closed that item — see EMPTY_PROJECT_KINDS")
-    if kind in SAME_WORK_AS_PARENT:
-        request.applymarker(pytest.mark.xfail(strict=True,
-                                              reason=S4J_SAME_WORK.format(kind=kind)))
+    # The HTTP retry transport completes its parent before retrying, so its
+    # fresh-DB baseline is intentionally not equivalent yet. Fallback no
+    # longer has this exception: declared lineage metadata re-admits it.
+    if kind == "retry_http":
+        request.applymarker(pytest.mark.xfail(
+            strict=True,
+            reason="deferred: completed-parent retry needs a seeded-lineage HTTP baseline"))
     live = LiveState(state)
     inject_cea(monkeypatch, live)
     spy = EnqueueSpy(monkeypatch)
