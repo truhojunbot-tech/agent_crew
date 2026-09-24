@@ -216,20 +216,130 @@ def test_cancelled_result_is_rejected_without_row_or_artifact_mutation(tmp_db):
     assert row == ("cancelled", None)
 
 
-def test_cancel_sends_sigterm_to_the_dispatched_process_group(tmp_db, monkeypatch):
-    """I-B: dispatcher-owned workers are stopped as a process group on cancel."""
+class _FakeProc:
+    """A worker whose exit is under the test's control, not the clock's."""
+
+    def __init__(self, pid=4242):
+        self.pid = pid
+        self.returncode = None
+
+    def exit(self, code=0):
+        self.returncode = code
+
+
+@pytest.fixture
+def cancel_app(tmp_db, monkeypatch):
+    """An app whose cancel-path SIGKILL escalation cannot outlive the test.
+
+    ⛔The original version of these tests armed a bare `threading.Timer(2.0,
+      ...)` around a REAL `os.killpg`, against a fake proc whose `returncode`
+      never flipped. The timer fired after monkeypatch teardown, so the kill
+      went out for real — at a pid the test never owned and the kernel may
+      since have recycled. Here `os.killpg` is recorded rather than sent, the
+      grace period is small enough to observe, and anything still armed is
+      defused before the `monkeypatch` fixture (torn down after this one)
+      restores the real syscall.
+    """
+    monkeypatch.setenv("AGENT_CREW_CANCEL_KILL_GRACE", "0.05")
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
-    calls = []
-    class Proc:
-        pid = 4242
-        returncode = None
-    monkeypatch.setattr("agent_crew.server.os.killpg", lambda pid, sig: calls.append((pid, sig)))
-    app.state.active_dispatch_processes["worker"] = Proc()
+    app.state.killpg_calls = []
+    monkeypatch.setattr("agent_crew.server.os.killpg",
+                        lambda pid, sig: app.state.killpg_calls.append((pid, sig)))
+    try:
+        yield app
+    finally:
+        for timer in list(app.state.cancel_kill_timers.values()):
+            timer.cancel()
+            timer.join(timeout=1.0)
+        app.state.cancel_kill_timers.clear()
+
+
+def _enqueue_and_cancel(app, task_id="worker"):
     with TestClient(app) as client:
-        client.post("/tasks", json={"task_id": "worker", "task_type": "implement", "description": "d", "branch": "main"})
-        response = client.delete("/tasks/worker")
+        client.post("/tasks", json={"task_id": task_id, "task_type": "implement",
+                                    "description": "d", "branch": "main"})
+        return client.delete(f"/tasks/{task_id}")
+
+
+def test_cancel_sends_sigterm_to_the_dispatched_process_group(cancel_app):
+    """I-B: dispatcher-owned workers are stopped as a process group on cancel."""
+    import signal as _signal
+
+    proc = _FakeProc()
+    cancel_app.state.active_dispatch_processes["worker"] = proc
+    response = _enqueue_and_cancel(cancel_app)
     assert response.json()["worker_termination"] == "sigterm_sent"
-    assert calls[0] == (4242, __import__("signal").SIGTERM)
+    assert cancel_app.state.killpg_calls[0] == (4242, _signal.SIGTERM)
+    assert "worker" in cancel_app.state.cancel_kill_timers, \
+        "the SIGKILL escalation must be addressable so it can be defused"
+
+
+def test_pending_sigkill_is_defused_when_the_worker_honours_sigterm(cancel_app):
+    """The escalation must be a no-op once the process is actually gone."""
+    import signal as _signal
+
+    proc = _FakeProc(pid=4343)
+    cancel_app.state.active_dispatch_processes["worker"] = proc
+    _enqueue_and_cancel(cancel_app)
+    proc.exit(0)                                  # worker obeys the SIGTERM
+    timer = cancel_app.state.cancel_kill_timers["worker"]
+    timer.join(timeout=2.0)
+    assert not timer.is_alive()
+    assert [sig for _pid, sig in cancel_app.state.killpg_calls] == [_signal.SIGTERM]
+    assert "worker" not in cancel_app.state.cancel_kill_timers
+
+
+def test_sigkill_escalates_only_while_the_worker_is_still_alive(cancel_app):
+    """A worker that ignores SIGTERM gets SIGKILL — at its own pid, once."""
+    import signal as _signal
+
+    cancel_app.state.active_dispatch_processes["worker"] = _FakeProc(pid=4444)
+    _enqueue_and_cancel(cancel_app)
+    cancel_app.state.cancel_kill_timers["worker"].join(timeout=2.0)
+    assert cancel_app.state.killpg_calls == [(4444, _signal.SIGTERM), (4444, _signal.SIGKILL)]
+    assert not cancel_app.state.cancel_kill_timers
+
+
+def test_cancel_of_a_pane_worker_says_so_rather_than_not_dispatched(cancel_app):
+    """A pane worker has no PID we own; `not_dispatched` claimed the opposite —
+    the task WAS dispatched, it just is not ours to kill."""
+    response = _enqueue_and_cancel(cancel_app, task_id="pane")
+    assert response.json()["worker_termination"] == "pane_worker_not_killable"
+    assert cancel_app.state.killpg_calls == []
+
+
+def test_cancel_commits_before_it_terminates_and_kills_nothing_on_failure(cancel_app, monkeypatch):
+    """I-A precedes I-B. If the authoritative cancel does not commit, the caller
+    gets a 5xx and the worker is left running — a killed-but-still-authorized
+    worker is the worse of the two failures."""
+    order = []
+    proc = _FakeProc(pid=4545)
+    cancel_app.state.active_dispatch_processes["worker"] = proc
+    real_terminate = cancel_app.state.terminate_worker
+    monkeypatch.setattr(cancel_app.state, "terminate_worker",
+                        lambda *a, **kw: (order.append("terminate"), real_terminate(*a, **kw))[1],
+                        raising=False)
+
+    with TestClient(cancel_app) as client:
+        client.post("/tasks", json={"task_id": "worker", "task_type": "implement",
+                                    "description": "d", "branch": "main"})
+        from agent_crew.queue import TaskQueue as _TQ
+        real_cancel = _TQ.cancel
+
+        def _cancel(self, task_id):
+            order.append("commit")
+            return real_cancel(self, task_id)
+
+        monkeypatch.setattr(_TQ, "cancel", _cancel)
+        assert client.delete("/tasks/worker").status_code == 200
+        assert order == ["commit", "terminate"] or order == ["commit"], order
+
+        # Now make the commit fail: nothing may be signalled.
+        monkeypatch.setattr(_TQ, "cancel", lambda self, task_id: (_ for _ in ()).throw(RuntimeError("db down")))
+        before = list(cancel_app.state.killpg_calls)
+        failed = client.delete("/tasks/worker")
+    assert failed.status_code == 500
+    assert cancel_app.state.killpg_calls == before, "a failed cancel must signal nothing"
 
 
 def test_heartbeat_only_touches_running_tasks(tmp_db):

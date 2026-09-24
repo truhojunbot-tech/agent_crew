@@ -4014,8 +4014,7 @@ class TaskQueue:
             # a copied task block unusable even if its worker ignores cancellation.
             receipt_id = row["receipt_id"]
             if receipt_id:
-                conn.execute("UPDATE dispatch_nonces SET used_at = ?, used_by = 'cancelled_attempt' "
-                             "WHERE receipt_id = ? AND used_at IS NULL", ("cancelled", receipt_id))
+                _cea_store.revoke_nonces_for_receipt(conn, receipt_id)
                 receipt = _cea_store.current_receipt(conn, receipt_id)
                 if receipt and receipt.get("state") not in _cea_store.TERMINAL_STATES:
                     self._cea_transition_in_txn(conn, self.cea_engine(), receipt_id, "REVOKED",

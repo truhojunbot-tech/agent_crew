@@ -2526,6 +2526,55 @@ def create_app(
     # Only dispatcher subprocesses live here.  Pane workers cannot be killed
     # by PID safely, so cancellation still revokes their authorization first.
     _active_dispatch_processes: dict[str, object] = {}
+    #: Pending SIGTERM→SIGKILL escalation timers, keyed by task_id.  Kept
+    #: addressable so they can be cancelled when the process exits on its own
+    #: (and by tests in teardown).  A bare ``threading.Timer`` holding a real
+    #: ``os.killpg`` is a live weapon: with a stubbed process whose
+    #: ``returncode`` never flips, it fired after the test had torn its
+    #: monkeypatching down and signalled whatever the kernel had since
+    #: recycled that pid to (review of 720ac76).
+    _cancel_kill_timers: dict[str, threading.Timer] = {}
+    #: Grace period between SIGTERM and SIGKILL on cancel.  Env-tunable so
+    #: tests can drive the escalation without a real two-second sleep.
+    _cancel_kill_grace = float(os.getenv("AGENT_CREW_CANCEL_KILL_GRACE", "2.0"))
+
+    def _cancel_pending_kill(task_id: str) -> None:
+        """Defuse a scheduled SIGKILL for ``task_id`` (process already gone)."""
+        timer = _cancel_kill_timers.pop(task_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _terminate_worker(task_id: str, proc) -> str:
+        """Stop the worker for an already-cancelled task.  Returns the state
+        to report, naming what actually happened rather than guessing.
+
+        Only dispatcher subprocesses are ours to signal; a pane worker has no
+        PID we own, so for it the authoritative cancel is the entire remedy.
+        """
+        if proc is None:
+            return "pane_worker_not_killable"
+        if getattr(proc, "returncode", None) is not None:
+            return "already_exited"
+        try:
+            # The subprocess owns a session, so this reaches its helpers too.
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            logger.warning("cancel: worker process group unavailable task=%s pid=%s",
+                           task_id, getattr(proc, "pid", None))
+            return "process_group_unavailable"
+
+        def _kill_if_still_alive() -> None:
+            _cancel_kill_timers.pop(task_id, None)
+            if getattr(proc, "returncode", None) is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+
+        _cancel_pending_kill(task_id)
+        timer = threading.Timer(_cancel_kill_grace, _kill_if_still_alive)
+        timer.daemon = True
+        _cancel_kill_timers[task_id] = timer
+        timer.start()
+        return "sigterm_sent"
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
@@ -4474,7 +4523,14 @@ def create_app(
                 # we can kill the whole tree on timeout — agent CLIs (gemini,
                 # agy, codex) spawn helper children that survive a plain
                 # proc.kill() and reparent to PID 1 as orphans (#191).
-            proc = await asyncio.create_subprocess_exec(
+                #
+                # ⛔The spawn MUST stay inside this `with`. `log_f` is passed
+                #   as the child's stdout/stderr, and the spawn reads its
+                #   `.fileno()` to dup it into the child — outside the block the
+                #   handle is closed and every dispatch dies with
+                #   "I/O operation on closed file" (review of 720ac76). The
+                #   child keeps its own dup, so closing ours on exit is safe.
+                proc = await asyncio.create_subprocess_exec(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                     start_new_session=True,
                 )
@@ -4624,6 +4680,9 @@ def create_app(
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
             _active_dispatch_processes.pop(task.task_id, None)
+            # The process is reaped; a cancel's pending SIGKILL now has no
+            # legitimate target and must not outlive it (review of 720ac76).
+            _cancel_pending_kill(task.task_id)
             # #272: release the test-stage lock before anything else in the
             # teardown can raise — a leaked flock would block every later test
             # on this worktree until the process exits.
@@ -4828,6 +4887,10 @@ def create_app(
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
     app.state.active_dispatch_processes = _active_dispatch_processes
+    # Exposed so a test can assert no kill is left armed after it finishes —
+    # and defuse one in teardown if it is.
+    app.state.cancel_kill_timers = _cancel_kill_timers
+    app.state.terminate_worker = _terminate_worker
     # Same rationale (#248, #265): expose the terminal-marking helper so a test
     # can drive the real timeout path instead of asserting against a
     # reimplementation of it.
@@ -5955,23 +6018,28 @@ def create_app(
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
-        proc = _active_dispatch_processes.get(task_id)
-        terminated = False
-        if proc is not None and getattr(proc, "returncode", None) is None:
-            try:
-                # The subprocess owns a session, so this reaches its helpers too.
-                os.killpg(proc.pid, signal.SIGTERM)
-                terminated = True
-                def _kill_if_still_alive():
-                    if getattr(proc, "returncode", None) is None:
-                        with contextlib.suppress(ProcessLookupError, PermissionError):
-                            os.killpg(proc.pid, signal.SIGKILL)
-                threading.Timer(2.0, _kill_if_still_alive).start()
-            except (ProcessLookupError, PermissionError):
-                logger.warning("cancel: worker process group unavailable task=%s pid=%s", task_id,
-                               getattr(proc, "pid", None))
-        q().cancel(task_id)
-        return {"status": "cancelled", "worker_termination": "sigterm_sent" if terminated else "not_dispatched"}
+        """G12 I-A then I-B, in that order.
+
+        The authoritative cancel — status ``cancelled``, receipt ``REVOKED``,
+        outstanding nonces spent — commits in one transaction BEFORE the worker
+        is signalled.  720ac76 had it the other way round, which left two bad
+        windows: a killed worker that was still authorized, and (if the commit
+        then raised) a permanently dead attempt that the queue still believed
+        was running.  On commit failure we return 5xx and kill nothing, so the
+        caller can retry against an unchanged world.
+        """
+        try:
+            q().cancel(task_id)
+        except Exception:
+            logger.exception("cancel: authoritative cancel failed task=%s", task_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"cancel of {task_id!r} did not commit; worker left running",
+            )
+        return {
+            "status": "cancelled",
+            "worker_termination": _terminate_worker(task_id, _active_dispatch_processes.get(task_id)),
+        }
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(older_than: float = 600.0):

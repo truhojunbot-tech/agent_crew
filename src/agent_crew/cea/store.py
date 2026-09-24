@@ -440,6 +440,31 @@ def consume_nonce(conn: sqlite3.Connection, nonce: str, *, used_by: Optional[str
     return cur.rowcount == 1
 
 
+CANCELLED_ATTEMPT_CONSUMER = "cancelled_attempt"
+"""``used_by`` written when a cancel spends an attempt's outstanding nonces.
+
+Distinct from :data:`EXECUTE_START_CONSUMER`, so :func:`consumed_by_execute_start`
+keeps refusing a result presented against a cancelled attempt.
+"""
+
+
+def revoke_nonces_for_receipt(conn: sqlite3.Connection, receipt_id: str, *,
+                              used_by: str = CANCELLED_ATTEMPT_CONSUMER,
+                              used_at: Optional[str] = None) -> int:
+    """Spend every still-unspent nonce of ``receipt_id``; returns how many.
+
+    ``used_at`` is an RFC3339 *timestamp* column — the reason belongs in
+    ``used_by`` (and in the receipt transition note), never in the timestamp.
+    Writing a sentinel string there made the row unparseable to every reader
+    that treats the column as a time (review of 7747c9f).
+    """
+    cur = conn.execute(
+        "UPDATE dispatch_nonces SET used_at = ?, used_by = ? "
+        "WHERE receipt_id = ? AND used_at IS NULL",
+        (used_at or _now_rfc3339(), used_by, receipt_id))
+    return cur.rowcount
+
+
 def nonce_row(conn: sqlite3.Connection, nonce: str) -> Optional[dict]:
     row = conn.execute("SELECT nonce, receipt_id, attempt, issued_at, used_at, used_by "
                        "FROM dispatch_nonces WHERE nonce = ?", (nonce,)).fetchone()
