@@ -131,8 +131,10 @@ def test_nested_claim_fixture_matches_account_id(tmp_path):
 
 def test_writer_reader_fingerprints_match_for_nested_claim(tmp_path, monkeypatch):
     quota_ops_path = os.environ.get("J6_QUOTA_OPS_PATH")
-    if not quota_ops_path:
-        pytest.skip("cross-repo contract test requires J6_QUOTA_OPS_PATH")
+    quota_core_path = os.environ.get("J6_QUOTA_CORE_PATH")
+    if not quota_ops_path or not quota_core_path:
+        pytest.skip("cross-repo contract test requires J6_QUOTA_OPS_PATH and J6_QUOTA_CORE_PATH")
+    monkeypatch.syspath_prepend(quota_core_path)
     monkeypatch.syspath_prepend(quota_ops_path)
     from codex_monitor import codex_monitor
 
