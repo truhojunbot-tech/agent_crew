@@ -23,6 +23,11 @@ from agent_crew.server import create_app
 
 FIXTURE = Path(__file__).resolve().parents[1] / "fixtures" / "pre_g12_tasks.db"
 NEW_COLUMNS = [c for c in EXEC_STATE_COLUMNS if c != "push_at"]
+# What the migration actually appends to a pre-G12 `tasks`, in order. The CEA
+# receipt store (queue.py `_cea_ensure_schema`) runs first and adds its own
+# nullable `receipt_id`, so the G12 columns do not start the tail. Pinned
+# exactly: a migration that reorders or drops one of these is not additive.
+MIGRATION_ADDED_COLUMNS = ["receipt_id", *NEW_COLUMNS]
 
 
 def _columns(db):
@@ -55,7 +60,7 @@ def test_fixture_is_the_pre_g12_shape(legacy_db):
     """The premise: 17 columns, as in every preserved SEV-0 DB."""
     cols = _columns(legacy_db)
     assert len(cols) == 17
-    assert not set(NEW_COLUMNS) & set(cols)
+    assert not set(MIGRATION_ADDED_COLUMNS) & set(cols)
 
 
 def test_migration_adds_columns_and_history_without_touching_old_data(legacy_db):
@@ -66,10 +71,11 @@ def test_migration_adds_columns_and_history_without_touching_old_data(legacy_db)
 
     cols = _columns(legacy_db)
     assert cols[:17] == old_cols                       # additive: order and names kept
-    assert cols[17:] == NEW_COLUMNS
+    assert cols[17:] == MIGRATION_ADDED_COLUMNS
     assert _rows(legacy_db, old_cols) == before        # every old value unchanged
-    # Old rows carry no invented claim: NULL, not 0 / ''.
-    assert all(v is None for row in _rows(legacy_db, NEW_COLUMNS) for v in row)
+    # Old rows carry no invented claim or receipt: NULL, not 0 / ''.
+    assert all(v is None
+               for row in _rows(legacy_db, MIGRATION_ADDED_COLUMNS) for v in row)
     with sqlite3.connect(legacy_db) as c:
         assert c.execute("SELECT COUNT(*) FROM task_exec_events").fetchone()[0] == 0
 
@@ -101,7 +107,9 @@ def test_migrated_legacy_rows_keep_working(legacy_db):
     assert task.task_id == "legacy-pending"
     state = q.get_exec_state("legacy-pending")
     assert state["claimed_by_role"] == "tester"
-    assert [e["event"] for e in state["events"]] == ["claimed"]
+    # A pre-2c row has no receipt, so the CEA claim gate reports it (shadow mode)
+    # before the claim itself is recorded; both are events on the same task.
+    assert [e["event"] for e in state["events"]] == ["cea_legacy_row", "claimed"]
 
 
 # ---------------------------------------------------------------------------
@@ -393,7 +401,10 @@ def test_push_path_records_claim_push_and_dispatch(tmp_db, tmp_path):
     assert execution["dispatch_target"] == "%101"
     assert execution["lease_owner"] == "pane:%101"
     assert execution["lease_expires_at"] is None       # no deadline on a pane task
-    assert [e["event"] for e in execution["events"]] == ["claimed", "pushed", "dispatched"]
+    # `dispatched` precedes `pushed`: record_dispatch mints the nonce that has to
+    # be *inside* the pushed message, so the dispatch is recorded before the pane
+    # ever sees it, and set_push_at follows the push (server.py _try_push_*).
+    assert [e["event"] for e in execution["events"]] == ["claimed", "dispatched", "pushed"]
 
 
 def test_http_poll_records_an_api_dispatch(tmp_db):
@@ -450,7 +461,14 @@ def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
     assert state["dispatch_agent"] == "claude"
     assert state["dispatch_target"] == "pid:4242"
     dispatched = next(e for e in state["events"] if e["event"] == "dispatched")
-    assert dispatched["lease_owner"] == "claude:pid:4242"
+    # The dispatch is decided before the subprocess exists (the nonce must be in
+    # the prompt that spawns it), so the event names the executor as `pending`;
+    # `bind_dispatch_target` writes `pid:4242` onto the row afterwards — the
+    # `dispatch_target` asserted above is that same UPDATE's other column.
+    assert dispatched["lease_owner"] == "claude:pending"
+    # The run finished inside this test, and ending a task ends its lease
+    # (`_end_lease_on`), so the bound owner is no longer on the row.
+    assert state["lease_owner"] is None
     assert dispatched["lease_expires_at"] == pytest.approx(dispatched["at"] + 600.0)
     assert state["last_heartbeat_source"] == "process_alive"
     assert state["last_heartbeat_at"] >= state["dispatched_at"]
