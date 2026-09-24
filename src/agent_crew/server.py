@@ -60,7 +60,7 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import (AdmissionRefused, CancelledAttemptError, TaskAlreadyExistsError,
+from agent_crew.queue import (AdmissionRefused, LateResultRejected, TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -942,7 +942,7 @@ _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 # (억제됐다 replay되는 result의 comment/escalation은 loss 가능하나, 리뷰어 판정상 duplication보다 허용됨.)
 _REPLAYING = contextvars.ContextVar("agent_crew_replaying", default=False)
 
-_LATE_RESULT_STATUSES = frozenset({"failed", "timed_out"})
+_LATE_RESULT_STATUSES = frozenset({"failed"})
 # #314 §5: merge 자동 재시도 상한. 이 횟수 이상 실패(conflict/gh 실패 등)면 자동 재시도 중단 →
 # escalation 대상(무한 재시도 금지). 비가역 상태(closed)는 횟수와 무관하게 즉시 재시도 안 함.
 _MAX_MERGE_ATTEMPTS = 3
@@ -5721,6 +5721,10 @@ def create_app(
 
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
+        """Accept active results; system-ended rows return HTTP 409 with
+        ``late_result=true`` and ``accepted=false``. The queue stores their
+        submitted summary, verdict and commit only in ``task_exec_events``.
+        """
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
@@ -5783,12 +5787,9 @@ def create_app(
         # target. Both numbers survive: `requested` in the context, `reported`
         # on the row.
         result, _pr_mismatch = hold_mismatched_pr_result(task_id, result, ctx)
-        # #265: a result can arrive for a task the dispatcher already ended —
-        # it stopped waiting, the worker kept going, and the row silently flips
-        # from `timed_out` (previously `failed`) to `completed`. A consumer that
-        # read the status when the notification fired sees only the first value
-        # and never learns it was revised. Capture the prior status so the
-        # revision can be announced.
+        # #265: worker-reported failures can still be revised by that worker.
+        # Queue admission now refuses a timeout, cancel or dispatcher failure
+        # under the write lock, so those statuses never reach revision logging.
         _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
         # §2.2 / P2 RESULT. Popped, not read: the nonce is a spent credential
         # and must not reach `result_json`. `presenter` defaults to the task's
@@ -5846,11 +5847,16 @@ def create_app(
             # read a 500 and retry the same bypass.
             logger.warning(f"POST /tasks/{task_id}/result: refused — {exc}")
             raise HTTPException(status_code=409, detail=str(exc))
-        except CancelledAttemptError as exc:
-            # This must precede every artifact, attribution, push, and cascade
-            # side effect below: cancelled work has no completion authority.
+        except LateResultRejected as exc:
+            # The queue decided this under its write lock and committed only a
+            # late_result evidence event. No attribution or cascade may follow.
+            from fastapi.responses import JSONResponse
             logger.warning("POST /tasks/%s/result: %s", task_id, exc)
-            raise HTTPException(status_code=409, detail=str(exc))
+            return JSONResponse(status_code=409, content={
+                "late_result": True, "accepted": False,
+                "task_id": task_id, "prior_status": exc.status,
+                "reason": str(exc),
+            })
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")

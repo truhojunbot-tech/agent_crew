@@ -1,11 +1,9 @@
-"""#265 — a dispatcher timeout was reported as a failure, then silently revised.
+"""#265 — dispatcher timeouts and late-result evidence.
 
-Reported from alpha_engine with six cases in one day. The dispatcher stops
-waiting, marks the task `failed`, the worker keeps running and later POSTs its
-result, and the row flips to `completed` with nothing announced. A consumer
-that read the status when the notification fired saw a false failure — and one
-of those tasks had already opened a PR, so re-issuing it would have produced a
-duplicate.
+Reported from alpha_engine with six cases in one day. The dispatcher stopped
+waiting, marked tasks `failed`, and workers later posted results. A terminal
+system status now remains final; a late payload is retained in execution
+history only, so it cannot launch another successor.
 
 Measured across 4,620 attribution rows while confirming the report:
 
@@ -170,8 +168,7 @@ def test_timed_out_is_a_valid_result_status():
 
 
 def test_a_late_result_is_recorded_as_an_event(tmp_db, tmp_path, monkeypatch):
-    """★★The silent flip. A consumer that read `timed_out` at notification time
-    must be able to learn the verdict was revised."""
+    """A late payload remains evidence without revising a terminal timeout."""
     from fastapi.testclient import TestClient
 
     from agent_crew.server import create_app
@@ -190,13 +187,12 @@ def test_a_late_result_is_recorded_as_an_event(tmp_db, tmp_path, monkeypatch):
                    json={"task_id": tid, "status": "completed",
                          "summary": "actually finished", "verdict": None,
                          "findings": [], "pr_number": None})
-        assert r.status_code == 200
+        assert r.status_code == 409
+        assert r.json()["late_result"] is True
 
-    events = [json.loads(l) for l in open(tmp_path / "context_events.jsonl")]
-    late = [e for e in events if e["event_type"] == "task_result_late"]
-    assert late, "the revision was silent — exactly the reported defect"
-    assert late[0]["previous_status"] == "timed_out"
-    assert late[0]["new_status"] == "completed"
+    late = [e for e in q.get_exec_state(tid)["events"] if e["event"] == "late_result"]
+    assert late and late[0]["prior_status"] == "timed_out"
+    assert late[0]["status"] == "completed"
 
 
 def test_an_ordinary_result_is_not_announced_as_late(tmp_db, tmp_path):
@@ -221,8 +217,8 @@ def test_an_ordinary_result_is_not_announced_as_late(tmp_db, tmp_path):
     assert not [e for e in events if e["event_type"] == "task_result_late"]
 
 
-def test_status_changed_at_moves_when_the_verdict_is_revised(tmp_db):
-    """The field a polling consumer can use without reading the event stream."""
+def test_status_changed_at_stays_fixed_after_a_late_result(tmp_db):
+    """A rejected result does not revise the terminal status timestamp."""
     q = TaskQueue(tmp_db)
     tid = _in_progress(q)
 
@@ -231,10 +227,12 @@ def test_status_changed_at_moves_when_the_verdict_is_revised(tmp_db):
                                     error_info={"reason": "dispatcher_timeout"}))
     first = next(t for t in q.list_tasks() if t.task_id == tid).status_changed_at
     time.sleep(0.01)
-    q.submit_result(tid, TaskResult(task_id=tid, status="completed", summary="done"))
+    from agent_crew.queue import LateResultRejected
+    with pytest.raises(LateResultRejected):
+        q.submit_result(tid, TaskResult(task_id=tid, status="completed", summary="done"))
     second = next(t for t in q.list_tasks() if t.task_id == tid).status_changed_at
 
-    assert first > 0 and second > first
+    assert first > 0 and second == first
 
 
 def test_a_duplicate_same_status_result_does_not_look_like_a_revision(tmp_db):
@@ -251,16 +249,14 @@ def test_a_duplicate_same_status_result_does_not_look_like_a_revision(tmp_db):
     def _stamp():
         return next(t for t in q.list_tasks() if t.task_id == tid).status_changed_at
 
-    q.submit_result(tid, TaskResult(task_id=tid, status="timed_out",
-                                    summary="dispatcher_timeout",
-                                    error_info={"reason": "dispatcher_timeout"}))
+    q.submit_result(tid, TaskResult(task_id=tid, status="completed",
+                                    summary="first"))
     first = _stamp()
     assert first > 0
 
     time.sleep(0.02)
-    q.submit_result(tid, TaskResult(task_id=tid, status="timed_out",
-                                    summary="dispatcher_timeout",
-                                    error_info={"reason": "dispatcher_timeout"}))
+    q.submit_result(tid, TaskResult(task_id=tid, status="completed",
+                                    summary="fuller"))
 
     assert _stamp() == first, "a repeated same-status result moved the clock"
 
@@ -279,9 +275,8 @@ def test_the_other_fields_still_update_on_a_repeat(tmp_db):
     assert task.summary == "fuller" and task.pr_number == 5517
 
 
-def test_the_late_result_is_still_accepted_and_durable(tmp_db, tmp_path):
-    """⛔Announcing the revision must not mean rejecting it. The work was real;
-    the record has to reflect it."""
+def test_the_late_result_is_evidence_only(tmp_db, tmp_path):
+    """The submitted details survive as an event, without reviving the task."""
     from fastapi.testclient import TestClient
 
     from agent_crew.server import create_app
@@ -296,12 +291,16 @@ def test_the_late_result_is_still_accepted_and_durable(tmp_db, tmp_path):
     app = create_app(db_path=db, pane_map={}, port=0, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as c:
-        c.post(f"/tasks/{tid}/result",
+        response = c.post(f"/tasks/{tid}/result",
                json={"task_id": tid, "status": "completed",
                      "summary": "Root-caused the starvation", "verdict": None,
                      "findings": [], "pr_number": 5517})
         got = c.get(f"/tasks/{tid}").json()
 
-    assert got["status"] == "completed"
-    assert got["pr_number"] == 5517
-    assert "Root-caused" in got["summary"]
+    assert response.status_code == 409
+    assert response.json()["accepted"] is False
+    assert got["status"] == "timed_out"
+    assert got["pr_number"] is None
+    assert got["summary"] == "dispatcher_timeout"
+    assert any("Root-caused" in e["summary"] for e in q.get_exec_state(tid)["events"]
+               if e["event"] == "late_result")

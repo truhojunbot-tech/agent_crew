@@ -77,9 +77,13 @@ class AdmissionRefused(Exception):
         super().__init__(f"{gate.point.value} refused: {gate.reason}")
 
 
-class CancelledAttemptError(RuntimeError):
-    """A cancelled task is a terminal authority boundary, not a late retry."""
+class LateResultRejected(RuntimeError):
+    """A system-ended task is terminal; retain the late payload as evidence."""
     code = "LATE_RESULT_REJECTED"
+
+    def __init__(self, status: str):
+        self.status = status
+        super().__init__(f"LATE_RESULT_REJECTED: task already {status}")
 
 
 ResultBeforeCommit = Callable[[sqlite3.Connection, object, float], None]
@@ -3427,14 +3431,41 @@ class TaskQueue:
             # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT task_type, status FROM tasks WHERE task_id = ?",
+                "SELECT task_type, status, error_info FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
-            if row["status"] == "cancelled":
-                conn.execute("ROLLBACK")
-                raise CancelledAttemptError(
-                    "LATE_RESULT_REJECTED: cancelled tasks never accept a result")
+            prior_status = row["status"]
+            system_failed = False
+            if prior_status == "failed":
+                # The execution history is best-effort instrumentation; its
+                # absence must not stop an ordinary result submission.
+                try:
+                    last_end = conn.execute(
+                        "SELECT event FROM task_exec_events WHERE task_id=? "
+                        "AND event IN ('force_failed', 'result') "
+                        "ORDER BY event_id DESC LIMIT 1", (task_id,),
+                    ).fetchone()
+                except sqlite3.OperationalError:
+                    last_end = None
+                try:
+                    failure_info = json.loads(row["error_info"] or "{}")
+                except (ValueError, TypeError):
+                    failure_info = {}
+                system_failed = (
+                    (last_end is not None and last_end["event"] == "force_failed")
+                    or (isinstance(failure_info, dict) and failure_info.get("final") is True)
+                )
+            if prior_status in ("cancelled", "timed_out") or system_failed:
+                # Same write lock as cancel/timeout: evidence is durable, but
+                # the terminal row, receipt, attribution and outbox stay put.
+                self._append_exec_event_on(
+                    conn, task_id, "late_result", time.time(),
+                    prior_status=prior_status, status=result.status,
+                    summary=result.summary, verdict=result.verdict, commit=result.commit,
+                )
+                conn.execute("COMMIT")
+                raise LateResultRejected(prior_status)
             if expected_status is not None and row["status"] != expected_status:
                 conn.execute("ROLLBACK")
                 raise RuntimeError(
