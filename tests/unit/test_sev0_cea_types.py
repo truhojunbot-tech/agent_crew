@@ -139,6 +139,7 @@ def test_input_providers_return_data_not_decisions():
 # (`test_cea_imports_no_db_http_or_queue_code`, below). This list is the review
 # gate — adding a call site means editing it, which is the point.
 CEA_IMPORTERS = {
+    "cli.py",         # P6: CLI resume must verify T0 against the signed snapshot before loosening
     "queue.py",        # step 1: the receipt store rides on the tasks DB connection
     "server.py",       # step 4c: T5 reads the project's rollout mode at /result
     "pipeline.py",     # step 4m: the cascade READS the review/test contract
