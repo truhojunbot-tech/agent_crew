@@ -35,6 +35,15 @@ from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommend
 from agent_crew.risk_tier import RISK_DECLARATION_FIELDS, risk_declaration
 
 
+#: Why a task was cancelled, as written into the ``task_exec`` end event and the
+#: receipt's REVOKED note. One vocabulary for both, so the history and the
+#: receipt agree on the cause.
+CANCEL_REASON_ATTEMPT = "cancelled_attempt"
+#: An expiry: the lease went idle past its bound. Still a cancel, still through
+#: :meth:`TaskQueue.cancel` — the reason is what differs, not the mechanism.
+CANCEL_REASON_STALE_LEASE = "STALE_LEASE"
+
+
 class PausedError(Exception):
     """#314 P0-1: runtime STOP 활성 시 실행생성 mutation(enqueue)이 원자적으로 거부됐음을 알림.
     호출측(result cascade 등)은 이를 잡아 successor 생성 대신 suppression으로 처리한다."""
@@ -2495,6 +2504,11 @@ class TaskQueue:
     #: One vocabulary, so ``/health`` counts the same thing the log line says.
     CEA_LEGACY_ROW_EVENT = "cea_legacy_row"
 
+    #: The exec-event name for "this task ended but its worker was left running
+    #: and we could not signal it". Carries the pid when we know one, so the
+    #: process an operator has to hunt down is named in the history.
+    WORKER_ORPHANED_EVENT = "worker_orphaned"
+
     def _cea_report_legacy_row_on(self, conn, task_id: str, *, point: str,
                                   config, at: Optional[float] = None) -> None:
         """REPORT a receipt-less row at a P2 call site: one log line, one event.
@@ -3999,16 +4013,35 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def cancel(self, task_id: str) -> None:
+    def cancel(self, task_id: str, *, reason: str = CANCEL_REASON_ATTEMPT,
+               expected_status: Optional[str] = None) -> bool:
         """Cancel a task. Dependent tasks (prev_task_id points to task_id) are marked
-        'orphaned' rather than cancelled — operators can manually cancel them if desired."""
+        'orphaned' rather than cancelled — operators can manually cancel them if desired.
+
+        This is the *only* authoritative way a task becomes ``cancelled``: the
+        status, the receipt revocation, every outstanding dispatch nonce and the
+        ``task_exec`` end event commit together. Anything that cancels with a raw
+        ``UPDATE tasks SET status = 'cancelled'`` leaves a live receipt and a
+        spendable nonce behind (r2 review of 4a49338, finding 1).
+
+        ``reason`` names *why* — it lands in the end event and in the receipt
+        transition note, never in a timestamp column. ``expected_status``, when
+        given, makes this a CAS: the cancel is skipped (returning False) if the
+        row moved on since the caller selected it, so a task that finished
+        between a stale-lease scan and its expiry is not cancelled retroactively.
+
+        Returns True when this call cancelled the row.
+        """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute("SELECT status, receipt_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
             if row is None:
                 conn.execute("ROLLBACK")
-                return
+                return False
+            if expected_status is not None and row["status"] != expected_status:
+                conn.execute("ROLLBACK")
+                return False
             conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))
             # Revocation is append-only.  Spending every outstanding nonce makes
             # a copied task block unusable even if its worker ignores cancellation.
@@ -4017,10 +4050,11 @@ class TaskQueue:
                 _cea_store.revoke_nonces_for_receipt(conn, receipt_id)
                 receipt = _cea_store.current_receipt(conn, receipt_id)
                 if receipt and receipt.get("state") not in _cea_store.TERMINAL_STATES:
-                    self._cea_transition_in_txn(conn, self.cea_engine(), receipt_id, "REVOKED",
-                                                note="cancel: active attempt authorization revoked")
+                    self._cea_transition_in_txn(
+                        conn, self.cea_engine(), receipt_id, "REVOKED",
+                        note=f"cancel({reason}): active attempt authorization revoked")
             self._record_end_on(conn, task_id, time.time(), "cancelled", posted=False,
-                                reason="cancelled_attempt")
+                                reason=reason)
             # Mark pending dependents as orphaned (not cancelled) so the operator
             # can see them and decide whether to cancel or reassign.
             conn.execute(
@@ -4032,12 +4066,51 @@ class TaskQueue:
                 (task_id,),
             )
             conn.commit()
+            return True
         finally:
             conn.close()
 
-    def expire_stale(self, older_than_seconds: float = 600.0) -> List[str]:
+    def record_worker_orphaned(self, task_id: str, *, pid: Optional[int] = None,
+                               reason: str = "", outcome: str = "") -> None:
+        """Record that an ended task's worker was left running unsignalled.
+
+        The task itself stays ``cancelled`` — what is ORPHANED here is the child
+        process, not the row. Append-only and non-raising: this exists so an
+        operator can find a process nobody killed, and failing to write the note
+        must not turn into a second incident on the cancel path.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._append_exec_event_on(conn, task_id, self.WORKER_ORPHANED_EVENT,
+                                       time.time(), state="ORPHANED", pid=pid,
+                                       reason=reason or None, outcome=outcome or None)
+            conn.execute("COMMIT")
+        except Exception:
+            logger.exception("exec-state: orphan record failed task_id=%s pid=%s", task_id, pid)
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+
+    def expire_stale(self, older_than_seconds: float = 600.0, *,
+                     on_cancelled: Optional[Callable[[str], None]] = None) -> List[str]:
         """Cancel in_progress tasks whose last_activity_at is older than
-        ``older_than_seconds``. Returns list of cancelled task_ids."""
+        ``older_than_seconds``. Returns list of cancelled task_ids.
+
+        ⛔Every expiry goes through :meth:`cancel`, one task per transaction, and
+          never a bulk ``UPDATE ... SET status = 'cancelled'``. The bulk UPDATE
+          this used to do produced a row that *said* cancelled while the receipt
+          stayed un-revoked, the attempt's dispatch nonce stayed spendable (so a
+          copied task block still worked), and no ``task_exec`` end event was
+          written at all — the three things cancel exists to guarantee
+          (r2 review of 4a49338, finding 1).
+
+        ``on_cancelled`` is the caller's worker-termination hook, invoked once
+        per task *after* that task's cancel has committed — the same I-A-then-I-B
+        ordering the HTTP DELETE uses. A hook that raises is logged and does not
+        abort the sweep: the authoritative cancel already committed.
+        """
         cutoff = time.time() - older_than_seconds
         conn = self._connect()
         try:
@@ -4045,17 +4118,28 @@ class TaskQueue:
                 "SELECT task_id FROM tasks WHERE status = 'in_progress' AND last_activity_at < ?",
                 (cutoff,),
             ).fetchall()
-            task_ids = [r["task_id"] for r in rows]
-            if task_ids:
-                placeholders = ",".join("?" * len(task_ids))
-                conn.execute(
-                    f"UPDATE tasks SET status = 'cancelled' WHERE task_id IN ({placeholders})",
-                    task_ids,
-                )
-                conn.commit()
-            return task_ids
+            candidates = [r["task_id"] for r in rows]
         finally:
             conn.close()
+        cancelled: List[str] = []
+        for task_id in candidates:
+            try:
+                # CAS on in_progress: a task that posted its result between the
+                # scan and here is finished, not stale.
+                if not self.cancel(task_id, reason=CANCEL_REASON_STALE_LEASE,
+                                   expected_status="in_progress"):
+                    continue
+            except Exception:
+                logger.exception("expire_stale: cancel failed task_id=%s", task_id)
+                continue
+            cancelled.append(task_id)
+            if on_cancelled is not None:
+                try:
+                    on_cancelled(task_id)
+                except Exception:
+                    logger.exception("expire_stale: worker termination hook failed task_id=%s",
+                                     task_id)
+        return cancelled
 
     def reset_stale_to_pending(self, older_than_seconds: float = 600.0) -> List[str]:
         """Reset in_progress tasks idle > ``older_than_seconds`` back to pending.

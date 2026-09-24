@@ -18,6 +18,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -209,3 +210,165 @@ def test_cancel_writes_a_parseable_timestamp_into_used_at(tmp_path):
     # Parses as a timestamp: the whole point of the column.  "cancelled" did not.
     parsed = dt.datetime.strptime(row["used_at"], "%Y-%m-%dT%H:%M:%SZ")
     assert parsed.year >= 2024
+
+
+# ── (1) a stale-lease expiry is a cancel, not a raw status UPDATE ──────────
+#
+# `expire_stale` used to do `UPDATE tasks SET status = 'cancelled' WHERE
+# task_id IN (...)`.  Everything cancel guarantees was therefore absent on the
+# expiry path: the receipt stayed live, the attempt's dispatch nonce stayed
+# spendable (so a copied task block still ran), no `task_exec` end event was
+# written, and a dispatcher child was neither signalled nor recorded
+# (r2 review of 4a49338, finding 1).
+
+
+class _FakeProc:
+    """A dispatcher child we can observe being signalled instead of signalling."""
+
+    def __init__(self, pid=5151, returncode=None):
+        self.pid = pid
+        self.returncode = returncode
+
+    async def wait(self):                       # pragma: no cover - reap path only
+        self.returncode = self.returncode if self.returncode is not None else 0
+        return self.returncode
+
+
+def _cea_queue(db):
+    """A CEA-wired queue, so the task under test has a real receipt and nonce."""
+    from agent_crew.cea.engine import EngineConfig
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED
+
+    return TaskQueue(db, cea_config=EngineConfig(mode="test"), cea_providers=dict(WIRED))
+
+
+def _dispatched_stale_task(db, task_id, *, idle_for=1200.0):
+    """Enqueue → claim → dispatch a task, then age its lease past any bound."""
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import admitted, task as _task
+
+    q = _cea_queue(db)
+    q.enqueue(_task(task_id, context=admitted()), ingress="http.tasks")
+    assert q.dequeue(role="implementer", agent="claude") is not None
+    nonce = q.record_dispatch(task_id, channel="claude_p", agent="claude",
+                              target="pid:5151", lease_owner="claude:pending")
+    assert nonce, "the fixture needs a real dispatch nonce to prove it gets spent"
+    with sqlite3.connect(db) as c:
+        c.execute("UPDATE tasks SET last_activity_at = ? WHERE task_id = ?",
+                  (time.time() - idle_for, task_id))
+    return q, nonce
+
+
+def _expire(app, db, task_id, *, pid):
+    """Create the stale attempt inside the running app, then expire it for real.
+
+    Order matters: startup re-queues in_progress rows, and that re-admission
+    SUPERSEDES the receipt — so an attempt built before startup would be
+    measuring the fixture's own re-admission and not the expiry.
+    """
+    try:
+        with TestClient(app) as client:
+            q, nonce = _dispatched_stale_task(db, task_id)
+            app.state.active_dispatch_processes[task_id] = _FakeProc(pid=pid)
+            body = client.post("/tasks/expire-stale?older_than=600").json()
+            return q, nonce, body
+    finally:
+        for timer in list(app.state.cancel_kill_timers.values()):
+            timer.cancel()
+            timer.join(timeout=1.0)
+        app.state.cancel_kill_timers.clear()
+
+
+def test_stale_expiry_goes_through_the_authoritative_cancel(tmp_path, monkeypatch):
+    """(1) After an expiry: cancelled, REVOKED, nonce spent with an RFC3339
+    `used_at`, a `task_exec` end event naming STALE_LEASE — and the child
+    actually signalled."""
+    import datetime as dt
+    import signal as _signal
+
+    from agent_crew.cea import store as receipt_store
+
+    db = str(tmp_path / "expire.db")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "test")
+    monkeypatch.setenv("AGENT_CREW_CANCEL_KILL_GRACE", "0.05")
+    signalled = []
+    monkeypatch.setattr("agent_crew.server.os.killpg",
+                        lambda pid, sig: signalled.append((pid, sig)))
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+
+    q, nonce, body = _expire(app, db, "stale-1", pid=5151)
+
+    with sqlite3.connect(db) as c:
+        c.row_factory = sqlite3.Row
+        receipt_id = c.execute("SELECT receipt_id FROM tasks WHERE task_id='stale-1'"
+                               ).fetchone()["receipt_id"]
+    assert receipt_id, "the fixture needs a receipt for REVOKED to mean anything"
+    assert body["cancelled"] == ["stale-1"]
+    # I-B: the child is ours and it was signalled as a group.
+    assert body["worker_termination"]["stale-1"] == "sigterm_sent"
+    assert signalled[0] == (5151, _signal.SIGTERM)
+
+    state = q.get_exec_state("stale-1")
+    assert q.get_task_status("stale-1") == "cancelled"
+    # The end event exists at all — the raw UPDATE wrote none — and it says why.
+    ends = [e for e in state["events"] if e["event"] == "cancelled"]
+    assert ends, f"expiry wrote no task_exec end event: {[e['event'] for e in state['events']]}"
+    assert ends[-1]["reason"] == "STALE_LEASE"
+    assert state["lease_owner"] is None, "the lease outlived the attempt it bounded"
+
+    with sqlite3.connect(db) as c:
+        c.row_factory = sqlite3.Row
+        nrow = receipt_store.nonce_row(c, nonce)
+        receipt = receipt_store.current_receipt(c, receipt_id)
+    assert nrow["used_at"], "the expired attempt's nonce is still spendable"
+    assert nrow["used_by"] == receipt_store.CANCELLED_ATTEMPT_CONSUMER
+    dt.datetime.strptime(nrow["used_at"], "%Y-%m-%dT%H:%M:%SZ")      # a timestamp, not a reason
+    assert receipt["state"] == "REVOKED", f"receipt left {receipt['state']} after expiry"
+
+
+def test_stale_expiry_records_an_unsignallable_child_as_orphaned(tmp_path, monkeypatch):
+    """(1) A child we cannot signal is not silently forgotten: it is ORPHANED,
+    with the pid an operator has to go and find."""
+    db = str(tmp_path / "orphan.db")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "test")
+
+    def _gone(pid, sig):
+        raise ProcessLookupError(pid)
+
+    monkeypatch.setattr("agent_crew.server.os.killpg", _gone)
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+
+    q, _nonce, body = _expire(app, db, "stale-2", pid=5252)
+
+    assert body["cancelled"] == ["stale-2"]
+    assert body["worker_termination"]["stale-2"] == "process_group_unavailable"
+    orphans = [e for e in q.get_exec_state("stale-2")["events"]
+               if e["event"] == TaskQueue.WORKER_ORPHANED_EVENT]
+    assert orphans, "a child that could not be signalled left no ORPHANED record"
+    assert orphans[-1]["state"] == "ORPHANED"
+    assert orphans[-1]["pid"] == 5252
+    assert orphans[-1]["reason"] == "STALE_LEASE"
+    # The task itself is cancelled; ORPHANED describes the process, not the row.
+    assert q.get_task_status("stale-2") == "cancelled"
+
+
+def test_a_task_that_finished_during_the_scan_is_not_expired(tmp_path, monkeypatch):
+    """The expiry is a CAS on in_progress, not a blind write.
+
+    The interleaving is the point: the result lands *after* the stale scan has
+    already selected the row.  A bulk `UPDATE ... WHERE task_id IN (...)` marks
+    that finished task cancelled anyway, which is how a completed attempt gets
+    retroactively un-completed.
+    """
+    db = str(tmp_path / "cas.db")
+    q, _nonce = _dispatched_stale_task(db, "done-1")
+    real_cancel = TaskQueue.cancel
+
+    def _finish_then_cancel(self, task_id, **kwargs):
+        # The worker's result commits between the scan and the cancel.
+        with sqlite3.connect(db) as c:
+            c.execute("UPDATE tasks SET status = 'completed' WHERE task_id = ?", (task_id,))
+        return real_cancel(self, task_id, **kwargs)
+
+    monkeypatch.setattr(TaskQueue, "cancel", _finish_then_cancel)
+    assert q.expire_stale(older_than_seconds=600.0) == []
+    assert q.get_task_status("done-1") == "completed"

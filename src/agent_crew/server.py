@@ -62,6 +62,8 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import (AdmissionRefused, CancelledAttemptError, TaskAlreadyExistsError,
                               TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE)
+from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
+from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
@@ -875,6 +877,37 @@ def _prepare_worktree_for_task_inner(
     # head" from "this review is about three commits ago", and a fix task gets
     # created for work that already exists.
     return _worktree_head(worktree_path)
+
+
+class _DispatchSlot:
+    """A dispatch that has been decided, whose child may not exist yet.
+
+    The registry entry exists from before ``record_dispatch`` commits until the
+    dispatch is over, so the two sides of the handoff always meet: a cancel
+    either finds ``proc`` and signals it, or sets ``cancel_requested`` for the
+    dispatcher to act on the moment the child appears.  ``pid`` delegates so the
+    slot reads like the process it stands in for.
+    """
+
+    __slots__ = ("task_id", "proc", "cancel_requested", "cancel_reason")
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.proc = None
+        self.cancel_requested = False
+        self.cancel_reason = ""
+
+    @property
+    def pid(self):
+        return getattr(self.proc, "pid", None)
+
+    @property
+    def returncode(self):
+        return getattr(self.proc, "returncode", None)
+
+    def __repr__(self) -> str:                    # pragma: no cover - diagnostics
+        return (f"_DispatchSlot(task_id={self.task_id!r}, pid={self.pid!r}, "
+                f"cancel_requested={self.cancel_requested!r})")
 
 
 def _review_result_is_actionable(result) -> bool:
@@ -2525,7 +2558,15 @@ def create_app(
     _dispatcher_enabled = os.getenv("AGENT_CREW_DISPATCHER", "0").lower() not in ("0", "false", "no")
     # Only dispatcher subprocesses live here.  Pane workers cannot be killed
     # by PID safely, so cancellation still revokes their authorization first.
+    #
+    # Values are either a spawned process (what a test injects directly) or a
+    # `_DispatchSlot` reservation for a dispatch whose child does not exist yet.
     _active_dispatch_processes: dict[str, object] = {}
+    #: Guards the registry *and* the cancel/spawn handoff it mediates.  Cancel
+    #: arrives on a FastAPI threadpool thread while the dispatcher runs on the
+    #: event loop, so "look up the process, decide, act" has to be one atomic
+    #: step for both of them.  Nothing awaits while holding it.
+    _active_dispatch_lock = threading.Lock()
     #: Pending SIGTERM→SIGKILL escalation timers, keyed by task_id.  Kept
     #: addressable so they can be cancelled when the process exits on its own
     #: (and by tests in teardown).  A bare ``threading.Timer`` holding a real
@@ -2544,6 +2585,113 @@ def create_app(
         if timer is not None:
             timer.cancel()
 
+    def _reserve_dispatch_slot(task_id: str) -> "_DispatchSlot":
+        """Claim the registry entry for a dispatch that is about to be decided.
+
+        ⛔Must happen BEFORE `record_dispatch` commits.  That commit is what
+          makes the attempt visible to a cancel, and the child does not exist
+          until several statements later; in that window the DELETE used to find
+          `None`, answer `pane_worker_not_killable` and kill nothing, after which
+          the dispatcher registered the child and awaited it as a live worker for
+          an already-cancelled task (r2 review of 4a49338, finding 2).  With the
+          reservation in place the cancel has something to find, and the
+          dispatcher's post-spawn re-check under the same lock does the killing.
+        """
+        slot = _DispatchSlot(task_id)
+        with _active_dispatch_lock:
+            _active_dispatch_processes[task_id] = slot
+        return slot
+
+    def _release_dispatch_slot(task_id: str, slot: "_DispatchSlot") -> None:
+        """Drop ``slot`` from the registry — only if it is still the one there,
+        so a later dispatch's entry is never popped by an earlier one's cleanup.
+        """
+        with _active_dispatch_lock:
+            if _active_dispatch_processes.get(task_id) is slot:
+                _active_dispatch_processes.pop(task_id, None)
+
+    def _drop_unspawned_reservation(task_id: str) -> None:
+        """Backstop for the dispatch teardown: a reservation whose child never
+        came into existence (prep raised between the reservation and the spawn)
+        must not outlive the dispatch, or every later cancel for this task is
+        answered `worker_not_spawned_yet` by a slot nobody will ever fill.  A
+        spawned process is left alone — the dispatch's own `finally` owns that.
+        """
+        with _active_dispatch_lock:
+            entry = _active_dispatch_processes.get(task_id)
+            if isinstance(entry, _DispatchSlot) and entry.proc is None:
+                _active_dispatch_processes.pop(task_id, None)
+
+    async def _claim_spawned_child(task_id: str, slot: "_DispatchSlot", proc) -> bool:
+        """Publish ``proc`` into its reserved slot and answer: was it already
+        cancelled?  True means the child has been stopped (or recorded ORPHANED)
+        and the caller must NOT await it as a live worker.
+
+        Both halves of the decision happen under one lock acquisition, so a
+        cancel either sees the process (and signals it itself) or sets the flag
+        this reads — never neither.  The DB status is re-read as well, because a
+        cancel that committed before the slot existed left no flag to see.
+        """
+        with _active_dispatch_lock:
+            slot.proc = proc
+            cancelled = slot.cancel_requested
+            reason = slot.cancel_reason or _CANCEL_REASON_ATTEMPT
+        if not cancelled:
+            try:
+                cancelled = q().get_task_status(task_id) == "cancelled"
+            except Exception:
+                logger.exception("dispatch: cancel re-check failed task=%s", task_id)
+                cancelled = False
+            reason = _CANCEL_REASON_ATTEMPT
+        if not cancelled:
+            return False
+        outcome = _terminate_worker(task_id, proc)
+        logger.warning("dispatch: task=%s was cancelled during handoff — worker %s pid=%s",
+                       task_id, outcome, getattr(proc, "pid", None))
+        if outcome in ("sigterm_sent", "already_exited"):
+            # Reaping, not awaiting a live worker: no result, timeout or failure
+            # handling runs off this wait.  It outlasts the SIGKILL escalation on
+            # purpose, so the only way past it is a child that survived SIGKILL —
+            # which is then honestly recorded as ORPHANED rather than forgotten.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=_cancel_kill_grace + 5.0)
+            if getattr(proc, "returncode", None) is None:
+                _record_orphaned_worker(task_id, proc, reason=reason,
+                                        outcome="survived_termination")
+        else:
+            _record_orphaned_worker(task_id, proc, reason=reason, outcome=outcome)
+        return True
+
+    def _record_orphaned_worker(task_id: str, proc, *, reason: str, outcome: str) -> None:
+        """Note a still-running child we could not signal, with its pid."""
+        with contextlib.suppress(Exception):
+            q().record_worker_orphaned(task_id, pid=getattr(proc, "pid", None),
+                                       reason=reason, outcome=outcome)
+
+    def _stop_worker_for_ended_task(task_id: str, *, reason: str) -> str:
+        """I-B for a task whose authoritative end has already committed.
+
+        One code path for the HTTP DELETE and for a stale-lease expiry, so the
+        two cannot drift: a child we own is signalled, a child that cannot be
+        signalled is recorded ORPHANED with its pid, and a dispatch that has
+        been decided but not yet spawned is handed to the dispatcher's own
+        post-spawn re-check instead of being reported as "nothing to kill".
+        """
+        with _active_dispatch_lock:
+            entry = _active_dispatch_processes.get(task_id)
+            if isinstance(entry, _DispatchSlot):
+                entry.cancel_requested = True
+                entry.cancel_reason = reason
+                proc = entry.proc
+                if proc is None:
+                    return "worker_not_spawned_yet"
+            else:
+                proc = entry
+        outcome = _terminate_worker(task_id, proc)
+        if proc is not None and outcome not in ("sigterm_sent", "already_exited"):
+            _record_orphaned_worker(task_id, proc, reason=reason, outcome=outcome)
+        return outcome
+
     def _terminate_worker(task_id: str, proc) -> str:
         """Stop the worker for an already-cancelled task.  Returns the state
         to report, naming what actually happened rather than guessing.
@@ -2551,6 +2699,8 @@ def create_app(
         Only dispatcher subprocesses are ours to signal; a pane worker has no
         PID we own, so for it the authoritative cancel is the entire remedy.
         """
+        if isinstance(proc, _DispatchSlot):
+            proc = proc.proc
         if proc is None:
             return "pane_worker_not_killable"
         if getattr(proc, "returncode", None) is not None:
@@ -4276,6 +4426,11 @@ def create_app(
         #   one afterwards. The pid is bound once the process exists
         #   (`bind_dispatch_target`); binding a target is telemetry, deciding a
         #   dispatch is not.
+        # ⛔The reservation goes in BEFORE the dispatch commits — see
+        #   `_reserve_dispatch_slot`. From here on every exit path must release
+        #   it: the refusal below does so explicitly, everything after the spawn
+        #   is covered by the `finally` that pops the registry.
+        _slot = _reserve_dispatch_slot(task.task_id)
         try:
             _dispatch_nonce = q().record_dispatch(
                 task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
@@ -4284,6 +4439,7 @@ def create_app(
                 lease_seconds=_dispatch_timeout_for_role(role))
         except AdmissionRefused as exc:
             logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
+            _release_dispatch_slot(task.task_id, _slot)
             return
         message = _format_task_message(task, port, nonce=_dispatch_nonce)
         # #239: assemble a bounded, provenance-linked Context Pack from durable
@@ -4534,7 +4690,12 @@ def create_app(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                     start_new_session=True,
                 )
-            _active_dispatch_processes[task.task_id] = proc
+            # ⛔I-B: publish the child into its reservation and decide, under the
+            #   same lock, whether a cancel has already landed. A cancel that
+            #   committed in the handoff window is not allowed to end with the
+            #   dispatcher awaiting the child it just authorized away.
+            if await _claim_spawned_child(task.task_id, _slot, proc):
+                return
             # G12: the lease is the kill timeout enforced just below. The
             # dispatch itself was decided before the prompt was built.
             q().bind_dispatch_target(task.task_id, target=f"pid:{proc.pid}",
@@ -4825,6 +4986,7 @@ def create_app(
                             try:
                                 await _dispatch_task(t, r)
                             finally:
+                                _drop_unspawned_reservation(t.task_id)
                                 active_roles.discard(r)
                                 if w:
                                     active_worktrees.discard(w)
@@ -4862,6 +5024,7 @@ def create_app(
                             try:
                                 await _dispatch_task(t, r)
                             finally:
+                                _drop_unspawned_reservation(t.task_id)
                                 active_roles.discard(s)
                                 if w:
                                     active_worktrees.discard(w)
@@ -4891,6 +5054,13 @@ def create_app(
     # and defuse one in teardown if it is.
     app.state.cancel_kill_timers = _cancel_kill_timers
     app.state.terminate_worker = _terminate_worker
+    # The cancel/spawn handoff (#51 I-B): the reservation helpers and the lock
+    # they share, so a test can drive a real interleaving instead of asserting
+    # against its own copy of the ordering.
+    app.state.active_dispatch_lock = _active_dispatch_lock
+    app.state.reserve_dispatch_slot = _reserve_dispatch_slot
+    app.state.claim_spawned_child = _claim_spawned_child
+    app.state.stop_worker_for_ended_task = _stop_worker_for_ended_task
     # Same rationale (#248, #265): expose the terminal-marking helper so a test
     # can drive the real timeout path instead of asserting against a
     # reimplementation of it.
@@ -6038,15 +6208,30 @@ def create_app(
             )
         return {
             "status": "cancelled",
-            "worker_termination": _terminate_worker(task_id, _active_dispatch_processes.get(task_id)),
+            "worker_termination": _stop_worker_for_ended_task(
+                task_id, reason=_CANCEL_REASON_ATTEMPT),
         }
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(older_than: float = 600.0):
         """Cancel in_progress tasks idle longer than ``older_than`` seconds.
-        Returns list of cancelled task_ids."""
-        cancelled = q().expire_stale(older_than_seconds=older_than)
-        return {"cancelled": cancelled}
+        Returns list of cancelled task_ids.
+
+        An expiry is a cancel: it goes through the same authoritative
+        transaction (status, receipt REVOKED, nonces spent, end event) and then
+        the same worker termination the DELETE performs — just with
+        ``STALE_LEASE`` as the recorded reason. Before this, expiry wrote the
+        status directly and stopped there, leaving a live receipt, a spendable
+        nonce and an unsignalled child behind (r2 review of 4a49338).
+        """
+        terminations: dict[str, str] = {}
+
+        def _stop(task_id: str) -> None:
+            terminations[task_id] = _stop_worker_for_ended_task(
+                task_id, reason=_CANCEL_REASON_STALE_LEASE)
+
+        cancelled = q().expire_stale(older_than_seconds=older_than, on_cancelled=_stop)
+        return {"cancelled": cancelled, "worker_termination": terminations}
 
     @app.post("/gates", status_code=201)
     def post_gate(gate: GateRequest):
