@@ -3431,7 +3431,7 @@ class TaskQueue:
             # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT task_type, status, error_info FROM tasks WHERE task_id = ?",
+                "SELECT task_type, status FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
@@ -3448,14 +3448,11 @@ class TaskQueue:
                     ).fetchone()
                 except sqlite3.OperationalError:
                     last_end = None
-                try:
-                    failure_info = json.loads(row["error_info"] or "{}")
-                except (ValueError, TypeError):
-                    failure_info = {}
-                system_failed = (
-                    (last_end is not None and last_end["event"] == "force_failed")
-                    or (isinstance(failure_info, dict) and failure_info.get("final") is True)
-                )
+                # `error_info.final` describes a reported failure, including
+                # dispatch setup failures written through submit_result. It is
+                # not evidence that the queue force-ended the row. Those
+                # results have always been revisable by a later report.
+                system_failed = last_end is not None and last_end["event"] == "force_failed"
             if prior_status in ("cancelled", "timed_out") or system_failed:
                 # Same write lock as cancel/timeout: evidence is durable, but
                 # the terminal row, receipt, attribution and outbox stay put.

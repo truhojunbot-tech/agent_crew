@@ -8,7 +8,7 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
-@pytest.mark.parametrize("ended", ["timed_out", "cancelled", "failed", "failed_result"])
+@pytest.mark.parametrize("ended", ["timed_out", "cancelled", "failed"])
 def test_system_terminal_result_is_evidence_only(tmp_db, ended):
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="review-late", task_type="review",
@@ -18,10 +18,6 @@ def test_system_terminal_result_is_evidence_only(tmp_db, ended):
         assert q.cancel("review-late")
     elif ended == "failed":
         assert q.force_fail("review-late", "watchdog timeout") == "review"
-    elif ended == "failed_result":
-        q.submit_result("review-late", TaskResult(
-            task_id="review-late", status="failed", summary="dispatcher exit",
-            error_info={"reason": "exit_1", "final": True}))
     else:
         q.submit_result("review-late", TaskResult(
             task_id="review-late", status="timed_out", summary="dispatcher timeout"))
@@ -46,7 +42,27 @@ def test_system_terminal_result_is_evidence_only(tmp_db, ended):
             if e["event"] == "late_result"]
     assert len(late) == 1
     assert (late[0]["prior_status"], late[0]["verdict"], late[0]["commit"]) == (
-        "failed" if ended == "failed_result" else ended, "request_changes", "a" * 40)
+        ended, "request_changes", "a" * 40)
+
+
+def test_reported_failure_with_final_metadata_can_be_revised(tmp_db):
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="review-revised", task_type="review",
+                          description="review", branch="main"))
+    assert q.dequeue(role="reviewer")
+    q.submit_result("review-revised", TaskResult(
+        task_id="review-revised", status="failed", summary="dispatch setup failed",
+        error_info={"reason": "pane_target_unresolvable", "final": True}))
+    app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks/review-revised/result", json={
+            "task_id": "review-revised", "status": "completed", "summary": "revised",
+            "verdict": "approve", "findings": [],
+        })
+    assert response.status_code == 200
+    assert q.get_task_status("review-revised") == "completed"
+    assert not [e for e in q.get_exec_state("review-revised")["events"]
+                if e["event"] == "late_result"]
 
 
 def test_in_progress_result_still_completes(tmp_db):
