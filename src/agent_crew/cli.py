@@ -1551,6 +1551,8 @@ def resume(project: str, base: str, generation: int, source: str, decision_id: s
                                              "owner (T0) decision that authorises it"},
                 ensure_ascii=False))
             raise SystemExit(1)
+        from agent_crew.cea.wiring import install_from_env
+        install_from_env(db_path=db_path, project=project)
         try:
             res = TaskQueue(db_path).resume_stop(
                 generation=generation, who=f"owner:{source}", decision_id=decision_id.strip())
