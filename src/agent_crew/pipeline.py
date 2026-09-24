@@ -45,7 +45,8 @@ from agent_crew.protocol import (
     RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
+from agent_crew.queue import (TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError,
+                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
 # §11.2 #14: the review/test contract comes from admission, already decided.
 # ⛔Do not import ``agent_crew.risk_tier`` here. Asking it again at cascade time
@@ -1900,7 +1901,8 @@ def auto_fallback_failed_task(
                 project=_successor_project(queue, original),
             )
             try:
-                queue.enqueue(fallback_req, ingress="cascade.fallback")
+                queue.enqueue(fallback_req, ingress="cascade.fallback",
+                              _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             except TaskAlreadyExistsError:
                 logger.info(f"auto_fallback: {fallback_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(

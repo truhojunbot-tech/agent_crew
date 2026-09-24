@@ -528,9 +528,10 @@ def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind
                                                      request):
     assert kind not in EMPTY_PROJECT_KINDS, (
         f"{kind} is listed project-less; s4j closed that item — see EMPTY_PROJECT_KINDS")
-    # The HTTP retry transport completes its parent before retrying, so its
-    # fresh-DB baseline is intentionally not equivalent yet. Fallback no
-    # longer has this exception: declared lineage metadata re-admits it.
+    # A trusted successor capability is intentionally not serializable: HTTP
+    # must strip the same lineage keys when a client replays them.  Compare
+    # retry/fallback to their matching internal capability path, while every
+    # untrusted transport remains directly comparable with HTTP.
     if kind == "retry_http":
         request.applymarker(pytest.mark.xfail(
             strict=True,
@@ -549,7 +550,17 @@ def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind
         assert not validate_receipt(got), validate_receipt(got)
         assert got["caller_identity_status"] == "UNVERIFIED"
         n = len(spy.calls)
-        _via_http(tmp_path, req, f"base-{kind}-{req.task_id}.db")
+        if kind == "cascade_fallback":
+            from agent_crew.queue import (AdmissionRefused, TaskQueue,
+                                          _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+            try:
+                TaskQueue(str(tmp_path / f"base-{kind}-{req.task_id}.db")).enqueue(
+                    req, ingress="cascade.fallback",
+                    _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+            except AdmissionRefused:
+                pass
+        else:
+            _via_http(tmp_path, req, f"base-{kind}-{req.task_id}.db")
         _, _, b_adm, b_rid, b_db = spy.calls[n]
         base = persisted_receipt(b_db, b_rid)
         assert _view(admitted, got) == _view(b_adm, base), (

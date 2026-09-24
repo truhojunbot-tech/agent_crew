@@ -61,7 +61,8 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import (AdmissionRefused, CancelledAttemptError, TaskAlreadyExistsError,
-                              TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE)
+                              TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              _ROLE_TO_TYPE, _TYPE_TO_ROLE)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
 from agent_crew.cea import callsites as _cea_callsites
@@ -5314,7 +5315,8 @@ def create_app(
             )
             from agent_crew.queue import TaskAlreadyExistsError as _TAE
             try:
-                q().enqueue(retry_req, ingress="retry.failed_task")
+                q().enqueue(retry_req, ingress="retry.failed_task",
+                            _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             except _TAE:
                 logger.info(f"_auto_retry_failed_task: {retry_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")

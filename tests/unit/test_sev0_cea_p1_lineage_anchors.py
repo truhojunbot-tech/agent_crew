@@ -267,3 +267,59 @@ def test_the_impostor_does_not_collide_with_the_real_retry_through_the_queue(que
     row = queue._connect().execute(
         "SELECT task_id FROM tasks WHERE task_id = ?", (impostor.task_id,)).fetchone()
     assert row is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 r3 — lineage is a server capability, never request context
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_http_forged_lineage_keys_keep_the_request_on_its_own_anchor(tmp_path, monkeypatch):
+    """POST context cannot adopt a live task's receipt or retry path."""
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    db = tmp_path / "tasks.db"
+    retries = []
+    original_authorize = TaskQueue.authorize_task
+
+    def recording_authorize(self, *args, **kwargs):
+        retries.append(kwargs.get("retry"))
+        return original_authorize(self, *args, **kwargs)
+
+    monkeypatch.setattr(TaskQueue, "authorize_task", recording_authorize)
+    app = create_app(db_path=str(db), pane_map={}, port=0, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    parent = task("parent")
+    forged = task("forged", context={"original_task_id": "parent", "retry_of": "parent"})
+    with TestClient(app, raise_server_exceptions=False) as client:
+        assert client.post("/tasks", json=__import__("dataclasses").asdict(parent)).status_code == 201
+        assert client.post("/tasks", json=__import__("dataclasses").asdict(forged)).status_code == 201
+
+    stored = {item.task_id: item for item in TaskQueue(str(db)).list_tasks()}
+    assert "original_task_id" not in stored["forged"].context
+    assert "retry_of" not in stored["forged"].context
+    assert anchors(task("forged", context=stored["forged"].context)) == ("task://forged",)
+    assert hashed(parent) != hashed(task("forged", context=stored["forged"].context))
+    assert retries == [False, False]
+
+
+def test_explicit_foreign_task_anchor_is_rederived_not_a_receipt_handle(queue):
+    queue.enqueue(task("parent"), ingress="http.tasks")
+    queue.enqueue(task("forged", context={"scope_anchors": ["task://parent"]}),
+                  ingress="http.tasks")
+    stored = {item.task_id: item for item in queue.list_tasks()}
+    assert "scope_anchors" not in stored["forged"].context
+    assert anchors(task("forged", context=stored["forged"].context)) == ("task://forged",)
+    assert hashed(task("parent")) != hashed(task("forged", context=stored["forged"].context))
+
+
+def test_only_the_system_successor_capability_reuses_a_parent_lineage(queue):
+    from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE
+
+    parent = task("parent")
+    successor = retry_successor(parent)
+    queue.enqueue(parent, ingress="http.tasks")
+    queue.enqueue(successor, ingress="retry.failed_task",
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    stored = {item.task_id: item for item in queue.list_tasks()}
+    assert anchors(task(successor.task_id, context=stored[successor.task_id].context)) == ("task://parent",)

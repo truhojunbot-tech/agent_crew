@@ -167,6 +167,10 @@ _CEA_LINEAGE_PARENT_KEYS = (
     "fallback_from_task_id",    # what pipeline.auto_fallback actually writes
     "original_task_id",         # what server._auto_retry_failed_task writes
 )
+# This capability is deliberately an object identity, rather than context data:
+# JSON clients can name any context key but cannot manufacture this value.  The
+# two successor constructors below the server boundary pass it explicitly.
+_CEA_SYSTEM_SUCCESSOR_PROVENANCE = object()
 # The successor ids minted by the deterministic-id rule (#314 §4 P0-1) embed
 # their parent verbatim: ``retry-<parent>-a<n>`` / ``fallback-<parent>-d<n>``.
 # ``$``-anchoring makes the non-greedy group take the *whole* parent id, so a
@@ -2146,6 +2150,56 @@ class TaskQueue:
             context.pop("issue")
         return context
 
+    def _trusted_enqueue_context(self, task: TaskRequest, *,
+                                 successor_provenance: object | None) -> dict:
+        """Return admission context after enforcing the lineage trust boundary.
+
+        Lineage is authority to re-admit an existing receipt, not caller
+        metadata.  HTTP, MCP, CLI, and direct adapter requests therefore lose
+        every lineage key.  Only an in-process successor constructor holding
+        the private object capability may retain them.
+        """
+        context = self._enqueue_context(task)
+        if successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+            return context
+
+        dropped = [key for key in _CEA_LINEAGE_PARENT_KEYS if key in context]
+        for key in dropped:
+            context.pop(key, None)
+        if dropped:
+            logger.warning("cea: dropped untrusted lineage keys for task %s: %s",
+                           task.task_id, ", ".join(dropped))
+
+        # ``task://`` is a derived anchor, not a portable handle to somebody
+        # else's receipt.  An external request may retain its own explicit
+        # anchor, but a known foreign task anchor is removed so normal
+        # derivation supplies this request's own id instead.
+        explicit = _cea_str_tuple(context.get("scope_anchors"))
+        foreign = []
+        for anchor in explicit:
+            if not anchor.startswith("task://"):
+                continue
+            target = anchor.removeprefix("task://")
+            if target and target != task.task_id and self._task_exists(target):
+                foreign.append(anchor)
+        if foreign:
+            kept = [anchor for anchor in explicit if anchor not in foreign]
+            if kept:
+                context["scope_anchors"] = kept
+            else:
+                context.pop("scope_anchors", None)
+            logger.warning("cea: dropped foreign task anchors for task %s: %s",
+                           task.task_id, ", ".join(foreign))
+        return context
+
+    def _task_exists(self, task_id: str) -> bool:
+        """Whether a task id is already owned by this queue's receipt space."""
+        conn = self._connect()
+        try:
+            return conn.execute("SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)).fetchone() is not None
+        finally:
+            conn.close()
+
     @property
     def project_identity(self) -> str:
         """The project this queue *is*, read off its own state directory.
@@ -2567,7 +2621,8 @@ class TaskQueue:
         return task.task_id
 
     def enqueue(self, task: TaskRequest, *, ingress: Optional[str] = None,
-                provenance: Optional["_CeaProvenance"] = None) -> str:
+                provenance: Optional["_CeaProvenance"] = None,
+                _successor_provenance: object | None = None) -> str:
         """Admit a task and write its row — the one path every §7 adapter takes.
 
         ``ingress`` names the adapter from
@@ -2599,14 +2654,18 @@ class TaskQueue:
         # named none, and a request that named a different one is refused here
         # rather than admitted under a project it chose for itself.
         task, refusal = self._project_from_queue_identity(task)
-        context = self._enqueue_context(task)
+        context = self._trusted_enqueue_context(
+            task, successor_provenance=_successor_provenance)
         if refusal is None:
             # A retry/fallback successor is the same intent as its parent
             # (P4), so it goes through the engine's retry re-admission rather
             # than opening a second lineage for one piece of work.
             auth = self.authorize_task(
                 task, context=context, provenance=provenance,
-                retry=_cea_is_lineage_successor(task, context or {}))
+                retry=(
+                    _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE
+                    and _cea_is_lineage_successor(task, context or {})
+                ))
         else:
             auth = self._refuse_admission(task, context=context, provenance=provenance,
                                           code=refusal[0], text=refusal[1])
