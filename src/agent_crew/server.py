@@ -9,6 +9,7 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -2522,6 +2523,9 @@ def create_app(
     _push_enabled = _delivery_raw in ("push", "both")
 
     _dispatcher_enabled = os.getenv("AGENT_CREW_DISPATCHER", "0").lower() not in ("0", "false", "no")
+    # Only dispatcher subprocesses live here.  Pane workers cannot be killed
+    # by PID safely, so cancellation still revokes their authorization first.
+    _active_dispatch_processes: dict[str, object] = {}
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
@@ -4470,10 +4474,11 @@ def create_app(
                 # we can kill the whole tree on timeout — agent CLIs (gemini,
                 # agy, codex) spawn helper children that survive a plain
                 # proc.kill() and reparent to PID 1 as orphans (#191).
-                proc = await asyncio.create_subprocess_exec(
+            proc = await asyncio.create_subprocess_exec(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                     start_new_session=True,
                 )
+            _active_dispatch_processes[task.task_id] = proc
             # G12: the lease is the kill timeout enforced just below. The
             # dispatch itself was decided before the prompt was built.
             q().bind_dispatch_target(task.task_id, target=f"pid:{proc.pid}",
@@ -4618,6 +4623,7 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
+            _active_dispatch_processes.pop(task.task_id, None)
             # #272: release the test-stage lock before anything else in the
             # teardown can raise — a leaked flock would block every later test
             # on this worktree until the process exits.
@@ -4821,6 +4827,7 @@ def create_app(
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
+    app.state.active_dispatch_processes = _active_dispatch_processes
     # Same rationale (#248, #265): expose the terminal-marking helper so a test
     # can drive the real timeout path instead of asserting against a
     # reimplementation of it.
@@ -5948,8 +5955,23 @@ def create_app(
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
+        proc = _active_dispatch_processes.get(task_id)
+        terminated = False
+        if proc is not None and getattr(proc, "returncode", None) is None:
+            try:
+                # The subprocess owns a session, so this reaches its helpers too.
+                os.killpg(proc.pid, signal.SIGTERM)
+                terminated = True
+                def _kill_if_still_alive():
+                    if getattr(proc, "returncode", None) is None:
+                        with contextlib.suppress(ProcessLookupError, PermissionError):
+                            os.killpg(proc.pid, signal.SIGKILL)
+                threading.Timer(2.0, _kill_if_still_alive).start()
+            except (ProcessLookupError, PermissionError):
+                logger.warning("cancel: worker process group unavailable task=%s pid=%s", task_id,
+                               getattr(proc, "pid", None))
         q().cancel(task_id)
-        return {"status": "cancelled"}
+        return {"status": "cancelled", "worker_termination": "sigterm_sent" if terminated else "not_dispatched"}
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(older_than: float = 600.0):

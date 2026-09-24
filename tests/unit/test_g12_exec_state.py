@@ -216,6 +216,22 @@ def test_cancelled_result_is_rejected_without_row_or_artifact_mutation(tmp_db):
     assert row == ("cancelled", None)
 
 
+def test_cancel_sends_sigterm_to_the_dispatched_process_group(tmp_db, monkeypatch):
+    """I-B: dispatcher-owned workers are stopped as a process group on cancel."""
+    app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
+    calls = []
+    class Proc:
+        pid = 4242
+        returncode = None
+    monkeypatch.setattr("agent_crew.server.os.killpg", lambda pid, sig: calls.append((pid, sig)))
+    app.state.active_dispatch_processes["worker"] = Proc()
+    with TestClient(app) as client:
+        client.post("/tasks", json={"task_id": "worker", "task_type": "implement", "description": "d", "branch": "main"})
+        response = client.delete("/tasks/worker")
+    assert response.json()["worker_termination"] == "sigterm_sent"
+    assert calls[0] == (4242, __import__("signal").SIGTERM)
+
+
 def test_heartbeat_only_touches_running_tasks(tmp_db):
     q = TaskQueue(tmp_db)
     q.enqueue(_task("hb"))
