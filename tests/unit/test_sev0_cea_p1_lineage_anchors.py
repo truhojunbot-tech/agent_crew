@@ -323,3 +323,36 @@ def test_only_the_system_successor_capability_reuses_a_parent_lineage(queue):
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     stored = {item.task_id: item for item in queue.list_tasks()}
     assert anchors(task(successor.task_id, context=stored[successor.task_id].context)) == ("task://parent",)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 r4b — caller task anchors are canonical, bounded, and never portable
+# ═══════════════════════════════════════════════════════════════════════════
+
+@pytest.mark.parametrize("foreign", [
+    "TASK://impl-victim",
+    "task://impl-victim/",
+    " task://impl-victim",
+])
+def test_canonical_foreign_task_anchor_spellings_are_dropped(queue, foreign):
+    queue.enqueue(task("caller", context={"scope_anchors": [foreign, "src/./keep.py"]}),
+                  ingress="http.tasks")
+    stored = {item.task_id: item for item in queue.list_tasks()}["caller"]
+    assert stored.context["scope_anchors"] == ["src/keep.py"]
+
+
+def test_future_task_anchor_is_dropped_even_when_no_such_task_exists(queue):
+    queue.enqueue(task("caller", context={"scope_anchors": ["task://future-successor"]}),
+                  ingress="http.tasks")
+    stored = {item.task_id: item for item in queue.list_tasks()}["caller"]
+    assert "scope_anchors" not in stored.context
+
+
+def test_caller_scope_anchors_are_bounded_to_allowed_short_canonical_values(queue):
+    anchors_in = [
+        "https://example.test/anchor",
+        "src/" + "x" * 253,
+    ] + [f"src/./file-{i}.py" for i in range(17)]
+    queue.enqueue(task("caller", context={"scope_anchors": anchors_in}), ingress="http.tasks")
+    stored = {item.task_id: item for item in queue.list_tasks()}["caller"]
+    assert stored.context["scope_anchors"] == [f"src/file-{i}.py" for i in range(16)]

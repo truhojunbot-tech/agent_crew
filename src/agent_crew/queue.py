@@ -23,7 +23,8 @@ from agent_crew.cea.intent import (
     CallerProvenance as _CeaProvenance, Intent as _CeaIntent,
     IntentIdentity as _CeaIdentity, InvalidScopeAnchor as _CeaInvalidScopeAnchor,
     Target as _CeaTarget, WorkClass as _CeaWorkClass,
-    canonical_anchors as _cea_canonical_anchors)
+    canonical_anchors as _cea_canonical_anchors,
+    canonical_scope_anchor as _cea_canonical_scope_anchor)
 from agent_crew.cea.store import ensure_schema as _cea_ensure_schema
 from agent_crew.cea.validator import ValidationOutcome as _CeaOutcome
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
@@ -112,6 +113,15 @@ def _cea_str_tuple(value) -> tuple:
 #: declared paths per task, read by both, so a task cannot be "about src/x.py"
 #: for tiering and about nothing for identity.
 _CEA_DECLARED_PATH_KEYS = ("artifacts", "changed_paths", "paths", "files", "touches")
+
+# Caller-provided identity input is bounded before it reaches an admission
+# receipt: retain at most 16 canonical anchors, each at most 256 characters.
+# Unsupported/invalid anchors are deterministically dropped rather than making
+# queue and non-HTTP callers disagree about an HTTP-only 422 response.
+_CEA_CALLER_SCOPE_ANCHOR_LIMIT = 16
+_CEA_CALLER_SCOPE_ANCHOR_MAX_LENGTH = 256
+_CEA_CALLER_SCOPE_ANCHOR_SCHEMES = frozenset({"task", "pr", "config", "module", "urn"})
+_CEA_SCOPE_ANCHOR_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 
 
 def _cea_declared_paths(ctx: dict) -> tuple[str, ...]:
@@ -2171,34 +2181,38 @@ class TaskQueue:
                            task.task_id, ", ".join(dropped))
 
         # ``task://`` is a derived anchor, not a portable handle to somebody
-        # else's receipt.  An external request may retain its own explicit
-        # anchor, but a known foreign task anchor is removed so normal
-        # derivation supplies this request's own id instead.
+        # else's receipt. Every caller anchor is canonicalised *before* this
+        # check, so spelling variants cannot bypass it. Caller anchors are
+        # bounded as documented above; invalid, unsupported, and foreign task
+        # anchors are deterministically dropped.
         explicit = _cea_str_tuple(context.get("scope_anchors"))
-        foreign = []
+        own_task_anchor = _cea_canonical_scope_anchor(f"task://{task.task_id}")
+        kept = []
+        dropped = []
         for anchor in explicit:
-            if not anchor.startswith("task://"):
+            try:
+                canonical = _cea_canonical_scope_anchor(anchor)
+            except _CeaInvalidScopeAnchor:
+                dropped.append(anchor)
                 continue
-            target = anchor.removeprefix("task://")
-            if target and target != task.task_id and self._task_exists(target):
-                foreign.append(anchor)
-        if foreign:
-            kept = [anchor for anchor in explicit if anchor not in foreign]
+            scheme = _CEA_SCOPE_ANCHOR_SCHEME_RE.match(canonical)
+            if (len(canonical) > _CEA_CALLER_SCOPE_ANCHOR_MAX_LENGTH
+                    or (scheme and scheme.group(1).lower() not in _CEA_CALLER_SCOPE_ANCHOR_SCHEMES)
+                    or (canonical.startswith("task://") and canonical != own_task_anchor)
+                    or (canonical.startswith("task:") and not canonical.startswith("task://"))
+                    or len(kept) >= _CEA_CALLER_SCOPE_ANCHOR_LIMIT):
+                dropped.append(anchor)
+                continue
+            kept.append(canonical)
+        if explicit:
             if kept:
                 context["scope_anchors"] = kept
             else:
                 context.pop("scope_anchors", None)
-            logger.warning("cea: dropped foreign task anchors for task %s: %s",
-                           task.task_id, ", ".join(foreign))
+        if dropped:
+            logger.warning("cea: dropped caller scope anchors for task %s: %s",
+                           task.task_id, ", ".join(dropped))
         return context
-
-    def _task_exists(self, task_id: str) -> bool:
-        """Whether a task id is already owned by this queue's receipt space."""
-        conn = self._connect()
-        try:
-            return conn.execute("SELECT 1 FROM tasks WHERE task_id = ?", (task_id,)).fetchone() is not None
-        finally:
-            conn.close()
 
     @property
     def project_identity(self) -> str:
