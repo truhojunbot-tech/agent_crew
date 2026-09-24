@@ -537,7 +537,12 @@ def test_a_legacy_row_with_no_receipt_is_refused_a_requeue_under_enforce(
 
 
 def test_retry_is_a_new_admission_not_a_requeue():
-    """``retry.failed_task`` creates a NEW task through ``enqueue`` (its own
-    receipt), so it is an ingress (I1 registry), not a path back to pending."""
+    """``retry.failed_task`` creates a new task through ``enqueue`` and binds
+    its receipt. P4 may reuse the parent's receipt when its binding is unchanged;
+    either way this is an ingress, not a path back to pending."""
     body = (SRC / "server.py").read_text(encoding="utf-8")
-    assert re.search(r'enqueue\(retry_req,\s*ingress="retry.failed_task"\)', body)
+    # The private successor provenance is required for a real retry admission;
+    # this still calls enqueue, which authorizes and binds the successor row.
+    assert re.search(
+        r'enqueue\(retry_req,\s*ingress="retry.failed_task",\s*'
+        r'_successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE\)', body)

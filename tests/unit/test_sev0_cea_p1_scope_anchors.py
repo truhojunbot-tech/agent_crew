@@ -153,6 +153,57 @@ def test_an_unspellable_explicit_anchor_reaches_the_engine_unchanged():
     assert anchors("t-bad", context={"scope_anchors": ["../escape"]}) == ("../escape",)
 
 
+def test_an_unspellable_explicit_anchor_is_refused_with_a_receipt(tmp_path):
+    from tests.unit.sev0_cea_acceptance_helpers import (
+        AuthorityState, enqueue_and_read, queue_for)
+
+    q = queue_for(tmp_path, AuthorityState("active"), name="invalid-anchor.db")
+    admitted, receipt = enqueue_and_read(
+        q, task("t-bad", context={"scope_anchors": ["../escape"]}),
+        ingress="cli.enqueue")
+    assert not admitted
+    assert receipt["decision"] == "BLOCK"
+    assert receipt["reason"]["code"] == "INVALID_SCOPE_ANCHOR"
+
+
+@pytest.mark.parametrize("anchor", ["proofs/p345-block", "route:post-/tasks"])
+def test_l3_block_anchor_survives_two_ingresses(tmp_path, anchor):
+    # The external p345 fixture's `proof:` namespace is unsupported; a
+    # declared path exercises its intended invariant without relaxing ingress.
+    from agent_crew.cea.engine import EngineConfig
+    from agent_crew.cea.memory import MemoryGate
+    from tests.unit.sev0_cea_acceptance_helpers import (
+        AuthorityState, enqueue_and_read, providers)
+    from agent_crew.queue import TaskQueue
+
+    class MemoryClient:
+        def provide(self, intent):
+            # L3 normalizes anchors to lowercase before exact matching.
+            hits = [a for a in intent.identity.target.scope_anchors
+                    if a.lower() == anchor]
+            return {"incident_memory": {"status": "OK", "matches": ([{
+                "id": "CX-P345", "recorded_disposition": "BLOCK",
+                "match": {"confidence": "HIGH", "basis": ["scope_anchor"],
+                          "matched": hits},
+            }] if hits else [])}}
+
+    p = providers(AuthorityState("active"))
+    p["gates"] = MemoryGate(p["gates"], MemoryClient())
+    q = TaskQueue(str(tmp_path / "memory.db"), cea_config=EngineConfig(mode="test"),
+                  cea_providers=p)
+    for task_id, ingress, declared in (
+            ("p5-cli", "cli.enqueue", anchor),
+            ("p5-coordinator", "http.tasks", anchor.upper())):
+        admitted, receipt = enqueue_and_read(
+            q, task(task_id, context={"scope_anchors": [declared]}),
+            ingress=ingress)
+        assert not admitted
+        assert receipt["decision"] == "BLOCK"
+        assert receipt["reason"]["code"] == "HUMAN_GATE_DENIED"
+        recorded = receipt["provenance"]["intent_identity"]["target"]["scope_anchors"]
+        assert [value.lower() for value in recorded] == [anchor]
+
+
 def test_an_unspellable_declared_path_does_not_block_the_task():
     """A path key is routing metadata, not a declaration of scope the caller
     chose to make — it falls through to the id rather than poisoning admission."""

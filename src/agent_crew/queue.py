@@ -116,11 +116,16 @@ _CEA_DECLARED_PATH_KEYS = ("artifacts", "changed_paths", "paths", "files", "touc
 
 # Caller-provided identity input is bounded before it reaches an admission
 # receipt: retain at most 16 canonical anchors, each at most 256 characters.
-# Unsupported/invalid anchors are deterministically dropped rather than making
-# queue and non-HTTP callers disagree about an HTTP-only 422 response.
+# Unsupported anchors are dropped; malformed explicit anchors reach the engine
+# for an audited refusal. Queue and non-HTTP callers share the same rule.
 _CEA_CALLER_SCOPE_ANCHOR_LIMIT = 16
 _CEA_CALLER_SCOPE_ANCHOR_MAX_LENGTH = 256
-_CEA_CALLER_SCOPE_ANCHOR_SCHEMES = frozenset({"task", "pr", "config", "module", "urn"})
+# These additional namespaces occur in the L3 incident index. Dropping them
+# makes a recorded BLOCK/REUSE unreachable by its own declared anchor.
+_CEA_CALLER_SCOPE_ANCHOR_SCHEMES = frozenset({
+    "task", "pr", "config", "module", "urn", "cap", "cmd", "commit", "op",
+    "port", "route", "ssot",
+})
 _CEA_SCOPE_ANCHOR_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
 
 
@@ -148,6 +153,19 @@ def _cea_canonical_or_none(anchors) -> Optional[tuple[str, ...]]:
         return _cea_canonical_anchors(anchors)
     except _CeaInvalidScopeAnchor:
         return None
+
+
+def _cea_first_invalid_scope_anchor(anchors) -> Optional[str]:
+    """Find a malformed explicit anchor for the engine to refuse with a receipt."""
+    for anchor in anchors:
+        try:
+            _cea_canonical_scope_anchor(anchor)
+        except _CeaInvalidScopeAnchor:
+            # Refusal still goes through the engine, but never carry an
+            # overlong caller value into its receipt.
+            return (anchor if len(anchor) <= _CEA_CALLER_SCOPE_ANCHOR_MAX_LENGTH
+                    else "../invalid-scope-anchor")
+    return None
 
 
 def _cea_sanitise_caller_scope_anchors(anchors, task_id: str) -> tuple[str, ...]:
@@ -326,6 +344,12 @@ def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ..
     declared_paths = _cea_declared_paths(ctx)
     selected = explicit or declared_paths
     if selected:
+        # Explicit malformed scope is an admission error, not an absent target.
+        # Preserve it only for the engine's INVALID_SCOPE_ANCHOR refusal.
+        if explicit:
+            invalid = _cea_first_invalid_scope_anchor(explicit)
+            if invalid is not None:
+                return (invalid,)
         # The system successor capability above is the sole exception: its
         # retained parent anchor is lineage, not caller-provided identity.
         if _cea_is_lineage_successor(task, ctx):
@@ -2204,9 +2228,13 @@ class TaskQueue:
         # ``task://`` is a derived anchor, not a portable handle to somebody
         # else's receipt. Every caller anchor is canonicalised *before* this
         # check, so spelling variants cannot bypass it. Caller anchors are
-        # bounded as documented above; invalid, unsupported, and foreign task
-        # anchors are deterministically dropped.
+        # bounded as documented above. Malformed explicit anchors reach the
+        # engine for refusal; unsupported and foreign task anchors are dropped.
         explicit = _cea_str_tuple(context.get("scope_anchors"))
+        invalid = _cea_first_invalid_scope_anchor(explicit)
+        if invalid is not None:
+            context["scope_anchors"] = [invalid]
+            return context
         kept = _cea_sanitise_caller_scope_anchors(explicit, task.task_id)
         if explicit:
             if kept:

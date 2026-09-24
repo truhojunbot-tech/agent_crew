@@ -1785,16 +1785,16 @@ def auto_fallback_failed_task(
                 f"auto_fallback: fallback_chain_depth={ctx.get('fallback_chain_depth')} "
                 f">= MAX ({MAX_FALLBACK_CHAIN_DEPTH}) for {task_id} — cancelling chain."
             )
-            # Cancel the original root task so the chain has a definitive
-            # terminal state of "cancelled" (not "failed") in the DB.
+            # Cancel an active root; G12 keeps an already-failed root terminal.
             original_task_id = ctx.get("original_task_id")
             if original_task_id:
                 try:
-                    queue.cancel(original_task_id)
-                    logger.info(
-                        f"auto_fallback: cancelled original task {original_task_id} "
-                        f"due to fallback loop detection"
-                    )
+                    if queue.cancel(original_task_id):
+                        logger.info("auto_fallback: cancelled original task %s due to fallback loop",
+                                    original_task_id)
+                    else:
+                        logger.info("auto_fallback: original task %s already terminal; cancel refused",
+                                    original_task_id)
                 except Exception as e:
                     logger.warning(
                         f"auto_fallback: failed to cancel original task {original_task_id}: {e}"
