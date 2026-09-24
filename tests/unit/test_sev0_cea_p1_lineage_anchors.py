@@ -203,3 +203,67 @@ def test_a_fallback_admitted_through_the_real_queue_reuses_the_parent_lineage(qu
     row = queue._connect().execute(
         "SELECT task_id FROM tasks WHERE task_id = ?", (successor.task_id,)).fetchone()
     assert row is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# P1 r2 — the id grammar is a convention, not evidence
+#
+# Codex REQUEST_CHANGES on 725c6c3: the walk unwrapped any id shaped like
+# ``retry-<parent>-a<n>`` / ``fallback-<parent>-d<n>`` even with no lineage key
+# in the context, so an ordinary task posted as ``retry-impl-1-a1`` anchored on
+# ``task://impl-1`` and ``_cea_is_lineage_successor`` handed it ``retry=True``
+# — the ADR path into a live lineage it never belonged to.
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_an_unrelated_task_shaped_like_a_retry_keeps_its_own_anchor():
+    """No ``retry_of``/``original_task_id``/``fallback_*``: no lineage."""
+    impostor = task("retry-impl-1a2b3c4d-a1")
+    assert anchors(impostor) == ("task://retry-impl-1a2b3c4d-a1",)
+    assert hashed(impostor) != hashed(task("impl-1a2b3c4d"))
+
+
+def test_an_unrelated_task_shaped_like_a_fallback_keeps_its_own_anchor():
+    impostor = task("fallback-impl-1a2b3c4d-d1")
+    assert anchors(impostor) == ("task://fallback-impl-1a2b3c4d-d1",)
+    assert hashed(impostor) != hashed(task("impl-1a2b3c4d"))
+
+
+def test_a_successor_shaped_id_alone_does_not_grant_the_retry_path():
+    """``retry=True`` is what lets a task re-admit another's receipt, so the
+    claim has to come from the context — the guard, not just the anchor."""
+    from agent_crew.queue import _cea_is_lineage_successor
+    impostor = task("retry-impl-1a2b3c4d-a1")
+    assert _cea_is_lineage_successor(impostor, impostor.context) is False
+    genuine = retry_successor(task("impl-1a2b3c4d"))
+    assert _cea_is_lineage_successor(genuine, genuine.context) is True
+
+
+def test_session_continuity_does_not_validate_the_id_grammar():
+    """``previous_task_id`` is not a lineage key (see the guard above), so it
+    must not be the hop that unlocks unwrapping either."""
+    impostor = task("retry-impl-1a2b3c4d-a1",
+                    context={"previous_task_id": "impl-1a2b3c4d"})
+    assert anchors(impostor) == ("task://retry-impl-1a2b3c4d-a1",)
+
+
+def test_a_declared_parent_is_honoured_even_when_the_id_says_nothing():
+    """The mirror: lineage is read off the context, so a successor that did not
+    take the minted-id shape still anchors on its parent."""
+    oddly_named = task("impl-9999", context={"retry_of": "impl-1a2b3c4d"})
+    assert anchors(oddly_named) == ("task://impl-1a2b3c4d",)
+
+
+def test_the_impostor_does_not_collide_with_the_real_retry_through_the_queue(queue):
+    """End to end: the parent and its genuine retry share one lineage; a task
+    whose id merely apes that retry is admitted as its own separate work."""
+    parent = task("impl-1a2b3c4d")
+    queue.enqueue(parent, ingress="cli.enqueue")
+    genuine = retry_successor(parent)
+    queue.enqueue(genuine, ingress="retry.failed_task")
+    impostor = task("retry-impl-1a2b3c4d-a7")       # same shape, no lineage key
+    queue.enqueue(impostor, ingress="cli.enqueue")
+    assert hashed(genuine) == hashed(parent)
+    assert hashed(impostor) != hashed(parent)
+    row = queue._connect().execute(
+        "SELECT task_id FROM tasks WHERE task_id = ?", (impostor.task_id,)).fetchone()
+    assert row is not None

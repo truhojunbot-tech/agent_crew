@@ -176,6 +176,19 @@ _CEA_SUCCESSOR_ID_RE = re.compile(r"^(?:retry|fallback)-(.+?)-[ad]\d+$")
 _CEA_LINEAGE_MAX_DEPTH = 16
 
 
+def _cea_lineage_parent_from_ctx(ctx: dict) -> str:
+    """The parent this task *declares*, from lineage keys the system writes.
+
+    This is the only admissible proof that a task is a successor. Its absence
+    is decisive: no parent key, no lineage — see :func:`_cea_lineage_root_task_id`.
+    """
+    for key in _CEA_LINEAGE_PARENT_KEYS:
+        candidate = str(ctx.get(key) or "").strip()
+        if candidate:
+            return candidate
+    return ""
+
+
 def _cea_lineage_root_task_id(task_id: str, ctx: dict) -> str:
     """The id of the task a successor chain *originated* from, or ``task_id``.
 
@@ -186,6 +199,10 @@ def _cea_lineage_root_task_id(task_id: str, ctx: dict) -> str:
     time a task was retried — the exact inverse of the #51 failure and just as
     wrong (codex REQUEST_CHANGES on 413f13b).
 
+    A chain exists only if the context *declares* it
+    (:func:`_cea_lineage_parent_from_ctx`). Without such a key this returns
+    ``task_id`` unchanged, whatever the id looks like.
+
     The walk is bounded (:data:`_CEA_LINEAGE_MAX_DEPTH`) and cycle-safe (a
     ``seen`` set): a hand-written context claiming ``original_task_id`` is the
     task itself, or two ids naming each other, must terminate — admission runs
@@ -193,26 +210,31 @@ def _cea_lineage_root_task_id(task_id: str, ctx: dict) -> str:
     """
     if not task_id:
         return task_id
+    # ⛔The first hop must come from lineage metadata the *system* wrote, never
+    #   from the shape of the id. The id grammar is a naming convention, not
+    #   evidence: any caller may POST ``task_id="retry-impl-1-a1"`` for work
+    #   that has nothing to do with ``impl-1``, and unwrapping it would anchor
+    #   that task on ``task://impl-1`` — letting an unrelated task reuse or
+    #   supersede a live lineage it never belonged to (codex REQUEST_CHANGES on
+    #   725c6c3). A task that declares no parent keeps its own anchor, however
+    #   much its id looks like a successor's.
+    parent = _cea_lineage_parent_from_ctx(ctx)
+    if not parent:
+        return task_id
     seen = {task_id}
     current = task_id
-    # The context describes one hop only; past that the deterministic id is the
-    # record of the chain, which is why it was made deterministic.
-    parent = ""
-    for key in _CEA_LINEAGE_PARENT_KEYS:
-        candidate = str(ctx.get(key) or "").strip()
-        if candidate:
-            parent = candidate
-            break
+    # Past that first validated hop the context has nothing more to say — it
+    # describes one hop only — so the chain above the parent is read off the
+    # deterministic id, which is the record of the chain and the reason it was
+    # made deterministic. Bounded (:data:`_CEA_LINEAGE_MAX_DEPTH`) and
+    # cycle-safe (``seen``): admission runs on the enqueue path and may not hang.
     for _ in range(_CEA_LINEAGE_MAX_DEPTH):
-        nxt = parent
-        parent = ""
-        if not nxt:
-            match = _CEA_SUCCESSOR_ID_RE.match(current)
-            nxt = match.group(1) if match else ""
-        if not nxt or nxt in seen:
+        if not parent or parent in seen:
             break
-        seen.add(nxt)
-        current = nxt
+        seen.add(parent)
+        current = parent
+        match = _CEA_SUCCESSOR_ID_RE.match(current)
+        parent = match.group(1) if match else ""
     return current
 
 
@@ -226,6 +248,11 @@ def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
     reuse the parent receipt with ``attempt + 1`` while B is unchanged and the
     budget holds, otherwise supersede and admit afresh. So the successor takes
     the ADR path rather than being handed a fresh anchor to dodge the check.
+
+    ⛔Being a successor is a claim the *context* makes, never one the ``task_id``
+      makes: ``retry=True`` grants the ADR path into another lineage's receipt,
+      so an unrelated task whose id merely reads like a successor's must not
+      reach it (codex REQUEST_CHANGES on 725c6c3).
     """
     task_id = str(getattr(task, "task_id", "") or "")
     return bool(task_id) and _cea_lineage_root_task_id(task_id, ctx) != task_id
