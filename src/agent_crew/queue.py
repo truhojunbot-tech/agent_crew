@@ -150,6 +150,26 @@ def _cea_canonical_or_none(anchors) -> Optional[tuple[str, ...]]:
         return None
 
 
+def _cea_sanitise_caller_scope_anchors(anchors, task_id: str) -> tuple[str, ...]:
+    """Return bounded, portable caller anchors after canonicalisation."""
+    own_task_anchor = _cea_canonical_scope_anchor(f"task://{task_id}")
+    kept = []
+    for anchor in anchors:
+        try:
+            canonical = _cea_canonical_scope_anchor(anchor)
+        except _CeaInvalidScopeAnchor:
+            continue
+        scheme = _CEA_SCOPE_ANCHOR_SCHEME_RE.match(canonical)
+        if (len(canonical) > _CEA_CALLER_SCOPE_ANCHOR_MAX_LENGTH
+                or (scheme and scheme.group(1).lower() not in _CEA_CALLER_SCOPE_ANCHOR_SCHEMES)
+                or (canonical.startswith("task://") and canonical != own_task_anchor)
+                or (canonical.startswith("task:") and not canonical.startswith("task://"))
+                or len(kept) >= _CEA_CALLER_SCOPE_ANCHOR_LIMIT):
+            continue
+        kept.append(canonical)
+    return tuple(kept)
+
+
 def _cea_repo(task: TaskRequest, ctx: dict, queue_identity: Optional[str]) -> str:
     """``target.repo``, from what is already known — never from a git call.
 
@@ -304,14 +324,14 @@ def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ..
       evidence of two empty fields.
     """
     explicit = _cea_str_tuple(ctx.get("scope_anchors"))
-    if explicit:
-        # Canonical when it can be, raw when it cannot — see _cea_canonical_or_none.
-        return _cea_canonical_or_none(explicit) or explicit
     declared_paths = _cea_declared_paths(ctx)
-    if declared_paths:
-        canonical = _cea_canonical_or_none(declared_paths)
-        if canonical:
-            return canonical
+    selected = explicit or declared_paths
+    if selected:
+        # The system successor capability above is the sole exception: its
+        # retained parent anchor is lineage, not caller-provided identity.
+        if _cea_is_lineage_successor(task, ctx):
+            return _cea_canonical_or_none(selected) or selected
+        return _cea_sanitise_caller_scope_anchors(selected, task.task_id)
     pr = _normalize_pr_number(ctx.get("pr_number"))
     if pr is None:
         pr = _normalize_pr_number(getattr(task, "pr_number", None))
@@ -2186,32 +2206,15 @@ class TaskQueue:
         # bounded as documented above; invalid, unsupported, and foreign task
         # anchors are deterministically dropped.
         explicit = _cea_str_tuple(context.get("scope_anchors"))
-        own_task_anchor = _cea_canonical_scope_anchor(f"task://{task.task_id}")
-        kept = []
-        dropped = []
-        for anchor in explicit:
-            try:
-                canonical = _cea_canonical_scope_anchor(anchor)
-            except _CeaInvalidScopeAnchor:
-                dropped.append(anchor)
-                continue
-            scheme = _CEA_SCOPE_ANCHOR_SCHEME_RE.match(canonical)
-            if (len(canonical) > _CEA_CALLER_SCOPE_ANCHOR_MAX_LENGTH
-                    or (scheme and scheme.group(1).lower() not in _CEA_CALLER_SCOPE_ANCHOR_SCHEMES)
-                    or (canonical.startswith("task://") and canonical != own_task_anchor)
-                    or (canonical.startswith("task:") and not canonical.startswith("task://"))
-                    or len(kept) >= _CEA_CALLER_SCOPE_ANCHOR_LIMIT):
-                dropped.append(anchor)
-                continue
-            kept.append(canonical)
+        kept = _cea_sanitise_caller_scope_anchors(explicit, task.task_id)
         if explicit:
             if kept:
-                context["scope_anchors"] = kept
+                context["scope_anchors"] = list(kept)
             else:
                 context.pop("scope_anchors", None)
-        if dropped:
+        if explicit and tuple(explicit) != kept:
             logger.warning("cea: dropped caller scope anchors for task %s: %s",
-                           task.task_id, ", ".join(dropped))
+                           task.task_id, ", ".join(explicit))
         return context
 
     @property

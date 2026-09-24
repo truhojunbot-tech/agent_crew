@@ -356,3 +356,31 @@ def test_caller_scope_anchors_are_bounded_to_allowed_short_canonical_values(queu
     queue.enqueue(task("caller", context={"scope_anchors": anchors_in}), ingress="http.tasks")
     stored = {item.task_id: item for item in queue.list_tasks()}["caller"]
     assert stored.context["scope_anchors"] == [f"src/file-{i}.py" for i in range(16)]
+
+
+# P1 r5 — declared paths are caller anchors too, not receipt handles.
+@pytest.mark.parametrize("key", ("files", "artifacts", "paths", "changed_paths", "touches"))
+@pytest.mark.parametrize("foreign", [
+    "TASK://impl-victim",
+    "task://impl-victim/",
+    " task://impl-victim",
+])
+def test_declared_path_foreign_task_anchor_spellings_are_dropped(queue, key, foreign):
+    victim = task("impl-victim")
+    caller = task("caller", context={key: [foreign, "src/./keep.py"]})
+    queue.enqueue(victim, ingress="http.tasks")
+    queue.enqueue(caller, ingress="http.tasks")
+    assert anchors(caller) == ("src/keep.py",)
+    assert hashed(caller) != hashed(victim)
+
+
+def test_declared_path_anchors_are_bounded_across_all_declared_path_keys(queue):
+    context = {
+        key: [f"src/./file-{index}.py"]
+        for index, key in enumerate(("files", "artifacts", "paths", "changed_paths", "touches"))
+    }
+    context["files"].extend(f"src/./file-{index}.py" for index in range(5, 17))
+    caller = task("caller", context=context)
+    queue.enqueue(caller, ingress="http.tasks")
+    assert len(anchors(caller)) == 16
+    assert all(anchor.startswith("src/file-") for anchor in anchors(caller))
