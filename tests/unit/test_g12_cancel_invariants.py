@@ -372,3 +372,127 @@ def test_a_task_that_finished_during_the_scan_is_not_expired(tmp_path, monkeypat
     monkeypatch.setattr(TaskQueue, "cancel", _finish_then_cancel)
     assert q.expire_stale(older_than_seconds=600.0) == []
     assert q.get_task_status("done-1") == "completed"
+
+
+# ── (2) the cancel/spawn handoff ──────────────────────────────────────────
+#
+# The dispatch commits (`record_dispatch`) several statements before the child
+# exists, and the child was registered several statements after it.  A cancel
+# landing in that window found `None` in the registry, answered
+# `pane_worker_not_killable` — killing nothing — and the dispatcher then
+# registered the child and awaited it as a live worker for a task whose
+# authorization it had just revoked (r2 review of 4a49338, finding 2).
+
+
+def _cancel_like_the_endpoint(db, app, task_id, *, via_server=True):
+    """The DELETE endpoint's own two steps, in its order: the authoritative
+    cancel commits, then I-B stops the worker.
+
+    Called directly rather than through TestClient because this runs *inside*
+    the event loop the dispatcher occupies, which a sync test client cannot
+    re-enter.  ``via_server=False`` models the other real caller — a cancel from
+    another process (`crew task expire-stale`, the CLI), which cannot touch this
+    server's in-memory registry at all, so only the DB says the task is over.
+    """
+    TaskQueue(db).cancel(task_id)
+    if not via_server:
+        return None
+    stop = getattr(app.state, "stop_worker_for_ended_task", None)
+    if stop is None:
+        # Pre-fix shape: the endpoint looked the process up itself and passed
+        # whatever it found (`None`, in this window) straight to termination.
+        return app.state.terminate_worker(
+            task_id, app.state.active_dispatch_processes.get(task_id))
+    return stop(task_id, reason="cancelled_attempt")
+
+
+def _dispatch_with_cancel_at_spawn(tmp_path, monkeypatch, *, task_id, via_server):
+    """Run one real dispatch, injecting a cancel in the handoff window.
+
+    The injection point is the spawn itself: `record_dispatch` has committed and
+    the nonce is already in the prompt, and the child is not in the registry
+    yet.  That is precisely the window the race lives in.
+    """
+    state_path = _dispatch_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("AGENT_CREW_CANCEL_KILL_GRACE", "0.05")
+    signalled = []
+    monkeypatch.setattr("agent_crew.server.os.killpg",
+                        lambda pid, sig: signalled.append((pid, sig)))
+    db = str(tmp_path / "tasks.db")
+    spawned = []
+    base_exec = _spawn_stub(spawned)
+    injected = {}
+    box = {}
+
+    async def _exec_then_cancel(*cmd, **kwargs):
+        proc = await base_exec(*cmd, **kwargs)
+        injected["termination"] = _cancel_like_the_endpoint(
+            db, box["app"], task_id, via_server=via_server)
+        injected["registry_entry"] = box["app"].state.active_dispatch_processes.get(task_id)
+        return proc
+
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _exec_then_cancel)
+    app = create_app(db_path=db, pane_map={}, port=8111, state_path=state_path,
+                     project="demo", watchdog_disabled=True, anomaly_disabled=True)
+    box["app"] = app
+    try:
+        with TestClient(app):
+            q = TaskQueue(db)
+            q.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                                  description="d", branch="main"))
+            task = q.dequeue(role="implementer")
+            assert task is not None
+            asyncio.run(app.state.dispatch_task(task, "implementer"))
+    finally:
+        for timer in list(app.state.cancel_kill_timers.values()):
+            timer.cancel()
+            timer.join(timeout=1.0)
+        app.state.cancel_kill_timers.clear()
+    return app, db, spawned, signalled, injected
+
+
+def test_a_cancel_in_the_dispatch_handoff_window_stops_the_child(tmp_path, monkeypatch):
+    """(2) A cancel between the dispatch commit and the registration finds the
+    dispatch, and the child is terminated rather than awaited as live."""
+    import signal as _signal
+
+    app, db, spawned, signalled, injected = _dispatch_with_cancel_at_spawn(
+        tmp_path, monkeypatch, task_id="race-task", via_server=True)
+
+    assert spawned, "the dispatcher never reached the spawn"
+    # The bug's signature: a decided dispatch reported as nothing to kill.
+    assert injected["termination"] == "worker_not_spawned_yet", injected["termination"]
+    assert injected["registry_entry"] is not None, \
+        "the dispatch was invisible to cancel until after the spawn"
+    # I-B: the child is stopped, as a group, by the dispatcher's own re-check.
+    assert signalled and signalled[0] == (4242, _signal.SIGTERM), signalled
+
+    q = TaskQueue(db)
+    state = q.get_exec_state("race-task")
+    assert q.get_task_status("race-task") == "cancelled", \
+        "the dispatcher overwrote the cancel with its own outcome"
+    # Never awaited as live: the pid was never bound, and no dispatcher outcome
+    # (timed_out / no_result_submitted / exit_*) was recorded against the task.
+    assert state["dispatch_target"] != "pid:4242", \
+        "the cancelled child was adopted as the task's live executor"
+    assert not [e for e in state["events"] if e["event"] in ("timed_out", "failed")]
+    assert "race-task" not in app.state.active_dispatch_processes
+    assert not app.state.cancel_kill_timers, "a SIGKILL was left armed after the dispatch"
+
+
+def test_a_cancel_from_another_process_is_caught_by_the_post_spawn_recheck(tmp_path, monkeypatch):
+    """(2) The same window, but the cancel never touched this server's registry
+    — `crew task expire-stale` runs in its own process.  Only the re-read of the
+    task's status can catch it, so that re-read has to exist."""
+    import signal as _signal
+
+    app, db, spawned, signalled, injected = _dispatch_with_cancel_at_spawn(
+        tmp_path, monkeypatch, task_id="race-cli", via_server=False)
+
+    assert spawned, "the dispatcher never reached the spawn"
+    assert injected["termination"] is None            # no server-side I-B ran
+    assert signalled and signalled[0] == (4242, _signal.SIGTERM), \
+        "an out-of-process cancel left the child running"
+    q = TaskQueue(db)
+    assert q.get_task_status("race-cli") == "cancelled"
+    assert q.get_exec_state("race-cli")["dispatch_target"] != "pid:4242"

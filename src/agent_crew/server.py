@@ -4840,7 +4840,8 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
-            _active_dispatch_processes.pop(task.task_id, None)
+            with _active_dispatch_lock:
+                _active_dispatch_processes.pop(task.task_id, None)
             # The process is reaped; a cancel's pending SIGKILL now has no
             # legitimate target and must not outlive it (review of 720ac76).
             _cancel_pending_kill(task.task_id)

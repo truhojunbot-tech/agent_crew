@@ -1640,9 +1640,18 @@ def task_expire_stale(project: str, base: str, db: str, older_than: int, dry_run
             idle = int(_t.time() - (r["last_activity_at"] or 0))
             click.echo(f"  would cancel: {r['task_id']} ({r['task_type']}, idle {idle}s)")
         return
+    # Out of process, so there is no dispatch registry here: the cancel is
+    # authoritative (status, receipt REVOKED, nonces spent, end event) but a
+    # dispatcher child cannot be signalled from the CLI. The server's
+    # POST /tasks/expire-stale does both halves; say so rather than letting an
+    # operator assume the worker died with the row.
     cancelled = q.expire_stale(older_than_seconds=float(older_than))
     if cancelled:
         click.echo(f"Cancelled {len(cancelled)} stale task(s): {', '.join(cancelled)}")
+        click.echo("Note: workers were not signalled from here — the dispatcher's "
+                   "own re-check stops a child it spawned. Use "
+                   "POST /tasks/expire-stale on the running server to terminate "
+                   "children as part of the expiry.")
     else:
         click.echo("No stale tasks found.")
 
