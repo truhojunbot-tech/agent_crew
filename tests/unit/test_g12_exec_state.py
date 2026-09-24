@@ -308,38 +308,46 @@ def test_cancel_of_a_pane_worker_says_so_rather_than_not_dispatched(cancel_app):
     assert cancel_app.state.killpg_calls == []
 
 
-def test_cancel_commits_before_it_terminates_and_kills_nothing_on_failure(cancel_app, monkeypatch):
-    """I-A precedes I-B. If the authoritative cancel does not commit, the caller
-    gets a 5xx and the worker is left running — a killed-but-still-authorized
-    worker is the worse of the two failures."""
-    order = []
-    proc = _FakeProc(pid=4545)
-    cancel_app.state.active_dispatch_processes["worker"] = proc
-    real_terminate = cancel_app.state.terminate_worker
-    monkeypatch.setattr(cancel_app.state, "terminate_worker",
-                        lambda *a, **kw: (order.append("terminate"), real_terminate(*a, **kw))[1],
-                        raising=False)
+def test_cancel_commits_before_it_terminates(cancel_app, monkeypatch):
+    """I-A precedes I-B. 720ac76 signalled first, which left a window where the
+    worker was dead but its attempt was still authorized."""
+    from agent_crew.queue import TaskQueue as _TQ
 
-    with TestClient(cancel_app) as client:
+    order = []
+    cancel_app.state.active_dispatch_processes["worker"] = _FakeProc(pid=4545)
+    # Both halves report into one list, so the assertion is on real ordering
+    # rather than on a wrapper the endpoint might not call.
+    monkeypatch.setattr("agent_crew.server.os.killpg",
+                        lambda pid, sig: order.append(f"signal:{int(sig)}"))
+    real_cancel = _TQ.cancel
+
+    def _cancel(self, task_id):
+        # Observed inside the commit, i.e. before it returns.
+        order.append("commit")
+        return real_cancel(self, task_id)
+
+    monkeypatch.setattr(_TQ, "cancel", _cancel)
+    response = _enqueue_and_cancel(cancel_app)
+    assert response.status_code == 200
+    assert order[:2] == ["commit", f"signal:{int(__import__('signal').SIGTERM)}"], order
+
+
+def test_a_cancel_that_does_not_commit_kills_nothing_and_returns_5xx(cancel_app, monkeypatch):
+    """The authoritative cancel is the precondition for termination, not a
+    best-effort companion to it: if it raises, the worker keeps running and the
+    caller gets a 5xx to retry against an unchanged world."""
+    from agent_crew.queue import TaskQueue as _TQ
+
+    cancel_app.state.active_dispatch_processes["worker"] = _FakeProc(pid=4646)
+    monkeypatch.setattr(_TQ, "cancel",
+                        lambda self, task_id: (_ for _ in ()).throw(RuntimeError("db down")))
+    with TestClient(cancel_app, raise_server_exceptions=False) as client:
         client.post("/tasks", json={"task_id": "worker", "task_type": "implement",
                                     "description": "d", "branch": "main"})
-        from agent_crew.queue import TaskQueue as _TQ
-        real_cancel = _TQ.cancel
-
-        def _cancel(self, task_id):
-            order.append("commit")
-            return real_cancel(self, task_id)
-
-        monkeypatch.setattr(_TQ, "cancel", _cancel)
-        assert client.delete("/tasks/worker").status_code == 200
-        assert order == ["commit", "terminate"] or order == ["commit"], order
-
-        # Now make the commit fail: nothing may be signalled.
-        monkeypatch.setattr(_TQ, "cancel", lambda self, task_id: (_ for _ in ()).throw(RuntimeError("db down")))
-        before = list(cancel_app.state.killpg_calls)
-        failed = client.delete("/tasks/worker")
-    assert failed.status_code == 500
-    assert cancel_app.state.killpg_calls == before, "a failed cancel must signal nothing"
+        response = client.delete("/tasks/worker")
+    assert response.status_code == 500
+    assert cancel_app.state.killpg_calls == [], "a failed cancel must signal nothing"
+    assert not cancel_app.state.cancel_kill_timers
 
 
 def test_heartbeat_only_touches_running_tasks(tmp_db):
