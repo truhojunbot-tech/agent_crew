@@ -6198,14 +6198,38 @@ def create_app(
         then raised) a permanently dead attempt that the queue still believed
         was running.  On commit failure we return 5xx and kill nothing, so the
         caller can retry against an unchanged world.
+
+        Only an *active* row can be cancelled. A row already decided (completed,
+        failed, cancelled, timed_out, blocked) answers 409 ``NOT_ACTIVE`` and
+        nothing happens at all — no revocation, no nonce spent, no worker
+        signal. Before this, DELETE on a completed task returned 200 and
+        persisted ``cancelled``, retroactively revoking a finished attempt and
+        orphaning the successors it had legitimately spawned (r4 review of
+        c8ce45f). An unknown id stays the tolerated no-op it was.
         """
+        from fastapi.responses import JSONResponse as _JSONResponse
         try:
-            q().cancel(task_id)
+            cancelled = q().cancel(task_id)
         except Exception:
             logger.exception("cancel: authoritative cancel failed task=%s", task_id)
             raise HTTPException(
                 status_code=500,
                 detail=f"cancel of {task_id!r} did not commit; worker left running",
+            )
+        if not cancelled:
+            # A refusal wrote nothing, and the status that caused it is terminal
+            # — it cannot have moved again — so reading it back here is safe.
+            current = q().get_task_status(task_id)
+            if current is None:
+                return {"status": "unknown", "reason": "NO_SUCH_TASK",
+                        "worker_termination": "skipped"}
+            # ⛔No worker termination either: the attempt this DELETE names has
+            #   already ended, and any process still running under that id would
+            #   belong to a later attempt we were not asked to touch.
+            return _JSONResponse(
+                status_code=409,
+                content={"status": current, "reason": "NOT_ACTIVE",
+                         "task_id": task_id},
             )
         return {
             "status": "cancelled",

@@ -45,6 +45,15 @@ CANCEL_REASON_ATTEMPT = "cancelled_attempt"
 #: :meth:`TaskQueue.cancel` — the reason is what differs, not the mechanism.
 CANCEL_REASON_STALE_LEASE = "STALE_LEASE"
 
+#: Statuses a task can no longer be cancelled *out of*. A row here has already
+#: been decided: the attempt posted a result, expired, or was revoked. Cancelling
+#: one retroactively would revoke a completed attempt's authorization and orphan
+#: the successors it legitimately spawned, so :meth:`TaskQueue.cancel` refuses.
+#: ⛔Not an allowlist of the opposite: ``orphaned`` and ``needs_human`` rows are
+#:   still live work an operator must be able to cancel (see :meth:`cancel`).
+TERMINAL_TASK_STATUSES = frozenset(
+    {"completed", "failed", "cancelled", "timed_out", "blocked"})
+
 
 class PausedError(Exception):
     """#314 P0-1: runtime STOP 활성 시 실행생성 mutation(enqueue)이 원자적으로 거부됐음을 알림.
@@ -4140,11 +4149,21 @@ class TaskQueue:
 
         ``reason`` names *why* — it lands in the end event and in the receipt
         transition note, never in a timestamp column. ``expected_status``, when
-        given, makes this a CAS: the cancel is skipped (returning False) if the
-        row moved on since the caller selected it, so a task that finished
-        between a stale-lease scan and its expiry is not cancelled retroactively.
+        given, makes this a CAS: the cancel is skipped if the row moved on since
+        the caller selected it, so a task that finished between a stale-lease
+        scan and its expiry is not cancelled retroactively.
 
-        Returns True when this call cancelled the row.
+        ⛔Cancellation applies to *active* rows only. A row already in
+          :data:`TERMINAL_TASK_STATUSES` is refused — no status write, no receipt
+          REVOKED transition, no nonce spent, no end event, no dependents
+          orphaned — because a completed attempt cannot be retroactively revoked
+          and its legitimate successors cannot be orphaned by a late DELETE
+          (r4 review of c8ce45f). The check reads and refuses inside the same
+          ``BEGIN IMMEDIATE`` as the write, so it is a CAS, not check-then-act.
+
+        Returns True when this call cancelled the row, False when it refused —
+        a refusal is a complete no-op, so the caller can read the refusing status
+        afterwards (terminal is final; it cannot have moved again).
         """
         conn = self._connect()
         try:
@@ -4153,7 +4172,11 @@ class TaskQueue:
             if row is None:
                 conn.execute("ROLLBACK")
                 return False
-            if expected_status is not None and row["status"] != expected_status:
+            status = row["status"]
+            if expected_status is not None and status != expected_status:
+                conn.execute("ROLLBACK")
+                return False
+            if status in TERMINAL_TASK_STATUSES:
                 conn.execute("ROLLBACK")
                 return False
             conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))

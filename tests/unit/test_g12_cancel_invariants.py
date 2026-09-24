@@ -496,3 +496,139 @@ def test_a_cancel_from_another_process_is_caught_by_the_post_spawn_recheck(tmp_p
     q = TaskQueue(db)
     assert q.get_task_status("race-cli") == "cancelled"
     assert q.get_exec_state("race-cli")["dispatch_target"] != "pid:4242"
+
+
+# ── (4) cancellation applies to active rows only ──────────────────────────
+#
+# `cancel_task` called `q().cancel(task_id)` without looking at the row's state
+# or at the boolean it returned, and `cancel` then wrote `status = 'cancelled'`
+# unconditionally.  So DELETE on a *completed* attempt answered 200, revoked a
+# receipt that had already earned its result, spent nothing but left the row
+# saying `cancelled` — retroactively un-completing finished work and orphaning
+# the successors it had legitimately spawned (r4 review of c8ce45f).
+
+
+def _db_snapshot(db):
+    """Every row of every table, so "nothing happened" is checked rather than
+    asserted table by table — receipts, nonces, exec events, results, the task
+    rows and their successors are all in here."""
+    with sqlite3.connect(db) as c:
+        tables = [r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+        return {t: sorted(repr(row) for row in c.execute(f"SELECT * FROM {t}"))
+                for t in tables}
+
+
+def _dispatched_task(db, task_id):
+    """A CEA-wired task claimed and dispatched: real receipt, real nonce."""
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import admitted, task as _task
+
+    q = _cea_queue(db)
+    q.enqueue(_task(task_id, context=admitted()), ingress="http.tasks")
+    assert q.dequeue(role="implementer", agent="claude") is not None
+    nonce = q.record_dispatch(task_id, channel="claude_p", agent="claude",
+                              target="pid:9090", lease_owner="claude:pid:9090")
+    assert nonce
+    return q, nonce
+
+
+def test_delete_on_a_completed_task_is_refused_with_no_side_effect(tmp_path):
+    """(a) The reviewer's repro: enqueue → dequeue → result(completed) → DELETE.
+
+    Before the fix this returned 200 and persisted `cancelled`.  Now it is a
+    409 NOT_ACTIVE and the whole database — the task row, the receipt chain, the
+    nonce, the result evidence, the commit attribution and any successor the
+    completion minted — is byte-identical to before the call.
+    """
+    db = str(tmp_path / "terminal.db")
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        q, _nonce = _dispatched_task(db, "done-attempt")
+        posted = client.post("/tasks/done-attempt/result", json={
+            "task_id": "done-attempt", "status": "completed", "summary": "done",
+            "commit": "cafebabe" * 5, "branch": "main",
+        })
+        assert posted.status_code == 200, posted.text
+        assert q.get_task_status("done-attempt") == "completed"
+
+        before = _db_snapshot(db)
+        response = client.delete("/tasks/done-attempt")
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {"status": "completed", "reason": "NOT_ACTIVE",
+                               "task_id": "done-attempt"}
+    assert _db_snapshot(db) == before, "the refused cancel still wrote to the database"
+
+
+def test_delete_on_an_in_progress_task_still_cancels(tmp_path):
+    """(b) The state the endpoint exists for is untouched by the guard: the
+    status, the receipt revocation and the nonce all move exactly as before."""
+    from agent_crew.cea import store as receipt_store
+
+    db = str(tmp_path / "active.db")
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        q, nonce = _dispatched_task(db, "live-attempt")
+        assert q.get_task_status("live-attempt") == "in_progress"
+        response = client.delete("/tasks/live-attempt")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    assert q.get_task_status("live-attempt") == "cancelled"
+    with sqlite3.connect(db) as c:
+        c.row_factory = sqlite3.Row
+        rid = c.execute("SELECT receipt_id FROM tasks WHERE task_id='live-attempt'"
+                        ).fetchone()["receipt_id"]
+        assert receipt_store.current_receipt(c, rid)["state"] == "REVOKED"
+        assert receipt_store.nonce_row(c, nonce)["used_by"] == "cancelled_attempt"
+
+
+def test_delete_on_a_pending_task_cancels_without_touching_a_worker(tmp_path):
+    """(c) A pending row has no attempt to stop: it cancels, and the endpoint
+    reports that there was no worker to signal rather than inventing one."""
+    db = str(tmp_path / "pending.db")
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.post("/tasks", json={"task_id": "waiting", "task_type": "implement",
+                                    "description": "d", "branch": "main"})
+        q = TaskQueue(db)
+        if q.get_task_status("waiting") != "pending":       # a push may have claimed it
+            with sqlite3.connect(db) as c:
+                c.execute("UPDATE tasks SET status='pending' WHERE task_id='waiting'")
+        assert "waiting" not in app.state.active_dispatch_processes
+        response = client.delete("/tasks/waiting")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "cancelled"
+    assert TaskQueue(db).get_task_status("waiting") == "cancelled"
+
+
+def test_a_second_delete_is_refused_rather_than_re_cancelling(tmp_path):
+    """`cancelled` is terminal too: the second DELETE must not write a second
+    revocation note or a second end event onto a lineage that already ended."""
+    db = str(tmp_path / "twice.db")
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        _dispatched_task(db, "twice")
+        assert client.delete("/tasks/twice").status_code == 200
+        before = _db_snapshot(db)
+        second = client.delete("/tasks/twice")
+
+    assert second.status_code == 409
+    assert second.json()["status"] == "cancelled"
+    assert _db_snapshot(db) == before
+
+
+def test_delete_on_an_unknown_id_stays_a_tolerated_no_op(tmp_path):
+    """The unknown-id path is not a terminal row and keeps its 200 (the HTTP/MCP
+    parity contract), but it must stay a no-op."""
+    db = str(tmp_path / "unknown.db")
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        before = _db_snapshot(db)
+        response = client.delete("/tasks/no-such-task")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "unknown"
+    assert _db_snapshot(db) == before
