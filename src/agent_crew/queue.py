@@ -155,6 +155,82 @@ def _cea_repo(task: TaskRequest, ctx: dict, queue_identity: Optional[str]) -> st
     return str(ctx.get("repo") or task.project or queue_identity or "").strip()
 
 
+# ── successor lineage (P4: a retry is not new work) ────────────────────────
+#
+# Keys a successor carries naming the task it *continues*. ⛔``previous_task_id``
+# is deliberately absent: that is session continuity — the task this provider
+# ran *before* — not the same work. Folding it in would give every task in one
+# session the first task's anchor, which is the collapse #51 exists to stop.
+_CEA_LINEAGE_PARENT_KEYS = (
+    "retry_of",                 # the lifecycle field, where a caller sets it
+    "fallback_of",
+    "fallback_from_task_id",    # what pipeline.auto_fallback actually writes
+    "original_task_id",         # what server._auto_retry_failed_task writes
+)
+# The successor ids minted by the deterministic-id rule (#314 §4 P0-1) embed
+# their parent verbatim: ``retry-<parent>-a<n>`` / ``fallback-<parent>-d<n>``.
+# ``$``-anchoring makes the non-greedy group take the *whole* parent id, so a
+# retry of a retry unwraps one layer per pass rather than stopping at the first
+# inner ``-a<n>``.
+_CEA_SUCCESSOR_ID_RE = re.compile(r"^(?:retry|fallback)-(.+?)-[ad]\d+$")
+_CEA_LINEAGE_MAX_DEPTH = 16
+
+
+def _cea_lineage_root_task_id(task_id: str, ctx: dict) -> str:
+    """The id of the task a successor chain *originated* from, or ``task_id``.
+
+    A retry, a provider fallback and a requeue are the **same work** as their
+    parent (P4). Before this, each minted a fresh ``task_id`` and step 4 of
+    :func:`_cea_scope_anchors` anchored on it, so the successor's
+    ``intent_hash`` differed from the parent's and the engine saw new work every
+    time a task was retried — the exact inverse of the #51 failure and just as
+    wrong (codex REQUEST_CHANGES on 413f13b).
+
+    The walk is bounded (:data:`_CEA_LINEAGE_MAX_DEPTH`) and cycle-safe (a
+    ``seen`` set): a hand-written context claiming ``original_task_id`` is the
+    task itself, or two ids naming each other, must terminate — admission runs
+    on the enqueue path and may not hang there.
+    """
+    if not task_id:
+        return task_id
+    seen = {task_id}
+    current = task_id
+    # The context describes one hop only; past that the deterministic id is the
+    # record of the chain, which is why it was made deterministic.
+    parent = ""
+    for key in _CEA_LINEAGE_PARENT_KEYS:
+        candidate = str(ctx.get(key) or "").strip()
+        if candidate:
+            parent = candidate
+            break
+    for _ in range(_CEA_LINEAGE_MAX_DEPTH):
+        nxt = parent
+        parent = ""
+        if not nxt:
+            match = _CEA_SUCCESSOR_ID_RE.match(current)
+            nxt = match.group(1) if match else ""
+        if not nxt or nxt in seen:
+            break
+        seen.add(nxt)
+        current = nxt
+    return current
+
+
+def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
+    """Is this task a retry/fallback of another — i.e. a P4 *re-admission*?
+
+    Once a successor anchors on its lineage root it hashes equal to the parent,
+    so plain admission would meet the parent's live lineage and refuse it
+    ``DUPLICATE_INTENT``. P4 already has the right answer for that case and the
+    engine already implements it (``Engine._existing_lineage(..., retry=True)``):
+    reuse the parent receipt with ``attempt + 1`` while B is unchanged and the
+    budget holds, otherwise supersede and admit afresh. So the successor takes
+    the ADR path rather than being handed a fresh anchor to dodge the check.
+    """
+    task_id = str(getattr(task, "task_id", "") or "")
+    return bool(task_id) and _cea_lineage_root_task_id(task_id, ctx) != task_id
+
+
 def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ...]:
     """``target.scope_anchors`` — derived, in this order, from what the task carries.
 
@@ -171,7 +247,10 @@ def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ..
        number names no PR, and ``pr://5`` would alias PR 5 of every repo.
     4. the task's own id as ``task://<task_id>`` — **only when the task declared
        nothing at all about its target**. Two organic tasks then never collapse,
-       while re-submitting one ``task_id`` still replays (P4).
+       while re-submitting one ``task_id`` still replays (P4). For a retry /
+       fallback / requeue successor the id used is the **lineage root's**
+       (:func:`_cea_lineage_root_task_id`), because retrying work does not make
+       it different work.
 
     ⛔Step 4 is gated on "declared nothing" on purpose. ``task_id`` is *not* a
       P4 identity member (P4, E10 4c), and permanent fixture CX-4c is the
@@ -204,7 +283,11 @@ def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ..
         return ()          # the caller declared a target; its declaration decides sameness
     if not task.task_id:
         return ()
-    return _cea_canonical_or_none((f"task://{task.task_id}",)) or ()
+    # Not ``task.task_id``: a retry/fallback/requeue successor is the same work
+    # as the task it continues, so it anchors on that lineage's root id and
+    # hashes equal to it (P4). See :func:`_cea_lineage_root_task_id`.
+    root = _cea_lineage_root_task_id(task.task_id, ctx)
+    return _cea_canonical_or_none((f"task://{root}",)) or ()
 
 
 def _with_project(task: TaskRequest, project: str) -> TaskRequest:
@@ -2491,7 +2574,12 @@ class TaskQueue:
         task, refusal = self._project_from_queue_identity(task)
         context = self._enqueue_context(task)
         if refusal is None:
-            auth = self.authorize_task(task, context=context, provenance=provenance)
+            # A retry/fallback successor is the same intent as its parent
+            # (P4), so it goes through the engine's retry re-admission rather
+            # than opening a second lineage for one piece of work.
+            auth = self.authorize_task(
+                task, context=context, provenance=provenance,
+                retry=_cea_is_lineage_successor(task, context or {}))
         else:
             auth = self._refuse_admission(task, context=context, provenance=provenance,
                                           code=refusal[0], text=refusal[1])
