@@ -21,13 +21,15 @@ from agent_crew.cea.auth import in_process_caller as _cea_in_process_caller
 from agent_crew.cea.engine import EngineConfig as _CeaEngineConfig, get_engine as _cea_get_engine
 from agent_crew.cea.intent import (
     CallerProvenance as _CeaProvenance, Intent as _CeaIntent,
-    IntentIdentity as _CeaIdentity, Target as _CeaTarget, WorkClass as _CeaWorkClass)
+    IntentIdentity as _CeaIdentity, InvalidScopeAnchor as _CeaInvalidScopeAnchor,
+    Target as _CeaTarget, WorkClass as _CeaWorkClass,
+    canonical_anchors as _cea_canonical_anchors)
 from agent_crew.cea.store import ensure_schema as _cea_ensure_schema
 from agent_crew.cea.validator import ValidationOutcome as _CeaOutcome
 from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
-    RESULT_COMMIT_CONTEXT_KEY,
+    RESULT_COMMIT_CONTEXT_KEY, normalize_pr_number as _normalize_pr_number,
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
@@ -95,6 +97,107 @@ def _cea_str_tuple(value) -> tuple:
     return tuple(str(v) for v in value if isinstance(v, str) and v.strip())
 
 
+#: Context keys a caller already uses to declare the paths a task touches.
+#: The same keys the deterministic risk classifier reads
+#: (:func:`agent_crew.risk_tier.classify_task`), plus ``artifacts`` — one list of
+#: declared paths per task, read by both, so a task cannot be "about src/x.py"
+#: for tiering and about nothing for identity.
+_CEA_DECLARED_PATH_KEYS = ("artifacts", "changed_paths", "paths", "files", "touches")
+
+
+def _cea_declared_paths(ctx: dict) -> tuple[str, ...]:
+    """The paths the task itself declares, in key order. ``()`` when it declares none."""
+    values: list[str] = []
+    for key in _CEA_DECLARED_PATH_KEYS:
+        value = ctx.get(key)
+        if isinstance(value, str):
+            values.append(value)
+        elif isinstance(value, (list, tuple)):
+            values.extend(v for v in value if isinstance(v, str))
+    return tuple(v for v in values if v.strip())
+
+
+def _cea_canonical_or_none(anchors) -> Optional[tuple[str, ...]]:
+    """:func:`canonical_anchors`, or ``None`` when some anchor has no canonical form.
+
+    ⛔Never raises. :func:`intent_for_task` runs *before* admission, so an
+      anchor nobody can spell must still reach the engine and be refused with a
+      receipt (P7) — raising here would turn a BLOCK into a 500 and lose the
+      audit row, which is the one thing P2 says must exist either way.
+    """
+    try:
+        return _cea_canonical_anchors(anchors)
+    except _CeaInvalidScopeAnchor:
+        return None
+
+
+def _cea_repo(task: TaskRequest, ctx: dict, queue_identity: Optional[str]) -> str:
+    """``target.repo``, from what is already known — never from a git call.
+
+    In order: the context's own ``repo``; else ``task.project``, which
+    :class:`~agent_crew.protocol.TaskRequest` documents as the ``owner/name``
+    form; else the queue's own identity (``state.json``'s project / the state
+    directory) that the caller's adapter had no transport to send.
+
+    ⛔Deliberately no ``git remote`` read. Admission is on the enqueue path and
+      a subprocess per task would put the queue's latency and failure modes at
+      the mercy of a git invocation; every value here is already in hand.
+    """
+    return str(ctx.get("repo") or task.project or queue_identity or "").strip()
+
+
+def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ...]:
+    """``target.scope_anchors`` — derived, in this order, from what the task carries.
+
+    Empty anchors are not a neutral default: with none of these derivations,
+    every organic task on one branch had ``scope_anchors=()`` **and**
+    ``repo=""``, so two unrelated tasks hashed to one ``intent_hash`` and the
+    second was refused ``DUPLICATE_INTENT`` / ``ALREADY_COMPLETED`` (observed in
+    the :8105 shadow records, owner P1 alfred#51).
+
+    1. ``context.scope_anchors`` — an explicit declaration always wins.
+    2. the declared artefact/target paths (:data:`_CEA_DECLARED_PATH_KEYS`).
+    3. ``context.pr_number`` (or ``task.pr_number``) as ``pr://<repo>/<n>``, so
+       two tasks about one PR *do* stay one intent. Needs a ``repo``: a bare PR
+       number names no PR, and ``pr://5`` would alias PR 5 of every repo.
+    4. the task's own id as ``task://<task_id>`` — **only when the task declared
+       nothing at all about its target**. Two organic tasks then never collapse,
+       while re-submitting one ``task_id`` still replays (P4).
+
+    ⛔Step 4 is gated on "declared nothing" on purpose. ``task_id`` is *not* a
+      P4 identity member (P4, E10 4c), and permanent fixture CX-4c is the
+      incident's own record of why: a task re-sent under a new id and new
+      wording for work it declared identically **must** still be refused as a
+      duplicate. So when a caller declared a target (a repo, a PR, paths) its
+      declaration decides sameness and two ids collapse, exactly as before;
+      the id is used only where there is no declaration to compare and the
+      engine would otherwise be asserting two tasks are the same work on the
+      evidence of two empty fields.
+    """
+    explicit = _cea_str_tuple(ctx.get("scope_anchors"))
+    if explicit:
+        # Canonical when it can be, raw when it cannot — see _cea_canonical_or_none.
+        return _cea_canonical_or_none(explicit) or explicit
+    declared_paths = _cea_declared_paths(ctx)
+    if declared_paths:
+        canonical = _cea_canonical_or_none(declared_paths)
+        if canonical:
+            return canonical
+    pr = _normalize_pr_number(ctx.get("pr_number"))
+    if pr is None:
+        pr = _normalize_pr_number(getattr(task, "pr_number", None))
+    if pr is not None and repo:
+        return _cea_canonical_or_none((f"pr://{repo}/{pr}",)) or ()
+    # Reaching here means any declared paths were absent or had no canonical
+    # form — an unusable declaration is not a declaration, and gating on it
+    # would put two tasks back on one empty identity.
+    if ctx.get("repo") or pr is not None:
+        return ()          # the caller declared a target; its declaration decides sameness
+    if not task.task_id:
+        return ()
+    return _cea_canonical_or_none((f"task://{task.task_id}",)) or ()
+
+
 def _with_project(task: TaskRequest, project: str) -> TaskRequest:
     """A copy of ``task`` naming ``project``, without re-running ``__init__``.
 
@@ -112,7 +215,8 @@ def _with_project(task: TaskRequest, project: str) -> TaskRequest:
     return clone
 
 
-def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None) -> "_CeaIntent":
+def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None,
+                    queue_identity: Optional[str] = None) -> "_CeaIntent":
     """The P4 intent a queue task represents (§7.1 step 2, temporary form).
 
     ⛔Everything here is read from what the task already carries; nothing is
@@ -121,16 +225,25 @@ def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None) -> "_C
       be free text with a ticket-shaped name (§1.4) — and J2 refuses ids the
       signed snapshot does not carry, which is the behaviour we want to see in
       the shadow measurement rather than paper over.
+
+    ``target`` is *derived* rather than copied: see :func:`_cea_repo` and
+    :func:`_cea_scope_anchors` for the order and for why an empty anchor list
+    was never a neutral default. ``queue_identity`` is the queue's own project —
+    the callers inside :class:`TaskQueue` pass it, a library caller need not.
+    Neither the hash formula (:func:`agent_crew.cea.engine.intent_hash`) nor the
+    receipt schema changes here; only what this function puts into the fields
+    they already hash.
     """
     ctx = dict(context if context is not None else (task.context or {}))
     work_class = _TASK_TYPE_WORK_CLASS.get((task.task_type or "").strip().lower(),
                                            _CeaWorkClass.IMPLEMENT)
+    repo = _cea_repo(task, ctx, queue_identity)
     identity = _CeaIdentity(
         project=task.project or "",
         work_class=work_class,
-        target=_CeaTarget(repo=str(ctx.get("repo") or ""),
+        target=_CeaTarget(repo=repo,
                           base_ref=str(task.branch or ""),
-                          scope_anchors=_cea_str_tuple(ctx.get("scope_anchors"))),
+                          scope_anchors=_cea_scope_anchors(task, ctx, repo)),
         capability_id=(str(ctx["capability_id"]) if ctx.get("capability_id") else None),
         authority_decision_ids=_cea_str_tuple(ctx.get("authority_decision_ids")))
     return _CeaIntent(
@@ -2171,9 +2284,10 @@ class TaskQueue:
         # decides under the same rollout mode `enqueue_with_receipt` then gates
         # it with. A task with no project resolves the process-wide mode and is
         # refused PROJECT_REQUIRED by the engine — a BLOCK receipt, not a raise.
-        engine = self.cea_engine(self._admission_project(task))
+        scope = self._admission_project(task)
+        engine = self.cea_engine(scope)
         caller = _cea_in_process_caller(provenance)
-        intent = intent_for_task(task, context=context)
+        intent = intent_for_task(task, context=context, queue_identity=scope)
         conn = self._connect()
         try:
             auth = engine.authorize(conn, intent, caller, retry=retry)
@@ -2402,7 +2516,7 @@ class TaskQueue:
             from agent_crew.cea.engine import AuthorizationEngine as _CeaEngine
             engine = _CeaEngine(config=self.cea_config(scope))
         scoped = _with_project(task, self.declared_project or task.project)
-        intent = intent_for_task(scoped, context=context)
+        intent = intent_for_task(scoped, context=context, queue_identity=scope)
         caller = _cea_in_process_caller(provenance)
         conn = self._connect()
         try:
