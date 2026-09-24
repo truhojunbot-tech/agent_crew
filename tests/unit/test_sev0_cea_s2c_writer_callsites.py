@@ -314,9 +314,28 @@ def test_wired_inputs_admit_review_work_under_enforcement(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_the_queue_builds_the_same_intent_for_a_reworded_task():
-    """P4: description and task_id are not members of the identity."""
+    """P4: the description is not a member of the identity."""
     a = intent_for_task(task("t1", description="add a --json flag"))
-    b = intent_for_task(task("t2", description="ADD A JSON FLAG, please"))
+    b = intent_for_task(task("t1", description="ADD A JSON FLAG, please"))
+    assert a.identity == b.identity
+
+
+def test_a_new_task_id_for_declared_work_builds_the_same_intent():
+    """P4: the task_id is not a member of the identity either — for work the
+    task *declared*, which is what CX-4c is the permanent record of.
+
+    ⛔Deliberately declares its target. This assertion used to hold for a task
+      that declared nothing, because `scope_anchors` and `repo` were then both
+      empty for everything — which is how two unrelated organic tasks on one
+      branch came to share an `intent_hash` and the second was refused
+      DUPLICATE_INTENT (owner P1 alfred#51). `intent_for_task` now anchors an
+      undeclared task on `task://<task_id>`; see
+      ``tests/unit/test_sev0_cea_p1_scope_anchors.py`` for the derivation order
+      and for the CX-4c case this test states.
+    """
+    declared = {"scope_anchors": ["src/agent_crew/cli.py"]}
+    a = intent_for_task(task("t1", context=declared, description="add a --json flag"))
+    b = intent_for_task(task("t2", context=declared, description="ADD A JSON FLAG, please"))
     assert a.identity == b.identity
 
 
