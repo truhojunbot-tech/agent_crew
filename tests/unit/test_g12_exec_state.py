@@ -178,6 +178,44 @@ def test_force_fail_ends_the_lease_without_claiming_a_result(tmp_db):
         "force_failed", "watchdog_timeout", "in_progress")
 
 
+def test_cancel_revokes_dispatched_attempt_and_refuses_its_nonce(tmp_path, monkeypatch):
+    """I-A: cancellation invalidates the receipt and every credential in its attempt."""
+    from agent_crew.cea import store as receipt_store
+    from agent_crew.cea.engine import EngineConfig
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED, admitted, task
+
+    db = str(tmp_path / "cancel.db")
+    q = TaskQueue(db, cea_config=EngineConfig(mode="test"), cea_providers=dict(WIRED))
+    q.enqueue(task("cancel-attempt", context=admitted()), ingress="http.tasks")
+    assert q.dequeue(role="implementer", agent="claude")
+    nonce = q.record_dispatch("cancel-attempt", channel="claude_p", agent="claude", target="pid:7")
+    assert nonce
+    q.cancel("cancel-attempt")
+
+    with sqlite3.connect(db) as c:
+        c.row_factory = sqlite3.Row
+        rid = c.execute("SELECT receipt_id FROM tasks WHERE task_id='cancel-attempt'").fetchone()["receipt_id"]
+        assert receipt_store.current_receipt(c, rid)["state"] == "REVOKED"
+        assert receipt_store.nonce_row(c, nonce)["used_by"] == "cancelled_attempt"
+        assert c.execute("SELECT COUNT(*) FROM authorization_receipts WHERE receipt_id=?", (rid,)).fetchone()[0] >= 2
+    start = q.start_execution("cancel-attempt", nonce, presenter="claude")
+    assert start["go"] is False and start["reason"].startswith("CANCELLED_ATTEMPT:")
+
+
+def test_cancelled_result_is_rejected_without_row_or_artifact_mutation(tmp_db):
+    """I-C/D: a late result cannot revive a cancel or create completion evidence."""
+    app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        client.post("/tasks", json={"task_id": "late", "task_type": "implement", "description": "d", "branch": "main"})
+        assert client.delete("/tasks/late").status_code == 200
+        response = client.post("/tasks/late/result", json={"task_id": "late", "status": "completed", "summary": "late", "commit": "deadbeef"})
+    assert response.status_code == 409
+    assert "LATE_RESULT_REJECTED" in response.text
+    with sqlite3.connect(tmp_db) as c:
+        row = c.execute("SELECT status, summary FROM tasks WHERE task_id='late'").fetchone()
+    assert row == ("cancelled", None)
+
+
 def test_heartbeat_only_touches_running_tasks(tmp_db):
     q = TaskQueue(tmp_db)
     q.enqueue(_task("hb"))

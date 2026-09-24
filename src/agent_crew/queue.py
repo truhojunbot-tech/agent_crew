@@ -56,6 +56,11 @@ class AdmissionRefused(Exception):
         super().__init__(f"{gate.point.value} refused: {gate.reason}")
 
 
+class CancelledAttemptError(RuntimeError):
+    """A cancelled task is a terminal authority boundary, not a late retry."""
+    code = "LATE_RESULT_REJECTED"
+
+
 ResultBeforeCommit = Callable[[sqlite3.Connection, object, float], None]
 
 
@@ -3069,6 +3074,10 @@ class TaskQueue:
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
+            if row["status"] == "cancelled":
+                conn.execute("ROLLBACK")
+                raise CancelledAttemptError(
+                    "LATE_RESULT_REJECTED: cancelled tasks never accept a result")
             if expected_status is not None and row["status"] != expected_status:
                 conn.execute("ROLLBACK")
                 raise RuntimeError(
@@ -3803,6 +3812,12 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            task_row = conn.execute("SELECT status, receipt_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if task_row is not None and task_row["status"] == "cancelled":
+                conn.execute("ROLLBACK")
+                return {"go": False, "task_id": task_id, "receipt_id": task_row["receipt_id"],
+                        "outcome": "BLOCK", "enforced": True,
+                        "reason": "CANCELLED_ATTEMPT: task cancellation invalidated this authorization"}
             receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
             if receipt is None:
                 conn.execute("ROLLBACK")
@@ -3989,7 +4004,24 @@ class TaskQueue:
         'orphaned' rather than cancelled — operators can manually cancel them if desired."""
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, receipt_id FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return
             conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))
+            # Revocation is append-only.  Spending every outstanding nonce makes
+            # a copied task block unusable even if its worker ignores cancellation.
+            receipt_id = row["receipt_id"]
+            if receipt_id:
+                conn.execute("UPDATE dispatch_nonces SET used_at = ?, used_by = 'cancelled_attempt' "
+                             "WHERE receipt_id = ? AND used_at IS NULL", ("cancelled", receipt_id))
+                receipt = _cea_store.current_receipt(conn, receipt_id)
+                if receipt and receipt.get("state") not in _cea_store.TERMINAL_STATES:
+                    self._cea_transition_in_txn(conn, self.cea_engine(), receipt_id, "REVOKED",
+                                                note="cancel: active attempt authorization revoked")
+            self._record_end_on(conn, task_id, time.time(), "cancelled", posted=False,
+                                reason="cancelled_attempt")
             # Mark pending dependents as orphaned (not cancelled) so the operator
             # can see them and decide whether to cancel or reassign.
             conn.execute(

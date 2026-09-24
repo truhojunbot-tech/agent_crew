@@ -59,7 +59,8 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import AdmissionRefused, TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE
+from agent_crew.queue import (AdmissionRefused, CancelledAttemptError, TaskAlreadyExistsError,
+                              TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE)
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
@@ -5601,6 +5602,11 @@ def create_app(
             # nonce (never asked /start for its go/no-go) must learn that, not
             # read a 500 and retry the same bypass.
             logger.warning(f"POST /tasks/{task_id}/result: refused — {exc}")
+            raise HTTPException(status_code=409, detail=str(exc))
+        except CancelledAttemptError as exc:
+            # This must precede every artifact, attribution, push, and cascade
+            # side effect below: cancelled work has no completion authority.
+            logger.warning("POST /tasks/%s/result: %s", task_id, exc)
             raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as e:
             msg = str(e)
