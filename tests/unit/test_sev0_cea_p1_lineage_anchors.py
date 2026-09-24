@@ -355,7 +355,8 @@ def test_caller_scope_anchors_are_bounded_to_allowed_short_canonical_values(queu
     ] + [f"src/./file-{i}.py" for i in range(17)]
     queue.enqueue(task("caller", context={"scope_anchors": anchors_in}), ingress="http.tasks")
     stored = {item.task_id: item for item in queue.list_tasks()}["caller"]
-    assert stored.context["scope_anchors"] == [f"src/file-{i}.py" for i in range(16)]
+    assert stored.context["scope_anchors"] == sorted(
+        f"src/file-{i}.py" for i in range(17))[:16]
 
 
 # P1 r5 — declared paths are caller anchors too, not receipt handles.
@@ -384,3 +385,30 @@ def test_declared_path_anchors_are_bounded_across_all_declared_path_keys(queue):
     queue.enqueue(caller, ingress="http.tasks")
     assert len(anchors(caller)) == 16
     assert all(anchor.startswith("src/file-") for anchor in anchors(caller))
+
+
+# P1 r6 — rejected caller declarations must not collapse into an empty intent.
+def test_all_dropped_declared_anchors_fall_back_to_each_tasks_own_anchor():
+    """The exact #51 repro: unrelated unusable declarations stay distinct."""
+    a = task("a", context={"repo": "", "files": ["task://x"]},
+             project="", description="fix login")
+    b = task("b", context={"repo": "", "files": ["y" * 300]},
+             project="", description="write docs")
+
+    assert anchors(a) == ("task://a",)
+    assert anchors(b) == ("task://b",)
+    assert hashed(a) != hashed(b)
+
+
+def test_all_dropped_explicit_anchors_fall_back_to_the_own_task_anchor():
+    caller = task("caller", context={"scope_anchors": ["task://other"]})
+
+    assert anchors(caller) == ("task://caller",)
+
+
+def test_more_than_sixteen_caller_anchors_are_canonicalised_before_sorting_and_truncating():
+    anchors_in = [f"src/./file-{index:02}.py" for index in range(16, 0, -1)]
+    anchors_in.extend(["src/./file-01.py", "src/file-00.py"])
+    caller = task("caller", context={"scope_anchors": anchors_in})
+
+    assert anchors(caller) == tuple(f"src/file-{index:02}.py" for index in range(16))

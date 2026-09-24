@@ -153,7 +153,7 @@ def _cea_canonical_or_none(anchors) -> Optional[tuple[str, ...]]:
 def _cea_sanitise_caller_scope_anchors(anchors, task_id: str) -> tuple[str, ...]:
     """Return bounded, portable caller anchors after canonicalisation."""
     own_task_anchor = _cea_canonical_scope_anchor(f"task://{task_id}")
-    kept = []
+    kept = set()
     for anchor in anchors:
         try:
             canonical = _cea_canonical_scope_anchor(anchor)
@@ -163,11 +163,10 @@ def _cea_sanitise_caller_scope_anchors(anchors, task_id: str) -> tuple[str, ...]
         if (len(canonical) > _CEA_CALLER_SCOPE_ANCHOR_MAX_LENGTH
                 or (scheme and scheme.group(1).lower() not in _CEA_CALLER_SCOPE_ANCHOR_SCHEMES)
                 or (canonical.startswith("task://") and canonical != own_task_anchor)
-                or (canonical.startswith("task:") and not canonical.startswith("task://"))
-                or len(kept) >= _CEA_CALLER_SCOPE_ANCHOR_LIMIT):
+                or (canonical.startswith("task:") and not canonical.startswith("task://"))):
             continue
-        kept.append(canonical)
-    return tuple(kept)
+        kept.add(canonical)
+    return tuple(sorted(kept)[:_CEA_CALLER_SCOPE_ANCHOR_LIMIT])
 
 
 def _cea_repo(task: TaskRequest, ctx: dict, queue_identity: Optional[str]) -> str:
@@ -331,7 +330,9 @@ def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ..
         # retained parent anchor is lineage, not caller-provided identity.
         if _cea_is_lineage_successor(task, ctx):
             return _cea_canonical_or_none(selected) or selected
-        return _cea_sanitise_caller_scope_anchors(selected, task.task_id)
+        kept = _cea_sanitise_caller_scope_anchors(selected, task.task_id)
+        if kept:
+            return kept
     pr = _normalize_pr_number(ctx.get("pr_number"))
     if pr is None:
         pr = _normalize_pr_number(getattr(task, "pr_number", None))
