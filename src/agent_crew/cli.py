@@ -70,6 +70,25 @@ def _context_pack_launch_value(state: dict | None = None) -> tuple[str, str]:
     return ("1" if _context_pack_enabled(state) else "0"), "project_state"
 
 
+def _codex_context_cap_state(project: str, state: dict | None) -> dict:
+    """Seed the proven cap only for agent_crew; retain explicit project values."""
+    result = dict(state or {})
+    if project == "agent_crew":
+        result.setdefault("codex_context_max_mb", 8)
+    return result
+
+
+def _codex_context_cap_launch_value(state: dict | None = None) -> tuple[str, str]:
+    """Environment overrides durable project state, then the 64 MB default."""
+    override = os.environ.get("AGENT_CREW_CODEX_CONTEXT_MAX_MB")
+    if override is not None:
+        return override, "environment"
+    value = (state or {}).get("codex_context_max_mb")
+    if value is not None:
+        return str(value), "project_state"
+    return "64", "built_in_default"
+
+
 def _parse_interval(text: str) -> float:
     """Parse a '30s' / '5m' / '1h' duration into seconds (#224)."""
     import re as _re
@@ -999,6 +1018,9 @@ def setup(project: str, agents: str, base: str):
         "tokenomics_policy_path": policy_path,
         "context_pack_enabled": context_pack_enabled,
     }
+    state_to_write.update({key: value for key, value in
+                           _codex_context_cap_state(project, existing_state).items()
+                           if key == "codex_context_max_mb"})
     # #337's explicit mapping records the default for new projects. Existing
     # state keeps its current role configuration during setup/recovery.
     if existing_state is None:
@@ -1019,6 +1041,7 @@ def setup(project: str, agents: str, base: str):
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         context_pack_value, context_pack_source = _context_pack_launch_value(
             {"context_pack_enabled": context_pack_enabled})
+        codex_cap_value, _ = _codex_context_cap_launch_value(state_to_write)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
@@ -1028,6 +1051,7 @@ def setup(project: str, agents: str, base: str):
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
+            "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
@@ -1075,6 +1099,7 @@ def setup(project: str, agents: str, base: str):
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         context_pack_value, context_pack_source = _context_pack_launch_value(
             {"context_pack_enabled": context_pack_enabled})
+        codex_cap_value, _ = _codex_context_cap_launch_value(state_to_write)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
@@ -1084,6 +1109,7 @@ def setup(project: str, agents: str, base: str):
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
+            "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
@@ -1708,6 +1734,10 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
     state = _read_state(base, project)
     if state is None:
         raise click.ClickException(f"project {project!r} not found. Run setup first.")
+    durable_state = _codex_context_cap_state(project, state)
+    if durable_state != state:
+        _write_state(base, project, durable_state)
+        state = durable_state
 
     session_name = state["session"]
     port = state["port"]
@@ -1741,6 +1771,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         state_file = _state_path(base, project)
         policy_path = _tokenomics_policy_path(proj_dir, state)
         context_pack_value, context_pack_source = _context_pack_launch_value(state)
+        codex_cap_value, _ = _codex_context_cap_launch_value(state)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
@@ -1750,6 +1781,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
+            "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")

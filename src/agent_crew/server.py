@@ -1273,6 +1273,22 @@ def _codex_home(home=None):
 CODEX_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CODEX_CONTEXT_MAX_MB", "64"))
 
 
+def _codex_context_cap_mb(state_path=None) -> float:
+    """Resolve launch override, durable project setting, then built-in default."""
+    override = os.environ.get("AGENT_CREW_CODEX_CONTEXT_MAX_MB")
+    if override is not None:
+        return float(override)
+    if state_path:
+        try:
+            with open(state_path) as state_file:
+                value = json.load(state_file).get("codex_context_max_mb")
+            if value is not None:
+                return float(value)
+        except (OSError, ValueError, TypeError, AttributeError):
+            logger.warning("Invalid Codex context cap in %s; using default", state_path)
+    return 64.0
+
+
 def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
     """The newest Codex session id recorded for ``cwd``, or ``""``."""
     return _codex_session_and_path(cwd, home=home, limit=limit)[0]
@@ -2622,6 +2638,8 @@ def create_app(
     """
     logger.info("Context Pack effective enabled=%s (AGENT_CREW_CONTEXT_PACK=%r)",
                 _cpack.enabled(), os.environ.get("AGENT_CREW_CONTEXT_PACK"))
+    _codex_cap_mb = _codex_context_cap_mb(state_path)
+    logger.info("Codex context cap effective=%s MB", _codex_cap_mb)
     _memory_provider = memory_provider or NullMemoryProvider()
     if shadow_memory_enabled is None:
         shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
@@ -4251,7 +4269,7 @@ def create_app(
             if not _codex_planned:
                 _codex_planned = codex_session_for_cwd(wt)
             _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(
-                wt, session_id=_codex_planned)
+                wt, max_mb=_codex_cap_mb, session_id=_codex_planned)
         elif agent == "claude":
             # #260: the same defect on the other provider. `--continue` was
             # unconditional here, so the session never rotated — one file per
