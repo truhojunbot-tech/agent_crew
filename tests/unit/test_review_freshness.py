@@ -7,6 +7,14 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
+@pytest.fixture(autouse=True)
+def _live_test_panes(monkeypatch):
+    """Keep handoff tests on the worker result path."""
+    monkeypatch.setattr("agent_crew.server._resolve_tmux_pane_target", lambda target: target)
+    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr("agent_crew.server._pane_process_kind", lambda pane: ("agent", "test"))
+
+
 def _impl_payload(task_id="impl-1"):
     return {
         "task_id": task_id,
@@ -14,7 +22,7 @@ def _impl_payload(task_id="impl-1"):
         "description": "Implement Issue #79 — telegram notify helper",
         "branch": "agent/agent_crew/claude",
         "priority": 3,
-        "context": {},
+        "context": {"repo": "truhojunbot-tech/agent_crew"},
         "project": "",
     }
 
