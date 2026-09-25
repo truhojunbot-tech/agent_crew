@@ -551,6 +551,23 @@ class AuthorizationEngine:
                                 code, text, conn=conn)
         return Authorization(receipt=receipt, http_status=403, code=code)
 
+    def hold_canary_fix(self, conn: sqlite3.Connection, intent: Intent,
+                        caller: Caller) -> Authorization:
+        """Record the owner-approved canary cap as a held, non-runnable intent.
+
+        This path can only withhold work. It uses the same signed P2 receipt
+        writer as admission and does not grant a task or dispatch nonce.
+        """
+        receipt_store.ensure_schema(conn)
+        self._require_authenticated(caller)
+        receipt = self._refusal(
+            intent, caller, uncanonical_intent_hash(intent.identity),
+            "HUMAN_GATE_PENDING",
+            "D-11832: tokenomics canary fix-round cap requires an owner decision",
+            conn=conn, decision="HUMAN_GATE")
+        return Authorization(receipt=receipt, http_status=423,
+                             code="HUMAN_GATE_PENDING")
+
 
     def authorize(self, conn: sqlite3.Connection, intent: Intent, caller: Caller, *,
                   retry: bool = False) -> Authorization:
@@ -1185,8 +1202,8 @@ class AuthorizationEngine:
         return ("ALLOW", "OK", "every input answered and the contract is satisfiable")
 
     def _refusal(self, intent: Intent, caller: Caller, ih: str, code: str, text: str,
-                 *, conn, unavailable: tuple = ()) -> dict:
-        """A BLOCK receipt for a lineage refusal (P2: the audit row exists either way).
+                 *, conn, unavailable: tuple = (), decision: str = "BLOCK") -> dict:
+        """A non-runnable receipt for a refusal or owner-approved hold (P2).
 
         It is deliberately built from the refusal alone and not from the full
         input sweep: the answer does not depend on policy, so reading policy to
@@ -1213,20 +1230,21 @@ class AuthorizationEngine:
             "runtime_state": "STOPPED",
             "provider_budget": {"provider": None, "state": "UNVERIFIED", "observed_at": None},
             "required_reviewer": None, "required_tester": None,
-            "human_gate_state": "NOT_REQUIRED",
+            "human_gate_state": "PENDING" if decision == "HUMAN_GATE" else "NOT_REQUIRED",
             "caller_identity": caller.principal,
             "caller_provenance": getattr(caller.provenance, "value", caller.provenance),
             "executor_binding": None,
             "executor_binding_status": "UNVERIFIED", "caller_identity_status": "UNVERIFIED",
             "downgrade_reason": "SHARED_UID_NO_CREDENTIAL_BOUNDARY",
-            "decision": "BLOCK", "reason": {"code": code, "text": text},
+            "decision": decision, "reason": {"code": code, "text": text},
             "signature": {"alg": None, "key_id": None, "value": None, "status": "UNVERIFIED"},
             "state": "ISSUED",
             "binding": {"policy_generation": 0, "policy_hash": "not-consulted",
                         "source_decision_revs": [],
                         "capability_registry": {"generation": None, "hash": None},
                         "matched_capability": None, "runtime_state": "STOPPED",
-                        "runtime_state_epoch": 0, "human_gate_state": "NOT_REQUIRED",
+                        "runtime_state_epoch": 0,
+                        "human_gate_state": "PENDING" if decision == "HUMAN_GATE" else "NOT_REQUIRED",
                         "budget_class": "EXHAUSTED"},
             "idempotency_key": intent.idempotency_key or ih,
             "attempt": 1, "max_attempts": 1, "dispatch_nonces": [], "supersedes": [],

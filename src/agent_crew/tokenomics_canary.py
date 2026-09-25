@@ -19,6 +19,9 @@ produced an ``approve``; the measured effect is >= 64,223,256 cache-read and
   id, so only reviews in that one lineage can ever be suppressed. Every other
   task in the fleet stays shadow: it is evaluated, a receipt records what would
   have happened, and the review dispatches exactly as before.
+
+The separate round-cap switch below reuses the same lineage pin. Its cascade
+decision is reversible by unsetting that switch and restarting the server.
 """
 from __future__ import annotations
 
@@ -32,6 +35,13 @@ logger = logging.getLogger(__name__)
 
 #: The single arming switch. Alfred sets it; this repo never does.
 CANARY_ENV = "AGENT_CREW_TOKENOMICS_CANARY_TASK_ID"
+#: Independent rollback switch for the owner-approved round-cap experiment.
+ROUNDS_CAP_ENV = "AGENT_CREW_TOKENOMICS_CANARY_ROUNDS_CAP"
+
+
+def rounds_cap_enabled(env: Optional[dict] = None) -> bool:
+    source = os.environ if env is None else env
+    return source.get(ROUNDS_CAP_ENV) == "1" and bool(canary_pin(source))
 
 #: The one recommendation kind the matched evidence supports.
 RECOMMENDATION_KIND = "suppress_identical_sha_rereview"

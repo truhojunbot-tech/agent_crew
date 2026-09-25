@@ -5719,6 +5719,7 @@ class TaskQueue:
         self, task_id: str, *, decision_source: str, recommendation: dict,
         applied: bool, counterfactual: str, reason: str,
         cea_receipt_id: Optional[str] = None,
+        preserve_applied: bool = False,
     ) -> None:
         """Persist one canary evaluation. Never raises into the dispatcher.
 
@@ -5741,11 +5742,80 @@ class TaskQueue:
                    SET canary_decision_source=?, canary_recommendation_json=?,
                        canary_applied=?, canary_counterfactual=?, canary_reason=?,
                        canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?
-                   WHERE task_id=?""",
+                   WHERE task_id=? AND (?=0 OR canary_applied IS NULL OR canary_applied=0 OR ?=1)""",
                 (decision_source, json.dumps(recommendation), int(bool(applied)),
-                 counterfactual or None, reason, cea_receipt_id, now, now, task_id),
+                 counterfactual or None, reason, cea_receipt_id, now, now, task_id,
+                 int(bool(preserve_applied)), int(bool(applied))),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def hold_tokenomics_canary_fix(
+        self, review_task: TaskRequest, *, receipt_task_id: str, fix_round: int,
+        recommendation: dict, counterfactual: dict,
+    ) -> str:
+        """Atomically record a held CEA fix intent and the applied canary receipt.
+
+        The proposed fix has no task row. Replayed review results reuse the
+        receipt already linked to the pinned lineage root observation.
+        """
+        from agent_crew.cea.engine import AuthorizationEngine
+        from agent_crew.pipeline import fix_task_id
+
+        now = time.time()
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT canary_applied, canary_cea_receipt_id "
+                "FROM tokenomics_shadow_receipts WHERE task_id=?",
+                (receipt_task_id,),
+            ).fetchone()
+            if row and row["canary_applied"] == 1 and row["canary_cea_receipt_id"]:
+                conn.commit()
+                return row["canary_cea_receipt_id"]
+            context = dict(review_task.context or {})
+            context["prev_task_id"] = review_task.task_id
+            context["fix_round"] = fix_round
+            proposed = TaskRequest(
+                task_id=fix_task_id(review_task.task_id, fix_round),
+                task_type="implement", description="Canary cap held fix",
+                branch=review_task.branch, context=context,
+                project=review_task.project or self.declared_project or "",
+            )
+            if conn.execute("SELECT 1 FROM tasks WHERE task_id=?",
+                            (proposed.task_id,)).fetchone():
+                raise TaskAlreadyExistsError(proposed.task_id, "already enqueued")
+            scope = self._admission_project(proposed)
+            engine = AuthorizationEngine(config=self.cea_config(scope))
+            intent = intent_for_task(proposed, context=context, queue_identity=scope)
+            auth = engine.hold_canary_fix(
+                conn, intent, _cea_in_process_caller(_CeaProvenance.CASCADE))
+            receipt_id = auth.receipt_id
+            engine.transition(conn, receipt_id, "HELD",
+                              note="D-11832: await human decision at canary cap")
+            conn.execute(
+                """INSERT OR IGNORE INTO tokenomics_shadow_receipts
+                   (task_id, decision_source, actual_execution_json, created_at, updated_at)
+                   VALUES (?, 'baseline', ?, ?, ?)""",
+                (receipt_task_id, json.dumps({"cascade": "baseline", "task_type": "implement"}), now, now),
+            )
+            conn.execute(
+                """UPDATE tokenomics_shadow_receipts
+                   SET canary_decision_source='quota_core_contract',
+                       canary_recommendation_json=?, canary_applied=1,
+                       canary_counterfactual=?, canary_reason='round_cap_reached',
+                       canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?
+                   WHERE task_id=?""",
+                (json.dumps(recommendation), json.dumps(counterfactual),
+                 receipt_id, now, now, receipt_task_id),
+            )
+            conn.commit()
+            return receipt_id
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

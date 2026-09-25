@@ -26,6 +26,7 @@ import sqlite3
 import json
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -48,6 +49,7 @@ from agent_crew.protocol import (
 from agent_crew.queue import (TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
+from agent_crew import tokenomics_canary as _tokenomics_canary
 # §11.2 #14: the review/test contract comes from admission, already decided.
 # ⛔Do not import ``agent_crew.risk_tier`` here. Asking it again at cascade time
 #   is what made this file a second decision implementation; the static rule in
@@ -77,6 +79,7 @@ def successor_context(parent_context: object) -> dict:
 #: a disagreement no additional round will settle. After the cap the loop stops
 #: and says so on the PR, because the next move is a human's.
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
+CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
 #: Bounds on how much review text is copied into the fix task description.
 MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
@@ -880,14 +883,10 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
 
 
 def _shadow_rounds_citation(tasks_by_id: dict, review_task) -> dict:
-    """What the tokenomics contract WOULD have capped this lineage at (#51).
+    """Read the quota-core recommendation for this lineage (#51).
 
-    ⛔Observation only, and fail-open by construction. The caller has already
-      taken its cap from the stored cascade contract before asking, so nothing
-      here can widen or narrow a budget. A contract that is missing, stale,
-      unreadable or silent about this lineage yields ``None`` — the cascade
-      then behaves exactly as it does with no contract at all, which is the
-      whole point of a shadow step.
+    The citation is normally observation only. The separately armed canary
+    validates its provenance, freshness and value before narrowing one cap.
     """
     shadow = shadow_recommendation_for_task_id(
         _lineage_root_task_id(tasks_by_id, review_task))
@@ -899,9 +898,40 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task) -> dict:
         recommended = None
     return {
         "recommended_max_review_fix_rounds": recommended,
+        "decision_source": shadow.get("decision_source"),
+        "produced_at": shadow.get("produced_at"),
         "contract_sha": shadow.get("contract_sha"),
         "rationale": recommendation.get("rationale") or shadow.get("reason"),
     }
+
+
+def _canary_round_cap(tasks_by_id: dict, review_task,
+                      baseline_cap: int) -> tuple[int, Optional[dict], str]:
+    """Return the narrowed cap only for the pinned lineage and a fresh contract."""
+    if not _tokenomics_canary.rounds_cap_enabled():
+        return baseline_cap, None, "switch_off"
+    if _lineage_root_task_id(tasks_by_id, review_task) != _tokenomics_canary.canary_pin():
+        return baseline_cap, None, "not_pinned"
+    citation = _shadow_rounds_citation(tasks_by_id, review_task)
+    recommended = citation["recommended_max_review_fix_rounds"]
+    reason = "cap_not_reached"
+    try:
+        produced = datetime.fromisoformat(str(citation["produced_at"]).replace("Z", "+00:00"))
+        current = produced.tzinfo is not None
+        if current:
+            age = (datetime.now(timezone.utc) - produced.astimezone(timezone.utc)).total_seconds()
+            current = 0 <= age <= CANARY_CONTRACT_MAX_AGE_SECONDS
+    except (ValueError, TypeError):
+        current = False
+    if citation["decision_source"] != "quota_core_contract" or not current:
+        reason = "contract_missing_or_stale"
+    elif recommended is None or recommended < 1:
+        reason = "invalid_recommendation"
+    elif recommended >= baseline_cap:
+        reason = "recommendation_does_not_narrow"
+    else:
+        return recommended, citation, reason
+    return baseline_cap, citation, reason
 
 
 def fix_task_id(review_task_id: str, fix_round: int) -> str:
@@ -1069,13 +1099,72 @@ def auto_enqueue_fix(
         contract = _cascade.stored(review_task)
         if not contract.enforced:
             _record_risk_tier_shadow(queue, review_task, "fix_legacy_cap")
-        max_rounds = contract.fix_round_cap(review_fix_max_rounds())
+        baseline_cap = contract.fix_round_cap(review_fix_max_rounds())
+        tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
+        lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
+        max_rounds, canary_citation, canary_reason = _canary_round_cap(
+            tasks_by_id, review_task, baseline_cap)
+        canary_pinned = (_tokenomics_canary.rounds_cap_enabled()
+                         and lineage_root_id == _tokenomics_canary.canary_pin())
+        if canary_pinned:
+            try:
+                queue.record_shadow_rounds_vs_cap(
+                    lineage_root_id,
+                    recommended=(canary_citation or {}).get(
+                        "recommended_max_review_fix_rounds"),
+                    actual_cap=max_rounds)
+            except Exception:
+                logger.exception("auto_enqueue_fix: canary rounds citation failed for %s", lineage_root_id)
         # The lineage counter rides in the task context, so it survives a
         # server restart and counts ROUNDS rather than tasks. An in-memory
         # per-task_id counter (the transient-retry shape) could not work here:
         # every round mints new task ids, so it would always read zero.
         fix_round = int(review_ctx.get("fix_round") or 0) + 1
+        canary_fired = (canary_pinned and max_rounds < baseline_cap
+                        and fix_round > max_rounds and fix_round <= baseline_cap)
+        if canary_fired and any(t.task_id == fix_task_id(review_task_id, fix_round)
+                                for t in tasks_by_id.values()):
+            # A switch turned on after baseline enqueue cannot retrospectively
+            # claim it suppressed work that already exists.
+            queue.record_tokenomics_canary_receipt(
+                lineage_root_id, decision_source="quota_core_contract",
+                recommendation=canary_citation or {}, applied=False,
+                counterfactual="", reason="fix_already_enqueued",
+                preserve_applied=True)
+            return None
+        if canary_pinned and not canary_fired:
+            try:
+                queue.record_tokenomics_canary_receipt(
+                    lineage_root_id, decision_source=(canary_citation or {}).get(
+                        "decision_source") or "baseline",
+                    recommendation=canary_citation or {}, applied=False,
+                    counterfactual="", reason=(
+                        "baseline_cap_reached" if fix_round > baseline_cap
+                        else canary_reason), preserve_applied=True)
+            except Exception:
+                logger.exception("auto_enqueue_fix: canary shadow receipt failed for %s", review_task_id)
         if max_rounds <= 0 or fix_round > max_rounds:
+            if canary_fired:
+                counterfactual = {
+                    "baseline_cap": baseline_cap, "effective_cap": max_rounds,
+                    "round": fix_round, "would_have_enqueued_fix": True,
+                }
+                try:
+                    queue.hold_tokenomics_canary_fix(
+                        review_task, receipt_task_id=lineage_root_id,
+                        fix_round=fix_round,
+                        recommendation=canary_citation or {},
+                        counterfactual=counterfactual)
+                except Exception:
+                    logger.exception("auto_enqueue_fix: canary HUMAN_GATE failed for %s", review_task_id)
+                    try:
+                        queue.record_tokenomics_canary_receipt(
+                            lineage_root_id, decision_source="quota_core_contract",
+                            recommendation=canary_citation or {}, applied=False,
+                            counterfactual=json.dumps(counterfactual),
+                            reason="human_gate_failed", preserve_applied=True)
+                    except Exception:
+                        logger.exception("auto_enqueue_fix: canary failure receipt failed for %s", lineage_root_id)
             logger.warning(
                 f"auto_enqueue_fix: review {review_task_id} requested changes but "
                 f"the automated fix budget is spent (round {fix_round} > "
@@ -1160,8 +1249,7 @@ def auto_enqueue_fix(
         # must not read as "no fix task was created".
         citation = None
         try:
-            citation = _shadow_rounds_citation(
-                {t.task_id: t for t in queue.list_tasks()}, review_task)
+            citation = _shadow_rounds_citation(tasks_by_id, review_task)
             fix_context["tokenomics_shadow"] = citation
         except Exception:
             logger.exception(
@@ -1666,6 +1754,24 @@ def auto_enqueue_test(
         # avoid self-review and self-test (#117).
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
         contract = _cascade.stored(review_task)
+        tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
+        if (_tokenomics_canary.rounds_cap_enabled()
+                and _lineage_root_task_id(tasks_by_id, review_task)
+                == _tokenomics_canary.canary_pin()):
+            try:
+                _, citation, reason = _canary_round_cap(
+                    tasks_by_id, review_task,
+                    contract.fix_round_cap(review_fix_max_rounds()))
+                queue.record_tokenomics_canary_receipt(
+                    _lineage_root_task_id(tasks_by_id, review_task),
+                    decision_source=(citation or {}).get(
+                        "decision_source") or "baseline",
+                    recommendation=citation or {}, applied=False,
+                    counterfactual="", reason=(
+                        "cap_not_reached" if reason == "cap_not_reached" else reason),
+                    preserve_applied=True)
+            except Exception:
+                logger.exception("auto_enqueue_test: canary receipt failed for %s", review_task_id)
         enforce_risk_tier = contract.enforced
         if not enforce_risk_tier:
             _record_risk_tier_shadow(queue, review_task, "test_enqueued")
