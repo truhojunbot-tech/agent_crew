@@ -1020,15 +1020,11 @@ def auto_enqueue_fix(
             return None
 
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-        # ⛔`coordinator_managed` is provenance only; it does not decide whether
-        #   this successor may exist. It used to skip the transition here and in
-        #   the two server-side ones, which put the admission question in the
-        #   hands of a flag the parent task's submitter wrote. Bounding
-        #   successors is the engine's decision (P1), and the things that
-        #   actually bound them — the review↔fix round cap, a terminal PR,
-        #   duplicate lineage — are not visible to a boolean in a context dict.
-        #   Removed on both transports at once, for the same reason the guard was
-        #   duplicated here in the first place (#123).
+        # The foreground coordinator enqueues its own follow-ups. Keep the
+        # guard here so HTTP and MCP callers cannot create a competing fix.
+        if review_ctx.get("coordinator_managed"):
+            logger.info("auto_enqueue_fix: coordinator-managed review %s — skipping", review_task_id)
+            return None
 
         review_project = review_task.project
         if review_project and server_project and review_project != server_project:

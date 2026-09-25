@@ -255,6 +255,7 @@ REQUEUE_CALL_SITES: dict[str, tuple[str, ...]] = {
     "queue.requeue": ("server._requeue_orphans (startup: in_progress → pending)",
                       "server push/spawn failure rollback",
                       "cli.recover"),
+    "queue.requeue_dispatcher_claim": ("server.recover_orphan_task",),
     "queue.defer_push_delivery": ("server tmux push refused by the pane (G_DT backoff)",),
     "queue.reset_stale_to_pending": ("cli.recover --reset-stale (#155)",),
 }

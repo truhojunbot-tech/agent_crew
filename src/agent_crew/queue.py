@@ -590,7 +590,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     verdict          TEXT,
     findings         TEXT,
     pr_number        INTEGER,
-    last_activity_at REAL NOT NULL DEFAULT 0
+    last_activity_at REAL NOT NULL DEFAULT 0,
+    claim_source    TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -601,6 +602,7 @@ _DDL_MIGRATE_LAST_ACTIVITY = (
 _DDL_MIGRATE_PUSH_AT = "ALTER TABLE tasks ADD COLUMN push_at REAL NOT NULL DEFAULT 0"
 _DDL_MIGRATE_DISPATCH_PANE = "ALTER TABLE tasks ADD COLUMN dispatch_pane_id TEXT NOT NULL DEFAULT ''"
 _DDL_MIGRATE_ERROR_INFO = "ALTER TABLE tasks ADD COLUMN error_info TEXT DEFAULT NULL"
+_DDL_MIGRATE_CLAIM_SOURCE = "ALTER TABLE tasks ADD COLUMN claim_source TEXT NOT NULL DEFAULT ''"
 
 # G12 / D6: execution state per task (alfred#51 c5777790815 §2). The tasks
 # table could not say who claimed a task, where it was sent, whether it was
@@ -1360,6 +1362,10 @@ class TaskQueue:
                 pass  # column already exists
         conn.execute(_DDL_TASK_EXEC_EVENTS)
         conn.execute(_DDL_TASK_EXEC_EVENTS_INDEX)
+        try:
+            conn.execute(_DDL_MIGRATE_CLAIM_SOURCE)
+        except Exception:
+            pass  # column already exists
         # #202: durable context identity + lineage columns on task_attribution.
         for _stmt in _DDL_MIGRATE_ATTRIBUTION_COLUMNS:
             try:
@@ -3046,8 +3052,9 @@ class TaskQueue:
             return False, gate
         at = time.time() if now is None else now
         conn.execute(
-            "UPDATE tasks SET status = 'in_progress', last_activity_at = ? WHERE task_id = ?",
-            (at, task_id),
+            "UPDATE tasks SET status = 'in_progress', last_activity_at = ?, "
+            "claim_source = ? WHERE task_id = ?",
+            (at, claimed_via, task_id),
         )
         self._record_claim_on(conn, task_id, at, role=role or None,
                               agent=agent or None, via=claimed_via)
@@ -3061,7 +3068,8 @@ class TaskQueue:
     #: method that flips a claimed row back to pending without going through
     #: :meth:`requeue_through_gate` is the §8 bypass the registry exists to
     #: expose.
-    REQUEUE_MUTATION_METHODS = ("requeue", "defer_push_delivery", "reset_stale_to_pending")
+    REQUEUE_MUTATION_METHODS = ("requeue", "requeue_dispatcher_claim",
+                                "defer_push_delivery", "reset_stale_to_pending")
 
     def requeue_through_gate(self, conn, task_id: str, *, path: str,
                              reason: str = "") -> tuple[bool, object]:
@@ -3299,9 +3307,11 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def dequeue(self, agent: str = "", role: str = "", *,
-                claimed_via: str = "",
-                skip_deferred: bool = False) -> Optional[TaskRequest]:
+    def dequeue(
+        self, agent: str = "", role: str = "", *, claimed_via: str = "",
+        claim_source: str = "", skip_task_ids: Optional[set[str]] = None,
+        skip_deferred: bool = False,
+    ) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
         Resolution order (Issue #106 phase 3 — supports dynamic role
@@ -3323,6 +3333,8 @@ class TaskQueue:
         winning the ORDER BY and starving the tasks behind it. Other consumers
         (dispatcher, MCP) leave it False — the backoff is about a pane, not
         the task.
+        ``claim_source`` is server-owned provenance for recovery. Skipped IDs
+        let push delivery pass a busy queue head during this scheduling pass.
         """
         _now = time.time()
         _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "
@@ -3343,17 +3355,20 @@ class TaskQueue:
                 conn.execute("ROLLBACK")
                 return None
             row = None
+            skipped = sorted(skip_task_ids or ())
+            skip_sql = f" AND task_id NOT IN ({','.join('?' for _ in skipped)})" if skipped else ""
             if agent:
                 # Stage 1 — explicit override claim for this agent.
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM tasks
                     WHERE status = 'pending'
-                      AND json_extract(context, '$.agent_override') = ?""" + _defer_sql + """
+                      AND json_extract(context, '$.agent_override') = ?
+                      {_defer_sql} {skip_sql}
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
                     """,
-                    (agent,),
+                    (agent, *skipped),
                 ).fetchone()
 
             if row is None and role:
@@ -3364,37 +3379,41 @@ class TaskQueue:
                     raise ValueError(f"Unknown role: {role!r}. Must be one of {list(_ROLE_TO_TYPE)}")
                 if agent:
                     row = conn.execute(
-                        """
+                        f"""
                         SELECT * FROM tasks
                         WHERE status = 'pending' AND task_type = ?
                           AND (
                             json_extract(context, '$.agent_override') IS NULL
                             OR json_extract(context, '$.agent_override') = ?
-                          )""" + _defer_sql + """
+                          )
+                          {_defer_sql} {skip_sql}
                         ORDER BY priority ASC, created_at ASC
                         LIMIT 1
                         """,
-                        (task_type_filter, agent),
+                        (task_type_filter, agent, *skipped),
                     ).fetchone()
                 else:
                     row = conn.execute(
-                        """
+                        f"""
                         SELECT * FROM tasks
-                        WHERE status = 'pending' AND task_type = ?""" + _defer_sql + """
+                        WHERE status = 'pending' AND task_type = ?
+                          {_defer_sql} {skip_sql}
                         ORDER BY priority ASC, created_at ASC
                         LIMIT 1
                         """,
-                        (task_type_filter,),
+                        (task_type_filter, *skipped),
                     ).fetchone()
 
             if row is None and not agent and not role:
                 row = conn.execute(
-                    """
+                    f"""
                     SELECT * FROM tasks
-                    WHERE status = 'pending'""" + _defer_sql + """
+                    WHERE status = 'pending'
+                      {_defer_sql} {skip_sql}
                     ORDER BY priority ASC, created_at ASC
                     LIMIT 1
-                    """
+                    """,
+                    skipped,
                 ).fetchone()
 
             if row is None:
@@ -3406,7 +3425,7 @@ class TaskQueue:
             # the check is never left half-claimed, and a claim that wins the
             # race never runs without the check having seen the same B′.
             claimed, _claim_gate = self.claim_through_gate(
-                conn, row["task_id"], agent=agent, role=role, claimed_via=claimed_via)
+                conn, row["task_id"], agent=agent, role=role, claimed_via=claim_source or claimed_via)
             if not claimed:
                 conn.execute("ROLLBACK")
                 return None
@@ -4438,7 +4457,8 @@ class TaskQueue:
                 conn.execute("COMMIT")   # keep the refusal's runtime event
                 return
             conn.execute(
-                "UPDATE tasks SET status = 'pending' WHERE task_id = ? AND status = 'in_progress'",
+                "UPDATE tasks SET status = 'pending', claim_source = '' "
+                "WHERE task_id = ? AND status = 'in_progress'",
                 (task_id,),
             )
             # G12: the lease ends with the claim; the history keeps both.
@@ -4448,6 +4468,48 @@ class TaskQueue:
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK")
             raise
+        finally:
+            conn.close()
+
+    def requeue_dispatcher_claim(self, task_id: str) -> bool:
+        """Recover only the in-progress claim made by the headless dispatcher."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, claim_source FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["status"] != "in_progress" or row["claim_source"] != "dispatcher":
+                conn.execute("ROLLBACK")
+                return False
+            admitted, _gate = self.requeue_through_gate(
+                conn, task_id, path="queue.requeue_dispatcher_claim")
+            if not admitted:
+                conn.execute("COMMIT")
+                return False
+            conn.execute(
+                "UPDATE tasks SET status = 'pending', claim_source = '' "
+                "WHERE task_id = ? AND status = 'in_progress' "
+                "AND claim_source = 'dispatcher'",
+                (task_id,),
+            )
+            self._record_end_on(conn, task_id, time.time(), "requeued", posted=False)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def get_task_claim_source(self, task_id: str) -> str:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT claim_source FROM tasks WHERE task_id = ?", (task_id,),
+            ).fetchone()
+            return row["claim_source"] if row else ""
         finally:
             conn.close()
 
@@ -4606,6 +4668,38 @@ class TaskQueue:
                                      task_id)
         return cancelled
 
+    def list_in_progress_activity(self) -> List[dict]:
+        """`in_progress` task 의 (id, type, last_activity_at, context) 목록.
+
+        ⭐orphan 판정용이다. `expire_stale` 은 **취소**를 하고 이 함수는 **보여주기만**
+          한다 — 전역 스윕 전에 "무엇이 몇 건 지워지는가" 를 먼저 볼 수 있어야 한다
+          (2026-09-23: 단건을 치우려다 라이브 3건을 같이 취소한 사고).
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, task_type, last_activity_at, created_at, context, claim_source "
+                "FROM tasks WHERE status = 'in_progress' "
+                "ORDER BY last_activity_at ASC"
+            ).fetchall()
+            out: List[dict] = []
+            for r in rows:
+                try:
+                    ctx = json.loads(r["context"]) if r["context"] else {}
+                except Exception:
+                    ctx = {}
+                out.append({
+                    "task_id": r["task_id"],
+                    "task_type": r["task_type"],
+                    "last_activity_at": float(r["last_activity_at"] or 0.0),
+                    "created_at": float(r["created_at"] or 0.0),
+                    "context": ctx if isinstance(ctx, dict) else {},
+                    "claim_source": r["claim_source"],
+                })
+            return out
+        finally:
+            conn.close()
+
     def reset_stale_to_pending(self, older_than_seconds: float = 600.0) -> List[str]:
         """Reset in_progress tasks idle > ``older_than_seconds`` back to pending.
 
@@ -4702,9 +4796,10 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def dequeue_discuss_for_agent(self, agent: str, *,
-                                  claimed_via: str = "",
-                                  skip_deferred: bool = False) -> Optional[TaskRequest]:
+    def dequeue_discuss_for_agent(
+        self, agent: str, *, claimed_via: str = "",
+        claim_source: str = "", skip_deferred: bool = False,
+    ) -> Optional[TaskRequest]:
         """Atomic pending→in_progress for the oldest pending discuss task whose
         context.agent matches `agent`. Context is stored as JSON, so filtering
         happens in Python under BEGIN IMMEDIATE to keep the read+update atomic."""
@@ -4747,7 +4842,7 @@ class TaskQueue:
             #   gate (codex review of 8993bdb, P1).
             claimed, _claim_gate = self.claim_through_gate(
                 conn, chosen["task_id"], agent=agent, role="discuss",
-                claimed_via=claimed_via)
+                claimed_via=claim_source or claimed_via)
             if not claimed:
                 conn.execute("ROLLBACK")
                 return None

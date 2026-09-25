@@ -217,8 +217,10 @@ def test_u_c19_discuss_context_includes_perspective():
     class _FakeQueue:
         def __init__(self):
             self.enqueued = []
-        def enqueue(self, req):
+            self.ingresses = []
+        def enqueue(self, req, **kwargs):
             self.enqueued.append(req)
+            self.ingresses.append(kwargs["ingress"])
             return req.task_id
 
     q = _FakeQueue()
@@ -227,6 +229,7 @@ def test_u_c19_discuss_context_includes_perspective():
         perspectives={"claude": "analyst", "codex": "critic"},
     )
     assert len(ids) == 2
+    assert q.ingresses == ["cli.discuss", "cli.discuss"]
     assert q.enqueued[0].context["agent"] == "claude"
     assert q.enqueued[0].context["perspective"] == "analyst"
     assert q.enqueued[1].context["agent"] == "codex"

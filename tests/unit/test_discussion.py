@@ -13,7 +13,7 @@ from agent_crew.discussion import (
 # U-D01: enqueue_panel_tasks — agents 수만큼 task_type=discuss 태스크 등록됨, task_id 유일성 보장
 def test_u_d01_enqueue_panel_tasks():
     queue = MagicMock()
-    queue.enqueue.side_effect = lambda req: req.task_id
+    queue.enqueue.side_effect = lambda req, **kwargs: req.task_id
 
     agents = ["claude", "codex", "gemini"]
     topic = "Should we adopt microservices?"
@@ -23,6 +23,7 @@ def test_u_d01_enqueue_panel_tasks():
 
     assert len(task_ids) == 3
     assert queue.enqueue.call_count == 3
+    assert all(c.kwargs["ingress"] == "cli.discuss" for c in queue.enqueue.call_args_list)
     assert len(set(task_ids)) == 3, "task_id must be unique across agents"
 
     for c in queue.enqueue.call_args_list:
@@ -35,7 +36,7 @@ def test_u_d01_enqueue_panel_tasks():
 def test_u_d01b_enqueue_panel_tasks_multi_round_unique():
     queue = MagicMock()
     all_ids = []
-    queue.enqueue.side_effect = lambda req: (all_ids.append(req.task_id) or req.task_id)
+    queue.enqueue.side_effect = lambda req, **kwargs: (all_ids.append(req.task_id) or req.task_id)
 
     agents = ["claude", "codex"]
     topic = "topic"
@@ -45,6 +46,7 @@ def test_u_d01b_enqueue_panel_tasks_multi_round_unique():
     enqueue_panel_tasks(queue, agents, topic, context)
 
     assert len(set(all_ids)) == len(all_ids), "task_ids must be globally unique across rounds"
+    assert all(c.kwargs["ingress"] == "cli.discuss" for c in queue.enqueue.call_args_list)
 
 
 # U-D02: assign_perspectives (default) — DEFAULT_PERSPECTIVES 라운드로빈 할당
@@ -100,7 +102,7 @@ def test_u_d05_multi_round():
     queue = MagicMock()
     enqueued_requests = []
 
-    def capture_enqueue(req):
+    def capture_enqueue(req, **kwargs):
         enqueued_requests.append(req)
         return req.task_id
 

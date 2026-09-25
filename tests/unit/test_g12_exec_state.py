@@ -71,12 +71,13 @@ def test_migration_adds_columns_and_history_without_touching_old_data(legacy_db)
 
     cols = _columns(legacy_db)
     assert cols[:17] == old_cols                       # additive: order and names kept
-    # #336 (PR #382) adds `dispatch_pane_id` in the same migration pass; it is
-    # main's NOT NULL DEFAULT '' column, so it is checked apart from the
-    # NULL-default G12 columns.
-    assert [c for c in cols[17:] if c != "dispatch_pane_id"] == MIGRATION_ADDED_COLUMNS
-    assert "dispatch_pane_id" in cols[17:]
-    assert all(v == "" for (v,) in _rows(legacy_db, ["dispatch_pane_id"]))
+    # Main's dispatch_pane_id and claim_source both default to ''. The G12
+    # execution columns retain NULL, so check those contracts separately.
+    main_columns = {"dispatch_pane_id", "claim_source"}
+    assert [c for c in cols[17:] if c not in main_columns] == MIGRATION_ADDED_COLUMNS
+    assert main_columns <= set(cols[17:])
+    assert all(values == ("", "")
+               for values in _rows(legacy_db, ["dispatch_pane_id", "claim_source"]))
     assert _rows(legacy_db, old_cols) == before        # every old value unchanged
     # Old rows carry no invented claim or receipt: NULL, not 0 / ''.
     assert all(v is None
