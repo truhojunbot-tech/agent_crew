@@ -101,7 +101,7 @@ def test_no_session_is_not_over_the_cap(tmp_path):
 # ── 3. the dispatch decision ──────────────────────────────────────────
 
 
-def _dispatch_cmd(tmp_path, monkeypatch, agent, *, policy="resume", over=False):
+def _dispatch_cmd(tmp_path, monkeypatch, agent, *, policy="resume", over=False, unused_tcp_port):
     """Run one real dispatch and return the argv the dispatcher would spawn."""
     import asyncio
 
@@ -146,7 +146,7 @@ def _dispatch_cmd(tmp_path, monkeypatch, agent, *, policy="resume", over=False):
 
     role = {"claude": "implementer", "codex": "reviewer"}[agent]
     ttype = {"claude": "implement", "codex": "review"}[agent]
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -170,29 +170,29 @@ def _dispatch_cmd(tmp_path, monkeypatch, agent, *, policy="resume", over=False):
     return spawned.get("cmd", [])
 
 
-def test_claude_resumes_when_the_policy_says_resume(tmp_path, monkeypatch):
-    cmd = _dispatch_cmd(tmp_path, monkeypatch, "claude")
+def test_claude_resumes_when_the_policy_says_resume(tmp_path, monkeypatch, *, unused_tcp_port):
+    cmd = _dispatch_cmd(tmp_path, monkeypatch, "claude", unused_tcp_port=unused_tcp_port)
 
     assert cmd[0] == "claude" and "--continue" in cmd
 
 
-def test_claude_does_not_resume_after_an_operator_reset(tmp_path, monkeypatch):
+def test_claude_does_not_resume_after_an_operator_reset(tmp_path, monkeypatch, *, unused_tcp_port):
     """★The core gap: `--continue` was unconditional, so a freshly minted
     context still resumed the provider's old session."""
-    cmd = _dispatch_cmd(tmp_path, monkeypatch, "claude", policy="fresh")
+    cmd = _dispatch_cmd(tmp_path, monkeypatch, "claude", policy="fresh", unused_tcp_port=unused_tcp_port)
 
     assert "--continue" not in cmd, "a reset context still resumed the old session"
 
 
-def test_a_capped_claude_session_forces_a_fresh_one(tmp_path, monkeypatch):
+def test_a_capped_claude_session_forces_a_fresh_one(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The cap, end to end: over the limit → no `--continue` on the real argv."""
-    cmd = _dispatch_cmd(tmp_path, monkeypatch, "claude", over=True)
+    cmd = _dispatch_cmd(tmp_path, monkeypatch, "claude", over=True, unused_tcp_port=unused_tcp_port)
 
     assert cmd[0] == "claude"
     assert "--continue" not in cmd
 
 
-def test_codex_resume_is_policy_aware_too(tmp_path, monkeypatch):
+def test_codex_resume_is_policy_aware_too(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔Updated by #262: `resume --last` is gone entirely.
 
     #260 made codex policy-aware and still used the global `--last` selector.
@@ -201,8 +201,8 @@ def test_codex_resume_is_policy_aware_too(tmp_path, monkeypatch):
     dispatches below are unbound, so both are fresh — and neither may contain
     `--last`, which is what #260 asserted and #262 removed.
     """
-    resumed = _dispatch_cmd(tmp_path, monkeypatch, "codex")
-    fresh = _dispatch_cmd(tmp_path, monkeypatch, "codex", policy="fresh")
+    resumed = _dispatch_cmd(tmp_path, monkeypatch, "codex", unused_tcp_port=unused_tcp_port)
+    fresh = _dispatch_cmd(tmp_path, monkeypatch, "codex", policy="fresh", unused_tcp_port=unused_tcp_port)
 
     for cmd in (resumed, fresh):
         assert cmd[:2] == ["codex", "exec"]
@@ -224,7 +224,7 @@ def test_the_capped_session_is_never_deleted(tmp_path, monkeypatch):
 # ── the cap event must name the provider that tripped it (#260 review) ──
 
 
-def _capped_event(tmp_path, monkeypatch, agent, cap_info):
+def _capped_event(tmp_path, monkeypatch, agent, cap_info, *, unused_tcp_port):
     """Drive a real dispatch whose cap trips, and return the recorded event."""
     import asyncio
     import json as _json
@@ -268,7 +268,7 @@ def _capped_event(tmp_path, monkeypatch, agent, cap_info):
 
     role = {"claude": "implementer", "gemini": "tester"}[agent]
     ttype = {"claude": "implement", "gemini": "test"}[agent]
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -283,13 +283,13 @@ def _capped_event(tmp_path, monkeypatch, agent, cap_info):
     return capped[0] if capped else None
 
 
-def test_a_claude_cap_trip_is_attributed_to_claude(tmp_path, monkeypatch):
+def test_a_claude_cap_trip_is_attributed_to_claude(tmp_path, monkeypatch, *, unused_tcp_port):
     """★The corrupted field: `provider` was hardcoded to "agy", so every claude
     trip was telemetered as a gemini one — the single field that says which
     store overflowed said the wrong store."""
     event = _capped_event(tmp_path, monkeypatch, "claude",
                           {"bytes": 99 * 1048576, "conversation_id": "sess-c",
-                           "cap_mb": 64, "provider": "claude"})
+                           "cap_mb": 64, "provider": "claude"}, unused_tcp_port=unused_tcp_port)
 
     assert event is not None, "no cap event was recorded"
     assert event["provider"] == "claude"
@@ -297,11 +297,11 @@ def test_a_claude_cap_trip_is_attributed_to_claude(tmp_path, monkeypatch):
     assert event["bytes"] == 99 * 1048576
 
 
-def test_an_agy_cap_trip_is_still_attributed_to_agy(tmp_path, monkeypatch):
+def test_an_agy_cap_trip_is_still_attributed_to_agy(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The fix must not swing the other way: gemini trips keep their label."""
     event = _capped_event(tmp_path, monkeypatch, "gemini",
                           {"bytes": 200 * 1048576, "conversation_id": "conv-g",
-                           "cap_mb": 64, "provider": "agy"})
+                           "cap_mb": 64, "provider": "agy"}, unused_tcp_port=unused_tcp_port)
 
     assert event is not None
     assert event["provider"] == "agy"

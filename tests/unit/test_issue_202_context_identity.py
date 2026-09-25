@@ -192,7 +192,7 @@ def test_u_i202_detect_context_compaction_false():
 # Full-dispatch acceptance tests
 # ---------------------------------------------------------------------------
 
-def test_u_i202_two_sequential_tasks_share_context_and_increment_index(tmp_db, tmp_path):
+def test_u_i202_two_sequential_tasks_share_context_and_increment_index(tmp_db, tmp_path, *, unused_tcp_port):
     """Acceptance criterion: two sequential tasks using the same resumed
     provider conversation share the same context_id and have increasing
     session_task_index."""
@@ -211,7 +211,7 @@ def test_u_i202_two_sequential_tasks_share_context_and_increment_index(tmp_db, t
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
@@ -232,7 +232,7 @@ def test_u_i202_two_sequential_tasks_share_context_and_increment_index(tmp_db, t
     assert row2["previous_task_id"] == "test-1"
 
 
-def test_u_i202_context_reset_flag_creates_new_generation(tmp_db, tmp_path):
+def test_u_i202_context_reset_flag_creates_new_generation(tmp_db, tmp_path, *, unused_tcp_port):
     """Acceptance criterion: a fresh/new provider conversation creates a new
     generation/context identity in a deterministic, observable way."""
     state, _ = _worktree_state(tmp_path)
@@ -250,7 +250,7 @@ def test_u_i202_context_reset_flag_creates_new_generation(tmp_db, tmp_path):
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
@@ -270,7 +270,7 @@ def test_u_i202_context_reset_flag_creates_new_generation(tmp_db, tmp_path):
     assert reset_events, f"expected a context_reset event for test-b, got event types {[e['event_type'] for e in events]}"
 
 
-def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path):
+def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, unused_tcp_port):
     """Acceptance criterion: retry and provider-fallback lineage can be
     reconstructed from durable records."""
     state, _ = _worktree_state(tmp_path)
@@ -288,7 +288,7 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path):
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
@@ -331,7 +331,7 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path):
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app2 = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app2):
@@ -343,7 +343,7 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path):
     assert fallback_row["fallback_of"] == "review-1"
 
 
-def test_u_i202_context_survives_restart(tmp_db, tmp_path):
+def test_u_i202_context_survives_restart(tmp_db, tmp_path, *, unused_tcp_port):
     """Acceptance criterion: context/task lifecycle survives Agent Crew
     restart because the relevant metadata is persisted."""
     state, _ = _worktree_state(tmp_path)
@@ -362,7 +362,7 @@ def test_u_i202_context_survives_restart(tmp_db, tmp_path):
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app1 = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app1) as client:
@@ -375,7 +375,7 @@ def test_u_i202_context_survives_restart(tmp_db, tmp_path):
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app2 = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app2) as client:
@@ -398,7 +398,7 @@ def test_u_i202_context_survives_restart(tmp_db, tmp_path):
     )
 
 
-def test_u_i202_works_with_no_external_consumer(tmp_db, tmp_path):
+def test_u_i202_works_with_no_external_consumer(tmp_db, tmp_path, *, unused_tcp_port):
     """Acceptance criterion: existing workflows continue to work when no
     external analytics consumer exists — this just means dispatch must not
     fail/raise because of any of the new telemetry code."""
@@ -417,7 +417,7 @@ def test_u_i202_works_with_no_external_consumer(tmp_db, tmp_path):
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
@@ -429,7 +429,7 @@ def test_u_i202_works_with_no_external_consumer(tmp_db, tmp_path):
     assert any(t.task_id == "plain-1" for t in tasks)
 
 
-def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, tmp_path):
+def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, tmp_path, *, unused_tcp_port):
     """#202 review of PR #203, finding 1: role-level exclusivity alone
     doesn't stop a tester task (default agent gemini) and a reviewer task
     with agent_override=gemini from both being dispatched at once — they
@@ -472,7 +472,7 @@ def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, t
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
@@ -500,7 +500,7 @@ def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, t
 # #202 review round 2: terminal attribution.jsonl line + atomic status update
 # ---------------------------------------------------------------------------
 
-def test_u_i202_attribution_terminal_state_on_agent_success(tmp_db, tmp_path):
+def test_u_i202_attribution_terminal_state_on_agent_success(tmp_db, tmp_path, *, unused_tcp_port):
     """The agent's own POST /tasks/{id}/result completion must (a) flip
     task_attribution.status from 'in_progress' to the terminal status
     atomically with outcome/completed_at, and (b) append a SECOND
@@ -516,7 +516,7 @@ def test_u_i202_attribution_terminal_state_on_agent_success(tmp_db, tmp_path):
 
     with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1", "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
         app = create_app(
-            db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+            db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
             watchdog_disabled=True, anomaly_disabled=True,
         )
         with TestClient(app) as client:
@@ -550,7 +550,7 @@ def test_u_i202_attribution_terminal_state_on_agent_success(tmp_db, tmp_path):
     assert succ_lines[1]["outcome"] == "completed"
 
 
-def test_u_i202_attribution_terminal_state_on_internal_dispatcher_failure(tmp_db, tmp_path):
+def test_u_i202_attribution_terminal_state_on_internal_dispatcher_failure(tmp_db, tmp_path, *, unused_tcp_port):
     """A task that fails via an INTERNAL dispatcher path (subprocess exits
     non-zero without the agent ever POSTing a result — _fail_if_active,
     not the agent-self-report HTTP endpoint) must get the same terminal
@@ -571,7 +571,7 @@ def test_u_i202_attribution_terminal_state_on_internal_dispatcher_failure(tmp_db
         with patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess):
             with patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
                 app = create_app(
-                    db_path=tmp_db, pane_map={}, port=0, state_path=str(state_file),
+                    db_path=tmp_db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
@@ -621,6 +621,7 @@ def _dispatch_snapshot(q, attr_jsonl_path, task_id, **kw):
 
 def test_u_i235_retry_completion_finalizes_outcome_and_keeps_original_start(
     tmp_db, tmp_path,
+    *, unused_tcp_port,
 ):
     """★Case 3 — a task that fails, is requeued, then completes must end with
     the terminal outcome AND its original started_at (#204's guarantee).
@@ -637,7 +638,7 @@ def test_u_i235_retry_completion_finalizes_outcome_and_keeps_original_start(
 
     with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1",
                                  "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
-        app = create_app(db_path=tmp_db, pane_map={}, port=0,
+        app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port,
                          state_path=str(state_file), watchdog_disabled=True,
                          anomaly_disabled=True)
         with TestClient(app) as client:
@@ -695,6 +696,7 @@ def test_u_i235_retry_completion_finalizes_outcome_and_keeps_original_start(
 
 def test_u_i235_jsonl_reconciles_to_one_task_without_double_counting(
     tmp_db, tmp_path,
+    *, unused_tcp_port,
 ):
     """★Case 4 — attribution.jsonl is append-only, so a task legitimately has
     several lines. A consumer folding by task_id must land on exactly one
@@ -712,7 +714,7 @@ def test_u_i235_jsonl_reconciles_to_one_task_without_double_counting(
 
     with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1",
                                  "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
-        app = create_app(db_path=tmp_db, pane_map={}, port=0,
+        app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port,
                          state_path=str(state_file), watchdog_disabled=True,
                          anomaly_disabled=True)
         with TestClient(app) as client:
@@ -741,7 +743,7 @@ def test_u_i235_jsonl_reconciles_to_one_task_without_double_counting(
         "started_at must be stable across appended lines"
 
 
-def test_u_i235_terminal_outcome_survives_a_restart(tmp_db, tmp_path):
+def test_u_i235_terminal_outcome_survives_a_restart(tmp_db, tmp_path, *, unused_tcp_port):
     """★Case 5 — the outcome is durable in SQLite, not just in the process
     that wrote it. A fresh TaskQueue over the same file must still see it.
 
@@ -757,7 +759,7 @@ def test_u_i235_terminal_outcome_survives_a_restart(tmp_db, tmp_path):
 
     with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1",
                                  "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1"}):
-        app = create_app(db_path=tmp_db, pane_map={}, port=0,
+        app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port,
                          state_path=str(state_file), watchdog_disabled=True,
                          anomaly_disabled=True)
         with TestClient(app) as client:

@@ -43,8 +43,8 @@ from agent_crew.queue import TaskQueue, task_issue_number
 from agent_crew.server import create_app
 
 
-def _server(tmp_db):
-    return create_app(db_path=tmp_db, pane_map={}, port=0,
+def _server(tmp_db, *, unused_tcp_port):
+    return create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port,
                       watchdog_disabled=True, anomaly_disabled=True,
                       push_fn=lambda *a, **k: None)
 
@@ -70,14 +70,14 @@ def test_the_server_does_not_reference_it():
     assert "active_tasks_for_issue" not in inspect.getsource(server_module)
 
 
-def test_a_colliding_enqueue_is_admitted_and_reports_nothing(tmp_db):
+def test_a_colliding_enqueue_is_admitted_and_reports_nothing(tmp_db, *, unused_tcp_port):
     """The exact #294 shape: a second implement for an issue that already has a
     non-terminal implement. Still admitted — it always was — and now the
     response says nothing about it, because nothing here is entitled to."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement", description="go",
                           branch="main", project="demo", context={"issue": 292}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         response = _post(client, "impl-b", issue=292)
     assert response.status_code == 201
     body = response.json()
@@ -85,10 +85,10 @@ def test_a_colliding_enqueue_is_admitted_and_reports_nothing(tmp_db):
         "POST /tasks returns the id and nothing else; no advisory key survives"
 
 
-def test_no_response_ever_carries_the_advisory_key(tmp_db):
+def test_no_response_ever_carries_the_advisory_key(tmp_db, *, unused_tcp_port):
     """⛔Asserted on the collision case *and* the clean case. A key that is
     absent only when empty is still a key a client will code against."""
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         assert "in_flight_for_issue" not in _post(client, "impl-a", issue=292).json()
         assert "in_flight_for_issue" not in _post(client, "impl-b", issue=292).json()
         assert "in_flight_for_issue" not in _post(client, "impl-c").json()

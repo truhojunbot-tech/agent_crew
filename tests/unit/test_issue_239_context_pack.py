@@ -649,6 +649,7 @@ def test_watch_persists_the_issue_body_it_already_fetched():
 
 def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
     tmp_path, monkeypatch,
+    *, unused_tcp_port,
 ):
     """★★The test whose absence let this ship broken.
 
@@ -697,7 +698,7 @@ def test_enabled_dispatcher_puts_the_ac_into_the_real_dispatched_prompt(
 
     from fastapi.testclient import TestClient
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                      watchdog_disabled=True, anomaly_disabled=True)
 
     # The queue is bound during lifespan startup, so the dispatch has to run
@@ -913,7 +914,7 @@ def test_truncation_marker_alone_marks_a_body_incomplete():
     assert body_is_truncated({"issue_body": "x", "issue_body_truncated": True}) is True
 
 
-def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch):
+def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★Dispatcher level, with the pack ENABLED and a real capped issue.
 
     The unit tests above all go through `build_task`; this one drives
@@ -960,7 +961,7 @@ def test_enabled_dispatcher_ships_the_ac_of_a_capped_issue(tmp_path, monkeypatch
 
     from fastapi.testclient import TestClient
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                      watchdog_disabled=True, anomaly_disabled=True)
 
     ingested = build_task(

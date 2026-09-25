@@ -3,6 +3,7 @@ import os
 from agent_crew.prompts.task_loop import build_task_loop_prompt
 from agent_crew.testing_policy import load_scope, render_scope
 from agent_crew.port_validation import require_project_port
+from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
 # Per-role instruction file paths inside each worktree (Issue #110 fix).
 #
@@ -17,18 +18,23 @@ from agent_crew.port_validation import require_project_port
 # work (alpha_engine PRs #801–#805).
 #
 # Layout:
-#   implementer → ".claude/CLAUDE.md"   Claude Code merges with root.
-#   reviewer    → "AGENTS.md"           Codex reads this at the root.
-#   tester      → "GEMINI.md"           Gemini reads this at the root.
+#   codex  → "AGENTS.md"           Codex reads this at the root.
+#   claude → ".claude/CLAUDE.md"   Claude Code merges with root.
+#   gemini → "GEMINI.md"          Gemini reads this at the root.
 #
 # AGENTS.md / GEMINI.md may already exist in the project (developer-facing
 # guides). To avoid clobbering them, `write()` uses a marker-bracketed
 # section that gets idempotently replaced on each rewrite — see
 # `_AGENT_CREW_BLOCK_*` below.
 ROLE_FILES: dict = {
-    "implementer": ".claude/CLAUDE.md",
-    "reviewer": "AGENTS.md",
+    "implementer": "AGENTS.md",
+    "reviewer": ".claude/CLAUDE.md",
     "tester": "GEMINI.md",
+}
+AGENT_FILES = {
+    "codex": "AGENTS.md",
+    "claude": ".claude/CLAUDE.md",
+    "gemini": "GEMINI.md",
 }
 
 # Marker-bracketed block — the only region `write()` touches in
@@ -39,11 +45,7 @@ _AGENT_CREW_BLOCK_END = "<!-- agent_crew:end -->"
 # Default agent name per role — used when a caller passes role but not the
 # agent identifier. The agent name is what appears inside the task-loop
 # prompt's `[agent: NAME]` tag and the `get_next_task(agent=...)` arg.
-_DEFAULT_AGENT_FOR_ROLE: dict = {
-    "implementer": "claude",
-    "reviewer": "codex",
-    "tester": "gemini",
-}
+_DEFAULT_AGENT_FOR_ROLE: dict = DEFAULT_ROLE_TO_AGENT
 
 _COMMON = """\
 # Agent Crew — <project>
@@ -477,7 +479,7 @@ stored as `failed` with `reason: no_artifact`.
 
 ### ⛔ Delegating review / test to the next role — DO NOT use `crew run`
 
-When you need the reviewer (codex) or tester (gemini) to take over after your
+When you need the reviewer (claude) or tester (gemini) to take over after your
 implementation, **do not** call `crew run "Review PR ..."`. `crew run` is a
 top-level loop client and forces `task_type=implement` regardless of the
 prompt — the review pane only picks tasks with `task_type=review`, so your
@@ -869,7 +871,7 @@ def write(
         raise ValueError(f"Unknown role: {role!r}. Must be one of {list(ROLE_FILES)}")
     with open(port_file) as f:
         port = require_project_port(int(f.read().strip()), project)
-    filename = ROLE_FILES[role]
+    filename = AGENT_FILES.get(agent, ROLE_FILES[role])
     new_block = generate(role, project, port, agent=agent, delivery=delivery,
                          worktree_path=worktree_path)
     path = os.path.join(worktree_path, filename)

@@ -77,7 +77,7 @@ def _dispatch_env(tmp_path, monkeypatch, *, agent="claude"):
     wt = tmp_path / "worktrees" / "demo" / agent
     wt.mkdir(parents=True, exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 8111, "worktrees": {agent: str(wt)}}))
+    state.write_text(json.dumps({"role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}, "port": 8111, "worktrees": {agent: str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setenv("AGENT_CREW_BASE", str(tmp_path))

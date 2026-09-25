@@ -251,7 +251,7 @@ def test_a_second_PROCESS_is_refused(worktree, tmp_path):
 # ── 4. the dispatcher honours it ──────────────────────────────────────
 
 
-def _dispatch(tmp_path, monkeypatch, task_type, *, lock_base, role="tester"):
+def _dispatch(tmp_path, monkeypatch, task_type, *, lock_base, role="tester", unused_tcp_port):
     """Run one dispatch through the real handler; return whether it spawned."""
     import asyncio
 
@@ -288,7 +288,7 @@ def _dispatch(tmp_path, monkeypatch, task_type, *, lock_base, role="tester"):
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -301,26 +301,26 @@ def _dispatch(tmp_path, monkeypatch, task_type, *, lock_base, role="tester"):
     return bool(spawned), status, str(wt)
 
 
-def test_the_dispatcher_defers_a_test_task_while_the_lock_is_held(tmp_path, monkeypatch):
+def test_the_dispatcher_defers_a_test_task_while_the_lock_is_held(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★End to end: a held lock must stop the second `make test` from ever
     starting, and must put the task back rather than burn it."""
     base = str(tmp_path / "lockbase")
     wt = tmp_path / "worktrees" / "demo" / "gemini"
     wt.mkdir(parents=True)
     with tp.test_stage_lock(str(wt), base=base):
-        spawned, status, _ = _dispatch(tmp_path, monkeypatch, "test", lock_base=base)
+        spawned, status, _ = _dispatch(tmp_path, monkeypatch, "test", lock_base=base, unused_tcp_port=unused_tcp_port)
     assert spawned is False, "a second test stage was launched against a locked worktree"
     assert status == "pending", f"the deferred task was not requeued (status={status})"
 
 
-def test_an_unlocked_worktree_still_dispatches_its_test(tmp_path, monkeypatch):
+def test_an_unlocked_worktree_still_dispatches_its_test(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The control. A lock that also blocks the uncontended case is a bug."""
     spawned, _, _ = _dispatch(tmp_path, monkeypatch, "test",
-                              lock_base=str(tmp_path / "lockbase"))
+                              lock_base=str(tmp_path / "lockbase"), unused_tcp_port=unused_tcp_port)
     assert spawned is True
 
 
-def test_a_non_test_task_is_not_gated_by_the_test_lock(tmp_path, monkeypatch):
+def test_a_non_test_task_is_not_gated_by_the_test_lock(tmp_path, monkeypatch, *, unused_tcp_port):
     """The lock is scoped to the test stage. Gating implement/review on it
     would serialise the whole crew behind a slow test run."""
     base = str(tmp_path / "lockbase")
@@ -328,5 +328,5 @@ def test_a_non_test_task_is_not_gated_by_the_test_lock(tmp_path, monkeypatch):
     wt.mkdir(parents=True)
     with tp.test_stage_lock(str(wt), base=base):
         spawned, _, _ = _dispatch(tmp_path, monkeypatch, "implement",
-                                  lock_base=base, role="implementer")
+                                  lock_base=base, role="implementer", unused_tcp_port=unused_tcp_port)
     assert spawned is True

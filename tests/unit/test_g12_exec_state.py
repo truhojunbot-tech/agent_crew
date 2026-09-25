@@ -71,7 +71,12 @@ def test_migration_adds_columns_and_history_without_touching_old_data(legacy_db)
 
     cols = _columns(legacy_db)
     assert cols[:17] == old_cols                       # additive: order and names kept
-    assert cols[17:] == MIGRATION_ADDED_COLUMNS
+    # #336 (PR #382) adds `dispatch_pane_id` in the same migration pass; it is
+    # main's NOT NULL DEFAULT '' column, so it is checked apart from the
+    # NULL-default G12 columns.
+    assert [c for c in cols[17:] if c != "dispatch_pane_id"] == MIGRATION_ADDED_COLUMNS
+    assert "dispatch_pane_id" in cols[17:]
+    assert all(v == "" for (v,) in _rows(legacy_db, ["dispatch_pane_id"]))
     assert _rows(legacy_db, old_cols) == before        # every old value unchanged
     # Old rows carry no invented claim or receipt: NULL, not 0 / ''.
     assert all(v is None
@@ -327,14 +332,16 @@ def test_cancel_commits_before_it_terminates(cancel_app, monkeypatch):
     # rather than on a wrapper the endpoint might not call.
     monkeypatch.setattr("agent_crew.server.os.killpg",
                         lambda pid, sig: order.append(f"signal:{int(sig)}"))
-    real_cancel = _TQ.cancel
+    # DELETE commits through `cancel_with_binding` (the one authoritative cancel,
+    # which `cancel()` wraps) so it can also learn the dispatch pane (#336).
+    real_cancel = _TQ.cancel_with_binding
 
-    def _cancel(self, task_id):
+    def _cancel(self, task_id, **kw):
         # Observed inside the commit, i.e. before it returns.
         order.append("commit")
-        return real_cancel(self, task_id)
+        return real_cancel(self, task_id, **kw)
 
-    monkeypatch.setattr(_TQ, "cancel", _cancel)
+    monkeypatch.setattr(_TQ, "cancel_with_binding", _cancel)
     response = _enqueue_and_cancel(cancel_app)
     assert response.status_code == 200
     assert order[:2] == ["commit", f"signal:{int(__import__('signal').SIGTERM)}"], order
@@ -347,8 +354,8 @@ def test_a_cancel_that_does_not_commit_kills_nothing_and_returns_5xx(cancel_app,
     from agent_crew.queue import TaskQueue as _TQ
 
     cancel_app.state.active_dispatch_processes["worker"] = _FakeProc(pid=4646)
-    monkeypatch.setattr(_TQ, "cancel",
-                        lambda self, task_id: (_ for _ in ()).throw(RuntimeError("db down")))
+    monkeypatch.setattr(_TQ, "cancel_with_binding",
+                        lambda self, task_id, **kw: (_ for _ in ()).throw(RuntimeError("db down")))
     with TestClient(cancel_app, raise_server_exceptions=False) as client:
         client.post("/tasks", json={"task_id": "worker", "task_type": "implement",
                                     "description": "d", "branch": "main"})
@@ -423,7 +430,7 @@ def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    state_file.write_text(json.dumps({"role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}, "worktrees": {"claude": str(wt)}}))
     db = str(tmp_path / "t.db")
 
     class _Proc:
@@ -445,7 +452,8 @@ def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
     monkeypatch.setattr("agent_crew.server._HEARTBEAT_INTERVAL_S", 0.01)
-    monkeypatch.setattr("agent_crew.server._dispatch_timeout_for_role", lambda _r: 600.0)
+    monkeypatch.setattr("agent_crew.server._dispatch_timeout_for_role",
+                        lambda _r, task_context=None: 600.0)
 
     app = create_app(db_path=db, pane_map={}, port=8199, state_path=str(state_file),
                      watchdog_disabled=True, anomaly_disabled=True)

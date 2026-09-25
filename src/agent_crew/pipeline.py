@@ -87,19 +87,43 @@ def verify_implement_artifact(
     """Fail closed unless a completed implementation names pushed new code (#353).
 
     This is deliberately a git proof, not a trust decision over the worker's
-    prose: the result commit must descend from the worktree base and be
-    reachable from the reported branch on ``origin``.  Any unavailable git
-    evidence is indistinguishable from no artifact for handoff purposes.
+    prose: the result commit must descend from the worktree base (or the
+    declared origin rebase target) and be reachable from the reported branch
+    on ``origin``. Any unavailable git evidence is indistinguishable from no
+    artifact for handoff purposes.
     """
     context = task.context if isinstance(task.context, dict) else {}
     base = str(context.get("worktree_base_sha") or context.get("reviewed_sha") or "").strip()
+    has_rebase_target = "rebase_onto" in context
+    rebase_target = str(context.get("rebase_onto") or "").strip()
     branch = (result.branch or task.branch or "").strip()
     commit = (result.commit or "").strip()
     if not repo_cwd:
         return False, "artifact repository unavailable"
-    if not base or not branch:
+    if (not base and not has_rebase_target) or not branch:
         return False, "missing base or branch"
+    if has_rebase_target and not rebase_target:
+        return False, "rebase_onto target is empty or invalid"
     try:
+        ancestor = base
+        if has_rebase_target:
+            target_fetch = subprocess.run(
+                ["git", "-C", repo_cwd, "fetch", "origin",
+                 f"+refs/heads/{rebase_target}:refs/remotes/origin/{rebase_target}",
+                 "--quiet"],
+                capture_output=True, text=True, timeout=60,
+            )
+            if target_fetch.returncode != 0:
+                return False, f"rebase_onto target {rebase_target!r} is unavailable on origin"
+            resolved_target = subprocess.run(
+                ["git", "-C", repo_cwd, "rev-parse", "--verify",
+                 f"origin/{rebase_target}^{{commit}}"],
+                capture_output=True, text=True, timeout=30,
+            )
+            ancestor = resolved_target.stdout.strip()
+            if resolved_target.returncode != 0 or not ancestor:
+                return False, f"rebase_onto target origin/{rebase_target} is not resolvable"
+
         # Workers should report their full SHA, but a missing typed field must
         # not discard code that origin can prove was pushed.  Deriving only
         # from the reported branch's fetched origin ref keeps this a git proof,
@@ -125,7 +149,9 @@ def verify_implement_artifact(
             result.commit = commit
             derived_commit = True
 
-        if commit == base:
+        if commit == ancestor:
+            if has_rebase_target:
+                return False, "reported commit is the rebase_onto target (no new artifact)"
             return False, "reported commit is the dispatch base (no new artifact)"
         local_commit = subprocess.run(
             ["git", "-C", repo_cwd, "rev-parse", "--verify", f"{commit}^{{commit}}"],
@@ -134,10 +160,12 @@ def verify_implement_artifact(
         if local_commit.returncode != 0:
             return False, "reported commit is not locally resolvable"
         descends_from_base = subprocess.run(
-            ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", base, commit],
+            ["git", "-C", repo_cwd, "merge-base", "--is-ancestor", ancestor, commit],
             capture_output=True, text=True, timeout=30,
         )
         if descends_from_base.returncode != 0:
+            if has_rebase_target:
+                return False, "reported commit does not descend from the rebase_onto target"
             return False, "reported commit does not descend from the dispatch base"
 
         if fetch.returncode == 0:
@@ -213,8 +241,10 @@ def artifact_gate_applies(task: Optional[TaskRequest], result: TaskResult) -> bo
     if declared_artifact_kind(task) is not None:
         return True
     context = task.context if isinstance(task.context, dict) else {}
+    # #374 (main): a declared `rebase_onto` target is a dispatch base too.
     return task.task_type == "implement" and bool(
-        context.get("worktree_base_sha") or context.get("reviewed_sha"))
+        context.get("worktree_base_sha") or context.get("reviewed_sha")
+        or "rebase_onto" in context)
 
 
 def verify_task_artifact(

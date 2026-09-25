@@ -35,12 +35,11 @@ def _write_port(tmp_path):
 
 
 class TestRoleFiles:
-    def test_implementer_stays_under_dot_claude(self):
-        assert instructions.ROLE_FILES["implementer"] == ".claude/CLAUDE.md"
+    def test_implementer_writes_to_root_agents_md(self):
+        assert instructions.ROLE_FILES["implementer"] == "AGENTS.md"
 
-    def test_reviewer_writes_to_root_agents_md(self):
-        # Codex reads ./AGENTS.md, not ./.claude/AGENTS.md.
-        assert instructions.ROLE_FILES["reviewer"] == "AGENTS.md"
+    def test_reviewer_writes_under_dot_claude(self):
+        assert instructions.ROLE_FILES["reviewer"] == ".claude/CLAUDE.md"
 
     def test_tester_writes_to_root_gemini_md(self):
         # Gemini reads ./GEMINI.md, not ./.claude/GEMINI.md.
@@ -67,6 +66,7 @@ class TestWriteImplementer:
             str(wt),
             project="proj",
             port_file=_write_port(tmp_path),
+            agent="claude",
         )
         body = open(path).read()
         assert "OLD CONTENT" not in body
@@ -83,6 +83,7 @@ class TestWriteReviewer:
             str(wt),
             project="proj",
             port_file=_write_port(tmp_path),
+            agent="codex",
         )
         assert path == os.path.abspath(str(wt / "AGENTS.md"))
         body = open(path).read()
@@ -101,6 +102,7 @@ class TestWriteReviewer:
             str(wt),
             project="proj",
             port_file=_write_port(tmp_path),
+            agent="codex",
         )
         body = open(path).read()
         # Block prepended; original content preserved verbatim below.
@@ -122,6 +124,7 @@ class TestWriteReviewer:
             str(wt),
             project="proj",
             port_file=_write_port(tmp_path),
+            agent="codex",
         )
         body = open(path).read()
         assert "OLD AGENT CREW BLOCK" not in body  # replaced

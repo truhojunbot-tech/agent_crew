@@ -111,6 +111,39 @@ def test_e_st01_setup_creates_artifacts(monkeypatch, git_repo, base_dir, e2e_pro
     assert _port_listening(port, timeout=2.0), f"server not listening on {port}"
 
 
+@requires_tmux
+def test_setup_default_roles_and_existing_state_unchanged(
+    monkeypatch, git_repo, base_dir, e2e_project,
+):
+    monkeypatch.chdir(git_repo)
+    runner = CliRunner()
+    first = runner.invoke(crew, ["setup", "testproj", "--base", base_dir])
+    e2e_project(base_dir, "testproj")
+    assert first.exit_code == 0, first.output
+
+    state_path = os.path.join(base_dir, "testproj", "state.json")
+    state = _read_state(base_dir, "testproj")
+    expected = {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}
+    assert state["agents"] == ["codex", "claude", "gemini"]
+    assert {entry["role"]: entry["agent"] for entry in state["roles"]} == expected
+    assert state["role_agents"] == expected
+    assert "Role: implementer" in open(
+        os.path.join(state["worktrees"]["codex"], "AGENTS.md")
+    ).read()
+    assert "Role: reviewer" in open(
+        os.path.join(state["worktrees"]["claude"], ".claude", "CLAUDE.md")
+    ).read()
+
+    state["roles"][0]["agent"] = "claude"
+    state["role_agents"]["implementer"] = "claude"
+    with open(state_path, "w") as f:
+        json.dump(state, f)
+    before = open(state_path, "rb").read()
+    second = runner.invoke(crew, ["setup", "testproj", "--base", base_dir])
+    assert second.exit_code == 0, second.output
+    assert open(state_path, "rb").read() == before
+
+
 # E-ST02: crew status after setup → shows agent alive, port, 0 tasks
 @requires_tmux
 def test_e_st02_status_after_setup(monkeypatch, git_repo, base_dir, e2e_project):

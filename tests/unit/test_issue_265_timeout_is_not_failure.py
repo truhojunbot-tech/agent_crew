@@ -42,7 +42,8 @@ def _in_progress(q, task_id="t-1", task_type="implement"):
 # ── 1. a timeout is not a failure ─────────────────────────────────────
 
 
-def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, return_db=False):
+def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port,
+                      context=None, captured_timeout=None, return_db=False):
     """Drive the REAL dispatch path and return the task row it ends with.
 
     ⛔Goes through `_dispatch_task`, not through the terminal-marking helper.
@@ -62,7 +63,7 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, return_db=False):
     wt.mkdir(exist_ok=True)
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}, "worktrees": {"claude": str(wt)}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -95,15 +96,24 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, return_db=False):
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
-    monkeypatch.setattr(sv, "_dispatch_timeout_for_role", lambda role: 0.05)
+    if captured_timeout is None:
+        monkeypatch.setattr(sv, "_dispatch_timeout_for_role", lambda role, task_context=None: 0.05)
+    else:
+        resolve_timeout = sv._dispatch_timeout_for_role
+
+        def capture_timeout(role, task_context=None):
+            captured_timeout.append(resolve_timeout(role, task_context))
+            return 0.05
+
+        monkeypatch.setattr(sv, "_dispatch_timeout_for_role", capture_timeout)
     monkeypatch.setattr(sv.os, "killpg", lambda *a, **k: None)
 
-    app = create_app(db_path=db, pane_map={}, port=18103, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
         q.enqueue(TaskRequest(task_id="t-1", task_type="implement",
-                              description="do it", branch="main"))
+                              description="do it", branch="main", context=context or {}))
         task = q.dequeue(role="implementer")
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))
@@ -111,10 +121,21 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, return_db=False):
         return (task_row, db) if return_db else task_row
 
 
-def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch):
+def test_dispatch_uses_task_context_timeout_without_server_restart(
+    tmp_path, monkeypatch, unused_tcp_port,
+):
+    captured_timeout = []
+    _dispatch_outcome(
+        tmp_path, monkeypatch, behaviour="clean", unused_tcp_port=unused_tcp_port,
+        context={"dispatch_timeout_s": 7200}, captured_timeout=captured_timeout,
+    )
+    assert captured_timeout == [3600.0]
+
+
+def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch, *, unused_tcp_port):
     """★The ask: "failed" and "we stopped waiting" must be distinguishable,
     and the DISPATCHER has to be the one making that distinction."""
-    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="hang")
+    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="hang", unused_tcp_port=unused_tcp_port)
 
     assert task.status == "timed_out", "a timeout is still reported as a failure"
     assert task.error_info["reason"] == "dispatcher_timeout"
@@ -124,19 +145,19 @@ def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch):
     )
 
 
-def test_a_clean_exit_without_a_result_is_also_timed_out(tmp_path, monkeypatch):
+def test_a_clean_exit_without_a_result_is_also_timed_out(tmp_path, monkeypatch, *, unused_tcp_port):
     """The process is gone, but the POST can still be in flight. "We did not
     observe a result" is not "the work failed"."""
-    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="clean")
+    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="clean", unused_tcp_port=unused_tcp_port)
 
     assert task.status == "timed_out"
     assert task.error_info["reason"] == "no_result_submitted"
 
 
-def test_a_real_failure_is_still_failed(tmp_path, monkeypatch):
+def test_a_real_failure_is_still_failed(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The distinction cuts both ways. A non-zero exit is a failure and must
     not be softened into "we do not know"."""
-    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="exit_1")
+    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="exit_1", unused_tcp_port=unused_tcp_port)
 
     assert task.status == "failed"
     assert task.error_info["reason"] == "exit_1"
@@ -170,7 +191,7 @@ def test_timed_out_is_a_valid_result_status():
 # ── 2. the late revision is announced ─────────────────────────────────
 
 
-def test_a_late_result_is_recorded_as_an_event(tmp_db, tmp_path, monkeypatch):
+def test_a_late_result_is_recorded_as_an_event(tmp_db, tmp_path, monkeypatch, *, unused_tcp_port):
     """A late payload remains evidence without revising a terminal timeout."""
     from fastapi.testclient import TestClient
 
@@ -183,7 +204,7 @@ def test_a_late_result_is_recorded_as_an_event(tmp_db, tmp_path, monkeypatch):
                                     summary="dispatcher_timeout",
                                     error_info={"reason": "dispatcher_timeout"}))
 
-    app = create_app(db_path=db, pane_map={}, port=0, watchdog_disabled=True,
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as c:
         r = c.post(f"/tasks/{tid}/result",
@@ -198,7 +219,7 @@ def test_a_late_result_is_recorded_as_an_event(tmp_db, tmp_path, monkeypatch):
     assert late[0]["status"] == "completed"
 
 
-def test_an_ordinary_result_is_not_announced_as_late(tmp_db, tmp_path):
+def test_an_ordinary_result_is_not_announced_as_late(tmp_db, tmp_path, *, unused_tcp_port):
     """⛔Only a REVISION is news. Announcing every result would bury it."""
     from fastapi.testclient import TestClient
 
@@ -208,7 +229,7 @@ def test_an_ordinary_result_is_not_announced_as_late(tmp_db, tmp_path):
     q = TaskQueue(db)
     tid = _in_progress(q)
 
-    app = create_app(db_path=db, pane_map={}, port=0, watchdog_disabled=True,
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as c:
         c.post(f"/tasks/{tid}/result",
@@ -278,7 +299,7 @@ def test_the_other_fields_still_update_on_a_repeat(tmp_db):
     assert task.summary == "fuller" and task.pr_number == 5517
 
 
-def test_the_late_result_is_evidence_only(tmp_db, tmp_path):
+def test_the_late_result_is_evidence_only(tmp_db, tmp_path, *, unused_tcp_port):
     """The submitted details survive as an event, without reviving the task."""
     from fastapi.testclient import TestClient
 
@@ -291,7 +312,7 @@ def test_the_late_result_is_evidence_only(tmp_db, tmp_path):
                                     summary="dispatcher_timeout",
                                     error_info={"reason": "dispatcher_timeout"}))
 
-    app = create_app(db_path=db, pane_map={}, port=0, watchdog_disabled=True,
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as c:
         response = c.post(f"/tasks/{tid}/result",

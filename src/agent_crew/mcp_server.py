@@ -46,7 +46,10 @@ from agent_crew.pipeline import (
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import AdmissionRefused, PausedError as _PausedError, TaskQueue
+from agent_crew.queue import (
+    AdmissionRefused, LateResultRejected, PausedError as _PausedError, TaskQueue,
+)
+from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -56,9 +59,7 @@ logger = logging.getLogger(__name__)
 # Stays in lockstep with `setup._AGENT_TO_ROLE`; kept here so this module
 # stays free of `setup` import overhead.
 _DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
-    "claude": "implementer",
-    "codex": "reviewer",
-    "gemini": "tester",
+    agent: role for role, agent in DEFAULT_ROLE_TO_AGENT.items()
 }
 
 
@@ -125,8 +126,8 @@ def build_mcp_server(
           (``crew run --reviewer gemini``) and the rate-limit fallback
           chain (#81) both rely on this path for dynamic role
           reassignment.
-        - Otherwise the agent's *default* role is consulted — claude
-          picks implement, codex picks review, gemini picks test —
+        - Otherwise the agent's *default* role is consulted — codex
+          picks implement, claude picks review, gemini picks test —
           excluding tasks claimed by another agent's override. Pass an
           explicit ``role=`` to override the default.
 
@@ -229,7 +230,8 @@ def build_mcp_server(
         if (not _runtime_paused and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
                 and declared_artifact_kind(_task) is None
-                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
+                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
+                         or "rebase_onto" in _artifact_context)):
             logger.info("MCP submit_result: artifact gate not applied — dispatch base absent (task=%s)", task_id)
         if not _runtime_paused and artifact_gate_applies(_task, result):
             # MCP is a per-worker subprocess launched from that worker's
@@ -259,6 +261,11 @@ def build_mcp_server(
             return {"acknowledged": False, "refused": exc.point,
                     "outcome": exc.outcome, "receipt_id": exc.receipt_id,
                     "error": str(exc)}
+        except LateResultRejected as exc:
+            # Same single guard as HTTP (queue.submit_result under the write
+            # lock); only the evidence event was committed, so no cascade.
+            return {"acknowledged": False, "late_result": True, "accepted": False,
+                    "task_id": task_id, "prior_status": exc.status, "error": str(exc)}
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
         # #348: mirror HTTP's post-commit, fail-soft persistence. This is

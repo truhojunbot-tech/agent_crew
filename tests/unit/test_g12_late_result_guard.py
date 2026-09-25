@@ -146,11 +146,11 @@ def test_reported_failure_with_final_metadata_can_be_revised(tmp_db):
 @pytest.mark.parametrize("behaviour,reason", [
     ("exception", "dispatcher_exception"), ("exit_1", "exit_1")])
 def test_dispatcher_final_failure_rejects_late_result(tmp_path, monkeypatch,
-                                                      behaviour, reason):
+                                                      behaviour, reason, unused_tcp_port):
     from tests.unit.test_issue_265_timeout_is_not_failure import _dispatch_outcome
 
     task, db = _dispatch_outcome(tmp_path, monkeypatch, behaviour=behaviour,
-                                 return_db=True)
+                                 unused_tcp_port=unused_tcp_port, return_db=True)
     assert task.status == "failed"
     assert task.error_info["reason"] == reason
     q = TaskQueue(db)

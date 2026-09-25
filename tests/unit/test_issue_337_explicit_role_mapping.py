@@ -69,7 +69,7 @@ def test_malformed_explicit_mapping_warns_and_preserves_legacy_resolution(caplog
 
     mapping, source = effective_role_mapping(state, project="demo")
 
-    assert mapping == {"implementer": "claude", "reviewer": "claude", "tester": "gemini"}
+    assert mapping == {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}
     assert source == "legacy state.json.roles"
     assert "demo" in caplog.text
     assert "role_agents" in caplog.text
