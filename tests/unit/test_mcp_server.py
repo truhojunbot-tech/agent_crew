@@ -94,10 +94,10 @@ class TestGetNextTask:
 
     def test_default_agent_role_resolved_when_role_omitted(self, tmp_db):
         """Calling get_next_task with only an agent name must resolve the
-        agent's default role (claude→implementer)."""
+        agent's default role (codex→implementer)."""
         TaskQueue(tmp_db).enqueue(_make_task("t-impl", task_type="implement"))
         mcp = build_mcp_server(tmp_db)
-        result = _call_tool(mcp, "get_next_task", agent="claude")
+        result = _call_tool(mcp, "get_next_task", agent="codex")
         assert result is not None
         assert result["task_id"] == "t-impl"
 
@@ -115,33 +115,38 @@ class TestGetNextTask:
         assert result["task_id"] == "t-rev-by-gemini"
 
     def test_override_for_other_agent_blocks_pickup(self, tmp_db):
-        """A review task with agent_override="claude" must NOT be picked
-        up by codex even though codex is the default reviewer."""
+        """An explicit reviewer override beats the new provider default."""
         q = TaskQueue(tmp_db)
         task = _make_task("t-rev-fallback", task_type="review")
-        task.context = {"agent_override": "claude"}
+        task.context = {"agent_override": "codex"}
         q.enqueue(task)
         mcp = build_mcp_server(tmp_db)
-        # codex sees no work — the review is claimed by claude.
-        assert _call_tool(mcp, "get_next_task", agent="codex") is None
-        # claude (default implementer) picks it up because the override claims it.
-        result = _call_tool(mcp, "get_next_task", agent="claude")
+        assert _call_tool(mcp, "get_next_task", agent="claude") is None
+        result = _call_tool(mcp, "get_next_task", agent="codex")
         assert result is not None
         assert result["task_id"] == "t-rev-fallback"
 
+    def test_implementer_override_beats_new_default(self, tmp_db):
+        task = _make_task("t-impl-by-claude", task_type="implement")
+        task.context = {"agent_override": "claude"}
+        TaskQueue(tmp_db).enqueue(task)
+        mcp = build_mcp_server(tmp_db)
+        assert _call_tool(mcp, "get_next_task", agent="codex") is None
+        assert _call_tool(mcp, "get_next_task", agent="claude")["task_id"] == "t-impl-by-claude"
+
     def test_override_takes_precedence_over_default_role(self, tmp_db):
-        """Two pending tasks: a default-role implement for claude, and
-        a review claimed by claude via override. The override task
+        """Two pending tasks: a default-role implement for codex, and
+        a review claimed by codex via override. The override task
         wins because phase 1 of dequeue prefers explicit claims."""
         q = TaskQueue(tmp_db)
-        # Default-role task for claude (no override).
+        # Default-role task for codex (no override).
         q.enqueue(_make_task("t-impl-default", task_type="implement"))
         # Override-claimed task.
         review_task = _make_task("t-rev-override", task_type="review")
-        review_task.context = {"agent_override": "claude"}
+        review_task.context = {"agent_override": "codex"}
         q.enqueue(review_task)
         mcp = build_mcp_server(tmp_db)
-        result = _call_tool(mcp, "get_next_task", agent="claude")
+        result = _call_tool(mcp, "get_next_task", agent="codex")
         assert result is not None
         assert result["task_id"] == "t-rev-override"
 
@@ -151,9 +156,9 @@ class TestGetNextTask:
         q = TaskQueue(tmp_db)
         q.enqueue(_make_task("t-rev", task_type="review"))
         mcp = build_mcp_server(tmp_db)
-        # claude asking for reviewer pulls the review even though its
+        # codex asking for reviewer pulls the review even though its
         # default role is implementer.
-        result = _call_tool(mcp, "get_next_task", agent="claude",
+        result = _call_tool(mcp, "get_next_task", agent="codex",
                             role="reviewer")
         assert result is not None
         assert result["task_id"] == "t-rev"

@@ -244,7 +244,7 @@ def test_the_refusal_shares_the_base_the_callers_already_catch(repo):
 
 
 def test_the_dispatcher_does_not_launch_into_a_broken_worktree(tmp_path, monkeypatch,
-                                                              repo):
+                                                              repo, *, unused_tcp_port):
     """★★End to end: no provider process, task marked needs_human."""
     import asyncio
 
@@ -274,7 +274,7 @@ def test_the_dispatcher_does_not_launch_into_a_broken_worktree(tmp_path, monkeyp
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -376,7 +376,7 @@ def test_losing_the_race_is_reported_loudly(repo, caplog):
 
 
 def test_an_unhealthy_worktree_is_not_reported_as_a_pr_problem(tmp_path,
-                                                               monkeypatch, repo):
+                                                               monkeypatch, repo, *, unused_tcp_port):
     """★★Review of PR #298, P2. Both handlers hardcoded `pr_head_unresolved`, so
     an operator reading the failure of a worktree whose HEAD does not resolve
     was sent to look at a PR that is perfectly fine."""
@@ -408,7 +408,7 @@ def test_an_unhealthy_worktree_is_not_reported_as_a_pr_problem(tmp_path,
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)

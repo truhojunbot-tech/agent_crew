@@ -47,3 +47,21 @@ def test_implementer_specific_override_alone_does_not_affect_other_roles(monkeyp
     monkeypatch.setenv("AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER", "2400")
     assert _dispatch_timeout_for_role("implementer") == 2400.0
     assert _dispatch_timeout_for_role("reviewer") == 900.0
+
+
+def test_task_context_override_sets_reviewer_timeout():
+    assert _dispatch_timeout_for_role("reviewer", {"dispatch_timeout_s": 1500}) == 1500.0
+
+
+def test_task_context_override_is_clamped_to_one_hour():
+    assert _dispatch_timeout_for_role("tester", {"dispatch_timeout_s": 7200}) == 3600.0
+
+
+@pytest.mark.parametrize("value", [0, -1, "invalid", None, {}, True, float("nan"), float("inf")])
+def test_invalid_task_context_override_uses_role_default(value):
+    assert _dispatch_timeout_for_role("reviewer", {"dispatch_timeout_s": value}) == 900.0
+
+
+def test_missing_task_context_override_preserves_implementer_env_default(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER", "2400")
+    assert _dispatch_timeout_for_role("implementer", {}) == 2400.0

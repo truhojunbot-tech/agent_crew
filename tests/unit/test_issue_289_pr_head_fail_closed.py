@@ -163,7 +163,7 @@ def test_failing_closed_writes_no_shared_ref(pr_repo, monkeypatch):
 # ── 2. the dispatcher launches nothing and records nothing ────────────
 
 
-def _dispatch(tmp_path, monkeypatch, pr_repo, *, head=None):
+def _dispatch(tmp_path, monkeypatch, pr_repo, *, head=None, unused_tcp_port):
     clone, wt, sha_a, main_tip = pr_repo
     spawned = []
 
@@ -190,7 +190,7 @@ def _dispatch(tmp_path, monkeypatch, pr_repo, *, head=None):
     monkeypatch.setattr(sv, "_resolve_pr_head_branch", lambda *a, **k: head)
 
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -209,38 +209,38 @@ def _dispatch(tmp_path, monkeypatch, pr_repo, *, head=None):
 
 
 def test_no_provider_is_launched_when_the_pr_head_is_unknown(tmp_path, monkeypatch,
-                                                             pr_repo):
+                                                             pr_repo, *, unused_tcp_port):
     """★★Acceptance: fail closed. A launched provider would produce a confident
     review of main that nothing downstream could distinguish from a real one."""
-    spawned, row, attr, events, wt = _dispatch(tmp_path, monkeypatch, pr_repo)
+    spawned, row, attr, events, wt = _dispatch(tmp_path, monkeypatch, pr_repo, unused_tcp_port=unused_tcp_port)
     assert spawned == [], "a provider ran against an unresolved target"
     assert row.status == "needs_human", row.status
 
 
 def test_no_tester_economics_are_recorded_for_a_test_that_never_ran(
-        tmp_path, monkeypatch, pr_repo):
+        tmp_path, monkeypatch, pr_repo, *, unused_tcp_port):
     """★★#278's treatment fields describe a test run. Emitting them here would
     attribute targeted/full-suite cost to a run that did not happen — the exact
     corruption #289 is about, one table over."""
-    spawned, row, attr, events, wt = _dispatch(tmp_path, monkeypatch, pr_repo)
+    spawned, row, attr, events, wt = _dispatch(tmp_path, monkeypatch, pr_repo, unused_tcp_port=unused_tcp_port)
     assert not [e for e in events if e.get("event_type") == "test_scope_resolved"]
     if attr is not None:
         assert attr["effective_test_scope"] is None, attr["effective_test_scope"]
 
 
 def test_the_worktree_is_left_alone_when_the_target_is_unknown(tmp_path, monkeypatch,
-                                                              pr_repo):
+                                                              pr_repo, *, unused_tcp_port):
     clone, wt0, sha_a, main_tip = pr_repo
     before = _sha(wt0)
-    spawned, row, attr, events, wt = _dispatch(tmp_path, monkeypatch, pr_repo)
+    spawned, row, attr, events, wt = _dispatch(tmp_path, monkeypatch, pr_repo, unused_tcp_port=unused_tcp_port)
     assert _sha(wt) == before != main_tip
 
 
-def test_a_resolvable_head_still_dispatches(tmp_path, monkeypatch, pr_repo):
+def test_a_resolvable_head_still_dispatches(tmp_path, monkeypatch, pr_repo, *, unused_tcp_port):
     """⛔The control, through the real dispatcher."""
     clone, wt0, sha_a, _ = pr_repo
     spawned, row, attr, events, wt = _dispatch(tmp_path, monkeypatch, pr_repo,
-                                               head=PR_BRANCH)
+                                               head=PR_BRANCH, unused_tcp_port=unused_tcp_port)
     assert len(spawned) == 1
     assert _sha(wt) == sha_a
     assert row.status != "needs_human"

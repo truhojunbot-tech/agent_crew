@@ -120,7 +120,7 @@ def test_the_search_is_bounded(tmp_path):
 # ── 2. the dispatch ───────────────────────────────────────────────────
 
 
-def _dispatch(tmp_path, monkeypatch, *, policy="resume", bound_session=""):
+def _dispatch(tmp_path, monkeypatch, *, policy="resume", bound_session="", unused_tcp_port):
     """One real dispatch of a codex review task; returns (argv, attribution)."""
     import asyncio
 
@@ -158,7 +158,7 @@ def _dispatch(tmp_path, monkeypatch, *, policy="resume", bound_session=""):
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
     monkeypatch.setattr(sv, "codex_session_for_cwd", lambda cwd, **kw: bound_session)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -178,48 +178,48 @@ def _dispatch(tmp_path, monkeypatch, *, policy="resume", bound_session=""):
     return spawned.get("cmd", []), attribution
 
 
-def test_resume_targets_the_bound_session_by_id(tmp_path, monkeypatch):
+def test_resume_targets_the_bound_session_by_id(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The fix, at dispatch level: an explicit id, never `--last`."""
-    cmd, _ = _dispatch(tmp_path, monkeypatch, bound_session="sess-a")
+    cmd, _ = _dispatch(tmp_path, monkeypatch, bound_session="sess-a", unused_tcp_port=unused_tcp_port)
 
     assert cmd[:4] == ["codex", "exec", "resume", "sess-a"]
     assert "--last" not in cmd, "the global selector is still in the command"
 
 
-def test_no_binding_means_fresh_rather_than_a_guess(tmp_path, monkeypatch):
+def test_no_binding_means_fresh_rather_than_a_guess(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔#262's rule 4: when nothing is known, start fresh. Resuming whatever
     ran last on the host is the failure, not the fallback."""
-    cmd, _ = _dispatch(tmp_path, monkeypatch, bound_session="")
+    cmd, _ = _dispatch(tmp_path, monkeypatch, bound_session="", unused_tcp_port=unused_tcp_port)
 
     assert cmd[:2] == ["codex", "exec"]
     assert "resume" not in cmd and "--last" not in cmd
 
 
-def test_a_reset_context_never_resumes(tmp_path, monkeypatch):
+def test_a_reset_context_never_resumes(tmp_path, monkeypatch, *, unused_tcp_port):
     """#261's rule survives: fresh/reset resumes no provider state at all,
     even when a perfectly good binding exists."""
-    cmd, _ = _dispatch(tmp_path, monkeypatch, policy="fresh", bound_session="sess-a")
+    cmd, _ = _dispatch(tmp_path, monkeypatch, policy="fresh", bound_session="sess-a", unused_tcp_port=unused_tcp_port)
 
     assert "resume" not in cmd and "sess-a" not in cmd
 
 
-def test_the_resumed_session_is_recorded_as_provider_session_id(tmp_path, monkeypatch):
+def test_the_resumed_session_is_recorded_as_provider_session_id(tmp_path, monkeypatch, *, unused_tcp_port):
     """#262's economics requirement: a resume must be joinable to the exact
     provider session that was resumed."""
-    _, attribution = _dispatch(tmp_path, monkeypatch, bound_session="sess-a")
+    _, attribution = _dispatch(tmp_path, monkeypatch, bound_session="sess-a", unused_tcp_port=unused_tcp_port)
 
     assert attribution.get("provider_session_id") == "sess-a"
     assert attribution.get("context_policy") == "resume"
 
 
-def test_an_unknown_session_stays_unknown_in_attribution(tmp_path, monkeypatch):
+def test_an_unknown_session_stays_unknown_in_attribution(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔Never attributed by cwd or timing. Unknown reads as unknown."""
-    _, attribution = _dispatch(tmp_path, monkeypatch, bound_session="")
+    _, attribution = _dispatch(tmp_path, monkeypatch, bound_session="", unused_tcp_port=unused_tcp_port)
 
     assert not attribution.get("provider_session_id")
 
 
-def test_the_binding_is_recorded_at_dispatch_not_only_afterwards(tmp_path, monkeypatch):
+def test_the_binding_is_recorded_at_dispatch_not_only_afterwards(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The attribution row is written BEFORE the provider runs. A task that
     crashes mid-run must still be joinable to the session it resumed, so the
     dispatch-time record has to carry it — the post-run capture is a top-up,
@@ -265,7 +265,7 @@ def test_the_binding_is_recorded_at_dispatch_not_only_afterwards(tmp_path, monke
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
     monkeypatch.setattr(sv, "codex_session_for_cwd", lambda cwd, **kw: next(answers, ""))
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -286,7 +286,7 @@ def test_the_binding_is_recorded_at_dispatch_not_only_afterwards(tmp_path, monke
     )
 
 
-def test_project_b_cannot_be_attached_to_project_a(tmp_path, monkeypatch):
+def test_project_b_cannot_be_attached_to_project_a(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The A/B interleaving the issue asks for, at dispatch level.
 
     B runs last, so `--last` would select B. A's dispatch must still resume A.
@@ -297,7 +297,7 @@ def test_project_b_cannot_be_attached_to_project_a(tmp_path, monkeypatch):
 
     real = sv.codex_session_for_cwd
     cmd, attribution = _dispatch(tmp_path, monkeypatch,
-                                 bound_session=real(str(tmp_path / "codex"), home=home))
+                                 bound_session=real(str(tmp_path / "codex"), home=home), unused_tcp_port=unused_tcp_port)
 
     assert a != b
     assert cmd[3] == a, "the dispatch resumed another project's session"
@@ -457,7 +457,7 @@ def test_an_unbound_worktree_is_not_over_the_cap(tmp_path):
     assert sv.codex_context_exceeds_cap(A, max_mb=1, home=tmp_path)[0] is False
 
 
-def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a"):
+def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a", unused_tcp_port):
     """A real codex dispatch with the cap decision stubbed; returns (argv, event)."""
     import asyncio
 
@@ -500,7 +500,7 @@ def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a"):
                                                      "cap_mb": 64,
                                                      "provider": "codex"}))
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -514,9 +514,9 @@ def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a"):
     return spawned.get("cmd", []), (capped[-1] if capped else None)
 
 
-def test_an_over_cap_codex_session_is_not_resumed(tmp_path, monkeypatch):
+def test_an_over_cap_codex_session_is_not_resumed(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★End to end: over the cap → fresh, and the event names codex."""
-    cmd, event = _codex_dispatch(tmp_path, monkeypatch, over=True)
+    cmd, event = _codex_dispatch(tmp_path, monkeypatch, over=True, unused_tcp_port=unused_tcp_port)
 
     assert "resume" not in cmd, "an oversized rollout was resumed anyway"
     assert cmd[:2] == ["codex", "exec"]
@@ -524,9 +524,9 @@ def test_an_over_cap_codex_session_is_not_resumed(tmp_path, monkeypatch):
     assert event["bytes"] == 99 * 1048576 and event["cap_mb"] == 64
 
 
-def test_an_under_cap_codex_session_still_resumes(tmp_path, monkeypatch):
+def test_an_under_cap_codex_session_still_resumes(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The cap must not become a blanket refusal to resume."""
-    cmd, event = _codex_dispatch(tmp_path, monkeypatch, over=False)
+    cmd, event = _codex_dispatch(tmp_path, monkeypatch, over=False, unused_tcp_port=unused_tcp_port)
 
     assert cmd[:4] == ["codex", "exec", "resume", "sess-a"]
     assert event is None
@@ -599,7 +599,7 @@ def test_the_peek_does_not_mint_a_context(tmp_db):
     assert again["session_task_index"] == 2      # only the real dispatch advanced it
 
 
-def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypatch):
+def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The regression the review asked for: an older stored oversized id plus
     a newer under-cap rollout for the same cwd."""
     import asyncio
@@ -652,7 +652,7 @@ def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypat
                         lambda cwd, **kw: sv.codex_session_for_cwd.__wrapped__(cwd)
                         if hasattr(sv.codex_session_for_cwd, "__wrapped__") else "newest")
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)

@@ -32,8 +32,8 @@ from agent_crew.server import create_app
 from agent_crew.watch import active_tasks_for_issue
 
 
-def _server(tmp_db):
-    return create_app(db_path=tmp_db, pane_map={}, port=0,
+def _server(tmp_db, *, unused_tcp_port):
+    return create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port,
                       watchdog_disabled=True, anomaly_disabled=True,
                       push_fn=lambda *a, **k: None)
 
@@ -107,56 +107,56 @@ def test_an_unreadable_queue_is_not_an_error(tmp_db):
 # ── 2. the advisory on POST /tasks ────────────────────────────────────
 
 
-def test_the_reported_collision_is_now_surfaced(tmp_db):
+def test_the_reported_collision_is_now_surfaced(tmp_db, *, unused_tcp_port):
     """★★The exact #294 scenario: a watch task in flight, then a direct
     enqueue for the same issue."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-watch-ac467aac", task_type="implement",
                           description="Implement #292: ...", branch="main",
                           context={"issue": 292, "source": "watch"}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "implement-066c91a2", issue=292).json()
     assert body["in_flight_for_issue"] == ["impl-watch-ac467aac"]
 
 
-def test_the_task_is_still_enqueued(tmp_db):
+def test_the_task_is_still_enqueued(tmp_db, *, unused_tcp_port):
     """⛔Advisory, not a gate. Blocking would break the cascade — and worse,
     would make the caller's decision for them at the one moment they have the
     context to make it themselves."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement", description="go",
                           branch="main", context={"issue": 292}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         response = _post(client, "impl-b", issue=292)
     assert response.status_code == 201
     assert "impl-b" in {t.task_id for t in TaskQueue(tmp_db).list_tasks()}
 
 
-def test_the_collision_is_logged_with_the_in_flight_id(tmp_db, caplog):
+def test_the_collision_is_logged_with_the_in_flight_id(tmp_db, caplog, *, unused_tcp_port):
     import logging
 
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement", description="go",
                           branch="main", context={"issue": 292}))
     with caplog.at_level(logging.WARNING, logger="agent_crew.server"):
-        with TestClient(_server(tmp_db)) as client:
+        with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
             _post(client, "impl-b", issue=292)
     assert any("impl-a" in r.message and "292" in r.message
                for r in caplog.records if r.levelno >= logging.WARNING), caplog.text
 
 
-def test_a_review_alongside_an_implement_is_not_a_collision(tmp_db):
+def test_a_review_alongside_an_implement_is_not_a_collision(tmp_db, *, unused_tcp_port):
     """⛔The cascade's normal shape. implement → review → fix → test all name one
     issue; flagging them would make the advisory noise, and noise is ignored."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement", description="go",
                           branch="main", context={"issue": 292}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "rev-a", task_type="review", issue=292).json()
     assert body["in_flight_for_issue"] == []
 
 
-def test_a_finished_implement_is_not_a_collision(tmp_db):
+def test_a_finished_implement_is_not_a_collision(tmp_db, *, unused_tcp_port):
     from agent_crew.protocol import TaskResult
 
     q = TaskQueue(tmp_db)
@@ -164,22 +164,22 @@ def test_a_finished_implement_is_not_a_collision(tmp_db):
                           branch="main", context={"issue": 292}))
     q.submit_result("impl-a", TaskResult(task_id="impl-a", status="completed",
                                          summary="done"))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "impl-b", issue=292).json()
     assert body["in_flight_for_issue"] == []
 
 
-def test_a_task_with_no_issue_reports_no_collision(tmp_db):
-    with TestClient(_server(tmp_db)) as client:
+def test_a_task_with_no_issue_reports_no_collision(tmp_db, *, unused_tcp_port):
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "impl-a").json()
     assert body["in_flight_for_issue"] == []
 
 
-def test_the_key_is_always_present(tmp_db):
+def test_the_key_is_always_present(tmp_db, *, unused_tcp_port):
     """⛔Always a list, never absent. A consumer should not have to distinguish
     "no collision" from "this server version does not report collisions" — an
     advisory nobody can rely on finding is one nobody will read."""
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         first = _post(client, "impl-a", issue=292).json()
         second = _post(client, "impl-b", issue=292).json()
     assert first["in_flight_for_issue"] == []
@@ -187,21 +187,21 @@ def test_the_key_is_always_present(tmp_db):
     assert first["task_id"] == "impl-a" and second["task_id"] == "impl-b"
 
 
-def test_the_new_task_does_not_report_itself(tmp_db):
+def test_the_new_task_does_not_report_itself(tmp_db, *, unused_tcp_port):
     """The check runs before the enqueue, so the task being created can never
     appear in its own collision list."""
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "impl-solo", issue=292).json()
     assert "impl-solo" not in body["in_flight_for_issue"]
 
 
-def test_a_bookkeeping_failure_does_not_break_the_enqueue(tmp_db, monkeypatch):
+def test_a_bookkeeping_failure_does_not_break_the_enqueue(tmp_db, monkeypatch, *, unused_tcp_port):
     """⛔The whole feature is advisory, so it must never be able to cost a task."""
     import agent_crew.server as sv
 
     monkeypatch.setattr(sv, "active_tasks_for_issue",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         response = _post(client, "impl-a", issue=292)
     assert response.status_code == 201
     assert response.json()["in_flight_for_issue"] == []
@@ -210,7 +210,7 @@ def test_a_bookkeeping_failure_does_not_break_the_enqueue(tmp_db, monkeypatch):
 # ── 3. the advisory must resolve the issue the way the queue will ─────
 
 
-def test_a_description_only_enqueue_still_sees_the_collision(tmp_db):
+def test_a_description_only_enqueue_still_sees_the_collision(tmp_db, *, unused_tcp_port):
     """★★The review's finding. `POST /tasks` read `context.issue` and nothing
     else, while `enqueue` backfilled that same field from the description
     moments later — so this task reported no collision and was then stored as
@@ -219,20 +219,20 @@ def test_a_description_only_enqueue_still_sees_the_collision(tmp_db):
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
                           description="Implement #292: go", branch="main",
                           context={"issue": 292}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "impl-b",
                      description="Implement #292: the same thing again").json()
     assert body["in_flight_for_issue"] == ["impl-a"]
 
 
-def test_both_sides_may_be_description_only(tmp_db):
+def test_both_sides_may_be_description_only(tmp_db, *, unused_tcp_port):
     """The in-flight task's own issue is backfilled by `enqueue`, so neither
     side needs the structured field for the advisory to work."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
                           description="Implement #292: go", branch="main",
                           context={}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "impl-b", description="Implement #292: again").json()
     assert body["in_flight_for_issue"] == ["impl-a"]
 
@@ -255,33 +255,33 @@ def test_one_resolver_answers_for_both_call_sites():
         "#276's parser is anchored on purpose — a PR number is not an issue"
 
 
-def test_the_structured_field_still_wins(tmp_db):
+def test_the_structured_field_still_wins(tmp_db, *, unused_tcp_port):
     """Precedence is unchanged: a description is free text, a context key is a
     claim. A task that says one thing and claims another is the claim."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
                           description="go", branch="main", context={"issue": 900}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "impl-b", issue=900,
                      description="Implement #292: misleading").json()
     assert body["in_flight_for_issue"] == ["impl-a"]
 
 
-def test_the_advisory_and_the_stored_row_agree(tmp_db):
+def test_the_advisory_and_the_stored_row_agree(tmp_db, *, unused_tcp_port):
     """★★The invariant behind the fix: whatever the advisory decided this task's
     issue was, that is the issue the row is stored under. These disagreeing is
     the bug — the advisory looked for nothing while the row joined issue 292."""
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         _post(client, "impl-b", description="Implement #292: go")
     assert TaskQueue(tmp_db).get_task_context("impl-b").get("issue") == 292
 
 
-def test_a_description_that_names_nothing_resolves_to_nothing(tmp_db):
+def test_a_description_that_names_nothing_resolves_to_nothing(tmp_db, *, unused_tcp_port):
     """No issue means no lookup — not a lookup for issue 0 or for everything."""
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-a", task_type="implement",
                           description="go", branch="main", context={"issue": 292}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         body = _post(client, "impl-b", description="just do the thing").json()
     assert body["in_flight_for_issue"] == []
 

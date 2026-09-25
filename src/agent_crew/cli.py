@@ -19,7 +19,7 @@ from agent_crew.role_mapping import (
 )
 
 _DEFAULT_BASE = os.path.expanduser("~/.agent_crew")
-_DEFAULT_AGENTS = "claude,codex,gemini"
+_DEFAULT_AGENTS = "codex,claude,gemini"
 logger = logging.getLogger(__name__)
 
 
@@ -692,7 +692,7 @@ def setup(project: str, agents: str, base: str):
 
     Examples:
 
-      crew setup myproj                        # default: claude,codex,gemini
+      crew setup myproj                        # default: codex,claude,gemini
 
       crew setup myproj --agents codex         # single-agent task
 
@@ -703,6 +703,11 @@ def setup(project: str, agents: str, base: str):
         raise click.ClickException("not a git repository")
 
     existing_state = _read_state(base, project)
+    if existing_state is not None:
+        try:
+            setup_module.require_exclusive_port(existing_state["port"], project, base)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
     if existing_state is not None:
         existing_pane_ids = existing_state.get("pane_ids", [])
         alive_panes = [p for p in existing_pane_ids if _pane_alive(p)]
@@ -815,7 +820,7 @@ def setup(project: str, agents: str, base: str):
         port = existing_state["port"]
         server_pid = existing_state["server_pid"]
     else:
-        port = setup_module.find_free_port()
+        port = setup_module.find_free_port(base=base, project=project)
         setup_module.write_port_file(port_file, port, project=project)
 
     # Instruction files (into each worktree)
@@ -975,7 +980,7 @@ def setup(project: str, agents: str, base: str):
         context_pack_enabled = os.environ["AGENT_CREW_CONTEXT_PACK"].strip().lower() in (
             "1", "true", "yes", "on",
         )
-    _write_state(base, project, {
+    state_to_write = {
         "project": project,
         "port": port,
         "port_file": port_file,
@@ -993,7 +998,20 @@ def setup(project: str, agents: str, base: str):
         "dispatcher_mode": _dispatcher_mode,
         "tokenomics_policy_path": policy_path,
         "context_pack_enabled": context_pack_enabled,
-    })
+    }
+    # #337's explicit mapping records the default for new projects. Existing
+    # state keeps its current role configuration during setup/recovery.
+    if existing_state is None:
+        new_role_agents = {
+            entry["role"]: entry["agent"] for entry in roles_meta
+        }
+        if len(agent_list) == 1:
+            new_role_agents = {role: agent_list[0] for role in _ROLES}
+        if set(new_role_agents) == set(_ROLES):
+            state_to_write["role_agents"] = new_role_agents
+    elif "role_agents" in existing_state:
+        state_to_write["role_agents"] = existing_state["role_agents"]
+    _write_state(base, project, state_to_write)
 
     # Start server — skip if reusing existing server (pane-only recreation path).
     if not _reuse_server:
@@ -1569,8 +1587,9 @@ def task_group():
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 def task_cancel(task_id: str, project: str, base: str, db: str):
-    """Cancel TASK_ID (marks as cancelled, orphans dependents)."""
+    """Cancel TASK_ID and attempt to interrupt its bound worker pane."""
     from agent_crew.queue import TaskQueue
+    from agent_crew.server import cancel_task_with_signal
     if not db:
         if not project:
             detected = _auto_detect_project(base)
@@ -1581,8 +1600,23 @@ def task_cancel(task_id: str, project: str, base: str, db: str):
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
         db = state["db"]
-    TaskQueue(db).cancel(task_id)
-    click.echo(f"Cancelled: {task_id}")
+    state_path = os.path.join(os.path.dirname(os.path.abspath(db)), "state.json")
+    try:
+        result = cancel_task_with_signal(
+            TaskQueue(db), task_id, state_path=state_path, pane_map=None,
+            events_path=os.path.join(os.path.dirname(os.path.abspath(db)),
+                                     "context_events.jsonl"),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result["cancel_signal_outcome"] in ("not_running", "pane_exited"):
+        click.echo(f"Cancelled: {task_id} ({result['cancel_signal_outcome']})")
+        return
+    click.echo(
+        f"Cancelled in DB: {task_id}; worker stop unconfirmed "
+        f"({result['cancel_signal_outcome']})", err=True,
+    )
+    raise SystemExit(1)
 
 
 @task_group.command("expire-stale")
@@ -1829,9 +1863,14 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
                         pane_targets=dead_targets, worktrees=worktrees,
                     )
                 pane_map = state.get("pane_map", {})
-                for a, pid in zip(agent_list, new_pane_ids):
-                    role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
-                    pane_map[role] = pid
+                for i, (a, pid) in enumerate(zip(agent_list, new_pane_ids)):
+                    old_pid = existing_pane_ids[i] if i < len(existing_pane_ids) else None
+                    old_roles = [
+                        role for role in ("implementer", "reviewer", "tester")
+                        if old_pid and pane_map.get(role) == old_pid
+                    ]
+                    for role in old_roles or [setup_module._AGENT_TO_ROLE.get(a, "implementer")]:
+                        pane_map[role] = pid
                     pane_map[a] = pid
                 # Single-agent recovery mirrors setup behavior — fill missing
                 # roles so the lone pane handles all task types (issue #72).
@@ -2421,7 +2460,10 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     _CM: dict = {"coordinator_managed": True}
 
-    impl_context = {**_CM, "base_branch": branch, "sync_landed_bases": _sync_landed_bases}
+    declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    run_branch_context = {"base_branch": declared_base,
+                          "crew_run_branch": branch != declared_base}
+    impl_context = {**_CM, **run_branch_context, "sync_landed_bases": _sync_landed_bases}
     if implementer:
         impl_context["agent_override"] = implementer
     if no_tester:
@@ -2433,7 +2475,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
 
     _loop_pr_number: int | None = None  # first PR number seen across all results
-    _previous_impl_commit = ""
+    _previous_reviewed_head = ("", "")
     _last_impl_branch = ""
 
     for iteration in range(1, max_iter + 1):
@@ -2442,18 +2484,22 @@ def run_cmd(task: str, db: str, project: str, base: str,
         impl_elapsed = int(time.time() - impl_start)
         _loop_pr_number = _loop_pr_number or getattr(impl_result, "pr_number", None)
         reported_branch = getattr(impl_result, "branch", "") or ""
+        if run_branch_context["crew_run_branch"] and reported_branch and reported_branch != branch:
+            click.echo(
+                f"[{iteration}/{max_iter}] ❌ implementer reported branch {reported_branch!r} "
+                f"instead of requested {branch!r}; refusing to review the wrong branch."
+            )
+            return
         if reported_branch:
             _last_impl_branch = reported_branch
-        impl_branch = _last_impl_branch
+        impl_branch = branch if run_branch_context["crew_run_branch"] else _last_impl_branch
         impl_commit = getattr(impl_result, "commit", "") or ""
-        if impl_commit and impl_commit == _previous_impl_commit:
+        if impl_commit and (impl_branch or branch, impl_commit) == _previous_reviewed_head:
             click.echo(
                 f"[{iteration}/{max_iter}] ❌ implementer changes not persisting "
                 "(same commit reported twice)"
             )
             return
-        if impl_commit:
-            _previous_impl_commit = impl_commit
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
         review_context = {**_CM}
@@ -2478,6 +2524,15 @@ def run_cmd(task: str, db: str, project: str, base: str,
             review_start = time.time()
             review_result = _wait(review_id)
             review_elapsed = int(time.time() - review_start)
+            # Compare the next implementation with the branch head this review
+            # was pinned to, rather than an unreviewed implementer report.
+            reviewed_head = review_context.get("reviewed_sha", "")
+            try:
+                reviewed_head = queue.get_task_context(review_id).get("reviewed_sha") or reviewed_head
+            except (AttributeError, KeyError):
+                pass
+            if reviewed_head:
+                _previous_reviewed_head = (impl_branch or branch, reviewed_head)
 
             # pass no_tester=True here — test enqueue is handled manually below
             outcome = handle_review_result(
@@ -2546,7 +2601,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
                     retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                               context={**_CM, "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
+                                               context={**_CM, **run_branch_context, "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
                 if _run_port:
@@ -2565,7 +2620,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
         feedback = build_feedback(review_result)
         retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
-        retry_context = {**_CM, "feedback": feedback, "sync_landed_bases": retry_bases}
+        retry_context = {**_CM, **run_branch_context, "feedback": feedback, "sync_landed_bases": retry_bases}
         if implementer:
             retry_context["agent_override"] = implementer
         impl_id = enqueue_implement(queue, task, impl_branch or branch,
@@ -2678,7 +2733,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     import time
 
     # Agents default: project's installed agents (from state) in project mode,
-    # or the global default (claude,codex,gemini) in standalone mode.
+    # or the global default (codex,claude,gemini) in standalone mode.
     if agents.strip():
         agent_list = [a.strip() for a in agents.split(",") if a.strip()]
     elif project_state and project_state.get("agents"):

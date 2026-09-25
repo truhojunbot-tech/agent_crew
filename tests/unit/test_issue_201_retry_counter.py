@@ -34,7 +34,7 @@ def _test_payload(task_id: str) -> dict:
     }
 
 
-def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path):
+def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unused_tcp_port):
     """A task that always produces a retriable transient error must give up
     after AGENT_CREW_TRANSIENT_RETRY_MAX attempts, not retry forever."""
     wt_claude = tmp_path / "claude"
@@ -80,7 +80,7 @@ def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path):
                 app = create_app(
                     db_path=tmp_db,
                     pane_map={},
-                    port=0,
+                    port=unused_tcp_port,
                     state_path=str(state_file),
                     watchdog_disabled=True,
                     anomaly_disabled=True,

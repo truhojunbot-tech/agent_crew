@@ -159,7 +159,7 @@ def test_unknown_does_not_clear_but_is_not_zero():
 # ── 4. the real push paths ────────────────────────────────────────────
 
 
-def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch):
+def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★End to end: a pane with no hint whose session is over the ceiling now
     gets cleared, which is the behaviour #292 says never happened."""
     from fastapi.testclient import TestClient
@@ -184,7 +184,7 @@ def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch):
     db = str(tmp_path / "tasks.db")
     pushed = []
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%91"}, port=0,
+                     pane_map={"implementer": "%91"}, port=unused_tcp_port,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -198,7 +198,7 @@ def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch):
     assert pushed == ["%91"]
 
 
-def test_the_push_path_does_not_clear_a_small_session(tmp_path, monkeypatch):
+def test_the_push_path_does_not_clear_a_small_session(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The control. Clearing on every push would destroy the cache-hit
     behaviour the threshold exists to preserve."""
     from fastapi.testclient import TestClient
@@ -222,7 +222,7 @@ def test_the_push_path_does_not_clear_a_small_session(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%91"}, port=0,
+                     pane_map={"implementer": "%91"}, port=unused_tcp_port,
                      push_fn=lambda pane, text: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -303,7 +303,7 @@ def test_an_unlocatable_agent_worktree_is_empty_not_someone_elses():
     assert sv._agent_worktree({"implementer": "/w/claude"}, "gemini", "implementer") == ""
 
 
-def _override_push(tmp_path, monkeypatch, *, override, role_worktrees, claude_tokens):
+def _override_push(tmp_path, monkeypatch, *, override, role_worktrees, claude_tokens, unused_tcp_port):
     """Push one task with an agent_override; return the panes that got /clear."""
     from fastapi.testclient import TestClient
 
@@ -337,7 +337,7 @@ def _override_push(tmp_path, monkeypatch, *, override, role_worktrees, claude_to
     app = create_app(db_path=db, state_path=str(state),
                      pane_map={"implementer": "%91", "reviewer": "%92",
                                "claude": "%91", "codex": "%92"},
-                     port=0, push_fn=lambda pane, text: pushed.append(pane),
+                     port=unused_tcp_port, push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         client.post("/tasks", json={
@@ -347,31 +347,31 @@ def _override_push(tmp_path, monkeypatch, *, override, role_worktrees, claude_to
     return cleared, pushed
 
 
-def test_an_override_does_not_clear_the_wrong_pane(tmp_path, monkeypatch):
+def test_an_override_does_not_clear_the_wrong_pane(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The reported failure. The implementer's Claude transcript is far over
     the threshold, but the task is routed to the codex pane — which must not be
     cleared on the strength of a window it is not carrying."""
     cleared, pushed = _override_push(
         tmp_path, monkeypatch, override="codex",
         role_worktrees={"implementer": "claude", "reviewer": "codex"},
-        claude_tokens=900_000)
+        claude_tokens=900_000, unused_tcp_port=unused_tcp_port)
     assert pushed == ["%92"], pushed
     assert cleared == [], f"cleared the wrong pane: {cleared}"
 
 
-def test_without_an_override_the_saturated_pane_is_still_cleared(tmp_path, monkeypatch):
+def test_without_an_override_the_saturated_pane_is_still_cleared(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The control. Binding to the agent must not switch the guard off for the
     ordinary case #292 exists to fix."""
     cleared, pushed = _override_push(
         tmp_path, monkeypatch, override="claude",
         role_worktrees={"implementer": "claude", "reviewer": "codex"},
-        claude_tokens=900_000)
+        claude_tokens=900_000, unused_tcp_port=unused_tcp_port)
     assert pushed == ["%91"]
     assert cleared == ["%91"]
 
 
 def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
-                                                                    monkeypatch):
+                                                                    monkeypatch, *, unused_tcp_port):
     """★★The review's other scenario, and the one the agent gate alone does NOT
     cover: a reviewer task overridden to claude uses the claude pane, so the
     gate passes — but if the worktree is still keyed on the task's role it
@@ -409,7 +409,7 @@ def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
     app = create_app(db_path=db, state_path=str(state),
                      pane_map={"implementer": "%91", "reviewer": "%92",
                                "claude": "%91", "codex": "%92"},
-                     port=0, push_fn=lambda pane, text: pushed.append(pane),
+                     port=unused_tcp_port, push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         client.post("/tasks", json={
@@ -421,7 +421,7 @@ def test_an_override_to_claude_reads_claudes_worktree_not_the_roles(tmp_path,
     assert cleared == [], "cleared on a transcript from a worktree claude does not own"
 
 
-def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch):
+def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The discuss path takes the agent directly, so it looked safe — but
     nothing asserted the gate until mutation forced `agent="claude"` there and
     killed no test. A codex panel must not be sized by a Claude transcript."""
@@ -446,7 +446,7 @@ def test_the_discuss_path_gates_on_its_agent_too(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"codex": "%92", "reviewer": "%92"}, port=0,
+                     pane_map={"codex": "%92", "reviewer": "%92"}, port=unused_tcp_port,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -523,7 +523,7 @@ def test_an_agent_in_no_role_resolves_to_nothing():
 
 
 def test_a_configured_claude_reviewer_is_not_sized_by_the_implementer(tmp_path,
-                                                                      monkeypatch):
+                                                                      monkeypatch, *, unused_tcp_port):
     """★★End to end: claude on BOTH roles, a huge implementer transcript and a
     small reviewer one. Pushing the reviewer task must read the reviewer's."""
     from fastapi.testclient import TestClient
@@ -554,7 +554,7 @@ def test_a_configured_claude_reviewer_is_not_sized_by_the_implementer(tmp_path,
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%91", "reviewer": "%92"}, port=0,
+                     pane_map={"implementer": "%91", "reviewer": "%92"}, port=unused_tcp_port,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -568,7 +568,7 @@ def test_a_configured_claude_reviewer_is_not_sized_by_the_implementer(tmp_path,
 
 
 def test_the_configured_implementer_is_still_cleared_when_saturated(tmp_path,
-                                                                    monkeypatch):
+                                                                    monkeypatch, *, unused_tcp_port):
     """⛔The control: reading the right worktree must still fire when THAT one
     is over the threshold."""
     from fastapi.testclient import TestClient
@@ -599,7 +599,7 @@ def test_the_configured_implementer_is_still_cleared_when_saturated(tmp_path,
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%91", "reviewer": "%92"}, port=0,
+                     pane_map={"implementer": "%91", "reviewer": "%92"}, port=unused_tcp_port,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
@@ -612,7 +612,7 @@ def test_the_configured_implementer_is_still_cleared_when_saturated(tmp_path,
     assert cleared == ["%91"]
 
 
-def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch):
+def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The discuss call site also has to pass the live mapping, and nothing
     asserted it: every earlier discuss test used an agent-keyed worktree map,
     where the role mapping is never consulted. Mutation caught that.
@@ -648,7 +648,7 @@ def test_the_discuss_path_uses_the_live_role_map_too(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"claude": "%91", "implementer": "%91"}, port=0,
+                     pane_map={"claude": "%91", "implementer": "%91"}, port=unused_tcp_port,
                      push_fn=lambda pane, text: pushed.append(pane),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
