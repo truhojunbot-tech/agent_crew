@@ -1569,8 +1569,9 @@ def task_group():
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 def task_cancel(task_id: str, project: str, base: str, db: str):
-    """Cancel TASK_ID (marks as cancelled, orphans dependents)."""
+    """Cancel TASK_ID and attempt to interrupt its bound worker pane."""
     from agent_crew.queue import TaskQueue
+    from agent_crew.server import cancel_task_with_signal
     if not db:
         if not project:
             detected = _auto_detect_project(base)
@@ -1581,8 +1582,23 @@ def task_cancel(task_id: str, project: str, base: str, db: str):
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
         db = state["db"]
-    TaskQueue(db).cancel(task_id)
-    click.echo(f"Cancelled: {task_id}")
+    state_path = os.path.join(os.path.dirname(os.path.abspath(db)), "state.json")
+    try:
+        result = cancel_task_with_signal(
+            TaskQueue(db), task_id, state_path=state_path, pane_map=None,
+            events_path=os.path.join(os.path.dirname(os.path.abspath(db)),
+                                     "context_events.jsonl"),
+        )
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+    if result["cancel_signal_outcome"] in ("not_running", "pane_exited"):
+        click.echo(f"Cancelled: {task_id} ({result['cancel_signal_outcome']})")
+        return
+    click.echo(
+        f"Cancelled in DB: {task_id}; worker stop unconfirmed "
+        f"({result['cancel_signal_outcome']})", err=True,
+    )
+    raise SystemExit(1)
 
 
 @task_group.command("expire-stale")
