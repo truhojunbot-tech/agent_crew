@@ -3,6 +3,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -85,7 +86,7 @@ def _pane_alive_for_push(pane_id: str) -> bool:
     """
     r = subprocess.run(
         ["tmux", "list-panes", "-t", pane_id],
-        capture_output=True,
+        capture_output=True, timeout=1,
     )
     return r.returncode == 0
 
@@ -129,6 +130,66 @@ def _recorded_pane_ids(
              if isinstance(pane_id, str) and pane_id}, False, "state_path_missing")
 
 
+def cancel_task_with_signal(
+    queue: TaskQueue, task_id: str, *, state_path: Optional[str],
+    pane_map: Optional[dict], events_path: str,
+) -> dict:
+    """Cancel in the DB and signal only its server-recorded, project-owned pane."""
+    prior_status, bound_pane = queue.cancel(task_id)
+    if prior_status is None:
+        raise ValueError(f"Task not found: {task_id!r}")
+    outcome = "not_running"
+    reachable = False
+    pane_exit_observed = False
+    if prior_status == "in_progress":
+        outcome = "unreachable"
+        if bound_pane:
+            owned_panes, _, _ = _recorded_pane_ids(state_path, pane_map)
+            can_signal = (re.fullmatch(r"%\d+", bound_pane)
+                          and bound_pane in owned_panes
+                          and not queue.pane_has_other_active_task(bound_pane, task_id))
+            try:
+                pane_alive = bool(can_signal and _pane_alive_for_push(bound_pane))
+            except (OSError, subprocess.TimeoutExpired):
+                pane_alive = False
+            if pane_alive:
+                try:
+                    sent = subprocess.run(
+                        ["tmux", "send-keys", "-t", bound_pane, "C-c"],
+                        capture_output=True, timeout=2,
+                    )
+                    reachable = sent.returncode == 0
+                    outcome = "ack_timeout" if reachable else "send_failed"
+                    if reachable:
+                        deadline = time.monotonic() + 0.5
+                        while True:
+                            try:
+                                still_alive = _pane_alive_for_push(bound_pane)
+                            except (OSError, subprocess.TimeoutExpired):
+                                break
+                            if not still_alive:
+                                pane_exit_observed = True
+                                outcome = "pane_exited"
+                                break
+                            if time.monotonic() >= deadline:
+                                break
+                            time.sleep(min(0.1, deadline - time.monotonic()))
+                except (OSError, subprocess.TimeoutExpired):
+                    outcome = "send_failed"
+        try:
+            record_context_event(
+                events_path, "cancel_signalled", task_id=task_id,
+                pane_id=bound_pane or None, outcome=outcome,
+                worker_reachable=reachable,
+                pane_exit_observed=pane_exit_observed,
+            )
+        except Exception:
+            logger.exception("cancel_signalled event failed for task=%s", task_id)
+    return {"status": "cancelled", "worker_reachable": reachable,
+            "cancel_signal_outcome": outcome,
+            "pane_exit_observed": pane_exit_observed}
+
+
 # Per-pane snapshot of the previous capture, keyed by pane_id. Used by the
 # default pane-busy probe to decide "did anything change since the last
 # tick?". Tests inject their own busy_fn so this dict is only touched by the
@@ -151,7 +212,7 @@ def _ensure_role_protocol(
     role: str, worktree_path: str, project: str, port_file: str, *, agent: str, port: int = 0,
 ) -> bool:
     """Ensure the role's worker contract survived worktree synchronisation (#353)."""
-    relative = instructions.ROLE_FILES.get(role)
+    relative = instructions.AGENT_FILES.get(agent, instructions.ROLE_FILES.get(role))
     if not relative:
         logger.error("dispatcher: no protocol file is defined for role=%s", role)
         return False
@@ -309,7 +370,7 @@ def _checkout_detached(worktree_path: str, refs, *, what: str) -> bool:
             logger.info(
                 f"_prepare_worktree_for_task: {what} detached at {ref} — "
                 f"agent_crew does not own that branch name, so the ref is left "
-                f"where it is (#280). Push with `git push origin HEAD:<branch>`."
+                f"where it is (#280). Push with `git push origin HEAD:refs/heads/<branch>`."
             )
             return True
         logger.warning(
@@ -655,7 +716,42 @@ def _prepare_worktree_for_task_inner(
         # Fresh branch per task from the configured base (#140/#353). Use task.branch when
         # set (crew run --branch), otherwise derive from task_id.
         branch = task_branch if task_branch else f"agent/{task_id[:12]}"
-        if not _agent_crew_owns_branch(branch):
+        if task_context.get("crew_run_branch"):
+            # A foreground run pins the requested branch's CONTENT, not its
+            # shared local ref. Preserve local-only commits; otherwise use the
+            # remote tip. A new branch starts at the declared base. Only our
+            # generated branch names may be checked out with -B (#280); a
+            # caller-supplied context flag never grants shared-ref ownership.
+            local = _branch_ref(worktree_path, f"refs/heads/{branch}")
+            remote = _branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
+            if local and remote and not _is_ancestor(worktree_path, local, remote):
+                start = local
+            else:
+                start = remote or local
+            if not start:
+                start = _branch_ref(worktree_path, str(task_context.get("worktree_base_sha") or "")) \
+                    or _branch_ref(worktree_path, f"refs/remotes/origin/{main_branch}")
+            if not start:
+                raise WorktreeTargetUnresolved(
+                    f"implementer {task_id}: neither origin/{branch} nor declared "
+                    f"base origin/{main_branch} resolves; refusing to use main"
+                )
+            if _agent_crew_owns_branch(branch):
+                r = subprocess.run(
+                    ["git", "-C", worktree_path, "checkout", "-B", branch, start],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    raise WorktreeTargetUnresolved(
+                        f"implementer {task_id}: could not check out {branch}: {r.stderr.strip()}"
+                    )
+            elif not _checkout_detached(
+                worktree_path, [start], what=f"implementer {task_id} preserving {branch}",
+            ):
+                raise WorktreeTargetUnresolved(
+                    f"implementer {task_id}: could not detach at {start} for {branch}"
+                )
+        elif not _agent_crew_owns_branch(branch):
             # #280: somebody else's branch name. Do not create it, do not move
             # it — start from its own remote tip so the task still sees the code
             # it was dispatched for, and fall back to main when there is no such
@@ -1010,7 +1106,7 @@ def _detect_transient_error_in_log(
     return None
 
 
-def _dispatch_timeout_for_role(role: str) -> float:
+def _dispatch_timeout_for_role(role: str, task_context: Optional[dict] = None) -> float:
     """Hard wall-clock timeout (seconds) for a dispatched subprocess.
 
     ``implement`` tasks routinely run longer than review/test — they write
@@ -1027,7 +1123,21 @@ def _dispatch_timeout_for_role(role: str) -> float:
     for that role or any other — so setting only the generic var still
     raises every role uniformly, matching pre-existing behavior for anyone
     already relying on it.
+
+    A task can set ``context.dispatch_timeout_s`` for its own dispatch. A
+    positive finite value takes precedence over the role/env default and is
+    capped at 3600 seconds. Invalid values leave the role/env default intact.
     """
+    if isinstance(task_context, dict):
+        value = task_context.get("dispatch_timeout_s")
+        if not isinstance(value, bool):
+            try:
+                task_timeout = float(value)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if math.isfinite(task_timeout) and task_timeout > 0:
+                    return min(task_timeout, 3600.0)
     default = "1800" if role == "implementer" else "900"
     if role == "implementer":
         env_value = os.getenv("AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER")
@@ -2794,7 +2904,7 @@ def create_app(
         push_fn(guarded_pane_id, _format_task_message(task, port))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
-        q().set_push_at(task.task_id)
+        q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
     #: How many times a push path found no pane to deliver to. Keyed by path so
     #: a persistent misconfiguration is loud once and then periodic (#260).
@@ -2889,7 +2999,7 @@ def create_app(
             return
         push_fn(guarded_pane_id, _format_task_message(task, port))
         # #152: record push time for watchdog idle clock.
-        q().set_push_at(task.task_id)
+        q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
     def _resolve_pane_for_row(row: dict) -> Optional[str]:
         """Find the pane assigned to an in_progress task row. Mirrors the routing
@@ -3198,7 +3308,7 @@ def create_app(
 
     # ── Headless dispatcher (subprocess-per-task model) ──────────────────────
     # Built from state.json's "roles" field when present; falls back to the
-    # hardcoded default (claude/codex/gemini). This is what lets the same
+    # hardcoded default (codex/claude/gemini). This is what lets the same
     # agent serve multiple roles (e.g. claude implementer + claude reviewer).
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
 
@@ -3944,7 +4054,7 @@ def create_app(
                 cmd = ["codex", "exec",
                        "--dangerously-bypass-approvals-and-sandbox", "--json", message]
 
-        timeout_secs = _dispatch_timeout_for_role(role)
+        timeout_secs = _dispatch_timeout_for_role(role, _ctx)
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
         # Only pop the retry counter on a terminal outcome. Flipped to False
         # right before the early `return` on a successful requeue — that
@@ -4914,10 +5024,12 @@ def create_app(
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
         if (not _runtime_paused and not _REPLAYING.get() and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
-                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
+                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
+                         or "rebase_onto" in _artifact_context)):
             logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
         if (not _runtime_paused and not _REPLAYING.get()
-                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))
+                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
+                         or "rebase_onto" in _artifact_context)
                 and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"):
             _ok, _detail = verify_implement_artifact(
@@ -4984,7 +5096,8 @@ def create_app(
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
-            status_code = 404 if "not found" in msg.lower() else 400
+            status_code = (409 if msg.startswith("LATE_RESULT_REJECTED:")
+                           else 404 if "not found" in msg.lower() else 400)
             raise HTTPException(status_code=status_code, detail=msg)
         # #202: lifecycle event for the agent-self-reported terminal outcome
         # (the internal dispatcher-detected failure paths emit their own
@@ -5334,8 +5447,13 @@ def create_app(
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
-        q().cancel(task_id)
-        return {"status": "cancelled"}
+        try:
+            return cancel_task_with_signal(
+                q(), task_id, state_path=state_path, pane_map=pane_map,
+                events_path=_context_events_path,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(

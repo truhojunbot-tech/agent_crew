@@ -56,7 +56,7 @@ def _setup(tmp_path):
     return state_file
 
 
-def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None):
+def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None, *, unused_tcp_port):
     state_file = _setup(tmp_path)
     spawn_log: list[list[str]] = []
 
@@ -89,7 +89,7 @@ def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None):
                 app = create_app(
                     db_path=tmp_db,
                     pane_map={},
-                    port=0,
+                    port=unused_tcp_port,
                     state_path=str(state_file),
                     watchdog_disabled=True,
                     anomaly_disabled=True,
@@ -107,11 +107,11 @@ def _model_arg(cmd: list[str]) -> str:
     return cmd[cmd.index("--model") + 1]
 
 
-def test_u227_default_gemini_model_is_a_currently_valid_name(tmp_db, tmp_path):
+def test_u227_default_gemini_model_is_a_currently_valid_name(tmp_db, tmp_path, *, unused_tcp_port):
     """Without AGENT_CREW_GEMINI_MODEL, the dispatched --model must NOT be
     the retired "Gemini 3.5 Flash (Medium)" name that broke every gemini
     dispatch, and must be the current successor."""
-    spawn_log = _run_dispatch(tmp_db, tmp_path, "test-227-a")
+    spawn_log = _run_dispatch(tmp_db, tmp_path, "test-227-a", unused_tcp_port=unused_tcp_port)
 
     assert spawn_log, "test task was never dispatched"
     model = _model_arg(spawn_log[0])
@@ -122,12 +122,13 @@ def test_u227_default_gemini_model_is_a_currently_valid_name(tmp_db, tmp_path):
     assert model == "Gemini 3.7 Flash (Medium)"
 
 
-def test_u227_env_override_still_honored(tmp_db, tmp_path):
+def test_u227_env_override_still_honored(tmp_db, tmp_path, *, unused_tcp_port):
     """AGENT_CREW_GEMINI_MODEL must still take precedence over the default,
     so operators can pin a specific model without a code change."""
     spawn_log = _run_dispatch(
         tmp_db, tmp_path, "test-227-b",
         extra_env={"AGENT_CREW_GEMINI_MODEL": "Gemini 3.7 Flash (High)"},
+        unused_tcp_port=unused_tcp_port,
     )
 
     assert spawn_log, "test task was never dispatched"
