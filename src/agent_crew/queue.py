@@ -1437,6 +1437,10 @@ class TaskQueue:
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
+            if row["status"] == "cancelled":
+                raise ValueError(
+                    f"LATE_RESULT_REJECTED: cancelled task {task_id!r} cannot accept a result"
+                )
             task_type = row["task_type"]
             self._last_previous_status = row["status"]
             # #167: persist structured error_info for failed results so post-mortem

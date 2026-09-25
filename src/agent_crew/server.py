@@ -86,7 +86,7 @@ def _pane_alive_for_push(pane_id: str) -> bool:
     """
     r = subprocess.run(
         ["tmux", "list-panes", "-t", pane_id],
-        capture_output=True,
+        capture_output=True, timeout=1,
     )
     return r.returncode == 0
 
@@ -128,6 +128,66 @@ def _recorded_pane_ids(
     # always pass state_path and therefore take the durable branch above.
     return ({pane_id for pane_id in (pane_map or {}).values()
              if isinstance(pane_id, str) and pane_id}, False, "state_path_missing")
+
+
+def cancel_task_with_signal(
+    queue: TaskQueue, task_id: str, *, state_path: Optional[str],
+    pane_map: Optional[dict], events_path: str,
+) -> dict:
+    """Cancel in the DB and signal only its server-recorded, project-owned pane."""
+    prior_status, bound_pane = queue.cancel(task_id)
+    if prior_status is None:
+        raise ValueError(f"Task not found: {task_id!r}")
+    outcome = "not_running"
+    reachable = False
+    pane_exit_observed = False
+    if prior_status == "in_progress":
+        outcome = "unreachable"
+        if bound_pane:
+            owned_panes, _, _ = _recorded_pane_ids(state_path, pane_map)
+            can_signal = (re.fullmatch(r"%\d+", bound_pane)
+                          and bound_pane in owned_panes
+                          and not queue.pane_has_other_active_task(bound_pane, task_id))
+            try:
+                pane_alive = bool(can_signal and _pane_alive_for_push(bound_pane))
+            except (OSError, subprocess.TimeoutExpired):
+                pane_alive = False
+            if pane_alive:
+                try:
+                    sent = subprocess.run(
+                        ["tmux", "send-keys", "-t", bound_pane, "C-c"],
+                        capture_output=True, timeout=2,
+                    )
+                    reachable = sent.returncode == 0
+                    outcome = "ack_timeout" if reachable else "send_failed"
+                    if reachable:
+                        deadline = time.monotonic() + 0.5
+                        while True:
+                            try:
+                                still_alive = _pane_alive_for_push(bound_pane)
+                            except (OSError, subprocess.TimeoutExpired):
+                                break
+                            if not still_alive:
+                                pane_exit_observed = True
+                                outcome = "pane_exited"
+                                break
+                            if time.monotonic() >= deadline:
+                                break
+                            time.sleep(min(0.1, deadline - time.monotonic()))
+                except (OSError, subprocess.TimeoutExpired):
+                    outcome = "send_failed"
+        try:
+            record_context_event(
+                events_path, "cancel_signalled", task_id=task_id,
+                pane_id=bound_pane or None, outcome=outcome,
+                worker_reachable=reachable,
+                pane_exit_observed=pane_exit_observed,
+            )
+        except Exception:
+            logger.exception("cancel_signalled event failed for task=%s", task_id)
+    return {"status": "cancelled", "worker_reachable": reachable,
+            "cancel_signal_outcome": outcome,
+            "pane_exit_observed": pane_exit_observed}
 
 
 # Per-pane snapshot of the previous capture, keyed by pane_id. Used by the
@@ -4987,7 +5047,8 @@ def create_app(
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
-            status_code = 404 if "not found" in msg.lower() else 400
+            status_code = (409 if msg.startswith("LATE_RESULT_REJECTED:")
+                           else 404 if "not found" in msg.lower() else 400)
             raise HTTPException(status_code=status_code, detail=msg)
         # #202: lifecycle event for the agent-self-reported terminal outcome
         # (the internal dispatcher-detected failure paths emit their own
@@ -5324,42 +5385,13 @@ def create_app(
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
-        prior_status, bound_pane = q().cancel(task_id)
-        outcome = "not_running"
-        reachable = False
-        if prior_status == "in_progress":
-            outcome = "unreachable"
-            if bound_pane:
-                owned_panes, _, _ = _recorded_pane_ids(state_path, pane_map)
-                # Only the canonical pane recorded at dispatch can be signalled.
-                # Never fall back to today's role map, which may have changed.
-                can_signal = (re.fullmatch(r"%\d+", bound_pane)
-                              and bound_pane in owned_panes
-                              and not q().pane_has_other_active_task(bound_pane, task_id))
-                try:
-                    pane_alive = bool(can_signal and _pane_alive_for_push(bound_pane))
-                except (OSError, subprocess.TimeoutExpired):
-                    pane_alive = False
-                if pane_alive:
-                    try:
-                        sent = subprocess.run(
-                            ["tmux", "send-keys", "-t", bound_pane, "C-c"],
-                            capture_output=True, timeout=2,
-                        )
-                        reachable = sent.returncode == 0
-                        outcome = "sent" if reachable else "send_failed"
-                    except (OSError, subprocess.TimeoutExpired):
-                        outcome = "send_failed"
-            try:
-                record_context_event(
-                    _context_events_path, "cancel_signalled", task_id=task_id,
-                    pane_id=bound_pane or None, outcome=outcome,
-                    worker_reachable=reachable,
-                )
-            except Exception:
-                logger.exception("cancel_signalled event failed for task=%s", task_id)
-        return {"status": "cancelled", "worker_reachable": reachable,
-                "cancel_signal_outcome": outcome}
+        try:
+            return cancel_task_with_signal(
+                q(), task_id, state_path=state_path, pane_map=pane_map,
+                events_path=_context_events_path,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(older_than: float = 600.0):
