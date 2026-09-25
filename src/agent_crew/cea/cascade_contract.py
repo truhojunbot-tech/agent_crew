@@ -74,17 +74,8 @@ class CascadeContract:
     j7_tester: Optional[str] = None
 
     def fix_round_cap(self, ceiling: Optional[int]) -> int:
-        """A-4's cap applied to the *live* ceiling.
-
-        The tier is the stored decision; the ceiling is an operator value read
-        at cascade time on purpose (``AGENT_CREW_REVIEW_FIX_MAX_ROUNDS`` is
-        meant to be changeable without a restart). Only the arithmetic happens
-        here.
-        """
-        if not self.enforced or self.tier is None:
-            return max(0, ceiling) if ceiling is not None else 3
-        policy_cap = {TIER_0: 0, TIER_1: 1, TIER_2: 3, TIER_3: 3}[self.tier]
-        return policy_cap if ceiling is None else min(max(0, ceiling), policy_cap)
+        """Return the live operator ceiling; quota-core owns round economics."""
+        return max(0, ceiling) if ceiling is not None else 3
 
     def as_record(self) -> dict:
         return {"enforced": self.enforced, "tier": self.tier,

@@ -4,6 +4,7 @@ from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_review, auto_enqu
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.risk_tier import classify_task, effective_fix_round_cap, risk_tier_enforcement_enabled
+from agent_crew.cea.cascade_contract import CascadeContract
 from agent_crew.telemetry import TaskTelemetry
 
 
@@ -27,6 +28,12 @@ def test_classifier_honours_explicit_override_and_metadata():
 
 def test_explicit_override_never_downgrades_merge_or_deploy():
     assert classify_task("merge then deploy", {"risk_tier": 0}) == 3
+
+
+def test_missing_contract_keeps_operator_round_baseline_even_when_tier_enforced(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
+    assert effective_fix_round_cap({"risk_tier": 1}, 5) == 5
+    assert CascadeContract(enforced=True, tier=1).fix_round_cap(5) == 5
 
 
 def test_description_comment_cannot_make_code_change_tier_zero():
@@ -66,7 +73,7 @@ def test_default_shadow_mode_preserves_full_cascade_and_records_counterfactual(
     assert "test_scope" not in _task(queue, test_id).context
 
 
-def test_low_tiers_reduce_automatic_cascade_and_fix_budget_when_enforced(tmp_db, monkeypatch):
+def test_low_tiers_keep_safety_gates_without_deriving_a_fix_budget(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("doc", "implement", "docs/README.md only", branch="b",
@@ -77,7 +84,7 @@ def test_low_tiers_reduce_automatic_cascade_and_fix_budget_when_enforced(tmp_db,
     review_id = auto_enqueue_review(queue, "internal", pr_number=2, pr_state_fn=_open)
     review = _task(queue, review_id)
     assert review.context["risk_tier"] == 1
-    assert effective_fix_round_cap(review.context) == 1
+    assert effective_fix_round_cap(review.context) == 3
     queue.submit_result(review_id, TaskResult(task_id=review_id, status="completed",
                                                summary="ok", verdict="approve"))
     test_id = auto_enqueue_test(queue, review_id, pr_state_fn=_open)

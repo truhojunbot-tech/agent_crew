@@ -1,10 +1,10 @@
-"""EGD Step 2 (#51 P0-1): cite the contract's round budget, enforce nothing.
+"""EGD Step 2 (#51 P0-1): cite quota-core's round budget.
 
-The cascade's fix-round cap still comes from `CascadeContract.fix_round_cap`.
+The operator baseline still comes from `CascadeContract.fix_round_cap`.
 These tests pin the one property that makes a shadow step worth having: the
 recommendation is *recorded next to* the cap in force, and a contract that is
 absent, unreadable or silent changes neither the cap nor whether the fix task
-exists. If any of that stopped holding, Step 2 would be enforcing by accident.
+exists. Narrowing requires the separately armed canary.
 """
 
 import json
@@ -153,7 +153,7 @@ def test_a_citation_failure_cannot_withhold_the_fix_task(q, monkeypatch):
     assert "tokenomics_shadow" not in _fix(q, fix_id).context
 
 
-def test_a_multi_hop_lineage_cites_the_root_not_the_nearest_ancestor(
+def test_a_multi_hop_lineage_cites_the_latest_resolved_recommendation(
         q, tmp_path, monkeypatch):
     """implement → review → fix → review → fix, with a DECOY at every hop.
 
@@ -184,12 +184,10 @@ def test_a_multi_hop_lineage_cites_the_root_not_the_nearest_ancestor(
     assert _fix(q, fix_2).context["fix_round"] == 2, (
         "not actually a second round — the decoys would be unreachable anyway")
     cited = _fix(q, fix_2).context["tokenomics_shadow"]
-    assert cited["recommended_max_review_fix_rounds"] == 2, (
-        f"cited an intermediate hop's decoy, not ROOT's decision: {cited}")
-    assert cited["rationale"] == (
-        "the only decision quota-core published for this lineage")
+    assert cited["cited_task_id"] == review_1
+    assert cited["recommended_max_review_fix_rounds"] == 11
     assert json.loads(q.get_tokenomics_shadow_receipt(fix_2)["actual_execution_json"])[
-        "shadow_rounds_vs_cap"] == {"recommended": 2,
+        "shadow_rounds_vs_cap"] == {"recommended": 11,
                                     "actual_cap": DEFAULT_REVIEW_FIX_MAX_ROUNDS}
 
 

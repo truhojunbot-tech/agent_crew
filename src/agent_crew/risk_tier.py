@@ -1,4 +1,4 @@
-"""Deterministic, metadata-first cascade risk policy (Council #39).
+"""Deterministic, metadata-first cascade safety classification (Council #39).
 
 The classifier is deliberately conservative: an explicit valid operator tier
 wins, clear irreversible/external keywords escalate, documentation-only work
@@ -158,17 +158,8 @@ def risk_declaration(description: str, context: Mapping | None = None) -> dict:
 
 
 def effective_fix_round_cap(context: Mapping | None, ceiling: int | None = None) -> int:
-    """Apply A-4: low-risk feedback stops before it costs another full round."""
-    if not risk_tier_enforcement_enabled():
-        return max(0, ceiling) if ceiling is not None else 3
-    # Pre-Council review rows have no tier metadata. Preserve their established
-    # ceiling exactly; only newly-classified lineages receive the lower cap.
-    if not isinstance(context, Mapping) or "risk_tier" not in context:
-        return max(0, ceiling) if ceiling is not None else 3
-    tier = classify_task("", context)
-    # Tier 0 has no automatic review; Tier 1 receives one bounded correction.
-    policy_cap = {TIER_0: 0, TIER_1: 1, TIER_2: 3, TIER_3: 3}[tier]
-    return policy_cap if ceiling is None else min(max(0, ceiling), policy_cap)
+    """Return the operator baseline; quota-core citation narrows it in the cascade."""
+    return max(0, ceiling) if ceiling is not None else 3
 
 
 def cascade_metadata(description: str, context: Mapping | None) -> dict:
@@ -184,17 +175,15 @@ def shadow_decision(
     actual_action: str,
     ceiling: int | None = None,
 ) -> dict:
-    """Return a counterfactual tier receipt without affecting execution."""
+    """Return a counterfactual safety receipt without deriving a round budget."""
     metadata = cascade_metadata(description, context)
     tier = metadata["risk_tier"]
-    policy_cap = {TIER_0: 0, TIER_1: 1, TIER_2: 3, TIER_3: 3}[tier]
-    would_fix_cap = policy_cap if ceiling is None else min(max(0, ceiling), policy_cap)
     return {
         "task_id": task_id,
         "tier": tier,
         "tier_source": metadata["risk_tier_source"],
         "would_gate": tier == TIER_3,
         "would_test_scope": "skip" if tier == TIER_0 else "targeted" if tier == TIER_1 else "full",
-        "would_fix_cap": would_fix_cap,
+        "would_fix_cap": None,
         "actual_action": actual_action,
     }

@@ -153,3 +153,54 @@ def test_cap_not_reached_keeps_review_then_test(q, tmp_path, monkeypatch):
     assert {t.task_id: t.task_type for t in q.list_tasks()}[test] == "test"
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_applied"] == 0
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
+
+
+def test_contract_produced_after_review_decision_cannot_narrow_retroactively(
+        q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    review = _review(q)
+    decision_at = q.get_exec_state(review)["events"][-1]["at"]
+    path = tmp_path / "future.json"
+    path.write_text(json.dumps({
+        "contract_version": "1.0", "mode": "shadow",
+        "produced_at": datetime.fromtimestamp(decision_at + 60, timezone.utc).isoformat(),
+        "decisions": [{"task_id": ROOT, "recommended_max_review_fix_rounds": 1}],
+    }))
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(path))
+    assert _run(q, review) is not None
+    row = q.get_tokenomics_shadow_receipt(ROOT)
+    assert row["canary_applied"] == 0
+    assert row["canary_reason"] == "contract_missing_or_stale"
+
+
+def test_latest_valid_lineage_receipt_wins_over_future_contract(
+        q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    review = _review(q)
+    decision_at = q.get_exec_state(review)["events"][-1]["at"]
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute(
+            """UPDATE tokenomics_shadow_receipts
+               SET shadow_decision_source='quota_core_contract',
+                   shadow_recommendation_json=?, shadow_resolved_at=?,
+                   shadow_contract_sha='earlier-contract'
+               WHERE task_id=?""",
+            (json.dumps({"recommended_max_review_fix_rounds": 1}),
+             decision_at - 10, ROOT))
+    path = tmp_path / "future.json"
+    path.write_text(json.dumps({
+        "contract_version": "1.0", "mode": "shadow",
+        "produced_at": datetime.fromtimestamp(decision_at + 60, timezone.utc).isoformat(),
+        "decisions": [{"task_id": review, "recommended_max_review_fix_rounds": 2}],
+    }))
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(path))
+    assert _run(q, review) is None
+    row = q.get_tokenomics_shadow_receipt(ROOT)
+    cited = json.loads(row["canary_recommendation_json"])
+    assert cited["cited_task_id"] == ROOT
+    assert cited["contract_sha"] == "earlier-contract"
+    assert cited["recommended_max_review_fix_rounds"] == 1
+    assert cited["produced_at"] == datetime.fromtimestamp(
+        decision_at - 10, timezone.utc).isoformat()

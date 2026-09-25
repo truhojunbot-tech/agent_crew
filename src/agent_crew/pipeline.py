@@ -882,44 +882,109 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
         current = tasks_by_id[prev]
 
 
-def _shadow_rounds_citation(tasks_by_id: dict, review_task) -> dict:
-    """Read the quota-core recommendation for this lineage (#51).
+def _contract_time(value) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+    except (TypeError, ValueError, OverflowError):
+        return None
 
-    The citation is normally observation only. The separately armed canary
-    validates its provenance, freshness and value before narrowing one cap.
-    """
-    shadow = shadow_recommendation_for_task_id(
-        _lineage_root_task_id(tasks_by_id, review_task))
+
+def _review_decision_time(queue: TaskQueue, review_task_id: str) -> Optional[datetime]:
+    """Use the durable result event, so replay cannot cite a later contract."""
+    try:
+        state = queue.get_exec_state(review_task_id)
+    except Exception:
+        logger.exception("review result time unavailable for %s", review_task_id)
+        return None
+    events = state.get("events", []) if state else []
+    results = [e["at"] for e in events if e["event"] == "result"]
+    return datetime.fromtimestamp(results[-1], timezone.utc) if results else None
+
+
+def _shadow_rounds_citation(tasks_by_id: dict, review_task,
+                            queue: Optional[TaskQueue] = None) -> dict:
+    """Cite the latest quota-core decision available when this review resolved."""
+    decision_at = _review_decision_time(queue, review_task.task_id) if queue else None
+    current = review_task
+    seen = set()
+    candidates = []
+    while current.task_id not in seen:
+        seen.add(current.task_id)
+        shadow = shadow_recommendation_for_task_id(current.task_id)
+        produced = _contract_time(shadow.get("produced_at"))
+        if (shadow.get("decision_source") == "quota_core_contract" and produced
+                and decision_at and produced <= decision_at):
+            candidates.append((produced, current.task_id, shadow))
+        if queue:
+            receipt = queue.get_tokenomics_shadow_receipt(current.task_id)
+            if receipt and receipt.get("shadow_decision_source") == "quota_core_contract":
+                resolved = receipt.get("shadow_resolved_at")
+                try:
+                    resolved_at = datetime.fromtimestamp(float(resolved), timezone.utc)
+                    recommendation = json.loads(receipt.get("shadow_recommendation_json") or "null")
+                except (TypeError, ValueError, OverflowError):
+                    resolved_at, recommendation = None, None
+                if (resolved_at and decision_at and resolved_at <= decision_at
+                        and isinstance(recommendation, dict)):
+                    candidates.append((resolved_at, current.task_id, {
+                        "decision_source": "quota_core_contract",
+                        "produced_at": resolved_at.isoformat(),
+                        "contract_sha": receipt.get("shadow_contract_sha"),
+                        "recommendation": recommendation,
+                        "reason": receipt.get("shadow_reason"),
+                    }))
+        ctx = current.context if isinstance(current.context, dict) else {}
+        previous = ctx.get("prev_task_id")
+        if not isinstance(previous, str) or previous not in tasks_by_id:
+            break
+        current = tasks_by_id[previous]
+    # Legacy untimed contracts remain visible in shadow telemetry, but cannot
+    # pass the canary's provenance and freshness checks.
+    cited_task_id = current.task_id
+    shadow = shadow_recommendation_for_task_id(cited_task_id)
+    if candidates:
+        produced, cited_task_id, shadow = max(candidates, key=lambda item: item[0])
+    elif _contract_time(shadow.get("produced_at")) is not None:
+        # A timed contract outside this review's decision window is not even
+        # a shadow citation for this decision.
+        shadow = {"decision_source": "baseline", "recommendation": None,
+                  "reason": "contract_after_review_decision"}
     recommendation = shadow.get("recommendation")
     recommendation = recommendation if isinstance(recommendation, dict) else {}
     recommended = recommendation.get("recommended_max_review_fix_rounds")
-    # `bool` is an `int` in Python; True is not a round budget.
     if isinstance(recommended, bool) or not isinstance(recommended, int):
         recommended = None
     return {
+        "cited_task_id": cited_task_id,
         "recommended_max_review_fix_rounds": recommended,
-        "decision_source": shadow.get("decision_source"),
-        "produced_at": shadow.get("produced_at"),
+        "decision_source": shadow.get("decision_source") if candidates else "baseline",
+        "produced_at": shadow.get("produced_at") if candidates else None,
         "contract_sha": shadow.get("contract_sha"),
         "rationale": recommendation.get("rationale") or shadow.get("reason"),
     }
 
 
 def _canary_round_cap(tasks_by_id: dict, review_task,
-                      baseline_cap: int) -> tuple[int, Optional[dict], str]:
+                      baseline_cap: int, queue: TaskQueue) -> tuple[int, Optional[dict], str]:
     """Return the narrowed cap only for the pinned lineage and a fresh contract."""
     if not _tokenomics_canary.rounds_cap_enabled():
         return baseline_cap, None, "switch_off"
     if _lineage_root_task_id(tasks_by_id, review_task) != _tokenomics_canary.canary_pin():
         return baseline_cap, None, "not_pinned"
-    citation = _shadow_rounds_citation(tasks_by_id, review_task)
+    try:
+        citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
+    except Exception:
+        logger.exception("quota-core rounds citation unavailable for %s", review_task.task_id)
+        return baseline_cap, None, "contract_missing_or_stale"
     recommended = citation["recommended_max_review_fix_rounds"]
     reason = "cap_not_reached"
     try:
-        produced = datetime.fromisoformat(str(citation["produced_at"]).replace("Z", "+00:00"))
-        current = produced.tzinfo is not None
+        produced = _contract_time(citation["produced_at"])
+        decision_at = _review_decision_time(queue, review_task.task_id)
+        current = produced is not None and decision_at is not None
         if current:
-            age = (datetime.now(timezone.utc) - produced.astimezone(timezone.utc)).total_seconds()
+            age = (decision_at - produced).total_seconds()
             current = 0 <= age <= CANARY_CONTRACT_MAX_AGE_SECONDS
     except (ValueError, TypeError):
         current = False
@@ -1093,9 +1158,8 @@ def auto_enqueue_fix(
             )
             return None
 
-        # Council #39 A-4: the configured value remains a hard ceiling, while
-        # low-risk work stops once an additional fix is less valuable than its
-        # independent review/test cost.
+        # The operator ceiling remains the baseline. The quota-core citation
+        # below may narrow it only for the pinned canary lineage.
         contract = _cascade.stored(review_task)
         if not contract.enforced:
             _record_risk_tier_shadow(queue, review_task, "fix_legacy_cap")
@@ -1103,7 +1167,7 @@ def auto_enqueue_fix(
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
         max_rounds, canary_citation, canary_reason = _canary_round_cap(
-            tasks_by_id, review_task, baseline_cap)
+            tasks_by_id, review_task, baseline_cap, queue)
         canary_pinned = (_tokenomics_canary.rounds_cap_enabled()
                          and lineage_root_id == _tokenomics_canary.canary_pin())
         if canary_pinned:
@@ -1249,7 +1313,7 @@ def auto_enqueue_fix(
         # must not read as "no fix task was created".
         citation = None
         try:
-            citation = _shadow_rounds_citation(tasks_by_id, review_task)
+            citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
             fix_context["tokenomics_shadow"] = citation
         except Exception:
             logger.exception(
@@ -1761,7 +1825,7 @@ def auto_enqueue_test(
             try:
                 _, citation, reason = _canary_round_cap(
                     tasks_by_id, review_task,
-                    contract.fix_round_cap(review_fix_max_rounds()))
+                    contract.fix_round_cap(review_fix_max_rounds()), queue)
                 queue.record_tokenomics_canary_receipt(
                     _lineage_root_task_id(tasks_by_id, review_task),
                     decision_source=(citation or {}).get(
