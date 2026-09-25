@@ -201,10 +201,12 @@ def build_mcp_server(
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
         if (not _runtime_paused and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
-                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))):
+                and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
+                         or "rebase_onto" in _artifact_context)):
             logger.info("MCP submit_result: artifact gate not applied — dispatch base absent (task=%s)", task_id)
         if (not _runtime_paused
-                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha"))
+                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
+                         or "rebase_onto" in _artifact_context)
                 and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"):
             # MCP is a per-worker subprocess launched from that worker's
