@@ -188,6 +188,7 @@ def test_run_loop_reviews_and_reimplements_on_reported_ref(tmp_path, monkeypatch
     invocation, dispatched = _run_loop(monkeypatch, tmp_path, results)
 
     assert invocation.exit_code == 0, invocation.output
+    assert dispatched[0][2]["crew_run_branch"] is False
     assert dispatched[1] == ("review", "fix/348-result", {
         "coordinator_managed": True, "no_tester": True, "pr_number": 348,
         "reviewed_sha": COMMIT,

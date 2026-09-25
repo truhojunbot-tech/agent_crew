@@ -50,6 +50,15 @@ crew status myproject
 crew teardown myproject
 ```
 
+When `main` is the configured base, `crew run --branch main` starts there;
+the implementer may
+report a separate work branch, which later review rounds follow. Naming a
+non-default branch (for example, `--branch feat/exec-engine`) pins that branch
+through implementation and review rounds and rejects a result reported from a
+different branch. The worker checks out caller-named branches detached so it
+does not lock or move a shared local ref. For a new remote branch, push a
+detached commit with `git push origin HEAD:refs/heads/<branch>`.
+
 ## Commands
 
 | Command | Description |
