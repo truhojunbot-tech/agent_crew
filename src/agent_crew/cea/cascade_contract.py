@@ -20,14 +20,8 @@ and never decides anything: ``pipeline.py`` imports nothing from
 ``agent_crew.risk_tier``, which
 ``tests/unit/test_sev0_cea_guard_count.py`` asserts statically.
 
-⛔What this step does **not** do: raise the contract to the receipt's J7 floor.
-  ``engine._j7_contract`` names a required reviewer/tester for essentially every
-  ``implement`` work class (``REVIEW_FLOOR``), so honouring it as a floor would
-  make Tier 0's implement-only cascade unreachable — a change to *which tasks
-  get reviewed*, not to where the decision lives. That is a behaviour change and
-  belongs to its own step with its own tests. The J7 fields are therefore
-  recorded on the contract (``j7_reviewer``/``j7_tester``) so the disagreement is
-  visible and measurable, and nothing here acts on them.
+The J7 fields are recorded on the contract for attribution. Every risk tier
+retains the baseline independent reviewer and tester; tiers may add gates.
 """
 from __future__ import annotations
 
@@ -127,15 +121,11 @@ def decide(description: str, context: Optional[Mapping],
         contract = CascadeContract(
             enforced=True, tier=tier,
             tier_source=(metadata or {}).get("risk_tier_source"),
-            # Tier 0 is intentionally implement-only. It remains observable via
-            # its task/result and can still be manually reviewed by an operator.
-            needs_reviewer=tier != TIER_0,
-            needs_tester=tier != TIER_0,
+            needs_reviewer=True,
+            needs_tester=True,
             review_mode="adversarial" if tier == TIER_2 else None,
-            # #272's tester consumes an explicit treatment rather than guessing
-            # scope from the project/provider.
-            test_scope="targeted" if tier == TIER_1 else None,
-            test_scope_source="risk_tier" if tier == TIER_1 else None,
+            test_scope=None,
+            test_scope_source=None,
             # Tier 3 contains irreversible/external work: no new worker becomes
             # runnable until a human resolves the durable approval gate.
             human_gate_required=tier == TIER_3,

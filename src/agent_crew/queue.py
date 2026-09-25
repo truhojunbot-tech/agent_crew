@@ -3837,7 +3837,8 @@ class TaskQueue:
                        shadow_resolved_at=?, shadow_reason=?, updated_at=?
                    WHERE task_id=?""",
                 (shadow["decision_source"], shadow["policy_version"],
-                 (json.dumps(shadow["recommendation"])
+                 (json.dumps({"produced_at": shadow.get("produced_at"),
+                              "recommendation": shadow["recommendation"]})
                   if shadow["recommendation"] is not None else None), shadow.get("contract_sha"),
                  now, shadow["reason"], now, task_id),
             )

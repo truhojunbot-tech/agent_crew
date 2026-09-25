@@ -78,7 +78,11 @@ def test_low_tiers_keep_safety_gates_without_deriving_a_fix_budget(tmp_db, monke
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("doc", "implement", "docs/README.md only", branch="b",
                               context={"changed_paths": ["docs/README.md"]}))
-    assert auto_enqueue_review(queue, "doc", pr_number=1, pr_state_fn=_open) is None
+    doc_review_id = auto_enqueue_review(queue, "doc", pr_number=1, pr_state_fn=_open)
+    assert doc_review_id == "review-doc-r0"
+    queue.submit_result(doc_review_id, TaskResult(
+        task_id=doc_review_id, status="completed", summary="ok", verdict="approve"))
+    assert auto_enqueue_test(queue, doc_review_id, pr_state_fn=_open) == "test-review-doc-r0"
     queue.enqueue(TaskRequest("internal", "implement", "internal helper with unit tests",
                               branch="b", context={"issue": 39}))
     review_id = auto_enqueue_review(queue, "internal", pr_number=2, pr_state_fn=_open)
@@ -88,7 +92,29 @@ def test_low_tiers_keep_safety_gates_without_deriving_a_fix_budget(tmp_db, monke
     queue.submit_result(review_id, TaskResult(task_id=review_id, status="completed",
                                                summary="ok", verdict="approve"))
     test_id = auto_enqueue_test(queue, review_id, pr_state_fn=_open)
-    assert _task(queue, test_id).context["test_scope"] == "targeted"
+    assert "test_scope" not in _task(queue, test_id).context
+
+
+def test_legacy_low_tier_contract_cannot_skip_independent_gates(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("legacy", "implement", "docs/README.md only", branch="b",
+                              context={"changed_paths": ["docs/README.md"]}))
+    contract = _task(queue, "legacy").context["cea_cascade"]
+    queue.patch_context("legacy", {"cea_cascade": {
+        **contract, "needs_reviewer": False, "needs_tester": False,
+        "test_scope": "targeted", "test_scope_source": "risk_tier"}})
+    review_id = auto_enqueue_review(queue, "legacy", pr_number=1, pr_state_fn=_open)
+    assert review_id == "review-legacy-r0"
+    review_contract = _task(queue, review_id).context["cea_cascade"]
+    queue.patch_context(review_id, {"cea_cascade": {
+        **review_contract, "needs_tester": False,
+        "test_scope": "targeted", "test_scope_source": "risk_tier"}})
+    queue.submit_result(review_id, TaskResult(
+        task_id=review_id, status="completed", summary="ok", verdict="approve"))
+    test_id = auto_enqueue_test(queue, review_id, pr_state_fn=_open)
+    assert test_id == "test-review-legacy-r0"
+    assert "test_scope" not in _task(queue, test_id).context
 
 
 def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(

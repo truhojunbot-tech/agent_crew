@@ -122,7 +122,7 @@ def test_completion_refresh_preserves_admission_receipt_and_records_later_decisi
     # Separately-provenanced completion fact.
     assert receipt["shadow_decision_source"] == "quota_core_contract"
     assert receipt["shadow_policy_version"] == "1.0"
-    assert json.loads(receipt["shadow_recommendation_json"])["risk_tier"] == "routine"
+    assert json.loads(receipt["shadow_recommendation_json"])["recommendation"]["risk_tier"] == "routine"
     assert receipt["shadow_contract_sha"]
     assert receipt["shadow_resolved_at"] is not None
 

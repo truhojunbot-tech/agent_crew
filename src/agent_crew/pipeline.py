@@ -919,17 +919,19 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task,
         if queue:
             receipt = queue.get_tokenomics_shadow_receipt(current.task_id)
             if receipt and receipt.get("shadow_decision_source") == "quota_core_contract":
-                resolved = receipt.get("shadow_resolved_at")
                 try:
-                    resolved_at = datetime.fromtimestamp(float(resolved), timezone.utc)
-                    recommendation = json.loads(receipt.get("shadow_recommendation_json") or "null")
+                    stored = json.loads(receipt.get("shadow_recommendation_json") or "null")
                 except (TypeError, ValueError, OverflowError):
-                    resolved_at, recommendation = None, None
-                if (resolved_at and decision_at and resolved_at <= decision_at
+                    stored = None
+                produced_at = (_contract_time(stored.get("produced_at"))
+                               if isinstance(stored, dict) else None)
+                recommendation = (stored.get("recommendation")
+                                  if isinstance(stored, dict) else None)
+                if (produced_at and decision_at and produced_at <= decision_at
                         and isinstance(recommendation, dict)):
-                    candidates.append((resolved_at, current.task_id, {
+                    candidates.append((produced_at, current.task_id, {
                         "decision_source": "quota_core_contract",
-                        "produced_at": resolved_at.isoformat(),
+                        "produced_at": produced_at.isoformat(),
                         "contract_sha": receipt.get("shadow_contract_sha"),
                         "recommendation": recommendation,
                         "reason": receipt.get("shadow_reason"),
@@ -939,17 +941,16 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task,
         if not isinstance(previous, str) or previous not in tasks_by_id:
             break
         current = tasks_by_id[previous]
-    # Legacy untimed contracts remain visible in shadow telemetry, but cannot
-    # pass the canary's provenance and freshness checks.
+    # Untimed and legacy receipts cannot establish when quota-core decided.
     cited_task_id = current.task_id
     shadow = shadow_recommendation_for_task_id(cited_task_id)
     if candidates:
         produced, cited_task_id, shadow = max(candidates, key=lambda item: item[0])
-    elif _contract_time(shadow.get("produced_at")) is not None:
-        # A timed contract outside this review's decision window is not even
-        # a shadow citation for this decision.
+    else:
+        # No eligible contract may supply a recommended value in baseline
+        # telemetry, whether it is untimed or outside this decision window.
         shadow = {"decision_source": "baseline", "recommendation": None,
-                  "reason": "contract_after_review_decision"}
+                  "reason": "contract_missing_or_stale"}
     recommendation = shadow.get("recommendation")
     recommendation = recommendation if isinstance(recommendation, dict) else {}
     recommended = recommendation.get("recommended_max_review_fix_rounds")
@@ -1585,10 +1586,6 @@ def auto_enqueue_review(
         risk = dict(contract.metadata)
         if not enforce_risk_tier:
             _record_risk_tier_shadow(queue, impl_task, "review_enqueued")
-        if enforce_risk_tier and not contract.needs_reviewer:
-            logger.info("auto_enqueue_review: %s needs no independent reviewer under the "
-                        "contract admission stored (tier %s)", impl_task_id, contract.tier)
-            return None
         # The gate itself is admission's decision; whether it has been resolved
         # is durable state on the row, which is a read, not a judgement.
         if enforce_risk_tier and contract.human_gate_required and not impl_ctx.get("tier3_gate_approved"):
@@ -1839,8 +1836,6 @@ def auto_enqueue_test(
         enforce_risk_tier = contract.enforced
         if not enforce_risk_tier:
             _record_risk_tier_shadow(queue, review_task, "test_enqueued")
-        if enforce_risk_tier and not contract.needs_tester:
-            return None
         # An approved Tier 3 test gate replays this exact transition.  The
         # durable receipt lives on the reviewed task, so a restart/replay does
         # not create a second gate or strand the already-approved lineage.
@@ -1882,10 +1877,10 @@ def auto_enqueue_test(
                 "risk_tier": contract.tier,
                 "risk_tier_source": review_ctx.get("risk_tier_source", "metadata"),
             })
-        if enforce_risk_tier and contract.test_scope:
-            # #272's tester consumes this as an explicit treatment rather than
-            # guessing scope from the project/provider. The scope is the one
-            # admission stored, not one re-derived here.
+        if (enforce_risk_tier and contract.test_scope
+                and contract.test_scope_source != "risk_tier"):
+            # Preserve independently admitted scope while refusing a legacy
+            # risk-tier treatment that weakens the baseline test requirement.
             test_context["test_scope"] = contract.test_scope
             test_context["test_scope_source"] = contract.test_scope_source or "risk_tier"
         if pr_number is not None:

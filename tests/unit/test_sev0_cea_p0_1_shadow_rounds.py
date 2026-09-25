@@ -10,6 +10,7 @@ exists. Narrowing requires the separately armed canary.
 import json
 import sqlite3
 import uuid
+from datetime import datetime, timezone
 
 import pytest
 
@@ -56,9 +57,10 @@ def _review(q, *, prev_task_id=ROOT, review_id=None, fix_round=None):
     return review_id
 
 
-def _contract(tmp_path, monkeypatch, decisions):
+def _contract(tmp_path, monkeypatch, decisions, *, produced_at=None):
     policy = tmp_path / "quota-core-v1.json"
     policy.write_text(json.dumps({"contract_version": "1.0", "mode": "shadow",
+                                  "produced_at": produced_at or datetime.now(timezone.utc).isoformat(),
                                   "decisions": decisions}))
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
     return policy
@@ -155,14 +157,7 @@ def test_a_citation_failure_cannot_withhold_the_fix_task(q, monkeypatch):
 
 def test_a_multi_hop_lineage_cites_the_latest_resolved_recommendation(
         q, tmp_path, monkeypatch):
-    """implement → review → fix → review → fix, with a DECOY at every hop.
-
-    ★The one-hop test above cannot tell "walk to the root" apart from "read
-      the parent's parent" — at round 1 they are the same task. Here they are
-      three tasks apart, and every id between the second fix and ROOT carries
-      a decision with a different number, so stopping anywhere short of ROOT
-      cites a budget quota-core published for some other task.
-    """
+    """A pinned multi-hop lineage may cite its latest eligible hop."""
     review_1, review_2 = "review-hop-1", "review-hop-2"
     fix_1 = fix_task_id(review_1, 1)
     _contract(tmp_path, monkeypatch, [
@@ -184,10 +179,10 @@ def test_a_multi_hop_lineage_cites_the_latest_resolved_recommendation(
     assert _fix(q, fix_2).context["fix_round"] == 2, (
         "not actually a second round — the decoys would be unreachable anyway")
     cited = _fix(q, fix_2).context["tokenomics_shadow"]
-    assert cited["cited_task_id"] == review_1
-    assert cited["recommended_max_review_fix_rounds"] == 11
+    assert cited["cited_task_id"] == review_2
+    assert cited["recommended_max_review_fix_rounds"] == 13
     assert json.loads(q.get_tokenomics_shadow_receipt(fix_2)["actual_execution_json"])[
-        "shadow_rounds_vs_cap"] == {"recommended": 11,
+        "shadow_rounds_vs_cap"] == {"recommended": 13,
                                     "actual_cap": DEFAULT_REVIEW_FIX_MAX_ROUNDS}
 
 
