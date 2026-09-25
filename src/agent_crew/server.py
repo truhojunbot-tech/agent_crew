@@ -370,7 +370,7 @@ def _checkout_detached(worktree_path: str, refs, *, what: str) -> bool:
             logger.info(
                 f"_prepare_worktree_for_task: {what} detached at {ref} — "
                 f"agent_crew does not own that branch name, so the ref is left "
-                f"where it is (#280). Push with `git push origin HEAD:<branch>`."
+                f"where it is (#280). Push with `git push origin HEAD:refs/heads/<branch>`."
             )
             return True
         logger.warning(
@@ -716,7 +716,42 @@ def _prepare_worktree_for_task_inner(
         # Fresh branch per task from the configured base (#140/#353). Use task.branch when
         # set (crew run --branch), otherwise derive from task_id.
         branch = task_branch if task_branch else f"agent/{task_id[:12]}"
-        if not _agent_crew_owns_branch(branch):
+        if task_context.get("crew_run_branch"):
+            # A foreground run pins the requested branch's CONTENT, not its
+            # shared local ref. Preserve local-only commits; otherwise use the
+            # remote tip. A new branch starts at the declared base. Only our
+            # generated branch names may be checked out with -B (#280); a
+            # caller-supplied context flag never grants shared-ref ownership.
+            local = _branch_ref(worktree_path, f"refs/heads/{branch}")
+            remote = _branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
+            if local and remote and not _is_ancestor(worktree_path, local, remote):
+                start = local
+            else:
+                start = remote or local
+            if not start:
+                start = _branch_ref(worktree_path, str(task_context.get("worktree_base_sha") or "")) \
+                    or _branch_ref(worktree_path, f"refs/remotes/origin/{main_branch}")
+            if not start:
+                raise WorktreeTargetUnresolved(
+                    f"implementer {task_id}: neither origin/{branch} nor declared "
+                    f"base origin/{main_branch} resolves; refusing to use main"
+                )
+            if _agent_crew_owns_branch(branch):
+                r = subprocess.run(
+                    ["git", "-C", worktree_path, "checkout", "-B", branch, start],
+                    capture_output=True, text=True, timeout=30,
+                )
+                if r.returncode != 0:
+                    raise WorktreeTargetUnresolved(
+                        f"implementer {task_id}: could not check out {branch}: {r.stderr.strip()}"
+                    )
+            elif not _checkout_detached(
+                worktree_path, [start], what=f"implementer {task_id} preserving {branch}",
+            ):
+                raise WorktreeTargetUnresolved(
+                    f"implementer {task_id}: could not detach at {start} for {branch}"
+                )
+        elif not _agent_crew_owns_branch(branch):
             # #280: somebody else's branch name. Do not create it, do not move
             # it — start from its own remote tip so the task still sees the code
             # it was dispatched for, and fall back to main when there is no such
