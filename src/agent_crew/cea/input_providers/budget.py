@@ -3,7 +3,8 @@
 ``budget_class`` per provider:
 
 * cooldown active (``{provider: until_epoch}`` in the cooldown file) ⇒ EXHAUSTED;
-* ``five_hour.utilization`` (or ``seven_day``, whichever is higher) ≥ 1.0 ⇒ EXHAUSTED,
+* ``five_hour.utilization`` / ``seven_day.utilization`` or Gemini bucket usage,
+  whichever is higher, ≥ 1.0 ⇒ EXHAUSTED,
   ≥ ``constrained_at`` ⇒ CONSTRAINED, else OK.
 
 O9 fail direction when the observation is **stale or missing** (``fetched_at``
@@ -117,10 +118,24 @@ class QuotaBudgetProvider:
         if cache.get("error") or now - observed > self.max_age_seconds:
             return self._stale(provider, observed)
         util = 0.0
+        observed_utilization = False
         for window in ("five_hour", "seven_day"):
             w = cache.get(window) or {}
             if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float)):
+                observed_utilization = True
                 util = max(util, float(w["utilization"]))
+        buckets = cache.get("buckets")
+        if isinstance(buckets, list):
+            for bucket in buckets:
+                if not isinstance(bucket, dict):
+                    continue
+                remaining = bucket.get("remainingFraction")
+                if (isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
+                        and 0 <= remaining <= 1):
+                    observed_utilization = True
+                    util = max(util, 1 - remaining)
+        if not observed_utilization:
+            return self._stale(provider, observed)
         if util >= 1.0:
             state = BudgetClass.EXHAUSTED
         elif util >= self.constrained_at:
