@@ -22,11 +22,13 @@
 import asyncio
 import json
 import os
+import sys
 import time
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 RUN_S = 0.35
@@ -211,3 +213,82 @@ def test_task_type_is_not_used_as_a_concurrency_lock_key():
     assert "active_workers" in loop and "active_worktrees" in loop, (
         "실행 슬롯/worktree lease 가 사라졌다"
     )
+
+
+def test_one_worker_assigned_two_roles_claims_review_tasks(tmp_db, tmp_path, monkeypatch):
+    def shared_roles(path):
+        wt = path / "wt_claude"
+        wt.mkdir()
+        (wt / ".git").mkdir()
+        state = {
+            "project": "t",
+            "role_agents": {
+                "implementer": "claude", "reviewer": "claude", "tester": "gemini",
+            },
+            "roles": [
+                {"role": role, "agent": "claude", "worktree": str(wt)}
+                for role in ("implementer", "reviewer")
+            ],
+        }
+        state_file = path / "state.json"
+        state_file.write_text(json.dumps(state))
+        return str(state_file)
+
+    monkeypatch.setattr(sys.modules[__name__], "_state", shared_roles)
+    spans = _run_dispatcher(
+        tmp_db, tmp_path, [_payload("review_only", task_type="review")],
+        settle_s=0.8,
+    )
+    assert len(spans) == 1 and spans[0][0] == "claude"
+
+
+def test_pull_claim_is_not_a_recoverable_dispatcher_orphan(tmp_db):
+    with patch.dict(os.environ, {
+        "AGENT_CREW_DISPATCHER": "1",
+        "AGENT_CREW_DISPATCH_INTERVAL": "60",
+        "AGENT_CREW_DELIVERY": "both",
+    }):
+        app = create_app(
+            db_path=tmp_db, pane_map={}, worktree_map={},
+            watchdog_disabled=True, anomaly_disabled=True,
+        )
+        with TestClient(app) as client:
+            assert client.post("/tasks", json=_payload("live_pull")).status_code == 201
+            claimed = client.get("/tasks/next", params={
+                "role": "implementer", "agent": "claude",
+            }).json()
+            assert claimed["task_id"] == "live_pull"
+            listing = client.get("/tasks/orphans").json()
+            assert listing["tasks"][0]["orphan"] is False
+            recovery = client.post("/tasks/live_pull/recover").json()
+            assert recovery["recovered"] is False
+            assert client.get("/tasks/live_pull").json()["status"] == "in_progress"
+        # A dispatcher restart must not reset another delivery owner's claim.
+        restarted = create_app(
+            db_path=tmp_db, pane_map={}, worktree_map={},
+            watchdog_disabled=True, anomaly_disabled=True,
+        )
+        with TestClient(restarted) as client:
+            assert client.get("/tasks/live_pull").json()["status"] == "in_progress"
+
+
+def test_dispatcher_claim_without_live_lease_can_be_recovered(tmp_db):
+    with patch.dict(os.environ, {
+        "AGENT_CREW_DISPATCHER": "1",
+        "AGENT_CREW_DISPATCH_INTERVAL": "60",
+    }):
+        app = create_app(
+            db_path=tmp_db, pane_map={}, worktree_map={},
+            watchdog_disabled=True, anomaly_disabled=True,
+        )
+        with TestClient(app) as client:
+            assert client.post("/tasks", json=_payload("orphaned_dispatch")).status_code == 201
+            claim = TaskQueue(tmp_db).dequeue(
+                role="implementer", claim_source="dispatcher")
+            assert claim.task_id == "orphaned_dispatch"
+            listing = client.get("/tasks/orphans").json()
+            assert listing["tasks"][0]["orphan"] is True
+            recovery = client.post("/tasks/orphaned_dispatch/recover").json()
+            assert recovery["recovered"] is True
+            assert client.get("/tasks/orphaned_dispatch").json()["status"] == "pending"
+            assert TaskQueue(tmp_db).get_task_claim_source("orphaned_dispatch") == ""

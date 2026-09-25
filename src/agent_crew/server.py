@@ -2370,14 +2370,16 @@ def create_app(
     reminded_task_ids: set[str] = set()
 
     def _requeue_orphans() -> None:
-        """On startup, reset in_progress tasks to pending and clean their worktrees.
+        """On startup, reset this dispatcher's in-progress claims to pending.
 
-        In dispatcher mode the server process owns agent subprocesses. A server
-        restart means those subprocesses were killed, so any in_progress task is
-        definitively incomplete and safe to re-queue.
+        Pull and push workers can share the queue in ``both`` delivery mode.
+        Their claims are not ours to reset when this process restarts.
         """
         tq = state["queue"]
-        orphans = tq.list_tasks(status="in_progress")
+        orphans = [
+            task for task in tq.list_tasks(status="in_progress")
+            if tq.get_task_claim_source(task.task_id) == "dispatcher"
+        ]
         if not orphans:
             return
         logger.info(f"dispatcher: re-queuing {len(orphans)} orphaned in_progress task(s)")
@@ -2625,38 +2627,40 @@ def create_app(
         #   두 번째 task 가 스케줄되지 않았다(2026-09-23 실측: pane 3개 중 실효 1개).
         #   잠금 키를 실행 자원(pane)으로 옮긴다 — 어느 pane 으로 갈지는 override 를
         #   해석해야 알 수 있으므로 **dequeue 뒤에** 판정하고, 충돌이면 되돌린다.
-        task = q().dequeue(role=role)
-        if task is None:
-            logger.debug(f"_try_push_next: no pending task for role {role}")
-            return  # nothing pending
-
-        # Check if task has an agent_override in context
-        _target_agent = _DISPATCH_ROLE_TO_AGENT.get(role, "")
-        task_context = task.context if isinstance(task.context, dict) else {}
-        logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
-        if "agent_override" in task_context:
-            agent_override = task_context["agent_override"]
-            override_pane_id = pane_map.get(agent_override)
-            if override_pane_id:
-                logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
-                pane_id = override_pane_id
-                # #292 review: the context measurement follows the pane, so it
-                # has to follow the override too.
-                _target_agent = agent_override
-            else:
-                logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
+        skipped: set[str] = set()
+        while True:
+            task = q().dequeue(role=role, skip_task_ids=skipped)
+            if task is None:
+                logger.debug(f"_try_push_next: no eligible pending task for role {role}")
                 return
+            pane_id = pane_map[role]
+            _target_agent = _DISPATCH_ROLE_TO_AGENT.get(role, "")
+            task_context = task.context if isinstance(task.context, dict) else {}
+            logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
+            if "agent_override" in task_context:
+                agent_override = task_context["agent_override"]
+                override_pane_id = pane_map.get(agent_override)
+                if override_pane_id:
+                    logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
+                    pane_id = override_pane_id
+                    # #292: context measurement follows the resolved pane.
+                    _target_agent = agent_override
+                else:
+                    logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
+                    q().requeue(task.task_id)
+                    skipped.add(task.task_id)
+                    continue
 
-        # ⭐override 까지 해석한 **최종 pane** 이 이미 바쁘면 되돌린다.
-        #   잠금 키는 task_type 이 아니라 실행 자원(pane)이다 — 같은 pane 에
-        #   두 task 를 밀어넣지 않는다(test_u_sp02 가 이 줄을 지킨다).
-        if pane_id in _panes_with_in_progress(exclude_task_id=task.task_id):
-            logger.debug(
-                f"_try_push_next: pane {pane_id} is busy — requeueing {task.task_id} "
-                f"(role={role}, task_type={task.task_type})"
-            )
-            q().requeue(task.task_id)
-            return
+            # A busy queue head must not hide a later task for a free pane.
+            if pane_id in _panes_with_in_progress(exclude_task_id=task.task_id):
+                logger.debug(
+                    f"_try_push_next: pane {pane_id} is busy — requeueing {task.task_id} "
+                    f"(role={role}, task_type={task.task_type})"
+                )
+                q().requeue(task.task_id)
+                skipped.add(task.task_id)
+                continue
+            break
 
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
@@ -4254,13 +4258,14 @@ def create_app(
         active_tasks: dict[str, asyncio.Task] = {}   # task_id → asyncio.Task
         task_slots: dict[str, str] = {}       # task_id → worker_id
 
-        # agent → 그 agent 가 기본으로 맡는 role (worktree 조회·기본 라우팅용).
-        _AGENT_TO_ROLE: dict[str, str] = {}
+        # Keep every configured role for an agent; the execution slot still
+        # serializes that agent's tasks across those roles.
+        _AGENT_TO_ROLES: dict[str, list[str]] = {}
         _ROLE_PRIORITY = {"implementer": 0, "reviewer": 1, "tester": 2}
         for _role, _agent in _DISPATCH_ROLE_TO_AGENT.items():
-            current = _AGENT_TO_ROLE.get(_agent)
-            if current is None or _ROLE_PRIORITY.get(_role, 99) < _ROLE_PRIORITY.get(current, 99):
-                _AGENT_TO_ROLE[_agent] = _role
+            _AGENT_TO_ROLES.setdefault(_agent, []).append(_role)
+        for _roles in _AGENT_TO_ROLES.values():
+            _roles.sort(key=lambda r: _ROLE_PRIORITY.get(r, 99))
 
         # worker 순회 순서 — 역할 우선순위를 따르되 같은 worker 는 한 번만.
         _workers: list[str] = []
@@ -4300,11 +4305,18 @@ def create_app(
                     for worker in _workers:
                         if worker in active_workers:
                             continue
-                        _default_role = _AGENT_TO_ROLE.get(worker, "")
-                        # ⭐`dequeue(agent=…)` 의 1단계가 **task_type 과 무관하게**
-                        #   `context.agent_override == worker` 인 task 를 먼저 집는다.
-                        #   override 가 스케줄 단계에서 반영되는 지점이 여기다.
-                        task = q().dequeue(agent=worker, role=_default_role)
+                        _worker_roles = _AGENT_TO_ROLES.get(worker, [])
+                        _default_role = _worker_roles[0] if _worker_roles else ""
+                        task = None
+                        for _candidate_role in _worker_roles:
+                            # Stage 1 checks overrides independent of task type;
+                            # Stage 2 checks each role this worker owns.
+                            task = q().dequeue(
+                                agent=worker, role=_candidate_role,
+                                claim_source="dispatcher",
+                            )
+                            if task is not None:
+                                break
                         if task is None:
                             continue
                         # 프로토콜·결과 처리는 task_type 이 정한다.
@@ -4355,10 +4367,11 @@ def create_app(
                     for agent in _discuss_workers:
                         if agent in active_workers:
                             continue
-                        task = q().dequeue_discuss_for_agent(agent)
+                        task = q().dequeue_discuss_for_agent(
+                            agent, claim_source="dispatcher")
                         if task is None:
                             continue
-                        role = _AGENT_TO_ROLE.get(agent, "implementer")
+                        role = _AGENT_TO_ROLES.get(agent, ["implementer"])[0]
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
                         _slot = _target_agent or agent
                         if _slot in active_workers:
@@ -5006,7 +5019,11 @@ def create_app(
         for r in rows:
             _ts = r["last_activity_at"] or r["created_at"]
             _age = max(0.0, _now - _ts) if _ts else None
-            _orphan = (_leased is not None and r["task_id"] not in _leased)
+            _orphan = (
+                _leased is not None
+                and r["claim_source"] == "dispatcher"
+                and r["task_id"] not in _leased
+            )
             if _age is not None and _age < older_than:
                 continue
             _ctx = r.get("context") or {}
@@ -5015,6 +5032,7 @@ def create_app(
                 "task_type": r["task_type"],
                 "idle_s": round(_age, 1) if _age is not None else None,
                 "agent_override": (_ctx.get("agent_override") or None),
+                "claim_source": r["claim_source"] or "unknown",
                 "has_dispatcher_lease": (None if _leased is None
                                          else r["task_id"] in _leased),
                 "orphan": _orphan,
@@ -5486,7 +5504,11 @@ def create_app(
         if _leased is not None and task_id in _leased and not force:
             return {"task_id": task_id, "recovered": False,
                     "reason": "dispatcher 가 이 task 의 lease 를 들고 있다(실행 중)"}
-        q().requeue(task_id)
+        if not force and not q().requeue_dispatcher_claim(task_id):
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "dispatcher claim provenance absent or changed"}
+        if force:
+            q().requeue(task_id)
         logger.info(
             f"recover_orphan_task: {task_id} in_progress -> pending "
             f"(lease_tracking={_leased is not None}, force={force})"
