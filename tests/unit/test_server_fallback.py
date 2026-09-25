@@ -60,6 +60,46 @@ def _make_app(tmp_db, *, push_calls, panes=None, **kwargs):
     )
 
 
+@pytest.mark.parametrize("summary, successor_prefix", [
+    ("worker failed", "retry-receipt-parent-"),
+    ("rate limit reached", "fallback-receipt-parent-"),
+])
+def test_successor_cea_blocks_belong_to_own_receipt(tmp_db, summary, successor_prefix):
+    app = _make_app(tmp_db, push_calls=[])
+    with TestClient(app) as client:
+        response = client.post("/tasks", json=_task_payload("receipt-parent"))
+        assert response.status_code == 201
+        queue = TaskQueue(tmp_db)
+        parent = next(t for t in queue.list_tasks() if t.task_id == "receipt-parent")
+        queue.patch_context(parent.task_id, {
+            "lineage_marker": "keep",
+            "cea_cascade": {"parent_only": True},
+            "cea_future_gate": {
+                "receipt_id": parent.context["cea_enqueue"]["receipt_id"],
+            },
+        })
+
+        response = client.post("/tasks/receipt-parent/result",
+                               json=_result("receipt-parent", summary=summary))
+        assert response.status_code == 200
+
+    tasks = queue.list_tasks()
+    parent = next(t for t in tasks if t.task_id == "receipt-parent")
+    child = next(t for t in tasks if t.task_id.startswith(successor_prefix))
+    parent_receipt = parent.context["cea_enqueue"]["receipt_id"]
+    child_receipt = child.context["cea_enqueue"]["receipt_id"]
+    assert parent.context["cea_result"]["receipt_id"] == parent_receipt
+    assert child_receipt != parent_receipt
+    assert child.context["lineage_marker"] == "keep"
+    assert child.context["original_task_id"] == parent.task_id
+    assert "cea_future_gate" not in child.context
+    assert "cea_result" not in child.context
+    assert "parent_only" not in child.context["cea_cascade"]
+    for key, block in child.context.items():
+        if key.startswith("cea_") and "receipt_id" in block:
+            assert block["receipt_id"] == child_receipt, key
+
+
 # U-FB01: rate-limit hit on implementer (claude) reroutes the same task to codex.
 def test_u_fb01_rate_limit_reroutes_implement_to_next_agent(tmp_db):
     push_calls: list = []

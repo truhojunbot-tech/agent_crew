@@ -58,6 +58,19 @@ logger = logging.getLogger(__name__)
 
 MAX_FALLBACK_CHAIN_DEPTH = 3
 
+
+def successor_context(parent_context: object) -> dict:
+    """Copy task metadata without the parent's per-receipt CEA decisions.
+
+    Admission writes fresh ``cea_enqueue`` and ``cea_cascade`` blocks for the
+    successor. A later result writes ``cea_result`` against that same receipt.
+    None of those blocks can be carried over from the parent task.
+    """
+    if not isinstance(parent_context, dict):
+        return {}
+    return {key: value for key, value in parent_context.items()
+            if not key.startswith("cea_")}
+
 #: Automated fix rounds allowed per review lineage (#244). The cap is the
 #: whole reason this transition is safe to automate: a reviewer that keeps
 #: rejecting would otherwise drive review→fix→review forever, burning quota on
@@ -1801,7 +1814,7 @@ def auto_fallback_failed_task(
         if not tasks:
             return False
         original = tasks[0]
-        ctx = dict(original.context) if isinstance(original.context, dict) else {}
+        ctx = successor_context(original.context)
         ctx.pop(RESULT_BRANCH_CONTEXT_KEY, None)
         ctx.pop(RESULT_COMMIT_CONTEXT_KEY, None)
 

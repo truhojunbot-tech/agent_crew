@@ -46,6 +46,7 @@ from agent_crew.pipeline import (
     auto_enqueue_review as _pipeline_auto_enqueue_review,
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
+    successor_context as _successor_context,
     hold_mismatched_pr_result,
     artifact_gate_applies,
     declared_artifact_kind,
@@ -5530,7 +5531,7 @@ def create_app(
                         return
 
             # Create retry task with incremented retry count
-            retry_context = dict(original_task.context) if isinstance(original_task.context, dict) else {}
+            retry_context = _successor_context(original_task.context)
             retry_context.pop(RESULT_BRANCH_CONTEXT_KEY, None)
             retry_context.pop(RESULT_COMMIT_CONTEXT_KEY, None)
             retry_context["retry_attempt"] = db_retry_attempt + 1
