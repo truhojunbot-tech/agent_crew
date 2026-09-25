@@ -704,6 +704,11 @@ def setup(project: str, agents: str, base: str):
 
     existing_state = _read_state(base, project)
     if existing_state is not None:
+        try:
+            setup_module.require_exclusive_port(existing_state["port"], project, base)
+        except ValueError as exc:
+            raise click.ClickException(str(exc)) from exc
+    if existing_state is not None:
         existing_pane_ids = existing_state.get("pane_ids", [])
         alive_panes = [p for p in existing_pane_ids if _pane_alive(p)]
         server_alive = _port_listening(existing_state.get("port", 0), timeout=1.0)
@@ -815,7 +820,7 @@ def setup(project: str, agents: str, base: str):
         port = existing_state["port"]
         server_pid = existing_state["server_pid"]
     else:
-        port = setup_module.find_free_port()
+        port = setup_module.find_free_port(base=base, project=project)
         setup_module.write_port_file(port_file, port, project=project)
 
     # Instruction files (into each worktree)

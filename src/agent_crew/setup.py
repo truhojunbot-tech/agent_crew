@@ -826,13 +826,13 @@ def _is_port_listening(port: int) -> bool:
             return False
 
 
-def _collect_active_ports(base: str | None = None) -> set[int]:
-    """Return ports from ~/.agent_crew/*/port files whose servers are still listening."""
+def _port_claims(base: str | None = None) -> dict[int, list[str]]:
+    """Read valid project port files without changing them."""
     if base is None:
         base = os.path.expanduser("~/.agent_crew")
-    active: set[int] = set()
+    claims: dict[int, list[str]] = {}
     if not os.path.isdir(base):
-        return active
+        return claims
     for entry in os.scandir(base):
         if not entry.is_dir():
             continue
@@ -840,38 +840,135 @@ def _collect_active_ports(base: str | None = None) -> set[int]:
         if not os.path.isfile(port_file):
             continue
         try:
-            port = require_project_port(int(open(port_file).read().strip()), entry.name)
+            with open(port_file) as file:
+                port = require_project_port(int(file.read().strip()), entry.name)
         except (ValueError, OSError):
             continue
-        if _is_port_listening(port):
-            active.add(port)
-    return active
+        claims.setdefault(port, []).append(entry.name)
+    return claims
 
 
-def find_free_port(start: int = 8100) -> int:
-    """Find a free port, blacklisting ports held by alive agent_crew servers.
+def list_duplicate_port_claims(base: str | None = None) -> dict[int, list[str]]:
+    """Return ports claimed by multiple projects, with sorted project names."""
+    return {port: sorted(projects) for port, projects in _port_claims(base).items()
+            if len(projects) > 1}
 
-    Scans ~/.agent_crew/*/port files and skips any port whose server is still
-    listening. Ports from dead (non-listening) projects remain eligible.
+
+def require_exclusive_port(port: int, project: str, base: str | None = None) -> int:
+    """Reject a port already recorded for another project."""
+    port = require_project_port(port, project)
+    others = sorted(name for name in _port_claims(base).get(port, []) if name != project)
+    if others:
+        raise ValueError(f"project {project!r}: port {port} is already claimed by "
+                         f"project(s) {', '.join(others)}")
+    return port
+
+
+def _claim_path(base: str, port: int) -> str:
+    return os.path.join(base, ".ports", str(port))
+
+
+def _claim_is_live(path: str) -> bool:
+    try:
+        pid = int(open(path).read().strip())
+        os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+def _claim_port(base: str | None, port: int) -> bool:
+    """Atomically reserve a pre-write allocation; reclaim dead-owner claims."""
+    if not base:
+        return True
+    claims = os.path.join(base, ".ports")
+    os.makedirs(claims, exist_ok=True)
+    path = _claim_path(base, port)
+    for _ in range(8):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if _claim_is_live(path):
+                return False
+            try:
+                os.unlink(path)
+            except OSError:
+                return False
+        else:
+            with os.fdopen(fd, "w") as claim:
+                claim.write(str(os.getpid()))
+            return True
+    return False
+
+
+def find_free_port(start: int = 8100, *, base: str | None = None,
+                   project: str = "", limit: int = 65535) -> int:
+    """Find a port owned by no other project and free to bind.
+
+    Scans ~/.agent_crew/*/port files and skips every claimed port.
     Binds the socket to verify (SO_REUSEADDR off) to avoid TOCTOU.
     """
     require_project_port(start, "allocator")
-    blacklisted = _collect_active_ports()
+    blacklisted = set(_port_claims(base))
+    if project and base:
+        own_file = os.path.join(base, project, "port")
+        try:
+            with open(own_file) as file:
+                own_port = require_project_port(int(file.read().strip()), project)
+        except FileNotFoundError:
+            own_port = None
+        except ValueError:
+            own_port = None
+        if own_port is not None:
+            require_exclusive_port(own_port, project, base)
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                    sock.bind(("127.0.0.1", own_port))
+                if _claim_port(base, own_port):
+                    return own_port
+            except OSError:
+                pass
     port = start
-    while True:
+    while port <= limit:
         if port in blacklisted:
             port += 1
             continue
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             try:
                 sock.bind(("127.0.0.1", port))
-                return port
+                if _claim_port(base, port):
+                    return port
+                port += 1
             except OSError:
                 port += 1
+    raise RuntimeError(f"no free ports available in range {start}-{limit}")
 
 
 def write_port_file(path: str, port: int, *, project: str = "") -> None:
     project = project or os.path.basename(os.path.dirname(os.path.abspath(path))) or "unknown"
     port = require_project_port(port, project)
-    with open(path, "w") as f:
-        f.write(str(port))
+    base = os.path.dirname(os.path.dirname(os.path.abspath(path)))
+    require_exclusive_port(port, project, base)
+    claim = _claim_path(base, port)
+    try:
+        with open(claim) as file:
+            claimed_by_self = int(file.read().strip()) == os.getpid()
+    except (FileNotFoundError, ValueError):
+        claimed_by_self = False
+    if not claimed_by_self and not _claim_port(base, port):
+        raise ValueError(f"project {project!r}: port {port} is reserved by another setup")
+    try:
+        require_exclusive_port(port, project, base)
+        unchanged = False
+        if os.path.isfile(path):
+            with open(path) as existing:
+                unchanged = existing.read().strip() == str(port)
+        if not unchanged:
+            with open(path, "w") as f:
+                f.write(str(port))
+    finally:
+        try:
+            if int(open(claim).read().strip()) == os.getpid():
+                os.unlink(claim)
+        except (OSError, ValueError):
+            pass
