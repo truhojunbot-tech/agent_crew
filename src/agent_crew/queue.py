@@ -3406,7 +3406,8 @@ class TaskQueue:
                       presenter: Optional[str] = None,
                       before_commit: Optional[ResultBeforeCommit] = None,
                       consume_receipt: bool = True,
-                      expected_status: Optional[str] = None) -> str:
+                      expected_status: Optional[str] = None,
+                      dispatcher_failed: bool = False) -> str:
         """Submit a task result. Returns the task_type of the completed task
         (so push-model callers can decide what to push next).
 
@@ -3460,16 +3461,15 @@ class TaskQueue:
                 try:
                     last_end = conn.execute(
                         "SELECT event FROM task_exec_events WHERE task_id=? "
-                        "AND event IN ('force_failed', 'result') "
+                        "AND event IN ('force_failed', 'dispatcher_failed', 'result') "
                         "ORDER BY event_id DESC LIMIT 1", (task_id,),
                     ).fetchone()
                 except sqlite3.OperationalError:
                     last_end = None
-                # `error_info.final` describes a reported failure, including
-                # dispatch setup failures written through submit_result. It is
-                # not evidence that the queue force-ended the row. Those
-                # results have always been revisable by a later report.
-                system_failed = last_end is not None and last_end["event"] == "force_failed"
+                # Only queue and dispatcher end events establish system
+                # authority. Worker-supplied error_info is never sufficient.
+                system_failed = (last_end is not None and last_end["event"]
+                                 in ("force_failed", "dispatcher_failed"))
             if prior_status in ("cancelled", "timed_out") or system_failed:
                 # Same write lock as cancel/timeout: evidence is durable, but
                 # the terminal row, receipt, attribution and outbox stay put.
@@ -3584,7 +3584,9 @@ class TaskQueue:
             )
             # G12 / D6: same funnel, same transaction — agent POSTs and
             # internal failures (_fail_if_active) both end the lease here.
-            self._record_end_on(conn, task_id, now, "result", posted=True,
+            self._record_end_on(conn, task_id, now,
+                                "dispatcher_failed" if dispatcher_failed else "result",
+                                posted=True, strict=dispatcher_failed,
                                 status=result.status, outcome=outcome)
             self._store_task_telemetry(conn, task_id, telemetry, now)
             # #204: completed_at >= started_at is expected to always hold —
@@ -4079,7 +4081,7 @@ class TaskQueue:
                 conn.execute("RELEASE SAVEPOINT exec_claim")
 
     def _record_end_on(self, conn, task_id: str, at: float, event: str, *,
-                       posted: bool, **fields) -> None:
+                       posted: bool, strict: bool = False, **fields) -> None:
         """End the lease and log how the task ended, inside the caller's txn.
 
         ``posted`` is True only for `submit_result` — a result that exists. A
@@ -4099,6 +4101,10 @@ class TaskQueue:
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK TO SAVEPOINT exec_end")
                 conn.execute("RELEASE SAVEPOINT exec_end")
+            if strict:
+                # A dispatcher-authored failure without its end marker could
+                # later admit a worker result. Roll back the whole result.
+                raise
 
     def record_dispatch(self, task_id: str, *, channel: str, agent: Optional[str] = None,
                         target: Optional[str] = None, lease_owner: Optional[str] = None,

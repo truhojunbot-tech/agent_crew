@@ -21,6 +21,14 @@ WRONG_REPO = "truhojunbot-tech/alfred"
 WORKTREE = "/canonical/quota-ops"
 
 
+@pytest.fixture(autouse=True)
+def _live_test_panes(monkeypatch):
+    """Let repository cascade tests submit results from live test panes."""
+    monkeypatch.setattr("agent_crew.server._resolve_tmux_pane_target", lambda target: target)
+    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr("agent_crew.server._pane_process_kind", lambda pane: ("agent", "test"))
+
+
 def _repo_from_worktree(cwd=None):
     return TARGET_REPO if cwd == WORKTREE else WRONG_REPO if cwd is None else None
 

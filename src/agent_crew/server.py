@@ -3874,6 +3874,7 @@ def create_app(
                     task_id,
                     TaskResult(task_id=task_id, status=status, summary=reason,
                                error_info={"reason": reason, "final": status == "failed"}),
+                    dispatcher_failed=status == "failed",
                 )
                 _attr = q().get_attribution(task_id)
                 record_context_event(

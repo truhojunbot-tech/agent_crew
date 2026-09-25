@@ -42,7 +42,7 @@ def _in_progress(q, task_id="t-1", task_type="implement"):
 # ── 1. a timeout is not a failure ─────────────────────────────────────
 
 
-def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour):
+def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, return_db=False):
     """Drive the REAL dispatch path and return the task row it ends with.
 
     ⛔Goes through `_dispatch_task`, not through the terminal-marking helper.
@@ -66,6 +66,8 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour):
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
+        if behaviour == "exception":
+            raise RuntimeError("subprocess setup failed")
         class _P:
             returncode = 0 if behaviour != "exit_1" else 1
             pid = 4242
@@ -96,7 +98,7 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour):
     monkeypatch.setattr(sv, "_dispatch_timeout_for_role", lambda role: 0.05)
     monkeypatch.setattr(sv.os, "killpg", lambda *a, **k: None)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=18103, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -105,7 +107,8 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour):
         task = q.dequeue(role="implementer")
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))
-        return next(t for t in q.list_tasks() if t.task_id == "t-1")
+        task_row = next(t for t in q.list_tasks() if t.task_id == "t-1")
+        return (task_row, db) if return_db else task_row
 
 
 def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch):

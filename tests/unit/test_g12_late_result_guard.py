@@ -126,11 +126,13 @@ def test_reported_failure_with_final_metadata_can_be_revised(tmp_db):
     q.enqueue(TaskRequest(task_id="review-revised", task_type="review",
                           description="review", branch="main"))
     assert q.dequeue(role="reviewer")
-    q.submit_result("review-revised", TaskResult(
-        task_id="review-revised", status="failed", summary="dispatch setup failed",
-        error_info={"reason": "pane_target_unresolvable", "final": True}))
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        reported = client.post("/tasks/review-revised/result", json={
+            "task_id": "review-revised", "status": "failed",
+            "summary": "worker failed", "error_info": {"final": True},
+        })
+        assert reported.status_code == 200
         response = client.post("/tasks/review-revised/result", json={
             "task_id": "review-revised", "status": "completed", "summary": "revised",
             "verdict": "approve", "findings": [],
@@ -139,6 +141,60 @@ def test_reported_failure_with_final_metadata_can_be_revised(tmp_db):
     assert q.get_task_status("review-revised") == "completed"
     assert not [e for e in q.get_exec_state("review-revised")["events"]
                 if e["event"] == "late_result"]
+
+
+@pytest.mark.parametrize("behaviour,reason", [
+    ("exception", "dispatcher_exception"), ("exit_1", "exit_1")])
+def test_dispatcher_final_failure_rejects_late_result(tmp_path, monkeypatch,
+                                                      behaviour, reason):
+    from tests.unit.test_issue_265_timeout_is_not_failure import _dispatch_outcome
+
+    task, db = _dispatch_outcome(tmp_path, monkeypatch, behaviour=behaviour,
+                                 return_db=True)
+    assert task.status == "failed"
+    assert task.error_info["reason"] == reason
+    q = TaskQueue(db)
+    assert [e["event"] for e in q.get_exec_state("t-1")["events"]
+            if e["event"] == "dispatcher_failed"] == ["dispatcher_failed"]
+    before_outbox = q.outbox_get("t-1")
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks/t-1/result", json={
+            "task_id": "t-1", "status": "completed", "summary": "late work",
+            "commit": "a" * 40,
+        })
+    assert response.status_code == 409, response.text
+    assert response.json()["late_result"] is True
+    after = next(t for t in q.list_tasks() if t.task_id == "t-1")
+    assert (after.status, after.summary, after.status_changed_at) == (
+        task.status, task.summary, task.status_changed_at)
+    assert q.outbox_get("t-1") == before_outbox
+    assert [t.task_id for t in q.list_tasks()] == ["t-1"]
+    late = [e for e in q.get_exec_state("t-1")["events"] if e["event"] == "late_result"]
+    assert len(late) == 1
+    assert late[0]["trust"] == "UNVERIFIED_LATE_EVIDENCE"
+
+
+def test_http_body_cannot_forge_dispatcher_failure(tmp_db):
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="worker-failure", task_type="review",
+                          description="review", branch="main"))
+    assert q.dequeue(role="reviewer")
+    app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        failed = client.post("/tasks/worker-failure/result", json={
+            "task_id": "worker-failure", "status": "failed", "summary": "worker error",
+            "dispatcher_failed": True,
+            "error_info": {"final": True, "dispatcher_failed": True},
+        })
+        assert failed.status_code == 200, failed.text
+        revised = client.post("/tasks/worker-failure/result", json={
+            "task_id": "worker-failure", "status": "completed", "summary": "revised",
+        })
+    assert revised.status_code == 200, revised.text
+    assert q.get_task_status("worker-failure") == "completed"
+    assert not [e for e in q.get_exec_state("worker-failure")["events"]
+                if e["event"] == "dispatcher_failed"]
 
 
 def test_in_progress_result_still_completes(tmp_db):
