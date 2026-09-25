@@ -20,7 +20,10 @@ class _HTTPQueueAdapter:
         self._client = client
         self.enqueued: list[str] = []
 
-    def enqueue(self, task) -> str:
+    def enqueue(self, task, *, ingress: str) -> str:
+        # The caller names its queue ingress; this adapter translates the call
+        # to POST /tasks, whose own admission ingress is http.tasks.
+        assert ingress == "cli.discuss"
         resp = self._client.post("/tasks", json={
             "task_id": task.task_id,
             "task_type": task.task_type,

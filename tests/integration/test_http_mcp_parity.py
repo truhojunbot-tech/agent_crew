@@ -27,6 +27,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -90,17 +91,36 @@ def _queue_snapshot(db_path: str) -> dict[str, dict]:
     snap = {}
     for t in q.list_tasks():
         # ``status`` lives outside TaskRequest — ask the queue.
-        rows = q._connect().execute(
-            "SELECT status FROM tasks WHERE task_id = ?", (t.task_id,)
-        ).fetchall()
+        conn = q._connect()
+        try:
+            rows = conn.execute(
+                "SELECT status, receipt_id FROM tasks WHERE task_id = ?", (t.task_id,)
+            ).fetchall()
+        finally:
+            conn.close()
         status = rows[0]["status"] if rows else None
+        assert rows[0]["receipt_id"] == t.context["cea_enqueue"]["receipt_id"]
         snap[t.task_id] = {
             "task_id": t.task_id,
             "task_type": t.task_type,
             "status": status,
-            "context": t.context,
+            "context": _normalize_context(t.context),
         }
     return snap
+
+
+def _normalize_context(context):
+    """Separate DB admissions mint different UUIDs; keep every gate decision."""
+    normalized = dict(context)
+    admission_id = normalized["cea_enqueue"]["receipt_id"]
+    assert str(UUID(admission_id)) == admission_id
+    for key in ("cea_enqueue", "cea_result"):
+        if key in normalized:
+            gate = dict(normalized[key])
+            assert gate["receipt_id"] == admission_id
+            gate["receipt_id"] = "<admission receipt>"
+            normalized[key] = gate
+    return normalized
 
 
 def _normalize_task_payload(payload):
@@ -112,7 +132,10 @@ def _normalize_task_payload(payload):
     if isinstance(payload, list):
         return [_normalize_task_payload(p) for p in payload]
     keys = ("task_id", "task_type", "description", "branch", "priority", "context")
-    return {k: payload.get(k) for k in keys if k in payload}
+    normalized = {k: payload.get(k) for k in keys if k in payload}
+    if "context" in normalized:
+        normalized["context"] = _normalize_context(normalized["context"])
+    return normalized
 
 
 @pytest.fixture
