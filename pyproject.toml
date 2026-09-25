@@ -29,4 +29,5 @@ markers = [
   "e2e: end-to-end tests",
   "stress: stress tests (50-run simulations)",
   "live_github: opts out of the GitHub write block; must target a disposable repo/PR (#263)",
+  "real_pane_process_kind: runs the real G_DT pane-process probe instead of the autouse agent default",
 ]

@@ -166,7 +166,7 @@ def test_deferring_an_unknown_task_is_not_an_error(tmp_db):
 
 
 def _dispatch(tmp_path, monkeypatch, *, lock_base, task_id="test-d", scope=None,
-              defers=0, unused_tcp_port):
+              context=None, defers=0, unused_tcp_port):
     """One real `_dispatch_task`; returns (spawned?, attribution row, events)."""
     from fastapi.testclient import TestClient
 
@@ -192,7 +192,7 @@ def _dispatch(tmp_path, monkeypatch, *, lock_base, task_id="test-d", scope=None,
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(scope))
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"gemini": str(wt)}}))
+    state.write_text(json.dumps({"port": 8111, "worktrees": {"gemini": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setenv("AGENT_CREW_BASE", lock_base)
@@ -204,7 +204,7 @@ def _dispatch(tmp_path, monkeypatch, *, lock_base, task_id="test-d", scope=None,
     with TestClient(app):
         q = TaskQueue(db)
         q.enqueue(TaskRequest(task_id=task_id, task_type="test", description="run",
-                              branch="main", context={}))
+                              branch="main", context=context or {}))
         for _ in range(defers):
             q.note_test_lock_defer(task_id)   # as earlier, deferred attempts would
         task = q.dequeue(role="tester")
@@ -246,6 +246,40 @@ def test_dispatch_records_an_opted_in_full_suite_and_its_source(tmp_path, monkey
     assert _of_type(events, "test_scope_resolved")[0]["effective_test_scope"] == "full_suite"
 
 
+def test_stale_risk_tier_targeted_scope_does_not_override_full_suite_by_default(
+    tmp_path, monkeypatch, *, unused_tcp_port,
+):
+    """An in-flight hard-cascade task must regain the baseline scope at default."""
+    monkeypatch.delenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", raising=False)
+    _, row, events = _dispatch(
+        tmp_path, monkeypatch, lock_base=str(tmp_path / "lb"),
+        scope={"full_suite": True, "full": ["make test"]},
+        context={"test_scope": "targeted"}, unused_tcp_port=unused_tcp_port,
+    )
+    assert row["effective_test_scope"] == "full_suite"
+    assert row["test_scope_source"] == "repo"
+    assert _of_type(events, "test_scope_resolved")[0]["effective_test_scope"] == "full_suite"
+
+
+def test_a_context_targeted_scope_is_ignored_even_when_risk_tier_is_enforced(
+    tmp_path, monkeypatch, *, unused_tcp_port,
+):
+    """SEV-0 CEA s4l, invariant 7 (§7.2): `context.test_scope` is request-side and
+    cannot lower the test gate, whatever the risk-tier flag says. Only the
+    admission receipt's J7 contract may reduce scope
+    (tests/unit/test_sev0_cea_s4l_ingress_test_scope.py)."""
+    monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
+    _, row, events = _dispatch(
+        tmp_path, monkeypatch, lock_base=str(tmp_path / "lb"),
+        scope={"full_suite": True, "full": ["make test"]},
+        context={"test_scope": "targeted", "test_scope_source": "risk_tier"},
+        unused_tcp_port=unused_tcp_port,
+    )
+    assert row["effective_test_scope"] == "full_suite"
+    assert row["test_scope_source"] == "repo"
+    assert _of_type(events, "test_scope_resolved")[0]["effective_test_scope"] == "full_suite"
+
+
 def test_the_event_stream_carries_no_filesystem_path(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔`scope["source"]` is a path under the user's home. The categorical kind
     is what goes out; publishing the path into an economics stream would be a
@@ -276,7 +310,7 @@ def test_a_non_test_task_records_no_treatment(tmp_path, monkeypatch, *, unused_t
     wt = tmp_path / "worktrees" / "demo" / "claude"
     wt.mkdir(parents=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}, "port": 8111, "worktrees": {"claude": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)

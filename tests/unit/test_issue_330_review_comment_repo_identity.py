@@ -13,6 +13,14 @@ REVIEWER_WORKTREE = "/fake/quota-ops-worktree"
 REVIEWER_REPO = "truhojunbot-tech/quota-ops"
 
 
+@pytest.fixture(autouse=True)
+def _live_test_panes(monkeypatch):
+    """Keep repository tests on the worker result path."""
+    monkeypatch.setattr("agent_crew.server._resolve_tmux_pane_target", lambda target: target)
+    monkeypatch.setattr("agent_crew.server._pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr("agent_crew.server._pane_process_kind", lambda pane: ("agent", "test"))
+
+
 def _state_path(tmp_path, roles):
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"roles": roles}))

@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import subprocess
 from typing import Optional
 
@@ -405,5 +406,35 @@ def merge_pr(
             timeout=30,
         )
         return result.returncode == 0
+    except Exception:
+        return False
+
+
+def independent_review_succeeded(pr_number: int, repo: str) -> bool:
+    """Require a successful independent-review commit status on the PR head.
+
+    A missing status, failed API call, or changed head is not merge authority.
+    GitHub's combined-status endpoint lists the latest state for each context.
+    """
+    if not repo or not check_gh_installed():
+        return False
+    try:
+        head = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo,
+             "--json", "headRefOid"],
+            capture_output=True, text=True, timeout=20)
+        if head.returncode != 0:
+            return False
+        sha = json.loads(head.stdout or "{}").get("headRefOid", "")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            return False
+        status = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{sha}/status"],
+            capture_output=True, text=True, timeout=20)
+        if status.returncode != 0:
+            return False
+        statuses = json.loads(status.stdout or "{}").get("statuses", [])
+        return any(s.get("context") == "crew/independent-review"
+                   and s.get("state") == "success" for s in statuses)
     except Exception:
         return False

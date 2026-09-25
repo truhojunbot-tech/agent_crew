@@ -172,11 +172,11 @@ def test_request_changes_with_nothing_actionable_enqueues_nothing(q):
     assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
 
 
-def test_coordinator_managed_review_is_skipped(q):
-    """`crew run` drives its own loop; a second enqueue here races it."""
+def test_coordinator_managed_review_still_enqueues_fix(q):
+    """alfred#51 §7.2 / CX-4b: provenance cannot suppress an actionable fix."""
     review_id = _review(q, context={"coordinator_managed": True})
 
-    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is not None
 
 
 def test_cross_project_review_is_skipped(q):
@@ -389,7 +389,8 @@ def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db):
                for pane, text in push.calls)
 
 
-def test_http_coordinator_managed_review_enqueues_no_fix(tmp_db):
+def test_http_coordinator_managed_review_enqueues_fix(tmp_db):
+    """alfred#51 §7.2 / CX-4b applies to the HTTP result cascade too."""
     from fastapi.testclient import TestClient
 
     push = _RecordingPush()
@@ -397,8 +398,8 @@ def test_http_coordinator_managed_review_enqueues_no_fix(tmp_db):
         _enqueue_review(client, "review-http-2", {"coordinator_managed": True})
         assert _post_review_result(client, "review-http-2").status_code == 200
 
-    assert not [t for t in TaskQueue(tmp_db).list_tasks()
-                if t.task_type == "implement"]
+    assert len([t for t in TaskQueue(tmp_db).list_tasks()
+                if t.task_type == "implement"]) == 1
 
 
 def test_http_approved_review_still_goes_to_test_not_fix(tmp_db):

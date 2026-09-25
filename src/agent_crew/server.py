@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import json
 import logging
 import math
@@ -9,12 +10,13 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
@@ -36,6 +38,7 @@ from agent_crew.context_identity import (
     record_context_event,
 )
 from agent_crew.fallback import is_rate_limit_error
+from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
@@ -44,7 +47,10 @@ from agent_crew.pipeline import (
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     hold_mismatched_pr_result,
+    artifact_gate_applies,
+    declared_artifact_kind,
     no_artifact_result,
+    verify_task_artifact,
     resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
     stale_review_task_id,
@@ -55,9 +61,14 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
+from agent_crew.queue import (AdmissionRefused, LateResultRejected, TaskAlreadyExistsError,
+                              TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              _ROLE_TO_TYPE, _TYPE_TO_ROLE)
+from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
+from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
+from agent_crew.cea import callsites as _cea_callsites
+from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
-from agent_crew.watch import active_tasks_for_issue
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
     load_scope as _load_test_scope,
@@ -133,11 +144,24 @@ def _recorded_pane_ids(
 def cancel_task_with_signal(
     queue: TaskQueue, task_id: str, *, state_path: Optional[str],
     pane_map: Optional[dict], events_path: str,
+    reason: str = _CANCEL_REASON_ATTEMPT,
 ) -> dict:
-    """Cancel in the DB and signal only its server-recorded, project-owned pane."""
-    prior_status, bound_pane = queue.cancel(task_id)
+    """Cancel in the DB and signal only its server-recorded, project-owned pane.
+
+    G12 I-A then #336's pane interrupt: the authoritative cancel (status,
+    receipt REVOKED, nonces spent, end event) commits in
+    ``TaskQueue.cancel_with_binding`` *before* any pane is signalled. A row
+    that is already terminal is refused there as a complete no-op and nothing
+    is signalled — ``cancelled`` is False and ``status`` names the refusing
+    status. An unknown id raises ValueError.
+    """
+    cancelled, prior_status, bound_pane = queue.cancel_with_binding(task_id, reason=reason)
     if prior_status is None:
         raise ValueError(f"Task not found: {task_id!r}")
+    if not cancelled:
+        return {"status": prior_status, "cancelled": False, "reason": "NOT_ACTIVE",
+                "worker_reachable": False, "cancel_signal_outcome": "not_active",
+                "pane_exit_observed": False}
     outcome = "not_running"
     reachable = False
     pane_exit_observed = False
@@ -185,7 +209,7 @@ def cancel_task_with_signal(
             )
         except Exception:
             logger.exception("cancel_signalled event failed for task=%s", task_id)
-    return {"status": "cancelled", "worker_reachable": reachable,
+    return {"status": "cancelled", "cancelled": True, "worker_reachable": reachable,
             "cancel_signal_outcome": outcome,
             "pane_exit_observed": pane_exit_observed}
 
@@ -965,6 +989,37 @@ def _prepare_worktree_for_task_inner(
     return _worktree_head(worktree_path)
 
 
+class _DispatchSlot:
+    """A dispatch that has been decided, whose child may not exist yet.
+
+    The registry entry exists from before ``record_dispatch`` commits until the
+    dispatch is over, so the two sides of the handoff always meet: a cancel
+    either finds ``proc`` and signals it, or sets ``cancel_requested`` for the
+    dispatcher to act on the moment the child appears.  ``pid`` delegates so the
+    slot reads like the process it stands in for.
+    """
+
+    __slots__ = ("task_id", "proc", "cancel_requested", "cancel_reason")
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.proc = None
+        self.cancel_requested = False
+        self.cancel_reason = ""
+
+    @property
+    def pid(self):
+        return getattr(self.proc, "pid", None)
+
+    @property
+    def returncode(self):
+        return getattr(self.proc, "returncode", None)
+
+    def __repr__(self) -> str:                    # pragma: no cover - diagnostics
+        return (f"_DispatchSlot(task_id={self.task_id!r}, pid={self.pid!r}, "
+                f"cancel_requested={self.cancel_requested!r})")
+
+
 def _review_result_is_actionable(result) -> bool:
     """Did this review actually review anything?
 
@@ -996,7 +1051,7 @@ _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 # (억제됐다 replay되는 result의 comment/escalation은 loss 가능하나, 리뷰어 판정상 duplication보다 허용됨.)
 _REPLAYING = contextvars.ContextVar("agent_crew_replaying", default=False)
 
-_LATE_RESULT_STATUSES = frozenset({"failed", "timed_out"})
+_LATE_RESULT_STATUSES = frozenset({"failed"})
 # #314 §5: merge 자동 재시도 상한. 이 횟수 이상 실패(conflict/gh 실패 등)면 자동 재시도 중단 →
 # escalation 대상(무한 재시도 금지). 비가역 상태(closed)는 횟수와 무관하게 즉시 재시도 안 함.
 _MAX_MERGE_ATTEMPTS = 3
@@ -1090,6 +1145,13 @@ def _detect_transient_error_in_log(
     if "subscriber fell behind updates" in tail:
         return "agy_subscriber_lag"
     return None
+
+
+#: G12 / D6 `dispatch_channel` for a dispatcher subprocess, by agent.
+_DISPATCH_CHANNEL = {"claude": "claude_p", "codex": "codex_exec", "gemini": "gemini_cli"}
+
+#: Seconds between process-alive heartbeats for a dispatcher subprocess (G12).
+_HEARTBEAT_INTERVAL_S = float(os.getenv("AGENT_CREW_HEARTBEAT_INTERVAL", "30"))
 
 
 def _dispatch_timeout_for_role(role: str, task_context: Optional[dict] = None) -> float:
@@ -1861,6 +1923,116 @@ def _pane_has_bash_prompt(pane_id: str) -> bool:
 #: Foreground commands that mean the agent CLI exited (#195 crash signature).
 _DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
 
+#: Executable names of the agent CLIs a task block may be pushed into (G_DT).
+#: Matched against argv[0] — or argv[1] under an interpreter, because the
+#: codex/gemini CLIs run as `node <path>/codex` and the claude quota wrapper as
+#: `python3 <path>/claude`.
+_AGENT_CLI_NAMES = frozenset({"claude", "codex", "gemini", "agy"})
+#: Refused pushes into one pane before the task ends as needs_human (G_DT).
+_PUSH_REFUSAL_MAX = max(1, int(os.getenv("AGENT_CREW_PUSH_REFUSAL_MAX", "3")))
+#: First backoff after a refused push; doubles per refusal on the same pane.
+_PUSH_REFUSAL_BACKOFF_S = float(os.getenv("AGENT_CREW_PUSH_REFUSAL_BACKOFF_S", "30"))
+#: The native claude binary is `~/.local/share/claude/versions/<semver>`, so
+#: tmux reports `#{pane_current_command}` as e.g. `2.1.185`.
+_CLAUDE_NATIVE_BINARY = re.compile(r"/claude/versions/[^/]+$")
+_INTERPRETER_NAME = re.compile(r"^(python[0-9.]*|node|bun|deno)$")
+#: `crew-log-viewer` (#182) — the process owned panes run in dispatcher mode.
+_LOG_VIEWER_NAMES = frozenset({"crew-log-viewer"})
+_LOG_VIEWER_MODULE = "agent_crew.log_viewer"
+
+
+def _process_identity(args: str) -> str:
+    """``agent`` | ``log_viewer`` | ``""`` for one process command line."""
+    argv = args.split()
+    if not argv:
+        return ""
+    names = [argv[0]]
+    if _INTERPRETER_NAME.match(os.path.basename(argv[0])):
+        if argv[1:3] == ["-m", _LOG_VIEWER_MODULE]:
+            return "log_viewer"
+        if len(argv) > 1:
+            names.append(argv[1])
+    for name in names:
+        base = os.path.basename(name)
+        if base in _LOG_VIEWER_NAMES:
+            return "log_viewer"
+        if base in _AGENT_CLI_NAMES or _CLAUDE_NATIVE_BINARY.search(name):
+            return "agent"
+    return ""
+
+
+def _pane_process_kind(pane_id: str) -> tuple[str, str]:
+    """Classify what a tmux push into ``pane_id`` would land in (G_DT).
+
+    Returns ``(verdict, detail)``; ``verdict`` is one of
+
+    * ``agent`` — an agent CLI runs in the pane's process tree;
+    * ``log_viewer`` — ``crew-log-viewer`` does (dispatcher-mode owned pane);
+    * ``shell`` — only a shell is left (the #195 crash signature);
+    * ``unknown`` — anything else, including a probe that failed.
+
+    Only ``agent`` may receive a push. The caller fails closed on the rest:
+    a task block typed into a log viewer or a bare shell is not delivered —
+    it is lost, or executed as shell input.
+
+    The whole process tree is read, not just ``#{pane_current_command}``:
+    that name alone is ambiguous — ``python3`` is both the log viewer and the
+    claude quota wrapper, ``node`` is codex, gemini, or an unrelated tool.
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p",
+             "#{pane_pid}\t#{pane_current_command}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001 — a probe failure refuses, never raises
+        return "unknown", f"tmux_probe_error:{type(exc).__name__}"
+    if r.returncode != 0:
+        return "unknown", "tmux_probe_failed"
+    pane_pid, _, current = r.stdout.strip().partition("\t")
+    if not pane_pid.isdigit():
+        return "unknown", "pane_pid_unavailable"
+    try:
+        ps = subprocess.run(
+            ["ps", "-e", "-o", "pid=,ppid=,args="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", f"ps_error:{type(exc).__name__}"
+    if ps.returncode != 0:
+        return "unknown", "ps_failed"
+    children: dict[str, list[str]] = {}
+    args_by_pid: dict[str, str] = {}
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        pid, ppid = parts[0], parts[1]
+        args_by_pid[pid] = parts[2] if len(parts) > 2 else ""
+        children.setdefault(ppid, []).append(pid)
+    if pane_pid not in args_by_pid:
+        return "unknown", f"pane_pid_{pane_pid}_not_running"
+    kinds: set[str] = set()
+    stack, seen = [pane_pid], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        kind = _process_identity(args_by_pid.get(pid, ""))
+        if kind:
+            kinds.add(kind)
+        stack.extend(children.get(pid, []))
+    detail = f"current_command={current or '?'}"
+    # A log viewer anywhere in the tree wins over an agent: ambiguity refuses.
+    if "log_viewer" in kinds:
+        return "log_viewer", detail
+    if "agent" in kinds:
+        return "agent", detail
+    if current in _DEAD_PANE_COMMANDS:
+        return "shell", detail
+    return "unknown", detail
+
 
 def _pane_liveness(pane_id: str) -> str:
     """``alive`` | ``dead`` | ``unknown`` for the process in ``pane_id`` (#231).
@@ -2342,22 +2514,55 @@ def _guard_description(task: TaskRequest) -> str:
     return f"{guard}\n\n{task.description}"
 
 
-def _format_task_message(task: TaskRequest, port: int) -> str:
+def _format_task_message(task: TaskRequest, port: int,
+                         nonce: Optional[str] = None) -> str:
+    """The block a worker receives — and, when one was minted, its dispatch nonce.
+
+    ADR P4/§2.2: the nonce is single-use, presented once at ``/start`` for a
+    go/no-go and once with the result under ``executor_binding``. Handing it to
+    the worker is what makes EXECUTE_START and RESULT *gates* rather than
+    helpers: ``record_dispatch`` minted one from the first day of step 2c, every
+    caller dropped it on the floor, and so under ``enforce`` every result was
+    refused for ``NONCE_MISSING`` while under ``shadow`` the gate recorded a
+    proof nobody had presented (codex cross-repo review of ``8993bdb``, P1 #2).
+
+    ``nonce=None`` reproduces the pre-2b block byte for byte. That is the honest
+    shape for a task with no receipt, and for a runtime whose engine minted
+    nothing: a block that told the worker to present a nonce it was never given
+    would just move the lie one hop downstream.
+    """
     ctx = json.dumps(task.context, ensure_ascii=False)
     description = _guard_description(task)
+    result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
+                   f"\"summary\":\"...\",\"findings\":[]}}")
+    start_step = ""
+    if nonce:
+        result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
+                       f"\"summary\":\"...\",\"findings\":[],"
+                       f"\"executor_binding\":{{\"nonce\":\"{nonce}\"}}}}")
+        start_step = (
+            f"FIRST, before any work, ask for the go/no-go — the nonce is single-use "
+            f"and this call spends it:\n"
+            f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/start "
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{\"nonce\":\"{nonce}\"}}'\n"
+            f"It answers {{\"go\": true|false}}. On go:false, STOP — do not start the work.\n"
+        )
     return (
         f"=== AGENT_CREW TASK ===\n"
         f"task_id: {task.task_id}\n"
         f"task_type: {task.task_type}\n"
         f"branch: {task.branch}\n"
         f"priority: {task.priority}\n"
-        f"context: {ctx}\n"
+        + (f"dispatch_nonce: {nonce}\n" if nonce else "")
+        + f"context: {ctx}\n"
         f"description: {description}\n"
         f"=== END TASK ===\n"
-        f"Do the work described above, then POST result: "
+        + start_step
+        + f"Do the work described above, then POST result: "
         f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
         f"-H 'Content-Type: application/json' "
-        f"-d '{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\",\"summary\":\"...\",\"findings\":[]}}'"
+        f"-d '{result_body}'"
     )
 
 
@@ -2475,9 +2680,180 @@ def create_app(
     _push_enabled = _delivery_raw in ("push", "both")
 
     _dispatcher_enabled = os.getenv("AGENT_CREW_DISPATCHER", "0").lower() not in ("0", "false", "no")
+    # Only dispatcher subprocesses live here.  Pane workers cannot be killed
+    # by PID safely, so cancellation still revokes their authorization first.
+    #
+    # Values are either a spawned process (what a test injects directly) or a
+    # `_DispatchSlot` reservation for a dispatch whose child does not exist yet.
+    _active_dispatch_processes: dict[str, object] = {}
+    #: Guards the registry *and* the cancel/spawn handoff it mediates.  Cancel
+    #: arrives on a FastAPI threadpool thread while the dispatcher runs on the
+    #: event loop, so "look up the process, decide, act" has to be one atomic
+    #: step for both of them.  Nothing awaits while holding it.
+    _active_dispatch_lock = threading.Lock()
+    #: Pending SIGTERM→SIGKILL escalation timers, keyed by task_id.  Kept
+    #: addressable so they can be cancelled when the process exits on its own
+    #: (and by tests in teardown).  A bare ``threading.Timer`` holding a real
+    #: ``os.killpg`` is a live weapon: with a stubbed process whose
+    #: ``returncode`` never flips, it fired after the test had torn its
+    #: monkeypatching down and signalled whatever the kernel had since
+    #: recycled that pid to (review of 720ac76).
+    _cancel_kill_timers: dict[str, threading.Timer] = {}
+    #: Grace period between SIGTERM and SIGKILL on cancel.  Env-tunable so
+    #: tests can drive the escalation without a real two-second sleep.
+    _cancel_kill_grace = float(os.getenv("AGENT_CREW_CANCEL_KILL_GRACE", "2.0"))
+
+    def _cancel_pending_kill(task_id: str) -> None:
+        """Defuse a scheduled SIGKILL for ``task_id`` (process already gone)."""
+        timer = _cancel_kill_timers.pop(task_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _reserve_dispatch_slot(task_id: str) -> "_DispatchSlot":
+        """Claim the registry entry for a dispatch that is about to be decided.
+
+        ⛔Must happen BEFORE `record_dispatch` commits.  That commit is what
+          makes the attempt visible to a cancel, and the child does not exist
+          until several statements later; in that window the DELETE used to find
+          `None`, answer `pane_worker_not_killable` and kill nothing, after which
+          the dispatcher registered the child and awaited it as a live worker for
+          an already-cancelled task (r2 review of 4a49338, finding 2).  With the
+          reservation in place the cancel has something to find, and the
+          dispatcher's post-spawn re-check under the same lock does the killing.
+        """
+        slot = _DispatchSlot(task_id)
+        with _active_dispatch_lock:
+            _active_dispatch_processes[task_id] = slot
+        return slot
+
+    def _release_dispatch_slot(task_id: str, slot: "_DispatchSlot") -> None:
+        """Drop ``slot`` from the registry — only if it is still the one there,
+        so a later dispatch's entry is never popped by an earlier one's cleanup.
+        """
+        with _active_dispatch_lock:
+            if _active_dispatch_processes.get(task_id) is slot:
+                _active_dispatch_processes.pop(task_id, None)
+
+    def _drop_unspawned_reservation(task_id: str) -> None:
+        """Backstop for the dispatch teardown: a reservation whose child never
+        came into existence (prep raised between the reservation and the spawn)
+        must not outlive the dispatch, or every later cancel for this task is
+        answered `worker_not_spawned_yet` by a slot nobody will ever fill.  A
+        spawned process is left alone — the dispatch's own `finally` owns that.
+        """
+        with _active_dispatch_lock:
+            entry = _active_dispatch_processes.get(task_id)
+            if isinstance(entry, _DispatchSlot) and entry.proc is None:
+                _active_dispatch_processes.pop(task_id, None)
+
+    async def _claim_spawned_child(task_id: str, slot: "_DispatchSlot", proc) -> bool:
+        """Publish ``proc`` into its reserved slot and answer: was it already
+        cancelled?  True means the child has been stopped (or recorded ORPHANED)
+        and the caller must NOT await it as a live worker.
+
+        Both halves of the decision happen under one lock acquisition, so a
+        cancel either sees the process (and signals it itself) or sets the flag
+        this reads — never neither.  The DB status is re-read as well, because a
+        cancel that committed before the slot existed left no flag to see.
+        """
+        with _active_dispatch_lock:
+            slot.proc = proc
+            cancelled = slot.cancel_requested
+            reason = slot.cancel_reason or _CANCEL_REASON_ATTEMPT
+        if not cancelled:
+            try:
+                cancelled = q().get_task_status(task_id) == "cancelled"
+            except Exception:
+                logger.exception("dispatch: cancel re-check failed task=%s", task_id)
+                cancelled = False
+            reason = _CANCEL_REASON_ATTEMPT
+        if not cancelled:
+            return False
+        outcome = _terminate_worker(task_id, proc)
+        logger.warning("dispatch: task=%s was cancelled during handoff — worker %s pid=%s",
+                       task_id, outcome, getattr(proc, "pid", None))
+        if outcome in ("sigterm_sent", "already_exited"):
+            # Reaping, not awaiting a live worker: no result, timeout or failure
+            # handling runs off this wait.  It outlasts the SIGKILL escalation on
+            # purpose, so the only way past it is a child that survived SIGKILL —
+            # which is then honestly recorded as ORPHANED rather than forgotten.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=_cancel_kill_grace + 5.0)
+            if getattr(proc, "returncode", None) is None:
+                _record_orphaned_worker(task_id, proc, reason=reason,
+                                        outcome="survived_termination")
+        else:
+            _record_orphaned_worker(task_id, proc, reason=reason, outcome=outcome)
+        return True
+
+    def _record_orphaned_worker(task_id: str, proc, *, reason: str, outcome: str) -> None:
+        """Note a still-running child we could not signal, with its pid."""
+        with contextlib.suppress(Exception):
+            q().record_worker_orphaned(task_id, pid=getattr(proc, "pid", None),
+                                       reason=reason, outcome=outcome)
+
+    def _stop_worker_for_ended_task(task_id: str, *, reason: str) -> str:
+        """I-B for a task whose authoritative end has already committed.
+
+        One code path for the HTTP DELETE and for a stale-lease expiry, so the
+        two cannot drift: a child we own is signalled, a child that cannot be
+        signalled is recorded ORPHANED with its pid, and a dispatch that has
+        been decided but not yet spawned is handed to the dispatcher's own
+        post-spawn re-check instead of being reported as "nothing to kill".
+        """
+        with _active_dispatch_lock:
+            entry = _active_dispatch_processes.get(task_id)
+            if isinstance(entry, _DispatchSlot):
+                entry.cancel_requested = True
+                entry.cancel_reason = reason
+                proc = entry.proc
+                if proc is None:
+                    return "worker_not_spawned_yet"
+            else:
+                proc = entry
+        outcome = _terminate_worker(task_id, proc)
+        if proc is not None and outcome not in ("sigterm_sent", "already_exited"):
+            _record_orphaned_worker(task_id, proc, reason=reason, outcome=outcome)
+        return outcome
+
+    def _terminate_worker(task_id: str, proc) -> str:
+        """Stop the worker for an already-cancelled task.  Returns the state
+        to report, naming what actually happened rather than guessing.
+
+        Only dispatcher subprocesses are ours to signal; a pane worker has no
+        PID we own, so for it the authoritative cancel is the entire remedy.
+        """
+        if isinstance(proc, _DispatchSlot):
+            proc = proc.proc
+        if proc is None:
+            return "pane_worker_not_killable"
+        if getattr(proc, "returncode", None) is not None:
+            return "already_exited"
+        try:
+            # The subprocess owns a session, so this reaches its helpers too.
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            logger.warning("cancel: worker process group unavailable task=%s pid=%s",
+                           task_id, getattr(proc, "pid", None))
+            return "process_group_unavailable"
+
+        def _kill_if_still_alive() -> None:
+            _cancel_kill_timers.pop(task_id, None)
+            if getattr(proc, "returncode", None) is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+
+        _cancel_pending_kill(task_id)
+        timer = threading.Timer(_cancel_kill_grace, _kill_if_still_alive)
+        timer.daemon = True
+        _cancel_kill_timers[task_id] = timer
+        timer.start()
+        return "sigterm_sent"
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
+    #: G_DT: tmux pushes refused because the pane runs no agent, by verdict.
+    delivery_guard_refusals: dict[str, int] = {}
 
     def _requeue_orphans() -> None:
         """On startup, reset this dispatcher's in-progress claims to pending.
@@ -2514,7 +2890,24 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        state["queue"] = TaskQueue(db_path)
+        # ADR P1/P7 — construct the CEA inputs here, in the process that decides.
+        # Before this, production built `TaskQueue(db_path)` with no providers at
+        # all: every input reported unavailable, every receipt was BLOCK, and the
+        # P6 loosening verifier had no production call site, so a signed snapshot
+        # on disk could not restore ACTIVE through this server no matter what it
+        # said. `install_from_env` never raises and never loosens by itself — an
+        # input it cannot read stays UNAVAILABLE, which P7 turns into a recorded
+        # BLOCK inside the engine rather than an exception out here.
+        #
+        # The schema-creating construction happens first and on purpose: the P6
+        # runtime row the runtime provider reads lives in that database, so
+        # wiring before it exists would leave the runtime slot UNAVAILABLE for
+        # the whole life of a first-ever start.
+        TaskQueue(db_path)
+        _cea_wiring = cea_wiring.install_from_env(
+            db_path=db_path, project=project, logger=logger)
+        state["cea_wiring"] = _cea_wiring
+        state["queue"] = TaskQueue(db_path, cea_providers=_cea_wiring.providers)
         # #248: stamp the build into the durable event stream at startup, so a
         # production before/after cohort can be cut on the PROCESS boundary
         # instead of on a GitHub merge time. #247 showed those are not the same
@@ -2581,6 +2974,26 @@ def create_app(
             "status": "ok", "suppressed_by_pause": True, "cascade_suppressed": True,
             "detail": "runtime STOP: execution-producing mutation atomically refused"})
 
+    # SEV-0 CEA s4f (FOLD-IN 5a): a refused admission is an answer, not a crash.
+    # Without this handler `POST /tasks` had no `except AdmissionRefused` (only
+    # TaskAlreadyExistsError -> 409) and no app-level handler, so every enforced
+    # refusal left as a 500 with a traceback — indistinguishable, to a client,
+    # from the server being broken. An app-level handler rather than a try/except
+    # in one route on purpose: AdmissionRefused is raised at three call sites
+    # (enqueue/claim/result), and a per-route catch would give the same refusal a
+    # different shape depending on which door it arrived at, which is exactly the
+    # ingress-equivalence property (§12.1 I1) the ADR asks us to preserve.
+    from agent_crew.queue import AdmissionRefused as _AdmissionRefused
+    from agent_crew.cea.refusal_http import refusal_payload as _refusal_payload
+
+    @app.exception_handler(_AdmissionRefused)
+    async def _admission_refused_handler(request, exc):  # noqa: ANN001
+        status, body = _refusal_payload(exc)
+        logger.warning("admission refused at %s: %s -> HTTP %s (receipt=%s, path=%s)",
+                       body["point"], body["reason"], status, body["receipt_id"],
+                       request.url.path)
+        return _JSONResponse(status_code=status, content=body)
+
     def q() -> TaskQueue:
         return state["queue"]
 
@@ -2596,8 +3009,55 @@ def create_app(
             return False
         return True
 
-    def _guard_tmx_push(task_id: str, target: str) -> str:
-        """Return a live, project-owned pane id or refuse the dispatch."""
+    def _guard_agent_process(task_id: str, target: str, pane_id: str, *,
+                             requeue: bool) -> bool:
+        """Refuse a push into an owned pane that is not running an agent CLI (G_DT).
+
+        #373 answers "is this pane ours?", not "is anything there to read the
+        block?". With AGENT_CREW_DELIVERY=both (the default) and the
+        dispatcher on, owned panes run `crew-log-viewer`, and a push typed
+        there is lost. Fail-closed: only a recognised agent is pushed to.
+
+        The task is backed off, not failed at once: under the dispatcher it is
+        still deliverable, and the refusal is about this pane, not the task.
+        `defer_push_delivery` counts refusals per (task, pane) and sets an
+        exponential `push_not_before` that only the push path's dequeue
+        honours, so the same oldest task cannot hot-loop claim→requeue and
+        starve the ones behind it (review of addc29e, P1). After
+        ``_PUSH_REFUSAL_MAX`` refusals on one pane it ends as `needs_human`:
+        nothing will make that pane an agent without a person.
+        ``requeue=False`` is for callers holding a task that is already
+        running elsewhere (watchdog reminders).
+        """
+        verdict, detail = _pane_process_kind(pane_id)
+        if verdict == "agent":
+            return True
+        reason = f"pane_not_agent_{verdict}"
+        delivery_guard_refusals[reason] = delivery_guard_refusals.get(reason, 0) + 1
+        logger.warning(
+            "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=%s "
+            "detail=%s refusals=%d delivery=%s",
+            task_id, target, pane_id, reason, detail,
+            delivery_guard_refusals[reason], _delivery_raw,
+        )
+        if requeue:
+            count = q().defer_push_delivery(
+                task_id, pane_id, reason,
+                max_refusals=_PUSH_REFUSAL_MAX, backoff_s=_PUSH_REFUSAL_BACKOFF_S)
+            if count is not None and count >= _PUSH_REFUSAL_MAX:
+                logger.error(
+                    "tmux push refused %d times task_id=%s pane=%s reason=%s — needs_human",
+                    count, task_id, pane_id, reason)
+                _fail_if_active(task_id, f"push_refused_{reason}", status="needs_human")
+        return False
+
+    def _guard_tmx_push(task_id: str, target: str, *, require_agent: bool = True) -> str:
+        """Return a live, project-owned pane id or refuse the dispatch.
+
+        ``require_agent=False`` is only for callers that inspect a pane rather
+        than type into it (the watchdog's busy/timeout probe): refusing those
+        would stop a task in a crashed pane from ever timing out.
+        """
         if not _guard_task_existence(task_id, target):
             return ""
         pane_id = _resolve_tmux_pane_target(target)
@@ -2638,11 +3098,14 @@ def create_app(
             )
             q().requeue(task_id)
             return ""
+        if require_agent and not _guard_agent_process(task_id, target, pane_id, requeue=True):
+            return ""
         return pane_id
 
     # Expose the exact push boundary for state-backed guard tests; production
     # dispatch still reaches it only through _try_push_next/_try_push_discuss.
     app.state.guard_tmx_push = _guard_tmx_push
+    app.state.delivery_guard_refusals = delivery_guard_refusals
 
     def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
                               caller: str) -> None:
@@ -2669,6 +3132,167 @@ def create_app(
             task.context = {**(task.context or {}), **base_context}
         except Exception:
             logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
+
+    def _complete_suppressed_review(task: TaskRequest, decision) -> bool:
+        """End a suppressed review as a COMPLETED review carrying the standing verdict.
+
+        ⛔Not `blocked`, and not `failed`. A suppression is "the review was
+          deliberately skipped because a verdict already stands", which is a
+          *reused judgement*, not an absent one. Every consumer that reads a
+          terminal review reads it as a failure otherwise, and each of them
+          then spends exactly what the canary exists to save:
+
+          * `loop.handle_review_result` mapped it to `review_failed`, so
+            `next_review_action` retried it twice and then gave up;
+          * `blocked` is in `loop._DEAD_REVIEW_STATUSES`, so `enqueue_review`
+            refused to reuse the task and minted a fresh `review-<uuid8>` at the
+            identical head — which the canary suppressed again, one more canary
+            receipt each time round;
+          * the server-side cascade (`auto_enqueue_fix`) drops any review whose
+            status is not `completed`, so the fix round never happened and the
+            lineage simply stopped.
+
+          Writing the standing verdict and its findings instead makes both
+          paths take the ordinary `request_changes` branch: the fix step runs
+          exactly as it would have after a real re-review, and the only thing
+          that did not happen is the reviewer invocation.
+
+        Returns ``True`` only once the terminal state is readable in the DB —
+        the caller dispatches normally otherwise, so an unrecordable
+        suppression can never silently swallow a review.
+        """
+        if not any(t.task_id == task.task_id
+                   for t in q().list_tasks(status="in_progress")):
+            return False
+        ctx = task.context if isinstance(task.context, dict) else {}
+        pr_number = ctx.get("pr_number", getattr(task, "pr_number", None))
+        try:
+            pr_number = (int(pr_number)
+                         if pr_number is not None and not isinstance(pr_number, bool)
+                         else None)
+        except (TypeError, ValueError):
+            pr_number = None
+        findings = _canary.reuse_findings(
+            getattr(decision, "standing_findings", None) or [],
+            decision.standing_review_task_id)
+        result = TaskResult(
+            task_id=task.task_id, status="completed", summary=_canary.SUPPRESSED_REASON,
+            verdict="request_changes", findings=findings, pr_number=pr_number,
+        )
+        if not q().suppress_review_atomically(
+            task.task_id, result, decision_source=decision.decision_source,
+            recommendation=decision.recommendation(),
+            counterfactual=decision.counterfactual, reason=decision.reason,
+        ):
+            return False
+        # These audit sinks are deliberately post-commit best effort.  They
+        # cannot turn a committed suppression into a provider dispatch.
+        try:
+            _attr = q().get_attribution(task.task_id)
+            record_context_event(
+                _context_events_path, "task_completed",
+                task_id=task.task_id, reason=_canary.SUPPRESSED_REASON,
+                project=(_attr or {}).get("project"), role=(_attr or {}).get("role"),
+                agent=(_attr or {}).get("agent"), context_id=(_attr or {}).get("context_id"),
+            )
+            if _attr:
+                append_attribution_jsonl(_attr_jsonl_path, _attr)
+        except Exception:
+            logger.exception("tokenomics canary: post-commit audit failed for %s", task.task_id)
+        # ⛔The cascade lives on the HTTP result endpoint, and this result never
+        #   goes through it — the suppression writes it from inside dispatch. So
+        #   drive the same transition here, or the reused verdict is recorded and
+        #   nothing acts on it, which is the lineage stall from the other
+        #   direction. `auto_enqueue_fix` is idempotent per review round and
+        #   swallows its own errors (#244).
+        try:
+            _auto_enqueue_fix(task.task_id, repo=str(ctx.get("repo") or ""))
+        except Exception:
+            logger.exception(
+                "tokenomics canary: fix cascade failed for suppressed review %s",
+                task.task_id)
+        return True
+
+    def _tokenomics_canary_gate(task: TaskRequest, reviewed_sha: str) -> bool:
+        """SEV-0 §11 ONE-TASK canary. ``True`` means this review was suppressed.
+
+        The only behaviour change the matched evidence (quota-core
+        ``sev0/phaseb-80-contract-emitter`` 869a3cf) supports: do not send a
+        reviewer to a commit that a standing ``request_changes`` already
+        describes. Every other review is evaluated, recorded and dispatched
+        exactly as before.
+
+        ⛔Fails open, in three places. An evaluation error, a receipt-write
+          error, or an unarmed pin all end in a normal dispatch. Suppression is
+          the narrow path and it only runs when everything about it is known
+          and written down — a suppression nobody can read afterwards would be
+          indistinguishable from the dispatcher silently losing the task.
+        """
+        try:
+            decision = _canary.evaluate_review_dispatch(
+                task, reviewed_sha=reviewed_sha or "",
+                standing_lookup=q().standing_request_changes_review,
+            )
+        except Exception:
+            logger.exception(
+                f"tokenomics canary: evaluation failed for {task.task_id} — dispatching")
+            return False
+        # Persist an intent-only receipt first. ``applied=true`` is written
+        # only after the terminal transition below is observable in the DB.
+        _recommendation = decision.recommendation()
+        if decision.applied:
+            _recommendation["applied"] = False
+            _recommendation["transition_pending"] = True
+        try:
+            q().record_tokenomics_canary_receipt(
+                task.task_id,
+                decision_source=decision.decision_source,
+                recommendation=_recommendation,
+                applied=False,
+                counterfactual=decision.counterfactual,
+                reason=decision.reason,
+                cea_receipt_id=q().task_receipt_id(task.task_id),
+            )
+        except Exception:
+            # ⛔Dispatch anyway. The receipt IS the canary's output; applying a
+            #   suppression we could not record would spend the experiment and
+            #   produce no measurement.
+            logger.exception(
+                f"tokenomics canary: receipt write failed for {task.task_id} — dispatching")
+            return False
+        if not decision.applied:
+            if decision.extra.get("condition_holds"):
+                logger.info(
+                    f"tokenomics canary (shadow): {task.task_id} would be suppressed "
+                    f"— {decision.reason}; standing request_changes "
+                    f"{decision.standing_review_task_id} on {decision.target} "
+                    f"@ {(decision.reviewed_sha or '?')[:9]}")
+            return False
+        if not _complete_suppressed_review(task, decision):
+            try:
+                _recommendation["transition_pending"] = False
+                q().record_tokenomics_canary_receipt(
+                    task.task_id, decision_source=decision.decision_source,
+                    recommendation=_recommendation, applied=False,
+                    counterfactual=decision.counterfactual,
+                    reason="suppression_transaction_failed",
+                    cea_receipt_id=q().task_receipt_id(task.task_id),
+                )
+            except Exception:
+                logger.exception("tokenomics canary: could not record failed suppression for %s",
+                                 task.task_id)
+            logger.error(
+                "tokenomics canary: could not confirm suppression for %s — dispatching",
+                task.task_id,
+            )
+            return False
+        logger.warning(
+            f"tokenomics canary APPLIED: not dispatching review {task.task_id} — "
+            f"{decision.standing_review_task_id} already stands as request_changes "
+            f"on {decision.target} @ {(decision.reviewed_sha or '?')[:9]}. "
+            f"Counterfactual: {decision.counterfactual}. "
+            f"Roll back by unsetting {_canary.CANARY_ENV} (no restart).")
+        return True
 
     # Expose watchdog tick on app.state so tests can drive it deterministically
     # without the asyncio loop. Production code never reads this attribute.
@@ -2739,7 +3363,7 @@ def create_app(
         #   해석해야 알 수 있으므로 **dequeue 뒤에** 판정하고, 충돌이면 되돌린다.
         skipped: set[str] = set()
         while True:
-            task = q().dequeue(role=role, skip_task_ids=skipped)
+            task = q().dequeue(role=role, claimed_via="tmux_push", skip_deferred=True, skip_task_ids=skipped)
             if task is None:
                 logger.debug(f"_try_push_next: no eligible pending task for role {role}")
                 return
@@ -2816,6 +3440,16 @@ def create_app(
                         f"_try_push_next: worktree prep failed for {role} "
                         f"task_id={task.task_id} — continuing with dispatch"
                     )
+
+        # SEV-0 §11 ONE-TASK tokenomics canary — the last gate before the
+        # provider is spent. Placed AFTER worktree prep because the commit the
+        # reviewer would read is only known once it is prepared, and BEFORE the
+        # protocol/pane work because everything past this point costs provider
+        # tokens. Prep itself costs none.
+        if task.task_type == "review" and _tokenomics_canary_gate(
+            task, (task.context or {}).get("reviewed_sha") or ""
+        ):
+            return
 
         _push_worktree = worktree_map.get(role) if worktree_map else ""
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
@@ -2935,7 +3569,18 @@ def create_app(
         # or deleted task block to an otherwise healthy owned pane.
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        # ⛔DISPATCH answers before the block is built, not after it was sent.
+        #   The nonce only exists once the gate said PROCEED, and a worker that
+        #   already has the block cannot be un-handed it — so a refused dispatch
+        #   must be refused here, while there is still a decision to make.
+        try:
+            _nonce = q().record_dispatch(
+                task.task_id, channel="tmux_pane", agent=_target_agent or None,
+                target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
+        except AdmissionRefused as exc:
+            logger.warning("_try_push_next: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        push_fn(guarded_pane_id, _format_task_message(task, port, nonce=_nonce))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
@@ -2984,7 +3629,7 @@ def create_app(
         if q().has_discuss_in_progress_for_agent(agent):
             logger.debug(f"_try_push_discuss: discuss task in progress for agent {agent}")
             return
-        task = q().dequeue_discuss_for_agent(agent)
+        task = q().dequeue_discuss_for_agent(agent, claimed_via="tmux_push", skip_deferred=True)
         if task is None:
             logger.debug(f"_try_push_discuss: no pending discuss task for agent {agent}")
             return
@@ -3031,7 +3676,14 @@ def create_app(
             )
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        try:
+            _nonce = q().record_dispatch(task.task_id, channel="tmux_pane", agent=agent,
+                                         target=guarded_pane_id,
+                                         lease_owner=f"pane:{guarded_pane_id}")
+        except AdmissionRefused as exc:
+            logger.warning("_try_push_discuss: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        push_fn(guarded_pane_id, _format_task_message(task, port, nonce=_nonce))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
@@ -3077,7 +3729,7 @@ def create_app(
             # Every watchdog tmux interaction, including permission dismissal
             # and timeout Ctrl+C, must use the same live ownership boundary as
             # task delivery. Never inspect or interrupt a foreign pane.
-            guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+            guarded_pane_id = _guard_tmx_push(task_id, pane_id, require_agent=False)
             if not guarded_pane_id:
                 continue
             pane_id = guarded_pane_id
@@ -3087,6 +3739,7 @@ def create_app(
                 _pane_dismiss_permission_prompt(pane_id)
                 if pane_busy_fn(pane_id):
                     q().bump_activity(task_id, ts=now)
+                    q().record_heartbeat(task_id, source="pane_busy", ts=now)
                     actions["bumped"].append(task_id)
                     # Busy pane resets the reminder cycle — agent is alive.
                     reminded_task_ids.discard(task_id)
@@ -3205,7 +3858,7 @@ def create_app(
                                     f"watchdog: failed to push next task for role {role}"
                                 )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
-                guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+                guarded_pane_id = _guard_tmx_push(task_id, pane_id, require_agent=False)
                 if not guarded_pane_id:
                     continue
                 pane_id = guarded_pane_id
@@ -3224,6 +3877,10 @@ def create_app(
                         )
                     except Exception:
                         logger.warning(f"watchdog: failed to send Ctrl+C to {pane_id}")
+                elif not _guard_agent_process(task_id, pane_id, pane_id, requeue=False):
+                    # G_DT: the reminder is a push too, but this task is
+                    # already running; refuse the text, leave the task alone.
+                    continue
                 else:
                     try:
                         push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
@@ -3367,7 +4024,7 @@ def create_app(
     # instead of just inferrable (#202 acceptance criterion).
     _seen_context_keys_this_process: set[str] = set()
 
-    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed") -> None:
+    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed") -> bool:
         """End a task only when it is still in_progress (agent may have submitted first).
 
         `status` distinguishes two things the dispatcher used to conflate (#265):
@@ -3388,6 +4045,7 @@ def create_app(
                     task_id,
                     TaskResult(task_id=task_id, status=status, summary=reason,
                                error_info={"reason": reason, "final": status == "failed"}),
+                    dispatcher_failed=status == "failed",
                 )
                 _attr = q().get_attribution(task_id)
                 record_context_event(
@@ -3404,8 +4062,10 @@ def create_app(
                 # can see this task actually failed.
                 if _attr:
                     append_attribution_jsonl(_attr_jsonl_path, _attr)
+                return q().get_task_status(task_id) == status
             except Exception:
                 logger.exception(f"_fail_if_active: could not fail task {task_id}")
+        return False
 
     def _resolve_dispatch_target(task: TaskRequest, role: str) -> tuple[str, Optional[str]]:
         """Resolve the (agent, worktree_path) a task will actually dispatch
@@ -3438,6 +4098,17 @@ def create_app(
                 agent = _override
         wt = wt_override or worktree_map.get(role)
         return agent, wt
+
+    async def _process_heartbeat(task_id: str, proc) -> None:
+        """Record, while `proc` runs, that the dispatcher still sees it alive (G12).
+
+        Observation only: it reads `proc.returncode` and writes one column. It
+        ends by itself when the process exits, so a path that forgets to
+        cancel it cannot leave it running.
+        """
+        while proc.returncode is None:
+            q().record_heartbeat(task_id, source="process_alive")
+            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
 
     async def _dispatch_task(task: TaskRequest, role: str) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
@@ -3758,6 +4429,17 @@ def create_app(
                     f"dispatcher: worktree prep failed for {role} task_id={task.task_id} — continuing"
                 )
 
+        # SEV-0 §11 ONE-TASK tokenomics canary — the last gate before the
+        # provider is spent. Placed AFTER worktree prep because the commit the
+        # reviewer would read is only known once it is prepared, and BEFORE the
+        # protocol/pane work because everything past this point costs provider
+        # tokens. Prep itself costs none.
+        if task.task_type == "review" and _tokenomics_canary_gate(
+            task, (task.context or {}).get("reviewed_sha") or ""
+        ):
+            _lock_stack.close()
+            return
+
         if not _ensure_role_protocol(
             role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent, port=port,
         ):
@@ -3845,9 +4527,34 @@ def create_app(
                 # operator-configured full-suite override. The cascade stores
                 # this decision on the task so replay/restart cannot infer it
                 # from a provider or project name.
-                if isinstance(task.context, dict) and task.context.get("test_scope") == "targeted":
+                # ⛔This reads the decision the cascade already STORED; it does
+                #   not make one. It used to re-ask the risk-tier module
+                #   whether tiering applied, which meant the same question was
+                #   answered twice — once when the cascade created this task and
+                #   again here, against config that may have changed in between.
+                #   The ADR removes that module as a decision (§11.1 row 13,
+                #   O10) and gives the review/test contract to the policy
+                #   snapshot's J7 `review_test_matrix`, read once at admission.
+                #   What survives at dispatch is honouring a reduction the
+                #   task's ADMISSION RECEIPT carries, and naming where it came
+                #   from.
+                # ⛔Not `task.context["test_scope"]`. The context is whatever the
+                #   request supplied, so honouring it let any ingress lower the
+                #   test gate — invariant 7, §7.2 (codex [0] at c18e092). A
+                #   request-side reduction is logged and ignored; with no J7
+                #   field on the receipt the task keeps its full scope.
+                _admitted = q().cea_admitted_test_scope(task.task_id)
+                if _admitted is not None:
                     _scope = {**_scope, "full_suite": False,
-                              "source": "risk_tier", "source_kind": "risk_tier"}
+                              "source": _admitted["source_kind"],
+                              "source_kind": _admitted["source_kind"]}
+                elif (isinstance(task.context, dict)
+                        and task.context.get("test_scope") not in (None, "")):
+                    logger.warning(
+                        "dispatcher: ingress test_scope ignored (§7.2) task_id=%s "
+                        "requested=%r source=%r", task.task_id,
+                        task.context.get("test_scope"),
+                        task.context.get("test_scope_source"))
                 _scope_name = _effective_scope(_scope)
                 _scope_hash = _scope_fingerprint(_scope)
                 q().record_test_economics(
@@ -3887,7 +4594,30 @@ def create_app(
             logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
 
 
-        message = _format_task_message(task, port)
+        # ⛔DISPATCH decides here, before the prompt exists, because the nonce it
+        #   mints must be *inside* that prompt — a subprocess cannot be handed
+        #   one afterwards. The pid is bound once the process exists
+        #   (`bind_dispatch_target`); binding a target is telemetry, deciding a
+        #   dispatch is not.
+        # ⛔The reservation goes in BEFORE the dispatch commits — see
+        #   `_reserve_dispatch_slot`. From here on every exit path must release
+        #   it: the refusal below does so explicitly, everything after the spawn
+        #   is covered by the `finally` that pops the registry.
+        # Resolved once (main's per-task `dispatch_timeout_s`): the lease and
+        # the wall-clock kill below must agree on the same budget.
+        timeout_secs = _dispatch_timeout_for_role(role, _ctx)
+        _slot = _reserve_dispatch_slot(task.task_id)
+        try:
+            _dispatch_nonce = q().record_dispatch(
+                task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
+                agent=agent, target=f"{agent}:pending",
+                lease_owner=f"{agent}:pending",
+                lease_seconds=timeout_secs)
+        except AdmissionRefused as exc:
+            logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
+            _release_dispatch_slot(task.task_id, _slot)
+            return
+        message = _format_task_message(task, port, nonce=_dispatch_nonce)
         # #239: assemble a bounded, provenance-linked Context Pack from durable
         # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
         # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
@@ -4088,7 +4818,6 @@ def create_app(
                 cmd = ["codex", "exec",
                        "--dangerously-bypass-approvals-and-sandbox", "--json", message]
 
-        timeout_secs = _dispatch_timeout_for_role(role, _ctx)
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
         # Only pop the retry counter on a terminal outcome. Flipped to False
         # right before the early `return` on a successful requeue — that
@@ -4125,10 +4854,28 @@ def create_app(
                 # we can kill the whole tree on timeout — agent CLIs (gemini,
                 # agy, codex) spawn helper children that survive a plain
                 # proc.kill() and reparent to PID 1 as orphans (#191).
+                #
+                # ⛔The spawn MUST stay inside this `with`. `log_f` is passed
+                #   as the child's stdout/stderr, and the spawn reads its
+                #   `.fileno()` to dup it into the child — outside the block the
+                #   handle is closed and every dispatch dies with
+                #   "I/O operation on closed file" (review of 720ac76). The
+                #   child keeps its own dup, so closing ours on exit is safe.
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                     start_new_session=True,
                 )
+            # ⛔I-B: publish the child into its reservation and decide, under the
+            #   same lock, whether a cancel has already landed. A cancel that
+            #   committed in the handoff window is not allowed to end with the
+            #   dispatcher awaiting the child it just authorized away.
+            if await _claim_spawned_child(task.task_id, _slot, proc):
+                return
+            # G12: the lease is the kill timeout enforced just below. The
+            # dispatch itself was decided before the prompt was built.
+            q().bind_dispatch_target(task.task_id, target=f"pid:{proc.pid}",
+                                     lease_owner=f"{agent}:pid:{proc.pid}")
+            _heartbeat = asyncio.create_task(_process_heartbeat(task.task_id, proc))
             _timed_out = False
             try:
                 await asyncio.wait_for(proc.wait(), timeout=timeout_secs)
@@ -4144,6 +4891,7 @@ def create_app(
                 except ProcessLookupError:
                     pass
                 logger.error(f"dispatcher: timeout {timeout_secs}s task={task.task_id}")
+            _heartbeat.cancel()
             # Inspect the dispatch log tail for upstream errors — applies to
             # both clean exit AND timeout (#190). Claude can return rc=0 with
             # api_error_status:429; gemini-cli often hangs on retry loops past
@@ -4267,6 +5015,11 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
+            with _active_dispatch_lock:
+                _active_dispatch_processes.pop(task.task_id, None)
+            # The process is reaped; a cancel's pending SIGKILL now has no
+            # legitimate target and must not outlive it (review of 720ac76).
+            _cancel_pending_kill(task.task_id)
             # #272: release the test-stage lock before anything else in the
             # teardown can raise — a leaked flock would block every later test
             # on this worktree until the process exits.
@@ -4421,10 +5174,8 @@ def create_app(
                         for _candidate_role in _worker_roles:
                             # Stage 1 checks overrides independent of task type;
                             # Stage 2 checks each role this worker owns.
-                            task = q().dequeue(
-                                agent=worker, role=_candidate_role,
-                                claim_source="dispatcher",
-                            )
+                            task = q().dequeue(agent=worker, role=_candidate_role, claimed_via="dispatcher",
+                                               claim_source="dispatcher")
                             if task is not None:
                                 break
                         if task is None:
@@ -4463,6 +5214,7 @@ def create_app(
                             try:
                                 await _dispatch_task(t, r)
                             finally:
+                                _drop_unspawned_reservation(t.task_id)
                                 active_workers.discard(s)
                                 if w:
                                     active_worktrees.discard(w)
@@ -4477,8 +5229,8 @@ def create_app(
                     for agent in _discuss_workers:
                         if agent in active_workers:
                             continue
-                        task = q().dequeue_discuss_for_agent(
-                            agent, claim_source="dispatcher")
+                        task = q().dequeue_discuss_for_agent(agent, claimed_via="dispatcher",
+                                                              claim_source="dispatcher")
                         if task is None:
                             continue
                         role = _AGENT_TO_ROLES.get(agent, ["implementer"])[0]
@@ -4510,6 +5262,7 @@ def create_app(
                             try:
                                 await _dispatch_task(t, r)
                             finally:
+                                _drop_unspawned_reservation(t.task_id)
                                 active_workers.discard(s)
                                 if w:
                                     active_worktrees.discard(w)
@@ -4534,6 +5287,18 @@ def create_app(
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
+    app.state.active_dispatch_processes = _active_dispatch_processes
+    # Exposed so a test can assert no kill is left armed after it finishes —
+    # and defuse one in teardown if it is.
+    app.state.cancel_kill_timers = _cancel_kill_timers
+    app.state.terminate_worker = _terminate_worker
+    # The cancel/spawn handoff (#51 I-B): the reservation helpers and the lock
+    # they share, so a test can drive a real interleaving instead of asserting
+    # against its own copy of the ordering.
+    app.state.active_dispatch_lock = _active_dispatch_lock
+    app.state.reserve_dispatch_slot = _reserve_dispatch_slot
+    app.state.claim_spawned_child = _claim_spawned_child
+    app.state.stop_worker_for_ended_task = _stop_worker_for_ended_task
     # Same rationale (#248, #265): expose the terminal-marking helper so a test
     # can drive the real timeout path instead of asserting against a
     # reimplementation of it.
@@ -4598,6 +5363,27 @@ def create_app(
             pass
         return ""
 
+    def _successor_project_for(parent_task_id: str, ctx: Optional[dict] = None) -> str:
+        """The project a server-internal successor is admitted under (§7.1, s4j).
+
+        In precedence order: the parent row's own project, the project its
+        context named, then this dispatcher's identity — which is
+        `_server_identity()`'s, i.e. the `create_app` argument or the state
+        directory the DB sits in (#248). `""` only when none of the three
+        answer, and an empty project is then refused with a receipt rather
+        than crashing the caller.
+        """
+        row_project = ""
+        try:
+            for t in q().list_tasks():
+                if t.task_id == parent_task_id:
+                    row_project = str(getattr(t, "project", "") or "").strip()
+                    break
+        except Exception:  # noqa: BLE001 — provenance, never a reason to drop the successor
+            row_project = ""
+        ctx_project = str((ctx or {}).get("project") or "").strip()
+        return row_project or ctx_project or str(_server_identity()["project"] or "").strip()
+
     def _requeue_review_at_head(review_task_id: str, pr_number, head: str, ctx) -> None:
         """Enqueue one head-anchored review for a PR whose head moved (#304).
 
@@ -4623,7 +5409,14 @@ def create_app(
                 branch=base.get("branch") or "main",
                 priority=3,
                 context=context,
-            ))
+                # s4j: a re-dispatched review is the same project as the review
+                # it supersedes. Naming none admitted project-less and the
+                # engine raised the frozen-contract violation inside the
+                # watchdog. `_server_identity` is the same fallback /health
+                # already reports this dispatcher under (#248).
+                project=_successor_project_for(review_task_id, base),
+            ),
+                        ingress="watchdog.stale_review")
             logger.info(
                 f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
                 f"{head[:12]}, superseding {review_task_id} (#304)")
@@ -4751,10 +5544,15 @@ def create_app(
                 branch=original_task.branch,
                 priority=original_task.priority + 1,  # Bump priority for retries
                 context=retry_context,
+                # s4j: a retry is the same work, so the same project. The row is
+                # right here — `original_task` — so prefer it over the lookup.
+                project=(str(getattr(original_task, "project", "") or "").strip()
+                         or _successor_project_for(task_id, retry_context)),
             )
             from agent_crew.queue import TaskAlreadyExistsError as _TAE
             try:
-                q().enqueue(retry_req)
+                q().enqueue(retry_req, ingress="retry.failed_task",
+                            _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             except _TAE:
                 logger.info(f"_auto_retry_failed_task: {retry_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")
@@ -4783,7 +5581,8 @@ def create_app(
         # IMMEDIATE 트랜잭션에서 runtime_stop을 확인해 unpaused일 때만 admit+reserve → STOP이
         # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
         # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
-        from agent_crew.github import get_repo, merge_pr, pr_state
+        from agent_crew.github import (get_repo, independent_review_succeeded,
+                                       merge_pr, pr_state)
         _merge_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         op_key = f"merge:pr:{pr_number}"
         resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
@@ -4823,6 +5622,19 @@ def create_app(
             q().external_op_mark(op_key, "failed",
                                  last_error="PR 상태 불명(gh 실패) — 다음 재확인 대기", inc_attempt=True)
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
+            return
+        # The HTTP cascade is allowed to run for every admitted task. Its
+        # test result alone is not authority to merge: crew run and external
+        # coordinators also submit test results and own their own merge policy.
+        # Require the independent review status on the current PR head for
+        # every server-side merge, regardless of caller-controlled context.
+        if not independent_review_succeeded(int(pr_number), _merge_repo):
+            q().external_op_mark(
+                op_key, "failed",
+                last_error="crew/independent-review success missing on PR head",
+                inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: PR #{pr_number} lacks successful "
+                           "crew/independent-review status — merge refused")
             return
         # st == 'open' → merge 시도
         ok = merge_pr(int(pr_number), merge_method="squash", repo=_merge_repo)
@@ -4904,11 +5716,47 @@ def create_app(
                          "incident": _stop.get("incident")}
         except Exception:
             _stop_out = {"epoch": None, "paused": True, "incident": None, "error": "read_failed"}
+        # P6 (ADR E11 @6cbce565): "/health.runtime_state exposes it." A state that
+        # is not in the runtime row does not exist — CX-4j is a runtime that was
+        # "quarantined" by record while its own row said otherwise, so the row is
+        # what this endpoint reports. `effective_state` folds in the tighten-only
+        # pause.json signal; `state` is the stored row.
+        try:
+            _rs = q().get_runtime_state()
+            _runtime_state_out = {
+                "state": _rs.get("state"),
+                "effective_state": _rs.get("effective_state"),
+                "epoch": _rs.get("epoch"),
+                "reason": _rs.get("reason"),
+                "decision_id": _rs.get("decision_id"),
+                "incident": _rs.get("incident"),
+                "pause_json_tightening": _rs.get("pause_json_tightening"),
+                "read_failed": bool(_rs.get("read_failed")),
+            }
+        except Exception:
+            _runtime_state_out = {"state": "STOPPED", "effective_state": "STOPPED", "epoch": None,
+                                  "reason": "runtime_state_unreadable", "decision_id": None,
+                                  "incident": None, "pause_json_tightening": None,
+                                  "read_failed": True}
+        # s4i item 2: how many rows are still in the queue with no receipt at
+        # all. Under `shadow` they claim and dispatch and are REPORTed; under
+        # `enforce` claim refuses them. "Is this project ready for enforce?" is
+        # that number reaching zero, so it rides on the endpoint an operator
+        # already polls rather than living only in a log nobody greps.
+        try:
+            _cea_out = {"legacy_rows": q().cea_legacy_rows()}
+        except Exception as exc:
+            _cea_out = {"legacy_rows": {"error": f"{type(exc).__name__}: {exc}"}}
         return {
             "status": "ok",
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,
+            "runtime_state": _runtime_state_out,
+            "cea": _cea_out,
+            # G_DT: pushes refused because the target pane runs no agent CLI.
+            "delivery_guard": {"delivery": _delivery_raw,
+                               "refusals": dict(delivery_guard_refusals)},
             "build": {
                 "commit": snap["commit"],
                 "commit_short": snap["commit_short"],
@@ -5010,28 +5858,22 @@ def create_app(
         one endpoint's error shape unique — and
         ``tests/unit/test_issue_273_duplicate_task_id.py`` asserts the whole
         body so the description cannot drift from it again.
+
+        ⛔No ``in_flight_for_issue``. #294's lexical in-flight advisory — match
+        the issue number, log a warning, return the colliding ids — was a
+        *second* duplicate matcher living beside admission, and the ADR removes
+        it (§11.1 row 14, fixture CXC-1). Matching on an issue number is
+        matching on a label: two tasks that mean the same thing under different
+        issue numbers were never flagged, and four tasks that legitimately share
+        one issue were. Duplicate suppression belongs to the engine's
+        ``intent_hash`` (Π P4), which is computed from what the task *is*, and
+        it decides rather than advises. Until that index lands, admission does
+        not pretend to answer the question at all — an advisory nobody can act
+        on is worse than a stated gap.
         """
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
-        # #294: gathered BEFORE the enqueue, so the task being created can
-        # never appear in its own collision list.
-        # ⛔Resolved the same way `enqueue` will resolve it moments later.
-        #   Reading `context.issue` alone here meant a direct enqueue whose
-        #   issue lives only in its description reported no collision and was
-        #   then stored under that very issue (review of PR #295).
-        _issue_number = task_issue_number(task)
-        _in_flight: list = []
-        if isinstance(_issue_number, int) and not isinstance(_issue_number, bool):
-            try:
-                _in_flight = active_tasks_for_issue(
-                    q(), _issue_number, task_type=task.task_type)
-            except Exception:
-                # The whole feature is advisory; it must never cost a task.
-                logger.exception(
-                    f"POST /tasks: in-flight lookup failed for issue "
-                    f"#{_issue_number} — enqueueing anyway")
-                _in_flight = []
         try:
-            task_id = q().enqueue(task)
+            task_id = q().enqueue(task, ingress="http.tasks")
         except TaskAlreadyExistsError as e:
             raise HTTPException(
                 status_code=409,
@@ -5042,18 +5884,6 @@ def create_app(
                 },
             )
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
-        if _in_flight:
-            # ⛔Advisory, never a gate. Several tasks legitimately share one
-            #   issue — implement, its review, its fix rounds, its test — so
-            #   refusing by issue would break the cascade. What was missing is
-            #   only that nobody was TOLD: #294 measured a direct enqueue
-            #   duplicating a watch task that was still in flight, 15 minutes
-            #   before the first one's PR existed.
-            logger.warning(
-                f"POST /tasks: {task_id} is a second {task.task_type!r} task for "
-                f"issue #{_issue_number} while {_in_flight} is still in flight. "
-                f"Enqueued anyway — this is a heads-up, not a block (#294)."
-            )
         if not _push_enabled:
             logger.warning(
                 f"POST /tasks: AGENT_CREW_DELIVERY={_delivery_raw!r} — task {task_id} enqueued "
@@ -5071,9 +5901,7 @@ def create_app(
                 _try_push_next(role)
             else:
                 logger.warning(f"POST /tasks: no role found for task_type={task.task_type}")
-        # Always a list, never absent: a consumer should not have to tell "no
-        # collision" from "this server does not report collisions".
-        return {"task_id": task_id, "in_flight_for_issue": _in_flight}
+        return {"task_id": task_id}
 
     @app.get("/tasks/next")
     def get_next_task(role: str = "", agent: str = ""):
@@ -5087,10 +5915,21 @@ def create_app(
                     "Use the MCP get_next_task tool instead of curl-polling this endpoint."
                 ),
             )
-        task = q().dequeue(agent=agent, role=role)
+        task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
         if task is None:
             return None
-        return task
+        try:
+            nonce = q().record_dispatch(task.task_id, channel="api", agent=agent or None,
+                                        target=f"http_poll:{agent or 'anonymous'}")
+        except AdmissionRefused as exc:
+            # The claim already committed; the dispatch did not. Say so rather
+            # than hand out a task the gate refused.
+            raise HTTPException(status_code=409, detail=str(exc))
+        # ⛔Additive: every field a poller already reads is unchanged. The nonce
+        #   is presented back at `/tasks/{id}/start` and with the result under
+        #   `executor_binding`; `None` means none was minted and the two later
+        #   call sites have nothing to check (P2).
+        return {**dataclasses.asdict(task), "dispatch_nonce": nonce}
 
     @app.get("/tasks")
     def list_tasks(status: str = ""):
@@ -5161,11 +6000,41 @@ def create_app(
         tasks = q().list_tasks()
         for t in tasks:
             if t.task_id == task_id:
-                return t
+                # G12 / D6: additive — every field a client already reads is
+                # unchanged; `execution` is the claim/dispatch/lease record.
+                return {**dataclasses.asdict(t), "execution": q().get_exec_state(task_id)}
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+
+    @app.post("/tasks/{task_id}/start", status_code=200)
+    def start_task(task_id: str, body: dict = Body(default_factory=dict)):
+        """P2 EXECUTE_START — the pane's one-shot go/no-go before it starts work.
+
+        ``{"nonce": "<the dispatch nonce from the task block>"}`` →
+        ``{"go": true|false, "reason": ...}``. The nonce is single-use: the
+        first caller spends it, and a second caller presenting the same one is
+        told no. A worker that gets ``go: false`` must not start.
+
+        ⛔This endpoint is the check, not the enforcement. Nothing stops a pane
+          from skipping the call; what step 2b adds is the task block that makes
+          calling it the only way to learn what to do. Answering honestly here
+          first is what lets that change be about the protocol rather than about
+          the decision.
+        """
+        nonce = body.get("nonce") if isinstance(body, dict) else None
+        presenter = body.get("presenter") if isinstance(body, dict) else None
+        try:
+            return q().start_execution(task_id, nonce if isinstance(nonce, str) else None,
+                                       presenter=presenter if isinstance(presenter, str) else None)
+        except Exception as exc:
+            logger.exception(f"POST /tasks/{task_id}/start failed")
+            raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
+        """Accept active results; system-ended rows return HTTP 409 with
+        ``late_result=true`` and ``accepted=false``. The queue stores their
+        submitted summary, verdict and commit only in ``task_exec_events``.
+        """
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
@@ -5173,28 +6042,55 @@ def create_app(
         _artifact_held = None
         _task = next((item for item in q().list_tasks() if item.task_id == task_id), None)
         try:
-            _runtime_paused = bool(q().get_stop_epoch().get("paused")) or q()._pausejson_active()
+            _runtime_paused = q().get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
             # STOP state is safety authority.  Do not rewrite an in-flight
             # result while its state cannot be read; submit_result will retain
             # its established fail-closed cascade handling (#313).
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
+        _artifact_verified = None
+        # T5, ADR §11.1 row 10 / fixture CXC-6a: "dispatch base absent" is a
+        # FAIL, never a pass. An implement task that completes with no declared
+        # artifact contract and no `worktree_base_sha`/`reviewed_sha` gives the
+        # gate nothing to check the completion against — so the honest answer is
+        # that the artifact is unproven, not that the rule did not apply. Logging
+        # "not applied" and accepting `completed` made an *absent input* read as
+        # a passing check, which is the one thing P7 forbids a gate to do.
+        #
+        # ⛔Held under the project's rollout mode, not unconditionally: under
+        #   `shadow`/`off` this is recorded and the result stands, because the
+        #   whole point of shadow is to measure how many live tasks this would
+        #   have caught before it catches any.
         if (not _runtime_paused and not _REPLAYING.get() and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
+                and declared_artifact_kind(_task) is None
                 and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
                          or "rebase_onto" in _artifact_context)):
-            logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
+            _no_base = ("dispatch base absent: this implement task declares no "
+                        "artifact contract and carries no worktree_base_sha or "
+                        "reviewed_sha, so its completion cannot be verified")
+            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
+                logger.warning("POST /tasks/%s/result: artifact gate FAILED — %s",
+                               task_id, _no_base)
+                _artifact_held = _no_base
+                result = no_artifact_result(result, _no_base)
+            else:
+                logger.info("POST /tasks/%s/result: artifact gate would FAIL under "
+                            "enforce — %s (shadow: result stands)", task_id, _no_base)
+        # #374: the check follows the task's declared contract; undeclared
+        # tasks keep #353's commit rule exactly (artifact_gate_applies).
         if (not _runtime_paused and not _REPLAYING.get()
-                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
-                         or "rebase_onto" in _artifact_context)
-                and _task is not None
-                and _task.task_type == "implement" and result.status == "completed"):
-            _ok, _detail = verify_implement_artifact(
-                _task, result, repo_cwd=_any_worktree_path())
+                and artifact_gate_applies(_task, result)):
+            _ok, _detail = verify_task_artifact(
+                _task, result, repo_cwd=_any_worktree_path(),
+                commit_verifier=verify_implement_artifact)
             if not _ok:
                 _artifact_held = _detail
                 result = no_artifact_result(result, _detail)
+            else:
+                _artifact_verified = {"kind": declared_artifact_kind(_task) if declared_artifact_kind(_task) is not None else "commit",
+                                      "detail": _detail}
         # #268: does this result even claim to be about the PR we dispatched
         # it for? Must happen before the row is written, so what lands in the
         # DB is the held form — a human reading the row later sees the
@@ -5202,15 +6098,18 @@ def create_app(
         # target. Both numbers survive: `requested` in the context, `reported`
         # on the row.
         result, _pr_mismatch = hold_mismatched_pr_result(task_id, result, ctx)
-        # #265: a result can arrive for a task the dispatcher already ended —
-        # it stopped waiting, the worker kept going, and the row silently flips
-        # from `timed_out` (previously `failed`) to `completed`. A consumer that
-        # read the status when the notification fired sees only the first value
-        # and never learns it was revised. Capture the prior status so the
-        # revision can be announced.
+        # #265: worker-reported failures can still be revised by that worker.
+        # Queue admission now refuses a timeout, cancel or dispatcher failure
+        # under the write lock, so those statuses never reach revision logging.
         _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
+        # §2.2 / P2 RESULT. Popped, not read: the nonce is a spent credential
+        # and must not reach `result_json`. `presenter` defaults to the task's
+        # dispatch agent only when the worker did not name itself — an asserted
+        # identity either way under P2a, and the receipt records that it is.
+        _nonce, _presenter = result.take_executor_binding()
         try:
-            task_type = q().submit_result(task_id, result)
+            task_type = q().submit_result(task_id, result, nonce=_nonce,
+                                          presenter=_presenter)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
             # outside submit_result's STOP-atomic transaction: a telemetry-like
@@ -5220,6 +6119,7 @@ def create_app(
                 key: value for key, value in (
                     (RESULT_BRANCH_CONTEXT_KEY, result.branch),
                     (RESULT_COMMIT_CONTEXT_KEY, result.commit),
+                    ("result_artifact", _artifact_verified),
                 ) if value
             }
             if _result_ref:
@@ -5251,11 +6151,27 @@ def create_app(
                 except Exception:
                     logger.exception(
                         f"POST /tasks/{task_id}/result: late-result event failed")
+        except AdmissionRefused as exc:
+            # P2 RESULT refused under enforce — nothing was written. 409, with
+            # the validator's own reason: a worker that presented an unspent
+            # nonce (never asked /start for its go/no-go) must learn that, not
+            # read a 500 and retry the same bypass.
+            logger.warning(f"POST /tasks/{task_id}/result: refused — {exc}")
+            raise HTTPException(status_code=409, detail=str(exc))
+        except LateResultRejected as exc:
+            # The queue decided this under its write lock and committed only a
+            # late_result evidence event. No attribution or cascade may follow.
+            from fastapi.responses import JSONResponse
+            logger.warning("POST /tasks/%s/result: %s", task_id, exc)
+            return JSONResponse(status_code=409, content={
+                "late_result": True, "accepted": False,
+                "task_id": task_id, "prior_status": exc.status,
+                "reason": str(exc),
+            })
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
-            status_code = (409 if msg.startswith("LATE_RESULT_REJECTED:")
-                           else 404 if "not found" in msg.lower() else 400)
+            status_code = 404 if "not found" in msg.lower() else 400
             raise HTTPException(status_code=status_code, detail=msg)
         # #202: lifecycle event for the agent-self-reported terminal outcome
         # (the internal dispatcher-detected failure paths emit their own
@@ -5361,16 +6277,12 @@ def create_app(
             # Auto-transition: impl task completed → auto-enqueue review task.
             # Pass through the PR number from the impl result so the reviewer
             # task description nails down which PR head to diff (#86).
-            # Skip when coordinator_managed=True — `crew run` drives transitions itself
-            # to avoid duplicate tasks and _wait() blocking on the wrong task_id.
+            #
             _task_ctx = ctx if isinstance(ctx, dict) else {}
             if task_type == "implement" and result.status == "completed":
-                if _task_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto review enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
-                    _auto_enqueue_review(task_id, pr_number=result.pr_number,
-                                         result=result)
+                logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
+                _auto_enqueue_review(task_id, pr_number=result.pr_number,
+                                     result=result)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
             # review counts as approved (#100). Skip when the review task was
@@ -5514,10 +6426,8 @@ def create_app(
                 if review_ctx.get("no_tester"):
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
                     # #171: no tester stage → merge immediately on review approval
-                    if pr_number and not review_ctx.get("coordinator_managed"):
+                    if pr_number:
                         _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt)
-                elif review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto test enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id, repo=_review_repo)
@@ -5528,20 +6438,15 @@ def create_app(
             # cascade, so a reviewer that keeps rejecting cannot spin the loop.
             elif (task_type == "review" and _resolve_verdict(result) == "request_changes"
                     and _review_result_is_actionable(result)):
-                review_ctx = ctx if isinstance(ctx, dict) else {}
-                if review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto fix enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
-                    _auto_enqueue_fix(task_id, repo=_review_repo)
+                logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
+                _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
             if task_type == "test" and result.status == "completed":
-                if not _task_ctx.get("coordinator_managed"):
-                    test_pr = result.pr_number or _task_ctx.get("pr_number")
-                    if test_pr:
-                        _test_wt = _any_worktree_path()
-                        _test_repo = _task_ctx.get("repo") or ""
-                        _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
+                test_pr = result.pr_number or _task_ctx.get("pr_number")
+                if test_pr:
+                    _test_wt = _any_worktree_path()
+                    _test_repo = _task_ctx.get("repo") or ""
+                    _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")
@@ -5592,13 +6497,59 @@ def create_app(
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
+        """G12 I-A then I-B, in that order.
+
+        The authoritative cancel — status ``cancelled``, receipt ``REVOKED``,
+        outstanding nonces spent — commits in one transaction BEFORE the worker
+        is signalled.  720ac76 had it the other way round, which left two bad
+        windows: a killed worker that was still authorized, and (if the commit
+        then raised) a permanently dead attempt that the queue still believed
+        was running.  On commit failure we return 5xx and kill nothing, so the
+        caller can retry against an unchanged world.
+
+        Only an *active* row can be cancelled. A row already decided (completed,
+        failed, cancelled, timed_out, blocked) answers 409 ``NOT_ACTIVE`` and
+        nothing happens at all — no revocation, no nonce spent, no worker
+        signal. Before this, DELETE on a completed task returned 200 and
+        persisted ``cancelled``, retroactively revoking a finished attempt and
+        orphaning the successors it had legitimately spawned (r4 review of
+        c8ce45f). An unknown id stays the tolerated no-op it was.
+
+        #336 (PR #382) rides on the same commit: once cancelled, the pane the
+        server recorded at dispatch is interrupted (``cancel_task_with_signal``)
+        and the dispatcher subprocess, if any, is stopped (I-B).
+        """
+        from fastapi.responses import JSONResponse as _JSONResponse
         try:
-            return cancel_task_with_signal(
+            outcome = cancel_task_with_signal(
                 q(), task_id, state_path=state_path, pane_map=pane_map,
-                events_path=_context_events_path,
+                events_path=_context_events_path, reason=_CANCEL_REASON_ATTEMPT,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError:
+            return {"status": "unknown", "reason": "NO_SUCH_TASK",
+                    "worker_termination": "skipped"}
+        except Exception:
+            logger.exception("cancel: authoritative cancel failed task=%s", task_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"cancel of {task_id!r} did not commit; worker left running",
+            )
+        if not outcome["cancelled"]:
+            # A refusal wrote nothing, and the status that caused it is terminal
+            # — it cannot have moved again.
+            current = outcome["status"]
+            # ⛔No worker termination either: the attempt this DELETE names has
+            #   already ended, and any process still running under that id would
+            #   belong to a later attempt we were not asked to touch.
+            return _JSONResponse(
+                status_code=409,
+                content={"status": current, "reason": "NOT_ACTIVE",
+                         "task_id": task_id},
+            )
+        outcome.pop("cancelled", None)
+        outcome["worker_termination"] = _stop_worker_for_ended_task(
+            task_id, reason=_CANCEL_REASON_ATTEMPT)
+        return outcome
 
     @app.post("/tasks/{task_id}/recover", status_code=200)
     def recover_orphan_task(task_id: str, force: bool = False):
@@ -5627,6 +6578,9 @@ def create_app(
                     "reason": "dispatcher claim provenance absent or changed"}
         if force:
             q().requeue(task_id)
+        if q().get_task_status(task_id) != "pending":
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "CEA requeue refused or task state changed"}
         logger.info(
             f"recover_orphan_task: {task_id} in_progress -> pending "
             f"(lease_tracking={_leased is not None}, force={force})"
@@ -5637,9 +6591,23 @@ def create_app(
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(older_than: float = 600.0):
         """Cancel in_progress tasks idle longer than ``older_than`` seconds.
-        Returns list of cancelled task_ids."""
-        cancelled = q().expire_stale(older_than_seconds=older_than)
-        return {"cancelled": cancelled}
+        Returns list of cancelled task_ids.
+
+        An expiry is a cancel: it goes through the same authoritative
+        transaction (status, receipt REVOKED, nonces spent, end event) and then
+        the same worker termination the DELETE performs — just with
+        ``STALE_LEASE`` as the recorded reason. Before this, expiry wrote the
+        status directly and stopped there, leaving a live receipt, a spendable
+        nonce and an unsignalled child behind (r2 review of 4a49338).
+        """
+        terminations: dict[str, str] = {}
+
+        def _stop(task_id: str) -> None:
+            terminations[task_id] = _stop_worker_for_ended_task(
+                task_id, reason=_CANCEL_REASON_STALE_LEASE)
+
+        cancelled = q().expire_stale(older_than_seconds=older_than, on_cancelled=_stop)
+        return {"cancelled": cancelled, "worker_termination": terminations}
 
     @app.post("/gates", status_code=201)
     def post_gate(gate: GateRequest):
@@ -5693,6 +6661,7 @@ def create_app(
         state = checkpoint.get("state", {})
         try:
             checkpoint_id = q().save_checkpoint(task_id, checkpoint_num, state)
+            q().record_heartbeat(task_id, source="worker_checkpoint")
             logger.info(f"POST /tasks/{task_id}/checkpoint: saved checkpoint {checkpoint_num}")
             return {"checkpoint_id": checkpoint_id}
         except Exception as e:

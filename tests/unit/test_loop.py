@@ -15,12 +15,13 @@ from agent_crew.protocol import TaskResult
 # U-L01: enqueue_implement — task_type=implement, TDD 지시 context 포함
 def test_u_l01_enqueue_implement():
     queue = MagicMock()
-    queue.enqueue.side_effect = lambda req: req.task_id
+    queue.enqueue.side_effect = lambda req, **kwargs: req.task_id
 
     task_id = enqueue_implement(queue, "Add login feature", "feat/login")
 
     assert isinstance(task_id, str)
     assert queue.enqueue.call_count == 1
+    assert queue.enqueue.call_args.kwargs["ingress"] == "loop.implement"
     req = queue.enqueue.call_args[0][0]
     assert req.task_type == "implement"
     assert "tdd" in str(req.context).lower() or "test" in str(req.context).lower()
@@ -29,13 +30,14 @@ def test_u_l01_enqueue_implement():
 # U-L02: enqueue_review — task_type=review, 3-layer 체크리스트 context 포함
 def test_u_l02_enqueue_review():
     queue = MagicMock()
-    queue.enqueue.side_effect = lambda req: req.task_id
+    queue.enqueue.side_effect = lambda req, **kwargs: req.task_id
 
     task_id = enqueue_review(queue, "Add login feature", "feat/login", prev_task_id="impl-001")
 
     assert isinstance(task_id, str)
     req = queue.enqueue.call_args[0][0]
     assert req.task_type == "review"
+    assert queue.enqueue.call_args.kwargs["ingress"] == "loop.review"
     ctx_str = str(req.context).lower()
     assert "layer" in ctx_str or "checklist" in ctx_str or "review" in ctx_str
 
@@ -108,7 +110,7 @@ def test_u_l08_handle_test_result_failed():
 # U-L09: enqueue_review context에 reviewer_rejects_happy_path_only 지시 포함
 def test_u_l09_enqueue_review_rejects_happy_path():
     queue = MagicMock()
-    queue.enqueue.side_effect = lambda req: req.task_id
+    queue.enqueue.side_effect = lambda req, **kwargs: req.task_id
 
     enqueue_review(queue, "Add login feature", "feat/login", prev_task_id="impl-001")
 
@@ -173,6 +175,7 @@ def test_u_l10c_build_feedback_dict_unknown_layer():
 # tasks sit QUEUED without ever reaching the tmux pane.
 def test_u_l11_enqueue_implement_routes_through_http_when_port_given():
     queue = MagicMock()
+    queue.project_identity = "test-project"
     fake_resp = MagicMock()
     fake_resp.read.return_value = b'{"task_id":"impl-http-1"}'
     fake_resp.__enter__ = lambda s: s
@@ -191,19 +194,21 @@ def test_u_l11_enqueue_implement_routes_through_http_when_port_given():
 # U-L12: port == 0 → direct queue.enqueue (legacy path, no server).
 def test_u_l12_enqueue_implement_direct_db_when_no_port():
     queue = MagicMock()
-    queue.enqueue.side_effect = lambda req: req.task_id
+    queue.enqueue.side_effect = lambda req, **kwargs: req.task_id
 
     with patch("agent_crew.loop.urllib.request.urlopen") as mock_urlopen:
         task_id = enqueue_implement(queue, "t", "main")
 
     assert task_id.startswith("impl-")
     queue.enqueue.assert_called_once()
+    assert queue.enqueue.call_args.kwargs["ingress"] == "loop.implement"
     mock_urlopen.assert_not_called()
 
 
 # U-L13: enqueue_review / enqueue_test also honor port.
 def test_u_l13_enqueue_review_and_test_honor_port():
     queue = MagicMock()
+    queue.project_identity = "test-project"
     fake_resp = MagicMock()
     fake_resp.read.return_value = b'{"task_id":"x"}'
     fake_resp.__enter__ = lambda s: s
@@ -241,7 +246,7 @@ def test_u_l14_enqueue_review_idempotent():
 def test_u_l15_enqueue_review_creates_new_if_none_exist():
     queue = MagicMock()
     queue.list_tasks.return_value = []  # No existing tasks
-    queue.enqueue.side_effect = lambda req: req.task_id
+    queue.enqueue.side_effect = lambda req, **kwargs: req.task_id
 
     task_id = enqueue_review(queue, "some work", "main", prev_task_id="impl-1")
 

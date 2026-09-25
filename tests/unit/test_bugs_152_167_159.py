@@ -393,12 +393,13 @@ class TestFallbackCancellation:
         """When fallback_chain_depth >= MAX, the original_task_id task must be
         marked 'cancelled' — not just have an escalation gate opened."""
         from agent_crew.pipeline import auto_fallback_failed_task
+        from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 
         q = TaskQueue(tmp_db)
-        # Seed the root original task as already failed.
+        # A failed row is terminal under G12 and cannot be retroactively
+        # cancelled; keep the root active to test the loop's cancel handoff.
         q.enqueue(_task("orig-root"))
         q.dequeue(role="implementer")
-        q.force_fail("orig-root", "first failure")
 
         # Simulate a fallback at depth=3 that traces back to orig-root.
         q.enqueue(_task("fb3", ctx={
@@ -406,7 +407,7 @@ class TestFallbackCancellation:
             "agent_override": "gemini",
             "fallback_excluded": ["claude", "codex", "gemini"],
             "original_task_id": "orig-root",
-        }))
+        }), _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         q.dequeue(role="implementer")
         result = TaskResult(
             task_id="fb3",

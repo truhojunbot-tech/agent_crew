@@ -118,6 +118,32 @@ class TaskResult:
     commit: str = ""
     retry_count: int = 0  # Track number of retry attempts
     error_info: Optional[dict] = None  # Structured error payload for debugging (#167)
+    #: #374: the non-commit artifact a declared contract hands back — for a
+    #: `report`, ``{"sha256": ..., "body": ...}`` or ``{"sha256": ..., "path": ...}``.
+    #: Optional and ignored unless the task declared `context.artifact_kind`.
+    artifact: Optional[dict] = None
+    #: ADR §2.2 / P2 RESULT — ``{"nonce": ..., "presenter": ...}``, the
+    #: single-use dispatch nonce the worker was handed in its task block.
+    #:
+    #: ⛔Transport only, and stripped by the endpoint before the row is
+    #:   written. It is the one field here that is a *credential* rather than a
+    #:   report: persisting it in ``result_json`` would leave a spent proof
+    #:   lying in a column every consumer of the row can read. The field exists
+    #:   on the model because both transports must accept the same body — a
+    #:   guard on one transport is a guard an agent walks around by changing
+    #:   how it reports (#123) — and because without it pydantic silently
+    #:   dropped the nonce, which is how RESULT came to be a gate nobody could
+    #:   pass (codex cross-repo review of 8993bdb, P1 #2).
+    executor_binding: Optional[dict] = None
+
+    def take_executor_binding(self) -> tuple[Optional[str], Optional[str]]:
+        """Pop ``(nonce, presenter)`` off the result, leaving nothing behind."""
+        binding = self.executor_binding if isinstance(self.executor_binding, dict) else {}
+        self.executor_binding = None
+        nonce = binding.get("nonce")
+        presenter = binding.get("presenter")
+        return (nonce if isinstance(nonce, str) and nonce else None,
+                presenter if isinstance(presenter, str) and presenter else None)
 
     def __post_init__(self):
         # #305: keep the SPELLING honest without ever throwing the result away.

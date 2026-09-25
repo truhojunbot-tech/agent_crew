@@ -388,6 +388,23 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 | `verdict` | reviewers only | `approve` \\| `request_changes` \\| `null` |
 | `findings` | reviewers only | Actionable issues. Empty list for non-reviewers. |
 | `pr_number` | if opened | GitHub PR number, otherwise `null`. |
+| `executor_binding` | if your task block had a `dispatch_nonce` | `{"nonce": "<it>", "presenter": "<your agent name>"}` |
+
+### The dispatch nonce (ADR P2, §2.2)
+
+If your task block carries a `dispatch_nonce:` line, it is a **single-use**
+proof that this task was dispatched to you, and it is checked twice:
+
+1. **Before you start**, present it once for a go/no-go. The block gives you the
+   exact call (`POST /tasks/<id>/start`, or pass it to the equivalent MCP tool).
+   It answers `{"go": true|false}`. **On `go: false`, stop** — somebody else is
+   already running this attempt, or the authorisation no longer holds.
+2. **With your result**, as `executor_binding={"nonce": ..., "presenter": ...}`.
+
+⛔Do not invent one, and do not reuse another task's. A block with no
+  `dispatch_nonce` line means none was minted for you: submit the result without
+  the field rather than making one up. A fabricated nonce is refused, and a
+  result refused at the gate is a result nobody reads.
 
 **Never skip `submit_result`.** POST `status: failed` or `status: needs_human`
 with an honest summary rather than staying silent.
@@ -446,6 +463,19 @@ Before you POST the result, verify:
 - [ ] `pr_number` set if you opened a PR; otherwise `null`
 - [ ] `status` is `completed` (or `failed`/`needs_human` with honest reason)
 - [ ] `verdict: null`, `findings: []` (implementers don't fill these)
+
+### Declared artifact contract (`context.artifact_kind`, #374)
+
+If the task context declares `artifact_kind`, the server checks that contract
+instead of the default commit rule. A result that does not satisfy it is
+stored as `failed` with `reason: no_artifact`.
+- `commit` (also the rule when nothing is declared): a new commit on top of the dispatch base, pushed.
+- `rebase`: push the rebased branch; its commit must descend from `origin/<context.rebase_onto>`
+  and carry the same change you were dispatched with (patch-equivalent commits, or one squash
+  of them). If the rebase needed conflict resolution, report `needs_human` instead.
+- `report`: do not commit. Send `"artifact": {"body": "<report>", "sha256": "<sha256 of body>"}`.
+  If the report is committed, send `"path"` plus `commit` instead of `"body"`.
+- `review`: `verdict` plus the reviewed `pr_number`; `request_changes` needs findings.
 
 ### ⛔ Delegating review / test to the next role — DO NOT use `crew run`
 

@@ -3,6 +3,7 @@ import urllib.request
 import uuid
 
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
+from agent_crew.tokenomics_canary import REUSED_FROM_KEY, SUPPRESSED_REASON
 
 DEFAULT_MAX_ITER: int = 5
 
@@ -21,6 +22,10 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
         "branch": req.branch,
         "priority": req.priority,
         "context": req.context,
+        # s4j: the project rides over the wire too. Dropping it here made the
+        # `--port` variant of these helpers admit project-less through
+        # `http.tasks` even once the in-process variant named one.
+        "project": req.project,
     }).encode()
     http_req = urllib.request.Request(
         f"http://127.0.0.1:{port}/tasks",
@@ -48,17 +53,33 @@ _REVIEW_CONTEXT = {
 }
 
 
-def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, port: int = 0) -> str:
+def _adapter_project(queue, project: str = "") -> str:
+    """The project a loop task is admitted under (§7.1 step 2).
+
+    The caller's own name wins — `crew run` knows it from `--project`/state.
+    Otherwise it is the queue's own identity (`<base>/<project>/tasks.db`).
+    Before s4j these three helpers named no project at all and admission raised
+    a frozen-contract violation out of every one of them.
+    """
+    named = str(project or "").strip()
+    if named:
+        return named
+    return getattr(queue, "project_identity", "") or ""
+
+
+def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, port: int = 0,
+                      project: str = "") -> str:
     req = TaskRequest(
         task_id=f"impl-{uuid.uuid4().hex[:8]}",
         task_type="implement",
         description=task_desc,
         branch=branch,
         context={**_TDD_CONTEXT, **context},
+        project=_adapter_project(queue, project),
     )
     if port:
         return _post_task_http(port, req)
-    return queue.enqueue(req)
+    return queue.enqueue(req, ingress="loop.implement")
 
 
 #: How many times a review that failed to RUN is re-dispatched before the loop
@@ -86,7 +107,8 @@ def next_review_action(outcome: str, attempts: int,
     return "retry" if attempts < max_attempts else "give_up"
 
 
-def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {}, port: int = 0) -> str:
+def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {},
+                   port: int = 0, project: str = "") -> str:
     # Check if a review task already exists for this impl task (auto-transition case).
     # This makes enqueue_review idempotent when the server has auto-created a review.
     try:
@@ -122,13 +144,15 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
         description=task_desc,
         branch=branch,
         context={**_REVIEW_CONTEXT, "prev_task_id": prev_task_id, **context},
+        project=_adapter_project(queue, project),
     )
     if port:
         return _post_task_http(port, req)
-    return queue.enqueue(req)
+    return queue.enqueue(req, ingress="loop.review")
 
 
-def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", context: dict = {}, port: int = 0) -> str:
+def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", context: dict = {},
+                 port: int = 0, project: str = "") -> str:
     # Check if a test task already exists for this review task (auto-transition case).
     # This makes enqueue_test idempotent when the server has auto-created a test.
     if prev_task_id:
@@ -148,10 +172,11 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
         description=task_desc,
         branch=branch,
         context=merged_context,
+        project=_adapter_project(queue, project),
     )
     if port:
         return _post_task_http(port, req)
-    return queue.enqueue(req)
+    return queue.enqueue(req, ingress="loop.test")
 
 
 _KNOWN_LAYERS = {"test_quality", "code_quality", "business_gap"}
@@ -205,7 +230,22 @@ def handle_review_result(
     #
     #   It must not consume an escalation round either: `iteration >= max_iter`
     #   would turn an infrastructure fault into a verdict about the work.
-    if getattr(result, "status", None) not in (None, "completed"):
+    # A canary suppression is an intentional policy outcome, not a reviewer
+    # crash: the review was skipped because a `request_changes` already stands
+    # on this exact commit, and the suppression carries that verdict and its
+    # findings forward. So it takes the ORDINARY `request_changes` path — the
+    # fix round runs exactly as it would have after a real re-review, and the
+    # only thing that did not happen is the reviewer invocation.
+    #
+    # ⛔Never `review_failed`. That retried the suppression twice and then gave
+    #   up, and `enqueue_review` treats the retry's dead task as unusable and
+    #   mints a fresh `review-<uuid8>` at the same head — suppressed again,
+    #   another canary receipt each round. The status test is skipped rather
+    #   than the verdict: a suppression written before §11 item B landed is
+    #   `blocked` with no verdict, and `_resolve_verdict` reads a non-completed
+    #   status as `request_changes`, so both shapes agree here.
+    _suppressed = getattr(result, "summary", None) == SUPPRESSED_REASON
+    if not _suppressed and getattr(result, "status", None) not in (None, "completed"):
         return "review_failed"
 
     verdict = _resolve_verdict(result)
@@ -240,17 +280,29 @@ def handle_test_result(result: TaskResult) -> str:
     return "failed"
 
 
+def _split_text_finding(text: str) -> tuple[str, str]:
+    parts = str(text).split(":", 1)
+    layer = parts[0].strip() if len(parts) == 2 and parts[0].strip() in _KNOWN_LAYERS else "unknown"
+    return layer, (parts[1].strip() if layer != "unknown" else str(text))
+
+
 def build_feedback(result: TaskResult) -> str:
     lines = [f"Review feedback (task {result.task_id}):"]
     for finding in result.findings:
         if isinstance(finding, dict):
             layer = finding.get("layer", "unknown")
-            if layer not in _KNOWN_LAYERS:
-                layer = "unknown"
             issue = finding.get("issue", str(finding))
+            if layer not in _KNOWN_LAYERS:
+                # A dict without a layer of its own may still carry the
+                # "<layer>: issue" text — a canary-reused string finding is
+                # wrapped in a dict so the provenance stamp has somewhere to
+                # live, and dropping to "unknown" would lose what the original
+                # reviewer said about it.
+                layer, issue = _split_text_finding(
+                    issue if isinstance(issue, str) else str(finding))
         else:
-            parts = str(finding).split(":", 1)
-            layer = parts[0].strip() if len(parts) == 2 and parts[0].strip() in _KNOWN_LAYERS else "unknown"
-            issue = parts[1].strip() if layer != "unknown" else str(finding)
-        lines.append(f"- [{layer}] {issue}")
+            layer, issue = _split_text_finding(finding)
+        reused_from = finding.get(REUSED_FROM_KEY) if isinstance(finding, dict) else None
+        origin = f" (standing finding reused from {reused_from})" if reused_from else ""
+        lines.append(f"- [{layer}] {issue}{origin}")
     return "\n".join(lines)

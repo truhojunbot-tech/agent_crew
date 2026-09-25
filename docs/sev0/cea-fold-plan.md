@@ -1,0 +1,591 @@
+# SEV-0 CEA fold plan — b574308 anchors and lane rebase analysis
+
+- **Kind:** `discovery` (anchors and measured merge trials) + `proposal` (fold points). Doc only; nothing here changes code.
+- **Task:** `sev0-cea-lineage-prep-r1` (implement, `agent_override: claude`, :8105), step 3. Branch `sev0/cea-lineage` from `b574308` (PR #375 head).
+- **Contract:** alfred `sev0/e11-adr-draft` `evidence/sev0-p0/E11-ADR-DRAFT.md` @ `6cbce56` ("the ADR"; Π P1–P7, §2.2 ingresses, §3, §7, §8, §11).
+- **Base read:** agent_crew `b574308` (= `5efea31` + `36e182d` + `b574308`; files vs `5efea31`: `pipeline.py`, `risk_tier.py`, `server.py`, 2 tests). Every line number below is `git show b574308:<file>` unless a lane commit is named.
+- **Freeze rule (owner 11354):** this document records *where* each fold lands and *what conflicts*; it resolves nothing. Interface candidates are in `src/agent_crew/cea/` (typed only).
+
+## 1. Enqueue paths at b574308 (every way a row reaches `QUEUED`)
+
+P1: after the fold, the raw INSERT is private to `enqueue_with_receipt`, and each row below is a §7 adapter that calls the engine. "Direct SQLite" rows are the ones §2.2 does not name and that bypass the server today.
+
+| # | Ingress (§2.2) | Anchor at b574308 | What it does today | Fold |
+|---|---|---|---|---|
+| E1 | direct `POST /tasks` | `server.py:4773` `post_task`; raw insert `q().enqueue(task)` `:4815`; push `_try_push_next(role)` `:4852`, `_try_push_discuss` `:4846` | no gate; `201` unconditionally (E10 4a; CXC-3) | engine at the endpoint; adapter `direct`/`manual`/`coordinator`/`cron` by credential (§6.5) |
+| E1a | #294 duplicate-in-flight advisory | `server.py:4797-4836` (`task_issue_number` `:4802`, `active_tasks_for_issue` `:4805-4806`, warning `:4830-4836`); helper `watch.py:554` | lexical, advisory, never blocks | **REMOVE** (§11.1 row 14; P4 `intent_hash` index) — fixture CXC-1 |
+| E2 | MCP | `mcp_server.py` has **no create path**: `get_next_task` `:109` (claim via `queue.dequeue`), `get_next_discuss_task` `:138`, `submit_result` `:146` → `_cascade_stage` `:285-304` (calls pipeline `auto_enqueue_review/_test/_fix` `:292/:295/:304`), `cancel_task` `:341` | MCP is a claim + result + cascade ingress, not an admission ingress | claim → T3 `validate_claim`; result → T3 `validate_result`; cascades → E5 |
+| E3 | CLI (`crew run`, `crew enqueue`) | `cli.py:3275` `enqueue()`: HTTP `POST /tasks` `:3329` when a port is known, **else direct SQLite** `TaskQueue(db).enqueue(TaskRequest(**payload))` `:3344` | the fallback writes QUEUED rows with no server, no push, no gate | HTTP path = E1 adapter `manual`; the direct-SQLite fallback must go (P1 mechanical guarantee) |
+| E3a | loop client (`crew run`) | `loop.py:10-33` `_post_task_http` (POST); `enqueue_implement` `:51-61` (`queue.enqueue` `:61` when `port=0`), `enqueue_review` `:89-128` (`:128`), `enqueue_test` `:131-154` (`:154`), `enqueue_implement_with_feedback` `:228` | same split: HTTP when a port is given, else direct SQLite | as E3 |
+| E3b | discuss panel | `discussion.py:9-36` `enqueue_panel_tasks` (`_post_task_http` or `queue.enqueue` `:36`); claim `queue.py:2059` `dequeue_discuss_for_agent` (stop re-check `:2069`); push `server.py:4846` | same split | discuss is `work_class=ops`; adapter `manual`/`coordinator` |
+| E4 | pipeline (transport-agnostic cascades) | `pipeline.py:588` `auto_enqueue_fix` (`external_op_reserve` `:726`, `queue.enqueue` `:801`); `:990` `auto_enqueue_review` (`:1213`); `:1231` `auto_enqueue_test` (`:1334`); `:1369` `auto_fallback_failed_task` (`:1526`); `:1350` `resume_tier3_gate` | in-process inserts, no gate; STOP checked via `runtime_stop` in `queue.enqueue` | cascade adapter: engine called in-process with `parent_receipt_id` (§8), `work_class` per successor |
+| E5 | server cascades on `/result` | `server.py:4324` `_auto_enqueue_review` (→ E4), `:4351` `_auto_enqueue_test` (**own** `q().enqueue` `:4399`), `:4428` `_auto_enqueue_fix`, `:4557` `_auto_merge_pr`; decision block `:5079-5262` | `coordinator_managed` **skips** review `:5082-5091`, test `:5237-5241`, fix `:5247-5254`, merge `:5235` / `:5257` | **REMOVE** the four suppression branches (§7.2, §11.1 row 10; fixture CX-4b); the flag becomes provenance with a named coordinator |
+| E6 | retry / fallback | `server.py:4464` `_auto_retry_failed_task` (`q().enqueue(retry_req)` `:4538`); `:4618` `_auto_fallback_failed_task` (→ pipeline `:1369`) | new rows with a retry suffix, no gate | P4 retry rule: same receipt iff B unchanged and `attempt < max_attempts`; else re-admit (adapter `retry`) |
+| E7 | recovery | `server.py:2373-2402` `_requeue_orphans` (`tq.requeue` `:2401`, runs in `lifespan` `:2430` when the dispatcher is enabled); other `requeue` call sites `:2521, :2528, :2710, :2720, :3355, :4067, :4246, :4280` | in_progress → pending with no re-validation | P7 recovery: every non-terminal receipt re-validated before any claim; `requeue` becomes `validate_claim`-gated |
+| E8 | STOP replay | `server.py:5270-5310` `/admin/replay-suppressed` (outbox drain); `:2456-2471` `PausedError` handler (outbox reopen); `queue.py` cascade outbox DDL `:376` | replays stored result bodies into E5 after resume | replay = new engine calls under current B (P4 "no in-memory replay bypasses the validator") |
+| E9 | watchdog | outside agent_crew (alfred A+); in-server `_watchdog_loop` `server.py:3150` only pushes reminders `:3072` | — | adapter `watchdog` (§2.2) |
+| E10 | risk-tier decision | `server.py:59` import; `:3691-3695` (`test_scope` decision when `risk_tier_enforcement_enabled()`); `pipeline.py:514` `_record_risk_tier_shadow`; `risk_tier.py` | second risk decision beside quota-core | **REMOVE** as a decision (§11.1 row 13, O10); J7 reads the snapshot `review_test_matrix` — fixture CXC-1 |
+
+**Claim points (T3 `validate_claim`):** `queue.py:1300` `dequeue` (precheck `:1320`, in-txn STOP `:1326-1330`); callers `server.py:2596` (`_try_push_next`), `:4231` (`_dispatcher_loop`), `:4871` (`GET /tasks/next` `:4859`); `mcp_server.py:109`; discuss `queue.py:2059/2069`.
+
+**Dispatch points (T3 `validate_dispatch`, then T6 G_DT):** pane push `push_fn(...)` `server.py:2781` and `:2877` (guarded by `_guard_task_existence` `:2476`, #362); one-shot spawn `:3285` `_dispatch_task` (target resolution `:3253`). Cascade-side suppression decision: `queue.py:1521` `_suppressed` (in `submit_result`'s txn) read back at `server.py:5056`.
+
+**Execute start (T3 `validate_execute_start`):** one-shot — inside `_dispatch_task` before `subprocess` spawn (`:3285+`); pane — new `POST /tasks/{id}/start {nonce}` (no anchor today; P2).
+
+**`/result` (T3 `validate_result`, then T5 G11):** `server.py:4888` `submit_result`: context/task read `:4893-4895`; STOP read `:4896-4902`; artifact gate `:4903-4919` (skip branch "not applied — dispatch base absent" `:4906-4907`); #268 PR mismatch `:4926`; prior status `:4934`; `q().submit_result` `:4937` (queue `:1415`, outbox `:1508-1529`); outbox `_suppressed` `:5056-5063`; artifact held `:5064`; discuss `:5068`; failed → fallback/retry `:5075-5078`; cascades `:5079-5262`.
+
+## 2. `runtime_stop` (P6 store to generalise, not duplicate)
+
+| Anchor (`queue.py`) | Role today | Under P6 | Status |
+|---|---|---|---|
+| `:360-369` `_DDL_RUNTIME_STOP` (`id=1, epoch, paused, incident, note, updated_at`) | the #314 single row | `paused` → `state ∈ {ACTIVE, DRAINING, QUARANTINED, STOPPED}` + `reason` + `decision_id`; `epoch` kept; append-only `runtime_state_events` | **DONE** (step 1, `4b62f32`): additive ALTERs + backfill `paused=1 → STOPPED`; `runtime_state_events` with UPDATE/DELETE triggers |
+| `:603`, `:912-1001` boot reconcile (`pause.json` vs row, higher generation wins; fail-closed write `:993-1001`) | two stores reconciled at boot | `pause.json` = tighten-only input reconciled into the row (P6; fixture CX-P6b) | **PARTIAL**: the reconciled verdict now writes `state` and appends an event; the #314 higher-generation rule is unchanged, so a higher `pause.json` generation can still resume. Gate-time `pause.json` remains additive (tighten-only) and is folded into `effective_state` |
+| `:785` `_stop_dir`, `:787` `_read_stop_row`, `:799` `get_stop_epoch`, `:806` `set_stop_epoch` (epoch+1, `BEGIN IMMEDIATE`), `:830` `resume_stop` (generation CAS) | read/transition API | `RuntimeStateProvider.current()`; transitions gain `who` (P6 table: anyone tightens, owner loosens) | **DONE** (step 1): `get_runtime_state()` + `transition_runtime_state(to, who=, decision_id=)`; `set_stop_epoch`/`resume_stop` keep working and now record `who='legacy:*'` events — see the gap note below |
+| `:873` `_pausejson_active` (additive, fail-closed) | second gate-time store | removed from gate time (§11.2 #13 → T3) | **PARTIAL**: still read at gate time, but only as a tightening (`_runtime_state_in_txn`). Removing it outright regresses global/direct pause on a live server; it goes when T3 owns the gate (step 2) |
+| `:889` `_stop_active_in_txn`, `:902` `_stop_active_precheck` | the gate predicate | becomes `validate_*` reading the one row | **DONE** (step 1) as `_runtime_state_in_txn(conn) != 'ACTIVE'` — DRAINING and QUARANTINED now gate enqueue/claim, which the boolean could not express. `validate_*` wiring is step 2 |
+| gates: enqueue `:1034-1038`, dequeue `:1326-1330`, cascade outbox `:1518-1529` (`_suppressed` `:1521`), `external_op_reserve` `:1856`, discuss `:2069` | STOP linearisation points | the same transactions host the T3 call points (P2 table "where") | step 2 |
+| `server.py:4679-4686` `/health.stop` | exposes `{epoch, paused, incident}` | `/health.runtime_state` (fixture CX-4j asserts `QUARANTINED`) | **DONE** (step 1): `/health.runtime_state` = `{state, effective_state, epoch, reason, decision_id, incident, pause_json_tightening, read_failed}`; `/health.stop` kept for #314 callers |
+| `cli.py:1502`, `:1533` pause/resume | mirror `pause.json` from the DB epoch | unchanged direction (DB is the linearisation point) | unchanged |
+
+## 3. Lane rebases onto b574308 — measured, not resolved
+
+Method: throwaway detached worktree at `b574308`, `git cherry-pick -x` per lane commit, git 2.34.1, **textual only, no tests run**, worktree removed afterwards (2026-09-23, this task). Each lane's own base is `5efea31`; `b574308` is 2 commits ahead of it (`36e182d`, `b574308`), touching `pipeline.py`, `risk_tier.py`, `server.py` (5 lines), 2 tests.
+
+| Lane | Commits | Files (non-test) | Alone onto b574308 |
+|---|---|---|---|
+| G11 (#374) | `37cb8af` → `846d13c` | `instructions.py`, `mcp_server.py`, `pipeline.py` (+209/+93), `protocol.py`, `server.py` `43-52` (imports), `4898-4925` (`/result` artifact gate → `artifact_gate_applies`/`verify_task_artifact`), `4936-4945` | **clean** |
+| G_DT | `addc29e` → `4df04aa` | `server.py` `1751-1863` (pane process-kind helpers), `2368-2376`, `2484-2634` (push refusal + `defer_push_delivery`), `2526-2681`, `2919`, `3047`, `3066`, `4687` (health); `queue.py` `dequeue(..., *, skip_deferred)` `1297-1395`, `defer_push_delivery` (+ before `requeue` `:1923`), `dequeue_discuss_for_agent(..., *, skip_deferred)` `2106-2140`; `pyproject.toml`, `tests/conftest.py`, docs | **clean** |
+| G12 | `b46bda4` → `3b8598f` → `9c90da1` | `queue.py` DDL `148-203` (`_EXEC_STATE_COLUMN_TYPES`, `task_exec_events`), migration `637-647`, `_claim_build` `194-210`, `dequeue(..., *, claimed_via)` `1371-1376` + claim record `1463-1476`, end-lease in `submit_result` `1569-1579`, `get_exec_state` (+ before `requeue`), `_append_exec_event_on/_record_claim_on/_record_end_on/record_dispatch/record_heartbeat` (+2002-2133), `cancel` `2153-2166`, discuss `2288-2335`, `expire_stale` `2599-2614`, watchdog `3111/3147`; `server.py` `997-1010`, `2593-2600` (`dequeue(role, claimed_via="tmux_push")`), `2782-2791` / `2877-2889` (`record_dispatch` on push), `2827-2837`, `2930-2942`, `3282-3312` (`_process_heartbeat`), `3972-4018` (`record_dispatch` on spawn), `4226-4296` (`claimed_via="dispatcher"`), `4866-4908` (`GET /tasks/next` `claimed_via="http_poll"` + `record_dispatch`; `GET /tasks/{id}` `execution`), `5372-5405`; `mcp_server.py`; `tests/fixtures/pre_g12_tasks.db`; docs | **clean** |
+| E8 | `4c123fc` | tests + doc only | **clean** (already on this branch as `c31541c`) |
+
+**Pairs:**
+
+| Order | Result |
+|---|---|
+| G11 → G12 | clean |
+| G_DT → G11 | clean |
+| E8 → G11 → G_DT | clean |
+| G_DT → G11 → **G12** | **CONFLICT** at `b46bda4` (G12 1/3): `queue.py`, one region — both lanes insert a new method immediately before `def requeue` (`queue.py:1923`): G_DT `defer_push_delivery`, G12 `get_exec_state`. `3b8598f` (G12 2/3) would then add the regions listed in the next row. |
+| G12 → G_DT | `addc29e` clean; **CONFLICT** at `4df04aa` (G_DT 2/2): `queue.py` 4 regions — top-of-file import (`contextlib` vs G12's import), `dequeue` signature + docstring (`skip_deferred` vs `claimed_via`, both keyword-only), `dequeue_discuss_for_agent` signature (same), the pre-`requeue` method insertion; `server.py` 2 regions — the push-path `q().dequeue(role=role, ...)` call (`skip_deferred=True` vs `claimed_via="tmux_push"`) and the push-refusal / `defer_push_delivery` block vs G12's `record_dispatch` on the same push path. |
+
+**What the G12 ↔ G_DT conflict is (not resolved here):**
+
+1. *Mechanical:* two keyword-only parameters on `dequeue` / `dequeue_discuss_for_agent`; two imports; two methods inserted at the same spot; one call site needing both arguments. Any resolver can merge these.
+2. *Semantic — belongs to the fold, not to a rebase:* on the tmux push path G_DT may **refuse** delivery (foreign pane / no agent CLI) and back the task off, while G12 **records** a dispatch with a pane lease. Which runs first decides whether a refused push leaves a `dispatched_at`/`lease_owner` on the row. Under §11.2 the order is fixed by the architecture: T3 `validate_dispatch` → T6 G_DT topology check → deliver → G12 event with `receipt_id`; a refused push is an event (`dispatch_refused`) and never a lease. O12 assigns who resolves this and requires re-review after the rebase.
+
+**ADR merge order (Appendix A):** (1) G15 `b574308` (this base) → (2) E8 + §12.2 fixtures (this branch: `c31541c`, `4c69c3a`) → (3) G12 + Codex #6 fixes → (4) engine + runtime state + P2a broker → (5) G11, G_DT rebased → (6) remove `risk_tier.py` decision + #294 advisory → (7) E8 green. G11 is order-independent (clean against every combination above); G12 before G_DT matches the ADR order and puts the semantic decision in step (5) where it is re-reviewed.
+
+## 4. Fold points per lane (where each lands after the validator)
+
+| Lane | ADR row | Lands at | Change in meaning |
+|---|---|---|---|
+| G11 `846d13c` | §11.1 row 10 (T5) | `/result` after `validate_result` (`server.py:4903-4919` today) | required reviewer/tester come from the receipt (`required_reviewer/tester`); the "not applied — dispatch base absent" skip (`:4906-4907`; G11 keeps it via `artifact_gate_applies`) becomes **FAIL** — fixture CXC-6a |
+| G_DT `4df04aa` | §11.1 row 11 (T6) | after `validate_dispatch` on the push path (`server.py:2596-2781`) | topology/foreign-pane check only; the #362 "unknown task" refusal (`_guard_task_existence` `:2476`) is subsumed by "no receipt ⇒ no dispatch" |
+| G12 `9c90da1` | §11.1 row 9 (T3 evidence) | `task_exec_events` + `authorization_receipts` under one append-only trigger; `cancel` (`queue.py:1935`) records the terminal event and clears the lease in one txn; `GET /tasks/{id}` (`server.py:4880`) redacts pid/pane/lease | events carry `receipt_id` — fixtures CXC-6b, CXC-6c |
+
+## 5. Findings while anchoring (`discovery`)
+
+- **Three direct-SQLite enqueue paths bypass the server entirely** at b574308: `cli.py:3344`, `loop.py:61/128/154` (port 0), `discussion.py:36`. §2.2 lists "manual operator (`crew run`, curl)" as one ingress via the endpoint; these fallbacks are a fourth, unlisted way into `QUEUED`. The I2 static test must enumerate `queue.enqueue` call sites across `cli.py`, `loop.py`, `discussion.py`, `pipeline.py`, `server.py`, not routes alone.
+- **MCP has no admission ingress** (no create tool), so §2.2's route table is complete for creation, but MCP is a *claim* ingress (`get_next_task` → `dequeue`) and a *result* ingress with its own cascade copy (`_cascade_stage`), so it has three T3 call sites, not zero.
+- **`_auto_enqueue_test` in `server.py` (`:4351-4399`) has its own `q().enqueue`**, separate from `pipeline.auto_enqueue_test` (`:1231`); the HTTP and MCP test cascades are two code paths for one invariant (same class as §11.3).
+- **`_requeue_orphans` runs before the dispatcher loop starts** (`server.py:2430`) with no re-validation — exactly the P7 recovery point; it is the natural first caller of `validate_claim` on restart.
+
+## 6. Step 1 — what landed, what did not (`result`)
+
+Task `sev0-cea-lineage-s1-state-validator`, commit `4b62f32` on `sev0/cea-lineage`
+(base `d073a59`). Contract frozen at alfred `6cbce565`; receipt schema copied
+byte-identically from alfred `e1063eb` (blob `41e7ebf`, asserted by a test).
+
+| Item | State | Where |
+|---|---|---|
+| P6 state + epoch + reason + decision_id on the `runtime_stop` row | **done** | `queue.py` `_DDL_MIGRATE_RUNTIME_STOP_P6`, `_DDL_BACKFILL_RUNTIME_STOP_STATE` |
+| append-only `runtime_state_events` (+ UPDATE/DELETE triggers) | **done** | `queue.py` `_DDL_RUNTIME_STATE_EVENTS*` |
+| transition rules / who-may-transition | **done** | `queue.transition_runtime_state`, `_transition_refusal` |
+| `/health.runtime_state` | **done** | `server.py` `/health` |
+| `authorization_receipts` = the frozen schema, append-only | **done** | `cea/store.py` |
+| `dispatch_nonces` single-use | **done** | `cea/store.py` `mint_nonce`/`consume_nonce` |
+| `tasks.receipt_id` (nullable) | **done** | `cea/store.py` `_DDL_MIGRATE_TASKS_RECEIPT_ID` |
+| one validator: P3 table, P6 matrix, P7, O18, O20 | **done** | `cea/validator.py` `validate()` |
+| the five validator call sites | **not started — step 2** | — |
+| `tasks.receipt_id` `NOT NULL` + FK | **not started — step 2** | — |
+| P4 unique partial index on `intent_hash` | **not started** | needs the "current state" view over the append-only rows; lands with the engine |
+
+**Honest gaps in step 1** (they are not hidden behind a green test):
+
+1. `set_stop_epoch(False)` and `resume_stop(...)` still loosen the runtime without
+   an owner `decision_id`. They are the #314 CLI/fleet paths and breaking them
+   would break `b574308`; they now record `who='legacy:set_stop_epoch'` /
+   `'legacy:resume_stop'` events so the bypass is visible in the audit trail. The
+   P6 authority rule is enforced on `transition_runtime_state`, which is the API
+   step 2 routes the transition endpoint through.
+2. `pause.json` is still read at gate time (as a tightening only). P6 wants it
+   read at boot only; removing the gate-time read now regresses global/direct
+   pause on a live server (the #314 reviewer note at `queue.py:_pausejson_active`).
+3. The validator's signature check reads `signature.status`; there is no engine
+   key yet (O3), so every receipt is `UNVERIFIED` and admissible only with a
+   `downgrade_reason`. That is P2a's stated position, not an oversight.
+
+**Verification** (`tests/test_cea_step1_state_and_validator.py`, 127 tests): schema
+blob identity; the dependency-free fallback checker agreeing with `jsonschema` on
+every fixture; trigger rejection of UPDATE/DELETE on both append-only tables;
+migration idempotence over three opens of a copy of the committed fixture DB **and**
+of a copy of the live `~/.agent_crew/agent_crew/tasks.db`; the P6 transition table
+row by row; all 20 cells of the P6 enforcement matrix; every row of the P3 outcome
+table; each O18 immediate-invalidation field against a one-minute-old receipt; and
+the O20 window on both sides. No live server, DB or GitHub state was touched — the
+live DB is copied into `tmp_path` and opened there.
+
+## 7. Step 4b — what landed, what did not (`result`)
+
+Task `sev0-cea-lineage-s4b-folds-acceptance-guards-r1`, branch `sev0/cea-lineage`,
+base `ba1d71d` (4a's head). Contract frozen at alfred `6cbce565`.
+
+### DONE in this step
+
+| Item | Where | Evidence |
+|---|---|---|
+| FOLD-IN 3 P1 — RESULT requires that EXECUTE_START consumed the nonce | `cea/store.py` (`EXECUTE_START_CONSUMER`, `consumer_tag`, `consumed_by_execute_start`), `cea/validator.py` (`nonce_consumed_by`/`nonce_attempt`, `_nonce_started`, three RESULT refusals), `queue.py` (`start_execution` tags the spend; `submit_result` reads the nonce row), `server.py` (`/result` → 409), `mcp_server.py` (same refusal) | `tests/unit/test_sev0_cea_s4b_result_requires_start.py` (13 tests); step-1 suite updated (147); CEA unit files 190 passed / 31 xfailed |
+
+The reproduction, run against `ba1d71d` in a throwaway copy of the tree before
+the fix (`mode=test`, `start_execution` omitted): task `completed`, nonce
+`used_at=None`, receipt `CLAIMED → CONSUMED` — never `RUNNING`. After the fix
+the same sequence is refused `NONCE_NOT_STARTED`, nothing is written, and the
+nonce stays unspent.
+
+### Guard inventory as measured on this branch (ADR §11.2, item (g))
+
+`discovery` — this is what the code contains today, not a claim that the count
+is already at or under the ADR's ceiling of six.
+
+| Guard | Implementation on this branch | Status |
+|---|---|---|
+| T3 validator (the five points) | `cea/callsites.py` — one `VALIDATOR`, five `gate_*` | the one decision surface |
+| G11 artifact contract | `pipeline.artifact_gate_applies` + `/result`, `mcp_server.py:234` | present; **not yet** invoked *from* the validator at T5, and "dispatch base absent" still skips rather than FAILs — item (a), REMAINING |
+| G_DT dispatch topology | `server._guard_agent_process`, `_guard_task_existence`, `queue.defer_push_delivery` | present; the #362 unknown-task refusal is **not yet** subsumed by "no receipt ⇒ no dispatch" — item (b), REMAINING |
+| G12 execution events | `queue.record_dispatch`/`_record_claim_on`/`_record_end_on`, `task_exec_events` | present; `receipt_id` on the rows, `cancel()` single-txn terminal event, `GET /tasks/{id}` redaction and the append-only trigger — item (c), REMAINING (**verified absent** in step 4i, §11) |
+| #294 lexical duplicate advisory | `server.py:5093` `active_tasks_for_issue` | **to remove** (§11.1 row 14) — REMAINING |
+| risk-tier decision | `risk_tier.risk_tier_enforcement_enabled` read at `pipeline.py:981/1296/1542`, `server.py:3931` | **to remove as a decision** (§11.1 row 13, O10) — REMAINING |
+
+### REMAINING after this step (nothing below was started)
+
+Carried from 4a's s2b remainder:
+
+1. Remove the #294 lexical duplicate advisory (`server.py:5093`).
+2. Remove `risk_tier.py` as a decision; J7 reads the snapshot `review_test_matrix`.
+3. Receipt-less legacy rows: not runnable under `enforce`, counted under `shadow`
+   (the claim path already refuses them under `enforce` — `queue.py:2172`; the
+   *report* under shadow is not built).
+4. Rollout config: engine mode `off|shadow|enforce|test` **per project** (today
+   the mode is process-wide, `AGENT_CREW_CEA_MODE`). Default `shadow` for live.
+5. E8 §11 scenarios flipping from xfail to pass under `enforce` (31 xfail today).
+
+This step's own list:
+
+- (a) G11 invoked from the validator at T5; "dispatch base absent" ⇒ FAIL.
+- (b) G_DT invoked after the validator at T6, topology only.
+- (c) G12 `receipt_id` on `task_exec_events`, single-txn `cancel()`, public
+  redaction, append-only triggers.
+- (d) I1 property test (static exhaustiveness over adapters + generated fixtures
+  through every adapter ⇒ identical `(decision, reason, intent_hash)`).
+- (e) I2 static + dynamic (no receipt / CONSUMED / stale per O18 field /
+  DRAINING, QUARANTINED, STOPPED / past the O20 window).
+- (f) Permanent fixtures: E10 4a–4j, the Codex six, same-uid executor/caller —
+  BLOCKED vs expected-red.
+- (g) Guard count reduced to ≤ 6 with the removals above; the table in this
+  section is the *starting* inventory, not the finished count.
+
+## 8. Step 4c — what landed, what did not (`result`)
+
+Task `sev0-cea-lineage-s4c-remainder-folds`, branch `sev0/cea-lineage`, base
+`bd58092` (4b's head). Contract frozen at alfred `6cbce565`. A parallel lane 4d
+owns the new I1/I2/fixture test files and the guard inventory doc; nothing here
+touches them.
+
+### DONE in this step
+
+| # | Item | Where | Evidence |
+|---|------|-------|----------|
+| 1 | #294 lexical duplicate advisory **removed** (§7 REMAINING 1) | `server.py` `post_task` (lookup, warning and the `in_flight_for_issue` response key), `watch.py` (`active_tasks_for_issue` deleted) | `tests/unit/test_issue_294_inflight_issue_advisory.py` rewritten as the removal record, 6 tests |
+| 2 | risk-tier decision **removed from the dispatch path** (§7 REMAINING 2, §11.1 row 13 — *server half only*) | `server.py` test-scope block now honours the stored `context.test_scope` and names `test_scope_source` instead of re-asking the module | CXC-1 flips xfail → pass; a new standing red holds the pipeline half |
+| 3 | Rollout config **per project** (§7 REMAINING 4) | `cea/engine.py` `OFF`, `project_mode_env_var`, `resolve_mode`, `EngineConfig.from_env(project=)`, `.recording`; `cea/callsites.py` `enforcing(project=)`, `recording()`; `queue.cea_config(project)` cached per project; ENQUEUE passes `task.project` | `tests/unit/test_sev0_cea_s4c_rollout_mode.py`, 23 tests |
+| 4 | (a) T5 "dispatch base absent" ⇒ **FAIL**, never "not applied" | `server.py` `/result`, held as `no_artifact` with the reason in `error_info.detail`, under the project's rollout mode | `tests/unit/test_sev0_cea_s4c_dispatch_base_absent.py`, 6 tests |
+
+`pytest tests/unit -k cea` → **272 passed, 21 xfailed**. `pytest tests/unit -k
+"353 or 374"` → 10 failures, identical in count and name at `bd58092` before
+this step (verified by stashing the work tree); they are pre-existing and are
+**not** fixed here. `pytest tests/unit -k "scope or tier"` → 49 passed, 9 failed,
+same 9 at base (`$.project: '' should be non-empty` — the engine's contract check
+on receipts minted for project-less fixtures).
+
+### `discovery` — the rollout mode is read in two different ways right now
+
+Driving the new T5 refusal with the process-wide `AGENT_CREW_CEA_MODE=enforce`
+returns **409 from the s4b RESULT rule** (a nonce proves a start happened)
+before the artifact gate is reached. The artifact check reads the *task's*
+project; the four post-admission T3 call sites still read the process-wide mode.
+Both behaviours are correct in isolation and the combination is the half-wired
+state below. The fix is not to pass the project down from each caller — it is
+for those sites to take it from the task's **receipt**, so a task admitted under
+one project's mode cannot be claimed or finished under another's.
+
+### REMAINING after step 4c
+
+Carried, unstarted:
+
+1. ~~#294 advisory~~ — done above.
+2. risk-tier **pipeline half**: `pipeline.py` still branches on
+   `risk_tier_enforcement_enabled()` at `:981`, `:1296`, `:1542` for the
+   review/test/fix cascades, including the TIER_0 skip and the TIER_3 gate. The
+   cascades must take reviewer/tester from the receipt's J7 contract instead.
+   Standing red: `test_cxc_1_pipeline_still_decides_by_risk_tier`.
+3. ~~Receipt-less legacy rows~~ — shadow report built in step 4i (§11).
+4. ~~Per-project rollout config~~ — done above; the post-admission threading
+   that was carved out here landed in step 4i (§11).
+5. E8 §11 scenarios still xfail under `enforce` (21 xfail in the cea selection).
+
+This step's own list, unstarted:
+
+- (b) G_DT invoked after the validator at T6, topology only; the #362
+  unknown-task refusal subsumed by "no receipt ⇒ no dispatch".
+- (c) G12: `receipt_id` on `task_exec_events`, single-txn `cancel()` terminal
+  event + lease clear, public `GET /tasks/{id}` redaction of pid/pane/lease,
+  append-only triggers on `task_exec_events`. Not inspected in this step;
+  **verified absent** in step 4i (§11), which is where the 4b hedge is resolved.
+- (d) I1, (e) I2, (f) permanent fixtures — lane 4d.
+- (g) Guard count: two removals landed (#294 advisory; the risk-tier read in
+  `server.py`). The count is **not** yet at the ADR's ceiling of six, because
+  the pipeline risk-tier branches remain.
+
+## 9. Step 4e — production wiring (`result`)
+
+Codex's review of alfred's `CEA-LIVE-DEPLOY-PLAN.md` (P1) found that no CEA
+input provider was constructed anywhere in production at `bd58092`.
+`TaskQueue` defaulted to none, so every input reported unavailable and every
+receipt was `BLOCK`; `set_default_runtime_authority()` had no production call
+site at all — only tests — so an `ACTIVE` restoration was always refused. The
+plan's proofs 3/4/5 could therefore not be run against a live uvicorn server,
+only against the injected test harness.
+
+### DONE in this step
+
+- `src/agent_crew/cea/wiring.py` — the single production factory.
+  `build_wiring()` / `build_engine_from_env()` / `install_from_env()`. One
+  question per slot ("is this input readable?"), and the answer is either a
+  real provider or nothing at all; absence stays the engine's `Unavailable*`
+  stub so P7 turns it into a recorded `BLOCK` rather than an exception.
+- `server.create_app`'s lifespan now calls `install_from_env(...)` and hands
+  the result to `TaskQueue(db_path, cea_providers=...)`. That is the call site
+  the finding was about — a passing provider test proves the factory works,
+  only the construction site proves production uses it. Asserted statically in
+  `test_the_server_constructs_its_queue_with_the_wired_providers`.
+- One startup log line naming every slot `WIRED`/`UNAVAILABLE` **with a reason**,
+  plus the engine mode and whether the loosening authority was installed.
+- `CanonicalPolicySnapshotReader` now carries `principals`, `build_commits` and
+  `runtimes` off each decision record. It dropped all three before, so
+  `SnapshotLooseningAuthority` failed conditions 3 and 4 for *every* record the
+  production reader produced: the authority was structurally incapable of
+  granting, and only a hand-built `DecisionRev` in `conftest` could satisfy it.
+- `hmac_sha256_verifier(key)` — the reader side of the snapshot signature.
+  Wired from `AGENT_CREW_CEA_SNAPSHOT_KEY_FILE`; absent ⇒ the snapshot stays
+  `UNKEYED`/`UNSIGNED` ⇒ an unverified input ⇒ `BLOCK`, exactly as before.
+- `AdmissionInputsClient(child_env=...)` so the wiring can tell the alfred
+  script which registry / incident-memory files to read.
+
+### Env contract
+
+| env | default | absent ⇒ |
+|-----|---------|----------|
+| `AGENT_CREW_CEA_REGISTRY_PATH` | `~/alfred/governance/capability_registry.json` | capabilities UNAVAILABLE |
+| `AGENT_CREW_CEA_SNAPSHOT_PATH` | `~/alfred/governance/control_policy_snapshot.json` | snapshots UNAVAILABLE |
+| `AGENT_CREW_CEA_SNAPSHOT_KEY_FILE` | — | snapshot UNKEYED ⇒ unverified input ⇒ BLOCK; `RefuseAllLoosening` stays |
+| `AGENT_CREW_CEA_MEMORY_CMD` | `python3 ~/alfred/tools/admission_inputs.py` | L3 + capabilities UNAVAILABLE |
+| `AGENT_CREW_CEA_QUOTA_CACHE_DIR` | `~/alfred/quota` | budgets UNAVAILABLE |
+| `AGENT_CREW_CEA_COOLDOWN_FILE` | — | no cooldown recorded (not an error) |
+| `AGENT_CREW_CEA_CREDIT_CLASS` | `{}` | unknown credit class = the costly one (O9) |
+
+The step-3 spellings (`AGENT_CREW_CEA_POLICY_SNAPSHOT`,
+`AGENT_CREW_CEA_CAPABILITY_REGISTRY`, `AGENT_CREW_CEA_ADMISSION_INPUTS`) are
+accepted as aliases. `AGENT_CREW_CEA_ENGINE_ENDPOINT` /
+`AGENT_CREW_CEA_ADAPTER_TOKEN_FILE` stay **unset** in this deployment, so
+`get_engine()` returns the in-process engine and these providers are the ones it
+reads; with an endpoint set, `build_wiring()` wires nothing and says so, because
+the deciding process is `crew-authz`.
+
+### `discovery` — what the live box actually reports today
+
+Run against this machine with no CEA env set at all:
+
+```
+snapshots=WIRED (…/control_policy_snapshot.json; unkeyed — AGENT_CREW_CEA_SNAPSHOT_KEY_FILE
+  unset, so the snapshot is an unverified input and admission BLOCKs (P7))
+capabilities=UNAVAILABLE (L2/L3 command unavailable, so E4 cannot be queried)
+gates=WIRED   runtime=UNAVAILABLE (db not created yet)   budgets=WIRED (…/alfred/quota)
+l3_memory=UNAVAILABLE (no readable L2/L3 command script at …/alfred/tools/admission_inputs.py)
+loosening_authority=RefuseAllLoosening (snapshot unverifiable)
+```
+
+Two facts follow, and neither is a claim about a future state:
+
+1. `~/alfred/tools/admission_inputs.py` **does not exist on this box**, so the
+   E4 and L3 inputs cannot be wired here today regardless of configuration.
+   That is alfred's side of the contract (`sev0/cea-alfred-lineage` @ `ca8b1e8`).
+2. no snapshot signing key exists either, so the snapshot is present but
+   unverified. Admission therefore still BLOCKs live, and `RefuseAllLoosening`
+   still stands. **This step wires the path; it does not make the live proofs
+   pass, and nothing here should be read as saying it does.**
+
+### REMAINING after step 4e
+
+- alfred must ship `tools/admission_inputs.py` and a signed snapshot before the
+  plan's proofs 3/4/5 can run against a live server rather than the injected
+  harness. Until then those proofs must be labelled non-live, as codex's P1 asks.
+- `cli.py` still constructs `TaskQueue` without the wiring; only the server does.
+  The dispatcher is the process that admits, so this is the load-bearing site,
+  but the gap is real and named here rather than glossed.
+- `install_from_env` is per-process, so a snapshot that gains a signature while
+  the dispatcher is running does not take effect until it restarts. P7 makes
+  that direction safe (stale ⇒ refuse), but there is no reload path yet.
+
+## 10. Step 4g — final merge and xfail reconciliation (`result`)
+
+The lineage's last step. `sev0/cea-lineage-s4d` (`d7e427f`, s4d-r3) was merged
+`--no-ff` into `sev0/cea-lineage` (`4a6ca04`, clean — no conflicts), then the
+whole CEA suite was reconciled against the markers.
+
+### Final suite counts
+
+Selection: `tests/unit/test_sev0_cea_*.py tests/test_cea_*.py
+tests/unit/test_sev0_runtime_authority.py`, `-p no:randomly`, foreground.
+
+| | Count |
+|---|---|
+| passed | **656** |
+| failed | **0** |
+| XPASS | **0** |
+| strict xfail | **60** |
+
+### DONE in this step
+
+- **Merged the s4d test lane.** All 14 I1 ingresses driven through their real
+  entry points, MCP `submit_result` end-to-end, guard inventory §7.
+- **Made the s4b harness hermetic.** The merge turned the suite red:
+  `test_http_result_before_start_is_refused` got 403 at `POST /tasks` because
+  `enforcing_queues` used `kw.setdefault` and did not stub `install_from_env`,
+  so after s4e the server's queue ran `mode=shadow` against the live
+  `~/alfred/governance` snapshot — unkeyed, therefore an unverified input, so
+  enqueue BLOCKs (P7). That refusal has nothing to do with the
+  RESULT-before-START rule the test pins. Same leak `c2de6db` closed in the
+  shared helpers; same fix applied here. Suite back to green.
+- **Reconciled the markers.** No marker had to be removed: XPASS was already 0,
+  so no named s4f item had silently landed. The one s4f item that did land —
+  http refusal mapping — had its marker removed in its own commit (`fc857aa`).
+- **Checked the markers are not stale.** Strict xfail + XPASS=0 proves a
+  behaviour is absent; it does not prove the marker names the *right* reason.
+  Both s4f items were re-run with `--runxfail`: empty-project fails on
+  `EngineError: $.project: '' should be non-empty` (`cea/engine.py:1170`) and
+  requeue fails on `assert 'CLAIMED' in ('QUEUED','HELD','SUPERSEDED')`. Both
+  match their marker text.
+- **Checked the markers are all strict.** No `strict=False` anywhere in the
+  suite. The three imperative `pytest.xfail()` calls in
+  `test_sev0_cea_i2_static_dynamic.py` are conditional on the gate's own answer
+  (`if not g.proceed`), so they become real PASSes when the cell lands rather
+  than masking it; none fired in this run. Its docstring still claimed
+  `strict=False` and was corrected.
+
+### DEFERRED — every remaining strict xfail, with why
+
+All 60 are marker-based and strict. Grouped by the item each names:
+
+| # | Item | Why it is genuinely deferred |
+|---|---|---|
+| 41 | **empty-project admission** (`i1_property`) | Engine raises `EngineError` instead of writing a P2 BLOCK receipt for `project=""`. A code-lane fix in `cea/engine.py` + the nine project-less adapters; not attempted in a test-reconciliation step. |
+| 5 | **requeue receipt lifecycle** (`i2_static_dynamic`) | `LIFECYCLE_GRAPH` has no CLAIMED→QUEUED edge, so the five paths back to `pending` strand the receipt in CLAIMED. Needs a lifecycle edge + a same-txn write. Zero-bypass holds; only liveness is lost. |
+| 9 | **E5(a) not landed** (CX-4a/4c/4i-a/b/c, CXC-2, CXC-3, CX-P2b, CX-P2c) | No engine/receipt at `POST /tasks` (P1/P2). |
+| 4 | **No canonical policy snapshot** (CX-4d/4e/4f/4g, §5.3) | alfred-side: `tools/admission_inputs.py` + a signed snapshot. Two are reference fixtures asserted from the consumer side only. |
+| 2 | **No caller/executor identity** (CX-4h, CXC-4, §6.5/E10 4h) | Blocked on the **O21b/O21c broker VERIFIED** identity work. |
+| 1 | **CX-4j** | Runtime row knows only `paused` (#314); no `QUARANTINED` state (P6). |
+| 1 | **CXC-1** | `pipeline.py` still branches on `risk_tier_enforcement_enabled()`; the cascades do not consume the receipt's J7 contract yet. This is guard #14, the same one keeping the §11.2 count at 7. |
+| 3 | **CXC-6 a/b/c** | G11 missing-base is a skip not a FAIL; G12 cancel; `task_exec_events` has no append-only trigger. |
+| 1 | **CXC-5** | E8 `test_sev0_e8_adversarial.py` still carries markers. |
+| 4 | **Permanent fixtures** CXC-5, CXC-6, CX-P2b, CX-P2c + the report gate | The acceptance verdict is **BLOCKED** while DEFERRED is non-empty — by design. |
+
+Only the first two are *this repo's* code lane. The rest are blocked on alfred
+(snapshot, `admission_inputs.py`), on the O21b/O21c identity broker, or on E5(a).
+
+### The lineage does not close the guard count
+
+`docs/sev0/cea-guard-inventory.md` §8: **5 target components + 2 extra
+judgements = 7**, against ADR §11.2's target of ≤ 6. Nothing in s4d–s4g removed
+a guard. The two named reductions (#12 `runtime_stop` into the P6 row T3 already
+reads; #14 `risk_tier` into the O10 snapshot matrix) are unstarted.
+
+### Acceptance verdict
+
+**BLOCKED**, and correctly so:
+`test_report_gate_acceptance_verdict_requires_every_fixture_blocked` is itself a
+strict xfail while DEFERRED is non-empty (CX-P2b, CX-P2c, CXC-5, CXC-6). The
+suite is green; the acceptance gate is not open.
+
+## 11. Step 4i — the mode comes off the receipt; legacy rows get counted (`result`)
+
+Two items. Both landed; everything else this step was asked to *check* is
+recorded below as DEFERRED with the evidence for why, not silently dropped.
+
+### DONE — item 1: the four post-admission call sites read the receipt's project
+
+`result`. Step 4c made rollout per-project and wired ENQUEUE (which holds the
+`TaskRequest`) and the T5 artifact gate (which reads the task row). The four
+post-admission points did not: `claim`, `dispatch`, `execute_start` and
+`result` all called `TaskQueue.cea_config()` with no argument, i.e. the
+process-wide mode. §8's `discovery` recorded the consequence and this step
+reproduces it as a test: with `AGENT_CREW_CEA_MODE=enforce` and a project held
+at `shadow`, `POST /result` answered **409 from the s4b RESULT nonce rule**
+(`NONCE_MISSING`) before the T5 artifact gate was reached. A task was admitted
+under one project's mode and finished under another's.
+
+| Where | Change |
+|---|---|
+| `queue.py` `cea_config_for_receipt(receipt)` | resolves the mode from the receipt's own `project`, falling back to the process-wide value when there is none |
+| `_cea_claim_gate`, `record_dispatch`, `start_execution`, `submit_result` | each passes the receipt it is deciding on |
+| `requeue_through_gate` (§8) | not one of P2's five, but it decides on the same receipt in the same lineage, so it reads the same project's mode |
+
+⛔The **receipt's** project, not the row's. The receipt is what admission
+  signed; `tasks.project` is what a caller wrote. Keying the rollout mode off
+  caller-supplied data would let a caller choose which mode applies to it.
+
+A pinned `cea_config=` still wins for every project (s4c's rule is unchanged: a
+caller holding a config already answered the question).
+
+### DONE — item 2: receipt-less legacy rows are REPORTed and counted
+
+`result`. A row written before step 2c has no receipt, so the gate cannot be
+asked. Under `enforce` the claim is refused already (`claim_through_gate`,
+formerly cited as `queue.py:2172`). Under `shadow` it ran and said so in a log
+line — which cannot answer *how many are left*, the number a deployment needs
+before it turns enforcement on.
+
+- One REPORT line **and** one durable `cea_legacy_row` event per row, at claim
+  and at dispatch (`_cea_report_legacy_row_on`, under its own SAVEPOINT:
+  recording only, a lost audit row must never change a claim).
+- `GET /health` → `cea.legacy_rows`: `total` / `open` / `by_status` from the
+  rows themselves (ground truth, including rows no call site has touched), and
+  `reported` counting **distinct tasks** per point — a row claimed twice is one
+  legacy row, not two.
+- `off` records nothing; the `enforce` refusal is unchanged. Shadow counts,
+  enforce stops.
+- ⛔The legacy report records the **process-wide** mode on purpose: with no
+  receipt there is no signed project to key an override off, and reading the
+  row's own column there would reopen the hole item 1 just closed.
+
+Dispatch of such a row mints no nonce, so EXECUTE_START and RESULT will have
+nothing to check — which is why dispatch gets a row of its own rather than
+being folded into the claim one.
+
+### Evidence
+
+`tests/unit/test_sev0_cea_s4i_project_scope_and_legacy.py` — **19 passed**,
+including the s4c discovery in both directions (a shadow project not enforced
+by a process-wide `enforce`; an enforce project enforced inside a shadow
+process), two projects decided separately in one process, and a static check
+that no post-admission site reads the process-wide mode again.
+
+### `discovery` — a consistently enforced lineage found a dropped nonce
+
+Wiring item 1 turned two green tests red, and the cause was a real defect, not
+the tests. `pipeline.no_artifact_result` rebuilds the `TaskResult` field by
+field rather than with `dataclasses.replace`, and it did not carry
+`executor_binding`. So under enforcement a completion held by the T5 artifact
+gate arrived at the P2 RESULT gate with no nonce and was refused **409
+`NONCE_MISSING`** — the row was never written, and the artifact finding that
+produced the hold was discarded with it. `hold_mismatched_pr_result`, the other
+holder on that path, uses `replace()` and was never affected.
+
+This was unreachable before: RESULT read the process-wide mode, so a project
+that had moved to `enforce` for the artifact gate was still in `shadow` at
+RESULT and the missing nonce never mattered. Fixed in the same commit, with a
+unit test naming the rule (`test_a_held_result_keeps_the_nonce_the_result_gate_needs`).
+
+`test_sev0_cea_s4c_dispatch_base_absent.py` was rewritten to drive claim →
+dispatch → start before posting, because that is now the only way to isolate the
+T5 gate: a result for a row that was never claimed is refused by P2 first. The
+same change makes that file hermetic — it was wiring itself from the live
+`~/alfred/governance` snapshot (the s4g leak, in a file s4g did not touch).
+
+### DEFERRED — checked in this step, with the reason
+
+| Item | State at this head | Why deferred |
+|---|---|---|
+| **G_DT at T6** (§8 list (b)) | `_guard_agent_process` runs inside `_guard_tmx_push`, i.e. while the pane is being resolved — **before** `record_dispatch` (the T6 validator) in both `_try_push_next` (`server.py:3029`) and `_try_push_discuss` (`server.py:3132`) | Topology only, but moving it is a change to the live dispatch ordering, not a bounded fold. Not attempted in a step whose two items are elsewhere. |
+| **G12 verification** (§8 list (c)) | `task_exec_events` has **no** `receipt_id` column and **no** append-only trigger (greps: no `trg_task_exec_events*` anywhere in `src/`); `cancel()` at `queue.py:3647` is not a single-txn terminal event + lease clear; `GET /tasks/{id}` redaction not inspected | Now *verified absent* rather than "unverified" — the 4b table's hedge can be dropped. The work itself is a schema migration plus a dispatch-path change; out of scope here. |
+| **pipeline risk-tier branches** | `pipeline.py:992`, `:1307`, `:1553` still call `risk_tier_enforcement_enabled()` — the same three branches §8 recorded at `:981`/`:1296`/`:1542`; only the line numbers moved | The cascades must take reviewer/tester from the receipt's J7 contract. This is guard #14, the one holding the §11.2 count at 7. Standing red `test_cxc_1_pipeline_still_decides_by_risk_tier` is doing its job. |
+| **remaining E8 §11 xfails** | unchanged from §10's table of 60 | All 60 are blocked on E5(a), on the alfred-side policy snapshot, or on the O21b/O21c identity broker — none of which is this repo's code lane. |
+
+### Suite counts at this head
+
+Same selection as §10: `tests/unit/test_sev0_cea_*.py tests/test_cea_*.py
+tests/unit/test_sev0_runtime_authority.py`, `-p no:randomly`, foreground.
+
+| | Count | vs §10 (s4g) |
+|---|---|---|
+| passed | **687** | 656 → 687 |
+| failed | **0** | 0 → 0 |
+| XPASS | **0** | unchanged |
+| strict xfail | **55** | 60 → 55; s4h landed the requeue receipt lifecycle and removed its five markers |
+
+`failed = 0`, `XPASS = 0`.
+
+⛔This is the **second** measurement of this step. The first turn measured
+  `failed = 2` and reported it as such rather than rounding it away; the two
+  were real and they are now diagnosed and fixed (`a905a2e`), so the number
+  moved honestly rather than the bar moving. What they were:
+
+  `test_sev0_cea_i1_property.py::test_every_transport_reaches_admission_as_its_own_ingress`
+  for `retry_http` and `stale_review_http` — *"never reached admission as
+  `retry.failed_task`; calls=['http.tasks']"*. Bisected to `e26ae5e` (s4h) and
+  first attributed to "the path reaching admission". The real cause is narrower
+  and is in the **test driver**: both called `dispatch_and_start` before
+  constructing the `TestClient`, leaving their own task `in_progress` across the
+  app's boot. `_requeue_orphans` then re-queued it at startup — and since s4h a
+  requeue is a re-admission, so it SUPERSEDEd the receipt the driver was
+  holding. The result POST came back 409 `RECEIPT_SUPERSEDED` before
+  `_auto_retry_failed_task` / `_requeue_review_at_head` could reach admission,
+  which is why the only recorded call was the driver's own setup enqueue.
+  Dispatching inside the client context restores the scenario the test names —
+  an agent dispatched by a server already running. **No production code
+  changed**, and the file now matches its own §10/s4g baseline exactly (62
+  passed, 29 xfailed, 0 failed).
+
+### `discovery` — since s4h, a restart supersedes the receipt of a live dispatch
+
+Diagnosing the two reds (below) surfaced a production semantic worth stating
+plainly, because it is not this step's and it is not visible from the tests'
+names. `_requeue_orphans` (`server.py:2529`) resets every `in_progress` row at
+startup — a server restart in dispatcher mode means the agent subprocesses died,
+so the row is incomplete. Since s4h that requeue is a **re-admission**, so it
+SUPERSEDEs the receipt.
+
+Consequence: if an agent *does* survive the restart, its result now comes back
+**409 `RECEIPT_SUPERSEDED`** where before s4h it was accepted. That is arguably
+what P4 asks for — the dispatch it was answering is dead and the row has already
+been handed out again — and accepting it would write a completion for a task
+another agent may now hold. It is recorded here as a behaviour change rather
+than endorsed: nothing in this lineage decided it deliberately, and no test
+names it. Not actioned in this step (a live dispatch-path semantic, not a fold).
+
+### The guard count is unchanged
+
+**7** (5 target components + 2 extra judgements) against ADR §11.2's ≤ 6.
+Nothing in 4h or 4i removed a guard; #14 (`risk_tier` into the O10 snapshot
+matrix) is still unstarted.
+
+## §P Provenance
+
+- Step 4i (§11): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4i-t3-project-legacy` on :8105, branch `sev0/cea-lineage`, base `e26ae5e`, 2026-09-23. Run in **two turns** under the same task id: the first landed the two items and pushed through `ada1814` but was cut by a context reset before POSTing; the second (base `ada1814`, `context_reset: true`) re-verified every claim in this section against the tree rather than trusting it, diagnosed the two standing reds to root cause and closed them (`a905a2e`), and refreshed the `pipeline.py` line numbers, which had drifted since §8. The two standing failures were baselined by extracting `e26ae5e` with `git archive` into `/tmp/cea_base` and running the same two files there — read-only, no worktree or branch created. All fixtures under `tmp_path`; `test_sev0_cea_s4c_dispatch_base_absent.py` was made hermetic in this step (it had been wiring itself from the live `~/alfred/governance` snapshot). No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
+- Step 4g (§10): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4g-final-merge-reconcile` on :8105, branch `sev0/cea-lineage`, base `fc857aa`, merged `origin/sev0/cea-lineage-s4d` `d7e427f`, 2026-09-23. Guard greps re-run on the merged head; xfail reasons re-verified with `--runxfail`. All fixtures under `tmp_path` — the s4b harness fix exists precisely to stop the suite reading the live `~/alfred/governance` files. No live server, DB, GitHub or Telegram mutation; no branch other than `sev0/cea-lineage` created or moved.
+- Step 4e (§9): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4e-production-wiring` on :8105, branch `sev0/cea-lineage`, base `caf5644`, 2026-09-23. All fixtures under `tmp_path`; the live `~/alfred/governance` files were read only to report what the factory finds there. No live server, DB, GitHub or Telegram mutation.
+- Step 4c (§8): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4c-remainder-folds` on :8105, branch `sev0/cea-lineage`, base `bd58092`, 2026-09-23. Baselines for the pre-existing failures were taken by stashing the work tree at each commit's parent and re-running the same selection. No live server, DB, GitHub or Telegram mutation.
+- Provider Claude, model `claude-fable-5-1`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-prep-r1` on :8105, branch `sev0/cea-lineage`.
+- Step 4b (§7): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s4b-folds-acceptance-guards-r1` on :8105, branch `sev0/cea-lineage`, base `ba1d71d`, 2026-09-23. Read-only inputs: `GET /tasks/sev0-cea-lineage-s4a-merge-remainder-p1s` on :8105. The pre-fix reproduction ran in a throwaway copy of the tree under `/tmp` (removed); no live server, DB, GitHub or Telegram mutation.
+- Step 1 (§6): provider Claude, model `claude-opus-5`, role implementer (`agent_override: claude`), task `sev0-cea-lineage-s1-state-validator` on :8105, same branch, base `d073a59`, 2026-09-23.
+- Read-only inputs: agent_crew `b574308`, `5efea31`, `4c123fc`, `37cb8af`, `846d13c`, `addc29e`, `4df04aa`, `b46bda4`, `3b8598f`, `9c90da1` (git objects); alfred `6cbce56` (E11 ADR), `sev0/e10-claude-redteam` E10 report + repro; `GET /tasks/sev0-e10-codex-challenge-r1` and `GET /tasks/sev0-cea-lineage` on :8105 (read-only, 2026-09-23).
+- Merge trials: temporary detached worktree under `/tmp`, cherry-pick only, removed; no branch other than `sev0/cea-lineage` was created or moved. No live server, DB, GitHub or Telegram mutation.

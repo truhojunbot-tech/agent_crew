@@ -36,7 +36,10 @@ def test_cancel_in_progress_interrupts_bound_pane_once(tmp_db):
                                               "description": "work", "branch": "main"})
         assert created.status_code == 201
         response = client.delete("/tasks/running")
-        assert client.delete("/tasks/running").json()["worker_reachable"] is False
+        # G12 (unified): a second DELETE on the now-terminal row is refused as a
+        # no-op 409 NOT_ACTIVE and signals nothing.
+        again = client.delete("/tasks/running")
+        assert again.status_code == 409 and again.json()["reason"] == "NOT_ACTIVE"
     assert response.json()["worker_reachable"] is True
     assert [c.args[0] for c in run.call_args_list if c.args[0][:2] == ["tmux", "send-keys"]] == [
         ["tmux", "send-keys", "-t", "%101", "C-c"]]
@@ -65,8 +68,12 @@ def test_pending_and_terminal_cancel_do_not_interrupt(tmp_db):
     queue.force_fail("terminal", "fixture")
     app = _app(tmp_db, {"implementer": "%101"})
     with patch("agent_crew.server.subprocess.run") as run, TestClient(app) as client:
-        for task_id in ("pending", "terminal"):
-            assert client.delete(f"/tasks/{task_id}").json()["worker_reachable"] is False
+        assert client.delete("/tasks/pending").json()["worker_reachable"] is False
+        # G12 (unified): a terminal row is refused (409 NOT_ACTIVE), not re-cancelled.
+        terminal = client.delete("/tasks/terminal")
+        assert terminal.status_code == 409
+        assert terminal.json() == {"status": "failed", "reason": "NOT_ACTIVE",
+                                   "task_id": "terminal"}
     assert not any(c.args[0][:2] == ["tmux", "send-keys"] for c in run.call_args_list)
 
 
@@ -155,5 +162,9 @@ def test_result_after_cancel_is_rejected_without_cascade(tmp_db):
             "task_id": "late", "status": "completed", "summary": "worker kept running",
         })
     assert response.status_code == 409
+    # Unified with G12: the one guard answers with its structured body.
+    assert response.json()["late_result"] is True
+    assert response.json()["accepted"] is False
+    assert response.json()["prior_status"] == "cancelled"
     assert queue.get_task_status("late") == "cancelled"
     assert queue.outbox_get("late") is None
