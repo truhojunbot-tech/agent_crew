@@ -2480,14 +2480,16 @@ def create_app(
     reminded_task_ids: set[str] = set()
 
     def _requeue_orphans() -> None:
-        """On startup, reset in_progress tasks to pending and clean their worktrees.
+        """On startup, reset this dispatcher's in-progress claims to pending.
 
-        In dispatcher mode the server process owns agent subprocesses. A server
-        restart means those subprocesses were killed, so any in_progress task is
-        definitively incomplete and safe to re-queue.
+        Pull and push workers can share the queue in ``both`` delivery mode.
+        Their claims are not ours to reset when this process restarts.
         """
         tq = state["queue"]
-        orphans = tq.list_tasks(status="in_progress")
+        orphans = [
+            task for task in tq.list_tasks(status="in_progress")
+            if tq.get_task_claim_source(task.task_id) == "dispatcher"
+        ]
         if not orphans:
             return
         logger.info(f"dispatcher: re-queuing {len(orphans)} orphaned in_progress task(s)")
@@ -2672,6 +2674,37 @@ def create_app(
     # without the asyncio loop. Production code never reads this attribute.
     app.state.reminded_task_ids = reminded_task_ids
 
+    def _panes_with_in_progress(exclude_task_id: str = "") -> set[str]:
+        """지금 `in_progress` 인 task 들이 점유 중인 **pane 집합**.
+
+        ⭐잠금 키를 `task_type` 에서 **실행 자원**으로 옮기기 위한 조회다
+          (2026-09-23). 같은 task_type 이라는 이유로 빈 pane 이 막히던 결함을 없앤다.
+
+        ⛔열거에 실패하면 **모든 pane 을 바쁜 것으로** 돌려준다(fail-closed).
+          빈 집합을 돌려주면 "아무도 안 바쁘다" 로 읽혀 같은 pane 에 두 task 를
+          밀어넣는다 — 이 함수가 막으려는 바로 그 사고다.
+        """
+        try:
+            busy: set[str] = set()
+            for _t in q().list_tasks(status="in_progress"):
+                if exclude_task_id and _t.task_id == exclude_task_id:
+                    continue
+                _ctx = _t.context if isinstance(_t.context, dict) else {}
+                _ov = (_ctx.get("agent_override") or "").strip().lower()
+                _p = pane_map.get(_ov) if _ov else None
+                if not _p:
+                    _r = _TYPE_TO_ROLE.get(_t.task_type)
+                    _p = pane_map.get(_r) if _r else None
+                if _p:
+                    busy.add(_p)
+            return busy
+        except Exception:
+            logger.exception(
+                "_panes_with_in_progress: could not enumerate in-progress tasks — "
+                "treating every pane as busy (fail-closed)"
+            )
+            return set(pane_map.values())
+
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
         # #314 §4 P0: replay 중에는 queue push 금지 — push는 다른 pending task를 claim/start하므로
@@ -2699,30 +2732,45 @@ def create_app(
         if task_type is None:
             logger.warning(f"_try_push_next: role {role} not in _ROLE_TO_TYPE")
             return
-        if q().has_in_progress(task_type):
-            logger.debug(f"_try_push_next: task_type {task_type} already in progress")
-            return  # agent busy; will get pushed when current task completes
-        task = q().dequeue(role=role)
-        if task is None:
-            logger.debug(f"_try_push_next: no pending task for role {role}")
-            return  # nothing pending
-
-        # Check if task has an agent_override in context
-        _target_agent = _DISPATCH_ROLE_TO_AGENT.get(role, "")
-        task_context = task.context if isinstance(task.context, dict) else {}
-        logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
-        if "agent_override" in task_context:
-            agent_override = task_context["agent_override"]
-            override_pane_id = pane_map.get(agent_override)
-            if override_pane_id:
-                logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
-                pane_id = override_pane_id
-                # #292 review: the context measurement follows the pane, so it
-                # has to follow the override too.
-                _target_agent = agent_override
-            else:
-                logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
+        # ⛔예전에는 여기서 `q().has_in_progress(task_type)` 로 막았다 — **전역
+        #   task_type 잠금**이라, 다른 pane 이 전부 비어 있어도 같은 task_type 이면
+        #   두 번째 task 가 스케줄되지 않았다(2026-09-23 실측: pane 3개 중 실효 1개).
+        #   잠금 키를 실행 자원(pane)으로 옮긴다 — 어느 pane 으로 갈지는 override 를
+        #   해석해야 알 수 있으므로 **dequeue 뒤에** 판정하고, 충돌이면 되돌린다.
+        skipped: set[str] = set()
+        while True:
+            task = q().dequeue(role=role, skip_task_ids=skipped)
+            if task is None:
+                logger.debug(f"_try_push_next: no eligible pending task for role {role}")
                 return
+            pane_id = pane_map[role]
+            _target_agent = _DISPATCH_ROLE_TO_AGENT.get(role, "")
+            task_context = task.context if isinstance(task.context, dict) else {}
+            logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
+            if "agent_override" in task_context:
+                agent_override = task_context["agent_override"]
+                override_pane_id = pane_map.get(agent_override)
+                if override_pane_id:
+                    logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
+                    pane_id = override_pane_id
+                    # #292: context measurement follows the resolved pane.
+                    _target_agent = agent_override
+                else:
+                    logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
+                    q().requeue(task.task_id)
+                    skipped.add(task.task_id)
+                    continue
+
+            # A busy queue head must not hide a later task for a free pane.
+            if pane_id in _panes_with_in_progress(exclude_task_id=task.task_id):
+                logger.debug(
+                    f"_try_push_next: pane {pane_id} is busy — requeueing {task.task_id} "
+                    f"(role={role}, task_type={task.task_type})"
+                )
+                q().requeue(task.task_id)
+                skipped.add(task.task_id)
+                continue
+            break
 
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
@@ -4290,119 +4338,183 @@ def create_app(
                 )
 
     async def _dispatcher_loop() -> None:
-        """Poll DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn headless
-        agent subprocesses.  One concurrent task per role (same --continue session
-        cannot be shared across parallel invocations) — AND, since #202
-        review of PR #203 (finding 1), one concurrent task per *resolved*
-        worktree, since agent_override can route two different roles into
-        the same underlying agent/worktree/provider conversation. Role-slot
-        exclusivity alone doesn't see that — e.g. tester's normal gemini
-        task and a reviewer task with agent_override=gemini both occupy
-        different role slots but resolve to the same gemini worktree, and
-        running both `--continue` processes concurrently there would
-        corrupt that conversation. See _resolve_dispatch_target.
-        """
-        active_roles: set[str] = set()
-        active_worktrees: set[str] = set()
-        active_tasks: dict[str, asyncio.Task] = {}  # task_id → asyncio.Task
-        task_roles: dict[str, str] = {}  # task_id → role
+        """Poll the DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn
+        headless agent subprocesses.
 
-        # Inverse of _DISPATCH_ROLE_TO_AGENT: agent → role (for worktree lookup).
-        # When the same agent maps to multiple roles (e.g. claude on both
-        # implementer and reviewer), prefer implementer for discuss dispatch
-        # since discuss tasks are exploratory rather than review-specific.
-        _AGENT_TO_ROLE: dict[str, str] = {}
+        ⭐**동시성 키는 실행 자원이다 — `task_type` 이 아니다.**
+
+        2026-09-23 실측(alpha_engine `:8101`): pane 세 개가 전부 비어 있는데도
+        `implement` 두 건이 직렬로 돌았다. 루프가 `for role in (...)` 로 **역할
+        슬롯**을 잠갔고 `agent_override` 는 그 뒤 실행 대상을 고를 때만 읽혔기
+        때문이다 — override 로 다른 worker 에 보낸 두 번째 implement 가
+        **스케줄 단계에서** 막혔다. 실효 병렬도가 3이 아니라 1이었다.
+
+        이제 잠그는 것은 두 가지뿐이다:
+
+        - **execution slot(`worker_id`)** — 같은 worker 에 동시에 두 task 금지.
+          한 provider 의 `--continue` 세션을 둘이 나눠 쓸 수 없다.
+        - **worktree lease** — 같은 worktree 에 동시 writer 금지(#202 / PR #203
+          finding 1). 서로 다른 worker 라도 override 로 같은 worktree 에 겹칠 수 있다.
+
+        ⛔`task_type`·`role` 은 잠금 키가 아니다. 서로 다른 worker + 서로 다른
+        worktree 면 같은 task_type 도 병렬로 돈다.
+
+        ⛔slot 은 **pane 이 아니라 `worker_id`** 다. pane 은 전달 계층의 관심사이고
+        여기서는 쓰지 않는다 — tmux 가 아닌 worker backend(컨테이너·원격 러너)가
+        추가돼도 이 스케줄러를 다시 뜯지 않게 하기 위해서다.
+        """
+        active_workers: set[str] = set()      # execution slot lease: worker_id
+        active_worktrees: set[str] = set()    # worktree lease: 해석된 worktree 경로
+        active_tasks: dict[str, asyncio.Task] = {}   # task_id → asyncio.Task
+        task_slots: dict[str, str] = {}       # task_id → worker_id
+
+        # Keep every configured role for an agent; the execution slot still
+        # serializes that agent's tasks across those roles.
+        _AGENT_TO_ROLES: dict[str, list[str]] = {}
         _ROLE_PRIORITY = {"implementer": 0, "reviewer": 1, "tester": 2}
         for _role, _agent in _DISPATCH_ROLE_TO_AGENT.items():
-            current = _AGENT_TO_ROLE.get(_agent)
-            if current is None or _ROLE_PRIORITY.get(_role, 99) < _ROLE_PRIORITY.get(current, 99):
-                _AGENT_TO_ROLE[_agent] = _role
+            _AGENT_TO_ROLES.setdefault(_agent, []).append(_role)
+        for _roles in _AGENT_TO_ROLES.values():
+            _roles.sort(key=lambda r: _ROLE_PRIORITY.get(r, 99))
+
+        # worker 순회 순서 — 역할 우선순위를 따르되 같은 worker 는 한 번만.
+        _workers: list[str] = []
+        for _role, _agent in sorted(
+            _DISPATCH_ROLE_TO_AGENT.items(),
+            key=lambda kv: _ROLE_PRIORITY.get(kv[0], 99),
+        ):
+            if _agent and _agent not in _workers:
+                _workers.append(_agent)
+        # discuss 는 role 매핑에 없는 agent 로도 올 수 있다.
+        _discuss_workers = list(dict.fromkeys(_workers + ["claude", "codex", "gemini"]))
+
+        # ⭐dispatcher 가 **실제로 들고 있는 lease**. orphan 판정의 권위다 —
+        #   `in_progress` 인데 여기 없으면 주인이 사라진 task 다(GET /tasks/orphans).
+        app.state.dispatcher_active_tasks = active_tasks
+        app.state.dispatcher_active_workers = active_workers
+        app.state.dispatcher_active_worktrees = active_worktrees
 
         interval = float(os.getenv("AGENT_CREW_DISPATCH_INTERVAL", "2"))
         try:
             while True:
                 await asyncio.sleep(interval)
                 try:
-                    logger.debug(f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} active_roles={active_roles}")
+                    logger.debug(
+                        f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} "
+                        f"active_workers={sorted(active_workers)} "
+                        f"active_worktrees={len(active_worktrees)}"
+                    )
                     # Reap completed dispatches, freeing their slots.
                     done = [tid for tid, t in list(active_tasks.items()) if t.done()]
                     for tid in done:
                         active_tasks.pop(tid, None)
-                        role = task_roles.pop(tid, None)
-                        if role:
-                            active_roles.discard(role)
+                        slot = task_slots.pop(tid, None)
+                        if slot:
+                            active_workers.discard(slot)
 
-                    for role in ("implementer", "reviewer", "tester"):
-                        if role in active_roles:
+                    for worker in _workers:
+                        if worker in active_workers:
                             continue
-                        task = q().dequeue(role=role)
+                        _worker_roles = _AGENT_TO_ROLES.get(worker, [])
+                        _default_role = _worker_roles[0] if _worker_roles else ""
+                        task = None
+                        for _candidate_role in _worker_roles:
+                            # Stage 1 checks overrides independent of task type;
+                            # Stage 2 checks each role this worker owns.
+                            task = q().dequeue(
+                                agent=worker, role=_candidate_role,
+                                claim_source="dispatcher",
+                            )
+                            if task is not None:
+                                break
                         if task is None:
                             continue
+                        # 프로토콜·결과 처리는 task_type 이 정한다.
+                        # override 는 **실행 자원만** 바꾼다(역할을 바꾸지 않는다).
+                        role = _TYPE_TO_ROLE.get(
+                            task.task_type, _default_role or "implementer")
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        _slot = _target_agent or worker
+                        if _slot in active_workers:
+                            # override 가 이미 바쁜 worker 를 가리켰다.
+                            logger.info(
+                                f"dispatcher: deferring task={task.task_id} — execution slot "
+                                f"{_slot} is held (task_type={task.task_type})"
+                            )
+                            q().requeue(task.task_id)
+                            continue
                         if _target_wt and _target_wt in active_worktrees:
-                            # Same worktree/provider conversation already in
-                            # flight under a different role slot — put the
-                            # task back and try again next tick, rather than
-                            # running two `--continue` processes against one
-                            # conversation concurrently.
+                            # 같은 worktree 에 두 writer 를 붙이지 않는다.
                             logger.info(
                                 f"dispatcher: deferring task={task.task_id} role={role} "
-                                f"agent={_target_agent} — target worktree {_target_wt} "
-                                "already active under another role this tick"
+                                f"agent={_target_agent} — worktree lease {_target_wt} is held"
                             )
                             q().requeue(task.task_id)
                             continue
-                        active_roles.add(role)
+                        active_workers.add(_slot)
                         if _target_wt:
                             active_worktrees.add(_target_wt)
-                        task_roles[task.task_id] = role
+                        task_slots[task.task_id] = _slot
 
-                        async def _run(t: TaskRequest = task, r: str = role, w: Optional[str] = _target_wt) -> None:
-                            try:
-                                await _dispatch_task(t, r)
-                            finally:
-                                active_roles.discard(r)
-                                if w:
-                                    active_worktrees.discard(w)
-                                active_tasks.pop(t.task_id, None)
-                                task_roles.pop(t.task_id, None)
-
-                        active_tasks[task.task_id] = asyncio.create_task(_run())
-
-                    # Discuss tasks are per-agent (not per-role); dispatch concurrently.
-                    for agent in ("claude", "codex", "gemini"):
-                        slot_key = f"discuss_{agent}"
-                        if slot_key in active_roles:
-                            continue
-                        task = q().dequeue_discuss_for_agent(agent)
-                        if task is None:
-                            continue
-                        role = _AGENT_TO_ROLE.get(agent, "implementer")
-                        _target_agent, _target_wt = _resolve_dispatch_target(task, role)
-                        if _target_wt and _target_wt in active_worktrees:
-                            logger.info(
-                                f"dispatcher: deferring discuss task={task.task_id} agent={agent} "
-                                f"— target worktree {_target_wt} already active this tick"
-                            )
-                            q().requeue(task.task_id)
-                            continue
-                        active_roles.add(slot_key)
-                        if _target_wt:
-                            active_worktrees.add(_target_wt)
-                        task_roles[task.task_id] = slot_key
-
-                        async def _run_discuss(
-                            t: TaskRequest = task, r: str = role, s: str = slot_key,
+                        async def _run(
+                            t: TaskRequest = task, r: str = role, s: str = _slot,
                             w: Optional[str] = _target_wt,
                         ) -> None:
                             try:
                                 await _dispatch_task(t, r)
                             finally:
-                                active_roles.discard(s)
+                                active_workers.discard(s)
                                 if w:
                                     active_worktrees.discard(w)
                                 active_tasks.pop(t.task_id, None)
-                                task_roles.pop(t.task_id, None)
+                                task_slots.pop(t.task_id, None)
+
+                        active_tasks[task.task_id] = asyncio.create_task(_run())
+
+                    # discuss 도 **같은 execution slot 네임스페이스**를 쓴다.
+                    # ⛔예전에는 `discuss_<agent>` 라는 별도 키였다 — 같은 provider 에
+                    #   일반 task 와 discuss 가 동시에 붙을 수 있었다(같은 결함의 변종).
+                    for agent in _discuss_workers:
+                        if agent in active_workers:
+                            continue
+                        task = q().dequeue_discuss_for_agent(
+                            agent, claim_source="dispatcher")
+                        if task is None:
+                            continue
+                        role = _AGENT_TO_ROLES.get(agent, ["implementer"])[0]
+                        _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        _slot = _target_agent or agent
+                        if _slot in active_workers:
+                            logger.info(
+                                f"dispatcher: deferring discuss task={task.task_id} "
+                                f"— execution slot {_slot} is held"
+                            )
+                            q().requeue(task.task_id)
+                            continue
+                        if _target_wt and _target_wt in active_worktrees:
+                            logger.info(
+                                f"dispatcher: deferring discuss task={task.task_id} agent={agent} "
+                                f"— worktree lease {_target_wt} is held"
+                            )
+                            q().requeue(task.task_id)
+                            continue
+                        active_workers.add(_slot)
+                        if _target_wt:
+                            active_worktrees.add(_target_wt)
+                        task_slots[task.task_id] = _slot
+
+                        async def _run_discuss(
+                            t: TaskRequest = task, r: str = role, s: str = _slot,
+                            w: Optional[str] = _target_wt,
+                        ) -> None:
+                            try:
+                                await _dispatch_task(t, r)
+                            finally:
+                                active_workers.discard(s)
+                                if w:
+                                    active_worktrees.discard(w)
+                                active_tasks.pop(t.task_id, None)
+                                task_slots.pop(t.task_id, None)
 
                         active_tasks[task.task_id] = asyncio.create_task(_run_discuss())
                 except Exception:
@@ -4984,6 +5096,66 @@ def create_app(
     def list_tasks(status: str = ""):
         return q().list_tasks(status=status)
 
+    def _dispatcher_lease_view() -> tuple[Optional[set], Optional[set]]:
+        """dispatcher 가 지금 들고 있는 (task_id lease, worker slot) 을 돌려준다.
+
+        ⛔dispatcher 가 안 돌고 있으면 `(None, None)` 이다 — 그때 "lease 가 없다"
+          를 "주인이 사라졌다" 로 읽으면 **살아 있는 task 를 orphan 으로 오인**한다.
+          그래서 호출부는 `lease_tracking` 을 함께 보고해야 한다.
+        """
+        _tasks = getattr(app.state, "dispatcher_active_tasks", None)
+        _workers = getattr(app.state, "dispatcher_active_workers", None)
+        if _tasks is None:
+            return None, None
+        return set(_tasks.keys()), set(_workers or ())
+
+    @app.get("/tasks/orphans")
+    def list_orphan_tasks(older_than: float = 0.0):
+        """`in_progress` 인데 **주인(dispatcher lease)이 없는** task 를 보여준다.
+
+        ⭐2026-09-23 실측: worker 프로세스가 사라졌는데 task 3건이 78분 동안
+          `in_progress` 로 남아 레인을 잡았다. 그때 쓸 수 있던 API 는 **전역
+          `expire-stale`** 뿐이라, 한 건을 치우려다 라이브 3건이 같이 취소됐다.
+          이 조회는 아무것도 바꾸지 않는다 — 스윕 전에 대상과 건수를 먼저 본다.
+
+        ⛔`lease_tracking=false` 면 이 목록은 orphan 판정이 아니라 **단순
+          in_progress 목록**이다(dispatcher 미가동). 그 상태에서 recover 를
+          돌리면 살아 있는 task 를 되돌릴 수 있다.
+        """
+        _leased, _ = _dispatcher_lease_view()
+        _now = time.time()
+        rows = q().list_in_progress_activity()
+        out = []
+        for r in rows:
+            _ts = r["last_activity_at"] or r["created_at"]
+            _age = max(0.0, _now - _ts) if _ts else None
+            _orphan = (
+                _leased is not None
+                and r["claim_source"] == "dispatcher"
+                and r["task_id"] not in _leased
+            )
+            if _age is not None and _age < older_than:
+                continue
+            _ctx = r.get("context") or {}
+            out.append({
+                "task_id": r["task_id"],
+                "task_type": r["task_type"],
+                "idle_s": round(_age, 1) if _age is not None else None,
+                "agent_override": (_ctx.get("agent_override") or None),
+                "claim_source": r["claim_source"] or "unknown",
+                "has_dispatcher_lease": (None if _leased is None
+                                         else r["task_id"] in _leased),
+                "orphan": _orphan,
+            })
+        return {
+            "lease_tracking": _leased is not None,
+            "in_progress": len(rows),
+            "listed": len(out),
+            "orphans": sum(1 for r in out if r["orphan"]),
+            "older_than": older_than,
+            "tasks": out,
+        }
+
     @app.get("/tasks/{task_id}")
     def get_task(task_id: str):
         tasks = q().list_tasks()
@@ -5427,6 +5599,40 @@ def create_app(
             )
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/tasks/{task_id}/recover", status_code=200)
+    def recover_orphan_task(task_id: str, force: bool = False):
+        """**단건** orphan 을 pending 으로 되돌린다(취소가 아니라 재큐).
+
+        ⭐전역 `expire-stale` 없이 한 건만 안전하게 회수하기 위한 경로다.
+        ⛔dispatcher lease 가 살아 있으면 거부한다 — 돌고 있는 task 를 되돌리면
+          같은 worker 에 두 번째 프로세스가 붙는다. `force=true` 로만 넘어간다.
+        """
+        _leased, _ = _dispatcher_lease_view()
+        _status = q().get_task_status(task_id)
+        if _status is None:
+            raise HTTPException(status_code=404, detail=f"unknown task {task_id}")
+        if _status != "in_progress":
+            return {"task_id": task_id, "recovered": False,
+                    "reason": f"status={_status} (in_progress 가 아님)"}
+        if _leased is None and not force:
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "dispatcher lease 를 못 읽었다 — lease_tracking=false. "
+                              "살아 있는 task 를 되돌릴 수 있으므로 거부한다(force 로 강제)"}
+        if _leased is not None and task_id in _leased and not force:
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "dispatcher 가 이 task 의 lease 를 들고 있다(실행 중)"}
+        if not force and not q().requeue_dispatcher_claim(task_id):
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "dispatcher claim provenance absent or changed"}
+        if force:
+            q().requeue(task_id)
+        logger.info(
+            f"recover_orphan_task: {task_id} in_progress -> pending "
+            f"(lease_tracking={_leased is not None}, force={force})"
+        )
+        return {"task_id": task_id, "recovered": True, "new_status": "pending",
+                "lease_tracking": _leased is not None, "force": force}
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(older_than: float = 600.0):
