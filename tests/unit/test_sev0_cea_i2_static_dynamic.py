@@ -339,8 +339,8 @@ from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
 #: ``defer_push_delivery`` writes status via a bound parameter (``status = ?``
 #: with "pending") so it is matched by name, not by literal.
 PENDING_WRITERS = {
-    "queue.py": {"enqueue (INSERT)", "requeue", "reset_stale_to_pending",
-                 "defer_push_delivery"},
+    "queue.py": {"enqueue (INSERT)", "requeue", "requeue_dispatcher_claim",
+                 "reset_stale_to_pending", "defer_push_delivery"},
 }
 #: callers of those writers that are themselves "paths back" (server/cli).
 REQUEUE_CALLERS = {"server.py": {"_requeue_orphans", "requeue"}, "cli.py": {"recover"}}
@@ -359,10 +359,29 @@ def _pending_writes():
 
 def test_static_every_literal_pending_write_is_inventoried():
     """Counts every ``UPDATE tasks SET ... status='pending'|'queued'`` — not just
-    INSERT. The two literal writers today are ``requeue`` and
-    ``reset_stale_to_pending``; ``defer_push_delivery`` is the bound-parameter one."""
+    INSERT. The three literal writers are ``requeue``, ``requeue_dispatcher_claim``
+    (queue.py:4486, receipt via ``requeue_through_gate`` before the write), and
+    ``reset_stale_to_pending`` (queue.py:4723, same gate per row before UPDATE).
+    ``defer_push_delivery`` is the bound-parameter writer."""
     writes = _pending_writes()
-    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 2, writes
+    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 3, writes
+
+
+def test_dispatcher_claim_requeue_moves_receipt_before_pending(tmp_path):
+    """#377 writer: queue.requeue_dispatcher_claim passes through the §8 gate
+    in its transaction, then writes pending. Exercise that path under CEA."""
+    q = _claimed(tmp_path, "dispatcher-recover.db", "test",
+                 config=EngineConfig(mode="test", default_max_attempts=3))
+    conn = sqlite3.connect(q._db_path)
+    conn.execute("UPDATE tasks SET claim_source = 'dispatcher' WHERE task_id = 't1'")
+    conn.commit()
+    conn.close()
+    before = receipt_for_task(q, "t1")
+    assert q.requeue_dispatcher_claim("t1") is True
+    assert q.get_task_status("t1") == "pending"
+    after = receipt_for_task(q, "t1")
+    assert after["receipt_id"] == before["receipt_id"]
+    assert (after["state"], after["attempt"]) == ("HELD", 2)
 
 
 def test_static_the_bound_parameter_pending_writer_is_inventoried():

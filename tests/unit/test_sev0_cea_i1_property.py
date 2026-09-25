@@ -228,7 +228,11 @@ from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
     seed_finished_parent)
 
 #: Every mutating FastAPI route, frozen. ``POST /tasks`` is the only one that is
-#: an ingress (http.tasks); retry.failed_task and watchdog.stale_review are
+#: a new-task ingress (http.tasks). ``POST /tasks/{task_id}/recover`` is a
+#: requeue ingress: server.recover_orphan_task -> queue.requeue or
+#: queue.requeue_dispatcher_claim -> requeue_through_gate -> receipt lifecycle,
+#: in the same transaction as the pending write (ADR §8; alfred#51 item 14).
+#: retry.failed_task and watchdog.stale_review are
 #: server-internal callers, not routes. A new route fails here until it is
 #: classified — ingress (add a transport below) or not.
 DOCUMENTED_MUTATING_ROUTES = {
@@ -238,8 +242,10 @@ DOCUMENTED_MUTATING_ROUTES = {
     ("POST", "/tasks"), ("POST", "/tasks/expire-stale"),
     ("POST", "/tasks/{task_id}/checkpoint"), ("POST", "/tasks/{task_id}/result"),
     ("POST", "/tasks/{task_id}/start"),
+    ("POST", "/tasks/{task_id}/recover"),
 }
 INGRESS_ROUTES = {("POST", "/tasks")}
+REQUEUE_ROUTES = {("POST", "/tasks/{task_id}/recover")}
 
 #: MCP exposes no task-creating tool (adapters.py: MCP deliberately absent);
 #: ``submit_result`` reaches admission only through the cascade.* adapters.
@@ -271,6 +277,33 @@ def test_route_table_equals_the_documented_list():
     assert routes == DOCUMENTED_MUTATING_ROUTES, (
         f"new: {sorted(routes - DOCUMENTED_MUTATING_ROUTES)}; "
         f"gone: {sorted(DOCUMENTED_MUTATING_ROUTES - routes)}")
+
+
+def test_http_recover_transport_carries_receipt_through_requeue(tmp_path, monkeypatch):
+    """alfred#51 item 14: force recover is an ADR §8 requeue ingress, not a
+    fresh ``http.tasks`` admission. Drive HTTP, then inspect the persisted
+    receipt and task together; a pending row cannot be left with CLAIMED."""
+    from agent_crew.queue import TaskQueue
+    from tests.unit.sev0_cea_acceptance_helpers import receipt_for_task
+
+    db = str(tmp_path / "recover.db")
+    live = LiveState(AuthorityState("active"))
+    inject_cea(monkeypatch, live)
+    with TestClient(_app(db), raise_server_exceptions=False) as client:
+        q = TaskQueue(db)
+        q.enqueue(task("recover-1", context={"authority_decision_ids": ["T0-1234"]}),
+                  ingress="http.tasks")
+        assert q.dequeue(agent="claude", role="implementer") is not None
+        before = receipt_for_task(q, "recover-1")
+        assert before["state"] == "CLAIMED"
+        response = client.post("/tasks/recover-1/recover?force=true")
+        assert response.status_code == 200, response.text
+        assert response.json()["recovered"] is True
+        assert q.get_task_status("recover-1") == "pending"
+        after = receipt_for_task(q, "recover-1")
+        assert after and after["receipt_id"] == before["receipt_id"]
+        assert after["state"] in ("HELD", "SUPERSEDED")
+        assert after["state"] != before["state"]
 
 
 def test_mcp_tool_registry_equals_the_documented_list(tmp_path):

@@ -87,6 +87,23 @@ Consequence (`tests/unit/test_sev0_cea_i2_static_dynamic.py`):
 
 ## 6. Transport findings from I1 (4d-r2) — code lane s4f
 
+### Current classification: HTTP single-task recover (alfred#51 §15 item 14)
+
+`POST /tasks/{task_id}/recover` is an ADR §8 **requeue ingress** because it can
+move an in-progress task back to `pending`. It does not create a new task and
+therefore is not a new `http.tasks` adapter. The route at `server.py:6541`
+uses `TaskQueue.requeue` when forced and `TaskQueue.requeue_dispatcher_claim`
+otherwise. Both call `requeue_through_gate` before their pending writes, within
+the same transaction (`queue.py:4454`, `:4486`; receipt lifecycle at `:3074`).
+`reset_stale_to_pending` likewise gates each selected row before its batch
+pending write (`queue.py:4723`, `:4731`). The gate reuses a receipt in `HELD`
+when an attempt remains, or records `SUPERSEDED` / `HELD` as ADR §8 requires;
+the claim gate then enforces the receipt state. The forced HTTP transport and
+dispatcher-claim writer are exercised by the I1 and I2 unit tests.
+
+The historical measurements above describe the earlier 4d-r2 code, before the
+§8 receipt lifecycle implementation.
+
 - **empty-project admission:** `loop.enqueue_*` and `discussion.enqueue_panel_tasks` build a `TaskRequest` with no `project`, and `crew enqueue --db` without `--project` and `watch.run_cycle(project="")` do the same. The engine then raises `EngineError` (`$.project` must be non-empty) instead of writing a P2 BLOCK audit receipt, so the adapter crashes and nothing is persisted.
 - **http refusal mapping:** `POST /tasks` catches only `TaskAlreadyExistsError`. A refused admission (`AdmissionRefused`) escapes as an unhandled 500, and the response carries no `receipt_id`.
 

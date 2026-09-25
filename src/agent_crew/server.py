@@ -6266,12 +6266,9 @@ def create_app(
             #
             _task_ctx = ctx if isinstance(ctx, dict) else {}
             if task_type == "implement" and result.status == "completed":
-                if _task_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto review enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
-                    _auto_enqueue_review(task_id, pr_number=result.pr_number,
-                                         result=result)
+                logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
+                _auto_enqueue_review(task_id, pr_number=result.pr_number,
+                                     result=result)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
             # review counts as approved (#100). Skip when the review task was
@@ -6415,10 +6412,8 @@ def create_app(
                 if review_ctx.get("no_tester"):
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
                     # #171: no tester stage → merge immediately on review approval
-                    if pr_number and not review_ctx.get("coordinator_managed"):
+                    if pr_number:
                         _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt)
-                elif review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto test enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id, repo=_review_repo)
@@ -6429,15 +6424,10 @@ def create_app(
             # cascade, so a reviewer that keeps rejecting cannot spin the loop.
             elif (task_type == "review" and _resolve_verdict(result) == "request_changes"
                     and _review_result_is_actionable(result)):
-                review_ctx = ctx if isinstance(ctx, dict) else {}
-                if review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto fix enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
-                    _auto_enqueue_fix(task_id, repo=_review_repo)
+                logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
+                _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
-            if (task_type == "test" and result.status == "completed"
-                    and not _task_ctx.get("coordinator_managed")):
+            if task_type == "test" and result.status == "completed":
                 test_pr = result.pr_number or _task_ctx.get("pr_number")
                 if test_pr:
                     _test_wt = _any_worktree_path()
@@ -6574,6 +6564,9 @@ def create_app(
                     "reason": "dispatcher claim provenance absent or changed"}
         if force:
             q().requeue(task_id)
+        if q().get_task_status(task_id) != "pending":
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "CEA requeue refused or task state changed"}
         logger.info(
             f"recover_orphan_task: {task_id} in_progress -> pending "
             f"(lease_tracking={_leased is not None}, force={force})"

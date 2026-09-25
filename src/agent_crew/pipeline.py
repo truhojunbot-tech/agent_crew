@@ -1020,12 +1020,6 @@ def auto_enqueue_fix(
             return None
 
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-        # The foreground coordinator enqueues its own follow-ups. Keep the
-        # guard here so HTTP and MCP callers cannot create a competing fix.
-        if review_ctx.get("coordinator_managed"):
-            logger.info("auto_enqueue_fix: coordinator-managed review %s — skipping", review_task_id)
-            return None
-
         review_project = review_task.project
         if review_project and server_project and review_project != server_project:
             logger.warning(

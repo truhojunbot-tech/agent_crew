@@ -203,15 +203,18 @@ def test_H_stop_admission_remains_before_merge_even_with_repo_params(tmp_db, tmp
     assert TaskQueue(tmp_db).external_op_get("merge:pr:91009") is None
 
 
-def test_I_coordinator_managed_still_suppresses_no_tester_merge(tmp_db, tmp_path, monkeypatch):
-    """I — coordinator-managed approval never enters the no-tester merge path."""
+def test_I_coordinator_managed_no_tester_follows_review_bound(tmp_db, tmp_path, monkeypatch):
+    """I — alfred#51 §7.2 / CX-4b: provenance cannot suppress a current-head approval."""
     from fastapi.testclient import TestClient
 
     _patch_open_pr(monkeypatch)
-    monkeypatch.setattr("agent_crew.github.merge_pr", lambda *a, **k: pytest.fail("merge suppressed"))
+    merged = []
+    monkeypatch.setattr("agent_crew.github.merge_pr",
+                        lambda pr, **kwargs: merged.append((pr, kwargs["repo"])) or True)
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
         assert _post_task(client, "review-I", "review", {"pr_number": 91010, "repo": TARGET_REPO, "no_tester": True, "coordinator_managed": True}, 91010).status_code == 200
-    assert TaskQueue(tmp_db).external_op_get("merge:pr:91010") is None
+    assert merged == [(91010, TARGET_REPO)]
+    assert TaskQueue(tmp_db).external_op_get("merge:pr:91010") is not None
 
 
 def test_J_no_bare_repo_lookup_or_unidentified_pr_state_calls():

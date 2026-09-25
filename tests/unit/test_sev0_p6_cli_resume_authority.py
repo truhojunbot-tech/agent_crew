@@ -4,6 +4,7 @@ import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +38,10 @@ def test_project_resume_checks_signed_t0_in_fresh_cli_process(
     home.mkdir()
     tmux.mkdir()
     env = os.environ.copy()
+    # The fresh CLI process must execute this checkout, not an unrelated
+    # editable/site install inherited from the host running pytest.
+    src = str(Path(__file__).resolve().parents[2] / "src")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (src, env.get("PYTHONPATH", ""))))
     for key in ("AGENT_CREW_CEA_SNAPSHOT_PATH", "AGENT_CREW_CEA_POLICY_SNAPSHOT",
                 "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"):
         env.pop(key, None)
