@@ -146,6 +146,7 @@ _DDL_MIGRATE_LAST_ACTIVITY = (
     "ALTER TABLE tasks ADD COLUMN last_activity_at REAL NOT NULL DEFAULT 0"
 )
 _DDL_MIGRATE_PUSH_AT = "ALTER TABLE tasks ADD COLUMN push_at REAL NOT NULL DEFAULT 0"
+_DDL_MIGRATE_DISPATCH_PANE = "ALTER TABLE tasks ADD COLUMN dispatch_pane_id TEXT NOT NULL DEFAULT ''"
 _DDL_MIGRATE_ERROR_INFO = "ALTER TABLE tasks ADD COLUMN error_info TEXT DEFAULT NULL"
 
 _DDL_ATTRIBUTION = """
@@ -582,6 +583,10 @@ class TaskQueue:
             pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_PUSH_AT)
+        except Exception:
+            pass  # column already exists
+        try:
+            conn.execute(_DDL_MIGRATE_DISPATCH_PANE)
         except Exception:
             pass  # column already exists
         try:
@@ -1932,11 +1937,16 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def cancel(self, task_id: str) -> None:
+    def cancel(self, task_id: str) -> tuple[Optional[str], str]:
         """Cancel a task. Dependent tasks (prev_task_id points to task_id) are marked
-        'orphaned' rather than cancelled — operators can manually cancel them if desired."""
+        'orphaned' rather than cancelled — operators can manually cancel them if desired.
+        Return the previous status and the pane bound at dispatch for signalling."""
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status, dispatch_pane_id FROM tasks WHERE task_id = ?", (task_id,)
+            ).fetchone()
             conn.execute("UPDATE tasks SET status = 'cancelled' WHERE task_id = ?", (task_id,))
             # Mark pending dependents as orphaned (not cancelled) so the operator
             # can see them and decide whether to cancel or reassign.
@@ -1949,6 +1959,7 @@ class TaskQueue:
                 (task_id,),
             )
             conn.commit()
+            return ((row["status"], row["dispatch_pane_id"]) if row else (None, ""))
         finally:
             conn.close()
 
@@ -2339,6 +2350,17 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def pane_has_other_active_task(self, pane_id: str, task_id: str) -> bool:
+        """Refuse an interrupt when a pane is also bound to another active task."""
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT 1 FROM tasks WHERE dispatch_pane_id = ? AND task_id != ? "
+                "AND status = 'in_progress' LIMIT 1", (pane_id, task_id),
+            ).fetchone() is not None
+        finally:
+            conn.close()
+
     def bump_activity(self, task_id: str, ts: Optional[float] = None) -> None:
         """Refresh last_activity_at for a task. Called by the watchdog whenever
         the agent's pane is observed busy, so the timeout/reminder clocks
@@ -2355,17 +2377,20 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def set_push_at(self, task_id: str, ts: Optional[float] = None) -> None:
+    def set_push_at(self, task_id: str, ts: Optional[float] = None,
+                    pane_id: str = "") -> None:
         """Record when push_fn was called for a task (bug #152).
         The watchdog uses push_at as the start of the idle clock so dispatch-queue
-        wait time is excluded from the idle measurement."""
+        wait time is excluded from the idle measurement. The pane is stored in a
+        server-owned column so cancellation never trusts task-supplied context."""
         if ts is None:
             ts = time.time()
         conn = self._connect()
         try:
             conn.execute(
-                "UPDATE tasks SET push_at = ? WHERE task_id = ? AND status = 'in_progress'",
-                (ts, task_id),
+                "UPDATE tasks SET push_at = ?, dispatch_pane_id = ? "
+                "WHERE task_id = ? AND status = 'in_progress'",
+                (ts, pane_id, task_id),
             )
             conn.commit()
         finally:

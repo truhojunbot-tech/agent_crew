@@ -2795,7 +2795,7 @@ def create_app(
         push_fn(guarded_pane_id, _format_task_message(task, port))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
-        q().set_push_at(task.task_id)
+        q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
     #: How many times a push path found no pane to deliver to. Keyed by path so
     #: a persistent misconfiguration is loud once and then periodic (#260).
@@ -2890,7 +2890,7 @@ def create_app(
             return
         push_fn(guarded_pane_id, _format_task_message(task, port))
         # #152: record push time for watchdog idle clock.
-        q().set_push_at(task.task_id)
+        q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
     def _resolve_pane_for_row(row: dict) -> Optional[str]:
         """Find the pane assigned to an in_progress task row. Mirrors the routing
@@ -5324,8 +5324,42 @@ def create_app(
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
-        q().cancel(task_id)
-        return {"status": "cancelled"}
+        prior_status, bound_pane = q().cancel(task_id)
+        outcome = "not_running"
+        reachable = False
+        if prior_status == "in_progress":
+            outcome = "unreachable"
+            if bound_pane:
+                owned_panes, _, _ = _recorded_pane_ids(state_path, pane_map)
+                # Only the canonical pane recorded at dispatch can be signalled.
+                # Never fall back to today's role map, which may have changed.
+                can_signal = (re.fullmatch(r"%\d+", bound_pane)
+                              and bound_pane in owned_panes
+                              and not q().pane_has_other_active_task(bound_pane, task_id))
+                try:
+                    pane_alive = bool(can_signal and _pane_alive_for_push(bound_pane))
+                except (OSError, subprocess.TimeoutExpired):
+                    pane_alive = False
+                if pane_alive:
+                    try:
+                        sent = subprocess.run(
+                            ["tmux", "send-keys", "-t", bound_pane, "C-c"],
+                            capture_output=True, timeout=2,
+                        )
+                        reachable = sent.returncode == 0
+                        outcome = "sent" if reachable else "send_failed"
+                    except (OSError, subprocess.TimeoutExpired):
+                        outcome = "send_failed"
+            try:
+                record_context_event(
+                    _context_events_path, "cancel_signalled", task_id=task_id,
+                    pane_id=bound_pane or None, outcome=outcome,
+                    worker_reachable=reachable,
+                )
+            except Exception:
+                logger.exception("cancel_signalled event failed for task=%s", task_id)
+        return {"status": "cancelled", "worker_reachable": reachable,
+                "cancel_signal_outcome": outcome}
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(older_than: float = 600.0):
