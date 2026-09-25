@@ -228,15 +228,15 @@ def test_the_publish_path_is_gated():
 # ── 6. end to end, through the real result path ───────────────────────
 
 
-def _server(tmp_db):
+def _server(tmp_db, *, unused_tcp_port):
     from agent_crew.server import create_app
 
-    return create_app(db_path=tmp_db, pane_map={}, port=0,
+    return create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port,
                       watchdog_disabled=True, anomaly_disabled=True,
                       push_fn=lambda *a, **k: None)
 
 
-def _submit_review(tmp_db, monkeypatch, head):
+def _submit_review(tmp_db, monkeypatch, head, *, unused_tcp_port):
     """Post a review result whose pin is PINNED, with the live head stubbed."""
     from fastapi.testclient import TestClient
 
@@ -254,7 +254,7 @@ def _submit_review(tmp_db, monkeypatch, head):
         task_id="review-stale", task_type="review", description="Review PR #5652",
         branch="main", context={"pr_number": 5652, "repo": "owner/repo",
                                 "reviewed_sha": PINNED, "coordinator_managed": True}))
-    with TestClient(_server(tmp_db)) as client:
+    with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         response = client.post("/tasks/review-stale/result", json={
             "task_id": "review-stale", "status": "completed",
             "summary": "blocker", "verdict": "request_changes",
@@ -264,35 +264,35 @@ def _submit_review(tmp_db, monkeypatch, head):
     return posted, TaskQueue(tmp_db)
 
 
-def test_a_stale_verdict_is_not_posted_to_the_pr(tmp_db, monkeypatch):
+def test_a_stale_verdict_is_not_posted_to_the_pr(tmp_db, monkeypatch, *, unused_tcp_port):
     """★★The incident, through the real POST path. A `request_changes` verdict
     about `5b496a9f` must not land on a PR whose head is `28419e96`."""
-    posted, _ = _submit_review(tmp_db, monkeypatch, MOVED_TO)
+    posted, _ = _submit_review(tmp_db, monkeypatch, MOVED_TO, unused_tcp_port=unused_tcp_port)
     assert posted == [], f"published a verdict against a moved head: {posted}"
 
 
-def test_a_current_verdict_is_still_posted(tmp_db, monkeypatch):
+def test_a_current_verdict_is_still_posted(tmp_db, monkeypatch, *, unused_tcp_port):
     """⛔The control. Suppressing every verdict would 'fix' this by disabling
     review publication entirely."""
-    posted, _ = _submit_review(tmp_db, monkeypatch, PINNED)
+    posted, _ = _submit_review(tmp_db, monkeypatch, PINNED, unused_tcp_port=unused_tcp_port)
     assert len(posted) == 1
     assert posted[0]["pr_number"] == 5652
 
 
-def test_the_suppression_is_recorded_on_the_task(tmp_db, monkeypatch):
+def test_the_suppression_is_recorded_on_the_task(tmp_db, monkeypatch, *, unused_tcp_port):
     """A verdict that vanishes without a trace is indistinguishable from one
     that was lost."""
-    _, q = _submit_review(tmp_db, monkeypatch, MOVED_TO)
+    _, q = _submit_review(tmp_db, monkeypatch, MOVED_TO, unused_tcp_port=unused_tcp_port)
     ctx = q.get_task_context("review-stale")
     assert ctx.get("review_publication") == "stale"
     assert MOVED_TO[:9] in (ctx.get("review_publication_reason") or "")
 
 
-def test_a_stale_review_requeues_exactly_one_head_anchored_review(tmp_db, monkeypatch):
+def test_a_stale_review_requeues_exactly_one_head_anchored_review(tmp_db, monkeypatch, *, unused_tcp_port):
     """★★The other half: the PR still needs a review at the head it actually
     has. Exactly one — the id is derived, so a duplicate result cannot put two
     reviewers on one commit."""
-    _, q = _submit_review(tmp_db, monkeypatch, MOVED_TO)
+    _, q = _submit_review(tmp_db, monkeypatch, MOVED_TO, unused_tcp_port=unused_tcp_port)
     requeued = [t for t in q.list_tasks() if t.task_id == stale_review_task_id(5652, MOVED_TO)]
     assert len(requeued) == 1
     assert requeued[0].task_type == "review"
@@ -300,10 +300,10 @@ def test_a_stale_review_requeues_exactly_one_head_anchored_review(tmp_db, monkey
     assert requeued[0].context.get("superseded_review") == "review-stale"
 
 
-def test_the_result_itself_is_still_recorded(tmp_db, monkeypatch):
+def test_the_result_itself_is_still_recorded(tmp_db, monkeypatch, *, unused_tcp_port):
     """⛔Only the attribution is stopped, never the audit trail — the standing
     rule for every gate in this pipeline."""
-    _, q = _submit_review(tmp_db, monkeypatch, MOVED_TO)
+    _, q = _submit_review(tmp_db, monkeypatch, MOVED_TO, unused_tcp_port=unused_tcp_port)
     assert q.get_result("review-stale") is not None
 
 
@@ -317,7 +317,7 @@ def test_the_result_itself_is_still_recorded(tmp_db, monkeypatch):
 # taken back by a later head-anchored review.
 
 
-def _submit_approve(tmp_db, monkeypatch, head, *, no_tester=False):
+def _submit_approve(tmp_db, monkeypatch, head, *, no_tester=False, unused_tcp_port):
     """Post an APPROVING review whose pin is PINNED, with the live head stubbed."""
     from fastapi.testclient import TestClient
 
@@ -344,7 +344,7 @@ def _submit_approve(tmp_db, monkeypatch, head, *, no_tester=False):
     q.enqueue(TaskRequest(task_id="review-approve", task_type="review",
                           description="Review PR #5652", branch="main", context=ctx))
 
-    app = create_app(db_path=tmp_db, pane_map={}, port=0, watchdog_disabled=True,
+    app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True, push_fn=lambda *a, **k: None)
     with TestClient(app) as client:
         response = client.post("/tasks/review-approve/result", json={
@@ -355,32 +355,32 @@ def _submit_approve(tmp_db, monkeypatch, head, *, no_tester=False):
     return posted, tests, merged
 
 
-def test_a_stale_approval_does_not_enqueue_a_tester(tmp_db, monkeypatch):
+def test_a_stale_approval_does_not_enqueue_a_tester(tmp_db, monkeypatch, *, unused_tcp_port):
     """★★P1. The verdict approves `5b496a9f`; the head is `28419e96`. Spending a
     tester on it treats an approval of the old commit as approval of the PR."""
-    posted, tests, _ = _submit_approve(tmp_db, monkeypatch, MOVED_TO)
+    posted, tests, _ = _submit_approve(tmp_db, monkeypatch, MOVED_TO, unused_tcp_port=unused_tcp_port)
     assert posted == []
     assert tests == [], f"a stale approval still enqueued a tester: {tests}"
 
 
-def test_a_current_approval_still_enqueues_a_tester(tmp_db, monkeypatch):
+def test_a_current_approval_still_enqueues_a_tester(tmp_db, monkeypatch, *, unused_tcp_port):
     """⛔The control. Gating everything would stop the pipeline, not fix it."""
-    _, tests, _ = _submit_approve(tmp_db, monkeypatch, PINNED)
+    _, tests, _ = _submit_approve(tmp_db, monkeypatch, PINNED, unused_tcp_port=unused_tcp_port)
     assert len(tests) == 1
 
 
-def test_a_stale_approval_with_no_tester_does_not_merge(tmp_db, monkeypatch):
+def test_a_stale_approval_with_no_tester_does_not_merge(tmp_db, monkeypatch, *, unused_tcp_port):
     """★★The worst case in the finding. `no_tester=True` sends an approval
     straight to merge — so a review of a commit nobody is looking at could land
     a PR whose head had moved twice."""
-    _, _, merged = _submit_approve(tmp_db, monkeypatch, MOVED_TO, no_tester=True)
+    _, _, merged = _submit_approve(tmp_db, monkeypatch, MOVED_TO, no_tester=True, unused_tcp_port=unused_tcp_port)
     assert merged == [], f"a stale approval merged a moved PR: {merged}"
 
 
-def test_the_suppressed_approval_is_recorded(tmp_db, monkeypatch):
+def test_the_suppressed_approval_is_recorded(tmp_db, monkeypatch, *, unused_tcp_port):
     from agent_crew.queue import TaskQueue
 
-    _submit_approve(tmp_db, monkeypatch, MOVED_TO)
+    _submit_approve(tmp_db, monkeypatch, MOVED_TO, unused_tcp_port=unused_tcp_port)
     ctx = TaskQueue(tmp_db).get_task_context("review-approve")
     assert ctx.get("review_publication") == "stale"
 
@@ -452,12 +452,12 @@ def test_a_task_with_no_expected_head_is_unaffected(tmp_db):
     assert detached and detached[0] == MOVED_AGAIN
 
 
-def test_the_requeued_task_carries_a_pin_prep_can_actually_use(tmp_db, monkeypatch):
+def test_the_requeued_task_carries_a_pin_prep_can_actually_use(tmp_db, monkeypatch, *, unused_tcp_port):
     """★★The end of the finding: the field must reach a reader. Asserted against
     prep itself, not against the string being present in the context."""
     from agent_crew.queue import TaskQueue
 
-    _submit_review(tmp_db, monkeypatch, MOVED_TO)
+    _submit_review(tmp_db, monkeypatch, MOVED_TO, unused_tcp_port=unused_tcp_port)
     requeued = [t for t in TaskQueue(tmp_db).list_tasks()
                 if t.task_id == stale_review_task_id(5652, MOVED_TO)][0]
     detached = _prep_with(requeued.context,
@@ -465,7 +465,7 @@ def test_the_requeued_task_carries_a_pin_prep_can_actually_use(tmp_db, monkeypat
     assert detached and detached[0] == MOVED_TO
 
 
-def test_a_non_review_result_still_submits(tmp_db):
+def test_a_non_review_result_still_submits(tmp_db, *, unused_tcp_port):
     """⛔The regression that reached a push. The approve gate reads `_pub`
     unconditionally, and binding it only inside the review branch made EVERY
     non-review result raise UnboundLocalError — 59 suites' worth, and the
@@ -482,7 +482,7 @@ def test_a_non_review_result_still_submits(tmp_db):
     q = TaskQueue(tmp_db)
     q.enqueue(TaskRequest(task_id="impl-plain", task_type="implement",
                           description="do a thing", branch="main", context={}))
-    app = create_app(db_path=tmp_db, pane_map={}, port=0, watchdog_disabled=True,
+    app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True, push_fn=lambda *a, **k: None)
     with TestClient(app) as client:
         response = client.post("/tasks/impl-plain/result", json={

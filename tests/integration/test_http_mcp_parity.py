@@ -116,14 +116,14 @@ def _normalize_task_payload(payload):
 
 
 @pytest.fixture
-def parity_pair(tmp_path):
+def parity_pair(tmp_path, *, unused_tcp_port):
     """Build a fresh HTTP app + MCP server bound to the same SQLite DB.
 
     Yields a tuple ``(http_client, mcp, db_path)``. The test is responsible
     for seeding tasks via ``_enqueue_task(db_path, ...)``.
     """
     db_path = str(tmp_path / "parity.db")
-    app = create_app(db_path=db_path, port=0, watchdog_disabled=True)
+    app = create_app(db_path=db_path, port=unused_tcp_port, watchdog_disabled=True)
     mcp = build_mcp_server(db_path)
     with TestClient(app) as client:
         yield client, mcp, db_path

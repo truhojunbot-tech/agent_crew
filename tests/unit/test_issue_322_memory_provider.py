@@ -74,7 +74,7 @@ class _TimeoutProvider:
 
 
 def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled=True,
-                       shadow_memory_timeout_seconds=None):
+                       shadow_memory_timeout_seconds=None, unused_tcp_port):
     """Run the production dispatch seam and return its actual provider prompt."""
     tmp_path.mkdir()
     wt = tmp_path / "claude"
@@ -110,7 +110,7 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
     )
 
     app = create_app(
-        db_path=db, pane_map={}, port=0, state_path=str(state_file), project="project-a",
+        db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file), project="project-a",
         memory_provider=provider, watchdog_disabled=True, anomaly_disabled=True,
         shadow_memory_enabled=shadow_memory_enabled,
         shadow_memory_timeout_seconds=shadow_memory_timeout_seconds,
@@ -160,17 +160,17 @@ class _CrossProjectProvider:
         ))
 
 
-def test_shadow_memory_kill_switch_never_invokes_provider(tmp_path, monkeypatch):
+def test_shadow_memory_kill_switch_never_invokes_provider(tmp_path, monkeypatch, *, unused_tcp_port):
     _, context, events, _ = _dispatch_snapshot(
-        tmp_path / "disabled", monkeypatch, _MustNotBeCalledProvider(), shadow_memory_enabled=False)
+        tmp_path / "disabled", monkeypatch, _MustNotBeCalledProvider(), shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
 
     assert "shadow_memory" not in context
     assert events == []
 
 
-def test_slow_shadow_provider_cannot_hold_baseline_dispatch(tmp_path, monkeypatch):
+def test_slow_shadow_provider_cannot_hold_baseline_dispatch(tmp_path, monkeypatch, *, unused_tcp_port):
     _, _, events, dispatch_seconds = _dispatch_snapshot(
-        tmp_path / "slow", monkeypatch, _SlowProvider(), shadow_memory_timeout_seconds=0.05)
+        tmp_path / "slow", monkeypatch, _SlowProvider(), shadow_memory_timeout_seconds=0.05, unused_tcp_port=unused_tcp_port)
 
     assert dispatch_seconds < 0.5
     assert events[0]["state"] == "timeout"
@@ -183,12 +183,13 @@ def test_shadow_retrieve_defense_in_depth_removes_cross_project_provider_items()
     assert [item.item_id for item in result.items] == ["project-a"]
 
 
-def test_shadow_results_leave_baseline_prompt_and_dispatch_byte_identical(tmp_path, monkeypatch):
+def test_shadow_results_leave_baseline_prompt_and_dispatch_byte_identical(tmp_path, monkeypatch, *, unused_tcp_port):
     baseline, baseline_context, baseline_events, _ = _dispatch_snapshot(
-        tmp_path / "baseline", monkeypatch, NullMemoryProvider())
+        tmp_path / "baseline", monkeypatch, NullMemoryProvider(), unused_tcp_port=unused_tcp_port)
     returned, returned_context, returned_events, _ = _dispatch_snapshot(
         tmp_path / "returned", monkeypatch,
         FakeMemoryProvider([_item("decision-1", "project-a")]),
+        unused_tcp_port=unused_tcp_port,
     )
 
     assert returned == baseline
@@ -201,12 +202,12 @@ def test_shadow_results_leave_baseline_prompt_and_dispatch_byte_identical(tmp_pa
     assert baseline_events[0]["state"] == "unavailable"
 
 
-def test_shadow_failures_timeouts_and_empty_results_leave_baseline_unchanged(tmp_path, monkeypatch):
-    baseline, _, _, _ = _dispatch_snapshot(tmp_path / "baseline", monkeypatch, NullMemoryProvider())
-    broken, _, broken_events, _ = _dispatch_snapshot(tmp_path / "broken", monkeypatch, _BrokenProvider())
-    timed_out, _, timeout_events, _ = _dispatch_snapshot(tmp_path / "timeout", monkeypatch, _TimeoutProvider())
+def test_shadow_failures_timeouts_and_empty_results_leave_baseline_unchanged(tmp_path, monkeypatch, *, unused_tcp_port):
+    baseline, _, _, _ = _dispatch_snapshot(tmp_path / "baseline", monkeypatch, NullMemoryProvider(), unused_tcp_port=unused_tcp_port)
+    broken, _, broken_events, _ = _dispatch_snapshot(tmp_path / "broken", monkeypatch, _BrokenProvider(), unused_tcp_port=unused_tcp_port)
+    timed_out, _, timeout_events, _ = _dispatch_snapshot(tmp_path / "timeout", monkeypatch, _TimeoutProvider(), unused_tcp_port=unused_tcp_port)
     empty, _, empty_events, _ = _dispatch_snapshot(
-        tmp_path / "empty", monkeypatch, FakeMemoryProvider([]))
+        tmp_path / "empty", monkeypatch, FakeMemoryProvider([]), unused_tcp_port=unused_tcp_port)
 
     assert broken == timed_out == empty == baseline
     assert broken_events[0]["state"] == "error"

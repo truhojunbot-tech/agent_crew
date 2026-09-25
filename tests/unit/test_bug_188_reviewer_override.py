@@ -29,7 +29,7 @@ def _review_payload(task_id: str, override_agent: str) -> dict:
     }
 
 
-def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path):
+def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path, *, unused_tcp_port):
     """--reviewer gemini must spawn `gemini`, not `codex`, in gemini's worktree."""
     wt_claude = tmp_path / "claude"
     wt_codex = tmp_path / "codex"
@@ -77,7 +77,7 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path):
                 app = create_app(
                     db_path=tmp_db,
                     pane_map={},
-                    port=0,
+                    port=unused_tcp_port,
                     state_path=str(state_file),
                     watchdog_disabled=True,
                     anomaly_disabled=True,
@@ -97,7 +97,7 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path):
     )
 
 
-def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path):
+def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_port):
     """Without agent_override the dispatcher still uses the role default (codex)."""
     wt_claude = tmp_path / "claude"
     wt_codex = tmp_path / "codex"
@@ -145,7 +145,7 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path):
                 app = create_app(
                     db_path=tmp_db,
                     pane_map={},
-                    port=0,
+                    port=unused_tcp_port,
                     state_path=str(state_file),
                     watchdog_disabled=True,
                     anomaly_disabled=True,

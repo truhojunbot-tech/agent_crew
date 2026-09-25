@@ -74,7 +74,7 @@ def test_the_merged_form_records_cleanly(tmp_path):
     assert event["context_pack_id"] == pack.pack_id
 
 
-def test_a_real_dispatch_writes_the_event(tmp_path, monkeypatch):
+def test_a_real_dispatch_writes_the_event(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The check the feature never had.
 
     #239 tested that the pack reached the prompt; nothing tested that the
@@ -114,7 +114,7 @@ def test_a_real_dispatch_writes_the_event(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                      project="agent_crew", watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app):
@@ -147,7 +147,7 @@ def test_a_real_dispatch_writes_the_event(tmp_path, monkeypatch):
         assert key in event, f"consumer schema field missing from telemetry: {key}"
 
 
-def test_the_dispatch_records_nothing_when_the_pack_is_disabled(tmp_path, monkeypatch):
+def test_the_dispatch_records_nothing_when_the_pack_is_disabled(tmp_path, monkeypatch, *, unused_tcp_port):
     """The event marks a pack that was actually built — an off feature emits
     no telemetry rather than an empty record."""
     import asyncio
@@ -183,7 +183,7 @@ def test_the_dispatch_records_nothing_when_the_pack_is_disabled(tmp_path, monkey
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                      project="agent_crew", watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app):
@@ -206,7 +206,7 @@ def test_the_dispatch_records_nothing_when_the_pack_is_disabled(tmp_path, monkey
 # attribution record that lies is worse than one that is missing.
 
 
-def _dispatch_with_pack_telemetry(tmp_path, monkeypatch, extra_telemetry):
+def _dispatch_with_pack_telemetry(tmp_path, monkeypatch, extra_telemetry, *, unused_tcp_port):
     """Run a real dispatch whose pack reports `extra_telemetry`."""
     import asyncio
 
@@ -250,7 +250,7 @@ def _dispatch_with_pack_telemetry(tmp_path, monkeypatch, extra_telemetry):
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="the-real-project", watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app):
@@ -270,7 +270,7 @@ def _dispatch_with_pack_telemetry(tmp_path, monkeypatch, extra_telemetry):
     return built[0]
 
 
-def test_pack_telemetry_cannot_relabel_the_event(tmp_path, monkeypatch):
+def test_pack_telemetry_cannot_relabel_the_event(tmp_path, monkeypatch, *, unused_tcp_port):
     """★A pack claiming another task's identity must not win."""
     event = _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {
         "task_id": "some-other-task",
@@ -278,7 +278,7 @@ def test_pack_telemetry_cannot_relabel_the_event(tmp_path, monkeypatch):
         "agent": "gemini",
         "context_id": "not-this-context",
         "context_generation": 99,
-    })
+    }, unused_tcp_port=unused_tcp_port)
 
     assert event["task_id"] == "disp-identity"
     # `project` is the dispatcher's own resolution (from the state directory,
@@ -290,10 +290,10 @@ def test_pack_telemetry_cannot_relabel_the_event(tmp_path, monkeypatch):
     assert event["context_generation"] != 99
 
 
-def test_the_pack_schema_still_reaches_the_event(tmp_path, monkeypatch):
+def test_the_pack_schema_still_reaches_the_event(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔Identity winning must not mean telemetry losing. Everything the
     consumer reads is still the pack's own."""
-    event = _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {})
+    event = _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {}, unused_tcp_port=unused_tcp_port)
 
     for key in ("context_pack_id", "context_pack_hash", "mode", "total_tokens",
                 "selected_count", "candidate_count", "degraded", "budget"):
@@ -301,23 +301,23 @@ def test_the_pack_schema_still_reaches_the_event(tmp_path, monkeypatch):
     assert event["role"] == "implementer"
 
 
-def test_a_shadowed_identity_key_is_reported(tmp_path, monkeypatch, caplog):
+def test_a_shadowed_identity_key_is_reported(tmp_path, monkeypatch, caplog, *, unused_tcp_port):
     """Dropping a telemetry field silently is a smaller harm than mislabelling
     the event, but it is still a harm — the collision has to be visible."""
     import logging
 
     with caplog.at_level(logging.WARNING, logger="agent_crew.server"):
-        _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {"task_id": "other"})
+        _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {"task_id": "other"}, unused_tcp_port=unused_tcp_port)
 
     assert any("dispatch identity keys" in r.message for r in caplog.records)
 
 
-def test_role_alone_is_not_reported_as_a_collision(tmp_path, monkeypatch, caplog):
+def test_role_alone_is_not_reported_as_a_collision(tmp_path, monkeypatch, caplog, *, unused_tcp_port):
     """⛔`role` is the known, benign overlap — warning on it every dispatch
     would train everyone to ignore the warning."""
     import logging
 
     with caplog.at_level(logging.WARNING, logger="agent_crew.server"):
-        _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {})
+        _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {}, unused_tcp_port=unused_tcp_port)
 
     assert not [r for r in caplog.records if "dispatch identity keys" in r.message]

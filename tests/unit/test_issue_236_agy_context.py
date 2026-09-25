@@ -236,7 +236,7 @@ def test_surfaced_quota_still_wins_over_lag(tmp_path):
 
 
 def _dispatch_and_collect_events(tmp_path, monkeypatch, *, task_context,
-                                 conversation_mb, cap_mb=64):
+                                 conversation_mb, cap_mb=64, unused_tcp_port):
     """Run one real dispatch and return the context lifecycle events."""
     import asyncio
     import json as _json
@@ -283,7 +283,7 @@ def _dispatch_and_collect_events(tmp_path, monkeypatch, *, task_context,
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
                         _fake_exec)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -305,12 +305,14 @@ def _types(events):
 
 def test_explicit_operator_reset_below_the_cap_is_not_reported_as_capped(
     tmp_path, monkeypatch,
+    *, unused_tcp_port,
 ):
     """★The regression: a deliberate reset must not be labelled a size trip."""
     events = _dispatch_and_collect_events(
         tmp_path, monkeypatch,
         task_context={"context_reset": True},   # operator asked for it
         conversation_mb=2,                       # well under the cap
+        unused_tcp_port=unused_tcp_port,
     )
 
     # A first dispatch into a (project, agent, worktree) mints generation 1,
@@ -324,12 +326,13 @@ def test_explicit_operator_reset_below_the_cap_is_not_reported_as_capped(
         f"{_types(events)}")
 
 
-def test_cap_trip_still_emits_the_capped_event(tmp_path, monkeypatch):
+def test_cap_trip_still_emits_the_capped_event(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The gate must not silence the real signal it exists to carry."""
     events = _dispatch_and_collect_events(
         tmp_path, monkeypatch,
         task_context={},                 # no operator reset
         conversation_mb=137,             # the alpha_engine shape
+        unused_tcp_port=unused_tcp_port,
     )
 
     assert "provider_context_capped" in _types(events), _types(events)
@@ -340,19 +343,20 @@ def test_cap_trip_still_emits_the_capped_event(tmp_path, monkeypatch):
     assert capped["cap_mb"] == 64
 
 
-def test_no_reset_and_under_the_cap_emits_nothing_capped(tmp_path, monkeypatch):
+def test_no_reset_and_under_the_cap_emits_nothing_capped(tmp_path, monkeypatch, *, unused_tcp_port):
     events = _dispatch_and_collect_events(
-        tmp_path, monkeypatch, task_context={}, conversation_mb=2)
+        tmp_path, monkeypatch, task_context={}, conversation_mb=2, unused_tcp_port=unused_tcp_port)
 
     assert "provider_context_capped" not in _types(events)
 
 
 def test_operator_reset_AND_a_real_cap_trip_still_reports_capped(
     tmp_path, monkeypatch,
+    *, unused_tcp_port,
 ):
     """Both true at once: the cap genuinely tripped, so say so."""
     events = _dispatch_and_collect_events(
         tmp_path, monkeypatch,
-        task_context={"context_reset": True}, conversation_mb=137)
+        task_context={"context_reset": True}, conversation_mb=137, unused_tcp_port=unused_tcp_port)
 
     assert "provider_context_capped" in _types(events), _types(events)

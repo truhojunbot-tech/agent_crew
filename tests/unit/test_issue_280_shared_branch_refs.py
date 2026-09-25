@@ -246,7 +246,7 @@ def test_the_cli_worktree_sync_does_not_force_move_main():
 
 
 def test_a_detached_worktree_still_reports_which_branch_the_work_is_about(
-        shared_clone, tmp_path, monkeypatch):
+        shared_clone, tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔A fix that erases telemetry is not free. On a detached worktree
     `rev-parse --abbrev-ref HEAD` returns the literal string "HEAD", which joins
     to nothing in quota's economics — so attribution falls back to the branch
@@ -280,7 +280,7 @@ def test_a_detached_worktree_still_reports_which_branch_the_work_is_about(
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
