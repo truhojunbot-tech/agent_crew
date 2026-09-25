@@ -212,7 +212,7 @@ def _ensure_role_protocol(
     role: str, worktree_path: str, project: str, port_file: str, *, agent: str, port: int = 0,
 ) -> bool:
     """Ensure the role's worker contract survived worktree synchronisation (#353)."""
-    relative = instructions.ROLE_FILES.get(role)
+    relative = instructions.AGENT_FILES.get(agent, instructions.ROLE_FILES.get(role))
     if not relative:
         logger.error("dispatcher: no protocol file is defined for role=%s", role)
         return False
@@ -3259,7 +3259,7 @@ def create_app(
 
     # ── Headless dispatcher (subprocess-per-task model) ──────────────────────
     # Built from state.json's "roles" field when present; falls back to the
-    # hardcoded default (claude/codex/gemini). This is what lets the same
+    # hardcoded default (codex/claude/gemini). This is what lets the same
     # agent serve multiple roles (e.g. claude implementer + claude reviewer).
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
 

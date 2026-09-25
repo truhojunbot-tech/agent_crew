@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 
 ROLE_ORDER = ("implementer", "reviewer", "tester")
 DEFAULT_ROLE_TO_AGENT = {
-    "implementer": "claude",
-    "reviewer": "codex",
+    "implementer": "codex",
+    "reviewer": "claude",
     "tester": "gemini",
 }
 EXPLICIT_SOURCE = "explicit project config"
