@@ -44,7 +44,8 @@ def _in_progress(q, task_id="t-1", task_type="implement"):
 # ── 1. a timeout is not a failure ─────────────────────────────────────
 
 
-def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port):
+def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port,
+                      context=None, captured_timeout=None):
     """Drive the REAL dispatch path and return the task row it ends with.
 
     ⛔Goes through `_dispatch_task`, not through the terminal-marking helper.
@@ -95,7 +96,16 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port):
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
-    monkeypatch.setattr(sv, "_dispatch_timeout_for_role", lambda role: 0.05)
+    if captured_timeout is None:
+        monkeypatch.setattr(sv, "_dispatch_timeout_for_role", lambda role, task_context=None: 0.05)
+    else:
+        resolve_timeout = sv._dispatch_timeout_for_role
+
+        def capture_timeout(role, task_context=None):
+            captured_timeout.append(resolve_timeout(role, task_context))
+            return 0.05
+
+        monkeypatch.setattr(sv, "_dispatch_timeout_for_role", capture_timeout)
     monkeypatch.setattr(sv.os, "killpg", lambda *a, **k: None)
 
     app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
@@ -103,11 +113,22 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port):
     with TestClient(app):
         q = TaskQueue(db)
         q.enqueue(TaskRequest(task_id="t-1", task_type="implement",
-                              description="do it", branch="main"))
+                              description="do it", branch="main", context=context or {}))
         task = q.dequeue(role="implementer")
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))
         return next(t for t in q.list_tasks() if t.task_id == "t-1")
+
+
+def test_dispatch_uses_task_context_timeout_without_server_restart(
+    tmp_path, monkeypatch, unused_tcp_port,
+):
+    captured_timeout = []
+    _dispatch_outcome(
+        tmp_path, monkeypatch, behaviour="clean", unused_tcp_port=unused_tcp_port,
+        context={"dispatch_timeout_s": 7200}, captured_timeout=captured_timeout,
+    )
+    assert captured_timeout == [3600.0]
 
 
 def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch, *, unused_tcp_port):

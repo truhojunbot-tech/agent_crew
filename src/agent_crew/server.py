@@ -3,6 +3,7 @@ import contextlib
 import contextvars
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -996,7 +997,7 @@ def _detect_transient_error_in_log(
     return None
 
 
-def _dispatch_timeout_for_role(role: str) -> float:
+def _dispatch_timeout_for_role(role: str, task_context: Optional[dict] = None) -> float:
     """Hard wall-clock timeout (seconds) for a dispatched subprocess.
 
     ``implement`` tasks routinely run longer than review/test — they write
@@ -1013,7 +1014,21 @@ def _dispatch_timeout_for_role(role: str) -> float:
     for that role or any other — so setting only the generic var still
     raises every role uniformly, matching pre-existing behavior for anyone
     already relying on it.
+
+    A task can set ``context.dispatch_timeout_s`` for its own dispatch. A
+    positive finite value takes precedence over the role/env default and is
+    capped at 3600 seconds. Invalid values leave the role/env default intact.
     """
+    if isinstance(task_context, dict):
+        value = task_context.get("dispatch_timeout_s")
+        if not isinstance(value, bool):
+            try:
+                task_timeout = float(value)
+            except (TypeError, ValueError, OverflowError):
+                pass
+            else:
+                if math.isfinite(task_timeout) and task_timeout > 0:
+                    return min(task_timeout, 3600.0)
     default = "1800" if role == "implementer" else "900"
     if role == "implementer":
         env_value = os.getenv("AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER")
@@ -3930,7 +3945,7 @@ def create_app(
                 cmd = ["codex", "exec",
                        "--dangerously-bypass-approvals-and-sandbox", "--json", message]
 
-        timeout_secs = _dispatch_timeout_for_role(role)
+        timeout_secs = _dispatch_timeout_for_role(role, _ctx)
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
         # Only pop the retry counter on a terminal outcome. Flipped to False
         # right before the early `return` on a successful requeue — that
