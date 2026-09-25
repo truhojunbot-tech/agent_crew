@@ -4,9 +4,13 @@
 전역 스윕이라 **3건**이 취소됐고, 그중 둘은 오너가 방금 계속하라고 지시한 라이브 레인이었다.
 요청에도 '전부' 라는 말이 없었고 응답도 무엇을 잃는지 **잃기 전에** 말해주지 않았다.
 """
+import subprocess
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
 
+from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
@@ -108,6 +112,64 @@ def test_scoped_real_cancel_cancels_exactly_that_task(client):
     assert r.json()["cancelled"] == ["stale-one"]
     assert client.get("/tasks/stale-one").json()["status"] == "cancelled"
     assert client.get("/tasks/fresh-one").json()["status"] == "in_progress"
+
+
+def test_scoped_cancel_signals_the_bound_worker(tmp_path):
+    db_path = str(tmp_path / "tasks.db")
+    app = create_app(db_path=db_path, pane_map={"implementer": "%101"},
+                     port=8299, push_fn=lambda *_: None, watchdog_disabled=True)
+    with TestClient(app) as client:
+        client.db_path = db_path
+        _seed_in_progress(client, "stale-one", "implement", idle_s=7200)
+        TaskQueue(db_path).set_push_at("stale-one", pane_id="%101")
+        with patch("agent_crew.server._pane_alive_for_push", side_effect=[True, False]), \
+             patch("agent_crew.server.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as run:
+            response = client.post("/tasks/expire-stale", params={
+                "older_than": 3600, "task_id": "stale-one", "dry_run": "false",
+            })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancel_signal_outcome"] == "pane_exited"
+    assert any(call.args[0] == ["tmux", "send-keys", "-t", "%101", "C-c"]
+               for call in run.call_args_list)
+
+
+def test_global_sweep_acts_only_on_its_previewed_candidates(client, monkeypatch):
+    _seed_in_progress(client, "stale-one", "implement", idle_s=7200)
+    _seed_in_progress(client, "fresh-one", "review", idle_s=0)
+    original = TaskQueue.expire_stale
+    calls = []
+
+    def preview_only(self, older_than_seconds=600.0, dry_run=False):
+        calls.append(dry_run)
+        assert dry_run, "global sweep must not re-query after selecting candidates"
+        return original(self, older_than_seconds=older_than_seconds, dry_run=True)
+
+    monkeypatch.setattr(TaskQueue, "expire_stale", preview_only)
+    response = client.post("/tasks/expire-stale", params={
+        "older_than": 3600, "dry_run": "false",
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] == ["stale-one"]
+    assert response.json()["cancel_signal_outcomes"] == {"stale-one": "unreachable"}
+    assert calls == [True]
+    assert client.get("/tasks/fresh-one").json()["status"] == "in_progress"
+
+
+def test_backend_without_preview_fails_closed(client, monkeypatch):
+    _seed_in_progress(client, "stale-one", "implement", idle_s=7200)
+
+    def no_preview(self, older_than_seconds=600.0):
+        raise AssertionError("a backend without preview must never sweep")
+
+    monkeypatch.setattr(TaskQueue, "expire_stale", no_preview)
+    response = client.post("/tasks/expire-stale", params={
+        "older_than": 3600, "task_id": "stale-one", "dry_run": "false",
+    })
+
+    assert response.status_code == 501
+    assert client.get("/tasks/stale-one").json()["status"] == "in_progress"
 
 
 def test_scoped_call_on_a_fresh_task_refuses(client):

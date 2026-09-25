@@ -1969,12 +1969,11 @@ class TaskQueue:
 
     def expire_stale(self, older_than_seconds: float = 600.0,
                      dry_run: bool = False) -> List[str]:
-        """Cancel in_progress tasks whose last_activity_at is older than
-        ``older_than_seconds``. Returns list of cancelled task_ids.
+        """List or cancel in_progress tasks idle past ``older_than_seconds``.
 
-        ``dry_run=True`` returns the same candidate set **without cancelling** —
-        the preview and the sweep share one predicate, so a preview can never
-        list a task the sweep would spare, or spare one it would cancel.
+        ``dry_run=True`` returns the candidates at the time of this call without
+        cancelling. Preview and sweep use the same predicate, but separate calls
+        can see different sets as time and task status change.
         """
         cutoff = time.time() - older_than_seconds
         conn = self._connect()

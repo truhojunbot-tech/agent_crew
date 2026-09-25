@@ -5479,7 +5479,9 @@ def create_app(
 
         Returns ``{"cancelled": [...], "dry_run": bool, "scope": ...}``;
         on a preview the ids are under ``"would_cancel"`` instead, so a caller
-        cannot mistake a preview for a completed action.
+        cannot mistake a preview for a completed action. A scoped cancellation
+        also reports ``cancel_signal_outcome`` for its bound worker; a global
+        sweep reports the outcome for each selected id.
         """
         candidates = q().expire_stale(older_than_seconds=older_than, dry_run=True) \
             if _expire_stale_supports_dry_run(q()) else None
@@ -5506,15 +5508,41 @@ def create_app(
             return {"would_cancel": candidates, "dry_run": True,
                     "scope": task_id or "global"}
         if task_id is not None:
-            q().cancel(task_id)
+            try:
+                signal = cancel_task_with_signal(
+                    q(), task_id, state_path=state_path, pane_map=pane_map,
+                    events_path=_context_events_path,
+                )
+            except ValueError:
+                return {"cancelled": [], "dry_run": False, "scope": task_id,
+                        "reason": "task disappeared after stale preview"}
             logger.info(f"POST /tasks/expire-stale: cancelled scoped task {task_id}")
-            return {"cancelled": [task_id], "dry_run": False, "scope": task_id}
-        cancelled = q().expire_stale(older_than_seconds=older_than)
+            return {"cancelled": [task_id], "dry_run": False, "scope": task_id,
+                    "worker_reachable": signal["worker_reachable"],
+                    "cancel_signal_outcome": signal["cancel_signal_outcome"],
+                    "pane_exit_observed": signal["pane_exit_observed"]}
+        cancelled = []
+        signal_outcomes = {}
+        for candidate in candidates:
+            try:
+                signal = cancel_task_with_signal(
+                    q(), candidate, state_path=state_path, pane_map=pane_map,
+                    events_path=_context_events_path,
+                )
+            except ValueError:
+                logger.warning(
+                    "POST /tasks/expire-stale: candidate %s disappeared after preview",
+                    candidate,
+                )
+                continue
+            cancelled.append(candidate)
+            signal_outcomes[candidate] = signal["cancel_signal_outcome"]
         logger.warning(
             f"POST /tasks/expire-stale: GLOBAL sweep cancelled {len(cancelled)} "
             f"task(s): {cancelled}"
         )
-        return {"cancelled": cancelled, "dry_run": False, "scope": "global"}
+        return {"cancelled": cancelled, "dry_run": False, "scope": "global",
+                "cancel_signal_outcomes": signal_outcomes}
 
     @app.post("/gates", status_code=201)
     def post_gate(gate: GateRequest):
