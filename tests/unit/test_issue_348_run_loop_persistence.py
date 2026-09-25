@@ -149,7 +149,7 @@ class _LoopQueue:
         return next(self.results)
 
 
-def _run_loop(monkeypatch, tmp_path, results, max_iter=2):
+def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main"):
     import agent_crew.loop as loop
 
     queue = _LoopQueue(results)
@@ -169,7 +169,7 @@ def _run_loop(monkeypatch, tmp_path, results, max_iter=2):
     runner = CliRunner()
     invocation = runner.invoke(crew, [
         "run", "implement persistence", "--db", str(tmp_path / "tasks.db"),
-        "--branch", "main", "--no-tester", "--max-iter", str(max_iter),
+        "--branch", branch, "--no-tester", "--max-iter", str(max_iter),
     ])
     return invocation, dispatched
 
@@ -225,3 +225,52 @@ def test_run_loop_carries_last_nonempty_branch_when_next_result_omits_one(tmp_pa
 
     assert invocation.exit_code == 0, invocation.output
     assert dispatched[3][0:2] == ("review", "fix/348-result")
+
+
+def test_run_branch_propagates_to_implementer_and_reviewer(tmp_path, monkeypatch):
+    branch = "fix/348-target"
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done", commit=COMMIT),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, branch=branch)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert dispatched[0][0:2] == ("implement", branch)
+    assert dispatched[0][2]["base_branch"] == "main"
+    assert dispatched[0][2]["crew_run_branch"] is True
+    assert dispatched[1][0:2] == ("review", branch)
+    assert dispatched[1][2]["reviewed_sha"] == COMMIT
+
+
+def test_new_commit_on_same_branch_does_not_trigger_identical_guard(tmp_path, monkeypatch):
+    branch = "fix/348-target"
+    next_commit = "b" * 40
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done",
+                   branch=branch, commit=COMMIT),
+        TaskResult(task_id="review-1", status="completed", summary="changes",
+                   verdict="request_changes", findings=["fix it"]),
+        TaskResult(task_id="impl-2", status="completed", summary="done",
+                   branch=branch, commit=next_commit),
+        TaskResult(task_id="review-2", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, branch=branch)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert "same commit reported twice" not in invocation.output
+    assert dispatched[2][2]["base_branch"] == "main"
+    assert dispatched[2][2]["crew_run_branch"] is True
+    assert dispatched[3][2]["reviewed_sha"] == next_commit
+
+
+def test_run_branch_refuses_result_from_another_branch(tmp_path, monkeypatch):
+    results = [TaskResult(task_id="impl-1", status="completed", summary="done",
+                          branch="fix/wrong", commit=COMMIT)]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results,
+                                       branch="fix/348-target")
+
+    assert "reported branch 'fix/wrong'" in invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]

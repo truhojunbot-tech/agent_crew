@@ -2442,7 +2442,10 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     _CM: dict = {"coordinator_managed": True}
 
-    impl_context = {**_CM, "base_branch": branch, "sync_landed_bases": _sync_landed_bases}
+    declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    run_branch_context = {"base_branch": declared_base,
+                          "crew_run_branch": branch != declared_base}
+    impl_context = {**_CM, **run_branch_context, "sync_landed_bases": _sync_landed_bases}
     if implementer:
         impl_context["agent_override"] = implementer
     if no_tester:
@@ -2454,7 +2457,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
 
     _loop_pr_number: int | None = None  # first PR number seen across all results
-    _previous_impl_commit = ""
+    _previous_reviewed_head = ("", "")
     _last_impl_branch = ""
 
     for iteration in range(1, max_iter + 1):
@@ -2463,18 +2466,22 @@ def run_cmd(task: str, db: str, project: str, base: str,
         impl_elapsed = int(time.time() - impl_start)
         _loop_pr_number = _loop_pr_number or getattr(impl_result, "pr_number", None)
         reported_branch = getattr(impl_result, "branch", "") or ""
+        if run_branch_context["crew_run_branch"] and reported_branch and reported_branch != branch:
+            click.echo(
+                f"[{iteration}/{max_iter}] ❌ implementer reported branch {reported_branch!r} "
+                f"instead of requested {branch!r}; refusing to review the wrong branch."
+            )
+            return
         if reported_branch:
             _last_impl_branch = reported_branch
-        impl_branch = _last_impl_branch
+        impl_branch = branch if run_branch_context["crew_run_branch"] else _last_impl_branch
         impl_commit = getattr(impl_result, "commit", "") or ""
-        if impl_commit and impl_commit == _previous_impl_commit:
+        if impl_commit and (impl_branch or branch, impl_commit) == _previous_reviewed_head:
             click.echo(
                 f"[{iteration}/{max_iter}] ❌ implementer changes not persisting "
                 "(same commit reported twice)"
             )
             return
-        if impl_commit:
-            _previous_impl_commit = impl_commit
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
         review_context = {**_CM}
@@ -2499,6 +2506,15 @@ def run_cmd(task: str, db: str, project: str, base: str,
             review_start = time.time()
             review_result = _wait(review_id)
             review_elapsed = int(time.time() - review_start)
+            # Compare the next implementation with the branch head this review
+            # was pinned to, rather than an unreviewed implementer report.
+            reviewed_head = review_context.get("reviewed_sha", "")
+            try:
+                reviewed_head = queue.get_task_context(review_id).get("reviewed_sha") or reviewed_head
+            except (AttributeError, KeyError):
+                pass
+            if reviewed_head:
+                _previous_reviewed_head = (impl_branch or branch, reviewed_head)
 
             # pass no_tester=True here — test enqueue is handled manually below
             outcome = handle_review_result(
@@ -2567,7 +2583,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
                     retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                               context={**_CM, "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
+                                               context={**_CM, **run_branch_context, "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
                 if _run_port:
@@ -2586,7 +2602,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
         feedback = build_feedback(review_result)
         retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
-        retry_context = {**_CM, "feedback": feedback, "sync_landed_bases": retry_bases}
+        retry_context = {**_CM, **run_branch_context, "feedback": feedback, "sync_landed_bases": retry_bases}
         if implementer:
             retry_context["agent_override"] = implementer
         impl_id = enqueue_implement(queue, task, impl_branch or branch,
