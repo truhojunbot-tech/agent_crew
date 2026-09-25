@@ -4036,9 +4036,9 @@ class TaskQueue:
 
     # ── G12 / D6: execution-state instrumentation ─────────────────────────
     #
-    # ⛔Recording only. Nothing in dispatch reads these columns or events, and
-    #   every recorder swallows its own failure: a lost audit row is a gap in
-    #   the evidence, a raised exception here would be a changed dispatch.
+    # Most recorders are best-effort instrumentation. A dispatcher failure's
+    # end marker is admission authority for late results, so that write must
+    # succeed in the same transaction as the failed task row.
 
     @staticmethod
     def _append_exec_event_on(conn, task_id: str, event: str, at: float, *,
