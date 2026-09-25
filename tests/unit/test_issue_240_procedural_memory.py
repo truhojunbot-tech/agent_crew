@@ -720,6 +720,7 @@ def test_a_corrupt_procedures_file_does_not_break_dispatch(tmp_path):
 
 def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
     tmp_path, monkeypatch,
+    *, unused_tcp_port,
 ):
     """★★The dispatch-level regression the review asked for.
 
@@ -770,7 +771,7 @@ def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
                         _fake_exec)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -1025,7 +1026,7 @@ def test_shadow_telemetry_is_not_written_for_an_out_of_scope_procedure(tmp_path)
     assert [r["task_id"] for r in recs] == ["t-in"]
 
 
-def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch):
+def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★Dispatcher level: the same two tasks, through the real dispatch path.
 
     The unit tests above call `build_pack_for_task` directly; this drives
@@ -1074,7 +1075,7 @@ def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch):
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec",
                         _fake_exec)
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state_file),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file),
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)

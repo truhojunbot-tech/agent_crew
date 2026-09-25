@@ -166,7 +166,7 @@ def test_deferring_an_unknown_task_is_not_an_error(tmp_db):
 
 
 def _dispatch(tmp_path, monkeypatch, *, lock_base, task_id="test-d", scope=None,
-              defers=0):
+              defers=0, unused_tcp_port):
     """One real `_dispatch_task`; returns (spawned?, attribution row, events)."""
     from fastapi.testclient import TestClient
 
@@ -199,7 +199,7 @@ def _dispatch(tmp_path, monkeypatch, *, lock_base, task_id="test-d", scope=None,
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
 
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -222,10 +222,10 @@ def _of_type(events, event_type):
     return [e for e in events if e.get("event_type") == event_type]
 
 
-def test_dispatch_records_the_targeted_default(tmp_path, monkeypatch):
+def test_dispatch_records_the_targeted_default(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★#278 validation 1, through the handler rather than the helper."""
     spawned, row, events = _dispatch(tmp_path, monkeypatch,
-                                     lock_base=str(tmp_path / "lb"))
+                                     lock_base=str(tmp_path / "lb"), unused_tcp_port=unused_tcp_port)
     assert spawned
     assert row["effective_test_scope"] == "targeted"
     assert row["test_scope_source"] == "builtin"
@@ -237,28 +237,28 @@ def test_dispatch_records_the_targeted_default(tmp_path, monkeypatch):
     assert resolved[0]["test_scope_hash"] == row["test_scope_hash"]
 
 
-def test_dispatch_records_an_opted_in_full_suite_and_its_source(tmp_path, monkeypatch):
+def test_dispatch_records_an_opted_in_full_suite_and_its_source(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★#278 validation 2."""
     _, row, events = _dispatch(tmp_path, monkeypatch, lock_base=str(tmp_path / "lb"),
-                               scope={"full_suite": True, "full": ["make test"]})
+                               scope={"full_suite": True, "full": ["make test"]}, unused_tcp_port=unused_tcp_port)
     assert row["effective_test_scope"] == "full_suite"
     assert row["test_scope_source"] == "repo"
     assert _of_type(events, "test_scope_resolved")[0]["effective_test_scope"] == "full_suite"
 
 
-def test_the_event_stream_carries_no_filesystem_path(tmp_path, monkeypatch):
+def test_the_event_stream_carries_no_filesystem_path(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔`scope["source"]` is a path under the user's home. The categorical kind
     is what goes out; publishing the path into an economics stream would be a
     privacy regression in the name of telemetry."""
     _, _, events = _dispatch(tmp_path, monkeypatch, lock_base=str(tmp_path / "lb"),
-                             scope={"guards": ["ruff check ."]})
+                             scope={"guards": ["ruff check ."]}, unused_tcp_port=unused_tcp_port)
     event = _of_type(events, "test_scope_resolved")[0]
     assert event["test_scope_source"] == "repo"
     blob = json.dumps(event)
     assert str(tmp_path) not in blob and "ruff check" not in blob
 
 
-def test_a_non_test_task_records_no_treatment(tmp_path, monkeypatch):
+def test_a_non_test_task_records_no_treatment(tmp_path, monkeypatch, *, unused_tcp_port):
     """An implement task has no tester scope, and inventing `targeted` for it
     would pollute every cohort built on this column."""
     from fastapi.testclient import TestClient
@@ -281,7 +281,7 @@ def test_a_non_test_task_records_no_treatment(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -292,7 +292,7 @@ def test_a_non_test_task_records_no_treatment(tmp_path, monkeypatch):
         assert q.get_attribution("impl-1")["effective_test_scope"] is None
 
 
-def test_a_deferred_dispatch_is_observable_and_is_not_runtime(tmp_path, monkeypatch):
+def test_a_deferred_dispatch_is_observable_and_is_not_runtime(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★#278 validation 4, with the lock genuinely held by another process.
 
     ⛔Two assertions, and the second is the one #278 turns on. `started_at` is
@@ -319,7 +319,7 @@ def test_a_deferred_dispatch_is_observable_and_is_not_runtime(tmp_path, monkeypa
         """)], stdout=subprocess.PIPE, text=True)
     try:
         assert holder.stdout.readline().strip() == "HELD"
-        spawned, row, events = _dispatch(tmp_path, monkeypatch, lock_base=base)
+        spawned, row, events = _dispatch(tmp_path, monkeypatch, lock_base=base, unused_tcp_port=unused_tcp_port)
     finally:
         holder.kill()
         holder.wait(timeout=10)
@@ -335,20 +335,20 @@ def test_a_deferred_dispatch_is_observable_and_is_not_runtime(tmp_path, monkeypa
         "a deferred attempt announced itself as started"
 
 
-def test_the_wait_is_attributed_when_the_task_finally_runs(tmp_path, monkeypatch):
+def test_the_wait_is_attributed_when_the_task_finally_runs(tmp_path, monkeypatch, *, unused_tcp_port):
     """The other half: once the lock frees, the accumulated deferral shows up
     as `lock_wait_seconds` on the row that DID run — separable from, and not
     added to, its provider execution time."""
     spawned, row, _ = _dispatch(tmp_path, monkeypatch, lock_base=str(tmp_path / "lb"),
-                                defers=2)
+                                defers=2, unused_tcp_port=unused_tcp_port)
     assert spawned
     assert row["lock_defer_count"] == 2
     assert row["lock_wait_seconds"] >= 0
     assert row["effective_test_scope"] == "targeted"
 
 
-def test_an_uncontended_run_reports_zero_wait_not_unknown(tmp_path, monkeypatch):
+def test_an_uncontended_run_reports_zero_wait_not_unknown(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔`0` and NULL mean different things here: measured-and-none versus
     never-measured. A dispatch that took the lock first try has measured it."""
-    _, row, _ = _dispatch(tmp_path, monkeypatch, lock_base=str(tmp_path / "lb"))
+    _, row, _ = _dispatch(tmp_path, monkeypatch, lock_base=str(tmp_path / "lb"), unused_tcp_port=unused_tcp_port)
     assert row["lock_wait_seconds"] == 0.0 and row["lock_defer_count"] == 0

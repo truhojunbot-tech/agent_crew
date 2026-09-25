@@ -294,7 +294,7 @@ def test_the_byte_cap_still_works_unchanged(tmp_path):
 # ── 3. the reset event has to say why ─────────────────────────────────
 
 
-def test_the_cap_event_carries_the_window_and_the_cause(tmp_path, monkeypatch):
+def test_the_cap_event_carries_the_window_and_the_cause(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★A reset that does not say which signal fired cannot be attributed, and
     on this fleet the two signals disagree about which worktrees are expensive.
     Byte-only telemetry would keep the #284 blind spot in the reset record."""
@@ -331,7 +331,7 @@ def test_the_cap_event_carries_the_window_and_the_cause(tmp_path, monkeypatch):
                                      "provider": "claude"}))
 
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)

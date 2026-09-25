@@ -38,7 +38,7 @@ def _discuss_payload(task_id: str, agent: str = "claude") -> dict:
 # U-DD01: Dispatcher loop dispatches discuss tasks per agent
 # ---------------------------------------------------------------------------
 
-def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path):
+def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path, unused_tcp_port):
     """In dispatcher mode, pending discuss tasks must transition to in_progress
     within seconds — not remain stuck as 'pending' forever.
 
@@ -93,7 +93,7 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path):
                 app = create_app(
                     db_path=tmp_db,
                     pane_map={},
-                    port=0,
+                    port=unused_tcp_port,
                     state_path=str(state_file),
                     watchdog_disabled=True,
                     anomaly_disabled=True,

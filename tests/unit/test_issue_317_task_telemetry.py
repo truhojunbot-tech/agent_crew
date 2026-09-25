@@ -241,7 +241,7 @@ def test_task_span_boundary_survives_queue_restart(tmp_path):
     assert (row["uncached_input_tokens"], row["output_tokens"]) == (31, 37)
 
 
-def test_claude_dispatch_persists_the_existing_transcript_byte_boundary(tmp_path, monkeypatch):
+def test_claude_dispatch_persists_the_existing_transcript_byte_boundary(tmp_path, monkeypatch, *, unused_tcp_port):
     import asyncio
     import subprocess
 
@@ -275,7 +275,7 @@ def test_claude_dispatch_persists_the_existing_transcript_byte_boundary(tmp_path
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""))
 
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state), project="project",
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state), project="project",
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         queue = TaskQueue(db)
