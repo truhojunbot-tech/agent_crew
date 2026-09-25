@@ -2794,6 +2794,19 @@ class TaskQueue:
             return None, None
         return receipt_id, _cea_store.current_receipt(conn, receipt_id)
 
+    def _cea_result_gate_on(self, conn, receipt: dict, *, nonce: Optional[str],
+                            presenter: Optional[str], config):
+        """Read the RESULT gate without consuming a nonce or moving a receipt."""
+        nrow = _cea_store.nonce_row(conn, nonce) if nonce else None
+        return _cea_callsites.gate_result(
+            receipt, nonce=nonce, presenter=presenter,
+            current=_cea_callsites.current_inputs(
+                self.cea_engine(), receipt, presenter=presenter,
+                nonce_unused=(None if nrow is None else nrow.get("used_at") is None),
+                nonce_consumed_by=(None if nrow is None else nrow.get("used_by")),
+                nonce_attempt=(None if nrow is None else nrow.get("attempt"))),
+            config=config)
+
     #: The receipt field J7 writes when the admitted review/test contract
     #: reduces a tester's scope. Read at dispatch, never written there.
     CEA_J7_TEST_SCOPE_KEY = "j7_test_scope"
@@ -3468,14 +3481,8 @@ class TaskQueue:
                 _receipt_id, _receipt = self._cea_receipt_for_task_on(conn, task_id)
                 if _receipt is not None and nonce:
                     try:
-                        _nrow = _cea_store.nonce_row(conn, nonce)
-                        late_gate = _cea_callsites.gate_result(
-                            _receipt, nonce=nonce, presenter=presenter,
-                            current=_cea_callsites.current_inputs(
-                                self.cea_engine(), _receipt, presenter=presenter,
-                                nonce_unused=(None if _nrow is None else _nrow.get("used_at") is None),
-                                nonce_consumed_by=(None if _nrow is None else _nrow.get("used_by")),
-                                nonce_attempt=(None if _nrow is None else _nrow.get("attempt"))),
+                        late_gate = self._cea_result_gate_on(
+                            conn, _receipt, nonce=nonce, presenter=presenter,
                             config=self.cea_config_for_receipt(_receipt))
                         # Use the validator's answer, not shadow mode's
                         # permissive `proceed`; this is never admission.
@@ -3509,18 +3516,10 @@ class TaskQueue:
             result_gate = None
             _receipt_id, _receipt = self._cea_receipt_for_task_on(conn, task_id)
             if _receipt is not None:
-                # The nonce's row in the claim table, not the receipt's own
-                # ``dispatch_nonces`` array: the receipt is caller-controlled
-                # data here, and the question RESULT must answer is whether
-                # EXECUTE_START spent this nonce for this attempt.
-                _nrow = _cea_store.nonce_row(conn, nonce) if nonce else None
-                result_gate = _cea_callsites.gate_result(
-                    _receipt, nonce=nonce, presenter=presenter,
-                    current=_cea_callsites.current_inputs(
-                        self.cea_engine(), _receipt, presenter=presenter,
-                        nonce_unused=(None if _nrow is None else _nrow.get("used_at") is None),
-                        nonce_consumed_by=(None if _nrow is None else _nrow.get("used_by")),
-                        nonce_attempt=(None if _nrow is None else _nrow.get("attempt"))),
+                # The nonce claim table, not the receipt's caller-controlled
+                # nonce list, proves EXECUTE_START spent this attempt's nonce.
+                result_gate = self._cea_result_gate_on(
+                    conn, _receipt, nonce=nonce, presenter=presenter,
                     config=self.cea_config_for_receipt(_receipt))
                 self._last_cea_result_gate = result_gate
                 if not result_gate.proceed:
