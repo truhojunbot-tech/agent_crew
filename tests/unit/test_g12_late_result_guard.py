@@ -1,5 +1,7 @@
 """System-ended tasks retain late worker payloads without restarting a cascade."""
 
+import sqlite3
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -43,6 +45,80 @@ def test_system_terminal_result_is_evidence_only(tmp_db, ended):
     assert len(late) == 1
     assert (late[0]["prior_status"], late[0]["verdict"], late[0]["commit"]) == (
         ended, "request_changes", "a" * 40)
+    assert late[0]["trust"] == "UNVERIFIED_LATE_EVIDENCE"
+    assert late[0]["nonce_presented"] is False
+    assert late[0]["presenter_asserted"] is None
+    assert "nonce_valid" not in late[0]
+
+
+@pytest.mark.parametrize("ended", ["timed_out", "cancelled"])
+@pytest.mark.parametrize("nonce_case", ["absent", "invalid"])
+def test_late_cea_result_is_untrusted_and_cannot_change_terminal_state(
+        tmp_path, monkeypatch, ended, nonce_case):
+    from agent_crew.cea import store as receipt_store
+    from agent_crew.cea.engine import EngineConfig
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED, admitted, task
+
+    db = str(tmp_path / "late-cea.db")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "test")
+    app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        q = TaskQueue(db, cea_config=EngineConfig(mode="test"), cea_providers=dict(WIRED))
+        q.enqueue(task("late-cea", context=admitted()), ingress="http.tasks")
+        assert q.dequeue(role="implementer", agent="claude")
+        nonce = q.record_dispatch("late-cea", channel="claude_p", agent="claude",
+                                  target="pid:123")
+        assert nonce
+        assert q.start_execution("late-cea", nonce, presenter="claude")["go"]
+        if ended == "cancelled":
+            assert q.cancel("late-cea")
+        else:
+            q.submit_result("late-cea", TaskResult(
+                task_id="late-cea", status="timed_out", summary="dispatcher timeout"),
+                nonce=nonce, presenter="claude")
+
+        before = next(t for t in q.list_tasks() if t.task_id == "late-cea")
+        with sqlite3.connect(db) as conn:
+            conn.row_factory = sqlite3.Row
+            receipt_id = conn.execute(
+                "SELECT receipt_id FROM tasks WHERE task_id='late-cea'").fetchone()["receipt_id"]
+            receipt_before = receipt_store.current_receipt(conn, receipt_id)
+            nonce_before = receipt_store.nonce_row(conn, nonce)
+            receipt_count = conn.execute(
+                "SELECT count(*) FROM authorization_receipts WHERE receipt_id=?",
+                (receipt_id,)).fetchone()[0]
+
+        summary = "x" * 5000
+        binding = ({"nonce": "not-a-dispatch-nonce", "presenter": "claude"}
+                   if nonce_case == "invalid" else {"presenter": "claude"})
+        response = client.post("/tasks/late-cea/result", json={
+            "task_id": "late-cea", "status": "completed", "summary": summary,
+            "verdict": "approve", "commit": "b" * 40,
+            "executor_binding": binding,
+        })
+        assert response.status_code == 409, response.text
+        assert response.json()["late_result"] is True
+        assert response.json()["accepted"] is False
+
+    after = next(t for t in q.list_tasks() if t.task_id == "late-cea")
+    assert (after.status, after.verdict, after.summary, after.status_changed_at) == (
+        before.status, before.verdict, before.summary, before.status_changed_at)
+    assert [t.task_id for t in q.list_tasks()] == ["late-cea"]
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        assert receipt_store.current_receipt(conn, receipt_id) == receipt_before
+        assert receipt_store.nonce_row(conn, nonce) == nonce_before
+        assert conn.execute(
+            "SELECT count(*) FROM authorization_receipts WHERE receipt_id=?",
+            (receipt_id,)).fetchone()[0] == receipt_count
+    late = [e for e in q.get_exec_state("late-cea")["events"]
+            if e["event"] == "late_result"]
+    assert len(late) == 1
+    assert late[0]["trust"] == "UNVERIFIED_LATE_EVIDENCE"
+    assert late[0]["nonce_presented"] is (nonce_case == "invalid")
+    assert late[0]["presenter_asserted"] == "claude"
+    assert late[0].get("nonce_valid") is (False if nonce_case == "invalid" else None)
+    assert len(late[0]["summary"]) == 4000
 
 
 def test_reported_failure_with_final_metadata_can_be_revised(tmp_db):

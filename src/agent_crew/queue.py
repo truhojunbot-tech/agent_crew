@@ -3417,6 +3417,10 @@ class TaskQueue:
         ``consume_receipt=False`` only for a terminal result that truthfully
         withdraws authorization (such as a canary suppression) rather than
         spending an executor invocation.
+
+        ``late_result`` events are unverified evidence only. Their asserted
+        verdict and commit must never become verdict, commit provenance, or a
+        cascade, even when a presented nonce passes the read-only check.
         """
         conn = self._connect()
         try:
@@ -3456,10 +3460,37 @@ class TaskQueue:
             if prior_status in ("cancelled", "timed_out") or system_failed:
                 # Same write lock as cancel/timeout: evidence is durable, but
                 # the terminal row, receipt, attribution and outbox stay put.
+                evidence = {
+                    "trust": "UNVERIFIED_LATE_EVIDENCE",
+                    "nonce_presented": bool(nonce),
+                    "presenter_asserted": presenter,
+                }
+                _receipt_id, _receipt = self._cea_receipt_for_task_on(conn, task_id)
+                if _receipt is not None and nonce:
+                    try:
+                        _nrow = _cea_store.nonce_row(conn, nonce)
+                        late_gate = _cea_callsites.gate_result(
+                            _receipt, nonce=nonce, presenter=presenter,
+                            current=_cea_callsites.current_inputs(
+                                self.cea_engine(), _receipt, presenter=presenter,
+                                nonce_unused=(None if _nrow is None else _nrow.get("used_at") is None),
+                                nonce_consumed_by=(None if _nrow is None else _nrow.get("used_by")),
+                                nonce_attempt=(None if _nrow is None else _nrow.get("attempt"))),
+                            config=self.cea_config_for_receipt(_receipt))
+                        # Use the validator's answer, not shadow mode's
+                        # permissive `proceed`; this is never admission.
+                        evidence["nonce_valid"] = late_gate.outcome is _CeaOutcome.PROCEED
+                    except Exception:
+                        # Evidence enrichment must not change the terminal
+                        # result's 409 contract when CEA inputs are unavailable.
+                        logger.exception("late-result nonce check unavailable task_id=%s", task_id)
+                        evidence["nonce_valid"] = False
                 self._append_exec_event_on(
                     conn, task_id, "late_result", time.time(),
                     prior_status=prior_status, status=result.status,
-                    summary=result.summary, verdict=result.verdict, commit=result.commit,
+                    summary=result.summary[:4000] if result.summary else result.summary,
+                    verdict=result.verdict, commit=result.commit,
+                    include_none=True, **evidence,
                 )
                 conn.execute("COMMIT")
                 raise LateResultRejected(prior_status)
@@ -4009,11 +4040,13 @@ class TaskQueue:
     #   the evidence, a raised exception here would be a changed dispatch.
 
     @staticmethod
-    def _append_exec_event_on(conn, task_id: str, event: str, at: float, **fields) -> None:
+    def _append_exec_event_on(conn, task_id: str, event: str, at: float, *,
+                              include_none: bool = False, **fields) -> None:
         conn.execute(
             "INSERT INTO task_exec_events (task_id, event, at, fields) VALUES (?, ?, ?, ?)",
             (task_id, event, at,
-             json.dumps({k: v for k, v in fields.items() if v is not None}, sort_keys=True)),
+             json.dumps({k: v for k, v in fields.items() if include_none or v is not None},
+                        sort_keys=True)),
         )
 
     def _record_claim_on(self, conn, task_id: str, at: float, *, role: Optional[str],
