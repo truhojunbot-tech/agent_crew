@@ -37,7 +37,7 @@ AGENT = "claude"
 
 def _app(db):
     from agent_crew.server import create_app
-    return create_app(db_path=str(db), pane_map={}, port=0, watchdog_disabled=True,
+    return create_app(db_path=str(db), pane_map={}, port=9999, watchdog_disabled=True,
                       anomaly_disabled=True)
 
 

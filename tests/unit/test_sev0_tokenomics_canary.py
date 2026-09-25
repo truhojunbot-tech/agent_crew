@@ -825,7 +825,11 @@ def _dispatch_review(tmp_path, monkeypatch, *, pin):
     wt = tmp_path / "codex-wt"
     wt.mkdir()
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 9999, "worktrees": {"codex": str(wt)}}))
+    state.write_text(json.dumps({
+        "port": 9999,
+        "worktrees": {"codex": str(wt)},
+        "role_agents": {"implementer": "codex", "reviewer": "codex", "tester": "codex"},
+    }))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_BASE", str(tmp_path / "lockbase"))
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)

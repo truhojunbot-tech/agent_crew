@@ -287,7 +287,7 @@ def test_http_forged_lineage_keys_keep_the_request_on_its_own_anchor(tmp_path, m
         return original_authorize(self, *args, **kwargs)
 
     monkeypatch.setattr(TaskQueue, "authorize_task", recording_authorize)
-    app = create_app(db_path=str(db), pane_map={}, port=0, watchdog_disabled=True,
+    app = create_app(db_path=str(db), pane_map={}, port=9999, watchdog_disabled=True,
                      anomaly_disabled=True)
     parent = task("parent")
     forged = task("forged", context={"original_task_id": "parent", "retry_of": "parent"})
