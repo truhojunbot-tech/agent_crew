@@ -1666,6 +1666,14 @@ def auto_enqueue_test(
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
         test_context: dict = {"prev_task_id": review_task_id}
+        # Test the exact revision approved by the reviewer. This is also the
+        # artifact component of the test's CEA intent identity.
+        if review_ctx.get("reviewed_sha"):
+            test_context["reviewed_sha"] = review_ctx["reviewed_sha"]
+        elif review_ctx.get("expected_head_sha"):
+            test_context["expected_head_sha"] = review_ctx["expected_head_sha"]
+        if review_ctx.get("fix_round") is not None:
+            test_context["fix_round"] = review_ctx["fix_round"]
         if enforce_risk_tier:
             test_context.update({
                 "risk_tier": contract.tier,

@@ -131,6 +131,7 @@ _CEA_CALLER_SCOPE_ANCHOR_SCHEMES = frozenset({
     "port", "route", "ssot",
 })
 _CEA_SCOPE_ANCHOR_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
+_CEA_COMMIT_RE = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
 
 
 def _cea_declared_paths(ctx: dict) -> tuple[str, ...]:
@@ -380,6 +381,28 @@ def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ..
     return _cea_canonical_or_none((f"task://{root}",)) or ()
 
 
+def _cea_artifact_anchors(task: TaskRequest, ctx: dict,
+                          anchors: tuple[str, ...]) -> tuple[str, ...]:
+    """Add the immutable artifact to review/test work without changing other work.
+
+    A PR anchor identifies the subject, but not the revision. A review of a
+    repaired head must be new work under P4; replaying the same head must still
+    find its completed lineage. Prefer the dispatch/review pin, then the head
+    expected by the stale-review guard. An automated fix round distinguishes
+    unpinned review successors until a commit is available.
+    """
+    if (task.task_type or "").strip().lower() not in ("review", "test"):
+        return anchors
+    for key in ("reviewed_sha", "expected_head_sha"):
+        sha = ctx.get(key)
+        if isinstance(sha, str) and _CEA_COMMIT_RE.fullmatch(sha.strip()):
+            return anchors + (f"commit:{sha.strip().lower()}",)
+    round_number = ctx.get("fix_round")
+    if isinstance(round_number, int) and not isinstance(round_number, bool) and round_number > 0:
+        return anchors + (f"config:fix_round.{round_number}",)
+    return anchors
+
+
 def _with_project(task: TaskRequest, project: str) -> TaskRequest:
     """A copy of ``task`` naming ``project``, without re-running ``__init__``.
 
@@ -425,7 +448,8 @@ def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None,
         work_class=work_class,
         target=_CeaTarget(repo=repo,
                           base_ref=str(task.branch or ""),
-                          scope_anchors=_cea_scope_anchors(task, ctx, repo)),
+                          scope_anchors=_cea_artifact_anchors(
+                              task, ctx, _cea_scope_anchors(task, ctx, repo))),
         capability_id=(str(ctx["capability_id"]) if ctx.get("capability_id") else None),
         authority_decision_ids=_cea_str_tuple(ctx.get("authority_decision_ids")))
     return _CeaIntent(
