@@ -264,18 +264,16 @@ def test_u_se16_find_free_port_reuses_dead_project_port():
 
 # U-SE17: _collect_active_ports scans all ~/.agent_crew/*/port files
 def test_u_se17_collect_active_ports_scans_all_port_files(tmp_path):
-    """Only ports whose servers are listening are returned."""
+    """All valid project claims are returned, even when no server listens."""
     (tmp_path / "proj_a").mkdir()
     (tmp_path / "proj_a" / "port").write_text("8100")
     (tmp_path / "proj_b").mkdir()
     (tmp_path / "proj_b" / "port").write_text("8101")
     (tmp_path / "proj_c").mkdir()  # no port file
 
-    with patch("agent_crew.setup._is_port_listening", side_effect=lambda p: p == 8100):
-        active = _collect_active_ports(base=str(tmp_path))
+    active = _collect_active_ports(base=str(tmp_path))
 
-    assert active == {8100}
-    assert 8101 not in active
+    assert active == {8100, 8101}
 
 
 # U-SE18: _collect_active_ports silently skips corrupt port files
