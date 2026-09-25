@@ -12,6 +12,16 @@ host.
 Configured walls: **1800s** for `implementer`, **900s** for every other role
 (`AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER` / `AGENT_CREW_DISPATCH_TIMEOUT`).
 
+## Per-task override (#340, item 1)
+
+Set `context.dispatch_timeout_s` on an individual dispatched task to give that
+task a different wall-clock budget, without changing the server environment or
+restarting it. The override applies to any role and takes precedence over its
+role/environment default. Positive finite numeric values are accepted and
+clamped to **3600 seconds (one hour)**. Missing, non-positive, or non-numeric
+values fall back to the existing role/environment default. The cap applies to
+the task override; it does not change the existing environment settings.
+
 ## What the numbers say
 
 **The timeouts are real wall-clock kills, not crashes.** The `dispatcher_timeout`

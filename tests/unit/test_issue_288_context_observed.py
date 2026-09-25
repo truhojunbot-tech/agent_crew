@@ -99,7 +99,7 @@ def test_a_measured_zero_never_trips_a_cap(tmp_path):
 # ── 2. the durable row ────────────────────────────────────────────────
 
 
-def _dispatch(tmp_path, monkeypatch, *, agent="claude", cap_info=None, over=False):
+def _dispatch(tmp_path, monkeypatch, *, agent="claude", cap_info=None, over=False, unused_tcp_port):
     """One real dispatch; returns the lifecycle events it wrote."""
     from fastapi.testclient import TestClient
 
@@ -132,7 +132,7 @@ def _dispatch(tmp_path, monkeypatch, *, agent="claude", cap_info=None, over=Fals
     task_type = {"implementer": "implement", "reviewer": "review",
                  "tester": "test"}[role]
     db = str(tmp_path / "tasks.db")
-    app = create_app(db_path=db, pane_map={}, port=0, state_path=str(state),
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
@@ -157,18 +157,18 @@ CLAUDE_INFO = {"provider": "claude", "bytes": 9_781_828,
                "context_tokens": 606_702, "cap_tokens": 0, "tripped_by": ""}
 
 
-def test_a_normal_dispatch_now_leaves_a_row(tmp_path, monkeypatch):
+def test_a_normal_dispatch_now_leaves_a_row(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The bug. Before #288 an uncapped dispatch wrote nothing at all."""
-    events = _dispatch(tmp_path, monkeypatch, cap_info=CLAUDE_INFO)
+    events = _dispatch(tmp_path, monkeypatch, cap_info=CLAUDE_INFO, unused_tcp_port=unused_tcp_port)
     observed = _of(events, "provider_context_observed")
     assert len(observed) == 1, [e.get("event_type") for e in events]
     assert observed[0]["context_tokens"] == 606_702
 
 
-def test_the_row_carries_what_a_cohort_needs_to_join_on(tmp_path, monkeypatch):
+def test_the_row_carries_what_a_cohort_needs_to_join_on(tmp_path, monkeypatch, *, unused_tcp_port):
     """The issue lists these by name: without them the observation cannot be
     attached to task economics and is a number in a file."""
-    event = _of(_dispatch(tmp_path, monkeypatch, cap_info=CLAUDE_INFO),
+    event = _of(_dispatch(tmp_path, monkeypatch, cap_info=CLAUDE_INFO, unused_tcp_port=unused_tcp_port),
                 "provider_context_observed")[0]
     assert event["task_id"] == "t-288"
     assert event["provider"] == "claude"
@@ -177,37 +177,37 @@ def test_the_row_carries_what_a_cohort_needs_to_join_on(tmp_path, monkeypatch):
     assert event["context_id"] and isinstance(event["context_generation"], int)
 
 
-def test_a_measured_zero_is_emitted_as_zero(tmp_path, monkeypatch):
+def test_a_measured_zero_is_emitted_as_zero(tmp_path, monkeypatch, *, unused_tcp_port):
     event = _of(_dispatch(tmp_path, monkeypatch,
-                          cap_info={**CLAUDE_INFO, "context_tokens": 0}),
+                          cap_info={**CLAUDE_INFO, "context_tokens": 0}, unused_tcp_port=unused_tcp_port),
                 "provider_context_observed")[0]
     assert event["context_tokens"] == 0
 
 
-def test_an_unknown_measurement_is_emitted_as_null(tmp_path, monkeypatch):
+def test_an_unknown_measurement_is_emitted_as_null(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔Emitted, not skipped. "We looked and could not tell" is itself a fact
     the cohort needs — dropping the row would make unknowns invisible and bias
     the sample toward sessions that happen to be readable."""
     event = _of(_dispatch(tmp_path, monkeypatch,
-                          cap_info={**CLAUDE_INFO, "context_tokens": None}),
+                          cap_info={**CLAUDE_INFO, "context_tokens": None}, unused_tcp_port=unused_tcp_port),
                 "provider_context_observed")[0]
     assert "context_tokens" in event and event["context_tokens"] is None
 
 
-def test_a_capped_dispatch_is_not_also_observed(tmp_path, monkeypatch):
+def test_a_capped_dispatch_is_not_also_observed(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★No double counting. The cap event already carries the numbers, and two
     rows for one dispatch would inflate any per-dispatch aggregate."""
     events = _dispatch(tmp_path, monkeypatch, over=True,
                        cap_info={**CLAUDE_INFO, "cap_tokens": 400_000,
-                                 "tripped_by": "tokens"})
+                                 "tripped_by": "tokens"}, unused_tcp_port=unused_tcp_port)
     assert len(_of(events, "provider_context_capped")) == 1
     assert _of(events, "provider_context_observed") == []
 
 
-def test_the_cap_event_keeps_its_own_meaning(tmp_path, monkeypatch):
+def test_the_cap_event_keeps_its_own_meaning(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔`provider_context_capped` means a reset was forced. #288 explicitly
     asks not to overload it, so an uncapped dispatch must never emit one."""
-    events = _dispatch(tmp_path, monkeypatch, cap_info=CLAUDE_INFO)
+    events = _dispatch(tmp_path, monkeypatch, cap_info=CLAUDE_INFO, unused_tcp_port=unused_tcp_port)
     assert _of(events, "provider_context_capped") == []
 
 
@@ -215,20 +215,20 @@ def test_the_cap_event_keeps_its_own_meaning(tmp_path, monkeypatch):
     ("gemini", {"provider": "agy", "bytes": 20_874_035, "conversation_id": "0aff70cb"}),
     ("codex", {"provider": "codex", "bytes": 6_617_088, "conversation_id": "01a02294"}),
 ])
-def test_the_other_providers_are_observed_too(tmp_path, monkeypatch, agent, info):
+def test_the_other_providers_are_observed_too(tmp_path, monkeypatch, agent, info, *, unused_tcp_port):
     """⛔Tokens are a Claude-only measurement today, so theirs is `null` — which
     is the honest value, not a reason to leave them out of the stream. A cohort
     that can only see one provider cannot compare policies across them."""
-    event = _of(_dispatch(tmp_path, monkeypatch, agent=agent, cap_info=info),
+    event = _of(_dispatch(tmp_path, monkeypatch, agent=agent, cap_info=info, unused_tcp_port=unused_tcp_port),
                 "provider_context_observed")[0]
     assert event["provider"] == info["provider"]
     assert event["context_bytes"] == info["bytes"]
     assert event["context_tokens"] is None
 
 
-def test_nothing_is_emitted_when_no_measurement_was_attempted(tmp_path, monkeypatch):
+def test_nothing_is_emitted_when_no_measurement_was_attempted(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔"Not measured" and "measured, unknown" are different. An agent with no
     sizing support at all should leave no row, or the stream would imply an
     attempt that never happened."""
-    events = _dispatch(tmp_path, monkeypatch, cap_info={})
+    events = _dispatch(tmp_path, monkeypatch, cap_info={}, unused_tcp_port=unused_tcp_port)
     assert _of(events, "provider_context_observed") == []

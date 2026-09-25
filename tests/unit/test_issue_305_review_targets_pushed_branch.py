@@ -189,7 +189,7 @@ def test_a_matching_branch_changes_nothing(tmp_db):
 # ── 4. the server hands the result over ───────────────────────────────
 
 
-def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db, monkeypatch):
+def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db, monkeypatch, *, unused_tcp_port):
     """★★The incident end to end, through the real POST path.
 
     ⛔This started as a source grep for `result=result`, which SURVIVED a mutant
@@ -219,7 +219,7 @@ def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db, mon
         lambda _task, _result, *, repo_cwd: (True, "verified artifact"),
     )
 
-    app = create_app(db_path=tmp_db, pane_map={}, port=0, watchdog_disabled=True,
+    app = create_app(db_path=tmp_db, pane_map={}, port=unused_tcp_port, watchdog_disabled=True,
                      anomaly_disabled=True, push_fn=lambda *a, **k: None)
     with TestClient(app) as client:
         response = client.post("/tasks/impl-watch-0073c3a7/result", json={

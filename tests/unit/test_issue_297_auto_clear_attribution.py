@@ -71,7 +71,7 @@ def _cleared_events(db_path):
 
 
 def _run(tmp_path, monkeypatch, *, tokens=BIG, task_type="implement",
-         context=None, agent_key="claude", pane="%91"):
+         context=None, agent_key="claude", pane="%91", unused_tcp_port):
     """Push one task through the real path; return (db, sent_keys, task_ctx)."""
     wt = tmp_path / "worktrees" / "demo" / agent_key
     wt.mkdir(parents=True, exist_ok=True)
@@ -98,7 +98,7 @@ def _run(tmp_path, monkeypatch, *, tokens=BIG, task_type="implement",
     pane_map = {"implementer": pane, "claude": pane, "codex": pane,
                 "reviewer": pane, "tester": pane}
     app = create_app(db_path=db, state_path=str(state), pane_map=pane_map,
-                     port=0, push_fn=lambda p, t: None,
+                     port=unused_tcp_port, push_fn=lambda p, t: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         client.post("/tasks", json={
@@ -112,15 +112,15 @@ def _run(tmp_path, monkeypatch, *, tokens=BIG, task_type="implement",
 # ── 1. the clear leaves a durable record ──────────────────────────────
 
 
-def test_an_auto_clear_emits_a_lifecycle_event(tmp_path, monkeypatch):
+def test_an_auto_clear_emits_a_lifecycle_event(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The bug: `_pane_clear_context` recorded nothing at all."""
-    db, sent, _ = _run(tmp_path, monkeypatch)
+    db, sent, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     assert any("/clear" in c for c in sent), "no /clear was sent"
     assert len(_cleared_events(db)) == 1
 
 
-def test_the_event_carries_what_an_audit_needs(tmp_path, monkeypatch):
-    db, _, _ = _run(tmp_path, monkeypatch)
+def test_the_event_carries_what_an_audit_needs(tmp_path, monkeypatch, *, unused_tcp_port):
+    db, _, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     event = _cleared_events(db)[0]
     assert event["task_id"] == "t-297"
     assert event["agent"] == "claude"
@@ -128,21 +128,21 @@ def test_the_event_carries_what_an_audit_needs(tmp_path, monkeypatch):
     assert event["reason"] == "auto_clear_token_threshold"
 
 
-def test_the_event_carries_the_measurement_that_triggered_it(tmp_path, monkeypatch):
+def test_the_event_carries_the_measurement_that_triggered_it(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The number and where it came from. A threshold event without the
     reading that crossed it cannot be audited or replayed."""
-    db, _, _ = _run(tmp_path, monkeypatch)
+    db, _, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     event = _cleared_events(db)[0]
     assert event["context_tokens"] == BIG
     assert event["token_source"] == "transcript"
     assert event["cap_tokens"] == sv._TOKEN_CLEAR_THRESHOLD
 
 
-def test_the_clear_is_recorded_as_attempted_not_completed(tmp_path, monkeypatch):
+def test_the_clear_is_recorded_as_attempted_not_completed(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔`send-keys` returning 0 proves the keystrokes were delivered, not that
     the provider cleared anything. Claiming `completed` would be inventing a
     confirmation the transport cannot give."""
-    db, _, _ = _run(tmp_path, monkeypatch)
+    db, _, _ = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     assert _cleared_events(db)[0]["outcome"] == "attempted"
 
 
@@ -170,10 +170,10 @@ def test_a_failed_send_is_recorded_as_such(tmp_path, monkeypatch):
     assert lines[0]["outcome"] == "send_failed"
 
 
-def test_no_clear_means_no_event(tmp_path, monkeypatch):
+def test_no_clear_means_no_event(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The control. An event stream that records non-events is worse than
     none — every rate computed from it would be wrong."""
-    db, sent, _ = _run(tmp_path, monkeypatch, tokens=10)
+    db, sent, _ = _run(tmp_path, monkeypatch, tokens=10, unused_tcp_port=unused_tcp_port)
     assert not any("/clear" in c for c in sent)
     assert _cleared_events(db) == []
 
@@ -181,43 +181,43 @@ def test_no_clear_means_no_event(tmp_path, monkeypatch):
 # ── 2. the treatment is corrected, not just described ─────────────────
 
 
-def test_the_cleared_task_is_marked_for_a_fresh_context(tmp_path, monkeypatch):
+def test_the_cleared_task_is_marked_for_a_fresh_context(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The integration bug. `context_reset` is what an operator sets to force
     a fresh context, and after a real `/clear` it is simply true — so the next
     resolution bumps the generation and records `fresh` instead of `resume`."""
-    _, _, ctx = _run(tmp_path, monkeypatch)
+    _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     assert ctx["context_reset"] is True
 
 
-def test_a_task_that_was_already_a_resume_is_still_corrected(tmp_path, monkeypatch):
+def test_a_task_that_was_already_a_resume_is_still_corrected(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★Acceptance 4's case: a pre-existing resume whose pane is over
     threshold. This is precisely the row that would otherwise enter a
     resume cohort having actually run fresh."""
-    _, _, ctx = _run(tmp_path, monkeypatch, context={"context_policy": "resume"})
+    _, _, ctx = _run(tmp_path, monkeypatch, context={"context_policy": "resume"}, unused_tcp_port=unused_tcp_port)
     assert ctx["context_reset"] is True
 
 
-def test_the_intervention_is_joinable_on_its_own(tmp_path, monkeypatch):
+def test_the_intervention_is_joinable_on_its_own(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔Acceptance 2's other half: a consumer must be able to EXCLUDE or
     stratify auto-cleared rows specifically, not merely see `fresh` and wonder
     which of several reasons produced it."""
-    _, _, ctx = _run(tmp_path, monkeypatch)
+    _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     assert ctx["auto_cleared_before_push"] is True
     assert ctx["auto_clear_context_tokens"] == BIG
     assert ctx["auto_clear_token_source"] == "transcript"
 
 
-def test_an_uncleared_task_carries_no_intervention_marks(tmp_path, monkeypatch):
-    _, _, ctx = _run(tmp_path, monkeypatch, tokens=10)
+def test_an_uncleared_task_carries_no_intervention_marks(tmp_path, monkeypatch, *, unused_tcp_port):
+    _, _, ctx = _run(tmp_path, monkeypatch, tokens=10, unused_tcp_port=unused_tcp_port)
     for key in ("context_reset", "auto_cleared_before_push"):
         assert key not in ctx, key
 
 
-def test_an_explicit_operator_reset_is_not_overwritten(tmp_path, monkeypatch):
+def test_an_explicit_operator_reset_is_not_overwritten(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The marker is additive. An operator who already asked for a reset must
     not have their intent relabelled as an auto-clear."""
     _, _, ctx = _run(tmp_path, monkeypatch, tokens=10,
-                     context={"context_reset": True})
+                     context={"context_reset": True}, unused_tcp_port=unused_tcp_port)
     assert ctx["context_reset"] is True
     assert "auto_cleared_before_push" not in ctx
 
@@ -225,19 +225,19 @@ def test_an_explicit_operator_reset_is_not_overwritten(tmp_path, monkeypatch):
 # ── 3. both push paths ────────────────────────────────────────────────
 
 
-def test_the_discuss_path_is_attributed_too(tmp_path, monkeypatch):
+def test_the_discuss_path_is_attributed_too(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔Acceptance 4. Panels accumulate the most context, which is why #260 put
     a guard on this path — so it is the path most likely to clear."""
     db, sent, _ = _run(tmp_path, monkeypatch, task_type="discuss",
-                       context={"agent": "claude"})
+                       context={"agent": "claude"}, unused_tcp_port=unused_tcp_port)
     assert any("/clear" in c for c in sent)
     events = _cleared_events(db)
     assert len(events) == 1 and events[0]["task_id"] == "t-297"
 
 
-def test_the_discuss_task_is_also_marked(tmp_path, monkeypatch):
+def test_the_discuss_task_is_also_marked(tmp_path, monkeypatch, *, unused_tcp_port):
     _, _, ctx = _run(tmp_path, monkeypatch, task_type="discuss",
-                     context={"agent": "claude"})
+                     context={"agent": "claude"}, unused_tcp_port=unused_tcp_port)
     assert ctx["context_reset"] is True and ctx["auto_cleared_before_push"] is True
 
 
@@ -277,7 +277,7 @@ def test_an_unknown_context_identity_is_absent_not_invented(tmp_path):
 #       class of bug as #292's round-2 finding, in the event's role field.
 
 
-def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None):
+def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None, unused_tcp_port):
     """Same push, but tmux refuses the keystrokes."""
     wt = tmp_path / "worktrees" / "demo" / "claude"
     wt.mkdir(parents=True, exist_ok=True)
@@ -304,7 +304,7 @@ def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None)
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"implementer": "%91", "claude": "%91"}, port=0,
+                     pane_map={"implementer": "%91", "claude": "%91"}, port=unused_tcp_port,
                      push_fn=lambda p, t: None, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as client:
@@ -316,42 +316,42 @@ def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None)
     return db, ctx
 
 
-def test_a_failed_send_does_not_claim_a_fresh_context(tmp_path, monkeypatch):
+def test_a_failed_send_does_not_claim_a_fresh_context(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★The finding. Marking `context_reset` for a pane that was not cleared
     puts an UNcleared task into the `fresh` cohort — the same contamination
     #297 exists to prevent, pointing the other way."""
-    _, ctx = _failing_send(tmp_path, monkeypatch)
+    _, ctx = _failing_send(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     assert "context_reset" not in ctx, ctx
     assert "auto_cleared_before_push" not in ctx, ctx
 
 
-def test_a_failed_send_on_the_discuss_path_is_also_unmarked(tmp_path, monkeypatch):
+def test_a_failed_send_on_the_discuss_path_is_also_unmarked(tmp_path, monkeypatch, *, unused_tcp_port):
     _, ctx = _failing_send(tmp_path, monkeypatch, task_type="discuss",
-                           context={"agent": "claude"})
+                           context={"agent": "claude"}, unused_tcp_port=unused_tcp_port)
     assert "context_reset" not in ctx
     assert "auto_cleared_before_push" not in ctx
 
 
-def test_a_failed_send_is_still_recorded(tmp_path, monkeypatch):
+def test_a_failed_send_is_still_recorded(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The attempt is still a fact, and the one the operator most needs: a
     pane over threshold that could not be cleared is unguarded. Not marking the
     task must not mean staying silent about it."""
-    db, _ = _failing_send(tmp_path, monkeypatch)
+    db, _ = _failing_send(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     events = _cleared_events(db)
     assert len(events) == 1
     assert events[0]["outcome"] == "send_failed"
 
 
-def test_a_successful_send_is_still_marked(tmp_path, monkeypatch):
+def test_a_successful_send_is_still_marked(tmp_path, monkeypatch, *, unused_tcp_port):
     """⛔The control, so the fix is not simply "never mark"."""
-    _, _, ctx = _run(tmp_path, monkeypatch)
+    _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
     assert ctx["context_reset"] is True and ctx["auto_cleared_before_push"] is True
 
 
 # ── 6. the event's role comes from the live map ───────────────────────
 
 
-def test_the_discuss_event_uses_the_configured_role(tmp_path, monkeypatch):
+def test_the_discuss_event_uses_the_configured_role(tmp_path, monkeypatch, *, unused_tcp_port):
     """★★P2. The static default says claude implements; a config that says
     otherwise has to win, or the event describes a deployment that does not
     exist."""
@@ -381,7 +381,7 @@ def test_the_discuss_event_uses_the_configured_role(tmp_path, monkeypatch):
 
     db = str(tmp_path / "tasks.db")
     app = create_app(db_path=db, state_path=str(state),
-                     pane_map={"claude": "%92", "reviewer": "%92"}, port=0,
+                     pane_map={"claude": "%92", "reviewer": "%92"}, port=unused_tcp_port,
                      push_fn=lambda p, t: None, watchdog_disabled=True,
                      anomaly_disabled=True)
     with TestClient(app) as client:
