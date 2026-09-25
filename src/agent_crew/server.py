@@ -5581,7 +5581,8 @@ def create_app(
         # IMMEDIATE 트랜잭션에서 runtime_stop을 확인해 unpaused일 때만 admit+reserve → STOP이
         # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
         # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
-        from agent_crew.github import get_repo, merge_pr, pr_state
+        from agent_crew.github import (get_repo, independent_review_succeeded,
+                                       merge_pr, pr_state)
         _merge_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         op_key = f"merge:pr:{pr_number}"
         resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
@@ -5621,6 +5622,19 @@ def create_app(
             q().external_op_mark(op_key, "failed",
                                  last_error="PR 상태 불명(gh 실패) — 다음 재확인 대기", inc_attempt=True)
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
+            return
+        # The HTTP cascade is allowed to run for every admitted task. Its
+        # test result alone is not authority to merge: crew run and external
+        # coordinators also submit test results and own their own merge policy.
+        # Require the independent review status on the current PR head for
+        # every server-side merge, regardless of caller-controlled context.
+        if not independent_review_succeeded(int(pr_number), _merge_repo):
+            q().external_op_mark(
+                op_key, "failed",
+                last_error="crew/independent-review success missing on PR head",
+                inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: PR #{pr_number} lacks successful "
+                           "crew/independent-review status — merge refused")
             return
         # st == 'open' → merge 시도
         ok = merge_pr(int(pr_number), merge_method="squash", repo=_merge_repo)

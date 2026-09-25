@@ -2478,13 +2478,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
         else:
             raise click.ClickException("Failed to create GitHub issue")
 
-    # coordinator_managed records *who drove* the transitions of this run. It no
-    # longer suppresses the server-side cascade: a flag the submitter writes into
-    # a context dict cannot be the thing that decides whether a successor task may
-    # exist (§7.2 — it is provenance, and "never reduces the contract"). Duplicate
-    # successors are prevented where they can actually be seen — the engine's
-    # lineage/idempotency answer and the deterministic successor task ids — not by
-    # asking the caller to promise it will behave.
+    # coordinator_managed is provenance only (§7.2). The loop adopts the
+    # server's persisted successors below; this flag never decides a transition.
     # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the
     # implementer always branches off the most recent merged state.
@@ -2653,13 +2648,37 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
         # request_changes: re-implement with feedback
         click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
-        feedback = build_feedback(review_result)
-        retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
-        retry_context = {**_CM, **run_branch_context, "feedback": feedback, "sync_landed_bases": retry_bases}
-        if implementer:
-            retry_context["agent_override"] = implementer
-        impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                    context=retry_context, port=_run_port)
+        # The result POST has completed the server cascade before _wait returns.
+        # Reuse its fix by lineage, including when it has already started. In
+        # standalone DB mode the same bounded cascade creates it here. Never
+        # mint an unrelated implement id for the same review verdict.
+        if not hasattr(queue, "list_tasks"):
+            # Legacy in-memory queue adapters used by the CLI loop tests have
+            # no persisted lineage to adopt. The production TaskQueue does.
+            feedback = build_feedback(review_result)
+            retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
+            retry_context = {**_CM, **run_branch_context, "feedback": feedback,
+                             "sync_landed_bases": retry_bases}
+            if implementer:
+                retry_context["agent_override"] = implementer
+            impl_id = enqueue_implement(queue, task, impl_branch or branch,
+                                        context=retry_context, port=_run_port)
+            continue
+        from agent_crew.pipeline import auto_enqueue_fix
+        fixes = [t for t in queue.list_tasks()
+                 if t.task_type == "implement"
+                 and isinstance(t.context, dict)
+                 and t.context.get("prev_task_id") == review_id]
+        if not fixes:
+            auto_enqueue_fix(queue, review_id)
+            fixes = [t for t in queue.list_tasks()
+                     if t.task_type == "implement"
+                     and isinstance(t.context, dict)
+                     and t.context.get("prev_task_id") == review_id]
+        if len(fixes) != 1:
+            click.echo(f"[{iteration}/{max_iter}] ❌ Expected one actionable fix for {review_id}; found {len(fixes)}. Stopping.")
+            return
+        impl_id = fixes[0].task_id
 
     click.echo(f"❌ Max iterations ({max_iter}) reached without approval.")
 

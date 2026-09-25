@@ -98,6 +98,7 @@ def test_A_merge_uses_worktree_repo_not_dispatcher_cwd(tmp_db, tmp_path, monkeyp
     monkeypatch.setattr("agent_crew.github.get_repo", repo_from_actual_worktree)
     monkeypatch.setattr("agent_crew.github.merge_pr",
                         lambda pr, **kwargs: calls.append(kwargs["repo"]) or True)
+    monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: True)
     app = _app(tmp_db, state_path)
     with TestClient(app) as client:
         assert _post_task(client, "review-A", "review", {"pr_number": 91002, "no_tester": True}, 91002).status_code == 200
@@ -147,6 +148,7 @@ def test_D_no_tester_merge_uses_explicit_review_repo(tmp_db, tmp_path, monkeypat
     calls = []
     _patch_open_pr(monkeypatch)
     monkeypatch.setattr("agent_crew.github.merge_pr", lambda pr, **kw: calls.append(kw["repo"]) or True)
+    monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: True)
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
         assert _post_task(client, "review-D", "review", {"pr_number": 91006, "repo": TARGET_REPO, "no_tester": True}, 91006).status_code == 200
     assert calls == [TARGET_REPO]
@@ -203,18 +205,21 @@ def test_H_stop_admission_remains_before_merge_even_with_repo_params(tmp_db, tmp
     assert TaskQueue(tmp_db).external_op_get("merge:pr:91009") is None
 
 
-def test_I_coordinator_managed_no_tester_follows_review_bound(tmp_db, tmp_path, monkeypatch):
-    """I — alfred#51 §7.2 / CX-4b: provenance cannot suppress a current-head approval."""
+def test_I_coordinator_managed_no_tester_requires_independent_status(tmp_db, tmp_path, monkeypatch):
+    """I — a coordinator's approval cannot authorize a server merge by context."""
     from fastapi.testclient import TestClient
 
     _patch_open_pr(monkeypatch)
     merged = []
     monkeypatch.setattr("agent_crew.github.merge_pr",
                         lambda pr, **kwargs: merged.append((pr, kwargs["repo"])) or True)
+    monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: False)
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
         assert _post_task(client, "review-I", "review", {"pr_number": 91010, "repo": TARGET_REPO, "no_tester": True, "coordinator_managed": True}, 91010).status_code == 200
-    assert merged == [(91010, TARGET_REPO)]
-    assert TaskQueue(tmp_db).external_op_get("merge:pr:91010") is not None
+    assert merged == []
+    receipt = TaskQueue(tmp_db).external_op_get("merge:pr:91010")
+    assert receipt["state"] == "failed"
+    assert "crew/independent-review" in receipt["last_error"]
 
 
 def test_J_no_bare_repo_lookup_or_unidentified_pr_state_calls():
