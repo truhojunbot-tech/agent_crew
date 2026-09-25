@@ -19,7 +19,7 @@ from agent_crew.role_mapping import (
 )
 
 _DEFAULT_BASE = os.path.expanduser("~/.agent_crew")
-_DEFAULT_AGENTS = "claude,codex,gemini"
+_DEFAULT_AGENTS = "codex,claude,gemini"
 logger = logging.getLogger(__name__)
 
 
@@ -692,7 +692,7 @@ def setup(project: str, agents: str, base: str):
 
     Examples:
 
-      crew setup myproj                        # default: claude,codex,gemini
+      crew setup myproj                        # default: codex,claude,gemini
 
       crew setup myproj --agents codex         # single-agent task
 
@@ -980,7 +980,7 @@ def setup(project: str, agents: str, base: str):
         context_pack_enabled = os.environ["AGENT_CREW_CONTEXT_PACK"].strip().lower() in (
             "1", "true", "yes", "on",
         )
-    _write_state(base, project, {
+    state_to_write = {
         "project": project,
         "port": port,
         "port_file": port_file,
@@ -998,7 +998,20 @@ def setup(project: str, agents: str, base: str):
         "dispatcher_mode": _dispatcher_mode,
         "tokenomics_policy_path": policy_path,
         "context_pack_enabled": context_pack_enabled,
-    })
+    }
+    # #337's explicit mapping records the default for new projects. Existing
+    # state keeps its current role configuration during setup/recovery.
+    if existing_state is None:
+        new_role_agents = {
+            entry["role"]: entry["agent"] for entry in roles_meta
+        }
+        if len(agent_list) == 1:
+            new_role_agents = {role: agent_list[0] for role in _ROLES}
+        if set(new_role_agents) == set(_ROLES):
+            state_to_write["role_agents"] = new_role_agents
+    elif "role_agents" in existing_state:
+        state_to_write["role_agents"] = existing_state["role_agents"]
+    _write_state(base, project, state_to_write)
 
     # Start server — skip if reusing existing server (pane-only recreation path).
     if not _reuse_server:
@@ -1850,9 +1863,14 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
                         pane_targets=dead_targets, worktrees=worktrees,
                     )
                 pane_map = state.get("pane_map", {})
-                for a, pid in zip(agent_list, new_pane_ids):
-                    role = setup_module._AGENT_TO_ROLE.get(a, "implementer")
-                    pane_map[role] = pid
+                for i, (a, pid) in enumerate(zip(agent_list, new_pane_ids)):
+                    old_pid = existing_pane_ids[i] if i < len(existing_pane_ids) else None
+                    old_roles = [
+                        role for role in ("implementer", "reviewer", "tester")
+                        if old_pid and pane_map.get(role) == old_pid
+                    ]
+                    for role in old_roles or [setup_module._AGENT_TO_ROLE.get(a, "implementer")]:
+                        pane_map[role] = pid
                     pane_map[a] = pid
                 # Single-agent recovery mirrors setup behavior — fill missing
                 # roles so the lone pane handles all task types (issue #72).
@@ -2699,7 +2717,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     import time
 
     # Agents default: project's installed agents (from state) in project mode,
-    # or the global default (claude,codex,gemini) in standalone mode.
+    # or the global default (codex,claude,gemini) in standalone mode.
     if agents.strip():
         agent_list = [a.strip() for a in agents.split(",") if a.strip()]
     elif project_state and project_state.get("agents"):

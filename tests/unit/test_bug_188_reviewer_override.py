@@ -98,7 +98,7 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path, *, 
 
 
 def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_port):
-    """Without agent_override the dispatcher still uses the role default (codex)."""
+    """Without agent_override the dispatcher uses the current reviewer default."""
     wt_claude = tmp_path / "claude"
     wt_codex = tmp_path / "codex"
     wt_gemini = tmp_path / "gemini"
@@ -159,9 +159,9 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_p
 
     assert spawn_log, "review task was never dispatched"
     spawned_agent, spawned_cwd = spawn_log[0]
-    assert spawned_agent == "codex", (
-        f"without override the reviewer role should run codex, got {spawned_agent}"
+    assert spawned_agent == "claude", (
+        f"without override the reviewer role should run claude, got {spawned_agent}"
     )
-    assert spawned_cwd == str(wt_codex), (
-        f"without override the reviewer should run in codex worktree, got cwd={spawned_cwd}"
+    assert spawned_cwd == str(wt_claude), (
+        f"without override the reviewer should run in claude worktree, got cwd={spawned_cwd}"
     )

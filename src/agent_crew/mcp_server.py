@@ -46,6 +46,7 @@ from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import PausedError as _PausedError, TaskQueue
+from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +56,7 @@ logger = logging.getLogger(__name__)
 # Stays in lockstep with `setup._AGENT_TO_ROLE`; kept here so this module
 # stays free of `setup` import overhead.
 _DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
-    "claude": "implementer",
-    "codex": "reviewer",
-    "gemini": "tester",
+    agent: role for role, agent in DEFAULT_ROLE_TO_AGENT.items()
 }
 
 
@@ -119,8 +118,8 @@ def build_mcp_server(
           (``crew run --reviewer gemini``) and the rate-limit fallback
           chain (#81) both rely on this path for dynamic role
           reassignment.
-        - Otherwise the agent's *default* role is consulted — claude
-          picks implement, codex picks review, gemini picks test —
+        - Otherwise the agent's *default* role is consulted — codex
+          picks implement, claude picks review, gemini picks test —
           excluding tasks claimed by another agent's override. Pass an
           explicit ``role=`` to override the default.
 

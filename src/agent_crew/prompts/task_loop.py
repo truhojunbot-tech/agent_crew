@@ -2,7 +2,7 @@
 
 Issue #106. Adapted from alpha_engine's ``orchestration/prompts/task_loop.py``,
 generalized for the agent_crew task vocabulary (implement / review / test /
-discuss) and the role layout (claude=implementer / codex=reviewer /
+discuss) and the role layout (codex=implementer / claude=reviewer /
 gemini=tester by default, configurable via pane_map / fallback chain).
 
 Two builders:

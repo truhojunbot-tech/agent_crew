@@ -78,8 +78,8 @@ def test_u_i06_role_files_match_each_agent_cli_lookup_path():
     the agent_crew prompts and led to the tester force-pushing over
     the implementer's PR head.
     """
-    assert ROLE_FILES["implementer"] == ".claude/CLAUDE.md"
-    assert ROLE_FILES["reviewer"] == "AGENTS.md"
+    assert ROLE_FILES["implementer"] == "AGENTS.md"
+    assert ROLE_FILES["reviewer"] == ".claude/CLAUDE.md"
     assert ROLE_FILES["tester"] == "GEMINI.md"
 
 
@@ -113,8 +113,8 @@ def test_u_i09_mcp_common_includes_result_format_guidance():
     and a concrete curl-style example so agents know exactly what to include.
     """
     from agent_crew.instructions import _MCP_COMMON
-    assert "branch:" in _MCP_COMMON
-    assert "commit:" in _MCP_COMMON
+    assert "branch=" in _MCP_COMMON
+    assert "commit=" in _MCP_COMMON
     assert "notes:" in _MCP_COMMON
 
 
