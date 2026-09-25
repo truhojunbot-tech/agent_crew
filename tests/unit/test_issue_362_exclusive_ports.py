@@ -1,7 +1,9 @@
 import socket
+import builtins
+from unittest.mock import patch
 import pytest
 
-from agent_crew.setup import find_free_port, list_duplicate_port_claims, write_port_file
+from agent_crew.setup import _claim_port, find_free_port, list_duplicate_port_claims, write_port_file
 
 
 def test_durable_dead_project_port_is_not_reallocated(tmp_path):
@@ -91,3 +93,27 @@ def test_existing_single_owner_file_stays_unchanged(tmp_path):
     assert find_free_port(9250, base=str(tmp_path), project="mine") == 9240
     write_port_file(str(port_file), 9240, project="mine")
     assert port_file.read_text() == "9240\n"
+
+
+def test_unreadable_stranger_port_does_not_block_other_project(tmp_path):
+    (tmp_path / "stranger").mkdir()
+    unreadable = tmp_path / "stranger" / "port"
+    unreadable.write_text("9250")
+    (tmp_path / "mine").mkdir()
+    real_open = builtins.open
+
+    def open_with_denied_stranger(file, *args, **kwargs):
+        if str(file) == str(unreadable):
+            raise PermissionError("stranger port is unreadable")
+        return real_open(file, *args, **kwargs)
+
+    with patch("builtins.open", side_effect=open_with_denied_stranger):
+        write_port_file(str(tmp_path / "mine" / "port"), 9251, project="mine")
+    assert (tmp_path / "mine" / "port").read_text() == "9251"
+
+
+def test_repeated_stale_claim_contention_has_bounded_retry(tmp_path):
+    with patch("agent_crew.setup.os.open", side_effect=FileExistsError), \
+         patch("agent_crew.setup._claim_is_live", return_value=False), \
+         patch("agent_crew.setup.os.unlink"):
+        assert _claim_port(str(tmp_path), 9252) is False

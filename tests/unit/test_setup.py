@@ -2,7 +2,7 @@ from unittest.mock import MagicMock, patch
 
 from agent_crew.setup import (
     _CLI_READY_MARKERS,
-    _collect_active_ports,
+    _port_claims,
     _is_port_listening,
     create_worktrees,
     find_free_port,
@@ -72,7 +72,7 @@ def test_u_se05_find_free_port():
     mock_sock.__exit__ = MagicMock(return_value=False)
     mock_sock.bind.side_effect = lambda addr: (_ for _ in ()).throw(OSError()) if addr[1] == 8100 else None
 
-    with patch("agent_crew.setup._collect_active_ports", return_value=set()), \
+    with patch("agent_crew.setup._port_claims", return_value={}), \
          patch("agent_crew.setup.socket.socket", return_value=mock_sock):
         port = find_free_port(start=8100)
     assert port == 8101
@@ -230,40 +230,40 @@ def test_u_se14_pretrust_noop_when_no_claude_worktree(tmp_path):
     assert _json.loads(config.read_text()) == original
 
 
-# U-SE15: find_free_port skips ports from active project port files
-def test_u_se15_find_free_port_skips_active_port_files():
-    """Port 8100 is referenced by an active server — must be skipped without bind attempt."""
+# U-SE15: find_free_port skips ports claimed by another project
+def test_u_se15_find_free_port_skips_claimed_port_files(tmp_path):
+    """A recorded port is skipped without a bind attempt, even if the server is down."""
+    (tmp_path / "other").mkdir()
+    (tmp_path / "other" / "port").write_text("8100")
     mock_sock = MagicMock()
     mock_sock.__enter__ = lambda s: s
     mock_sock.__exit__ = MagicMock(return_value=False)
     mock_sock.bind.side_effect = None  # 8101 binds fine
 
-    with patch("agent_crew.setup._collect_active_ports", return_value={8100}), \
-         patch("agent_crew.setup.socket.socket", return_value=mock_sock):
-        port = find_free_port(start=8100)
+    with patch("agent_crew.setup.socket.socket", return_value=mock_sock):
+        port = find_free_port(start=8100, base=str(tmp_path), limit=8101)
 
     assert port == 8101
     called_ports = [call[0][0][1] for call in mock_sock.bind.call_args_list]
     assert 8100 not in called_ports
 
 
-# U-SE16: find_free_port reuses port from dead project (stale port file, no server)
-def test_u_se16_find_free_port_reuses_dead_project_port():
-    """Port 8100 in a stale port file but server is dead — must be eligible."""
+# U-SE16: find_free_port can choose an unclaimed port
+def test_u_se16_find_free_port_chooses_unclaimed_port(tmp_path):
+    """An unclaimed port is eligible when its bind succeeds."""
     mock_sock = MagicMock()
     mock_sock.__enter__ = lambda s: s
     mock_sock.__exit__ = MagicMock(return_value=False)
     mock_sock.bind.side_effect = None  # 8100 binds fine
 
-    with patch("agent_crew.setup._collect_active_ports", return_value=set()), \
-         patch("agent_crew.setup.socket.socket", return_value=mock_sock):
-        port = find_free_port(start=8100)
+    with patch("agent_crew.setup.socket.socket", return_value=mock_sock):
+        port = find_free_port(start=8100, base=str(tmp_path), limit=8100)
 
     assert port == 8100
 
 
-# U-SE17: _collect_active_ports scans all ~/.agent_crew/*/port files
-def test_u_se17_collect_active_ports_scans_all_port_files(tmp_path):
+# U-SE17: _port_claims scans all ~/.agent_crew/*/port files
+def test_u_se17_port_claims_scan_all_port_files(tmp_path):
     """All valid project claims are returned, even when no server listens."""
     (tmp_path / "proj_a").mkdir()
     (tmp_path / "proj_a" / "port").write_text("8100")
@@ -271,23 +271,22 @@ def test_u_se17_collect_active_ports_scans_all_port_files(tmp_path):
     (tmp_path / "proj_b" / "port").write_text("8101")
     (tmp_path / "proj_c").mkdir()  # no port file
 
-    active = _collect_active_ports(base=str(tmp_path))
+    claims = _port_claims(base=str(tmp_path))
 
-    assert active == {8100, 8101}
+    assert claims == {8100: ["proj_a"], 8101: ["proj_b"]}
 
 
-# U-SE18: _collect_active_ports silently skips corrupt port files
-def test_u_se18_collect_active_ports_handles_corrupt_port_files(tmp_path):
+# U-SE18: _port_claims silently skips corrupt port files
+def test_u_se18_port_claims_handle_corrupt_port_files(tmp_path):
     """A port file with non-integer content is silently skipped."""
     (tmp_path / "bad_proj").mkdir()
     (tmp_path / "bad_proj" / "port").write_text("not-a-number")
     (tmp_path / "good_proj").mkdir()
     (tmp_path / "good_proj" / "port").write_text("8200")
 
-    with patch("agent_crew.setup._is_port_listening", return_value=True):
-        active = _collect_active_ports(base=str(tmp_path))
+    claims = _port_claims(base=str(tmp_path))
 
-    assert 8200 in active  # no exception for bad_proj
+    assert claims == {8200: ["good_proj"]}
 
 
 # U-SE19: _is_port_listening returns True when a server is bound

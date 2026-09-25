@@ -826,11 +826,6 @@ def _is_port_listening(port: int) -> bool:
             return False
 
 
-def _collect_active_ports(base: str | None = None) -> set[int]:
-    """Return all durable project-owned ports, whether or not they listen."""
-    return set(_port_claims(base))
-
-
 def _port_claims(base: str | None = None) -> dict[int, list[str]]:
     """Read valid project port files without changing them."""
     if base is None:
@@ -847,7 +842,7 @@ def _port_claims(base: str | None = None) -> dict[int, list[str]]:
         try:
             with open(port_file) as file:
                 port = require_project_port(int(file.read().strip()), entry.name)
-        except ValueError:
+        except (ValueError, OSError):
             continue
         claims.setdefault(port, []).append(entry.name)
     return claims
@@ -889,19 +884,21 @@ def _claim_port(base: str | None, port: int) -> bool:
     claims = os.path.join(base, ".ports")
     os.makedirs(claims, exist_ok=True)
     path = _claim_path(base, port)
-    try:
-        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError:
-        if _claim_is_live(path):
-            return False
+    for _ in range(8):
         try:
-            os.unlink(path)
-        except OSError:
-            return False
-        return _claim_port(base, port)
-    with os.fdopen(fd, "w") as claim:
-        claim.write(str(os.getpid()))
-    return True
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        except FileExistsError:
+            if _claim_is_live(path):
+                return False
+            try:
+                os.unlink(path)
+            except OSError:
+                return False
+        else:
+            with os.fdopen(fd, "w") as claim:
+                claim.write(str(os.getpid()))
+            return True
+    return False
 
 
 def find_free_port(start: int = 8100, *, base: str | None = None,
@@ -912,7 +909,7 @@ def find_free_port(start: int = 8100, *, base: str | None = None,
     Binds the socket to verify (SO_REUSEADDR off) to avoid TOCTOU.
     """
     require_project_port(start, "allocator")
-    blacklisted = _collect_active_ports(base)
+    blacklisted = set(_port_claims(base))
     if project and base:
         own_file = os.path.join(base, project, "port")
         try:
