@@ -160,7 +160,14 @@ def post_review_comment(
     if not repo:
         return False
 
-    verdict_label = "✅ approve" if verdict == "approve" else "🔄 request_changes"
+    # ⛔Only the two contract verdicts get a label. Anything else is a malformed
+    #   review result and must not be published as if the reviewer had decided.
+    if verdict == "approve":
+        verdict_label = "✅ approve"
+    elif verdict == "request_changes":
+        verdict_label = "🔄 request_changes"
+    else:
+        return False
     lines = [f"[agent_crew review] verdict: {verdict_label}", ""]
     if findings:
         lines.append("**Findings:**")

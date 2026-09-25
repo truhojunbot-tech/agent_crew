@@ -96,11 +96,20 @@ def test_an_approval_is_untouched():
                                 iteration=1, max_iter=3) == "approved"
 
 
-def test_a_clean_review_with_nothing_to_say_is_still_an_approval():
-    """#208: reviewers post verdict=None with no findings when they have nothing
-    to flag. That is an approval and must not be swept into the new outcome."""
+def test_a_clean_review_with_nothing_to_say_is_no_longer_inferred_as_approval():
+    """⛔REVERSED by the owner decision of 2026-09-23 (was #208's rule).
+
+    `verdict=None` + no findings used to be read as an approval. It is not: the
+    reviewer said nothing, and inferring a verdict from silence is what let a
+    malformed result drive merges and fix rounds. It now resolves to
+    `invalid_review_result`, which is not `approve`, so `handle_review_result`
+    reports `request_changes` — nothing is merged and no test is enqueued.
+
+    The reviewer's obligation is to set `verdict` explicitly; see
+    `tests/unit/test_review_result_contract.py` for the full contract.
+    """
     assert handle_review_result(_review(status="completed", verdict=None, findings=[]),
-                                iteration=1, max_iter=3) == "approved"
+                                iteration=1, max_iter=3) == "request_changes"
 
 
 def test_a_failed_review_does_not_consume_an_escalation_round():
