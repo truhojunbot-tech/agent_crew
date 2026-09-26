@@ -1342,7 +1342,8 @@ def auto_enqueue_fix(
                 context=fix_context,
                 project=_successor_project(queue, review_task, server_project),
             ),
-                          ingress="cascade.fix")
+                          ingress="cascade.fix",
+                          _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.
