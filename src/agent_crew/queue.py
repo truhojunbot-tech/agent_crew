@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
+from agent_crew.anomaly import _extract_repo_from_url, auto_detect_expected_repos
 from agent_crew.cea import adapters as _cea_adapters
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import cascade_contract as _cea_cascade
@@ -2406,6 +2407,11 @@ class TaskQueue:
           and the policy snapshot. Choosing it from a request body is choosing
           your own enforcement.
 
+        * **Repository.** When ``context.target_repo`` names a repository,
+          compare it with this queue's state-backed worktree origin. An unknown
+          origin or a mismatch uses the same refusal receipt; without a target
+          repo, existing admission behavior is unchanged (#397, owner 12167).
+
         ⛔The refusal fires only against :attr:`declared_project`, never against
           the directory-derived guess. Filling a gap with a guess produces a
           working admission; *refusing* over a guess destroys work that was
@@ -2425,14 +2431,41 @@ class TaskQueue:
         declared = self.declared_project
         if not named:
             identity = self.queue_project
-            return (_with_project(task, identity) if identity else task), None
-        if declared and named != declared:
+            task = _with_project(task, identity) if identity else task
+        elif declared and named != declared:
             return task, (self.PROJECT_MISMATCH,
                           f"§7.1 step 2: this queue admits for project {declared!r} "
                           f"(state.json), and the ingress named {named!r}. An ingress "
                           f"translates a transport; it does not choose the project its "
                           f"task is admitted under — the project selects the rollout "
                           f"mode, the lineage namespace and the policy snapshot (P4, §3)")
+        context = task.context if isinstance(task.context, dict) else {}
+        if "target_repo" in context and context["target_repo"] is not None:
+            raw_target = str(context["target_repo"]).strip()
+            if "://" in raw_target or raw_target.startswith("git@"):
+                # The shared parser extracts slugs, but accepts a substring of
+                # any URL. Check the host first so a foreign URL containing
+                # `github.com/owner/repo` in its path cannot claim that repo.
+                github_remote = re.match(
+                    r"(?i)\A(?:https://github\.com/|ssh://git@github\.com/|git@github\.com:)",
+                    raw_target)
+                target = (_extract_repo_from_url(raw_target.lower()) or "") if github_remote else ""
+            else:
+                target = raw_target.removesuffix(".git")
+            state_path = os.path.join(os.path.dirname(os.path.abspath(self._db_path)),
+                                      "state.json")
+            repos = auto_detect_expected_repos(state_path)
+            if len(repos) != 1:
+                return task, (self.PROJECT_MISMATCH,
+                              f"context.target_repo={raw_target!r} was set, but this "
+                              f"crew could not determine one project repository from "
+                              f"its worktree origins (found {len(repos)}). Refusing admission")
+            own_repo = repos[0]
+            if (not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", target)
+                    or target.casefold() != own_repo.casefold()):
+                return task, (self.PROJECT_MISMATCH,
+                              f"context.target_repo={raw_target!r} does not match "
+                              f"this crew project's origin {own_repo!r}")
         return task, None
 
     def _admission_project(self, task: TaskRequest) -> Optional[str]:
