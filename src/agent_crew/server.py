@@ -695,8 +695,8 @@ def _prepare_worktree_for_task_inner(
     # `main` is only a default.  A project can run on a long-lived integration
     # branch; dispatching its worker from origin/main silently makes it edit a
     # stale, different tree (#353).  The explicit context is produced by the
-    # CLI and survives queue/restart; task.branch remains the useful fallback
-    # for callers which do not supply one.
+    # CLI and survives queue/restart. Without one, use the configured default;
+    # task.branch names the output branch for implementers.
     main_branch = str(task_context.get("base_branch") or _WORKTREE_MAIN_BRANCH).strip()
     # #296: is this worktree even usable? Asked BEFORE any other git call,
     # because an interrupted ref update can leave HEAD pointing at a branch that
@@ -731,7 +731,7 @@ def _prepare_worktree_for_task_inner(
         capture_output=True, text=True, timeout=30,
     )
     # Fetch all remote branches so the target ref is up to date.
-    subprocess.run(
+    fetch = subprocess.run(
         ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
         capture_output=True, text=True,
         timeout=60,
@@ -741,6 +741,13 @@ def _prepare_worktree_for_task_inner(
         # Fresh branch per task from the configured base (#140/#353). Use task.branch when
         # set (crew run --branch), otherwise derive from task_id.
         branch = task_branch if task_branch else f"agent/{task_id[:12]}"
+        # #397: task.branch names the output PR branch, not the input base.
+        # Once prepared, the recorded SHA pins a second preparation of the same
+        # task even if origin/main advances between push and dispatch.
+        pinned_base = _object_id_or_empty(task_context.get("worktree_base_sha"))
+        base_ref = pinned_base or f"origin/{main_branch}"
+        base_sha = _branch_ref(worktree_path, base_ref)
+        checkout_base = base_sha or base_ref
         if task_context.get("crew_run_branch"):
             # A foreground run pins the requested branch's CONTENT, not its
             # shared local ref. Preserve local-only commits; otherwise use the
@@ -754,8 +761,7 @@ def _prepare_worktree_for_task_inner(
             else:
                 start = remote or local
             if not start:
-                start = _branch_ref(worktree_path, str(task_context.get("worktree_base_sha") or "")) \
-                    or _branch_ref(worktree_path, f"refs/remotes/origin/{main_branch}")
+                start = base_sha or _branch_ref(worktree_path, f"origin/{main_branch}")
             if not start:
                 raise WorktreeTargetUnresolved(
                     f"implementer {task_id}: neither origin/{branch} nor declared "
@@ -776,14 +782,13 @@ def _prepare_worktree_for_task_inner(
                 raise WorktreeTargetUnresolved(
                     f"implementer {task_id}: could not detach at {start} for {branch}"
                 )
+            return _worktree_head(worktree_path)
         elif not _agent_crew_owns_branch(branch):
-            # #280: somebody else's branch name. Do not create it, do not move
-            # it — start from its own remote tip so the task still sees the code
-            # it was dispatched for, and fall back to main when there is no such
-            # remote (a name that does not exist yet).
-            _checkout_detached(
+            # #280: preserve somebody else's ref. The task still starts from
+            # its declared base, even when its output branch already exists.
+            checkout_ok = _checkout_detached(
                 worktree_path,
-                [f"origin/{branch}", f"origin/{main_branch}"],
+                [checkout_base],
                 what=f"implementer {task_id}",
             )
         else:
@@ -792,24 +797,32 @@ def _prepare_worktree_for_task_inner(
             if not reset_is_safe:
                 logger.warning(
                     f"_prepare_worktree_for_task: refusing to reset owned branch {branch} "
-                    f"at local-only commit {local_sha}; detaching at origin instead (#300)"
+                    f"at local-only commit {local_sha}; detaching at declared base instead (#300)"
                 )
-                _checkout_detached(
+                checkout_ok = _checkout_detached(
                     worktree_path,
-                    [f"origin/{branch}", f"origin/{main_branch}"],
+                    [checkout_base],
                     what=f"implementer {task_id} preserving {branch}",
                 )
             else:
                 r = subprocess.run(
                     ["git", "-C", worktree_path, "checkout", "-B", branch,
-                     f"origin/{main_branch}"],
+                     checkout_base],
                     capture_output=True, text=True, timeout=30,
                 )
-                if r.returncode != 0:
+                checkout_ok = r.returncode == 0
+                if not checkout_ok:
                     logger.warning(
                         f"_prepare_worktree_for_task: implementer checkout {branch} "
-                        f"from origin/{main_branch} failed: {r.stderr.strip()}"
+                        f"from {checkout_base} failed: {r.stderr.strip()}"
                     )
+        # #358: a failed or unresolvable prep has no proven base. Returning the
+        # old HEAD here made an unrelated PR branch look like the dispatch base
+        # (#397). Dispatch continues with explicit unknown; the artifact gate
+        # already refuses a completed implementation with no known base.
+        fresh_base = bool(pinned_base) or fetch.returncode == 0
+        return (base_sha if fresh_base and checkout_ok
+                and _worktree_head(worktree_path) == base_sha else "")
     else:
         # Reviewer/tester: checkout the PR branch from origin (#141, #186).
         # task.branch holds the base branch (e.g. main), not the PR head.
