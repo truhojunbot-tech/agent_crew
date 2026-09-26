@@ -50,6 +50,13 @@ def run_to(eng, conn, receipt_id, state):
     return out
 
 
+def set_task_status(conn, receipt_id, status):
+    task_id = receipt_store.current_receipt(conn, receipt_id)["task_id"]
+    conn.execute("INSERT INTO tasks (task_id, status, receipt_id) VALUES (?, ?, ?) "
+                 "ON CONFLICT(task_id) DO UPDATE SET status=excluded.status",
+                 (task_id, status, receipt_id))
+
+
 
 # ---------------------------------------------------------------------------
 # fixture writers — every provider answers, so a test that wants a missing input
@@ -173,6 +180,8 @@ def conn():
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     receipt_store.ensure_schema(c)
+    c.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+              "receipt_id TEXT NOT NULL)")
     yield c
     c.close()
 
@@ -467,6 +476,7 @@ def test_a_completed_lineage_refuses_re_admission(conn):
     eng = engine()
     first = eng.authorize(conn, intent("adm-r1"), caller())
     run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
     again = eng.authorize(conn, intent("adm-r2"), caller())
     assert again.http_status == 409 and again.code == "ALREADY_COMPLETED"
 
@@ -482,6 +492,7 @@ def test_a_superseding_decision_re_admits_completed_work(conn):
     eng = engine()
     first = eng.authorize(conn, intent("adm-r1"), caller())
     run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING))
     superseding = intent("adm-r2", ident=identity(authority=("T0-1234", "T0-9999")))

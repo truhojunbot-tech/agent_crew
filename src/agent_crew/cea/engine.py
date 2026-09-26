@@ -63,6 +63,11 @@ from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
 from agent_crew.cea.schema import canonical_json, validate_receipt
 from agent_crew.cea import store as receipt_store
 
+# A CONSUMED receipt says execution ended, but only these known task outcomes
+# permit a new admission for the same intent. Missing task data fails closed.
+RELEASABLE_CONSUMED_TASK_STATUSES = frozenset(
+    {"failed", "needs_human", "cancelled", "timed_out"})
+
 # ═══════════════════════════════════════════════════════════════════════════
 # P4 — intent identity
 # ═══════════════════════════════════════════════════════════════════════════
@@ -675,6 +680,9 @@ class AuthorizationEngine:
             decided = self._existing_lineage(conn, intent, caller, ih, lineage, retry=retry)
             if decided is not None:
                 return decided
+            if (lineage["state"] == "CONSUMED"
+                    and receipt_store.current_receipt(conn, lineage["receipt_id"]) is not None):
+                intent = replace(intent, parent_receipt_id=lineage["receipt_id"])
 
         # J2–J8
         executor = self._executor_binding(intent)
@@ -772,8 +780,8 @@ class AuthorizationEngine:
                           lineage: dict, *, retry: bool) -> Optional[Authorization]:
         """P4's three answers for an intent that already has a lineage.
 
-        Returns ``None`` only when the lineage is free (SUPERSEDED/REVOKED) and
-        admission should proceed normally.
+        Returns ``None`` when the lineage is free or its consumed task has an
+        explicitly known unsuccessful outcome, so admission should proceed.
         """
         state = lineage["state"]
         prior = receipt_store.current_receipt(conn, lineage["receipt_id"])
@@ -781,10 +789,14 @@ class AuthorizationEngine:
             return None
 
         if state == "CONSUMED":
-            # P4: completed work is not re-admitted. The exception is a
-            # superseding decision record — and that needs no special case here,
-            # because `authority_decision_ids` is an intent_hash input, so a
-            # newer decision produces a different hash and lands as a new lineage.
+            # CONSUMED only means the receipt ran. Release its claim only for
+            # an explicitly known unsuccessful task outcome; missing task data
+            # cannot prove that re-admission is safe.
+            if (receipt_store.task_status(conn, prior["task_id"])
+                    in RELEASABLE_CONSUMED_TASK_STATUSES):
+                receipt_store.release_lineage(conn, ih, lineage["receipt_id"])
+                return None
+            # Completed or unverified work retains the replay guard.
             return Authorization(
                 receipt=self._refusal(intent, caller, ih, "ALREADY_COMPLETED",
                                      f"this intent completed as receipt {lineage['receipt_id']}; "
