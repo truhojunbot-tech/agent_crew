@@ -731,7 +731,7 @@ def _prepare_worktree_for_task_inner(
         capture_output=True, text=True, timeout=30,
     )
     # Fetch all remote branches so the target ref is up to date.
-    fetch = subprocess.run(
+    subprocess.run(
         ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
         capture_output=True, text=True,
         timeout=60,
@@ -746,16 +746,8 @@ def _prepare_worktree_for_task_inner(
         # task even if origin/main advances between push and dispatch.
         pinned_base = _object_id_or_empty(task_context.get("worktree_base_sha"))
         base_ref = pinned_base or f"origin/{main_branch}"
-        if not pinned_base and fetch.returncode != 0:
-            raise WorktreeTargetUnresolved(
-                f"implementer {task_id}: could not refresh origin/{main_branch}: "
-                f"{fetch.stderr.strip()}"
-            )
         base_sha = _branch_ref(worktree_path, base_ref)
-        if not base_sha:
-            raise WorktreeTargetUnresolved(
-                f"implementer {task_id}: declared base {base_ref} does not resolve"
-            )
+        checkout_base = base_sha or base_ref
         if task_context.get("crew_run_branch"):
             # A foreground run pins the requested branch's CONTENT, not its
             # shared local ref. Preserve local-only commits; otherwise use the
@@ -769,7 +761,12 @@ def _prepare_worktree_for_task_inner(
             else:
                 start = remote or local
             if not start:
-                start = base_sha
+                start = base_sha or _branch_ref(worktree_path, f"origin/{main_branch}")
+            if not start:
+                raise WorktreeTargetUnresolved(
+                    f"implementer {task_id}: neither origin/{branch} nor declared "
+                    f"base origin/{main_branch} resolves; refusing to use main"
+                )
             if _agent_crew_owns_branch(branch):
                 r = subprocess.run(
                     ["git", "-C", worktree_path, "checkout", "-B", branch, start],
@@ -785,17 +782,15 @@ def _prepare_worktree_for_task_inner(
                 raise WorktreeTargetUnresolved(
                     f"implementer {task_id}: could not detach at {start} for {branch}"
                 )
+            return _worktree_head(worktree_path)
         elif not _agent_crew_owns_branch(branch):
             # #280: preserve somebody else's ref. The task still starts from
             # its declared base, even when its output branch already exists.
-            if not _checkout_detached(
+            checkout_ok = _checkout_detached(
                 worktree_path,
-                [base_sha],
+                [checkout_base],
                 what=f"implementer {task_id}",
-            ):
-                raise WorktreeTargetUnresolved(
-                    f"implementer {task_id}: could not detach at base {base_sha}"
-                )
+            )
         else:
             reset_is_safe, local_sha = _owned_branch_reset_is_safe(
                 worktree_path, branch, main_branch)
@@ -804,29 +799,28 @@ def _prepare_worktree_for_task_inner(
                     f"_prepare_worktree_for_task: refusing to reset owned branch {branch} "
                     f"at local-only commit {local_sha}; detaching at declared base instead (#300)"
                 )
-                if not _checkout_detached(
+                checkout_ok = _checkout_detached(
                     worktree_path,
-                    [base_sha],
+                    [checkout_base],
                     what=f"implementer {task_id} preserving {branch}",
-                ):
-                    raise WorktreeTargetUnresolved(
-                        f"implementer {task_id}: could not detach at base {base_sha}"
-                    )
+                )
             else:
                 r = subprocess.run(
                     ["git", "-C", worktree_path, "checkout", "-B", branch,
-                     base_sha],
+                     checkout_base],
                     capture_output=True, text=True, timeout=30,
                 )
-                if r.returncode != 0:
-                    raise WorktreeTargetUnresolved(
-                        f"implementer {task_id}: checkout {branch} from "
-                        f"{base_sha} failed: {r.stderr.strip()}"
+                checkout_ok = r.returncode == 0
+                if not checkout_ok:
+                    logger.warning(
+                        f"_prepare_worktree_for_task: implementer checkout {branch} "
+                        f"from {checkout_base} failed: {r.stderr.strip()}"
                     )
-        if not task_context.get("crew_run_branch") and _worktree_head(worktree_path) != base_sha:
-            raise WorktreeTargetUnresolved(
-                f"implementer {task_id}: prepared HEAD differs from declared base {base_sha}"
-            )
+        # #358: a failed or unresolvable prep has no proven base. Returning the
+        # old HEAD here made an unrelated PR branch look like the dispatch base
+        # (#397). Dispatch continues with explicit unknown; the artifact gate
+        # already refuses a completed implementation with no known base.
+        return base_sha if checkout_ok and _worktree_head(worktree_path) == base_sha else ""
     else:
         # Reviewer/tester: checkout the PR branch from origin (#141, #186).
         # task.branch holds the base branch (e.g. main), not the PR head.

@@ -276,3 +276,22 @@ def test_implement_dispatch_ignores_prior_pr_branch_head(
     result = TaskResult("impl-397", "completed", "done", branch="fix/next",
                         commit=result_sha)
     assert verify_implement_artifact(task, result, repo_cwd=str(worker))[0]
+
+
+def test_unresolved_implement_base_returns_unknown_without_refusing(tmp_path):
+    """#358 still dispatches with an explicit unknown base when origin is absent."""
+    from agent_crew.server import _prepare_worktree_for_task
+
+    worker = tmp_path / "worker"
+    _git(tmp_path, "init", str(worker))
+    _git(worker, "config", "user.email", "test@example.com")
+    _git(worker, "config", "user.name", "test")
+    (worker / "prior.txt").write_text("prior task\n")
+    _git(worker, "add", ".")
+    _git(worker, "commit", "-m", "prior task")
+    old_head = _git(worker, "rev-parse", "HEAD").stdout.strip()
+
+    prepared = _prepare_worktree_for_task(str(worker), "impl-next", "fix/next",
+                                          "implementer", {})
+    assert prepared == ""
+    assert _git(worker, "rev-parse", "HEAD").stdout.strip() == old_head
