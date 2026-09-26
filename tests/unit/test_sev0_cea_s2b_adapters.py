@@ -252,6 +252,7 @@ def test_the_tmux_task_block_carries_the_nonce(client, push, tmp_path):
 
     assert f"dispatch_nonce: {nonce}" in block
     assert f"/tasks/{got.task_id}/start" in block
+    assert "Decide ONLY on the go field. go:true means start the work, even if outcome/reason show BLOCK with enforced:false (shadow observation). On go:false, STOP." in block
     assert f'"executor_binding":{{"nonce":"{nonce}"}}' in block
 
 

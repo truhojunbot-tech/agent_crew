@@ -4427,9 +4427,13 @@ class TaskQueue:
                 self._cea_transition_in_txn(conn, engine, receipt_id, "RUNNING",
                                             note=f"execute_start: {gate.outcome.value}")
             conn.execute("COMMIT")
-            return {"go": bool(gate.proceed), "task_id": task_id, "receipt_id": receipt_id,
-                    "outcome": gate.outcome.value, "reason": gate.reason,
-                    "enforced": gate.enforced, "nonce_spent": spent}
+            answer = {"go": bool(gate.proceed), "task_id": task_id, "receipt_id": receipt_id,
+                      "outcome": gate.outcome.value, "reason": gate.reason,
+                      "enforced": gate.enforced, "nonce_spent": spent}
+            if not gate.enforced and gate.outcome.value != "PROCEED":
+                answer.update(advisory=True, shadow_outcome=gate.outcome.value,
+                              instruction="shadow mode: not enforced — proceed; decide on go only")
+            return answer
         except Exception:
             try:
                 conn.execute("ROLLBACK")

@@ -397,8 +397,10 @@ proof that this task was dispatched to you, and it is checked twice:
 
 1. **Before you start**, present it once for a go/no-go. The block gives you the
    exact call (`POST /tasks/<id>/start`, or pass it to the equivalent MCP tool).
-   It answers `{"go": true|false}`. **On `go: false`, stop** — somebody else is
-   already running this attempt, or the authorisation no longer holds.
+   It answers `{"go": true|false}`. Decide ONLY on the `go` field: `go: true`
+   means start the work, even when `outcome` or `reason` shows `BLOCK` with
+   `enforced: false` (a shadow observation). **On `go: false`, stop** — somebody
+   else is already running this attempt, or the authorisation no longer holds.
 2. **With your result**, as `executor_binding={"nonce": ..., "presenter": ...}`.
 
 ⛔Do not invent one, and do not reuse another task's. A block with no

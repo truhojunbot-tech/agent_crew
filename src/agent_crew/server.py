@@ -2576,7 +2576,9 @@ def _format_task_message(task: TaskRequest, port: int,
             f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/start "
             f"-H 'Content-Type: application/json' "
             f"-d '{{\"nonce\":\"{nonce}\"}}'\n"
-            f"It answers {{\"go\": true|false}}. On go:false, STOP — do not start the work.\n"
+            f"It answers {{\"go\": true|false}}. Decide ONLY on the go field. "
+            f"go:true means start the work, even if outcome/reason show BLOCK with "
+            f"enforced:false (shadow observation). On go:false, STOP.\n"
         )
     return (
         f"=== AGENT_CREW TASK ===\n"

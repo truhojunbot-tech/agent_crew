@@ -436,6 +436,33 @@ def test_execute_start_spends_the_nonce_exactly_once(tmp_path):
     assert second["go"] is False, "P4: a dispatch nonce is single-use"
 
 
+def test_shadow_block_start_is_explicitly_advisory(tmp_path):
+    q = queue(tmp_path, mode="shadow", wired=True)
+    q.enqueue(task(task_type="review", context=admitted()))
+    q.dequeue(agent="codex", role="reviewer")
+    nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
+    answer = q.start_execution("t1", nonce, presenter="gemini")
+    assert answer["go"] is True
+    assert answer["outcome"] == "BLOCK"
+    assert answer["enforced"] is False
+    assert answer["advisory"] is True
+    assert answer["shadow_outcome"] == "BLOCK"
+    assert answer["instruction"] == "shadow mode: not enforced — proceed; decide on go only"
+
+
+def test_enforced_block_start_response_is_unchanged(tmp_path):
+    q = queue(tmp_path, mode="test", wired=True)
+    q.enqueue(task(task_type="review", context=admitted()))
+    q.dequeue(agent="codex", role="reviewer")
+    nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
+    answer = q.start_execution("t1", nonce, presenter="gemini")
+    assert json.dumps(answer, separators=(",", ":")) == json.dumps({
+        "go": False, "task_id": "t1", "receipt_id": answer["receipt_id"],
+        "outcome": "BLOCK", "reason": answer["reason"], "enforced": True,
+        "nonce_spent": False,
+    }, separators=(",", ":"))
+
+
 def test_execute_start_refuses_a_nonce_nobody_minted(tmp_path):
     q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
