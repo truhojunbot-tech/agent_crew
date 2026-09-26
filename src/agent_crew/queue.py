@@ -2625,11 +2625,16 @@ class TaskQueue:
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
             duplicate_id = self._duplicate_review_in_txn(conn, task, context)
             if duplicate_id:
-                self._append_exec_event_on(
-                    conn, task.task_id, "duplicate_review_refused", time.time(),
-                    existing_task_id=duplicate_id, code=DuplicateReviewError.code)
-                conn.commit()
-                raise DuplicateReviewError(duplicate_id)
+                if context.get("allow_duplicate_review") is True:
+                    self._append_exec_event_on(
+                        conn, task.task_id, "duplicate_review_override", time.time(),
+                        existing_task_id=duplicate_id)
+                else:
+                    self._append_exec_event_on(
+                        conn, task.task_id, "duplicate_review_refused", time.time(),
+                        existing_task_id=duplicate_id, code=DuplicateReviewError.code)
+                    conn.commit()
+                    raise DuplicateReviewError(duplicate_id)
             conn.execute(
                 """
                 INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project, receipt_id)

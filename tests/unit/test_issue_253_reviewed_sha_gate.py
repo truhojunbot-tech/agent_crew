@@ -46,11 +46,13 @@ def _pr_is_open(monkeypatch):
 
 
 def _review(q, *, reviewed_sha=OLD, pr_number=PR, verdict="request_changes",
-            findings=(FINDING,)):
+            findings=(FINDING,), allow_duplicate_review=False):
     rid = f"review-{uuid.uuid4().hex[:8]}"
     ctx = {"prev_task_id": "impl-1", "pr_number": pr_number}
     if reviewed_sha:
         ctx["reviewed_sha"] = reviewed_sha
+    if allow_duplicate_review:
+        ctx["allow_duplicate_review"] = True
     q.enqueue(TaskRequest(task_id=rid, task_type="review", description="review",
                           branch=BRANCH, context=ctx))
     q.submit_result(rid, TaskResult(task_id=rid, status="completed",
@@ -166,7 +168,7 @@ def test_two_reviews_of_one_head_with_a_fix_between_them(q):
     """
     head = {"sha": OLD}
     first = _review(q, reviewed_sha=OLD)
-    second = _review(q, reviewed_sha=OLD)
+    second = _review(q, reviewed_sha=OLD, allow_duplicate_review=True)
 
     fix_id = auto_enqueue_fix(q, first, head_sha_fn=lambda pr: head["sha"], repo="owner/repo")
     assert fix_id is not None, "the first review must still produce work"

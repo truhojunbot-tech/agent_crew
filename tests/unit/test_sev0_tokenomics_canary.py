@@ -148,10 +148,12 @@ def test_non_review_tasks_are_never_touched(monkeypatch):
 
 # ── the standing-review lookup, against a real queue ───────────────────────
 
-def _finish_review(queue, task_id, *, verdict, pr, sha, branch="feat/x"):
+def _finish_review(queue, task_id, *, verdict, pr, sha, branch="feat/x",
+                   allow_duplicate_review=False):
     queue.enqueue(TaskRequest(task_id=task_id, task_type="review", description="r",
                               branch=branch,
-                              context={"pr_number": pr, "reviewed_sha": sha}))
+                              context={"pr_number": pr, "reviewed_sha": sha,
+                                       "allow_duplicate_review": allow_duplicate_review}))
     queue.submit_result(task_id, TaskResult(
         task_id=task_id, status="completed", summary="reviewed",
         verdict=verdict, findings=["f1"] if verdict == "request_changes" else [],
@@ -174,7 +176,8 @@ def test_lookup_matches_only_the_identical_pr_and_sha(tmp_db):
 def test_a_later_approve_on_the_same_sha_supersedes_the_request_changes(tmp_db):
     queue = TaskQueue(tmp_db)
     _finish_review(queue, "rev-1", verdict="request_changes", pr=7, sha=SHA_A)
-    _finish_review(queue, "rev-2", verdict="approve", pr=7, sha=SHA_A)
+    _finish_review(queue, "rev-2", verdict="approve", pr=7, sha=SHA_A,
+                   allow_duplicate_review=True)
     assert queue.standing_request_changes_review(
         pr_number=7, reviewed_sha=SHA_A)["verdict"] == "approve"
 
@@ -191,7 +194,8 @@ def test_the_later_verdict_wins_when_the_reviews_complete_out_of_order(tmp_db):
     for task_id in ("rev-a", "rev-b"):
         queue.enqueue(TaskRequest(
             task_id=task_id, task_type="review", description="r", branch="feat/x",
-            context={"pr_number": 7, "reviewed_sha": SHA_A}))
+            context={"pr_number": 7, "reviewed_sha": SHA_A,
+                     "allow_duplicate_review": task_id == "rev-b"}))
 
     # claimed A first, then B — so B holds the later `last_activity_at`
     assert queue.dequeue(role="reviewer").task_id == "rev-a"
@@ -403,7 +407,8 @@ def _post_rereview(client, *, pr=7, sha=SHA_A):
         "task_id": "review-impl-77-r1", "task_type": "review",
         "description": f"Review PR #{pr} for task impl-77.", "branch": "feat/x",
         "priority": 3,
-        "context": {"prev_task_id": "impl-77", "pr_number": pr, "reviewed_sha": sha},
+        "context": {"prev_task_id": "impl-77", "pr_number": pr, "reviewed_sha": sha,
+                    "allow_duplicate_review": True},
         "project": "",
     })
 
@@ -528,7 +533,9 @@ def test_the_pipeline_cascade_creates_the_fix_from_a_suppressed_review(tmp_db):
     from agent_crew.pipeline import auto_enqueue_fix
 
     queue = _seed_standing_request_changes(tmp_db)
-    queue.enqueue(_review("review-impl-77-r1", parent="impl-77", sha=SHA_A))
+    rereview = _review("review-impl-77-r1", parent="impl-77", sha=SHA_A)
+    rereview.context["allow_duplicate_review"] = True
+    queue.enqueue(rereview)
     queue.submit_result("review-impl-77-r1", TaskResult(
         task_id="review-impl-77-r1", status="completed",
         summary=canary.SUPPRESSED_REASON, verdict="request_changes",
@@ -856,7 +863,8 @@ def _dispatch_review(tmp_path, monkeypatch, *, pin):
         queue.enqueue(TaskRequest(
             task_id="review-impl-77-r1", task_type="review",
             description="Review PR #7 for task impl-77.", branch="feat/x",
-            context={"prev_task_id": "impl-77", "pr_number": 7, "reviewed_sha": SHA_A}))
+            context={"prev_task_id": "impl-77", "pr_number": 7, "reviewed_sha": SHA_A,
+                     "allow_duplicate_review": True}))
         task = queue.dequeue(role="reviewer")
         assert task is not None and task.task_id == "review-impl-77-r1"
         _RecordingExitStack.instances = []

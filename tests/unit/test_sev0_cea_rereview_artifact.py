@@ -41,8 +41,10 @@ def test_completed_head_blocks_replay_but_allows_new_head(tmp_path, task_type, m
     with sqlite3.connect(q._db_path) as conn:
         store.set_lineage_state(conn, first["intent_hash"], first["receipt_id"], "CONSUMED")
 
+    replay_task = _task("replay", task_type, SHA_A)
+    replay_task.context["allow_duplicate_review"] = True
     replay_admitted, replay = enqueue_and_read(
-        q, _task("replay", task_type, SHA_A), ingress="cli.enqueue")
+        q, replay_task, ingress="cli.enqueue")
     assert replay_admitted is (mode == "shadow")
     assert replay["decision"] == "BLOCK"
     assert replay["reason"]["code"] == "ALREADY_COMPLETED"

@@ -17,10 +17,12 @@ def queue(tmp_path):
     return TaskQueue(str(tmp_path / "queue.db"))
 
 
-def task(task_id, *, kind="review", pr=23, sha=SHA_A, project="owner/repo", branch="feature"):
+def task(task_id, *, kind="review", pr=23, sha=SHA_A, project="owner/repo", branch="feature",
+         allow_duplicate_review=False):
     return TaskRequest(task_id=task_id, task_type=kind, description="check PR",
                        project=project, branch=branch,
-                       context={"pr_number": pr, "reviewed_sha": sha})
+                       context={"pr_number": pr, "reviewed_sha": sha,
+                                "allow_duplicate_review": allow_duplicate_review})
 
 
 @pytest.mark.parametrize("kind", ["review", "test"])
@@ -69,11 +71,38 @@ def test_completed_verdict_blocks_rereview(queue):
         queue.enqueue(task("second"))
 
 
+def test_explicit_same_head_rereview_records_override(queue):
+    queue.enqueue(task("first"))
+    queue.enqueue(task("second", allow_duplicate_review=True))
+    assert [t.task_id for t in queue.list_tasks()] == ["first", "second"]
+    conn = queue._connect()
+    try:
+        row = conn.execute("SELECT event, fields FROM task_exec_events "
+                           "WHERE task_id='second' AND event='duplicate_review_override'").fetchone()
+        assert row is not None
+        assert json.loads(row["fields"])["existing_task_id"] == "first"
+    finally:
+        conn.close()
+
+
 def test_failed_or_unjudged_completion_can_retry(queue):
     queue.enqueue(task("first"))
     queue.submit_result("first", TaskResult(task_id="first", status="completed",
                                             summary="no verdict"))
     queue.enqueue(task("second"))
+
+
+@pytest.mark.parametrize("status", ["failed", "timed_out", "cancelled", "needs_human"])
+def test_nonstanding_review_can_retry(queue, status):
+    queue.enqueue(task("first"))
+    conn = queue._connect()
+    try:
+        conn.execute("UPDATE tasks SET status=? WHERE task_id='first'", (status,))
+        conn.commit()
+    finally:
+        conn.close()
+    queue.enqueue(task("second"))
+    assert [t.task_id for t in queue.list_tasks()] == ["first", "second"]
 
 
 def test_implement_tasks_unaffected(queue):
