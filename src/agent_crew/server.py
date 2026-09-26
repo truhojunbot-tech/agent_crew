@@ -3146,7 +3146,7 @@ def create_app(
     app.state.delivery_guard_refusals = delivery_guard_refusals
 
     def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
-                              caller: str) -> None:
+                              caller: str) -> bool:
         """Persist the exact prepared base, including an explicit unknown (#358)."""
         try:
             base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
@@ -3166,10 +3166,16 @@ def create_app(
                         "sync_base_sha": record.get("sha"),
                         "sync_base_status": record.get("status", "unknown"),
                     })
-            q().patch_context(task.task_id, base_context)
+            if role in ("reviewer", "tester"):
+                if not q().record_prepared_review_base(task.task_id, base_context):
+                    return False
+            else:
+                q().patch_context(task.task_id, base_context)
             task.context = {**(task.context or {}), **base_context}
+            return True
         except Exception:
             logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
+            return role == "implementer"  # Preserve the implementer path's prior behavior.
 
     def _complete_suppressed_review(task: TaskRequest, decision) -> bool:
         """End a suppressed review as a COMPLETED review carrying the standing verdict.
@@ -3448,7 +3454,10 @@ def create_app(
                     # see which commit it was given can say so in its result,
                     # and a reviewer that cannot has no way to notice the head
                     # moved under it.
-                    _record_prepared_base(task, role, _reviewed_sha, "_try_push_next")
+                    if not _record_prepared_base(task, role, _reviewed_sha, "_try_push_next"):
+                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                        status="needs_human")
+                        return
                     logger.info(
                         f"_try_push_next: worktree prepared for {role} "
                         f"task_id={task.task_id} branch={task.branch or '(none)'}"
@@ -4442,7 +4451,11 @@ def create_app(
                 # unknown, before prompt construction.  A prep failure still
                 # dispatches, but can no longer masquerade as an unrecorded
                 # stale base later in the task lineage.
-                _record_prepared_base(task, role, _reviewed_sha, "dispatcher")
+                if not _record_prepared_base(task, role, _reviewed_sha, "dispatcher"):
+                    _lock_stack.close()
+                    _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                    status="needs_human")
+                    return
                 logger.info(
                     f"dispatcher: worktree prepared for {role} "
                     f"task_id={task.task_id} branch={task.branch or '(none)'} "
