@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import sqlite3
 import time
@@ -77,6 +78,7 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope) -> bool:
 class MemoryStorage(Protocol):
     def put(self, record: MemoryRecord) -> None: ...
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]: ...
+    def audit(self, scope: MemoryScope, exact_key: str) -> list[MemoryRecord]: ...
 
 
 class SQLiteMemoryStorage:
@@ -116,6 +118,50 @@ class SQLiteMemoryStorage:
     def put(self, record: MemoryRecord) -> None:
         if record.layer not in LAYERS: raise ValueError("unknown memory layer")
         with closing(sqlite3.connect(self.path)) as db:
+            if record.layer == "authoritative" and record.value.get("kind") == "owner_statement":
+                # Serialize the identity check with the insert across processes.
+                db.execute("BEGIN IMMEDIATE")
+                value = record.value
+                proof = value.get("verification", {})
+                expected_key = json.dumps(
+                    [value.get("bot"), "plugin:telegram:telegram", str(value.get("chat_id")),
+                     str(value.get("message_id"))], ensure_ascii=False, separators=(",", ":"))
+                if (record.scope != MemoryScope(project=value.get("bot"))
+                        or record.key != expected_key or value.get("channel") != "plugin:telegram:telegram"
+                        or record.version != 1
+                        or not value.get("source_ref") or not value.get("timestamp")
+                        or not isinstance(value.get("text"), str)
+                        or hashlib.sha256(value["text"].encode()).hexdigest() != value.get("text_sha256")
+                        or proof.get("status") != "VERIFIED"
+                        or proof.get("chat_id") != value.get("chat_id")
+                        or proof.get("user_id") != value.get("chat_id")
+                        or str(proof.get("message_id")) != str(value.get("message_id"))
+                        or proof.get("text_sha256") != value.get("text_sha256")):
+                    raise ValueError("owner statement identity or verification invalid")
+                existing = db.execute(
+                    "SELECT value FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
+                    (record.layer, record.key, _canonical_scope_json(record.scope)),
+                ).fetchone()
+                if existing:
+                    if json.loads(existing[0]) != record.value:
+                        raise ValueError("owner statement identity is immutable")
+                    return
+                target = record.value.get("supersedes")
+                if target:
+                    original = db.execute(
+                        "SELECT value FROM adr001_memory WHERE layer='authoritative' AND key=? AND scope=?",
+                        (target, _canonical_scope_json(record.scope)),
+                    ).fetchone()
+                    if not original or json.loads(original[0]).get("kind") != "owner_statement":
+                        raise ValueError("superseded owner statement not found in bot scope")
+            elif record.layer == "authoritative":
+                db.execute("BEGIN IMMEDIATE")
+                existing = db.execute(
+                    "SELECT value FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
+                    (record.layer, record.key, _canonical_scope_json(record.scope)),
+                ).fetchone()
+                if existing and json.loads(existing[0]).get("kind") == "owner_statement":
+                    raise ValueError("owner statement identity is immutable")
             db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
                 ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
                 WHERE excluded.version > adr001_memory.version""",
@@ -140,11 +186,15 @@ class SQLiteMemoryStorage:
             MemoryRecord(r[0], r[1], json.loads(r[2]), _scope_from_json(r[3]), r[4])
             for r in rows
         ]
+        superseded_keys = {record.value["supersedes"] for record in result
+                           if record.layer == "authoritative" and record.value.get("kind") == "owner_statement"
+                           and record.value.get("supersedes")}
         result = [record for record in result
                   if _scope_applies(record.scope, scope)
                   and not record.value.get("invalidated_at")
                   and not record.value.get("superseded_at")
-                  and not record.value.get("superseded")]
+                  and not record.value.get("superseded")
+                  and not (record.layer == "authoritative" and record.key in superseded_keys)]
         terms = set(query.lower().replace('-', ' ').split())
         def rank(record):
             text = (record.key + ' ' + json.dumps(record.value)).lower().replace('-', ' ')
@@ -152,6 +202,28 @@ class SQLiteMemoryStorage:
             specificity = _scope_specificity(record.scope)
             return (-relevance, -specificity, record.key)
         return sorted(result, key=rank)
+
+    def audit(self, scope: MemoryScope, exact_key: str) -> list[MemoryRecord]:
+        """Read an original by exact identity and its linked corrections, including history."""
+        if not exact_key:
+            raise ValueError("exact_key is required for historical audit")
+        with closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute(
+                "SELECT layer,key,value,scope,version FROM adr001_memory WHERE layer='authoritative'"
+            ).fetchall()
+        records = [MemoryRecord(row[0], row[1], json.loads(row[2]), _scope_from_json(row[3]), row[4])
+                   for row in rows]
+        records = [record for record in records if _scope_applies(record.scope, scope)]
+        linked = {exact_key}
+        while True:
+            expanded = linked | {record.key for record in records if record.value.get("supersedes") in linked}
+            if expanded == linked:
+                break
+            linked = expanded
+        if not any(record.key == exact_key for record in records):
+            return []
+        return sorted((record for record in records if record.key in linked),
+                      key=lambda record: (record.value.get("timestamp") or "", record.key))
 
 
 def memory_enabled() -> bool:

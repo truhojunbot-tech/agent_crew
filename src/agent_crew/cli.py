@@ -651,6 +651,30 @@ def crew():
     """agent_crew — multi-agent development crew CLI."""
 
 
+@crew.command("ingest-owner-transcripts")
+@click.option("--bot", required=True, help="Explicit target bot/project")
+@click.option("--transcripts-glob", required=True, help="Claude Code JSONL files for this bot only")
+@click.option("--access-path", required=True, help="Owner channel allowFrom JSON")
+@click.option("--db", "db_path", required=True, help="Existing ADR-001 SQLite memory store")
+@click.option("--supersedes-json", type=click.Path(exists=True, dir_okay=False),
+              help="Optional JSON map from correction message ID to original message ID")
+def ingest_owner_transcripts_cli(bot, transcripts_glob, access_path, db_path, supersedes_json):
+    """Explicit backfill; does not enable live memory or install a hook."""
+    from agent_crew.memory_runtime import SQLiteMemoryStorage
+    from agent_crew.owner_statements import ingest_owner_transcripts
+
+    try:
+        with open(supersedes_json, encoding="utf-8") if supersedes_json else open(os.devnull) as stream:
+            supersedes = json.load(stream) if supersedes_json else None
+        report = ingest_owner_transcripts(
+            SQLiteMemoryStorage(db_path), bot=bot, transcripts_glob=transcripts_glob,
+            access_path=access_path, supersedes=supersedes,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        raise click.ClickException(str(exc)) from exc
+    click.echo(json.dumps(report, ensure_ascii=False))
+
+
 @crew.group()
 def roles():
     """Inspect or explicitly configure a project's role-to-provider mapping."""
