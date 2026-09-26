@@ -4740,6 +4740,7 @@ def create_app(
                     _memory_provider, MemoryRequest(
                         project=_project,
                         task_id=task.task_id,
+                        issue=str(_ctx.get("issue", "")) if isinstance(_ctx, dict) else "",
                         context_id=_ctx_info["context_id"],
                         agent_identity=agent,
                         context_generation=_ctx_info["context_generation"],

@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import time
+import re
 from contextlib import closing
 from dataclasses import dataclass, asdict
 from typing import Optional, Protocol
@@ -66,9 +67,9 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope) -> bool:
         if not is_unset(record_value):
             if record_value != query_value:
                 return False
-        elif index <= deepest_set and not is_unset(query_value):
-            # An unset ancestor of the record's deepest set dimension is an
-            # exact-unset requirement, not a wildcard into another branch.
+        elif index == 0 and deepest_set > 0 and not is_unset(query_value):
+            # A project record with no fleet must not cross into a named
+            # fleet. Other omitted intermediate dimensions are ancestors.
             return False
     return True
 
@@ -139,7 +140,11 @@ class SQLiteMemoryStorage:
             MemoryRecord(r[0], r[1], json.loads(r[2]), _scope_from_json(r[3]), r[4])
             for r in rows
         ]
-        result = [record for record in result if _scope_applies(record.scope, scope)]
+        result = [record for record in result
+                  if _scope_applies(record.scope, scope)
+                  and not record.value.get("invalidated_at")
+                  and not record.value.get("superseded_at")
+                  and not record.value.get("superseded")]
         terms = set(query.lower().replace('-', ' ').split())
         def rank(record):
             text = (record.key + ' ' + json.dumps(record.value)).lower().replace('-', ' ')
@@ -151,6 +156,58 @@ class SQLiteMemoryStorage:
 
 def memory_enabled() -> bool:
     return os.getenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "").lower() in {"1", "true", "yes", "on"}
+
+
+def ingest_blackboard_entry(storage: MemoryStorage, frontmatter: dict) -> MemoryRecord:
+    """Store one Blackboard frontmatter entry as its original raw episode."""
+    required = ("id", "from", "type", "link", "topic", "status", "result_link")
+    if not all(key in frontmatter for key in required) or not frontmatter["id"]:
+        raise ValueError("incomplete Blackboard frontmatter")
+    link = str(frontmatter["link"])
+    issue = re.search(r"/(?:issues|pull)/(\d+)\b|#(\d+)\b", link)
+    record = MemoryRecord(
+        "episodic", str(frontmatter["id"]), dict(frontmatter),
+        MemoryScope(project=str(frontmatter["from"]), issue=next(
+            (part for part in issue.groups() if part), "") if issue else ""),
+    )
+    storage.put(record)
+    return record
+
+
+class RuntimeMemoryProvider:
+    """Shadow-only adapter from MemoryStorage to memory.MemoryProvider."""
+
+    name = "memory_runtime"
+    backend = "sqlite"
+
+    def __init__(self, storage: MemoryStorage, *, fleet: str = ""):
+        self.storage = storage
+        self.fleet = fleet
+
+    def retrieve(self, request):
+        from .memory import MemoryItem, MemoryResult
+
+        if not memory_enabled():
+            return MemoryResult(provider=self.name, backend=self.backend, state="unavailable")
+        if not request.project:
+            return MemoryResult(provider=self.name, backend=self.backend, state="empty")
+        scope = MemoryScope(fleet=self.fleet, project=request.project,
+                            issue=request.issue, task_id=request.task_id,
+                            context_generation=request.context_generation)
+        records = self.storage.retrieve(scope, query=request.retrieval_query)
+        allowed = set(request.memory_types) if request.memory_types else {"procedural", "episodic"}
+        records = [record for record in records if record.layer in allowed
+                   and record.layer in {"procedural", "episodic"}]
+        items = tuple(MemoryItem(
+            item_id=record.key,
+            project=record.scope.project,
+            memory_type=record.layer,
+            source_ref=str(record.value.get("link") or record.value.get("source_ref") or record.key),
+            excerpt=str(record.value.get("topic") or record.value.get("text") or ""),
+            rank=index,
+        ) for index, record in enumerate(records[:max(0, request.limit)], 1))
+        return MemoryResult(provider=self.name, backend=self.backend,
+                            state="results" if items else "empty", items=items)
 
 
 def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: MemoryScope) -> dict:

@@ -27,7 +27,7 @@ PIPELINE_STAGES = (
 
 @dataclass(frozen=True)
 class MemoryRequest:
-    """A project-local request for non-authoritative historical evidence."""
+    """A scoped request for non-authoritative historical evidence."""
 
     project: str
     task_id: str = ""
@@ -44,6 +44,7 @@ class MemoryRequest:
     pipeline: tuple[str, ...] = PIPELINE_STAGES
     retrieval_query: str = ""
     query_source: str = ""
+    issue: str = ""
 
 
 @dataclass(frozen=True)
@@ -76,7 +77,7 @@ class MemoryResult:
 
 
 class MemoryProvider(Protocol):
-    """Backend-neutral retrieval contract. Implementations must be project-local."""
+    """Backend-neutral retrieval contract for project and fleet evidence."""
 
     name: str
     backend: str
@@ -131,16 +132,16 @@ class FakeMemoryProvider:
 def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryResult:
     """Fail-soft wrapper used solely for telemetry at the dispatch seam.
 
-    It also filters a provider's response by the mandatory request project.
-    This is defense in depth: a future backend cannot cause a cross-project
-    result merely by failing to enforce the contract itself.
+    It permits project-local and fleet-scope items; the storage adapter enforces
+    the full hierarchy before items cross this boundary.
     """
     started = perf_counter()
     name = getattr(provider, "name", provider.__class__.__name__)
     backend = getattr(provider, "backend", "")
     try:
         result = provider.retrieve(request)
-        scoped = tuple(item for item in result.items if item.project == request.project)
+        scoped = tuple(item for item in result.items
+                       if request.project and item.project in ("", request.project))
         state = result.state
         if state == "results" and not scoped:
             state = "empty"
