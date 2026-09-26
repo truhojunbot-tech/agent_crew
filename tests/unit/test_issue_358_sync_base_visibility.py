@@ -2,8 +2,11 @@
 from unittest.mock import MagicMock
 import subprocess
 from pathlib import Path
+import pytest
 
 from fastapi.testclient import TestClient
+from agent_crew.pipeline import verify_implement_artifact
+from agent_crew.protocol import TaskRequest, TaskResult
 
 
 SHA_REQUESTED = "a" * 40
@@ -184,3 +187,92 @@ def test_dispatch_records_the_exact_prepared_worktree_base(monkeypatch, tmp_db, 
     assert response.status_code == 201
     assert stored["context"]["worktree_base_sha"] == SHA_DEFAULT
     assert stored["context"]["worktree_base_status"] == "known"
+
+
+@pytest.mark.parametrize("explicit_base", [None, "feat/integration"])
+def test_implement_dispatch_ignores_prior_pr_branch_head(
+        tmp_path, tmp_db, monkeypatch, explicit_base):
+    """#397: a previous PR branch cannot become the next task's base."""
+    from agent_crew.server import create_app
+    import json
+
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    clone = tmp_path / "clone"
+    _git(tmp_path, "clone", str(origin), str(clone))
+    _git(clone, "config", "user.email", "test@example.com")
+    _git(clone, "config", "user.name", "test")
+    (clone / "base.txt").write_text("base\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-m", "base")
+    _git(clone, "push", "origin", "main")
+    _git(clone, "checkout", "-b", "fix/prior")
+    (clone / "prior.txt").write_text("prior PR\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-m", "prior PR")
+    _git(clone, "push", "origin", "fix/prior")
+    prior_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    worker_clone = tmp_path / "worker-clone"
+    _git(tmp_path, "clone", str(origin), str(worker_clone))
+    _git(worker_clone, "config", "user.email", "worker@example.com")
+    _git(worker_clone, "config", "user.name", "worker")
+    worker = tmp_path / "worker"
+    _git(worker_clone, "worktree", "add", "--detach", str(worker),
+         "origin/fix/prior")
+    assert _git(worker, "rev-parse", "origin/main").stdout.strip() != prior_sha
+    _git(clone, "checkout", "main")
+    (clone / "main.txt").write_text("new main\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-m", "new main")
+    _git(clone, "push", "origin", "main")
+    main_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    expected_sha = main_sha
+    if explicit_base:
+        _git(clone, "checkout", "-b", explicit_base)
+        (clone / "integration.txt").write_text("explicit base\n")
+        _git(clone, "add", ".")
+        _git(clone, "commit", "-m", "integration base")
+        _git(clone, "push", "origin", explicit_base)
+        expected_sha = _git(clone, "rev-parse", "HEAD").stdout.strip()
+    assert _git(worker, "rev-parse", "HEAD").stdout.strip() == prior_sha
+    assert _git(worker, "rev-parse", "origin/main").stdout.strip() != main_sha
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"roles": [{"role": "implementer", "agent": "codex",
+                                          "worktree": str(worker)}]}))
+    monkeypatch.setattr("agent_crew.server._pane_has_usage_limit", lambda *_a, **_k: False)
+    app = create_app(tmp_db, state_path=str(state), pane_map={"implementer": "%91"},
+                     push_fn=lambda *_args: None, watchdog_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "task_id": "impl-397", "task_type": "implement", "description": "next task",
+            "branch": "fix/prior", "priority": 3,
+            "context": {"base_branch": explicit_base} if explicit_base else {},
+            "project": "demo",
+        })
+        stored = client.get("/tasks/impl-397").json()
+    assert response.status_code == 201
+    assert stored["context"]["worktree_base_sha"] == expected_sha
+    assert _git(worker, "rev-parse", "HEAD").stdout.strip() == expected_sha
+
+    # Dispatch can prepare twice; the recorded SHA must keep the second pass
+    # on the same base even if the remote base branch advances in between.
+    _git(clone, "checkout", explicit_base or "main")
+    (clone / "advanced.txt").write_text("base advanced\n")
+    _git(clone, "add", ".")
+    _git(clone, "commit", "-m", "advance base")
+    _git(clone, "push", "origin", explicit_base or "main")
+    from agent_crew.server import _prepare_worktree_for_task
+    assert _prepare_worktree_for_task(str(worker), "impl-397", "fix/prior",
+                                      "implementer", stored["context"]) == expected_sha
+
+    (worker / "next.txt").write_text("valid task B commit\n")
+    _git(worker, "add", ".")
+    _git(worker, "commit", "-m", "next task")
+    result_sha = _git(worker, "rev-parse", "HEAD").stdout.strip()
+    _git(worker, "push", "origin", "HEAD:refs/heads/fix/next")
+    task = TaskRequest("impl-397", "implement", "next task", branch="fix/next",
+                       context=stored["context"])
+    result = TaskResult("impl-397", "completed", "done", branch="fix/next",
+                        commit=result_sha)
+    assert verify_implement_artifact(task, result, repo_cwd=str(worker))[0]
