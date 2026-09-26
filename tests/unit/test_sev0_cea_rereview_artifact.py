@@ -40,6 +40,7 @@ def test_completed_head_blocks_replay_but_allows_new_head(tmp_path, task_type, m
     assert admitted and first["decision"] == "ALLOW"
     with sqlite3.connect(q._db_path) as conn:
         store.set_lineage_state(conn, first["intent_hash"], first["receipt_id"], "CONSUMED")
+        conn.execute("UPDATE tasks SET status = 'completed' WHERE task_id = 'first'")
 
     replay_task = _task("replay", task_type, SHA_A)
     replay_task.context["allow_duplicate_review"] = True

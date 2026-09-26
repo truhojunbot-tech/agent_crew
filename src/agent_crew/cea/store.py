@@ -137,9 +137,9 @@ CREATE TABLE IF NOT EXISTS dispatch_nonces (
 # reading "no live lineage" and both inserting is exactly the duplicate E10 4c
 # found, and only the database can arbitrate it.
 #
-# A CONSUMED lineage keeps its row: that is what makes ALREADY_COMPLETED
-# answerable (P4). SUPERSEDED/REVOKED release it, because re-admission is the
-# intended outcome there.
+# A CONSUMED lineage keeps its row until admission checks the task outcome:
+# completed tasks block replay; noncompleted tasks release it for a linked
+# retry. SUPERSEDED/REVOKED release it immediately.
 _DDL_INTENT_LINEAGES = """
 CREATE TABLE IF NOT EXISTS intent_lineages (
     intent_hash TEXT PRIMARY KEY,
@@ -514,9 +514,20 @@ def lineage_for_intent(conn: sqlite3.Connection, intent_hash: str) -> Optional[d
     return {k: (row[k] if isinstance(row, sqlite3.Row) else row[i]) for i, k in enumerate(keys)}
 
 
+def task_status(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """The task outcome, if the queue has a row for this receipt's task."""
+    try:
+        row = conn.execute("SELECT status FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table: tasks" not in str(exc):
+            raise
+        return None  # Receipt-only engine tests and stores have no queue table.
+    return None if row is None else row[0]
+
+
 def completed_lineage_for_work(conn: sqlite3.Connection, work_hash: str,
                                *, exclude_intent_hash: Optional[str] = None) -> Optional[dict]:
-    """A CONSUMED lineage for the same *work*, whatever authority it ran under.
+    """A CONSUMED lineage with a completed task for the same *work*.
 
     This is what makes P4's ALREADY_COMPLETED answerable when the request's
     ``authority_decision_ids`` differ from the completed run's: the exact-hash
@@ -525,11 +536,20 @@ def completed_lineage_for_work(conn: sqlite3.Connection, work_hash: str,
     """
     if not work_hash:
         return None
-    row = conn.execute(
-        "SELECT intent_hash, receipt_id, project, state, claimed_at, updated_at, work_hash "
-        "FROM intent_lineages WHERE work_hash = ? AND state = 'CONSUMED' "
-        "AND intent_hash IS NOT ? ORDER BY updated_at DESC LIMIT 1",
-        (work_hash, exclude_intent_hash)).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT intent_hash, receipt_id, project, state, claimed_at, updated_at, work_hash "
+            "FROM intent_lineages WHERE work_hash = ? AND state = 'CONSUMED' "
+            "AND intent_hash IS NOT ? AND EXISTS ("
+            "SELECT 1 FROM authorization_receipts AS r "
+            "JOIN tasks AS t ON t.task_id = r.task_id "
+            "WHERE r.receipt_id = intent_lineages.receipt_id AND t.status = 'completed') "
+            "ORDER BY updated_at DESC LIMIT 1",
+            (work_hash, exclude_intent_hash)).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table: tasks" not in str(exc):
+            raise
+        return None
     if row is None:
         return None
     keys = ("intent_hash", "receipt_id", "project", "state", "claimed_at", "updated_at",
@@ -542,8 +562,8 @@ def set_lineage_state(conn: sqlite3.Connection, intent_hash: str, receipt_id: st
     """Keep the claim in step with the receipt's lifecycle.
 
     SUPERSEDED and REVOKED release the claim so the intent can be re-admitted;
-    every other state — including CONSUMED — keeps it, because "this work already
-    completed" is a fact a later request has to be told (P4).
+    every other state — including CONSUMED — keeps it until admission checks
+    whether the task actually completed (P4).
     """
     if state in ("SUPERSEDED", "REVOKED"):
         release_lineage(conn, intent_hash, receipt_id)

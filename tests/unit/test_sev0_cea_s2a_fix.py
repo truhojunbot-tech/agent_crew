@@ -31,7 +31,7 @@ from agent_crew.cea.service import EngineService, UnixSocketEngineClient, encode
 
 from tests.unit.test_sev0_cea_engine import (  # the step-2a fixture writers, unchanged
     DECISION, FakeBudget, FakeGate, FakeRegistry, FakeRuntime, FakeSnapshot, caller,
-    forged_caller, run_to, engine, identity, intent)
+    forged_caller, run_to, set_task_status, engine, identity, intent)
 
 
 @pytest.fixture()
@@ -39,6 +39,8 @@ def conn():
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     receipt_store.ensure_schema(c)
+    c.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+              "receipt_id TEXT NOT NULL)")
     yield c
     c.close()
 
@@ -377,6 +379,55 @@ def _ops(task_id, *, authority=("T0-1234",), anchors=("ops/rotate.py",)):
                                           authority=authority))
 
 
+@pytest.mark.parametrize("mode", ["shadow", "test"])
+@pytest.mark.parametrize("status", ["needs_human", "failed", "cancelled", "timed_out"])
+def test_consumed_noncompleted_human_gate_retry_is_a_new_linked_lineage(conn, mode, status):
+    eng = engine(config=EngineConfig(mode=mode))
+    first = eng.authorize(conn, _ops("attempt-1"), caller())
+    assert first.decision == "HUMAN_GATE"
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, status)
+
+    retry = eng.authorize(conn, _ops("attempt-2"), caller())
+    assert retry.code != "ALREADY_COMPLETED"
+    assert retry.decision == first.decision
+    assert retry.receipt_id != first.receipt_id
+    assert retry.receipt["parent_receipt_id"] == first.receipt_id
+    assert receipt_store.lineage_for_intent(conn, first.receipt["intent_hash"])["receipt_id"] == retry.receipt_id
+
+
+@pytest.mark.parametrize("mode", ["shadow", "test"])
+def test_consumed_completed_task_still_blocks_same_intent(conn, mode):
+    eng = engine(config=EngineConfig(mode=mode))
+    first = eng.authorize(conn, _ops("complete-1"), caller())
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
+    retry = eng.authorize(conn, _ops("complete-2"), caller())
+    assert retry.code == "ALREADY_COMPLETED"
+
+
+@pytest.mark.parametrize("mode", ["shadow", "test"])
+def test_noncompleted_work_does_not_block_a_changed_authority_hash(conn, mode):
+    extra = DecisionRev("T0-5555", "d" * 32)
+    snapshot = FakeSnapshot(decisions=(DECISION, extra), in_scope=(DECISION, extra))
+    eng = engine(config=EngineConfig(mode=mode), snapshots=snapshot)
+    first = eng.authorize(conn, _ops("authority-1"), caller())
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "needs_human")
+    retry = eng.authorize(conn, _ops("authority-2", authority=("T0-1234", "T0-5555")),
+                          caller())
+    assert retry.code != "ALREADY_COMPLETED"
+
+
+@pytest.mark.parametrize("mode", ["shadow", "test"])
+def test_in_flight_human_gate_lineage_remains_duplicate(conn, mode):
+    eng = engine(config=EngineConfig(mode=mode))
+    first = eng.authorize(conn, _ops("flight-1"), caller())
+    retry = eng.authorize(conn, _ops("flight-2"), caller())
+    assert first.decision == "HUMAN_GATE"
+    assert retry.code == "DUPLICATE_INTENT"
+
+
 def test_the_exact_review_bypass_of_already_completed(conn):
     """codex P1 #2, verbatim: after consuming an OPS lineage authorised by
     T0-1234, the caller-supplied tuple (T0-1234, ATTACKER-ID) produced ALLOW —
@@ -390,6 +441,7 @@ def test_the_exact_review_bypass_of_already_completed(conn):
     # which is what this test needs: completed work that must not re-admit.
     assert first.decision == "HUMAN_GATE"
     run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
 
     attack = eng.authorize(conn, _ops("j2-2", authority=("T0-1234", "ATTACKER-ID")), caller())
     assert attack.http_status == 409, "the completed work was re-admitted"
@@ -406,6 +458,7 @@ def test_a_real_id_that_does_not_supersede_is_also_refused(conn):
     eng = engine(snapshots=snapshot)
     first = eng.authorize(conn, _ops("j2-3"), caller())
     run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
     again = eng.authorize(conn, _ops("j2-4", authority=("T0-1234", "T0-5555")), caller())
     assert again.code == "ALREADY_COMPLETED"
 
@@ -415,6 +468,7 @@ def test_an_explicit_superseding_record_in_the_snapshot_does_re_admit(conn):
     plain = engine()
     first = plain.authorize(conn, _ops("j2-5"), caller())
     run_to(plain, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING))
     again = engine(snapshots=snapshot).authorize(
@@ -434,6 +488,7 @@ def test_a_superseding_record_the_caller_did_not_ask_under_is_not_enough(conn):
     plain = engine()
     first = plain.authorize(conn, _ops("j2-7"), caller())
     run_to(plain, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING))
     again = engine(snapshots=snapshot).authorize(conn, _ops("j2-8", authority=("T0-1234",)),
@@ -447,6 +502,7 @@ def test_a_supersession_we_cannot_verify_is_not_one(conn, status):
     plain = engine()
     first = plain.authorize(conn, _ops(f"j2-sig-{status.value}"), caller())
     run_to(plain, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, "completed")
     snapshot = FakeSnapshot(decisions=(DECISION, SUPERSEDING),
                             in_scope=(DECISION, SUPERSEDING), signature=status)
     again = engine(snapshots=snapshot).authorize(

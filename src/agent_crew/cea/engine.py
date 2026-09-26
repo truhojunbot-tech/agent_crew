@@ -675,6 +675,9 @@ class AuthorizationEngine:
             decided = self._existing_lineage(conn, intent, caller, ih, lineage, retry=retry)
             if decided is not None:
                 return decided
+            if (lineage["state"] == "CONSUMED"
+                    and receipt_store.current_receipt(conn, lineage["receipt_id"]) is not None):
+                intent = replace(intent, parent_receipt_id=lineage["receipt_id"])
 
         # J2–J8
         executor = self._executor_binding(intent)
@@ -772,8 +775,8 @@ class AuthorizationEngine:
                           lineage: dict, *, retry: bool) -> Optional[Authorization]:
         """P4's three answers for an intent that already has a lineage.
 
-        Returns ``None`` only when the lineage is free (SUPERSEDED/REVOKED) and
-        admission should proceed normally.
+        Returns ``None`` when the lineage is free or its consumed task did not
+        complete, so admission should proceed normally.
         """
         state = lineage["state"]
         prior = receipt_store.current_receipt(conn, lineage["receipt_id"])
@@ -781,10 +784,12 @@ class AuthorizationEngine:
             return None
 
         if state == "CONSUMED":
-            # P4: completed work is not re-admitted. The exception is a
-            # superseding decision record — and that needs no special case here,
-            # because `authority_decision_ids` is an intent_hash input, so a
-            # newer decision produces a different hash and lands as a new lineage.
+            # CONSUMED only means the receipt ran. A task that did not complete
+            # releases its claim; the new receipt links back to this one.
+            if receipt_store.task_status(conn, prior["task_id"]) != "completed":
+                receipt_store.release_lineage(conn, ih, lineage["receipt_id"])
+                return None
+            # Completed work requires a verified superseding decision record.
             return Authorization(
                 receipt=self._refusal(intent, caller, ih, "ALREADY_COMPLETED",
                                      f"this intent completed as receipt {lineage['receipt_id']}; "
