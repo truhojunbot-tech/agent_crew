@@ -1,6 +1,7 @@
 import json
 import contextlib
 import copy
+import fcntl
 import hashlib
 import logging
 import os
@@ -2388,6 +2389,48 @@ class TaskQueue:
     #: intent. :func:`agent_crew.cea.refusal_http.status_for` maps it to 403 by
     #: its outcome, which is the right answer: it is a decision, not a deferral.
     PROJECT_MISMATCH = "PROJECT_MISMATCH"
+    IMPLEMENT_SLOT_BUSY = "IMPLEMENT_SLOT_BUSY"
+
+    def _max_open_implement(self) -> Optional[int]:
+        """Live project admission cap; an absent or invalid setting is disabled."""
+        path = str(self._db_path or "")
+        if not path or path == ":memory:":
+            return None
+        state_path = os.path.join(os.path.dirname(os.path.abspath(path)), "state.json")
+        try:
+            with open(state_path, "r", encoding="utf-8") as fh:
+                value = (json.load(fh) or {}).get("max_open_implement")
+        except (OSError, ValueError, TypeError):
+            return None
+        return value if type(value) is int and value > 0 else None
+
+    def _open_implement_task_id(self, project: str, cap: int) -> Optional[str]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id FROM tasks WHERE project=? AND task_type='implement' "
+                "AND status IN ('pending', 'in_progress') ORDER BY created_at, task_id "
+                "LIMIT ?", (project, cap),
+            ).fetchall()
+            return rows[0]["task_id"] if len(rows) >= cap else None
+        finally:
+            conn.close()
+
+    @contextlib.contextmanager
+    def _implement_admission_lock(self, task: TaskRequest):
+        """Serialize capped admissions through receipt authorization and insert."""
+        if task.task_type != "implement" or self._max_open_implement() is None:
+            yield
+            return
+        path = os.path.join(os.path.dirname(os.path.abspath(self._db_path)),
+                            ".implement-admission.lock")
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
 
     def _project_from_queue_identity(self, task: TaskRequest):
         """``(task, refusal)`` — §7's project rule, applied once for every adapter.
@@ -2674,6 +2717,21 @@ class TaskQueue:
                         existing_task_id=duplicate_id, code=DuplicateReviewError.code)
                     conn.commit()
                     raise DuplicateReviewError(duplicate_id)
+            if (task.task_type == "implement"
+                    and context.get("allow_parallel_implement") is True):
+                cap = self._max_open_implement()
+                if cap is not None:
+                    row = conn.execute(
+                        "SELECT task_id FROM tasks WHERE project=? "
+                        "AND task_type='implement' "
+                        "AND status IN ('pending', 'in_progress') "
+                        "ORDER BY created_at, task_id LIMIT 1",
+                        (task.project,),
+                    ).fetchone()
+                    if row:
+                        self._append_exec_event_on(
+                            conn, task.task_id, "parallel_implement_override",
+                            time.time(), existing_task_id=row["task_id"], cap=cap)
             conn.execute(
                 """
                 INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project, receipt_id)
@@ -2842,23 +2900,40 @@ class TaskQueue:
         # s4k: the project comes from the queue's own identity when the request
         # named none, and a request that named a different one is refused here
         # rather than admitted under a project it chose for itself.
-        task, refusal = self._project_from_queue_identity(task)
-        context = self._trusted_enqueue_context(
-            task, successor_provenance=_successor_provenance)
-        if refusal is None:
-            # A retry/fallback successor is the same intent as its parent
-            # (P4), so it goes through the engine's retry re-admission rather
-            # than opening a second lineage for one piece of work.
-            auth = self.authorize_task(
-                task, context=context, provenance=provenance,
-                retry=(
+        with self._implement_admission_lock(task):
+            task, refusal = self._project_from_queue_identity(task)
+            context = self._trusted_enqueue_context(
+                task, successor_provenance=_successor_provenance)
+            if refusal is None and task.task_type == "implement":
+                cap = self._max_open_implement()
+                is_system_successor = (
                     _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE
-                    and _cea_is_lineage_successor(task, context or {})
-                ))
-        else:
-            auth = self._refuse_admission(task, context=context, provenance=provenance,
-                                          code=refusal[0], text=refusal[1])
-        return self.enqueue_with_receipt(task, auth.receipt, context=context)
+                    and (_cea_is_lineage_successor(task, context)
+                         or (ingress == "cascade.fix" and context.get("fix_round") is not None
+                             and context.get("prev_task_id")))
+                )
+                if cap is not None and not is_system_successor:
+                    existing = self._open_implement_task_id(task.project, cap)
+                    if existing and context.get("allow_parallel_implement") is not True:
+                        refusal = (
+                            self.IMPLEMENT_SLOT_BUSY,
+                            f"Project {task.project!r} already has {cap} open implement "
+                            f"task(s); open task_id={existing!r}",
+                        )
+            if refusal is None:
+                # A retry/fallback successor is the same intent as its parent
+                # (P4), so it goes through the engine's retry re-admission rather
+                # than opening a second lineage for one piece of work.
+                auth = self.authorize_task(
+                    task, context=context, provenance=provenance,
+                    retry=(
+                        _successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE
+                        and _cea_is_lineage_successor(task, context or {})
+                    ))
+            else:
+                auth = self._refuse_admission(task, context=context, provenance=provenance,
+                                              code=refusal[0], text=refusal[1])
+            return self.enqueue_with_receipt(task, auth.receipt, context=context)
 
     def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
                           provenance: "_CeaProvenance", code: str, text: str):

@@ -113,6 +113,13 @@ Tracks tmux pane lifecycle per agent.
 
 **State file**: `~/.agent_crew/<project>/state.json`
 
+Set `"max_open_implement": 1` in this file to admit at most one pending or
+in-progress implement task for the project. The queue reads this setting on
+each admission, so changes take effect without a restart. When the key is
+absent, implement admission has no project slot cap. A server-created fix
+successor is exempt; an explicit `context.allow_parallel_implement: true`
+also bypasses the cap and records a `parallel_implement_override` event.
+
 ```json
 {
   "claude":  {"pane": "myproject:0.1", "started_at": 1713500000, "failures": 0, "cmd": "claude --dangerously-skip-permissions --continue"},
