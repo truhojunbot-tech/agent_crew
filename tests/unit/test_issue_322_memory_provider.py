@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import time
+import uuid
 
 from fastapi.testclient import TestClient
 
@@ -15,6 +16,9 @@ from agent_crew.memory import (
     NullMemoryProvider,
     MemoryResult,
     shadow_retrieve,
+)
+from agent_crew.memory_runtime import (
+    MemoryRecord, MemoryScope, RuntimeMemoryProvider, SQLiteMemoryStorage,
 )
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
@@ -101,8 +105,12 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
         return Process()
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.delenv("AGENT_CREW_CONTEXT_PACK", raising=False)
+    ids = iter(range(1, 1000))
+    monkeypatch.setattr(uuid, "uuid4", lambda: uuid.UUID(int=next(ids)))
+    monkeypatch.setattr("agent_crew.cea.engine.secrets.token_hex", lambda count: "a" * (2 * count))
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", fake_exec)
     monkeypatch.setattr(
         "agent_crew.server.subprocess.run",
@@ -111,6 +119,7 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
 
     app = create_app(
         db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state_file), project="project-a",
+        worktree_map={"implementer": str(wt)},
         memory_provider=provider, watchdog_disabled=True, anomaly_disabled=True,
         shadow_memory_enabled=shadow_memory_enabled,
         shadow_memory_timeout_seconds=shadow_memory_timeout_seconds,
@@ -166,6 +175,71 @@ def test_shadow_memory_kill_switch_never_invokes_provider(tmp_path, monkeypatch,
 
     assert "shadow_memory" not in context
     assert events == []
+
+
+def test_existing_shadow_db_wires_runtime_provider_without_live_read_flag(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    storage.put(MemoryRecord(
+        "episodic", "episode-1", {"link": "git:episode-1", "topic": "prior result"},
+        MemoryScope(project="project-a"),
+    ))
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+    monkeypatch.delenv("AGENT_CREW_ADR001_MEMORY_ENABLED", raising=False)
+    cmd, _, events, _ = _dispatch_snapshot(
+        tmp_path / "wired", monkeypatch, None, unused_tcp_port=unused_tcp_port)
+
+    assert len(events) == 1
+    assert events[0]["provider"] == "memory_runtime"
+    assert events[0]["backend"] == "sqlite"
+    assert events[0]["state"] == "results"
+    assert events[0]["result_ids"] == ["episode-1"]
+    assert "prior result" not in " ".join(map(str, cmd)).lower()
+
+
+def test_missing_shadow_db_uses_null_provider_and_does_not_create_file(
+        tmp_path, monkeypatch, caplog, *, unused_tcp_port):
+    missing = tmp_path / "missing.db"
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", str(missing))
+    _, _, events, _ = _dispatch_snapshot(
+        tmp_path / "missing", monkeypatch, None, unused_tcp_port=unused_tcp_port)
+
+    assert not missing.exists()
+    assert events[0]["provider"] == "null"
+    assert events[0]["state"] == "unavailable"
+    assert sum("AGENT_CREW_SHADOW_MEMORY_DB" in record.message for record in caplog.records) == 1
+
+
+def test_runtime_shadow_flag_off_makes_no_retrieval_and_keeps_message_identical(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    storage.put(MemoryRecord(
+        "episodic", "episode-1", {"topic": "prior result"}, MemoryScope(project="project-a"),
+    ))
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+    monkeypatch.delenv("AGENT_CREW_ADR001_MEMORY_ENABLED", raising=False)
+    calls = []
+    original_retrieve = RuntimeMemoryProvider.retrieve
+
+    def observed_retrieve(self, request):
+        calls.append(request.task_id)
+        return original_retrieve(self, request)
+
+    monkeypatch.setattr(RuntimeMemoryProvider, "retrieve", observed_retrieve)
+    off_cmd, off_context, off_events, _ = _dispatch_snapshot(
+        tmp_path / "off", monkeypatch, None, shadow_memory_enabled=False,
+        unused_tcp_port=unused_tcp_port)
+    assert calls == []
+    on_cmd, on_context, on_events, _ = _dispatch_snapshot(
+        tmp_path / "on", monkeypatch, None, shadow_memory_enabled=True,
+        unused_tcp_port=unused_tcp_port)
+
+    assert off_cmd == on_cmd
+    assert calls == ["shadow-322"]
+    assert off_events == []
+    assert "shadow_memory" not in off_context
+    assert on_events[0]["result_ids"] == ["episode-1"]
+    assert {key: value for key, value in on_context.items() if key != "shadow_memory"} == off_context
 
 
 def test_slow_shadow_provider_cannot_hold_baseline_dispatch(tmp_path, monkeypatch, *, unused_tcp_port):

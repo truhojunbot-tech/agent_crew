@@ -334,6 +334,9 @@ observe (task↔context attribution, retry/fallback lineage, restart recovery).
 | `AGENT_CREW_CLAUDE_CONTEXT_MAX_MB` | `64` | Cap on the Claude Code session a worker resumes (`0` disables) |
 | `AGENT_CREW_CODEX_CONTEXT_MAX_MB` | `64` | Cap on the codex rollout a worker resumes (`0` disables) |
 | `AGENT_CREW_MAIN_BRANCH` | `main` | Default main branch name |
+| `AGENT_CREW_SHADOW_MEMORY_ENABLED` | off | Enable bounded, telemetry-only memory retrieval at dispatch |
+| `AGENT_CREW_SHADOW_MEMORY_DB` | unset | Existing SQLite memory file for shadow retrieval (canonical path: `~/.agent_crew/memory/adr001_memory.db`); missing files use the null provider |
+| `AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS` | `0.05` | Maximum wait for a shadow retrieval before dispatch continues |
 | `GH_TOKEN` / `GITHUB_TOKEN` | — | GitHub API token (for triage/PR features) |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token (for notifications) |
 | `TELEGRAM_CHAT_ID` | — | Telegram chat ID for notifications |
