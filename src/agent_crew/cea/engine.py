@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import os
 import re
 import secrets
@@ -67,6 +68,8 @@ from agent_crew.cea import store as receipt_store
 # permit a new admission for the same intent. Missing task data fails closed.
 RELEASABLE_CONSUMED_TASK_STATUSES = frozenset(
     {"failed", "needs_human", "cancelled", "timed_out"})
+
+logger = logging.getLogger(__name__)
 
 # ═══════════════════════════════════════════════════════════════════════════
 # P4 — intent identity
@@ -179,6 +182,24 @@ TEST = "test"
 MODES = (OFF, TEST, SHADOW, ENFORCE)
 
 EMBEDDED_MODES = (OFF, TEST, SHADOW)
+"""The modes in which :meth:`AuthorizationEngine.authorize` may run embedded.
+
+⛔Codex, re-reviewing ``f1aee1d``: an in-process Python construct is not an
+  authentication boundary, so the engine must "keep [itself] behind the
+  credential-validating service/process boundary (or refuse embedded direct
+  authorization) until an actual broker capability boundary exists". This is
+  that refusal, and it is what makes the choice a *deployment* decision rather
+  than a claim about class privacy.
+
+  ``shadow`` may run embedded because it stops nothing: it measures. ``test``
+  may run embedded because it is a test harness and says so in its name. In
+  ``enforce`` — the only mode where the engine's verdict withholds work — the
+  engine must be reached across the unix socket in :mod:`agent_crew.cea.service`,
+  where the credential is checked by a peer that is not the caller. Same-uid
+  peers are still untrusted and ``caller_identity_status`` is still UNVERIFIED
+  by contract until the O21b broker (see ``src/agent_crew/cea/README.md``); the
+  socket is a process boundary, not a verified identity.
+"""
 
 #: What a refusal receipt names as its ``project`` when the intent named none.
 #: §3 freezes ``project`` as a non-empty string and P2 requires the audit row
@@ -229,24 +250,53 @@ def resolve_mode(env: dict, project: Optional[str] = None) -> str:
         if raw:
             return raw if raw in MODES else SHADOW
     return SHADOW
-"""The modes in which :meth:`AuthorizationEngine.authorize` may run embedded.
 
-⛔Codex, re-reviewing ``f1aee1d``: an in-process Python construct is not an
-  authentication boundary, so the engine must "keep [itself] behind the
-  credential-validating service/process boundary (or refuse embedded direct
-  authorization) until an actual broker capability boundary exists". This is
-  that refusal, and it is what makes the choice a *deployment* decision rather
-  than a claim about class privacy.
 
-  ``shadow`` may run embedded because it stops nothing: it measures. ``test``
-  may run embedded because it is a test harness and says so in its name. In
-  ``enforce`` — the only mode where the engine's verdict withholds work — the
-  engine must be reached across the unix socket in :mod:`agent_crew.cea.service`,
-  where the credential is checked by a peer that is not the caller. Same-uid
-  peers are still untrusted and ``caller_identity_status`` is still UNVERIFIED
-  by contract until the O21b broker (see ``src/agent_crew/cea/README.md``); the
-  socket is a process boundary, not a verified identity.
-"""
+# Codes emitted by the engine or the receipt validator. Keep this explicit so a
+# misspelled rollout code cannot silently broaden enforcement.
+ENFORCEABLE_REASON_CODES = frozenset({
+    "ALREADY_COMPLETED", "ATTEMPT_MISMATCH", "AUTHORITY_NOT_IN_SNAPSHOT",
+    "BINDING_DRIFT", "BUDGET", "BUDGET_EXHAUSTED", "BUDGET_UNVERIFIED",
+    "CREDENTIAL_BOUNDARY_UNAVAILABLE", "DECISION_BLOCK", "DECISION_HUMAN_GATE",
+    "DUPLICATE_INTENT", "EXECUTOR_BINDING_MISMATCH", "HUMAN_GATE_DENIED",
+    "HUMAN_GATE_PENDING", "HUMAN_GATE_REVOKED",
+    "IDENTITY_DEPENDENT_ALLOW_UNVERIFIED", "IDEMPOTENT_REPLAY",
+    "IDENTITY_UNVERIFIED_NO_REVIEWER", "IMPLEMENT_SLOT_BUSY",
+    "IDENTITY_UNVERIFIED_REVIEW_REQUIRED", "IDENTITY_UNVERIFIED_WHO_MAY_ACT",
+    "INPUTS_UNAVAILABLE", "INVALID_SCOPE_ANCHOR", "NONCE_MISSING",
+    "NONCE_NOT_STARTED", "NONCE_REUSED", "NONCE_UNKNOWN",
+    "NONCE_WRONG_ATTEMPT", "NO_AUTHORITY", "OWNER_CONFLICT",
+    "PROJECT_MISMATCH", "PROJECT_REQUIRED", "RECEIPT_CONSUMED", "RECEIPT_HELD",
+    "RECEIPT_REVOKED", "RECEIPT_SCHEMA_INVALID", "RECEIPT_STATE_INVALID",
+    "RECEIPT_SUPERSEDED", "RECEIPT_TOO_OLD", "RECEIPT_UNSIGNED",
+    "RESULT_ACCEPTED_INPUTS_UNAVAILABLE", "RESULT_ACCEPTED_NO_SUCCESSORS",
+    "RESULT_ACCEPTED_SNAPSHOT_STALE", "RESULT_WITHOUT_EXECUTE_START",
+    "REVIEW_WITHOUT_REVIEWER", "RUNTIME_DRAINING", "RUNTIME_EPOCH_ADVANCED",
+    "RUNTIME_STATE_FORBIDS", "SIGNATURE_UNVERIFIED_AT_BOUNDARY",
+    "SNAPSHOT_STALE", "STALE_RECEIPT", "TASK_ID_MISMATCH",
+})
+
+
+def resolve_enforce_codes(env: dict, project: Optional[str] = None) -> Optional[frozenset[str]]:
+    """Per-project code allowlist, then process-wide; ``None`` means unrestricted."""
+    project_name = None
+    if project:
+        suffix = project_mode_env_var(project).removeprefix("AGENT_CREW_CEA_MODE__")
+        project_name = f"AGENT_CREW_CEA_ENFORCE_CODES_{suffix}"
+    for name in (project_name, "AGENT_CREW_CEA_ENFORCE_CODES"):
+        if name is None or not str(env.get(name) or "").strip():
+            continue
+        codes = set()
+        for item in str(env[name]).split(","):
+            code = item.strip().upper()
+            if not code:
+                continue
+            if code in ENFORCEABLE_REASON_CODES:
+                codes.add(code)
+            else:
+                logger.warning("Ignoring unrecognised CEA enforcement code %r in %s", code, name)
+        return frozenset(codes)
+    return None
 
 
 @dataclass(frozen=True)
@@ -255,7 +305,8 @@ class EngineConfig:
 
     ``mode`` is read by the **adapters** to decide whether a non-ALLOW receipt
     stops the work: in ``shadow`` they record it and proceed as they do today; in
-    ``test`` and ``enforce`` only PROCEED proceeds. The engine's verdict is
+    ``test`` and ``enforce`` non-PROCEED answers stop work according to the
+    optional reason-code allowlist. The engine's verdict is
     identical in all three — that is what makes the shadow measurement worth
     anything, and it is why "shadow-ALLOW because an input was missing" cannot
     happen: the engine has no shadow branch to take.
@@ -290,6 +341,9 @@ class EngineConfig:
     """Which project's rollout setting produced :attr:`mode` — provenance, so a
     recorded gate answer can be read back against the config that produced it."""
 
+    enforce_codes: Optional[frozenset[str]] = None
+    """Codes allowed to stop work; ``None`` preserves full ENFORCE behavior."""
+
     @classmethod
     def from_env(cls, env: Optional[dict] = None,
                  project: Optional[str] = None) -> "EngineConfig":
@@ -299,6 +353,7 @@ class EngineConfig:
         return cls(
             mode=mode,
             project=project or None,
+            enforce_codes=resolve_enforce_codes(e, project),
             endpoint=(e.get("AGENT_CREW_CEA_ENGINE_ENDPOINT") or "").strip() or None,
             key_path=(e.get("AGENT_CREW_CEA_ENGINE_KEY") or "").strip() or None,
             issuer=(e.get("AGENT_CREW_CEA_ISSUER") or "").strip() or cls.issuer,

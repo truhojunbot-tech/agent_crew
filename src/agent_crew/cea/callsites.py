@@ -26,7 +26,8 @@ truthfully (P7: no shadow branch), and the validator always answers truthfully;
 what a deployment chooses is whether a non-PROCEED answer *stops the work*. In
 ``shadow`` every gate returns ``proceed=True`` with ``enforced=False`` and the
 answer is recorded — which is the measurement the shadow phase exists to produce.
-In ``enforce`` only ``PROCEED`` proceeds.
+In ``enforce`` only ``PROCEED`` proceeds unless a configured reason-code
+allowlist makes a particular non-PROCEED verdict advisory.
 
 ⛔A gate never invents a verdict when it cannot compute one. If ``B′`` is not
   available the :class:`~agent_crew.cea.validator.CurrentInputs` says so and the
@@ -61,6 +62,7 @@ class GateOutcome:
     result: ValidationResult
     proceed: bool
     enforced: bool
+    review_required: bool = False
 
     @property
     def outcome(self) -> ValidationOutcome:
@@ -76,14 +78,17 @@ class GateOutcome:
 
     def as_record(self) -> dict:
         """The audit shape an adapter stores/logs — the answer, and what was done with it."""
-        return {"point": self.point.value, "outcome": self.outcome.value,
+        record = {"point": self.point.value, "outcome": self.outcome.value,
                 "reason": self.reason, "receipt_id": self.receipt_id,
                 "proceed": self.proceed, "enforced": self.enforced,
                 "changed_fields": list(self.result.changed_fields)}
+        if self.review_required:
+            record.update(advisory=True, review_required=True)
+        return record
 
 
 def enforcing(config: Optional[EngineConfig] = None, *,
-              project: Optional[str] = None) -> bool:
+              project: Optional[str] = None, reason_code: Optional[str] = None) -> bool:
     """``test`` enforces exactly as ``enforce`` does — the two differ only in
     whether the engine may run embedded (:data:`agent_crew.cea.engine.EMBEDDED_MODES`),
     which is a deployment question and not a question about this gate.
@@ -93,7 +98,11 @@ def enforcing(config: Optional[EngineConfig] = None, *,
     ``config`` is given — a caller holding a config has already resolved the
     question, and re-resolving it here would silently override them.
     """
-    return (config or EngineConfig.from_env(project=project)).mode in (ENFORCE, TEST)
+    resolved = config or EngineConfig.from_env(project=project)
+    if resolved.mode not in (ENFORCE, TEST):
+        return False
+    return (reason_code is None or resolved.enforce_codes is None
+            or reason_code in resolved.enforce_codes)
 
 
 def recording(config: Optional[EngineConfig] = None, *,
@@ -103,10 +112,18 @@ def recording(config: Optional[EngineConfig] = None, *,
 
 
 def _gate(point: ValidationPoint, result: ValidationResult,
-          config: Optional[EngineConfig]) -> GateOutcome:
-    enforce = enforcing(config)
+          config: Optional[EngineConfig], receipt: dict) -> GateOutcome:
+    resolved = config or EngineConfig.from_env()
+    code = result.reason.partition(":")[0].strip()
+    if code in ("DECISION_BLOCK", "DECISION_HUMAN_GATE"):
+        code = str((receipt.get("reason") or {}).get("code") or code)
+    enforce = enforcing(resolved, reason_code=(
+        None if result.outcome is ValidationOutcome.PROCEED else code))
     proceed = (result.outcome is ValidationOutcome.PROCEED) or not enforce
-    return GateOutcome(point=point, result=result, proceed=proceed, enforced=enforce)
+    review_required = (resolved.mode in (ENFORCE, TEST) and proceed
+                       and result.outcome is not ValidationOutcome.PROCEED)
+    return GateOutcome(point=point, result=result, proceed=proceed,
+                       enforced=enforce, review_required=review_required)
 
 
 def current_inputs(engine, receipt: dict, **overrides) -> CurrentInputs:
@@ -135,7 +152,7 @@ def gate_enqueue(receipt: dict, *, task_id: str, current: CurrentInputs,
     """P2 Enqueue. The only gate that fails *closed* on an uncomputable B′ (P7)."""
     return _gate(ValidationPoint.ENQUEUE,
                  VALIDATOR.validate_enqueue(receipt, task_id=task_id, current=current),
-                 config)
+                 config, receipt)
 
 
 def gate_claim(receipt: dict, *, claimant: Optional[str], current: CurrentInputs,
@@ -144,7 +161,7 @@ def gate_claim(receipt: dict, *, claimant: Optional[str], current: CurrentInputs
     not proven, and the receipt records that it is not."""
     return _gate(ValidationPoint.CLAIM,
                  VALIDATOR.validate_claim(receipt, claimant=claimant, current=current),
-                 config)
+                 config, receipt)
 
 
 def gate_dispatch(receipt: dict, *, attempt: Optional[int], current: CurrentInputs,
@@ -153,7 +170,7 @@ def gate_dispatch(receipt: dict, *, attempt: Optional[int], current: CurrentInpu
     because minting is a write and a refused dispatch must not leave one behind."""
     return _gate(ValidationPoint.DISPATCH,
                  VALIDATOR.validate_dispatch(receipt, attempt=attempt, current=current),
-                 config)
+                 config, receipt)
 
 
 def gate_execute_start(receipt: dict, *, nonce: Optional[str], current: CurrentInputs,
@@ -162,7 +179,7 @@ def gate_execute_start(receipt: dict, *, nonce: Optional[str], current: CurrentI
     the store's claim table, never from the receipt's own ``dispatch_nonces``."""
     return _gate(ValidationPoint.EXECUTE_START,
                  VALIDATOR.validate_execute_start(receipt, nonce=nonce, current=current),
-                 config)
+                 config, receipt)
 
 
 def gate_result(receipt: dict, *, nonce: Optional[str], presenter: Optional[str],
@@ -172,7 +189,7 @@ def gate_result(receipt: dict, *, nonce: Optional[str], presenter: Optional[str]
     return _gate(ValidationPoint.RESULT,
                  VALIDATOR.validate_result(receipt, nonce=nonce, presenter=presenter,
                                            current=current),
-                 config)
+                 config, receipt)
 
 
 # ── P6 runtime state: the row is an input, not a second authority ───────────
