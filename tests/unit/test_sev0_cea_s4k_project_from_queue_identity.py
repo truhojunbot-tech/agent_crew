@@ -190,6 +190,7 @@ def test_matching_target_repo_is_admitted(tmp_path, live, origin, target):
 @pytest.mark.parametrize("target", [
     "elsewhere/other",
     "https://elsewhere.example/path/github.com/owner/repo",
+    "https://github.com.evil.example/owner/repo",
 ])
 def test_mismatched_target_repo_is_403_with_block_receipt_and_no_task(
         tmp_path, live, target):
@@ -234,6 +235,28 @@ def test_target_repo_mismatch_uses_same_refusal_for_every_ingress(tmp_path, live
         assert got["decision"] == "BLOCK", ingress
         assert got["reason"]["code"] == "PROJECT_MISMATCH", ingress
         assert _row_project(db, request.task_id) is None
+
+
+def test_target_repo_enqueue_never_spawns_git_after_queue_construction(
+        tmp_path, live, monkeypatch):
+    db = _queue_with_origin(tmp_path, "https://github.com/owner/repo.git")
+    q = TaskQueue(str(db))
+
+    def no_subprocess(*_args, **_kwargs):
+        raise AssertionError("enqueue spawned a subprocess")
+
+    monkeypatch.setattr(subprocess, "run", no_subprocess)
+    matching = task("matching", project=PROJECT)
+    matching.context = {"target_repo": "git@github.com:owner/repo.git"}
+    q.enqueue(matching, ingress="http.tasks")
+    assert _row_project(db, "matching") == PROJECT
+
+    foreign = task("foreign", project=PROJECT)
+    foreign.context = {"target_repo": "elsewhere/other"}
+    with pytest.raises(AdmissionRefused) as exc:
+        q.enqueue(foreign, ingress="http.tasks")
+    assert receipt_by_id(q, exc.value.receipt_id)["reason"]["code"] == "PROJECT_MISMATCH"
+    assert _row_project(db, "foreign") is None
 
 
 def test_enforce_without_a_credential_is_403_with_a_receipt_naming_the_queue_project(

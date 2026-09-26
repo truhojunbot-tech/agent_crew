@@ -1283,6 +1283,11 @@ class TaskQueue:
         self._cea_providers = dict(cea_providers or {})
         self._cea_engine_cache: dict = {}
         self._declared_project: Optional[str] = None
+        # #403: repository identity is stable for this queue instance. Resolve
+        # the state-backed worktree origins once, outside the enqueue path;
+        # admission must never spawn git for each task.
+        state_path = os.path.join(os.path.dirname(os.path.abspath(db_path)), "state.json")
+        self._project_repos = auto_detect_expected_repos(state_path)
         # P6: who may loosen this runtime. Fail-closed by default — a runtime with
         # no verifier refuses every loosening rather than trusting the requester's
         # own account of its authority. Wire a :class:`SnapshotLooseningAuthority`
@@ -2452,9 +2457,7 @@ class TaskQueue:
                 target = (_extract_repo_from_url(raw_target.lower()) or "") if github_remote else ""
             else:
                 target = raw_target.removesuffix(".git")
-            state_path = os.path.join(os.path.dirname(os.path.abspath(self._db_path)),
-                                      "state.json")
-            repos = auto_detect_expected_repos(state_path)
+            repos = self._project_repos
             if len(repos) != 1:
                 return task, (self.PROJECT_MISMATCH,
                               f"context.target_repo={raw_target!r} was set, but this "
