@@ -295,3 +295,22 @@ def test_unresolved_implement_base_returns_unknown_without_refusing(tmp_path):
                                           "implementer", {})
     assert prepared == ""
     assert _git(worker, "rev-parse", "HEAD").stdout.strip() == old_head
+
+
+def test_failed_fetch_cannot_turn_a_stale_tracking_ref_into_known_base(tmp_path):
+    from agent_crew.server import _prepare_worktree_for_task
+
+    origin = tmp_path / "origin.git"
+    _git(tmp_path, "init", "--bare", "-b", "main", str(origin))
+    worker = tmp_path / "worker"
+    _git(tmp_path, "clone", str(origin), str(worker))
+    _git(worker, "config", "user.email", "test@example.com")
+    _git(worker, "config", "user.name", "test")
+    (worker / "file.txt").write_text("base\n")
+    _git(worker, "add", ".")
+    _git(worker, "commit", "-m", "base")
+    _git(worker, "push", "origin", "main")
+    _git(worker, "remote", "set-url", "origin", str(tmp_path / "missing.git"))
+
+    assert _prepare_worktree_for_task(str(worker), "impl-next", "fix/next",
+                                      "implementer", {}) == ""

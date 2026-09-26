@@ -731,7 +731,7 @@ def _prepare_worktree_for_task_inner(
         capture_output=True, text=True, timeout=30,
     )
     # Fetch all remote branches so the target ref is up to date.
-    subprocess.run(
+    fetch = subprocess.run(
         ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
         capture_output=True, text=True,
         timeout=60,
@@ -820,7 +820,9 @@ def _prepare_worktree_for_task_inner(
         # old HEAD here made an unrelated PR branch look like the dispatch base
         # (#397). Dispatch continues with explicit unknown; the artifact gate
         # already refuses a completed implementation with no known base.
-        return base_sha if checkout_ok and _worktree_head(worktree_path) == base_sha else ""
+        fresh_base = bool(pinned_base) or fetch.returncode == 0
+        return (base_sha if fresh_base and checkout_ok
+                and _worktree_head(worktree_path) == base_sha else "")
     else:
         # Reviewer/tester: checkout the PR branch from origin (#141, #186).
         # task.branch holds the base branch (e.g. main), not the PR head.
