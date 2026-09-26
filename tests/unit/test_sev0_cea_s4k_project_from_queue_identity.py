@@ -30,6 +30,7 @@ import ast
 import dataclasses
 import json
 import sqlite3
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -159,6 +160,80 @@ def receipt_by_id_from(db, receipt_id: str):
         return receipt_store.current_receipt(conn, receipt_id)
     finally:
         conn.close()
+
+
+def _queue_with_origin(tmp_path, origin: str):
+    db = _project_dir(tmp_path)
+    worktree = tmp_path / "checkout"
+    subprocess.run(["git", "init", str(worktree)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(worktree), "remote", "add", "origin", origin],
+                   check=True, capture_output=True)
+    state_path = db.parent / "state.json"
+    state = json.loads(state_path.read_text())
+    state["worktrees"] = {"codex": str(worktree)}
+    state_path.write_text(json.dumps(state))
+    return db
+
+
+@pytest.mark.parametrize(("origin", "target"), [
+    ("https://github.com/owner/repo.git", "owner/repo"),
+    ("https://github.com/owner/repo.git", "git@github.com:owner/repo.git"),
+    ("git@github.com:owner/repo.git", "https://github.com/owner/repo"),
+])
+def test_matching_target_repo_is_admitted(tmp_path, live, origin, target):
+    db = _queue_with_origin(tmp_path, origin)
+    resp = _post(db, _body(context={"target_repo": target}))
+    assert resp.status_code == 201, resp.text
+    assert _row_project(db, "t1") == PROJECT
+
+
+@pytest.mark.parametrize("target", [
+    "elsewhere/other",
+    "https://elsewhere.example/path/github.com/owner/repo",
+])
+def test_mismatched_target_repo_is_403_with_block_receipt_and_no_task(
+        tmp_path, live, target):
+    db = _queue_with_origin(tmp_path, "git@github.com:owner/repo.git")
+    resp = _post(db, _body(context={"target_repo": target}))
+    assert resp.status_code == 403, resp.text
+    got = receipt_by_id_from(db, resp.json()["receipt_id"])
+    assert got["decision"] == "BLOCK"
+    assert got["reason"]["code"] == "PROJECT_MISMATCH"
+    assert target in got["reason"]["text"]
+    assert _row_project(db, "t1") is None
+
+
+def test_absent_target_repo_remains_admitted(tmp_path, live):
+    db = _queue_with_origin(tmp_path, "https://github.com/owner/repo.git")
+    resp = _post(db, _body())
+    assert resp.status_code == 201, resp.text
+    assert _row_project(db, "t1") == PROJECT
+
+
+def test_target_repo_refuses_when_queue_origin_is_unknown(tmp_path, live):
+    db = _project_dir(tmp_path)
+    resp = _post(db, _body(context={"target_repo": "owner/repo"}))
+    assert resp.status_code == 403, resp.text
+    got = receipt_by_id_from(db, resp.json()["receipt_id"])
+    assert got["decision"] == "BLOCK"
+    assert got["reason"]["code"] == "PROJECT_MISMATCH"
+    assert "could not determine" in got["reason"]["text"]
+    assert _row_project(db, "t1") is None
+
+
+def test_target_repo_mismatch_uses_same_refusal_for_every_ingress(tmp_path, live):
+    db = _queue_with_origin(tmp_path, "https://github.com/owner/repo.git")
+    q = TaskQueue(str(db))
+    for ingress in sorted(__import__("agent_crew.cea.adapters",
+                                     fromlist=["BY_ID"]).BY_ID):
+        request = task(f"repo-{ingress}", project=PROJECT)
+        request.context = {"target_repo": "another/project"}
+        with pytest.raises(AdmissionRefused) as exc:
+            q.enqueue(request, ingress=ingress)
+        got = receipt_by_id(q, exc.value.receipt_id)
+        assert got["decision"] == "BLOCK", ingress
+        assert got["reason"]["code"] == "PROJECT_MISMATCH", ingress
+        assert _row_project(db, request.task_id) is None
 
 
 def test_enforce_without_a_credential_is_403_with_a_receipt_naming_the_queue_project(
