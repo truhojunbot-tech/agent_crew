@@ -3,7 +3,8 @@
 
 Usage: runtime_swap.sh PROJECT FULL_SHA preflight|go|post
 Set AGENT_CREW_SWAP_CEA_ENV_FILE to a private KEY=VAL file. A rollback uses
-this same command with the previous full SHA. No SIGKILL or implicit rollback.
+this same command with the previous full SHA after a healthy swap. For recovery
+after a failed relaunch, see docs/runtime_swap.md. No SIGKILL.
 """
 from __future__ import annotations
 
@@ -144,7 +145,9 @@ def main(argv=None) -> int:
     paused(db_path, health)
     require_empty_queue(api(port, "/tasks"))
     pid = listener_pid(port)
-    evidence.mkdir(parents=True, exist_ok=True)
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.parent.chmod(0o700)
+    evidence.mkdir(exist_ok=True)
     evidence.chmod(0o700)
     if args.step == "preflight":
         (evidence / "env.pre.nul").write_bytes((Path("/proc") / str(pid) / "environ").read_bytes())
@@ -211,6 +214,12 @@ def main(argv=None) -> int:
         raise RuntimeError("task status counts changed across swap")
     write_json(evidence / "counts.post.json", counts(db_path))
     write_json(evidence / "health.post.json", health)
+    # The captured environment can carry provider tokens. It is needed only
+    # until a verified post; retain its digest, not its secret contents.
+    env_dump = evidence / "env.pre.nul"
+    if env_dump.exists():
+        (evidence / "env.pre.sha256").write_text(hashlib.sha256(env_dump.read_bytes()).hexdigest() + "\n")
+        env_dump.unlink()
     print(f"POST_OK evidence={evidence}")
     return 0
 

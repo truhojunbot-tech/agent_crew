@@ -2,7 +2,6 @@
 """Relaunch crew using captured NUL env plus explicit KEY=VAL CEA overrides."""
 from __future__ import annotations
 
-import os
 import re
 import subprocess
 import sys
@@ -24,17 +23,21 @@ def parse_env(raw: bytes) -> dict[str, str]:
 
 
 def spawn(env_file: Path, cea_file: Path, log: Path, port: int, source: Path) -> int:
-    from runtime_swap import parse_env_file
+    try:
+        from .runtime_swap import parse_env_file
+    except ImportError:  # executed as a file by runtime_swap.py
+        from runtime_swap import parse_env_file
 
     env = parse_env(env_file.read_bytes())
     for key in list(env):
         if key in {"_", "OLDPWD", "PWD", "SHLVL"} or key.startswith("AGENT_CREW_CEA_"):
             env.pop(key)
-    previous = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = re.sub(r"(?:/[^: ]+)?/alfred/(?:projects/agent_crew|runtime/agent_crew-[0-9a-f]+)/src",
-                                str(source), previous) if previous else str(source)
-    if str(source) not in env["PYTHONPATH"].split(":"):
-        env["PYTHONPATH"] = str(source) + (":" + env["PYTHONPATH"] if env["PYTHONPATH"] else "")
+    # Remove any old checkout that actually contains agent_crew, regardless of
+    # its directory layout. Retain unrelated entries in their original order.
+    previous = env.get("PYTHONPATH", "").split(":")
+    other = [entry for entry in previous if entry and Path(entry) != source
+             and not (Path(entry) / "agent_crew").is_dir()]
+    env["PYTHONPATH"] = ":".join([str(source), *other])
     env.update(parse_env_file(cea_file))
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as output:
