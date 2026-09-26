@@ -2630,6 +2630,9 @@ class TaskQueue:
                         conn, task.task_id, "duplicate_review_override", time.time(),
                         existing_task_id=duplicate_id)
                 else:
+                    # The refusal audit must not commit writes made earlier in
+                    # the admission transaction. Record it on a clean one.
+                    conn.rollback()
                     self._append_exec_event_on(
                         conn, task.task_id, "duplicate_review_refused", time.time(),
                         existing_task_id=duplicate_id, code=DuplicateReviewError.code)
@@ -2745,7 +2748,8 @@ class TaskQueue:
             "SELECT task_id, branch, pr_number, context FROM tasks "
             "WHERE project=? AND task_type=? AND task_id<>? "
             "AND (status IN ('pending', 'in_progress') "
-            "OR (status='completed' AND verdict IN ('approve', 'request_changes'))) "
+            "OR (status='completed' AND (task_type='test' "
+            "OR (verdict IS NOT NULL AND trim(verdict) <> '')))) "
             "ORDER BY created_at",
             (task.project, task.task_type, task.task_id),
         ).fetchall()

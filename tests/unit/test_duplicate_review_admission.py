@@ -63,12 +63,42 @@ def test_in_progress_review_is_refused(queue):
         queue.enqueue(task("second"))
 
 
-def test_completed_verdict_blocks_rereview(queue):
+@pytest.mark.parametrize("verdict", ["approve", "request_changes", "changes_requested"])
+def test_completed_verdict_blocks_rereview(queue, verdict):
     queue.enqueue(task("first"))
     queue.submit_result("first", TaskResult(task_id="first", status="completed",
-                                            summary="reviewed", verdict="approve"))
+                                            summary="reviewed", verdict=verdict))
     with pytest.raises(DuplicateReviewError):
         queue.enqueue(task("second"))
+
+
+def test_completed_test_without_verdict_blocks_retest(queue):
+    queue.enqueue(task("first", kind="test"))
+    queue.submit_result("first", TaskResult(task_id="first", status="completed",
+                                            summary="tested"))
+    with pytest.raises(DuplicateReviewError):
+        queue.enqueue(task("second", kind="test"))
+
+
+def test_refusal_does_not_commit_other_transaction_writes(queue, monkeypatch):
+    queue.enqueue(task("first"))
+    original = TaskQueue._duplicate_review_in_txn
+
+    def with_prior_write(conn, task_request, context):
+        conn.execute("UPDATE tasks SET description='unrelated write' WHERE task_id='first'")
+        return original(conn, task_request, context)
+
+    monkeypatch.setattr(TaskQueue, "_duplicate_review_in_txn", staticmethod(with_prior_write))
+    with pytest.raises(DuplicateReviewError):
+        queue.enqueue(task("second"))
+    conn = queue._connect()
+    try:
+        description = conn.execute("SELECT description FROM tasks WHERE task_id='first'").fetchone()[0]
+        event = conn.execute("SELECT event FROM task_exec_events WHERE task_id='second'").fetchone()[0]
+        assert description == "check PR"
+        assert event == "duplicate_review_refused"
+    finally:
+        conn.close()
 
 
 def test_explicit_same_head_rereview_records_override(queue):
@@ -92,16 +122,17 @@ def test_failed_or_unjudged_completion_can_retry(queue):
     queue.enqueue(task("second"))
 
 
+@pytest.mark.parametrize("kind", ["review", "test"])
 @pytest.mark.parametrize("status", ["failed", "timed_out", "cancelled", "needs_human"])
-def test_nonstanding_review_can_retry(queue, status):
-    queue.enqueue(task("first"))
+def test_nonstanding_review_can_retry(queue, status, kind):
+    queue.enqueue(task("first", kind=kind))
     conn = queue._connect()
     try:
         conn.execute("UPDATE tasks SET status=? WHERE task_id='first'", (status,))
         conn.commit()
     finally:
         conn.close()
-    queue.enqueue(task("second"))
+    queue.enqueue(task("second", kind=kind))
     assert [t.task_id for t in queue.list_tasks()] == ["first", "second"]
 
 
