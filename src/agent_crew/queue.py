@@ -4479,12 +4479,13 @@ class TaskQueue:
                         "outcome": None, "enforced": _cea_callsites.enforcing(self.cea_config())}
             engine = self.cea_engine()
             row = _cea_store.nonce_row(conn, nonce) if nonce else None
+            gate_config = self.cea_config_for_receipt(receipt)
             gate = _cea_callsites.gate_execute_start(
                 receipt, nonce=nonce,
                 current=_cea_callsites.current_inputs(
                     engine, receipt, presenter=presenter, already_dispatched=True,
                     nonce_unused=(None if row is None else row.get("used_at") is None)),
-                config=self.cea_config_for_receipt(receipt))
+                config=gate_config)
             spent = False
             if gate.proceed and nonce:
                 # ⛔Tag *who* spent it. RESULT reads this back to tell
@@ -4510,7 +4511,12 @@ class TaskQueue:
                       "enforced": gate.enforced, "nonce_spent": spent}
             if not gate.enforced and gate.outcome.value != "PROCEED":
                 answer.update(advisory=True, shadow_outcome=gate.outcome.value,
-                              instruction="shadow mode: not enforced — proceed; decide on go only")
+                              instruction=(
+                                  "shadow mode: not enforced — proceed; decide on go only"
+                                  if gate_config.mode == "shadow" else
+                                  "advisory verdict: not enforced — proceed; decide on go only"))
+                if gate.review_required:
+                    answer["review_required"] = True
             return answer
         except Exception:
             try:

@@ -73,6 +73,18 @@ engine rather than duplicating it.
 | `test` | yes — a harness, and it says so in its name | yes |
 | `enforce` | **no** | yes |
 
+For staged enforcement, set `AGENT_CREW_CEA_ENFORCE_CODES_<PROJECT>` to a
+comma-separated set of reason codes, for example
+`AGENT_CREW_CEA_ENFORCE_CODES_ALFRED=RUNTIME_STATE_FORBIDS`. Project names use
+the same uppercase, non-alphanumeric-to-underscore normalization as
+`AGENT_CREW_CEA_MODE__<PROJECT>`. The process-wide fallback is
+`AGENT_CREW_CEA_ENFORCE_CODES`. A project value takes precedence when present.
+In `enforce` or `test`, only listed codes stop work; other non-PROCEED answers
+remain recorded as advisory and require review. Without either variable, all
+codes enforce as before. Unknown codes are ignored with a warning. This setting
+changes only whether a verdict stops work; the receipt keeps its actual decision
+and reason code. It does not change the separate operator STOP gate.
+
 In `enforce`, embedded in-process `authorize()` returns a P7 fail-closed receipt
 (`BLOCK` / `CREDENTIAL_BOUNDARY_UNAVAILABLE`, with `caller_credential_boundary`
 in `provenance.unavailable_inputs`) and the engine must be reached over the unix
