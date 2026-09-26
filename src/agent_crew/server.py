@@ -824,6 +824,10 @@ def _prepare_worktree_for_task_inner(
         return (base_sha if fresh_base and checkout_ok
                 and _worktree_head(worktree_path) == base_sha else "")
     else:
+        # ⛔The roles have different input commits: an implementer starts from
+        # the declared base so a prior PR head cannot become its dispatch base
+        # (#397). A reviewer or tester must see the PR head's code, not that
+        # base, or it would judge/test a change it never checked out (#286).
         # Reviewer/tester: checkout the PR branch from origin (#141, #186).
         # task.branch holds the base branch (e.g. main), not the PR head.
         # Resolve the actual PR head ref from pr_number when available so
