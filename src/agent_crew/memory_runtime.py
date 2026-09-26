@@ -1,6 +1,7 @@
 """ADR-001 durable, backend-neutral memory layer (disabled by default)."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -116,6 +117,18 @@ class SQLiteMemoryStorage:
     def put(self, record: MemoryRecord) -> None:
         if record.layer not in LAYERS: raise ValueError("unknown memory layer")
         with closing(sqlite3.connect(self.path)) as db:
+            if record.layer == "authoritative" and record.key.startswith("owner:"):
+                # Owner source records are immutable even when a caller supplies
+                # a higher version. A correction has its own message identity.
+                db.execute("BEGIN IMMEDIATE")
+                previous = db.execute(
+                    "SELECT value FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
+                    (record.layer, record.key, _canonical_scope_json(record.scope)),
+                ).fetchone()
+                if previous:
+                    if json.loads(previous[0]) != record.value:
+                        raise ValueError("owner statement is immutable")
+                    return
             db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
                 ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
                 WHERE excluded.version > adr001_memory.version""",
@@ -152,6 +165,105 @@ class SQLiteMemoryStorage:
             specificity = _scope_specificity(record.scope)
             return (-relevance, -specificity, record.key)
         return sorted(result, key=rank)
+
+
+def owner_statement_key(project: str, channel: str, chat_id: str,
+                        message_id: str) -> str:
+    """Exact owner identity: target bot, verified channel, chat and message."""
+    parts = (project, channel, chat_id, message_id)
+    if any(not isinstance(part, str) or not part or ":" in part for part in parts):
+        raise ValueError("incomplete owner statement identity")
+    return "owner:" + ":".join(parts)
+
+
+def capture_owner_statement(storage: MemoryStorage, *, project: str,
+                            target_project: str, proof: dict, text: str,
+                            source_ref: str, supersedes: Optional[list] = None,
+                            observed_at: str = ""
+                            ) -> MemoryRecord:
+    """Write an independently verified message to the existing authoritative layer.
+
+    The caller must obtain ``proof`` from owner_channel.verify_telegram on the
+    exact source text. No inferred bot, sender, correction or authority is accepted.
+    """
+    if not project or project != target_project or not source_ref:
+        raise ValueError("owner source target or provenance missing/mismatched")
+    if not isinstance(proof, dict) or proof.get("status") != "VERIFIED":
+        raise ValueError("owner message not verified")
+    chat, sender, mid = (str(proof.get(k) or "") for k in
+                         ("chat_id", "user_id", "message_id"))
+    if not chat or chat != sender or not mid or not proof.get("ts"):
+        raise ValueError("owner chat/message identity not verified")
+    if not isinstance(text, str) or not text or proof.get("text_sha256") != hashlib.sha256(text.encode()).hexdigest():
+        raise ValueError("owner text hash mismatch")
+    key = owner_statement_key(project, "telegram", chat, mid)
+    links = supersedes or []
+    if not isinstance(links, list) or any(not isinstance(link, str) for link in links):
+        raise ValueError("invalid supersedes links")
+    scope = MemoryScope(project=project)
+    for link in links:
+        prior = [r for r in storage.retrieve(scope, exact_key=link)
+                 if r.layer == "authoritative" and r.scope.project == project
+                 and r.value.get("kind") == "owner_statement"]
+        if not prior or link == key:
+            raise ValueError("superseded owner message is absent or outside target bot")
+    record = MemoryRecord("authoritative", key, {
+        "kind": "owner_statement", "text": text, "text_sha256": proof["text_sha256"],
+        "message_id": mid, "chat_id": chat, "channel": "telegram",
+        "timestamp": observed_at or str(proof["ts"]),
+        "channel_ts": str(proof["ts"]), "source_ref": source_ref,
+        "verification_status": "VERIFIED", "supersedes": links,
+    }, scope)
+    storage.put(record)
+    return record
+
+
+def effective_owner_statements(storage: MemoryStorage, project: str) -> list[MemoryRecord]:
+    """PR #57 correction resolution on records from one scoped memory store."""
+    records = _scoped_owner_records(storage, project)
+    superseded = {link for record in records
+                  for link in record.value.get("supersedes", [])}
+    return [r for r in records if r.key not in superseded]
+
+
+def owner_statement_history(storage: MemoryStorage, project: str,
+                            exact_key: str) -> list[MemoryRecord]:
+    """Read the immutable original and linked corrections for audit only."""
+    records = _scoped_owner_records(storage, project)
+    originals = [r for r in records if r.key == exact_key]
+    if not originals:
+        return []
+    seen = {exact_key}
+    while True:
+        added = {r.key for r in records if r.key not in seen
+                 and any(link in seen for link in r.value.get("supersedes", []))}
+        if not added:
+            break
+        seen.update(added)
+    return originals + [r for r in records if r.key in seen and r.key != exact_key]
+
+
+def _scoped_owner_records(storage: MemoryStorage, project: str) -> list[MemoryRecord]:
+    if not project:
+        raise ValueError("owner project is required")
+    records = [r for r in storage.retrieve(MemoryScope(project=project))
+               if r.layer == "authoritative" and r.value.get("kind") == "owner_statement"
+               and r.scope.project == project]
+    for record in records:
+        value = record.value
+        expected = owner_statement_key(project, "telegram", str(value.get("chat_id") or ""),
+                                       str(value.get("message_id") or ""))
+        if (record.key != expected or value.get("verification_status") != "VERIFIED"
+                or value.get("text_sha256") != hashlib.sha256(
+                    str(value.get("text") or "").encode()).hexdigest()):
+            raise ValueError("invalid authoritative owner record")
+    keys = {record.key for record in records}
+    for record in records:
+        links = record.value.get("supersedes", [])
+        if (not isinstance(links, list)
+                or any(not isinstance(link, str) or link not in keys for link in links)):
+            raise ValueError("invalid owner statement supersedes link")
+    return records
 
 
 def memory_enabled() -> bool:
