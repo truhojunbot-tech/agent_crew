@@ -62,7 +62,7 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import (AdmissionRefused, LateResultRejected, TaskAlreadyExistsError,
+from agent_crew.queue import (AdmissionRefused, DuplicateReviewError, LateResultRejected, TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -5902,6 +5902,11 @@ def create_app(
                     "task_id": e.task_id,
                     "status": e.status,
                 },
+            )
+        except DuplicateReviewError as e:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": e.code, "existing_task_id": e.existing_task_id},
             )
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
         if not _push_enabled:

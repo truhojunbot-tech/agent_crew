@@ -1220,6 +1220,16 @@ class TaskAlreadyExistsError(Exception):
         super().__init__(f"task_id {task_id!r} already exists with status={status!r}")
 
 
+class DuplicateReviewError(Exception):
+    """A review or test of the same target and immutable head already exists."""
+
+    code = "DUPLICATE_REVIEW"
+
+    def __init__(self, existing_task_id: str):
+        self.existing_task_id = existing_task_id
+        super().__init__(f"DUPLICATE_REVIEW: existing task {existing_task_id}")
+
+
 def _is_issue_number(value) -> bool:
     """Is this a usable issue number?
 
@@ -2613,6 +2623,13 @@ class TaskQueue:
             if self._stop_active_in_txn(conn, point=_cea_validator.ValidationPoint.ENQUEUE):
                 conn.execute("ROLLBACK")
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
+            duplicate_id = self._duplicate_review_in_txn(conn, task, context)
+            if duplicate_id:
+                self._append_exec_event_on(
+                    conn, task.task_id, "duplicate_review_refused", time.time(),
+                    existing_task_id=duplicate_id, code=DuplicateReviewError.code)
+                conn.commit()
+                raise DuplicateReviewError(duplicate_id)
             conn.execute(
                 """
                 INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project, receipt_id)
@@ -2704,6 +2721,48 @@ class TaskQueue:
         except Exception:
             logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
         return task.task_id
+
+    @staticmethod
+    def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict) -> Optional[str]:
+        """Find a standing review/test of this target and head under the write lock."""
+        if task.task_type not in ("review", "test"):
+            return None
+        sha = context.get("reviewed_sha") or context.get("expected_head_sha") or context.get("head_sha")
+        if not isinstance(sha, str) or not _CEA_COMMIT_RE.fullmatch(sha.strip()):
+            return None  # A moving or unknown head has no safe immutable identity.
+        sha = sha.strip().lower()
+        pr = _normalize_pr_number(context.get("pr_number"))
+        if pr is None:
+            pr = _normalize_pr_number(task.pr_number)
+        if pr is None and not task.branch:
+            return None
+        rows = conn.execute(
+            "SELECT task_id, branch, pr_number, context FROM tasks "
+            "WHERE project=? AND task_type=? AND task_id<>? "
+            "AND (status IN ('pending', 'in_progress') "
+            "OR (status='completed' AND verdict IN ('approve', 'request_changes'))) "
+            "ORDER BY created_at",
+            (task.project, task.task_type, task.task_id),
+        ).fetchall()
+        for row in rows:
+            try:
+                old = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(old, dict):
+                continue
+            old_pr = _normalize_pr_number(old.get("pr_number"))
+            if old_pr is None:
+                old_pr = _normalize_pr_number(row["pr_number"])
+            if pr is not None:
+                if old_pr != pr:
+                    continue
+            elif old_pr is not None or row["branch"] != task.branch:
+                continue
+            old_sha = old.get("reviewed_sha") or old.get("expected_head_sha") or old.get("head_sha")
+            if isinstance(old_sha, str) and old_sha.strip().lower() == sha:
+                return row["task_id"]
+        return None
 
     def enqueue(self, task: TaskRequest, *, ingress: Optional[str] = None,
                 provenance: Optional["_CeaProvenance"] = None,

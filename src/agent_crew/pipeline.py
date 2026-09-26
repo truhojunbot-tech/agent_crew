@@ -47,6 +47,7 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import (TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError,
+                              DuplicateReviewError,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
 from agent_crew import tokenomics_canary as _tokenomics_canary
@@ -1768,6 +1769,8 @@ def auto_enqueue_review(
         except TaskAlreadyExistsError:
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
+        except DuplicateReviewError as exc:
+            return exc.existing_task_id
         return review_id
     except PausedError:
         # #314 §4 P0-2: STOP race — successor enqueue가 원자 거부됨. 부모(impl) outbox를 reopen해
@@ -1915,6 +1918,8 @@ def auto_enqueue_test(
             queue.enqueue(test_req, ingress="cascade.test")
         except TaskAlreadyExistsError:
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
+        except DuplicateReviewError as exc:
+            return exc.existing_task_id
         return test_id
     except PausedError:
         # #314 §4 P0-2: STOP race — 부모(review) outbox reopen + 전파.
