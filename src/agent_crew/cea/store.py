@@ -138,8 +138,9 @@ CREATE TABLE IF NOT EXISTS dispatch_nonces (
 # found, and only the database can arbitrate it.
 #
 # A CONSUMED lineage keeps its row until admission checks the task outcome:
-# completed tasks block replay; noncompleted tasks release it for a linked
-# retry. SUPERSEDED/REVOKED release it immediately.
+# completed or unknown task outcomes block replay; explicitly known failed,
+# needs_human, cancelled, or timed_out outcomes release it for a linked retry.
+# SUPERSEDED/REVOKED release it immediately.
 _DDL_INTENT_LINEAGES = """
 CREATE TABLE IF NOT EXISTS intent_lineages (
     intent_hash TEXT PRIMARY KEY,

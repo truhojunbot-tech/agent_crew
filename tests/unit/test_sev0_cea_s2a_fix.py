@@ -407,6 +407,31 @@ def test_consumed_completed_task_still_blocks_same_intent(conn, mode):
 
 
 @pytest.mark.parametrize("mode", ["shadow", "test"])
+@pytest.mark.parametrize("missing", ["task_row", "tasks_table"])
+def test_consumed_unknown_task_status_still_blocks_same_intent(conn, mode, missing):
+    eng = engine(config=EngineConfig(mode=mode))
+    first = eng.authorize(conn, _ops("unknown-1"), caller())
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
+    if missing == "tasks_table":
+        conn.execute("DROP TABLE tasks")
+    # The task row is already absent in the task_row case.
+    retry = eng.authorize(conn, _ops("unknown-2"), caller())
+    assert retry.code == "ALREADY_COMPLETED"
+    lineage = receipt_store.lineage_for_intent(conn, first.receipt["intent_hash"])
+    assert lineage["receipt_id"] == first.receipt_id
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress", "blocked"])
+def test_consumed_other_known_statuses_do_not_release_lineage(conn, status):
+    eng = engine()
+    first = eng.authorize(conn, _ops("other-status-1"), caller())
+    run_to(eng, conn, first.receipt_id, "CONSUMED")
+    set_task_status(conn, first.receipt_id, status)
+    retry = eng.authorize(conn, _ops("other-status-2"), caller())
+    assert retry.code == "ALREADY_COMPLETED"
+
+
+@pytest.mark.parametrize("mode", ["shadow", "test"])
 def test_noncompleted_work_does_not_block_a_changed_authority_hash(conn, mode):
     extra = DecisionRev("T0-5555", "d" * 32)
     snapshot = FakeSnapshot(decisions=(DECISION, extra), in_scope=(DECISION, extra))
