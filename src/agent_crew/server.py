@@ -8,6 +8,7 @@ import math
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -2651,7 +2652,9 @@ def create_app(
         each worktree (fetch + branch checkout) before dispatching a task to
         it. Falls back to _load_worktree_map(state_path) if omitted.
     memory_provider: optional project-local historical-memory provider. Its
-        retrieval is shadow telemetry only and can never alter dispatch.
+        retrieval is shadow telemetry only and can never alter dispatch. When
+        omitted, AGENT_CREW_SHADOW_MEMORY_DB selects an existing SQLite memory
+        file; an absent or unusable file falls back to NullMemoryProvider.
     shadow_memory_enabled: explicit opt-in for shadow retrieval. Disabled by
         default, so even an injected provider receives zero calls until enabled.
     """
@@ -2659,7 +2662,22 @@ def create_app(
                 _cpack.enabled(), os.environ.get("AGENT_CREW_CONTEXT_PACK"))
     _codex_cap_mb = _codex_context_cap_mb(state_path)
     logger.info("Codex context cap effective=%s MB", _codex_cap_mb)
-    _memory_provider = memory_provider or NullMemoryProvider()
+    if memory_provider is not None:
+        _memory_provider = memory_provider
+    else:
+        shadow_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()
+        if shadow_db and os.path.isfile(os.path.expanduser(shadow_db)):
+            from agent_crew.memory_runtime import RuntimeMemoryProvider, SQLiteMemoryStorage
+            try:
+                _memory_provider = RuntimeMemoryProvider(
+                    SQLiteMemoryStorage(os.path.expanduser(shadow_db)))
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                logger.warning("AGENT_CREW_SHADOW_MEMORY_DB is unusable: %s", exc)
+                _memory_provider = NullMemoryProvider()
+        else:
+            if shadow_db:
+                logger.warning("AGENT_CREW_SHADOW_MEMORY_DB does not name an existing file: %s", shadow_db)
+            _memory_provider = NullMemoryProvider()
     if shadow_memory_enabled is None:
         shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
             "1", "true", "yes",

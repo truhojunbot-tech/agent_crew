@@ -299,8 +299,9 @@ class RuntimeMemoryProvider:
     def retrieve(self, request):
         from .memory import MemoryItem, MemoryResult
 
-        if not memory_enabled():
-            return MemoryResult(provider=self.name, backend=self.backend, state="unavailable")
+        # This adapter is only used by the shadow dispatch seam. Its flag is
+        # AGENT_CREW_SHADOW_MEMORY_ENABLED; the live-read flag belongs solely
+        # to reconstruct_context and must not suppress a shadow comparison.
         if not request.project:
             return MemoryResult(provider=self.name, backend=self.backend, state="empty")
         scope = MemoryScope(fleet=self.fleet, project=request.project,
