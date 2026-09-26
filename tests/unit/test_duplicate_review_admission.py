@@ -1,9 +1,11 @@
 import json
+import dataclasses
 
 import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.cea import store as receipt_store
 from agent_crew.queue import DuplicateReviewError, TaskQueue
 from agent_crew.server import create_app
 
@@ -19,10 +21,124 @@ def queue(tmp_path):
 
 def task(task_id, *, kind="review", pr=23, sha=SHA_A, project="owner/repo", branch="feature",
          allow_duplicate_review=False):
+    context = {"allow_duplicate_review": allow_duplicate_review}
+    if pr is not None:
+        context["pr_number"] = pr
+    if sha is not None:
+        context["reviewed_sha"] = sha
     return TaskRequest(task_id=task_id, task_type=kind, description="check PR",
                        project=project, branch=branch,
-                       context={"pr_number": pr, "reviewed_sha": sha,
-                                "allow_duplicate_review": allow_duplicate_review})
+                       context=context)
+
+
+@pytest.mark.parametrize("kind", ["review", "test"])
+@pytest.mark.parametrize("pr", [5694, None])
+@pytest.mark.parametrize("second_sha", [SHA_A, None])
+def test_alpha_engine_pending_unpinned_cascade_blocks_coordinator(queue, kind, pr,
+                                                                   second_sha):
+    first = task("review-impl-dartsub-0926b-r0", kind=kind, pr=pr, sha=None)
+    second = task("review-5694-r1", kind=kind, pr=pr, sha=second_sha)
+    second.context["coordinator_managed"] = True
+    queue.enqueue(first)
+    with pytest.raises(DuplicateReviewError) as exc:
+        queue.enqueue(second)
+    assert exc.value.existing_task_id == first.task_id
+
+
+def test_reverse_order_waits_for_dispatch_pin(queue):
+    queue.enqueue(task("pinned-first", sha=SHA_A))
+    queue.enqueue(task("unpinned-second", sha=None))
+    assert len(queue.list_tasks()) == 2
+    first = queue.dequeue(role="reviewer")
+    assert first.task_id == "pinned-first"
+    assert queue.record_prepared_review_base(first.task_id, {"reviewed_sha": SHA_A})
+    second = queue.dequeue(role="reviewer")
+    assert second.task_id == "unpinned-second"
+    assert not queue.record_prepared_review_base(second.task_id, {"reviewed_sha": SHA_A})
+    assert queue.get_task_status(second.task_id) == "blocked"
+    conn = queue._connect()
+    try:
+        receipt = receipt_store.current_receipt(conn, queue.task_receipt_id(second.task_id))
+        assert receipt["state"] == "REVOKED"
+        row = conn.execute("SELECT event, fields FROM task_exec_events "
+                           "WHERE task_id=? AND event='duplicate_review_refused'",
+                           (second.task_id,)).fetchone()
+        assert json.loads(row["fields"])["existing_task_id"] == first.task_id
+    finally:
+        conn.close()
+
+
+def test_dispatch_pin_override_and_different_sha(queue):
+    queue.enqueue(task("first", sha=SHA_A))
+    queue.enqueue(task("override", sha=None, allow_duplicate_review=True))
+    first = queue.dequeue(role="reviewer")
+    assert queue.record_prepared_review_base(first.task_id, {"reviewed_sha": SHA_A})
+    override = queue.dequeue(role="reviewer")
+    assert queue.record_prepared_review_base(override.task_id, {"reviewed_sha": SHA_A})
+    assert queue.get_task_status(override.task_id) == "in_progress"
+    conn = queue._connect()
+    try:
+        event = conn.execute("SELECT 1 FROM task_exec_events WHERE task_id='override' "
+                             "AND event='duplicate_review_override'").fetchone()
+        assert event is not None
+    finally:
+        conn.close()
+    queue.enqueue(task("new-head", sha=None))
+    different = queue.dequeue(role="reviewer")
+    assert queue.record_prepared_review_base(different.task_id, {"reviewed_sha": SHA_B})
+    assert queue.get_task_status(different.task_id) == "in_progress"
+
+
+@pytest.mark.parametrize("kind", ["review", "test"])
+def test_pending_unpinned_override_and_new_head(queue, kind):
+    queue.enqueue(task("first", kind=kind, sha=None))
+    queue.enqueue(task("override", kind=kind, sha=SHA_A, allow_duplicate_review=True))
+    assert queue.get_task_status("override") == "pending"
+    conn = queue._connect()
+    try:
+        event = conn.execute("SELECT 1 FROM task_exec_events WHERE task_id='override' "
+                             "AND event='duplicate_review_override'").fetchone()
+        assert event is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("kind", ["review", "test"])
+def test_dispatch_pin_refuses_completed_judgement(queue, kind):
+    queue.enqueue(task("judged", kind=kind, sha=SHA_A))
+    queue.submit_result("judged", TaskResult(
+        task_id="judged", status="completed", summary="done",
+        verdict="approve" if kind == "review" else None))
+    queue.enqueue(task("late-unpinned", kind=kind, sha=None))
+    late = queue.dequeue(role="reviewer" if kind == "review" else "tester")
+    assert late.task_id == "late-unpinned"
+    assert not queue.record_prepared_review_base(late.task_id, {"reviewed_sha": SHA_A})
+    assert queue.get_task_status(late.task_id) == "blocked"
+
+
+def test_duplicate_found_at_prepared_base_is_not_pushed(tmp_path, monkeypatch):
+    from agent_crew import server
+
+    db = str(tmp_path / "push.db")
+    q = TaskQueue(db)
+    q.enqueue(task("judged", sha=SHA_A))
+    q.submit_result("judged", TaskResult(
+        task_id="judged", status="completed", summary="done", verdict="approve"))
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+    monkeypatch.setattr(server, "_prepare_worktree_for_task", lambda *_a, **_kw: SHA_A)
+    pushes = []
+    app = create_app(
+        db_path=db, pane_map={"reviewer": "%101"},
+        worktree_map={"reviewer": str(tmp_path)}, port=9999,
+        push_fn=lambda pane, text: pushes.append((pane, text)),
+        watchdog_disabled=True, anomaly_disabled=True,
+    )
+    with TestClient(app) as client:
+        response = client.post("/tasks", json=dataclasses.asdict(task("late", sha=None)))
+        assert response.status_code == 201, response.text
+    assert q.get_task_status("late") == "blocked"
+    assert pushes == []
 
 
 @pytest.mark.parametrize("kind", ["review", "test"])

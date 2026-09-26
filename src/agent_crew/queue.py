@@ -1223,7 +1223,7 @@ class TaskAlreadyExistsError(Exception):
 
 
 class DuplicateReviewError(Exception):
-    """A review or test of the same target and immutable head already exists."""
+    """A review or test already reserves this target or has judged its head."""
 
     code = "DUPLICATE_REVIEW"
 
@@ -2825,21 +2825,29 @@ class TaskQueue:
         return task.task_id
 
     @staticmethod
-    def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict) -> Optional[str]:
-        """Find a standing review/test of this target and head under the write lock."""
+    def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict, *,
+                                 dispatch: bool = False) -> Optional[str]:
+        """Find a standing review/test of this target under the write lock.
+
+        Pending reviews without a pin will use the current head at dispatch, so
+        they reserve their PR or branch at enqueue. Once a task has prepared
+        its head, only an in-progress or judged-complete task at that exact SHA
+        can suppress it.
+        """
         if task.task_type not in ("review", "test"):
             return None
-        sha = context.get("reviewed_sha") or context.get("expected_head_sha") or context.get("head_sha")
-        if not isinstance(sha, str) or not _CEA_COMMIT_RE.fullmatch(sha.strip()):
-            return None  # A moving or unknown head has no safe immutable identity.
-        sha = sha.strip().lower()
+        sha = (context.get("reviewed_sha") if dispatch else
+               context.get("reviewed_sha") or context.get("expected_head_sha")
+               or context.get("head_sha"))
+        sha = (sha.strip().lower() if isinstance(sha, str)
+               and _CEA_COMMIT_RE.fullmatch(sha.strip()) else None)
         pr = _normalize_pr_number(context.get("pr_number"))
         if pr is None:
             pr = _normalize_pr_number(task.pr_number)
         if pr is None and not task.branch:
             return None
         rows = conn.execute(
-            "SELECT task_id, branch, pr_number, context FROM tasks "
+            "SELECT task_id, branch, pr_number, context, status FROM tasks "
             "WHERE project=? AND task_type=? AND task_id<>? "
             "AND (status IN ('pending', 'in_progress') "
             "OR (status='completed' AND (task_type='test' "
@@ -2862,10 +2870,72 @@ class TaskQueue:
                     continue
             elif old_pr is not None or row["branch"] != task.branch:
                 continue
-            old_sha = old.get("reviewed_sha") or old.get("expected_head_sha") or old.get("head_sha")
-            if isinstance(old_sha, str) and old_sha.strip().lower() == sha:
+            old_sha = (old.get("reviewed_sha") if dispatch else
+                       old.get("reviewed_sha") or old.get("expected_head_sha")
+                       or old.get("head_sha"))
+            old_sha = (old_sha.strip().lower() if isinstance(old_sha, str)
+                       and _CEA_COMMIT_RE.fullmatch(old_sha.strip()) else None)
+            if row["status"] == "pending" and dispatch:
+                continue
+            if row["status"] == "pending" and old_sha is None and not dispatch:
+                return row["task_id"]
+            if sha is not None and old_sha == sha:
                 return row["task_id"]
         return None
+
+    def record_prepared_review_base(self, task_id: str, base_context: dict) -> bool:
+        """Pin a claimed review/test or end it before delivery if already judged.
+
+        The duplicate lookup, context write and terminal refusal share one
+        SQLite write lock. ``False`` means the server must not push this task.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT task_type, description, branch, project, pr_number, "
+                "context, status FROM tasks WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.rollback()
+                return False
+            old_context = json.loads(row["context"] or "{}")
+            context = {**old_context, **base_context}
+            request = TaskRequest(
+                task_id=task_id, task_type=row["task_type"],
+                description=row["description"], branch=row["branch"],
+                project=row["project"], context=context, pr_number=row["pr_number"],
+            )
+            existing = self._duplicate_review_in_txn(conn, request, context, dispatch=True)
+            if existing and context.get("allow_duplicate_review") is not True:
+                summary = f"DUPLICATE_REVIEW: existing task {existing} reviews this head"
+                conn.execute(
+                    "UPDATE tasks SET status='blocked', summary=?, context=? "
+                    "WHERE task_id=?",
+                    (summary, json.dumps(context), task_id),
+                )
+                self._append_exec_event_on(
+                    conn, task_id, "duplicate_review_refused", time.time(),
+                    existing_task_id=existing, code=DuplicateReviewError.code)
+                self._record_end_on(conn, task_id, time.time(), "duplicate_review_refused",
+                                    posted=False, existing_task_id=existing)
+                conn.commit()
+                self.settle_unused_task_receipt(task_id, note=summary)
+                return False
+            if existing:
+                self._append_exec_event_on(
+                    conn, task_id, "duplicate_review_override", time.time(),
+                    existing_task_id=existing)
+            conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                         (json.dumps(context), task_id))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def enqueue(self, task: TaskRequest, *, ingress: Optional[str] = None,
                 provenance: Optional["_CeaProvenance"] = None,
