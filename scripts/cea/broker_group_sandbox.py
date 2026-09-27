@@ -30,9 +30,19 @@ def client(sock, credential, expected_uid):
     errors = validate_receipt(reply["receipt"])
     if errors:
         raise RuntimeError(f"invalid receipt: {errors}")
+    from agent_crew.cea import signed_receipt
+    public = signed_receipt.load_public(os.environ["AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE"])
+    receipt = reply["receipt"]
+    valid = signed_receipt.verify_signature(receipt, public)
+    tampered = dict(receipt, description="tampered")
+    rejected = signed_receipt.verify_signature(tampered, public)
+    if not valid or rejected:
+        raise RuntimeError(f"signed receipt verification or tamper rejection failed: decision={receipt.get('decision')} valid={valid} tampered_valid={rejected}")
     return {"peer_uid": peer_uid, "authorize_code": reply.get("code"),
             "decision": reply["receipt"].get("decision"), "authenticated": True,
-            "schema_valid": True, "downgrade_reason": reply["receipt"].get("downgrade_reason")}
+            "schema_valid": True, "signed_receipt_valid": valid,
+            "tampered_receipt_rejected": not rejected,
+            "downgrade_reason": reply["receipt"].get("downgrade_reason")}
 
 
 def proof(source_root, token_source, *, cross_uid, installed_root=None):
@@ -98,6 +108,20 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None):
             tokens.chmod(0o600)
             if cross_uid:
                 os.chown(tokens, broker_uid, broker_gid)
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        signing_private = installed_root / "receipt-signing.key" if installed_root else private / "receipt-signing.key"
+        signing_public = installed_root / "receipt-signing.pub" if installed_root else root / "receipt-signing.pub"
+        if not installed_root:
+            key = Ed25519PrivateKey.generate()
+            signing_private.write_bytes(key.private_bytes(serialization.Encoding.Raw,
+                serialization.PrivateFormat.Raw, serialization.NoEncryption()))
+            signing_public.write_bytes(key.public_key().public_bytes(serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw))
+            signing_private.chmod(0o400)
+            signing_public.chmod(0o644)
+            if cross_uid:
+                os.chown(signing_private, broker_uid, broker_gid)
         sockdir = root / "sock"
         sockdir.mkdir()
         if cross_uid:
@@ -121,6 +145,8 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None):
         env.update(PYTHONPATH=(str(staged) if installed_root else os.pathsep.join((str(staged), str(user_site)))),
                    AGENT_CREW_AUTHZ_SRC_COMMIT_PATH=str(commit_marker),
                    AGENT_CREW_CEA_BROKER_DB=str(db),
+                   AGENT_CREW_CEA_RECEIPT_SIGNING_KEY_FILE=str(signing_private),
+                   AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE=str(signing_public),
                    AGENT_CREW_CEA_CALLER_TOKENS=str(tokens), AGENT_CREW_CEA_MODE="enforce",
                    AGENT_CREW_CEA_REGISTRY_PATH=str(root / "absent-registry.json"),
                    AGENT_CREW_CEA_SNAPSHOT_PATH=str(root / "absent-snapshot.json"),

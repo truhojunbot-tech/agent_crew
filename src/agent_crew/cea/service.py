@@ -216,6 +216,19 @@ class BrokerDecisionClient(UnixSocketEngineClient):
                              code=str(reply["code"]), reused=bool(reply.get("reused")),
                              existing_receipt_id=reply.get("existing_receipt_id"))
 
+    def verify(self, receipt: dict) -> bool:
+        from agent_crew.cea import signed_receipt
+        try:
+            public = signed_receipt.load_public(os.environ.get(
+                "AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE", signed_receipt.DEFAULT_PUBLIC))
+            binding = (receipt.get("provenance") or {}).get(signed_receipt.DISPATCH_BINDING) or {}
+            valid, _ = signed_receipt.verify(receipt, public,
+                task_id=receipt.get("task_id"), receipt_id=receipt.get("receipt_id"),
+                payload=binding.get("payload_hash"))
+            return valid
+        except (OSError, ValueError, TypeError, KeyError):
+            return False
+
 
 # ── server ──────────────────────────────────────────────────────────────────
 
