@@ -286,6 +286,37 @@ def test_source_update_retains_grant_for_installed_owner_key(tmp_path):
     assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*" in sudoers.read_text()
 
 
+def test_owner_reviewer_id_install_dry_run_and_undo(tmp_path):
+    tree, _, sudoers = _seed(tmp_path)
+    dry = _run(tmp_path, "--dry-run", "--update-src", "--caller-tokens",
+               "/home/truhojun/.verify-private/tokens.json", "--owner-reviewer-id", "10932361")
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert "owner reviewer ID 10932361" in dry.stdout
+    assert not (tree / "owner-reviewer.json").exists()
+    applied = _run(tmp_path, "--apply", "--caller-tokens",
+                   "/home/truhojun/.verify-private/tokens.json", "--owner-reviewer-id", "10932361")
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    pinned = tree / "owner-reviewer.json"
+    assert json.loads(pinned.read_text()) == {"user_id": 10932361}
+    assert pinned.stat().st_mode & 0o777 == 0o644
+    assert "(root) NOPASSWD" in sudoers.read_text()
+    undone = _run(tmp_path, "--undo")
+    assert undone.returncode == 0, undone.stdout + undone.stderr
+    assert not pinned.exists()
+
+
+def test_source_update_keeps_installed_reviewer_grant(tmp_path):
+    tree, _, sudoers = _seed(tmp_path)
+    pinned = tree / "owner-reviewer.json"
+    pinned.write_text('{"user_id": 10932361}\n')
+    pinned.chmod(0o644)
+    result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(pinned.read_text()) == {"user_id": 10932361}
+    assert "(root) NOPASSWD" in sudoers.read_text()
+
+
 def test_apply_requires_ed25519_public_key(tmp_path):
     _seed(tmp_path)
     pubkey = tmp_path / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub"
@@ -482,7 +513,7 @@ def test_update_src_refuses_symlinked_snapshot_state(tmp_path):
 
 
 @pytest.mark.parametrize("stage", ["src", "schema", "venv", "state", "tokens", "receipt-key",
-                                   "receipt-pubkey", "launcher", "updater", "sudoers", "snapshot-pubkey", "selftest"])
+                                   "receipt-pubkey", "launcher", "updater", "sudoers", "snapshot-pubkey", "owner-reviewer", "selftest"])
 def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     tree, _, _ = _seed(tmp_path)
     launcher = tmp_path / "usr/local/libexec/crew-authz/broker-launch.sh"
@@ -511,8 +542,9 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     (tree / "state/snapshot-hwm.json").chmod(0o600)
     (tree / "receipt-signing.key").chmod(0o400)
     before = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in paths}
+    reviewer_args = ("--owner-reviewer-id", "10932361") if stage == "owner-reviewer" else ()
     result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
-                  "/home/truhojun/.verify-private/tokens.json",
+                  "/home/truhojun/.verify-private/tokens.json", *reviewer_args,
                   extra_env={"AGENT_CREW_OWNER_SETUP_TEST_FAIL_STAGE": stage})
     assert result.returncode != 0, result.stdout
     assert "injected update failure" in result.stderr
@@ -527,6 +559,8 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     assert not launcher.with_name("broker-launch.new").exists()
     assert not launcher.with_name("broker-update.old").exists()
     assert not launcher.with_name("broker-update.new").exists()
+    assert not (tree / "owner-reviewer.json").exists()
+    assert not (tree / "owner-reviewer.json.new").exists()
 
 
 def test_update_src_undo_restores_every_saved_component(tmp_path):
@@ -544,7 +578,8 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
                (tmp_path / "etc/sudoers.d/crew-authz-broker",
                 tmp_path / "etc/sudoers.d/crew-authz-broker.old", False),
                (tree / "snapshot.pub", tree / "snapshot.pub.old", False),
-               (tree / "owner-t0.pub", tree / "owner-t0.pub.old", False)]
+               (tree / "owner-t0.pub", tree / "owner-t0.pub.old", False),
+               (tree / "owner-reviewer.json", tree / "owner-reviewer.json.old", False)]
     for live, backup, directory in entries:
         live.parent.mkdir(parents=True, exist_ok=True)
         if directory:
@@ -562,6 +597,7 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
                                     "had_tokens": True, "had_launcher": True,
                                     "had_updater": True, "had_sudoers": True,
                                     "had_snapshot_pub": True, "had_owner_t0_pub": True,
+                                    "had_owner_reviewer": True,
                                     "had_receipt-signing.key": True,
                                     "had_receipt-signing.pub": True,
                                     "old_commit": "old-build\n"}))
