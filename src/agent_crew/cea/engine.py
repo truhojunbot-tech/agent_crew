@@ -55,6 +55,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Optional
 
 from agent_crew.cea._caller_mint import is_authenticated_caller
+from agent_crew.cea.broker import DISPATCHER_REGISTRATION_UNAUTHENTICATED
 from agent_crew.cea.intent import (
     IDENTITY_DEPENDENT_WORK_CLASSES, Caller, IdentityStatus, Intent, IntentIdentity,
     InvalidScopeAnchor, Target, WorkClass, canonical_identity)
@@ -327,6 +328,7 @@ class EngineConfig:
     endpoint: Optional[str] = None          # unix socket path; None ⇒ in-process
     broker_socket: Optional[str] = None    # opt-in broker decision endpoint
     broker_degraded: bool = False          # sandbox only; same uid never proves isolation
+    out_of_process_broker: bool = False    # set by broker main, never inferred from env
     fallback_reason: Optional[str] = None
     key_path: Optional[str] = None          # engine signing key (P5, O3)
     issuer: str = "agent_crew.cea.engine"
@@ -509,6 +511,14 @@ class AuthorizationEngine:
         self.gates = gates or SnapshotHumanGate()
         self._clock = clock or time.time
         self._key = _load_key(self.config.key_path)
+
+    def _identity_downgrade_reason(self) -> str:
+        """Name the remaining identity gap without obscuring broker integrity."""
+        if self.config.fallback_reason:
+            return self.config.fallback_reason
+        if self.config.out_of_process_broker:
+            return DISPATCHER_REGISTRATION_UNAUTHENTICATED
+        return "SHARED_UID_NO_CREDENTIAL_BOUNDARY"
 
     # ── caller + identity preconditions, shared by both entry points ────
 
@@ -1174,8 +1184,7 @@ class AuthorizationEngine:
             "executor_binding": executor,
             "executor_binding_status": executor_status.value,
             "caller_identity_status": caller_status.value,
-            "downgrade_reason": (self.config.fallback_reason or
-                                 ("SHARED_UID_NO_CREDENTIAL_BOUNDARY" if degraded else None)),
+            "downgrade_reason": self._identity_downgrade_reason() if degraded else None,
             "decision": decision,
             "reason": {"code": code, "text": text},
             "signature": {"alg": None, "key_id": None, "value": None, "status": "UNVERIFIED"},
@@ -1311,7 +1320,7 @@ class AuthorizationEngine:
             "caller_provenance": getattr(caller.provenance, "value", caller.provenance),
             "executor_binding": None,
             "executor_binding_status": "UNVERIFIED", "caller_identity_status": "UNVERIFIED",
-            "downgrade_reason": self.config.fallback_reason or "SHARED_UID_NO_CREDENTIAL_BOUNDARY",
+            "downgrade_reason": self._identity_downgrade_reason(),
             "decision": decision, "reason": {"code": code, "text": text},
             "signature": {"alg": None, "key_id": None, "value": None, "status": "UNVERIFIED"},
             "state": "ISSUED",

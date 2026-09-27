@@ -138,6 +138,8 @@ source_updater = Path(os.environ["CREW_AUTHZ_UPDATER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
 source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
 sys.path.insert(0, str(source_root / "src"))
+sys.path.insert(0, str(source_root / "scripts/cea"))
+from owner_selftest_expectations import assert_installed_selftest
 schema_source = source_root / "tests/cea_contract/receipt.schema.json"
 requirements = source_root / "scripts/cea/broker-requirements.txt"
 venv = tree / "venv"
@@ -263,7 +265,7 @@ def pinned_crypto(interpreter, operation, **paths):
                    env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1"})
     return True
 
-def installed_selftest():
+def installed_selftest(*, test_root_owned_tree=False, launcher_check=None):
     if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_FAIL_STAGE") == "selftest":
         raise RuntimeError("injected update failure: selftest")
     command = [str(venv / "bin/python"), str(source_root / "scripts/cea/broker_group_sandbox.py"),
@@ -275,18 +277,17 @@ def installed_selftest():
         return
     if privileged:
         command.append("--cross-uid")
+    if test_root_owned_tree:
+        command.append("--test-root-owned-tree")
     result = subprocess.run(command, capture_output=True, text=True, timeout=90,
                             env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1"})
     if result.returncode:
         raise RuntimeError(f"installed broker self-test failed: {result.stderr.strip()}")
     evidence = json.loads(result.stdout)
-    if (not evidence.get("pass") or not evidence.get("authenticated") or
-            not evidence.get("schema_valid") or not evidence.get("signed_receipt_valid") or
-            not evidence.get("tampered_receipt_rejected") or
-            not evidence.get("snapshot_rollback_refused") or
-            evidence.get("downgrade_reason") != ("BROKER_TREE_USER_WRITABLE" if args.rehearse else None)):
-        raise RuntimeError(f"installed broker self-test failed: {evidence}")
+    assert_installed_selftest(evidence, privileged=privileged or test_root_owned_tree,
+                              launcher_check=launcher_check)
     say("installed broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
+    return evidence
 
 def apply_preconditions(source_update=False):
     """Return failures visible before root changes, plus checks requiring root."""
@@ -694,12 +695,21 @@ if args.update_src:
         os.chmod(marker, 0o644)
         if privileged:
             run("chown", "root:root", str(marker))
-        installed_selftest()
-        if privileged:
+        if args.rehearse:
+            installed_selftest()
+            # This probe affects only the disposable degraded broker. It makes
+            # the privileged receipt expectation reachable without root.
+            say("rehearsal privileged integrity probe: root-owned tree")
+            installed_selftest(test_root_owned_tree=True,
+                               launcher_check="downgrade_reason=none")
+        elif not fake:
+            # Both checks use the same expectation function. The launcher
+            # reports tree integrity independently of the broker receipt.
             check = run("sudo", "-n", "-u", "crew-authz", str(launcher), "--check", capture=True).stdout
             say(check.rstrip())
-            if "downgrade_reason=none" not in check:
-                raise RuntimeError("installed broker --check still downgraded")
+            installed_selftest(launcher_check=check)
+        else:
+            installed_selftest()
         # A successful update is committed: its temporary backups must not
         # block the next one-command update. Failure above still rolls back.
         for _, backup, _ in swaps:

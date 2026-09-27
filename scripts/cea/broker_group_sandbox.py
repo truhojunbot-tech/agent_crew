@@ -38,7 +38,9 @@ def client(sock, credential, expected_uid):
     intent = Intent(identity=IntentIdentity(project="sandbox", work_class=WorkClass.REVIEW,
                     target=Target(repo="sandbox", base_ref="main")), task_id="broker-group-proof",
                     task_type="review", description="isolated authenticated socket proof")
-    reply, peer_uid = BrokerClient(sock, expected_uid=expected_uid)._call(
+    broker_client = BrokerClient(sock, expected_uid=expected_uid)
+    status, _ = broker_client._call({"op": "status"})
+    reply, peer_uid = broker_client._call(
         {"op": "authorize", **encode_intent(intent, credential)})
     if peer_uid != expected_uid or reply.get("code") == "UNAUTHENTICATED" or not reply.get("receipt"):
         raise RuntimeError(f"authenticated authorize failed: peer={peer_uid} reply={reply}")
@@ -58,10 +60,13 @@ def client(sock, credential, expected_uid):
             "decision": reply["receipt"].get("decision"), "authenticated": True,
             "schema_valid": True, "signed_receipt_valid": valid,
             "tampered_receipt_rejected": not rejected,
+            "broker_status_downgrade_reason": status.get("downgrade_reason"),
+            "broker_preflight_downgrade_reason": status.get("preflight_downgrade_reason"),
             "downgrade_reason": reply["receipt"].get("downgrade_reason")}
 
 
-def proof(source_root, token_source, *, cross_uid, installed_root=None, python=None):
+def proof(source_root, token_source, *, cross_uid, installed_root=None, python=None,
+          test_root_owned_tree=False):
     import secrets
     broker_uid = pwd.getpwnam("crew-authz").pw_uid if cross_uid else os.geteuid()
     broker_gid = pwd.getpwnam("crew-authz").pw_gid if cross_uid else os.getegid()
@@ -194,6 +199,8 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None, python=N
                           "--init-groups", *broker_cmd]
         else:
             broker_cmd.append("--degraded")
+            if test_root_owned_tree:
+                broker_cmd.append("--test-root-owned-tree")
         broker = subprocess.Popen(broker_cmd, env=env, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True)
         try:
@@ -251,6 +258,8 @@ def main():
     parser.add_argument("--cross-uid", action="store_true")
     parser.add_argument("--installed-root", type=Path)
     parser.add_argument("--python", type=Path, help="pinned interpreter for preinstall proof")
+    parser.add_argument("--test-root-owned-tree", action="store_true",
+                        help="rehearsal-only broker integrity probe")
     parser.add_argument("--client", nargs=2, metavar=("SOCKET", "EXPECTED_UID"))
     args = parser.parse_args()
     if args.client:
@@ -260,6 +269,8 @@ def main():
         args.caller_tokens = args.installed_root / "caller-tokens.json"
     if not args.caller_tokens:
         parser.error("--caller-tokens is required")
+    if args.test_root_owned_tree and (args.cross_uid or not args.installed_root):
+        parser.error("--test-root-owned-tree requires a non-cross-uid installed rehearsal")
     if not args.cross_uid and os.getegid() != grp.getgrnam("crew-authz-clients").gr_gid:
         command = [str(args.python or (args.installed_root / "venv/bin/python" if args.installed_root else sys.executable)),
                    str(Path(__file__).resolve()), "--source-root", str(args.source_root),
@@ -268,6 +279,8 @@ def main():
             command.extend(("--installed-root", str(args.installed_root)))
         if args.python:
             command.extend(("--python", str(args.python)))
+        if args.test_root_owned_tree:
+            command.append("--test-root-owned-tree")
         result = subprocess.run(["sg", "crew-authz-clients", "-c", shlex.join(command)],
                                 capture_output=True, text=True, timeout=60)
         if result.returncode:
@@ -275,7 +288,8 @@ def main():
         print(result.stdout, end="")
         return
     print(json.dumps(proof(args.source_root, args.caller_tokens, cross_uid=args.cross_uid,
-                           installed_root=args.installed_root, python=str(args.python) if args.python else None), sort_keys=True))
+                           installed_root=args.installed_root, python=str(args.python) if args.python else None,
+                           test_root_owned_tree=args.test_root_owned_tree), sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -311,7 +311,8 @@ class Broker:
             return {"ok": True} if caller is not None else {"ok": False, "error": "UNAUTHENTICATED"}
         if op == "status":
             return {"ok": True, "degraded": self.degraded, "registrations": len(self._regs),
-                    "downgrade_reason": BROKER_TREE_USER_WRITABLE if self.tree_writable else None}
+                    "downgrade_reason": BROKER_TREE_USER_WRITABLE if self.tree_writable else None,
+                    "preflight_downgrade_reason": BROKER_TREE_USER_WRITABLE if self.tree_writable else None}
         return {"ok": False, "error": "UNKNOWN_OP"}
 
     def _authorize(self, req: dict) -> dict:
@@ -683,8 +684,16 @@ def main(argv=None) -> int:
     ap.add_argument("--client-uid", type=int, action="append", default=None)
     ap.add_argument("--degraded", action="store_true")
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--test-root-owned-tree", action="store_true",
+                    help=argparse.SUPPRESS)
     a = ap.parse_args(argv)
+    if a.test_root_owned_tree and not a.degraded:
+        ap.error("--test-root-owned-tree requires --degraded")
     b = Broker(a.sock_dir, degraded=a.degraded, client_uids=tuple(a.client_uid or (1000,)))
+    if a.test_root_owned_tree:
+        # Test/rehearsal-only probe: the real production path always uses the
+        # filesystem check in Broker.__init__. Degraded mode cannot issue VERIFIED.
+        b.tree_writable = False
     db_path = os.environ.get("AGENT_CREW_CEA_BROKER_DB")
     if db_path:
         import sqlite3
@@ -693,8 +702,9 @@ def main(argv=None) -> int:
         from agent_crew.cea.wiring import build_wiring
         config = EngineConfig.from_env()
         # Attestation and authorization must use the same integrity result.
-        if b.tree_writable:
-            config = dataclasses.replace(config, fallback_reason=BROKER_TREE_USER_WRITABLE)
+        config = dataclasses.replace(config, out_of_process_broker=True,
+                                     fallback_reason=(BROKER_TREE_USER_WRITABLE
+                                                      if b.tree_writable else None))
         wiring = build_wiring(db_path=db_path)
         b.decision_engine = AuthorizationEngine(config=config, **wiring.providers)
         b.connect = lambda: sqlite3.connect(db_path)
