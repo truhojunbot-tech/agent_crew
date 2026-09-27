@@ -1,4 +1,5 @@
 """Offline owner setup contract: all mutations stay under a fake root."""
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -86,3 +87,42 @@ def test_snapshot_key_requires_explicit_flag(tmp_path):
     assert (tree / "snapshot.key").read_bytes() == b"snapshot-key"
     assert (tree / "snapshot.key").stat().st_mode & 0o777 == 0o640
     assert "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=/opt/agent_crew-authz/snapshot.key" in (tree / "broker.env").read_text()
+
+
+def test_first_apply_with_no_backup_targets_can_be_undone(tmp_path):
+    db = tmp_path / "home/truhojun/.agent_crew/alfred/tasks.db"
+    db.parent.mkdir(parents=True)
+    db.write_bytes(b"SQLite fixture")
+    token = tmp_path / "home/truhojun/.verify-private/tokens.json"
+    token.parent.mkdir(parents=True)
+    token.write_text('{"private":"token"}')
+    assert not (tmp_path / "opt/agent_crew-authz").exists()
+    assert not (tmp_path / "usr/local/libexec/crew-authz").exists()
+    assert not (tmp_path / "etc/sudoers.d/crew-authz-broker").exists()
+    apply = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    assert apply.returncode == 0, apply.stderr
+    assert "-T /dev/null" in apply.stdout
+    undo = _run(tmp_path, "--undo")
+    assert undo.returncode == 0, undo.stderr
+    assert db.read_bytes() == b"SQLite fixture"
+    assert token.read_text() == '{"private":"token"}'
+    assert not (tmp_path / "opt/agent_crew-authz").exists()
+    assert not (tmp_path / "usr/local/libexec/crew-authz").exists()
+    assert not (tmp_path / "etc/sudoers.d/crew-authz-broker").exists()
+
+
+def test_incomplete_apply_requires_undo_before_retry(tmp_path):
+    _seed(tmp_path)
+    first = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    assert first.returncode == 0, first.stderr
+    manifest_path = tmp_path / "var/lib/crew-authz/owner-root-enforce/manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["completed"] = False
+    manifest_path.write_text(json.dumps(manifest))
+    retry = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    assert retry.returncode != 0
+    assert "incomplete apply; undo first" in retry.stderr
+    assert manifest_path.exists()
+    undo = _run(tmp_path, "--undo")
+    assert undo.returncode == 0, undo.stderr
+    assert not manifest_path.exists()

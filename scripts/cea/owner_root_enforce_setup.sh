@@ -14,7 +14,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tarfile
 
 p = argparse.ArgumentParser(description="Offline, reversible root broker setup")
 mode = p.add_mutually_exclusive_group()
@@ -87,21 +86,13 @@ if args.undo:
         raise SystemExit(f"no apply manifest: {manifest_file}")
     manifest = json.loads(manifest_file.read_text())
     say(f"undo: restore archive {archive} and ACLs {acl_file}")
-    if fake:
-        for item in targets:
-            if item.is_dir():
-                shutil.rmtree(item)
-            elif item.exists():
-                item.unlink()
-        with tarfile.open(archive) as bundle:
-            bundle.extractall(root, filter="data")
-    else:
-        for item in targets:
-            if item.is_dir():
-                shutil.rmtree(item)
-            elif item.exists():
-                item.unlink()
-        run("tar", "--acls", "--xattrs", "--numeric-owner", "-xf", str(archive), "-C", "/")
+    for item in targets:
+        if item.is_dir():
+            shutil.rmtree(item)
+        elif item.exists():
+            item.unlink()
+    run("tar", "--acls", "--xattrs", "--numeric-owner", "-xf", str(archive), "-C", str(root))
+    if not fake:
         if acl_file.exists():
             run("setfacl", "--restore", str(acl_file))
         for user in manifest["added_users"]:
@@ -136,7 +127,8 @@ else:
 for step in plan:
     say(step)
 commands = [
-    "tar --acls --xattrs --numeric-owner -cf <manifest>/before.tar -C / <existing targets>",
+    ("tar --acls --xattrs --numeric-owner -cf <manifest>/before.tar -C / "
+     + ("<existing targets>" if originals() else "-T /dev/null")),
     "getfacl -p <queue parent> <alfred queue dir> <tasks.db> > <manifest>/before.acl",
     "apt-get update && apt-get install -y acl  # only if setfacl is missing",
     "groupadd --system crew-authz-clients  # only if group is missing",
@@ -184,13 +176,12 @@ before = originals()
 manifest = {"existing": [str(x) for x in before], "added_users": [],
             "created_group": False, "installed_acl": False, "completed": False,
             "created_parents": [str(x) for x in created_parents]}
-if fake:
-    with tarfile.open(archive, "w") as bundle:
-        for item in before:
-            bundle.add(item, arcname=str(item.relative_to(root)))
-else:
-    run("tar", "--acls", "--xattrs", "--numeric-owner", "-cf", str(archive),
-        "-C", "/", *(str(x.relative_to(root)) for x in before))
+members = [str(x.relative_to(root)) for x in before]
+# GNU tar rejects a create command with no operands. An explicit empty file list
+# produces a valid empty archive that --undo can extract in the first-install case.
+run("tar", "--acls", "--xattrs", "--numeric-owner", "-cf", str(archive),
+    "-C", str(root), *(members or ["-T", "/dev/null"]))
+if not fake:
     if shutil.which("getfacl"):
         acl_file.write_text(run("getfacl", "-p", str(crew_dir), str(alfred_dir), str(db), capture=True).stdout)
 manifest_file.write_text(json.dumps(manifest, indent=2))
