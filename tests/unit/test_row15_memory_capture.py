@@ -39,6 +39,134 @@ def test_task_outcomes_write_canonical_evidence_without_promoting_procedure(tmp_
     assert {row.layer for row in completed} == {"episodic", "decision"}
 
 
+def test_result_capture_fills_existing_task_scope_and_is_idempotent(tmp_path, monkeypatch):
+    memory_db = tmp_path / "memory.db"
+    SQLiteMemoryStorage(str(memory_db))
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", str(memory_db))
+    task_db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(task_db)
+    queue.enqueue(TaskRequest(task_id="scope-task", task_type="implement",
+                              description="scope", project="agent_crew",
+                              context={"issue": 423}))
+    queue.record_attribution(task_id="scope-task", project="agent_crew", agent="codex",
+                             worktree_path="/tmp/codex-worktree", provider_session_id="session-42",
+                             context_generation=3)
+    result = type("Result", (), {"status": "completed", "summary": "done",
+                                   "verdict": None, "pr_number": None})()
+    capture_result_best_effort(task_db, "scope-task", result)
+    capture_result_best_effort(task_db, "scope-task", result)
+    rows = SQLiteMemoryStorage(str(memory_db)).retrieve(MemoryScope(
+        project="agent_crew", task_id="scope-task", issue="423",
+        worktree="/tmp/codex-worktree", provider_session="session-42",
+        context_generation=3))
+    assert len(rows) == 2
+    assert all(row.scope == MemoryScope(project="agent_crew", task_id="scope-task",
+                                         issue="423", worktree="/tmp/codex-worktree",
+                                         provider_session="session-42",
+                                         context_generation=3) for row in rows)
+
+
+def test_enriching_capture_scope_replaces_same_task_key(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    capture_task_outcome(storage, project="agent_crew", repo="", task_id="scope-task",
+                         status="completed", summary="done")
+    capture_task_outcome(storage, project="agent_crew", repo="", task_id="scope-task",
+                         status="completed", summary="done", issue="423",
+                         provider_session="known-session")
+    with sqlite3.connect(storage.path) as db:
+        rows = db.execute("SELECT scope FROM adr001_memory WHERE key LIKE 'task:scope-task:%'").fetchall()
+    assert len(rows) == 2
+    assert all(json.loads(row[0])["provider_session"] == "known-session" for row in rows)
+
+
+def test_scope_enrichment_preserves_version_lineage(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    capture_task_outcome(storage, project="agent_crew", repo="", task_id="scope-task",
+                         status="failed", summary="first")
+    capture_task_outcome(storage, project="agent_crew", repo="", task_id="scope-task",
+                         status="failed", summary="corrected")
+    capture_task_outcome(storage, project="agent_crew", repo="", task_id="scope-task",
+                         status="failed", summary="corrected", issue="423")
+    with sqlite3.connect(storage.path) as db:
+        versions = db.execute("SELECT version FROM adr001_memory WHERE key LIKE 'task:scope-task:%'").fetchall()
+    assert len(versions) == 3
+    assert {row[0] for row in versions} == {3}
+
+
+def test_result_capture_without_attribution_table_and_bad_issue(tmp_path, monkeypatch):
+    memory_db = tmp_path / "memory.db"
+    storage = SQLiteMemoryStorage(str(memory_db))
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", str(memory_db))
+    task_db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(task_db)
+    queue.enqueue(TaskRequest(task_id="legacy-task", task_type="discuss",
+                              description="legacy", project="agent_crew",
+                              context={"issue": [423]}))
+    with sqlite3.connect(task_db) as db:
+        db.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                   (json.dumps({"issue": [423]}), "legacy-task"))
+        db.execute("DROP TABLE task_attribution")
+    result = type("Result", (), {"status": "completed", "summary": "done",
+                                   "verdict": None, "pr_number": None})()
+    capture_result_best_effort(task_db, "legacy-task", result)
+    rows = storage.retrieve(MemoryScope(project="agent_crew", task_id="legacy-task"))
+    assert len(rows) == 2
+    assert all(row.scope.issue == "" and row.scope.provider_session == ""
+               for row in rows)
+
+
+def test_shadow_scope_restricts_explicit_dimensions_and_fleet(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    capture_task_outcome(storage, project="agent_crew", repo="", task_id="scope-task",
+                         status="completed", summary="done", issue="423",
+                         worktree="/tmp/one", provider_session="session-one")
+    layers = {"episodic", "decision"}
+    def keys(scope):
+        return {row.key for row in storage.retrieve_shadow(scope, layers, 10)[0]}
+    assert keys(MemoryScope(project="agent_crew"))
+    assert not keys(MemoryScope(project="agent_crew", task_id="other-task"))
+    assert not keys(MemoryScope(project="agent_crew", issue="other-issue"))
+    assert not keys(MemoryScope(project="agent_crew", worktree="/tmp/other"))
+    assert not keys(MemoryScope(project="agent_crew", provider_session="session-two"))
+    assert not keys(MemoryScope(fleet="named-fleet", project="agent_crew"))
+    assert keys(MemoryScope(project="agent_crew", task_id="scope-task", issue="423",
+                            worktree="/tmp/one", provider_session="session-one"))
+
+
+def test_result_and_episode_missing_scope_fields_stay_empty(tmp_path, monkeypatch):
+    memory_db = tmp_path / "memory.db"
+    storage = SQLiteMemoryStorage(str(memory_db))
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", str(memory_db))
+    task_db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(task_db)
+    queue.enqueue(TaskRequest(task_id="bare-task", task_type="discuss",
+                              description="bare", project="agent_crew"))
+    result = type("Result", (), {"status": "completed", "summary": "done",
+                                   "verdict": None, "pr_number": None})()
+    capture_result_best_effort(task_db, "bare-task", result)
+    task_rows = [row for row in storage.retrieve(MemoryScope(project="agent_crew",
+                                                             task_id="bare-task"))
+                 if row.key.startswith("task:bare-task:")]
+    assert task_rows and all(row.scope == MemoryScope(project="agent_crew", task_id="bare-task")
+                             for row in task_rows)
+    episode_rows = capture_episode(storage, {"task_id": "episode-task", "outcome": "completed"},
+                                   project="agent_crew")
+    assert all(row.scope == MemoryScope(project="agent_crew", task_id="episode-task")
+               for row in episode_rows)
+
+
+def test_episode_uses_only_supplied_scope_metadata(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    rows = capture_episode(storage, {"task_id": "episode-task", "outcome": "completed",
+                                     "issue": 398, "worktree": "/tmp/episode-wt",
+                                     "provider_session": "known-session", "context_generation": 2},
+                           project="agent_crew")
+    assert all(row.scope == MemoryScope(project="agent_crew", task_id="episode-task",
+                                         issue="398", worktree="/tmp/episode-wt",
+                                         provider_session="known-session", context_generation=2)
+               for row in rows)
+
+
 def test_runtime_returns_new_layers_and_drops_projectless_decision(tmp_path):
     storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
     capture_task_outcome(storage, project="agent_crew", repo="agent_crew",
@@ -113,7 +241,7 @@ def test_revised_outcome_replaces_first_capture(tmp_path):
                          task_id="reused", status="failed", summary="first")
     capture_task_outcome(storage, project="agent_crew", repo="agent_crew",
                          task_id="reused", status="completed", summary="corrected")
-    records = storage.retrieve(MemoryScope(project="agent_crew"))
+    records = storage.retrieve(MemoryScope(project="agent_crew", task_id="reused"))
     assert {r.value["status"] for r in records} == {"completed"}
     assert {r.layer for r in records} == {"episodic", "decision"}
 
