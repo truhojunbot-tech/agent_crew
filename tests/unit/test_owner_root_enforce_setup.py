@@ -3,6 +3,8 @@ import json
 import os
 from pathlib import Path
 import subprocess
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/cea/owner_root_enforce_setup.sh"
@@ -21,15 +23,19 @@ def _seed(root):
     tree.mkdir(parents=True)
     (tree / "SRC_COMMIT").write_text("old-build\n")
     (tree / "broker.env").write_text(
-        "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=/home/truhojun/.verify-private/ssot-producer.key\n"
+        "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=/opt/agent_crew-authz/snapshot.key\n"
     )
+    (tree / "snapshot.key").write_bytes(b"old-secret")
     db = root / "home/truhojun/.agent_crew/alfred/tasks.db"
     db.parent.mkdir(parents=True)
     db.write_bytes(b"SQLite fixture")
     token = root / "home/truhojun/.verify-private/tokens.json"
     token.parent.mkdir(parents=True)
     token.write_text('{"private":"token"}')
-    (token.parent / "ssot-producer.key").write_bytes(b"snapshot-key")
+    pubkey = root / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub"
+    pubkey.parent.mkdir(parents=True)
+    pubkey.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
     sudoers = root / "etc/sudoers.d/crew-authz-broker"
     sudoers.parent.mkdir(parents=True)
     sudoers.write_text("old sudoers\n")
@@ -61,6 +67,10 @@ def test_apply_and_undo_restore_existing_files(tmp_path):
     assert (tree / "caller-tokens.json").read_text() == token.read_text()
     assert (tree / "caller-tokens.json").stat().st_mode & 0o777 == 0o640
     assert not (tree / "snapshot.key").exists()
+    assert (tree / "snapshot.pub").read_bytes() == (
+        tmp_path / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub").read_bytes()
+    assert (tree / "snapshot.pub").stat().st_mode & 0o777 == 0o644
+    assert "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE=/opt/agent_crew-authz/snapshot.pub" in (tree / "broker.env").read_text()
     assert "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE" not in (tree / "broker.env").read_text()
     assert "crew-authz-clients" in (tree / "broker.env").read_text()
     assert "libexec/crew-authz/broker-launch.sh" in sudoers.read_text()
@@ -73,20 +83,41 @@ def test_apply_and_undo_restore_existing_files(tmp_path):
     assert (tree / "SRC_COMMIT").read_text() == "old-build\n"
     assert tree.stat().st_mode & 0o777 == old_mode
     assert not (tree / "caller-tokens.json").exists()
+    assert (tree / "snapshot.key").read_bytes() == b"old-secret"
     assert sudoers.read_text() == "old sudoers\n"
     assert not (tmp_path / "usr/local/libexec/crew-authz").exists()
     assert not (tmp_path / "usr/local/libexec").exists()
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce").exists()
 
 
-def test_snapshot_key_requires_explicit_flag(tmp_path):
+def test_public_key_source_can_be_overridden(tmp_path):
     tree, _, _ = _seed(tmp_path)
-    result = _run(tmp_path, "--apply", "--with-snapshot-key", "--caller-tokens",
+    alternate = tmp_path / "alternate.pub"
+    alternate.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    result = _run(tmp_path, "--apply", "--snapshot-pubkey", str(alternate), "--caller-tokens",
                   "/home/truhojun/.verify-private/tokens.json")
     assert result.returncode == 0, result.stderr
-    assert (tree / "snapshot.key").read_bytes() == b"snapshot-key"
-    assert (tree / "snapshot.key").stat().st_mode & 0o777 == 0o640
-    assert "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=/opt/agent_crew-authz/snapshot.key" in (tree / "broker.env").read_text()
+    assert (tree / "snapshot.pub").read_bytes() == alternate.read_bytes()
+    assert "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE" not in (tree / "broker.env").read_text()
+
+
+def test_apply_requires_ed25519_public_key(tmp_path):
+    _seed(tmp_path)
+    pubkey = tmp_path / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub"
+    pubkey.unlink()
+    result = _run(tmp_path, "--apply", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json")
+    assert result.returncode != 0
+    assert "missing snapshot public key" in result.stderr
+    assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce").exists()
+
+
+def test_old_hmac_copy_flag_is_rejected(tmp_path):
+    _seed(tmp_path)
+    result = _run(tmp_path, "--with-snapshot-key")
+    assert result.returncode != 0
+    assert "unrecognized arguments" in result.stderr
 
 
 def test_first_apply_with_no_backup_targets_can_be_undone(tmp_path):
@@ -96,6 +127,10 @@ def test_first_apply_with_no_backup_targets_can_be_undone(tmp_path):
     token = tmp_path / "home/truhojun/.verify-private/tokens.json"
     token.parent.mkdir(parents=True)
     token.write_text('{"private":"token"}')
+    pubkey = tmp_path / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub"
+    pubkey.parent.mkdir(parents=True)
+    pubkey.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
     assert not (tmp_path / "opt/agent_crew-authz").exists()
     assert not (tmp_path / "usr/local/libexec/crew-authz").exists()
     assert not (tmp_path / "etc/sudoers.d/crew-authz-broker").exists()

@@ -21,7 +21,7 @@ mode.add_argument("--dry-run", action="store_true", help="print plan only (defau
 mode.add_argument("--apply", action="store_true")
 mode.add_argument("--undo", action="store_true")
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
-p.add_argument("--with-snapshot-key", action="store_true", help="copy ssot-producer.key")
+p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
 p.add_argument("--root-prefix", type=Path, help=argparse.SUPPRESS)
 args = p.parse_args()
 if args.root_prefix and os.environ.get("AGENT_CREW_OWNER_SETUP_TESTING") != "1":
@@ -43,7 +43,6 @@ sudoers = path("/etc/sudoers.d/crew-authz-broker")
 db = path("/home/truhojun/.agent_crew/alfred/tasks.db")
 crew_dir = path("/home/truhojun/.agent_crew")
 alfred_dir = db.parent
-private = path("/home/truhojun/.verify-private")
 manifest_dir = path("/var/lib/crew-authz/owner-root-enforce")
 manifest_file = manifest_dir / "manifest.json"
 archive = manifest_dir / "before.tar"
@@ -62,7 +61,9 @@ if token_source is None:
                 if candidate != tree / "caller-tokens.json":
                     token_source = path(str(candidate)) if fake else candidate
                 break
-snapshot_source = private / "ssot-producer.key"
+snapshot_source = args.snapshot_pubkey or path("/home/truhojun/alfred/governance/ssot-producer-ed25519.pub")
+if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snapshot_source.is_relative_to(root):
+    snapshot_source = path(str(snapshot_source))
 source_launcher = Path(os.environ["CREW_AUTHZ_LAUNCHER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
 if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
@@ -115,15 +116,12 @@ plan = [
     f"install acl if missing; save ACLs, grant crew-authz x on {crew_dir}, rwx on {alfred_dir}, rw on {db}",
     f"backup existing broker tree, launcher directory and sudoers in {manifest_dir}",
     f"copy caller tokens to {tree / 'caller-tokens.json'} root:crew-authz 0640",
+    f"copy Ed25519 public key {snapshot_source} to {tree / 'snapshot.pub'} root:crew-authz 0644; remove staged HMAC key",
     f"copy launcher to {launcher} root:root 0755; root-own broker tree and remove group/other write",
     f"validate temporary sudoers with visudo -cf, then install {sudoers} 0440",
     f"write {tree / 'SRC_COMMIT'} = {source_commit}",
     f"sudo -u crew-authz {launcher} --check; require downgrade_reason=none",
 ]
-if args.with_snapshot_key:
-    plan.insert(4, f"copy {snapshot_source} to {tree / 'snapshot.key'} root:crew-authz 0640")
-else:
-    plan.insert(4, "snapshot key omitted: snapshots remain unverified; admission may refuse")
 for step in plan:
     say(step)
 commands = [
@@ -139,14 +137,13 @@ commands = [
     f"setfacl -m u:crew-authz:rw- {db}",
     f"install -m 0755 {source_launcher} {launcher}",
     f"install -m 0640 <caller tokens> {tree / 'caller-tokens.json'}",
-    "chown root:crew-authz <broker.env and copied keys>",
+    f"install -m 0644 {snapshot_source} {tree / 'snapshot.pub'}",
+    "chown root:crew-authz <broker.env, caller tokens and snapshot.pub>",
     f"chown root:root <broker tree entries except keys under {tree}>",
     f"visudo -cf {sudoers.with_name('crew-authz-broker.pending')}",
     f"install -m 0440 <validated pending sudoers> {sudoers}",
     f"sudo -u crew-authz {launcher} --check",
 ]
-if args.with_snapshot_key:
-    commands.insert(11, f"install -m 0640 {snapshot_source} {tree / 'snapshot.key'}")
 for command in commands:
     say(f"PLAN $ {command}")
 if not args.apply:
@@ -160,8 +157,16 @@ if manifest_file.exists():
     raise SystemExit(f"incomplete apply; undo first: {manifest_file}")
 if not token_source or not token_source.is_file():
     raise SystemExit("--caller-tokens must name a readable token table for apply")
-if args.with_snapshot_key and not snapshot_source.is_file():
-    raise SystemExit(f"missing snapshot key: {snapshot_source}")
+if not snapshot_source.is_file() or snapshot_source.is_symlink():
+    raise SystemExit(f"missing snapshot public key: {snapshot_source}")
+try:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    parsed_key = serialization.load_pem_public_key(snapshot_source.read_bytes())
+    if not isinstance(parsed_key, Ed25519PublicKey):
+        raise ValueError("expected an Ed25519 public key")
+except (ImportError, ValueError) as exc:
+    raise SystemExit(f"invalid Ed25519 public key {snapshot_source}: {exc}") from exc
 for base in (manifest_dir, launcher.parent, tree, sudoers.parent):
     missing = []
     current = base
@@ -219,18 +224,17 @@ try:
     os.chmod(launcher, 0o755)
     shutil.copyfile(token_source, tree / "caller-tokens.json")
     os.chmod(tree / "caller-tokens.json", 0o640)
-    if args.with_snapshot_key:
-        shutil.copyfile(snapshot_source, tree / "snapshot.key")
-        os.chmod(tree / "snapshot.key", 0o640)
+    (tree / "snapshot.key").unlink(missing_ok=True)
+    shutil.copyfile(snapshot_source, tree / "snapshot.pub")
+    os.chmod(tree / "snapshot.pub", 0o644)
     config = tree / "broker.env"
     lines = config.read_text().splitlines() if config.exists() else []
     overrides = {"AGENT_CREW_AUTHZ_CLIENT_GROUP": "crew-authz-clients",
                  "AGENT_CREW_CEA_BROKER_DB": "/home/truhojun/.agent_crew/alfred/tasks.db",
                  "AGENT_CREW_CEA_CALLER_TOKENS": "/opt/agent_crew-authz/caller-tokens.json",
                  "AGENT_CREW_CEA_MODE": "enforce",
-                 "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS"}
-    if args.with_snapshot_key:
-        overrides["AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"] = "/opt/agent_crew-authz/snapshot.key"
+                 "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS",
+                 "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE": "/opt/agent_crew-authz/snapshot.pub"}
     lines = [line for line in lines if line.split("=", 1)[0] not in
              (set(overrides) | {"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"})]
     lines += [f"{key}={value}" for key, value in overrides.items()]
@@ -244,7 +248,7 @@ try:
                 raise RuntimeError(f"symlink in broker tree: {item}")
             os.chmod(item, stat.S_IMODE(item.stat().st_mode) & ~0o022)
             if not fake:
-                group = "crew-authz" if item.name in ("caller-tokens.json", "snapshot.key", "broker.env") else "root"
+                group = "crew-authz" if item.name in ("caller-tokens.json", "snapshot.pub", "broker.env") else "root"
                 run("chown", f"root:{group}", str(item))
     os.chmod(tree, stat.S_IMODE(tree.stat().st_mode) & ~0o022)
     if not fake:
