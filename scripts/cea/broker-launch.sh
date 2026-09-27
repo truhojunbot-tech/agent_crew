@@ -13,6 +13,7 @@
 #   (default)   refuse unless euid == crew-authz; exec the broker.
 #   --check     print uid, ptrace_scope, socket-dir perms, python import; exit 0/1.
 #   --degraded  run in the caller's uid; the broker NEVER issues VERIFIED.
+# Live broker lifecycle is managed separately from the owner update script.
 #
 # Tests inject a fake euid with AGENT_CREW_AUTHZ_FAKE_EUID. It only moves this
 # script's gate: the Python broker re-checks the real euid and refuses, so the
@@ -44,7 +45,8 @@ done
 
 SERVICE_UID="$(id -u "$SERVICE_USER" 2>/dev/null || echo "")"
 EUID_NOW="${AGENT_CREW_AUTHZ_FAKE_EUID:-$(id -u)}"
-PYTHON="${AGENT_CREW_AUTHZ_PYTHON:-/usr/bin/python3}"
+VENV="${AGENT_CREW_AUTHZ_VENV:-/opt/agent_crew-authz/venv}"
+PYTHON="${AGENT_CREW_AUTHZ_PYTHON:-$VENV/bin/python}"
 # The agent_crew source must be readable by crew-authz. /home/truhojun is 0750,
 # so the default is a world-readable install location, not the dev checkout.
 PYPATH="${AGENT_CREW_AUTHZ_PYTHONPATH:-/opt/agent_crew-authz/src}"
@@ -52,6 +54,7 @@ SOCK_DIR="${AGENT_CREW_AUTHZ_SOCK_DIR:-/tmp/crew-authz-${SERVICE_UID:-none}}"
 CLIENT_UID="${AGENT_CREW_AUTHZ_CLIENT_UID:-1000}"
 CLIENT_GROUP="${AGENT_CREW_AUTHZ_CLIENT_GROUP:-truhojun}"
 PTRACE_SCOPE_FILE="${AGENT_CREW_AUTHZ_PTRACE_SCOPE_FILE:-/proc/sys/kernel/yama/ptrace_scope}"
+export PYTHONNOUSERSITE=1
 
 ptrace_scope() { cat "$PTRACE_SCOPE_FILE" 2>/dev/null || echo "unknown"; }
 
@@ -122,7 +125,24 @@ if [[ "$MODE" == "check" ]]; then
   echo "ptrace_scope=$(ptrace_scope)"
   echo "sock_dir=$SOCK_DIR perms=$(dir_report)"
   echo "pythonpath=$PYPATH readable=$([[ -r "$PYPATH/agent_crew/cea/broker.py" ]] && echo yes || echo no)"
-  integrity_report
+  integrity="$(integrity_report)"
+  echo "$integrity"
+  [[ "$integrity" == "downgrade_reason=none" ]] || ok=1
+  if [[ ! -x "$PYTHON" ]]; then echo "FAIL: pinned venv python missing: $PYTHON"; ok=1
+  else
+    if ! PYTHONPATH="$PYPATH" "$PYTHON" - <<'PY'
+import importlib.metadata as m
+from agent_crew.cea.schema import load_schema
+from agent_crew.cea import broker, auth, engine, wiring, service
+for name in ("jsonschema", "cryptography", "httpx"):
+    print(f"dependency {name}={m.version(name)}")
+import jsonschema
+assert hasattr(jsonschema, "Draft202012Validator"), "jsonschema >=4.18 required"
+load_schema()
+print("receipt_schema=ok")
+PY
+    then ok=1; fi
+  fi
   [[ -n "$SERVICE_UID" ]] || { echo "FAIL: user $SERVICE_USER missing"; ok=1; }
   s="$(ptrace_scope)"; [[ "$s" =~ ^[0-9]+$ && "$s" -ge 1 ]] || { echo "FAIL: ptrace_scope must be >=1"; ok=1; }
   [[ "$EUID_NOW" == "$SERVICE_UID" ]] || echo "NOTE: not running as $SERVICE_USER (only --degraded would start)"

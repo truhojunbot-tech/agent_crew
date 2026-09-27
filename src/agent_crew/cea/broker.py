@@ -673,6 +673,14 @@ def main(argv=None) -> int:
         b.decision_engine = AuthorizationEngine(config=config, **wiring.providers)
         b.connect = lambda: sqlite3.connect(db_path)
         b.authenticator = authenticator_from_env()
+    # A missing installed contract must fail at startup, not on the first
+    # authorization after the socket is already serving clients.
+    from agent_crew.cea.schema import load_schema
+    try:
+        load_schema()
+    except (OSError, ValueError) as exc:
+        print(json.dumps({"ok": False, "refused": f"receipt schema unavailable: {exc}"}), file=sys.stderr)
+        return 3
     try:
         report = b.preflight()
     except BrokerRefused as exc:

@@ -26,11 +26,16 @@ def client(sock, credential, expected_uid):
         {"op": "authorize", **encode_intent(intent, credential)})
     if peer_uid != expected_uid or reply.get("code") == "UNAUTHENTICATED" or not reply.get("receipt"):
         raise RuntimeError(f"authenticated authorize failed: peer={peer_uid} reply={reply}")
+    from agent_crew.cea.schema import validate_receipt
+    errors = validate_receipt(reply["receipt"])
+    if errors:
+        raise RuntimeError(f"invalid receipt: {errors}")
     return {"peer_uid": peer_uid, "authorize_code": reply.get("code"),
-            "decision": reply["receipt"].get("decision"), "authenticated": True}
+            "decision": reply["receipt"].get("decision"), "authenticated": True,
+            "schema_valid": True, "downgrade_reason": reply["receipt"].get("downgrade_reason")}
 
 
-def proof(source_root, token_source, *, cross_uid):
+def proof(source_root, token_source, *, cross_uid, installed_root=None):
     import secrets
     broker_uid = pwd.getpwnam("crew-authz").pw_uid if cross_uid else os.geteuid()
     broker_gid = pwd.getpwnam("crew-authz").pw_gid if cross_uid else os.getegid()
@@ -46,21 +51,28 @@ def proof(source_root, token_source, *, cross_uid):
     with tempfile.TemporaryDirectory(prefix="crew-broker-group-") as directory:
         root = Path(directory)
         root.chmod(0o755)
-        staged = root / "src"
-        for item in (source_root / "src").rglob("*"):
-            if item.is_symlink():
-                raise RuntimeError(f"source symlink: {item}")
-        shutil.copytree(source_root / "src", staged, symlinks=False)
+        staged = installed_root / "src" if installed_root else root / "src"
+        if not installed_root:
+            for item in (source_root / "src").rglob("*"):
+                if item.is_symlink():
+                    raise RuntimeError(f"source symlink: {item}")
+            shutil.copytree(source_root / "src", staged, symlinks=False)
         staged_client = root / "broker_group_client.py"
         shutil.copyfile(Path(__file__), staged_client)
         staged_client.chmod(0o644)
-        contract_dir = root / "tests" / "cea_contract"
-        contract_dir.mkdir(parents=True)
-        shutil.copyfile(source_root / "tests" / "cea_contract" / "receipt.schema.json",
-                        contract_dir / "receipt.schema.json")
-        commit_marker = root / "SRC_COMMIT"
-        commit_marker.write_text("sandbox-preinstall\n")
-        if cross_uid:
+        if installed_root:
+            contract_dir = installed_root / "tests" / "cea_contract"
+            commit_marker = installed_root / "SRC_COMMIT"
+            if not (contract_dir / "receipt.schema.json").is_file():
+                raise RuntimeError("installed receipt schema missing")
+        else:
+            contract_dir = root / "tests" / "cea_contract"
+            contract_dir.mkdir(parents=True)
+            shutil.copyfile(source_root / "tests" / "cea_contract" / "receipt.schema.json",
+                            contract_dir / "receipt.schema.json")
+            commit_marker = root / "SRC_COMMIT"
+            commit_marker.write_text("sandbox-preinstall\n")
+        if cross_uid and not installed_root:
             for parent, dirs, files in os.walk(staged):
                 for name in dirs + files:
                     item = Path(parent) / name
@@ -73,18 +85,19 @@ def proof(source_root, token_source, *, cross_uid):
         private.mkdir(mode=0o700)
         if cross_uid:
             os.chown(private, broker_uid, broker_gid)
-        tokens = private / "tokens.json"
+        tokens = installed_root / "caller-tokens.json" if installed_root else private / "tokens.json"
         # Use an isolated token with the same adapter-table shape; never emit it.
         original = json.loads(Path(token_source).read_text())
         adapters = original.get("adapters") or {}
         if not adapters:
             raise RuntimeError("caller token table has no adapters")
         identity = next(iter(adapters.values()))
-        credential = secrets.token_urlsafe(32)
-        tokens.write_text(json.dumps({"adapters": {credential: identity}}))
-        tokens.chmod(0o600)
-        if cross_uid:
-            os.chown(tokens, broker_uid, broker_gid)
+        credential = next(iter(adapters)) if installed_root else secrets.token_urlsafe(32)
+        if not installed_root:
+            tokens.write_text(json.dumps({"adapters": {credential: identity}}))
+            tokens.chmod(0o600)
+            if cross_uid:
+                os.chown(tokens, broker_uid, broker_gid)
         sockdir = root / "sock"
         sockdir.mkdir()
         if cross_uid:
@@ -96,13 +109,16 @@ def proof(source_root, token_source, *, cross_uid):
         db = private / "receipts.db"
         # The production broker opens an already initialized task database.
         sys.path.insert(0, str(staged))
-        sys.path.insert(1, str(user_site))
+        if not installed_root:
+            sys.path.insert(1, str(user_site))
         from agent_crew.queue import TaskQueue
         TaskQueue(str(db))
         if cross_uid:
             os.chown(db, broker_uid, broker_gid)
-        env = {k: v for k, v in os.environ.items() if not k.startswith("AGENT_CREW_")}
-        env.update(PYTHONPATH=os.pathsep.join((str(staged), str(user_site))),
+        env = ({"PATH": "/usr/local/bin:/usr/bin:/bin",
+                "PYTHONNOUSERSITE": "1"} if installed_root else
+               {k: v for k, v in os.environ.items() if not k.startswith("AGENT_CREW_")})
+        env.update(PYTHONPATH=(str(staged) if installed_root else os.pathsep.join((str(staged), str(user_site)))),
                    AGENT_CREW_AUTHZ_SRC_COMMIT_PATH=str(commit_marker),
                    AGENT_CREW_CEA_BROKER_DB=str(db),
                    AGENT_CREW_CEA_CALLER_TOKENS=str(tokens), AGENT_CREW_CEA_MODE="enforce",
@@ -110,7 +126,11 @@ def proof(source_root, token_source, *, cross_uid):
                    AGENT_CREW_CEA_SNAPSHOT_PATH=str(root / "absent-snapshot.json"),
                    AGENT_CREW_CEA_QUOTA_CACHE_DIR=str(root / "absent-quota"),
                    AGENT_CREW_CEA_CODEX_AUTH_PATH=str(root / "absent-auth.json"))
-        broker_cmd = [sys.executable, "-m", "agent_crew.cea.broker", "--sock-dir", str(sockdir),
+        if installed_root:
+            env["AGENT_CREW_AUTHZ_LAUNCHER_PATH"] = str(installed_root.parent.parent / "usr/local/libexec/crew-authz/broker-launch.sh")
+            env["AGENT_CREW_AUTHZ_CONFIG_PATH"] = str(installed_root / "broker.env")
+        python = str(installed_root / "venv/bin/python") if installed_root else sys.executable
+        broker_cmd = [python, "-m", "agent_crew.cea.broker", "--sock-dir", str(sockdir),
                       "--client-uid", str(client_uid)]
         if cross_uid:
             broker_cmd = ["setpriv", "--reuid", str(broker_uid), "--regid", str(broker_gid),
@@ -134,7 +154,7 @@ def proof(source_root, token_source, *, cross_uid):
                     (st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode)) != (broker_uid, group_gid, 0o660)):
                 raise RuntimeError(f"wrong socket ownership/mode: {st.st_uid}:{st.st_gid} {stat.S_IMODE(st.st_mode):04o}")
             client_env = dict(env, BROKER_PROOF_CREDENTIAL=credential)
-            client_cmd = [sys.executable, str(staged_client), "--client", str(sock),
+            client_cmd = [python, str(staged_client), "--client", str(sock),
                           str(broker_uid)]
             if cross_uid:
                 client_cmd = ["setpriv", "--reuid", str(client_uid), "--regid", str(client_gid),
@@ -162,11 +182,14 @@ def main():
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parents[2])
     parser.add_argument("--caller-tokens", type=Path)
     parser.add_argument("--cross-uid", action="store_true")
+    parser.add_argument("--installed-root", type=Path)
     parser.add_argument("--client", nargs=2, metavar=("SOCKET", "EXPECTED_UID"))
     args = parser.parse_args()
     if args.client:
         print(json.dumps(client(args.client[0], os.environ["BROKER_PROOF_CREDENTIAL"], int(args.client[1]))))
         return
+    if args.installed_root:
+        args.caller_tokens = args.installed_root / "caller-tokens.json"
     if not args.caller_tokens:
         parser.error("--caller-tokens is required")
     if not args.cross_uid and os.getegid() != grp.getgrnam("crew-authz-clients").gr_gid:
@@ -178,7 +201,8 @@ def main():
             raise RuntimeError(result.stderr.strip())
         print(result.stdout, end="")
         return
-    print(json.dumps(proof(args.source_root, args.caller_tokens, cross_uid=args.cross_uid), sort_keys=True))
+    print(json.dumps(proof(args.source_root, args.caller_tokens, cross_uid=args.cross_uid,
+                           installed_root=args.installed_root), sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,5 @@
+# Audited imports for the broker, CEA schema/signature providers, and queue helpers.
+# Transitive dependencies are resolved by pip within this root-owned venv.
+jsonschema==4.26.0
+cryptography==50.0.1
+httpx==0.28.1

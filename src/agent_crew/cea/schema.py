@@ -36,8 +36,7 @@ def _schema_path() -> Path:
         return repo_copy
     return here.parent / "receipt.schema.json"
 
-
-SCHEMA_PATH = _schema_path()
+SCHEMA_PATH = _schema_path()  # compatibility for callers displaying the path
 
 SCHEMA_SOURCE = "alfred sev0/cea-alfred-lineage @e1063eb tests/cea_contract/receipt.schema.json"
 SCHEMA_BLOB = "41e7ebf271830790f6aae80a413e51edf7805fcd"
@@ -47,7 +46,7 @@ SCHEMA_BLOB = "41e7ebf271830790f6aae80a413e51edf7805fcd"
 @lru_cache(maxsize=1)
 def load_schema() -> dict:
     """The frozen schema as a dict. Cached; the file never changes at runtime."""
-    with open(SCHEMA_PATH, "r", encoding="utf-8") as fh:
+    with open(_schema_path(), "r", encoding="utf-8") as fh:
         return json.load(fh)
 
 
