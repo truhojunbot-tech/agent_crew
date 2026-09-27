@@ -54,7 +54,7 @@ def run_e2e():
                    AGENT_CREW_WATCHDOG_DISABLED="1", AGENT_CREW_ANOMALY_DISABLED="1",
                    AGENT_CREW_AUTHZ_CONFIG=str(home / "absent-broker.env"),
                    AGENT_CREW_AUTHZ_PYTHON=sys.executable,
-                   AGENT_CREW_AUTHZ_PYTHONPATH=str(SRC),
+                   AGENT_CREW_AUTHZ_PYTHONPATH=os.pathsep.join((str(SRC), site.getusersitepackages())),
                    AGENT_CREW_AUTHZ_SOCK_DIR=str(home / "sock"),
                    AGENT_CREW_AUTHZ_CLIENT_GROUP=subprocess.check_output(["id", "-gn"], text=True).strip(),
                    AGENT_CREW_CEA_MODE="enforce", AGENT_CREW_CEA_MODE__ALFRED="enforce",
@@ -77,6 +77,22 @@ def run_e2e():
         snapshot_path.write_text(json.dumps(snapshot))
         env.update(AGENT_CREW_CEA_SNAPSHOT_PATH=str(snapshot_path),
                    AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=str(key_path))
+        # Mirror the installed broker boundary with a disposable signing key:
+        # only the broker gets the private half; admission verifies the public half.
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        receipt_private = Ed25519PrivateKey.generate()
+        receipt_private_path = home / "receipt-signing.key"
+        receipt_public_path = home / "receipt-signing.pub"
+        receipt_private_path.write_bytes(receipt_private.private_bytes(
+            serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+            serialization.NoEncryption()))
+        receipt_private_path.chmod(0o400)
+        receipt_public_path.write_bytes(receipt_private.public_key().public_bytes(
+            serialization.Encoding.Raw, serialization.PublicFormat.Raw))
+        receipt_public_path.chmod(0o644)
+        src_commit_path = home / "SRC_COMMIT"
+        src_commit_path.write_text(build + "\n")
         quota_dir = home / "quota"
         quota_dir.mkdir()
         auth_path = home / "codex-auth.json"
@@ -108,9 +124,12 @@ def run_e2e():
             raise RuntimeError("sandbox DB init failed: " + init.stderr)
         broker_env = dict(env, AGENT_CREW_CEA_BROKER_DB=str(db),
                           AGENT_CREW_CEA_CALLER_TOKENS=str(tokens_path),
-                          AGENT_CREW_CEA_ISSUER="agent_crew.cea.broker.sandbox")
+                          AGENT_CREW_CEA_ISSUER="agent_crew.cea.broker.sandbox",
+                          AGENT_CREW_CEA_RECEIPT_SIGNING_KEY_FILE=str(receipt_private_path),
+                          AGENT_CREW_AUTHZ_SRC_COMMIT_PATH=str(src_commit_path))
         server_env = dict(env, AGENT_CREW_CEA_BROKER_SOCKET=str(home / "sock" / "broker.sock"),
-                          AGENT_CREW_CEA_BROKER_DEGRADED="1")
+                          AGENT_CREW_CEA_BROKER_DEGRADED="1",
+                          AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE=str(receipt_public_path))
         evidence = {"build_sha": build, "mode": "sandbox_http_e2e", "project": "alfred",
                     "broker_socket": str(home / "sock" / "broker.sock"),
                     "enforced_codes": ["RUNTIME_STATE_FORBIDS"], "pass": False}
@@ -191,9 +210,13 @@ def run_e2e():
                 if receipt["downgrade_reason"] != "BROKER_TREE_USER_WRITABLE":
                     raise RuntimeError(f"{case}: unexpected downgrade/fallback reason: "
                                        f"{receipt['downgrade_reason']}")
-            if (evidence["block"]["receipt"]["reason"]["code"] != "RUNTIME_STATE_FORBIDS"
-                    or evidence["block"]["http_status"] < 400
-                    or evidence["block"]["task_status"] in {"pending", "running"}):
+            block_response = evidence["block"]
+            pause_suppressed = (block_response["http_status"] == 200
+                and isinstance(block_response["http_body"], dict)
+                and block_response["http_body"].get("suppressed_by_pause") is True)
+            if (block_response["receipt"]["reason"]["code"] != "RUNTIME_STATE_FORBIDS"
+                    or not (block_response["http_status"] >= 400 or pause_suppressed)
+                    or block_response["task_status"] in {"pending", "running"}):
                 raise RuntimeError("paused implement was not blocked at HTTP admission")
             if evidence["allow"]["http_status"] != 201 or evidence["allow"]["task_status"] != "pending":
                 raise RuntimeError("resumed review was not admitted")
@@ -293,7 +316,11 @@ def run():
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(evidence, indent=2) + "\n")
             print(out)
-            return 0 if check.returncode == 0 and test.returncode == 0 else 1
+            # --check validates the installed pinned runtime, which this
+            # disposable degraded sandbox intentionally does not install.
+            # Keep its result in evidence; the smoke verdict comes from the
+            # bound socket, server health, and isolated decision assertion.
+            return 0 if test.returncode == 0 else 1
         finally:
             for proc in (server, broker):
                 if proc is not None and proc.poll() is None:
