@@ -1402,6 +1402,74 @@ def codex_session_size_for_id(session_id: str, *, home=None) -> int:
         return 0
 
 
+def codex_latest_compaction_summary(session_id: str, *, home=None) -> str:
+    """Read the latest plain-text summary from Codex's own rollout.
+
+    A compacted record may contain only encrypted replacement history. In that
+    case there is no portable summary to seed, so the caller uses its durable
+    checkpoint alone. Never use unrelated user messages as a substitute.
+    """
+    path = codex_rollout_path(session_id, home=home)
+    if path is None:
+        return ""
+    summary = ""
+    try:
+        with path.open(errors="replace") as rollout:
+            for line in rollout:
+                if '"compacted"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("type") != "compacted":
+                    continue
+                payload = record.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                message = payload.get("message")
+                candidate = message if isinstance(message, str) else ""
+                if not candidate and isinstance(message, dict):
+                    candidate = "\n".join(
+                        part.get("text", "") for part in message.get("content", [])
+                        if isinstance(part, dict) and isinstance(part.get("text"), str))
+                if not candidate:
+                    for item in reversed(payload.get("replacement_history") or []):
+                        if (isinstance(item, dict) and item.get("type") == "compaction"
+                                and isinstance(item.get("text"), str)):
+                            candidate = item["text"]
+                            break
+                summary = candidate.strip()
+    except OSError:
+        return ""
+    return summary[:40000]
+
+
+def codex_thread_id_from_output(output: str) -> str:
+    """Read the session ID emitted by ``codex exec --json``."""
+    for line in output.splitlines():
+        if '"thread.started"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "thread.started":
+            return str(event.get("thread_id") or "")
+    return ""
+
+
+def _codex_session_mode(state_path: str | None) -> str:
+    if not state_path:
+        return ""
+    try:
+        with open(state_path) as state_file:
+            value = json.load(state_file).get("codex_session_mode")
+        return value if value == "renew_rehydrate" else ""
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+
+
 def codex_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
                               session_id: str = "") -> tuple:
     """Is the rollout a codex resume would replay past the cap (#260 review)?
@@ -2714,6 +2782,7 @@ def create_app(
     logger.info("Context Pack effective enabled=%s (AGENT_CREW_CONTEXT_PACK=%r)",
                 _cpack.enabled(), os.environ.get("AGENT_CREW_CONTEXT_PACK"))
     _codex_cap_mb = _codex_context_cap_mb(state_path)
+    _codex_mode = _codex_session_mode(state_path)
     logger.info("Codex context cap effective=%s MB", _codex_cap_mb)
     if memory_provider is not None:
         _memory_provider = memory_provider
@@ -4346,6 +4415,7 @@ def create_app(
         _ctx_over = False
         _ctx_cap_info = {}
         _codex_planned = ""      # the session a codex resume would use, if any
+        _renew_previous_session = ""
         if agent == "gemini":
             _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
         elif agent == "codex":
@@ -4364,6 +4434,12 @@ def create_app(
                 _project, agent, wt) or "").strip()
             if not _codex_planned:
                 _codex_planned = codex_session_for_cwd(wt)
+            if (_codex_mode == "renew_rehydrate"
+                    and task.task_type == "implement"
+                    and not (_ctx.get("fix_round") or str(task.task_id).startswith("fix-"))
+                    and not _force_context_reset and _codex_planned):
+                _renew_previous_session = _codex_planned
+                _force_context_reset = True
             _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(
                 wt, max_mb=_codex_cap_mb, session_id=_codex_planned)
         elif agent == "claude":
@@ -4737,6 +4813,47 @@ def create_app(
             _release_dispatch_slot(task.task_id, _slot)
             return
         message = _format_task_message(task, port, nonce=_dispatch_nonce)
+        if _renew_previous_session:
+            _summary = codex_latest_compaction_summary(_renew_previous_session)
+            _seed = "summary_and_checkpoint" if _summary else "checkpoint_only"
+            _previous_context = (q().get_task_context(_ctx_info["previous_task_id"])
+                                 if _ctx_info.get("previous_task_id") else {})
+            _chain_root = (_ctx.get("chain_root") or _ctx.get("prev_task_id")
+                           or task.task_id)
+            _checkpoint = {
+                "task_id": task.task_id, "branch": task.branch,
+                "pr_number": _ctx.get("pr_number") or _previous_context.get("pr_number"),
+                "previous_task_id": _ctx_info.get("previous_task_id"),
+                "chain_root": _chain_root,
+            }
+            # The existing ADR-001 store supplies verified owner statements.
+            # Only already provisioned project-local memory is read; a missing
+            # store is an explicit empty authority set, never an invented fact.
+            _owner_facts = []
+            try:
+                from agent_crew.memory_runtime import effective_owner_statements
+                _storage = getattr(_memory_provider, "storage", None)
+                if _storage is not None:
+                    _owner_facts = [
+                        {"source_ref": record.value.get("source_ref"),
+                         "text": record.value.get("text")}
+                        for record in effective_owner_statements(_storage, _project)
+                    ]
+            except Exception:
+                logger.exception("dispatcher: owner memory read failed for %s", task.task_id)
+            _checkpoint["owner_authority_facts"] = _owner_facts
+            _renew_block = (
+                "ADR-001 7.7 renewal checkpoint (verify current sources):\n"
+                + json.dumps(_checkpoint, ensure_ascii=False)
+                + ("\nPrevious Codex rollout compaction summary:\n" + _summary
+                   if _summary else "")
+            )
+            message = _renew_block + "\n\n" + message
+            q().patch_context(task.task_id, {
+                "context_renewal": {"mode": _codex_mode, "seed": _seed,
+                                    "previous_session_id": _renew_previous_session,
+                                    "chain_root": _chain_root},
+            })
         # #239: assemble a bounded, provenance-linked Context Pack from durable
         # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
         # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
@@ -5060,12 +5177,27 @@ def create_app(
                     # cheap to find, and once recorded the next resume needs no
                     # search at all. Without this a fresh codex task would never
                     # acquire a binding and every dispatch would start over.
-                    _codex_after = codex_session_for_cwd(wt)
+                    _codex_after = ((codex_thread_id_from_output(_task_log_tail)
+                                     if _renew_previous_session else "")
+                                    or codex_session_for_cwd(wt))
                     if _codex_after and _codex_after != _ctx_info.get("provider_session_id"):
                         q().update_context_provider_session_id(_context_key, _codex_after)
                         logger.info(
                             "dispatcher: recorded codex session %s for %s (#262)",
                             _codex_after[:8], wt)
+                    if _renew_previous_session:
+                        if _codex_after and _codex_after != _renew_previous_session:
+                            q().update_attribution_provider_session_id(task.task_id, _codex_after)
+                        _renew_fields = {
+                            "mode": _codex_mode, "seed": _seed,
+                            "previous_session_id": _renew_previous_session,
+                            "new_session_id": (_codex_after if _codex_after != _renew_previous_session else ""),
+                            "task_id": task.task_id, "chain_root": _chain_root,
+                        }
+                        q().patch_context(task.task_id, {"context_renewal": _renew_fields})
+                        record_context_event(_context_events_path, "context_renewed",
+                                             project=_project, agent=agent, role=role,
+                                             **_renew_fields)
                 if detect_context_compaction(_task_log_tail):
                     record_context_event(
                         _context_events_path, "context_compacted",
