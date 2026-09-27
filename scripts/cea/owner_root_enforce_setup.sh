@@ -542,9 +542,6 @@ if args.update_src:
             if check_high_water_mark(str(state_stage / "snapshot-hwm.json"),
                                      current.generation, current.hash, bootstrap=True):
                 raise RuntimeError("current signed snapshot conflicts with existing high-water mark")
-        os.chmod(state_stage / "snapshot-hwm.json", 0o600)
-        if privileged:
-            os.chown(state_stage / "snapshot-hwm.json", authz.pw_uid, authz.pw_gid)
         shutil.copyfile(source_tokens, token_stage)
         os.chmod(token_stage, 0o400)
         if privileged:
@@ -576,6 +573,9 @@ if args.update_src:
                     serialization.PublicFormat.Raw)
             private_stage.write_bytes(private_bytes)
             public_stage.write_bytes(public_bytes)
+        os.chmod(state_stage / "snapshot-hwm.json", 0o600)
+        if privileged:
+            os.chown(state_stage / "snapshot-hwm.json", authz.pw_uid, authz.pw_gid)
         os.chmod(private_stage, 0o400)
         os.chmod(public_stage, 0o644)
         if privileged:
