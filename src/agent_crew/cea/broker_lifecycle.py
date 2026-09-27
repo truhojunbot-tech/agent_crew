@@ -198,6 +198,7 @@ def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
     tmp.write_text(json.dumps({"pid": proc.pid, "start_time": born}) + "\n")
     tmp.replace(pidfile)
     deadline = time.monotonic() + timeout
+    last_health_error = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             pidfile.unlink(missing_ok=True)
@@ -206,13 +207,15 @@ def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
             health(sock_dir, tokens_path, service_uid)
             print(f"broker started pid={proc.pid}; authenticated health ok", flush=True)
             return
-        except LifecycleError:
+        except LifecycleError as exc:
+            last_health_error = exc
             time.sleep(0.1)
     try:
-        stop(pidfile, sock_dir, service_uid)
+        stop(pidfile, sock_dir, service_uid, allow_degraded=degraded)
     except LifecycleError as exc:
         raise LifecycleError(f"broker failed authenticated health; cleanup failed: {exc}; see {log}") from exc
-    raise LifecycleError(f"broker failed authenticated health within {timeout:g}s; stopped; see {log}")
+    raise LifecycleError(f"broker failed authenticated health within {timeout:g}s: "
+                         f"{last_health_error}; stopped; see {log}")
 
 
 def main(argv: list[str] | None = None) -> int:
