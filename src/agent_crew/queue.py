@@ -5854,6 +5854,18 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def update_attribution_provider_session_id(self, task_id: str, provider_session_id: str) -> None:
+        """Attach a newly observed fresh provider session to its dispatch receipt."""
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE task_attribution SET provider_session_id=?, updated_at=? WHERE task_id=?",
+                (provider_session_id, time.time(), task_id),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
     def get_attribution(self, task_id: str) -> Optional[dict]:
         """Return the durable attribution row for ``task_id`` (#202), or
         None if no attribution was ever recorded for it. Used to correlate

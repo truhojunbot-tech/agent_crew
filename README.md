@@ -50,6 +50,23 @@ crew status myproject
 crew teardown myproject
 ```
 
+### Codex session renewal (opt in)
+
+Set `"codex_session_mode": "renew_rehydrate"` in
+`~/.agent_crew/<project>/state.json`, then restart the project server through
+the normal T0 runtime swap. This affects only new Codex implement tasks: each
+starts a fresh session with the previous rollout's latest readable compaction
+summary and a task/branch/PR/verified owner-memory checkpoint. If the rollout
+has no readable summary, the checkpoint alone is used. Review fix rounds keep
+resuming their bound session. `AGENTS.md` is still supplied by the normal
+worker protocol. `context_events.jsonl` records `context_renewed`, and the
+task context and attribution receipt record the old and new session IDs.
+
+To revert, remove `codex_session_mode` (or set another value) in the same
+state file and use the next T0 runtime swap. The default Codex resume behavior
+and `codex_context_max_mb` setting remain unchanged; this flip does not edit
+existing rollout files.
+
 When `main` is the configured base, `crew run --branch main` starts there;
 the implementer may
 report a separate work branch, which later review rounds follow. Naming a

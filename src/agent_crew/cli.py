@@ -1018,6 +1018,8 @@ def setup(project: str, agents: str, base: str):
         "tokenomics_policy_path": policy_path,
         "context_pack_enabled": context_pack_enabled,
     }
+    if existing_state and "codex_session_mode" in existing_state:
+        state_to_write["codex_session_mode"] = existing_state["codex_session_mode"]
     state_to_write.update({key: value for key, value in
                            _codex_context_cap_state(project, existing_state).items()
                            if key == "codex_context_max_mb"})
