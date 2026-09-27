@@ -75,8 +75,17 @@ def run_e2e():
                                    "value": hmac.new(key, canonical, hashlib.sha256).hexdigest()})
         snapshot_path = home / "snapshot.json"
         snapshot_path.write_text(json.dumps(snapshot))
+        hwm_dir = home / "state"
+        hwm_dir.mkdir(mode=0o700)
+        hwm_path = hwm_dir / "snapshot-hwm.json"
+        hwm_path.write_text(json.dumps({
+            "generation": body["generation"],
+            "content_hash": "sha256:" + hashlib.sha256(canonical).hexdigest(),
+        }))
+        hwm_path.chmod(0o600)
         env.update(AGENT_CREW_CEA_SNAPSHOT_PATH=str(snapshot_path),
-                   AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=str(key_path))
+                   AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=str(key_path),
+                   AGENT_CREW_CEA_SNAPSHOT_HWM_FILE=str(hwm_path))
         # Mirror the installed broker boundary with a disposable signing key:
         # only the broker gets the private half; admission verifies the public half.
         from cryptography.hazmat.primitives import serialization

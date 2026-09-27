@@ -273,7 +273,7 @@ ENFORCEABLE_REASON_CODES = frozenset({
     "RESULT_ACCEPTED_SNAPSHOT_STALE", "RESULT_WITHOUT_EXECUTE_START",
     "REVIEW_WITHOUT_REVIEWER", "RUNTIME_DRAINING", "RUNTIME_EPOCH_ADVANCED",
     "RUNTIME_STATE_FORBIDS", "SIGNATURE_UNVERIFIED_AT_BOUNDARY",
-    "SNAPSHOT_STALE", "STALE_RECEIPT", "TASK_ID_MISMATCH",
+    "SNAPSHOT_STALE", "SNAPSHOT_ROLLBACK", "STALE_RECEIPT", "TASK_ID_MISMATCH",
 })
 
 
@@ -1197,6 +1197,9 @@ class AuthorizationEngine:
         P7 first: an input that did not answer outranks every other judgement,
         because a decision made without it is not a decision, it is a guess.
         """
+        if getattr(snapshot, "rollback_status", None) == "SNAPSHOT_ROLLBACK":
+            return ("BLOCK", "SNAPSHOT_ROLLBACK",
+                    "signed policy snapshot is older than or conflicts with the high-water mark")
         if unavailable:
             return ("BLOCK", "INPUTS_UNAVAILABLE",
                     f"P7: {', '.join(unavailable)} did not answer; admission fails closed and "
@@ -1461,6 +1464,7 @@ def _provenance(intent: Intent, snapshot, unavailable) -> dict:
     prov: dict = {
         "snapshot_signature_status": (getattr(snapshot.signature, "value", None)
                                       if snapshot is not None else None),
+        "snapshot_rollback_status": getattr(snapshot, "rollback_status", None),
         "coordinator": intent.coordinator_id,
         "intent_identity": _identity_json(intent.identity),
     }
