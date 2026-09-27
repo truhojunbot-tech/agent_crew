@@ -2606,6 +2606,21 @@ def _format_task_message(task: TaskRequest, port: int,
     )
 
 
+def worker_environment(server_env, worktree: str) -> dict[str, str]:
+    """Build a provider environment without server-only memory controls.
+
+    The server may capture into a live shadow DB, but a worker running pytest
+    must not pass that DB path to its own in-test server (#430).
+    """
+    child = {
+        key: value for key, value in server_env.items()
+        if not key.startswith(("AGENT_CREW_SHADOW_MEMORY_", "AGENT_CREW_ADR001_"))
+        and key not in {"PYTHONPATH", "PYTHONHOME"}
+    }
+    child["TELEGRAM_STATE_DIR"] = os.path.join(worktree, ".telegram")
+    return child
+
+
 def create_app(
     db_path: str,
     pane_map: Optional[dict] = None,
@@ -4923,9 +4938,7 @@ def create_app(
                 # Strip PYTHONPATH/PYTHONHOME so codex/gemini python wrappers
                 # don't load the server's 3.10 stdlib under a 3.12 interpreter
                 # (causes "SRE module mismatch" crash on subprocess startup).
-                _dispatch_env = {**os.environ, "TELEGRAM_STATE_DIR": os.path.join(wt, ".telegram")}
-                _dispatch_env.pop("PYTHONPATH", None)
-                _dispatch_env.pop("PYTHONHOME", None)
+                _dispatch_env = worker_environment(os.environ, wt)
                 # start_new_session=True puts proc in its own process group so
                 # we can kill the whole tree on timeout — agent CLIs (gemini,
                 # agy, codex) spawn helper children that survive a plain
