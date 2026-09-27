@@ -62,9 +62,9 @@ from agent_crew.pipeline import (
 from agent_crew import provenance as _prov
 from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
-    RESULT_COMMIT_CONTEXT_KEY,
+    RESULT_COMMIT_CONTEXT_KEY, validate_review_result,
 )
-from agent_crew.queue import (AdmissionRefused, DuplicateReviewError, LateResultRejected, TaskAlreadyExistsError,
+from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError, LateResultRejected, TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -6120,6 +6120,10 @@ def create_app(
         ctx = q().get_task_context(task_id)
         _artifact_held = None
         _task = next((item for item in q().list_tasks() if item.task_id == task_id), None)
+        if _task is not None and _task.task_type == "review" and not _REPLAYING.get():
+            _review_error = validate_review_result(result)
+            if _review_error:
+                raise HTTPException(status_code=422, detail=_review_error)
         try:
             _runtime_paused = q().get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
@@ -6188,7 +6192,8 @@ def create_app(
         _nonce, _presenter = result.take_executor_binding()
         try:
             task_type = q().submit_result(task_id, result, nonce=_nonce,
-                                          presenter=_presenter)
+                                          presenter=_presenter,
+                                          allow_review_replay=_REPLAYING.get())
             capture_result_best_effort(db_path, task_id, result)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
@@ -6248,6 +6253,8 @@ def create_app(
                 "task_id": task_id, "prior_status": exc.status,
                 "reason": str(exc),
             })
+        except CompletedReviewRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")

@@ -88,6 +88,13 @@ class LateResultRejected(RuntimeError):
         super().__init__(f"LATE_RESULT_REJECTED: task already {status}")
 
 
+class CompletedReviewRejected(RuntimeError):
+    """A published review verdict cannot be replaced after its cascade ran."""
+
+    def __init__(self):
+        super().__init__("review already completed; submit a new review task instead")
+
+
 ResultBeforeCommit = Callable[[sqlite3.Connection, object, float], None]
 
 
@@ -3709,7 +3716,8 @@ class TaskQueue:
                       before_commit: Optional[ResultBeforeCommit] = None,
                       consume_receipt: bool = True,
                       expected_status: Optional[str] = None,
-                      dispatcher_failed: bool = False) -> str:
+                      dispatcher_failed: bool = False,
+                      allow_review_replay: bool = False) -> str:
         """Submit a task result. Returns the task_type of the completed task
         (so push-model callers can decide what to push next).
 
@@ -3756,6 +3764,10 @@ class TaskQueue:
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             prior_status = row["status"]
+            if (row["task_type"] == "review" and prior_status == "completed"
+                    and not allow_review_replay):
+                conn.execute("ROLLBACK")
+                raise CompletedReviewRejected()
             system_failed = False
             if prior_status == "failed":
                 # The execution history is best-effort instrumentation; its

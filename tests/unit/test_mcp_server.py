@@ -212,7 +212,7 @@ class TestSubmitResult:
             "submit_result",
             task_id="t-rev",
             status="completed",
-            summary="reviewed",
+            summary="Reviewed this change and found an off-by-one error.",
             verdict="request_changes",
             findings=["[bug] off-by-one in step 2"],
         )

@@ -45,10 +45,11 @@ from agent_crew.pipeline import (
 )
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
+    validate_review_result,
 )
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
-    AdmissionRefused, LateResultRejected, PausedError as _PausedError, TaskQueue,
+    AdmissionRefused, CompletedReviewRejected, LateResultRejected, PausedError as _PausedError, TaskQueue,
 )
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
@@ -166,7 +167,7 @@ def build_mcp_server(
         status: str = "completed",
         summary: str = "",
         verdict: Optional[str] = None,
-        findings: Optional[list[str]] = None,
+        findings: Optional[list[Union[str, dict]]] = None,
         # `int | str` for the same reason as the HTTP body: agents write PR
         # numbers as `#268`, and a transport that 422s on the spelling throws
         # the whole result away (review of PR #270).
@@ -222,6 +223,10 @@ def build_mcp_server(
         result, mismatch = hold_mismatched_pr_result(task_id, result, _task_ctx)
         _artifact_held = None
         _task = next((item for item in queue.list_tasks() if item.task_id == task_id), None)
+        if _task is not None and _task.task_type == "review":
+            _review_error = validate_review_result(result)
+            if _review_error:
+                return {"acknowledged": False, "error": _review_error}
         try:
             _runtime_paused = queue.get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
@@ -268,6 +273,8 @@ def build_mcp_server(
             # lock); only the evidence event was committed, so no cascade.
             return {"acknowledged": False, "late_result": True, "accepted": False,
                     "task_id": task_id, "prior_status": exc.status, "error": str(exc)}
+        except CompletedReviewRejected as exc:
+            return {"acknowledged": False, "accepted": False, "error": str(exc)}
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
         # #348: mirror HTTP's post-commit, fail-soft persistence. This is
