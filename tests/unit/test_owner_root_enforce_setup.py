@@ -630,7 +630,8 @@ def test_installed_selftest_argv_uses_installed_venv(tmp_path):
 @pytest.mark.skipif(os.environ.get("RUN_OWNER_REHEARSAL") != "1",
                     reason="set RUN_OWNER_REHEARSAL=1 for the real pinned-venv rehearsal")
 def test_owner_rehearsal_with_real_venv():
-    token = Path.home() / ".agent_crew/alfred-cea/caller-tokens.json"
+    token = Path(os.environ.get("RUN_OWNER_REHEARSAL_TOKENS",
+                                "/home/truhojun/.agent_crew/alfred-cea/caller-tokens.json"))
     result = subprocess.run(["bash", str(SCRIPT), "--rehearse", "--update-src",
                              "--caller-tokens", str(token)], capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stderr + result.stdout

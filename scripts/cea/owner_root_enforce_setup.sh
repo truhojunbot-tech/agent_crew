@@ -227,6 +227,17 @@ def build_venv(destination):
         os.chown(destination, 0, 0)
     os.chmod(destination, 0o755)
 
+def pinned_crypto(interpreter, operation, **paths):
+    if fake:
+        return False
+    command = [str(interpreter), str(source_root / "scripts/cea/owner_crypto.py"),
+               operation, "--source-root", str(source_root), "--pubkey", str(snapshot_source)]
+    for name, value in paths.items():
+        command.extend(("--" + name.replace("_", "-"), str(value)))
+    subprocess.run(command, check=True,
+                   env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1"})
+    return True
+
 def installed_selftest():
     if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_FAIL_STAGE") == "selftest":
         raise RuntimeError("injected update failure: selftest")
@@ -299,8 +310,7 @@ def apply_preconditions(source_update=False):
                         if len(values) != 1:
                             raise ValueError("AGENT_CREW_CEA_SNAPSHOT_PATH must have one value")
                         configured = values[0]
-                from agent_crew.cea.wiring import DEFAULT_SNAPSHOT_PATH
-                broker_snapshot = path(configured or DEFAULT_SNAPSHOT_PATH)
+                broker_snapshot = path(configured or "/home/truhojun/alfred/governance/cea_policy_snapshot.json")
                 if broker_snapshot.resolve() != snapshot_path.resolve():
                     failures.append(f"HWM seed path {snapshot_path} differs from broker snapshot path {broker_snapshot}; recover by setting AGENT_CREW_CEA_SNAPSHOT_PATH in broker.env")
             except ValueError as exc:
@@ -309,7 +319,7 @@ def apply_preconditions(source_update=False):
             failures.append(f"signed snapshot missing: {snapshot_path}; recover by publishing a signed snapshot")
         elif not os.access(snapshot_path, os.R_OK) or not os.access(snapshot_source, os.R_OK):
             unverified.append(f"signed snapshot or public key unreadable as non-root: {snapshot_path}")
-        else:
+        elif fake:
             try:
                 sys.path.insert(0, str(source_root / "src"))
                 from agent_crew.cea.input_providers.snapshot import CanonicalPolicySnapshotReader, ed25519_verifier
@@ -320,6 +330,13 @@ def apply_preconditions(source_update=False):
                     failures.append(f"current snapshot is not signed and fresh: {snapshot_path}; recover by publishing a signed snapshot")
             except Exception as exc:
                 failures.append(f"snapshot verification failed: {exc}; recover by publishing a signed snapshot")
+        elif (venv / "bin/python").is_file():
+            try:
+                pinned_crypto(venv / "bin/python", "snapshot", snapshot=snapshot_path)
+            except (OSError, subprocess.CalledProcessError) as exc:
+                failures.append(f"snapshot verification failed: {exc}; recover by publishing a signed snapshot")
+        else:
+            unverified.append("signed snapshot verification awaits staged pinned venv")
         if not venv.is_dir():
             unverified.append(f"pinned venv absent at {venv}; --update-src will build it")
         elif not (venv / "bin/python").exists():
@@ -369,7 +386,7 @@ def apply_preconditions(source_update=False):
             unverified.append(f"snapshot public key in restricted directory: {snapshot_source.parent}")
         elif not snapshot_source.is_file() or snapshot_source.is_symlink():
             failures.append(f"missing snapshot public key: {snapshot_source}")
-        elif os.access(snapshot_source, os.R_OK):
+        elif os.access(snapshot_source, os.R_OK) and fake:
             try:
                 from cryptography.hazmat.primitives import serialization
                 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -378,7 +395,7 @@ def apply_preconditions(source_update=False):
             except (ImportError, ValueError) as exc:
                 failures.append(f"invalid Ed25519 public key {snapshot_source}: {exc}")
         else:
-            unverified.append(f"snapshot public key contents: {snapshot_source}")
+            unverified.append(f"snapshot public key contents checked under pinned venv: {snapshot_source}")
         if sudoers.is_symlink() or sudoers.parent.is_symlink() or (sudoers.exists() and not sudoers.is_file()):
             failures.append(f"unsafe sudoers path: {sudoers}")
     if tokens is None:
@@ -503,14 +520,6 @@ if args.update_src:
         if privileged:
             import pwd
             authz = pwd.getpwnam("crew-authz")
-        sys.path.insert(0, str(staging))
-        from agent_crew.cea.input_providers.snapshot import (
-            CanonicalPolicySnapshotReader, check_high_water_mark, ed25519_verifier)
-        from agent_crew.cea.providers import SignatureStatus
-        verifier = ed25519_verifier(snapshot_source.read_bytes())
-        current = CanonicalPolicySnapshotReader(str(snapshot_path), verifier=verifier).current()
-        if current.signature is not SignatureStatus.VALID or not current.available:
-            raise RuntimeError(f"current snapshot is not signed and fresh: {snapshot_path}")
         if (tree / "state").exists():
             if (tree / "state").is_symlink() or any(
                     item.is_symlink() for item in (tree / "state").rglob("*")):
@@ -521,9 +530,18 @@ if args.update_src:
         os.chmod(state_stage, 0o700)
         if privileged:
             os.chown(state_stage, authz.pw_uid, authz.pw_gid)
-        if check_high_water_mark(str(state_stage / "snapshot-hwm.json"),
-                                 current.generation, current.hash, bootstrap=True):
-            raise RuntimeError("current signed snapshot conflicts with existing high-water mark")
+        if fake:
+            sys.path.insert(0, str(staging))
+            from agent_crew.cea.input_providers.snapshot import (
+                CanonicalPolicySnapshotReader, check_high_water_mark, ed25519_verifier)
+            from agent_crew.cea.providers import SignatureStatus
+            verifier = ed25519_verifier(snapshot_source.read_bytes())
+            current = CanonicalPolicySnapshotReader(str(snapshot_path), verifier=verifier).current()
+            if current.signature is not SignatureStatus.VALID or not current.available:
+                raise RuntimeError(f"current snapshot is not signed and fresh: {snapshot_path}")
+            if check_high_water_mark(str(state_stage / "snapshot-hwm.json"),
+                                     current.generation, current.hash, bootstrap=True):
+                raise RuntimeError("current signed snapshot conflicts with existing high-water mark")
         os.chmod(state_stage / "snapshot-hwm.json", 0o600)
         if privileged:
             os.chown(state_stage / "snapshot-hwm.json", authz.pw_uid, authz.pw_gid)
@@ -533,25 +551,31 @@ if args.update_src:
             import pwd
             authz = pwd.getpwnam("crew-authz")
             os.chown(token_stage, authz.pw_uid, authz.pw_gid)
-        from cryptography.hazmat.primitives import serialization
-        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
         old_private, old_public = tree / "receipt-signing.key", tree / "receipt-signing.pub"
-        if old_private.exists() != old_public.exists():
-            raise RuntimeError("incomplete receipt signing keypair; recover the missing key")
-        if old_private.exists():
-            private_bytes, public_bytes = old_private.read_bytes(), old_public.read_bytes()
-            signing_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
-            if signing_key.public_key().public_bytes(serialization.Encoding.Raw,
-                    serialization.PublicFormat.Raw) != public_bytes:
-                raise RuntimeError("receipt signing keypair mismatch")
+        if not fake:
+            pinned_crypto(venv_stage / "bin/python", "stage-security",
+                          snapshot=snapshot_path, state=state_stage,
+                          old_private=old_private, old_public=old_public,
+                          new_private=private_stage, new_public=public_stage)
         else:
-            signing_key = Ed25519PrivateKey.generate()
-            private_bytes = signing_key.private_bytes(serialization.Encoding.Raw,
-                serialization.PrivateFormat.Raw, serialization.NoEncryption())
-            public_bytes = signing_key.public_key().public_bytes(serialization.Encoding.Raw,
-                serialization.PublicFormat.Raw)
-        private_stage.write_bytes(private_bytes)
-        public_stage.write_bytes(public_bytes)
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+            if old_private.exists() != old_public.exists():
+                raise RuntimeError("incomplete receipt signing keypair; recover the missing key")
+            if old_private.exists():
+                private_bytes, public_bytes = old_private.read_bytes(), old_public.read_bytes()
+                signing_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+                if signing_key.public_key().public_bytes(serialization.Encoding.Raw,
+                        serialization.PublicFormat.Raw) != public_bytes:
+                    raise RuntimeError("receipt signing keypair mismatch")
+            else:
+                signing_key = Ed25519PrivateKey.generate()
+                private_bytes = signing_key.private_bytes(serialization.Encoding.Raw,
+                    serialization.PrivateFormat.Raw, serialization.NoEncryption())
+                public_bytes = signing_key.public_key().public_bytes(serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw)
+            private_stage.write_bytes(private_bytes)
+            public_stage.write_bytes(public_bytes)
         os.chmod(private_stage, 0o400)
         os.chmod(public_stage, 0o644)
         if privileged:
@@ -813,18 +837,21 @@ if not token_source or not token_source.is_file():
     raise SystemExit("--caller-tokens must name a readable token table for apply")
 if not snapshot_source.is_file() or snapshot_source.is_symlink():
     raise SystemExit(f"missing snapshot public key: {snapshot_source}")
-try:
-    from cryptography.hazmat.primitives import serialization
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
-    parsed_key = serialization.load_pem_public_key(snapshot_source.read_bytes())
-    if not isinstance(parsed_key, Ed25519PublicKey):
-        raise ValueError("expected an Ed25519 public key")
-except (ImportError, ValueError) as exc:
-    raise SystemExit(f"invalid Ed25519 public key {snapshot_source}: {exc}") from exc
+if fake:
+    try:
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        parsed_key = serialization.load_pem_public_key(snapshot_source.read_bytes())
+        if not isinstance(parsed_key, Ed25519PublicKey):
+            raise ValueError("expected an Ed25519 public key")
+    except (ImportError, ValueError) as exc:
+        raise SystemExit(f"invalid Ed25519 public key {snapshot_source}: {exc}") from exc
 # The installed-path proof runs after staging, against the exact paths the
 # launcher will use. The manifest permits undo if any later root operation fails.
 if not fake or os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
     if venv.is_dir():
+        if not fake:
+            pinned_crypto(venv / "bin/python", "pubkey")
         preinstall_selftest(token_source, venv / "bin/python")
     elif fake:
         preinstall_selftest(token_source, Path(shutil.which("python3")))
@@ -833,6 +860,7 @@ if not fake or os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
             os.chmod(stage_dir, 0o755)
             temporary_venv = Path(stage_dir) / "venv"
             build_venv(temporary_venv)
+            pinned_crypto(temporary_venv / "bin/python", "pubkey")
             preinstall_selftest(token_source, temporary_venv / "bin/python")
 for base in (manifest_dir, launcher.parent, tree, sudoers.parent):
     missing = []
