@@ -145,34 +145,93 @@ _PANE_IDLE_PATTERNS = [
 ]
 
 
-def _auto_detect_project(base: str) -> str | None:
-    """Try to auto-detect active project from crew state directory.
-
-    Returns project name if found, else None.
-    Strategy: check ~/.agent_crew for state.json files and return most recently
-    modified project's name.
-    """
-    try:
-        proj_dir = os.path.expanduser(base)
-        if not os.path.isdir(proj_dir):
-            return None
-
-        # Find all projects with state.json
-        projects_with_state = []
-        for entry in os.listdir(proj_dir):
-            state_path = os.path.join(proj_dir, entry, "state.json")
-            if os.path.isfile(state_path):
-                mtime = os.path.getmtime(state_path)
-                projects_with_state.append((entry, mtime))
-
-        if not projects_with_state:
-            return None
-
-        # Return the most recently modified project
-        projects_with_state.sort(key=lambda x: x[1], reverse=True)
-        return projects_with_state[0][0]
-    except Exception:
+def _git_repo_identity(path: str) -> tuple[str, str] | None:
+    """Return real top-level and common Git directory for a repository path."""
+    if not os.path.isdir(path) or not setup_module.validate_git_repo(path):
         return None
+    try:
+        top = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        common = subprocess.run(["git", "-C", path, "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return os.path.realpath(top), os.path.realpath(os.path.join(path, common))
+
+
+def _matching_projects(base: str) -> list[str]:
+    cwd_identity = _git_repo_identity(os.getcwd())
+    root = os.path.expanduser(base)
+    if cwd_identity is None or not os.path.isdir(root):
+        return []
+    exact_matches = []
+    common_matches = []
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return []
+    for entry in entries:
+        state_path = _state_path(root, entry)
+        if not os.path.isfile(state_path):
+            continue
+        try:
+            with open(state_path) as stream:
+                state = json.load(stream)
+            if not isinstance(state, dict):
+                continue
+            repo_path = state.get("repo_path")
+            paths = ([repo_path] if isinstance(repo_path, str) and repo_path else [])
+            worktrees = state.get("worktrees")
+            if isinstance(worktrees, dict):
+                paths.extend(path for path in worktrees.values() if isinstance(path, str))
+            identities = [identity for path in paths
+                          if (identity := _git_repo_identity(path)) is not None]
+            if any(identity[0] == cwd_identity[0] for identity in identities):
+                exact_matches.append(entry)
+            elif any(identity[1] == cwd_identity[1] for identity in identities):
+                common_matches.append(entry)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Skipping invalid project state %s: %s", state_path, exc)
+    return exact_matches if exact_matches else common_matches
+
+
+def _auto_detect_project(base: str) -> str | None:
+    """Resolve cwd to exactly one registered crew project, never by mtime."""
+    matches = _matching_projects(base)
+    if len(matches) > 1:
+        raise click.ClickException(
+            f"Current repository matches multiple projects: {', '.join(matches)}. "
+            "Specify --project."
+        )
+    return matches[0] if matches else None
+
+
+def _select_project(base: str, project: str, allow_cross_project: bool) -> str:
+    matches = _matching_projects(base)
+    if not project:
+        if len(matches) != 1:
+            reason = ("matches multiple projects: " + ", ".join(matches)) if matches else "matches no registered project"
+            raise click.ClickException(f"Current repository {reason}; specify --project (or --db).")
+        return matches[0]
+    if len(matches) == 1 and matches[0] != project:
+        if not allow_cross_project:
+            raise click.ClickException(
+                f"Current repository belongs to {matches[0]!r}, not {project!r}; "
+                "pass --allow-cross-project to proceed."
+            )
+        message = f"Cross-project operation: cwd project {matches[0]!r} -> {project!r}"
+        click.echo(message, err=True)
+        _crew_log(_proj_dir(os.path.expanduser(base), project), message)
+    elif len(matches) > 1 and project not in matches:
+        if not allow_cross_project:
+            raise click.ClickException(
+                f"Current repository matches multiple projects: {', '.join(matches)}; "
+                "pass --allow-cross-project to target another project."
+            )
+        message = f"Cross-project operation: cwd projects {', '.join(matches)} -> {project!r}"
+        click.echo(message, err=True)
+        _crew_log(_proj_dir(os.path.expanduser(base), project), message)
+    return project
 
 
 def _status_all_projects(base: str) -> None:
@@ -1001,6 +1060,7 @@ def setup(project: str, agents: str, base: str):
         )
     state_to_write = {
         "project": project,
+        "repo_path": _git_repo_identity(cwd)[0],
         "port": port,
         "port_file": port_file,
         "session": session_name,
@@ -1631,18 +1691,15 @@ def task_group():
 @task_group.command("cancel")
 @click.argument("task_id")
 @click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--db", default="", help="SQLite DB path (standalone)")
-def task_cancel(task_id: str, project: str, base: str, db: str):
+def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str, db: str):
     """Cancel TASK_ID and attempt to interrupt its bound worker pane."""
     from agent_crew.queue import TaskQueue
     from agent_crew.server import cancel_task_with_signal
     if not db:
-        if not project:
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException("--db or --project is required")
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
@@ -1672,21 +1729,18 @@ def task_cancel(task_id: str, project: str, base: str, db: str):
 
 @task_group.command("expire-stale")
 @click.option("--project", default="", help="Project name")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--older-than", default=600, type=int, show_default=True,
               help="Cancel in_progress tasks idle longer than N seconds")
 @click.option("--dry-run", is_flag=True, help="Print which tasks would be cancelled, but don't cancel")
-def task_expire_stale(project: str, base: str, db: str, older_than: int, dry_run: bool):
+def task_expire_stale(project: str, allow_cross_project: bool, base: str, db: str, older_than: int, dry_run: bool):
     """Cancel stale in_progress tasks (idle > --older-than seconds)."""
     import time as _t
     from agent_crew.queue import TaskQueue
     if not db:
-        if not project:
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException("--db or --project is required")
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
@@ -2127,6 +2181,7 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.argument("task")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--max-iter", default=0, type=int, help="Max review iterations (0 = default)")
 @click.option("--no-tester", is_flag=True, help="Skip test phase after approval")
@@ -2138,7 +2193,7 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.option("--implementer", default="", help="Agent for implementation (claude/codex/gemini)")
 @click.option("--reviewer", default="", help="Agent for review (claude/codex/gemini)")
 @click.option("--auto-merge", is_flag=True, help="Auto-merge PR via gh when loop completes successfully")
-def run_cmd(task: str, db: str, project: str, base: str,
+def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: str,
             max_iter: int, no_tester: bool, branch: str, timeout: int,
             create_issue: bool, create_pr: bool, repo: str,
             implementer: str, reviewer: str, auto_merge: bool):
@@ -2147,17 +2202,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         raise click.UsageError("task must not be empty")
 
     if not db:
-        if not project:
-            # Try to auto-detect project
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException(
-                    "Error: --db or --project is required.\n"
-                    f"Usage: crew run \"task\" --project <name>\n"
-                    f"Or:    crew run \"task\" --db <path>/tasks.db\n"
-                    f"List projects: ls {os.path.expanduser(base)}/"
-                )
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
@@ -2774,6 +2819,7 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
 @click.option("--then-run", is_flag=True, help="Trigger code-review loop after synthesis")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--output", default="synthesis.md", show_default=True, help="Path to write synthesis")
 @click.option("--branch", default="main", show_default=True)
@@ -2789,7 +2835,7 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
                    "number once the discussion completes (#219). No effect with "
                    "--nowait, since there's no synthesis yet when that returns.")
 def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: bool,
-            db: str, project: str, base: str, output: str, branch: str,
+            db: str, project: str, allow_cross_project: bool, base: str, output: str, branch: str,
             timeout: int, nowait: bool, github_discussion: str, post_to: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
@@ -2797,17 +2843,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
 
     project_state = None
     if not db:
-        if not project:
-            # Try to auto-detect project
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException(
-                    "Error: --db or --project is required.\n"
-                    f"Usage: crew discuss \"topic\" --project <name>\n"
-                    f"Or:    crew discuss \"topic\" --db <path>/tasks.db\n"
-                    f"List projects: ls {os.path.expanduser(base)}/"
-                )
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         project_state = _read_state(base, project)
         if project_state is None:
             raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
