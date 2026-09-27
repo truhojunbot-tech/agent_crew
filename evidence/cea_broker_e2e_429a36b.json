@@ -1,0 +1,108 @@
+{
+  "build_sha": "429a36ba3c6217c6c386bd631efc1361e4c26275",
+  "mode": "sandbox_http_e2e",
+  "project": "alfred",
+  "broker_socket": "/tmp/cea-broker-e2e-ypezv1a6/sock/broker.sock",
+  "enforced_codes": [
+    "RUNTIME_STATE_FORBIDS"
+  ],
+  "pass": true,
+  "pause": {
+    "paused": true,
+    "scope": "project",
+    "generation": 1,
+    "db_epoch": 1,
+    "incident": "alfred#51",
+    "reason": "broker e2e gate"
+  },
+  "block": {
+    "http_status": 403,
+    "http_body": {
+      "error": "admission refused",
+      "point": "enqueue",
+      "outcome": "BLOCK",
+      "reason": "DECISION_BLOCK: receipt decision is BLOCK",
+      "receipt_id": "9adee2cb-a42a-4518-ab58-71c48efc7262"
+    },
+    "receipt": {
+      "receipt_id": "9adee2cb-a42a-4518-ab58-71c48efc7262",
+      "issuer": "agent_crew.cea.broker.sandbox",
+      "decision": "BLOCK",
+      "reason": {
+        "code": "RUNTIME_STATE_FORBIDS",
+        "text": "P6: runtime state is STOPPED; enqueue is refused in every non-ACTIVE state"
+      },
+      "provider_budget": {
+        "observed_at": null,
+        "provider": "claude",
+        "state": "UNVERIFIED"
+      },
+      "downgrade_reason": "BROKER_TREE_USER_WRITABLE",
+      "provenance": {
+        "coordinator": null,
+        "intent_identity": {
+          "authority_decision_ids": [],
+          "capability_id": null,
+          "project": "alfred",
+          "target": {
+            "base_ref": "",
+            "repo": "alfred",
+            "scope_anchors": [
+              "task://broker-e2e-block"
+            ]
+          },
+          "work_class": "implement"
+        },
+        "snapshot_signature_status": "VALID",
+        "task_type": "implement"
+      }
+    },
+    "task_status": null
+  },
+  "resume": {
+    "resumed": true,
+    "epoch": 2,
+    "reason": "resumed",
+    "incident": "alfred#51"
+  },
+  "allow": {
+    "http_status": 201,
+    "http_body": {
+      "task_id": "broker-e2e-allow"
+    },
+    "receipt": {
+      "receipt_id": "7963c809-2b4c-4ded-a37b-3a61953e5e80",
+      "issuer": "agent_crew.cea.broker.sandbox",
+      "decision": "ALLOW",
+      "reason": {
+        "code": "OK",
+        "text": "every input answered and the contract is satisfiable"
+      },
+      "provider_budget": {
+        "observed_at": "2026-09-27T08:08:37Z",
+        "provider": "codex",
+        "state": "OK"
+      },
+      "downgrade_reason": "BROKER_TREE_USER_WRITABLE",
+      "provenance": {
+        "coordinator": null,
+        "intent_identity": {
+          "authority_decision_ids": [],
+          "capability_id": null,
+          "project": "alfred",
+          "target": {
+            "base_ref": "",
+            "repo": "alfred",
+            "scope_anchors": [
+              "task://broker-e2e-allow"
+            ]
+          },
+          "work_class": "review"
+        },
+        "snapshot_signature_status": "VALID",
+        "task_type": "review"
+      }
+    },
+    "task_status": "pending"
+  }
+}
