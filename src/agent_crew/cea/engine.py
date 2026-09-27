@@ -325,6 +325,9 @@ class EngineConfig:
     """
     mode: str = SHADOW
     endpoint: Optional[str] = None          # unix socket path; None ⇒ in-process
+    broker_socket: Optional[str] = None    # opt-in broker decision endpoint
+    broker_degraded: bool = False          # sandbox only; same uid never proves isolation
+    fallback_reason: Optional[str] = None
     key_path: Optional[str] = None          # engine signing key (P5, O3)
     issuer: str = "agent_crew.cea.engine"
     role_agents: dict = field(default_factory=lambda: dict(DEFAULT_ROLE_AGENTS))
@@ -355,6 +358,8 @@ class EngineConfig:
             project=project or None,
             enforce_codes=resolve_enforce_codes(e, project),
             endpoint=(e.get("AGENT_CREW_CEA_ENGINE_ENDPOINT") or "").strip() or None,
+            broker_socket=(e.get("AGENT_CREW_CEA_BROKER_SOCKET") or "").strip() or None,
+            broker_degraded=e.get("AGENT_CREW_CEA_BROKER_DEGRADED") == "1",
             key_path=(e.get("AGENT_CREW_CEA_ENGINE_KEY") or "").strip() or None,
             issuer=(e.get("AGENT_CREW_CEA_ISSUER") or "").strip() or cls.issuer,
             caller_token_path=(e.get("AGENT_CREW_CEA_ADAPTER_TOKEN_FILE") or "").strip() or None,
@@ -1169,7 +1174,8 @@ class AuthorizationEngine:
             "executor_binding": executor,
             "executor_binding_status": executor_status.value,
             "caller_identity_status": caller_status.value,
-            "downgrade_reason": ("SHARED_UID_NO_CREDENTIAL_BOUNDARY" if degraded else None),
+            "downgrade_reason": (self.config.fallback_reason or
+                                 ("SHARED_UID_NO_CREDENTIAL_BOUNDARY" if degraded else None)),
             "decision": decision,
             "reason": {"code": code, "text": text},
             "signature": {"alg": None, "key_id": None, "value": None, "status": "UNVERIFIED"},
@@ -1302,7 +1308,7 @@ class AuthorizationEngine:
             "caller_provenance": getattr(caller.provenance, "value", caller.provenance),
             "executor_binding": None,
             "executor_binding_status": "UNVERIFIED", "caller_identity_status": "UNVERIFIED",
-            "downgrade_reason": "SHARED_UID_NO_CREDENTIAL_BOUNDARY",
+            "downgrade_reason": self.config.fallback_reason or "SHARED_UID_NO_CREDENTIAL_BOUNDARY",
             "decision": decision, "reason": {"code": code, "text": text},
             "signature": {"alg": None, "key_id": None, "value": None, "status": "UNVERIFIED"},
             "state": "ISSUED",
@@ -1541,6 +1547,9 @@ def get_engine(*, config: Optional[EngineConfig] = None, **providers):
     """
     global _ENGINE
     cfg = config or EngineConfig.from_env()
+    if cfg.broker_socket:
+        from agent_crew.cea.service import BrokerDecisionClient
+        return BrokerDecisionClient(cfg, providers=providers)
     if cfg.endpoint:
         from agent_crew.cea.service import UnixSocketEngineClient
         return UnixSocketEngineClient(cfg)

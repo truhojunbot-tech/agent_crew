@@ -89,8 +89,10 @@ executor after attestation, which would make VERIFIED a label.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
+from pathlib import Path
 import pwd
 import secrets
 import socket
@@ -169,6 +171,38 @@ def peer_cred(conn: socket.socket) -> tuple[int, int, int]:
 PEER_ASSERTED = "PEER_ASSERTED"
 BROKER_SPAWNED = "BROKER_SPAWNED"
 DISPATCHER_REGISTRATION_UNAUTHENTICATED = "DISPATCHER_REGISTRATION_UNAUTHENTICATED"
+BROKER_TREE_USER_WRITABLE = "BROKER_TREE_USER_WRITABLE"
+
+
+def writable_broker_tree(*paths: str, tree_root: Optional[str] = None) -> bool:
+    """A replaceable file or ancestor defeats the broker's uid boundary."""
+    for path in paths:
+        if not path:
+            return True
+        current = Path(os.path.abspath(path))
+        while True:
+            try:
+                mode = os.lstat(current)
+            except OSError:
+                return True
+            if mode.st_uid != 0 or mode.st_mode & 0o022 or stat.S_ISLNK(mode.st_mode):
+                return True
+            if current == current.parent:
+                break
+            current = current.parent
+    if tree_root:
+        if not os.path.isdir(tree_root):
+            return True
+        for root, dirs, files in os.walk(tree_root, followlinks=False):
+            for name in dirs + files:
+                path = os.path.join(root, name)
+                try:
+                    entry = os.lstat(path)
+                except OSError:
+                    return True
+                if entry.st_uid != 0 or entry.st_mode & 0o022 or stat.S_ISLNK(entry.st_mode):
+                    return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -210,7 +244,10 @@ class Broker:
 
     def __init__(self, sock_dir: str, *, degraded: bool = False,
                  client_uids: tuple[int, ...] = (1000,), proc: Optional[ProcReader] = None,
-                 service_uid_override: Optional[int] = None, ptrace_scope_path: Optional[str] = None):
+                 service_uid_override: Optional[int] = None, ptrace_scope_path: Optional[str] = None,
+                 integrity_paths: Optional[tuple[str, ...]] = None,
+                 integrity_tree_root: Optional[str] = None,
+                 decision_engine=None, connect=None, authenticator=None):
         self.sock_dir = sock_dir
         self.degraded = degraded
         self.client_uids = tuple(client_uids)
@@ -219,6 +256,17 @@ class Broker:
         # no env var for this: the launcher cannot reach it.
         self._service_uid = service_uid_override
         self._ptrace_path = ptrace_scope_path
+        config_path = os.environ.get("AGENT_CREW_AUTHZ_CONFIG_PATH", "")
+        self.integrity_paths = integrity_paths or tuple(p for p in (
+            os.environ.get("AGENT_CREW_AUTHZ_LAUNCHER_PATH", ""), __file__,
+            os.environ.get("AGENT_CREW_AUTHZ_SRC_COMMIT_PATH", "/opt/agent_crew-authz/SRC_COMMIT"),
+            config_path if config_path and os.path.exists(config_path) else "") if p)
+        self.tree_writable = writable_broker_tree(*self.integrity_paths,
+                                                  tree_root=(str(Path(__file__).resolve().parents[2])
+                                                             if integrity_tree_root is None else integrity_tree_root))
+        self.decision_engine = decision_engine
+        self.connect = connect
+        self.authenticator = authenticator
         self._regs: dict[tuple[str, int], Registration] = {}
         self._poisoned: set[tuple[str, int]] = set()
         self._lock = threading.Lock()
@@ -231,7 +279,8 @@ class Broker:
         want = self._service_uid if self._service_uid is not None else service_uid()
         scope = ptrace_scope(self._ptrace_path) if self._ptrace_path else ptrace_scope()
         report = {"euid": euid, "service_uid": want, "ptrace_scope": scope,
-                  "degraded": self.degraded, "sock_dir": self.sock_dir}
+                  "degraded": self.degraded, "sock_dir": self.sock_dir,
+                  "downgrade_reason": BROKER_TREE_USER_WRITABLE if self.tree_writable else None}
         if scope is None or scope < 1:
             raise BrokerRefused(f"kernel.yama.ptrace_scope={scope}; >=1 required (same-uid ptrace "
                                 f"would defeat any peer binding)")
@@ -252,9 +301,36 @@ class Broker:
             return self._attest(peer_pid, req)
         if op == "spawn":
             return self.spawn(req)
+        if op == "authorize":
+            return self._authorize(req)
         if op == "status":
-            return {"ok": True, "degraded": self.degraded, "registrations": len(self._regs)}
+            return {"ok": True, "degraded": self.degraded, "registrations": len(self._regs),
+                    "downgrade_reason": BROKER_TREE_USER_WRITABLE if self.tree_writable else None}
         return {"ok": False, "error": "UNKNOWN_OP"}
+
+    def _authorize(self, req: dict) -> dict:
+        """Run the same authenticated engine entry point as EngineService."""
+        if self.decision_engine is None or self.connect is None or self.authenticator is None:
+            return {"ok": False, "error": "DECISION_ENGINE_UNAVAILABLE"}
+        from agent_crew.cea.auth import AuthenticationError
+        from agent_crew.cea.service import decode_intent
+        try:
+            intent, token, retry = decode_intent(req)
+            caller = self.authenticator.authenticate(token)
+        except (AuthenticationError, KeyError, TypeError, ValueError):
+            caller = None
+        if caller is None:
+            return {"error": "unauthenticated caller", "code": "UNAUTHENTICATED",
+                    "http_status": 401, "receipt": None}
+        conn = self.connect()
+        try:
+            auth = self.decision_engine._authorize_authenticated(conn, intent, caller, retry=retry)
+            conn.commit()
+        finally:
+            conn.close()
+        return {"receipt": auth.receipt, "http_status": auth.http_status,
+                "code": auth.code, "reused": auth.reused,
+                "existing_receipt_id": auth.existing_receipt_id}
 
     def _register(self, peer_pid: int, req: dict) -> dict:
         try:
@@ -319,6 +395,10 @@ class Broker:
             return dict(base, executor_binding_status=BLOCKED, reason="PEER_CRED_MISMATCH")
         if self.proc.tracer(peer_pid) not in (0,):
             return dict(base, executor_binding_status=BLOCKED, reason="PEER_TRACED")
+        if self.tree_writable:
+            return dict(base, executor_binding_status=UNVERIFIED,
+                        reason=BROKER_TREE_USER_WRITABLE,
+                        downgrade_reason=BROKER_TREE_USER_WRITABLE)
         if self.degraded:
             return dict(base, executor_binding_status=UNVERIFIED, reason="BROKER_DEGRADED_SAME_UID",
                         downgrade_reason="BROKER_DEGRADED_SAME_UID")
@@ -345,6 +425,10 @@ class Broker:
         """The executor is the process *this* broker forked, under a uid the
         dispatcher does not have. Then ``(pid, start_time)`` is the broker's own
         observation and SO_PEERCRED closes the loop."""
+        if self.tree_writable:
+            return dict(base, executor_binding_status=UNVERIFIED,
+                        reason=BROKER_TREE_USER_WRITABLE,
+                        downgrade_reason=BROKER_TREE_USER_WRITABLE)
         return dict(base, executor_binding_status=VERIFIED, reason="BROKER_SPAWNED_BINDING",
                     nonce=reg.nonce, pid=reg.pid, start_time=reg.start_time)
 
@@ -505,6 +589,16 @@ class BrokerClient:
         except (OSError, ValueError) as exc:
             return {"ok": False, "error": f"BROKER_UNREACHABLE: {exc}"}
 
+    def decision(self, request: dict) -> dict:
+        """Authenticated CEA request; errors stay explicit for caller fallback."""
+        try:
+            reply, uid = self._call({"op": "authorize", **request})
+        except (OSError, ValueError) as exc:
+            return {"error": "broker_unreachable", "detail": type(exc).__name__}
+        if self.expected_uid is None or uid != self.expected_uid:
+            return {"error": "broker_unreachable", "detail": "BROKER_PEER_NOT_SERVICE_UID"}
+        return reply
+
     def attest(self, receipt_id: str, attempt: int) -> dict:
         """``{executor_binding_status, caller_identity_status, reason}``; never raises."""
         down = {"executor_binding_status": UNVERIFIED, "caller_identity_status": UNVERIFIED}
@@ -556,6 +650,20 @@ def main(argv=None) -> int:
     ap.add_argument("--check", action="store_true")
     a = ap.parse_args(argv)
     b = Broker(a.sock_dir, degraded=a.degraded, client_uids=tuple(a.client_uid or (1000,)))
+    db_path = os.environ.get("AGENT_CREW_CEA_BROKER_DB")
+    if db_path:
+        import sqlite3
+        from agent_crew.cea.auth import authenticator_from_env
+        from agent_crew.cea.engine import AuthorizationEngine, EngineConfig
+        from agent_crew.cea.wiring import build_wiring
+        config = EngineConfig.from_env()
+        # Attestation and authorization must use the same integrity result.
+        if b.tree_writable:
+            config = dataclasses.replace(config, fallback_reason=BROKER_TREE_USER_WRITABLE)
+        wiring = build_wiring(db_path=db_path)
+        b.decision_engine = AuthorizationEngine(config=config, **wiring.providers)
+        b.connect = lambda: sqlite3.connect(db_path)
+        b.authenticator = authenticator_from_env()
     try:
         report = b.preflight()
     except BrokerRefused as exc:

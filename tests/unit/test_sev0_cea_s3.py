@@ -374,7 +374,8 @@ def live_broker(tmp_path):
     d = tmp_path / "sock"
     d.mkdir(mode=0o710)   # bind() accepts 0710 to the client group and nothing else
     b = Broker(str(d), service_uid_override=os.geteuid(), ptrace_scope_path=scope_file(tmp_path),
-               client_uids=(os.geteuid(),))
+               client_uids=(os.geteuid(),), integrity_paths=("/usr",),
+               integrity_tree_root="")
     b.preflight()
     b.bind()
     t = threading.Thread(target=b.serve_forever, daemon=True)

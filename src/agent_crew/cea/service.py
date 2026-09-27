@@ -19,7 +19,7 @@ import os
 import socket
 import socketserver
 import threading
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from typing import Optional
 
 from agent_crew.cea.auth import AuthenticationError, DenyAllAuthenticator
@@ -186,6 +186,35 @@ class UnixSocketEngineClient:
         finally:
             sock.close()
         return json.loads(b"".join(chunks).decode("utf-8") or "{}")
+
+
+class BrokerDecisionClient(UnixSocketEngineClient):
+    """Opt-in broker decision path with an auditable embedded fallback."""
+
+    def __init__(self, config: EngineConfig, *, providers=None):
+        super().__init__(config)
+        from agent_crew.cea.broker import BrokerClient
+        self.broker = BrokerClient(config.broker_socket,
+                                   expected_uid=os.geteuid() if config.broker_degraded else None)
+        self.providers = dict(providers or {})
+        self._fallback = None
+
+    def authorize(self, conn, intent: Intent, caller: Optional[Caller] = None, *,
+                  retry: bool = False) -> Authorization:
+        reply = self.broker.decision(encode_intent(intent, self.credential(), retry=retry))
+        if reply.get("error") == "broker_unreachable":
+            if self._fallback is None:
+                config = replace(self.config, broker_socket=None, endpoint=None,
+                                 fallback_reason="broker_unreachable")
+                self._fallback = AuthorizationEngine(config=config, **self.providers)
+            return self._fallback.authorize(conn, intent, caller, retry=retry)
+        if reply.get("code") == "UNAUTHENTICATED":
+            raise EngineError("401 UNAUTHENTICATED: broker rejected adapter credential")
+        if "error" in reply:
+            raise EngineError(str(reply["error"]))
+        return Authorization(receipt=reply["receipt"], http_status=int(reply["http_status"]),
+                             code=str(reply["code"]), reused=bool(reply.get("reused")),
+                             existing_receipt_id=reply.get("existing_receipt_id"))
 
 
 # ── server ──────────────────────────────────────────────────────────────────
