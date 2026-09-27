@@ -59,6 +59,7 @@ def _seed(root):
     (tree / "SRC_COMMIT").write_text("old-build\n")
     (tree / "broker.env").write_text(
         "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=/opt/agent_crew-authz/snapshot.key\n"
+        "AGENT_CREW_CEA_SNAPSHOT_PATH=/home/truhojun/alfred/governance/cea_policy_snapshot.json\n"
         "AGENT_CREW_CEA_CALLER_TOKENS=/home/truhojun/.verify-private/tokens.json\n"
     )
     (tree / "snapshot.key").write_bytes(b"old-secret")
@@ -77,7 +78,7 @@ def _seed(root):
     raw = signing_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     body = {"generation": 2, "produced_at": datetime.now(timezone.utc).isoformat(), "decisions": []}
     canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    (pubkey.parent / "control_policy_snapshot.json").write_text(json.dumps({**body,
+    (pubkey.parent / "cea_policy_snapshot.json").write_text(json.dumps({**body,
         "signature": {"ed25519": {"key_id": hashlib.sha256(raw).hexdigest()[:16],
                                   "value": base64.b64encode(signing_key.sign(canonical)).decode()}}}))
     sudoers = root / "etc/sudoers.d/crew-authz-broker"
@@ -104,9 +105,9 @@ def test_dry_run_changes_nothing_and_does_not_show_secrets(tmp_path):
 
 
 @pytest.mark.parametrize("blocker,expected", [
-    ("src_old", "source update backup exists"),
+    ("src_old", "source update has no installed src and SRC_COMMIT"),
     ("src_new", "source update staging exists"),
-    ("update_manifest", "source update manifest exists"),
+    ("update_manifest", "source update has no installed src and SRC_COMMIT"),
     ("dirty_checkout", "source checkout is dirty"),
     ("wrong_commit", "differs from expected"),
     ("token_mode", "caller token mode 0644"),
@@ -137,8 +138,7 @@ def test_source_update_preview_reports_apply_blockers(tmp_path, blocker, expecte
     assert (tree / "SRC_COMMIT").read_bytes() == before
     assert not (tree / "src" / "agent_crew").exists()
     if blocker == "src_old":
-        assert "--undo --update-src" not in result.stdout
-        assert f"mv -- {tree / 'src.old'} {tree / 'src.old.saved'}" in result.stdout
+        assert "source update has no installed src and SRC_COMMIT" in result.stdout
     if blocker == "update_manifest":
         assert "--undo --update-src" in result.stdout
 
@@ -147,7 +147,7 @@ def test_source_update_preview_reports_apply_blockers(tmp_path, blocker, expecte
     ("missing_pubkey", "missing snapshot public key"),
     ("unsafe_sudoers", "refusing symlink"),
     ("incomplete_manifest", "incomplete apply manifest"),
-    ("outstanding_update", "source update manifest exists"),
+    ("outstanding_update", "source update has no installed src and SRC_COMMIT"),
 ])
 def test_full_preview_reports_apply_blockers(tmp_path, blocker, expected):
     tree, _, sudoers = _seed(tmp_path)
@@ -354,6 +354,81 @@ def test_update_src_is_repeatable_without_owner_cleanup(tmp_path):
     assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
     assert not (tree / "src.old").exists()
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
+
+
+@pytest.mark.parametrize("with_manifest", [False, True])
+def test_completed_legacy_update_rotates_all_backups(tmp_path, with_manifest):
+    tree, _, _ = _seed(tmp_path)
+    (tree / "src").mkdir()
+    (tree / "src/installed.py").write_text("committed")
+    launcher = tmp_path / "usr/local/libexec/crew-authz/broker-launch.sh"
+    launcher.parent.mkdir(parents=True)
+    backup_names = ("src.old", "tests.old", "venv.old", "state.old",
+                    "caller-tokens.json.old", "receipt-signing.key.old",
+                    "receipt-signing.pub.old")
+    for name in backup_names:
+        (tree / name).write_text("evidence")
+    launcher.with_name("broker-launch.old").write_text("evidence")
+    manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
+    if with_manifest:
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text(json.dumps({"new_commit": "old-build"}))
+    args = ("--update-src", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    dry = _run(tmp_path, *args)
+    assert dry.returncode == 0, dry.stdout + dry.stderr
+    assert dry.stdout.count("WOULD ROTATE") >= 8
+    assert all((tree / name).exists() for name in backup_names)
+    applied = _run(tmp_path, "--apply", *args)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert not manifest.exists()
+    for backup in [*(tree / name for name in backup_names), launcher.with_name("broker-launch.old")]:
+        assert not backup.exists()
+        rotated = list(backup.parent.glob(backup.name + ".committed-old-bui-*") )
+        assert len(rotated) == 1
+        assert rotated[0].read_text() == "evidence"
+
+
+def test_incomplete_legacy_update_still_aborts(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    (tree / "src").mkdir()
+    (tree / "src.old").mkdir()
+    manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
+    manifest.parent.mkdir(parents=True)
+    manifest.write_text(json.dumps({"new_commit": "different"}))
+    result = _run(tmp_path, "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json")
+    assert result.returncode != 0
+    assert "WOULD ABORT: source update manifest does not match SRC_COMMIT" in result.stdout
+    assert (tree / "src.old").exists() and manifest.exists()
+
+
+def test_snapshot_default_and_broker_path_mismatch(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    good = _run(tmp_path, "--update-src", "--caller-tokens",
+                "/home/truhojun/.verify-private/tokens.json")
+    assert good.returncode == 0, good.stdout + good.stderr
+    assert "cea_policy_snapshot.json" not in good.stdout or "WOULD ABORT" not in good.stdout
+    config = tree / "broker.env"
+    config.write_text(config.read_text().replace("cea_policy_snapshot.json", "control_policy_snapshot.json"))
+    bad = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
+               "/home/truhojun/.verify-private/tokens.json")
+    assert bad.returncode != 0
+    assert "HWM seed path" in bad.stdout and "differs from broker snapshot path" in bad.stdout
+
+
+def test_update_src_accepts_existing_broker_env_without_snapshot_path(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    config = tree / "broker.env"
+    config.write_text("\n".join(
+        line for line in config.read_text().splitlines()
+        if not line.startswith("AGENT_CREW_CEA_SNAPSHOT_PATH=")
+    ) + "\n")
+    args = ("--update-src", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    preview = _run(tmp_path, *args)
+    assert preview.returncode == 0, preview.stdout + preview.stderr
+    applied = _run(tmp_path, "--apply", *args)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert (tree / "state/snapshot-hwm.json").is_file()
 
 
 def test_update_src_refuses_symlinked_snapshot_state(tmp_path):
