@@ -157,6 +157,12 @@ class SQLiteMemoryStorage:
             db.execute("BEGIN IMMEDIATE")
             for record in records:
                 scope = _canonical_scope_json(record.scope)
+                # A later result may know more scope fields than the first
+                # capture. These task/episode keys identify one observation;
+                # keep its newest scope without leaving an older duplicate.
+                db.execute("DELETE FROM adr001_memory WHERE layer=? AND key=? "
+                           "AND json_extract(scope,'$.project')=? AND scope<>?",
+                           (record.layer, record.key, project, scope))
                 prior = db.execute("SELECT value,version FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
                                    (record.layer, record.key, scope)).fetchone()
                 if prior and json.loads(prior[0]) == record.value:
@@ -168,8 +174,8 @@ class SQLiteMemoryStorage:
                     (record.layer, record.key, json.dumps(record.value), scope,
                      version, time.time()))
             for key in retire_keys:
-                db.execute("DELETE FROM adr001_memory WHERE layer='failure_pattern' AND key=? AND scope=?",
-                           (key, _canonical_scope_json(records[0].scope)))
+                db.execute("DELETE FROM adr001_memory WHERE layer='failure_pattern' AND key=? "
+                           "AND json_extract(scope,'$.project')=?", (key, project))
             db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
                 SELECT rowid FROM adr001_memory
                 WHERE layer IN ('episodic','decision','failure_pattern')
@@ -220,6 +226,11 @@ class SQLiteMemoryStorage:
         for name, value in asdict(scope).items():
             if name == "project":
                 continue
+            # Shadow evidence from a prior task can still inform a later task
+            # when the request has no value for that dimension. The live pack
+            # continues to use the strict scope matcher in retrieve().
+            if name != "fleet" and value in ("", None):
+                continue
             path = f"$.{name}"
             if name == "context_generation":
                 clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
@@ -244,7 +255,11 @@ class SQLiteMemoryStorage:
                 [*args, scope.project, min(limit, 50)]).fetchall()
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
-        return [r for r in records if _scope_applies(r.scope, scope)], dropped
+        return [r for r in records if all(
+            (getattr(scope, name) in ("", None) and name != "fleet")
+            or getattr(r.scope, name) in ("", None, 0, getattr(scope, name))
+            for name in ("fleet", "worktree", "issue", "task_id",
+                         "context_generation", "provider_session"))], dropped
 
 
 def owner_statement_key(project: str, channel: str, chat_id: str,

@@ -33,6 +33,15 @@ _ALIASES = {"agent-crew": "agent_crew", "agent crew": "agent_crew",
             "quota_core": "quota-core", "quota core": "quota-core"}
 
 
+def _optional_generation(value) -> int | None:
+    """Zero is the existing context identity sentinel for an unknown generation."""
+    try:
+        generation = int(value)
+        return generation if generation > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def canonical_project(name: str, *, repo: str = "") -> str:
     """Resolve one owner/bot name; ambiguous Quota requires a repository."""
     token = str(name or "").strip().lower()
@@ -51,7 +60,10 @@ def canonical_project(name: str, *, repo: str = "") -> str:
 
 def capture_task_outcome(storage: SQLiteMemoryStorage, *, project: str, repo: str,
                          task_id: str, status: str, summary: str,
-                         verdict: str = "", pr_number: int | None = None) -> list[MemoryRecord]:
+                         verdict: str = "", pr_number: int | None = None,
+                         issue: str = "", worktree: str = "",
+                         provider_session: str = "",
+                         context_generation: int | None = None) -> list[MemoryRecord]:
     """Idempotent raw outcome and optional decision/failure evidence."""
     canonical = canonical_project(project, repo=repo)
     if not task_id or status not in {"completed", "failed", "needs_human", "timed_out"}:
@@ -62,8 +74,11 @@ def capture_task_outcome(storage: SQLiteMemoryStorage, *, project: str, repo: st
     layers = ["episodic", "decision"]
     if status in {"failed", "needs_human", "timed_out"}:
         layers.append("failure_pattern")
-    records = [MemoryRecord(layer, f"task:{task_id}:{layer}", value,
-                            MemoryScope(project=canonical))
+    scope = MemoryScope(project=canonical, task_id=task_id, issue=str(issue or ""),
+                        worktree=str(worktree or ""),
+                        provider_session=str(provider_session or ""),
+                        context_generation=_optional_generation(context_generation))
+    records = [MemoryRecord(layer, f"task:{task_id}:{layer}", value, scope)
                for layer in layers]
     storage.put_many_shadow(records, retire_keys=(f"task:{task_id}:failure_pattern",)
                             if status == "completed" else ())
@@ -94,8 +109,13 @@ def capture_episode(storage: SQLiteMemoryStorage, episode: dict, *, project: str
         value["verdict"] = episode["verdict"]
     if outcome.startswith("failed") or outcome == "needs_human":
         layers.append("failure_pattern")
-    records = [MemoryRecord(layer, f"episode:{task_id}:{layer}", value,
-                            MemoryScope(project=canonical))
+    scope = MemoryScope(project=canonical, task_id=task_id,
+                        issue=str(episode.get("issue") or ""),
+                        worktree=str(episode.get("worktree") or ""),
+                        provider_session=str(episode.get("provider_session")
+                                             or episode.get("provider_session_id") or ""),
+                        context_generation=_optional_generation(episode.get("context_generation")))
+    records = [MemoryRecord(layer, f"episode:{task_id}:{layer}", value, scope)
                for layer in layers]
     storage.put_many_shadow(records, retire_keys=(f"episode:{task_id}:failure_pattern",)
                             if outcome == "completed" else ())
@@ -121,12 +141,25 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
                                      timeout=0.05)) as db:
             row = db.execute("SELECT project,context FROM tasks WHERE task_id=?",
                              (task_id,)).fetchone()
+            try:
+                attribution = db.execute(
+                    "SELECT worktree_path,provider_session_id,context_generation "
+                    "FROM task_attribution WHERE task_id=?", (task_id,)).fetchone()
+            except sqlite3.OperationalError:
+                # Older task databases may not have the optional attribution table.
+                attribution = None
         context = json.loads(row[1] or "{}") if row else {}
+        if not isinstance(context, dict):
+            context = {}
         records = capture_task_outcome(
             SQLiteMemoryStorage.existing(str(path)), project=row[0] if row else "",
             repo=str(context.get("repo") or context.get("target_repo") or ""),
             task_id=task_id, status=result.status, summary=result.summary,
             verdict=result.verdict or "", pr_number=result.pr_number,
+            issue=context.get("issue") or "",
+            worktree=attribution[0] if attribution else "",
+            provider_session=attribution[1] if attribution else "",
+            context_generation=attribution[2] if attribution else None,
         )
         record_context_event(events_path, "shadow_memory_capture",
                              task_id=task_id, outcome="stored",
