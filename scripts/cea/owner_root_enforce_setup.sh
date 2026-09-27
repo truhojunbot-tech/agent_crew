@@ -8,6 +8,7 @@ export CREW_AUTHZ_SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
 export CREW_AUTHZ_SOURCE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 python3 - "$@" <<'PY'
 import argparse
+from datetime import datetime, timezone
 import hashlib
 import json
 import os
@@ -81,12 +82,13 @@ if token_source is None and not (args.undo or args.update_src):
 snapshot_source = args.snapshot_pubkey or path("/home/truhojun/alfred/governance/ssot-producer-ed25519.pub")
 if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snapshot_source.is_relative_to(root):
     snapshot_source = path(str(snapshot_source))
-snapshot_path = args.snapshot_path or path("/home/truhojun/alfred/governance/control_policy_snapshot.json")
+snapshot_path = args.snapshot_path or path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")
 if fake and args.snapshot_path and snapshot_path.is_absolute() and not snapshot_path.is_relative_to(root):
     snapshot_path = path(str(snapshot_path))
 source_launcher = Path(os.environ["CREW_AUTHZ_LAUNCHER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
 source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
+sys.path.insert(0, str(source_root / "src"))
 schema_source = source_root / "tests/cea_contract/receipt.schema.json"
 requirements = source_root / "scripts/cea/broker-requirements.txt"
 venv = tree / "venv"
@@ -94,6 +96,50 @@ schema_installed = tree / "tests/cea_contract/receipt.schema.json"
 SCHEMA_BLOB = "41e7ebf271830790f6aae80a413e51edf7805fcd"
 if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
     p.error("invalid source commit")
+
+def update_backups():
+    # Keep this list aligned with the update's atomic swap list below.
+    return [tree / (name + ".old") for name in
+            ("src", "tests", "venv", "state", "caller-tokens.json",
+             "receipt-signing.key", "receipt-signing.pub")] + [launcher.with_name("broker-launch.old")]
+
+def completed_update_leftovers():
+    """Return rotatable backups, or a reason an earlier update needs recovery."""
+    marker = tree / "SRC_COMMIT"
+    update_manifest = manifest_dir / "src-update.json"
+    staged = [tree / (name + ".new") for name in ("src", "tests", "venv", "state")]
+    staged += [tree / name for name in ("caller-tokens.new", "receipt-signing.key.new",
+                                        "receipt-signing.pub.new")]
+    staged.append(launcher.with_name("broker-launch.new"))
+    if any(item.exists() for item in staged):
+        return [], "source update staging exists; inspect and remove it before retrying"
+    backups = [item for item in update_backups() if item.exists()]
+    if not backups and not update_manifest.exists():
+        return [], None
+    if not marker.is_file() or not (tree / "src").is_dir():
+        return [], "source update has no installed src and SRC_COMMIT; recover with --undo --update-src"
+    if update_manifest.exists():
+        try:
+            saved = json.loads(update_manifest.read_text())
+        except (OSError, ValueError) as exc:
+            return [], f"source update manifest unreadable or invalid: {exc}; recover with --undo --update-src"
+        if saved.get("new_commit") != marker.read_text().strip():
+            return [], "source update manifest does not match SRC_COMMIT; recover with --undo --update-src"
+    return backups, None
+
+def rotate_completed_update(backups):
+    marker = tree / "SRC_COMMIT"
+    old_commit = marker.read_text().strip()[:7]
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+    destinations = [backup.with_name(f"{backup.name}.committed-{old_commit}-{stamp}")
+                    for backup in backups]
+    for destination in destinations:
+        if destination.exists():
+            raise SystemExit(f"committed backup rotation target exists: {destination}")
+    for backup, destination in zip(backups, destinations):
+        os.replace(backup, destination)
+        say(f"ROTATED {backup} -> {destination}")
+    (manifest_dir / "src-update.json").unlink(missing_ok=True)
 
 def preinstall_selftest(tokens):
     if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") != "1":
@@ -172,24 +218,26 @@ def apply_preconditions(source_update=False):
     """Return failures visible before root changes, plus checks requiring root."""
     failures, unverified = [], []
     update_manifest = manifest_dir / "src-update.json"
-    previous = tree / "src.old"
-    staging = tree / "src.new"
     undo_update = f"sudo {shlex.quote(str(source_root / 'scripts/cea/owner_root_enforce_setup.sh'))} --undo --update-src"
     manifest_visible = not manifest_dir.exists() or os.access(manifest_dir, os.X_OK)
     tree_visible = not tree.exists() or os.access(tree, os.X_OK)
     if not manifest_visible:
         unverified.append(f"source update manifest in restricted directory: {manifest_dir}")
-    elif update_manifest.exists():
-        failures.append(f"source update manifest exists: {update_manifest}; recover with: {undo_update}")
     if not tree_visible:
         unverified.append(f"source backup and staging in restricted directory: {tree}")
-    else:
-        if previous.exists():
-            recovery = undo_update if manifest_visible and update_manifest.exists() else (
-                f"mv -- {shlex.quote(str(previous))} {shlex.quote(str(previous) + '.saved')}")
-            failures.append(f"source update backup exists: {previous}; recover with: {recovery}")
-        if staging.exists():
-            failures.append(f"source update staging exists: {staging}; inspect and remove it before retrying")
+    elif manifest_visible:
+        backups, incomplete = completed_update_leftovers()
+        if incomplete:
+            failures.append(f"{incomplete}; recover with: {undo_update}")
+        elif source_update:
+            for backup in backups:
+                say(f"WOULD ROTATE {backup} (committed update)")
+            if update_manifest.exists():
+                say(f"WOULD ROTATE stale manifest {update_manifest} (remove after backups)")
+        elif update_manifest.exists():
+            failures.append(f"source update manifest exists: {update_manifest}; recover with: {undo_update}")
+    elif any(item.exists() for item in update_backups()):
+        unverified.append("completed source backup rotation requires root to inspect manifest")
     if not (source_root / "src").is_dir():
         failures.append(f"checkout src missing: {source_root / 'src'}")
     elif any(item.is_symlink() for item in (source_root / "src").rglob("*")):
@@ -200,6 +248,25 @@ def apply_preconditions(source_update=False):
     if not requirements.is_file():
         failures.append(f"pinned broker requirements missing: {requirements}; recover by restoring checkout")
     if source_update:
+        broker_config = tree / "broker.env"
+        broker_content = read_broker_env(broker_config)
+        if broker_content is None:
+            unverified.append(f"broker snapshot path in unreadable broker.env: {broker_config}")
+        else:
+            try:
+                configured = None
+                for line in broker_content.splitlines():
+                    if line.startswith("AGENT_CREW_CEA_SNAPSHOT_PATH="):
+                        values = shlex.split(line.split("=", 1)[1])
+                        if len(values) != 1:
+                            raise ValueError("AGENT_CREW_CEA_SNAPSHOT_PATH must have one value")
+                        configured = values[0]
+                from agent_crew.cea.wiring import DEFAULT_SNAPSHOT_PATH
+                broker_snapshot = path(configured or DEFAULT_SNAPSHOT_PATH)
+                if broker_snapshot.resolve() != snapshot_path.resolve():
+                    failures.append(f"HWM seed path {snapshot_path} differs from broker snapshot path {broker_snapshot}; recover by setting AGENT_CREW_CEA_SNAPSHOT_PATH in broker.env")
+            except ValueError as exc:
+                failures.append(f"invalid broker snapshot path configuration: {exc}")
         if not snapshot_path.is_file() or snapshot_path.is_symlink():
             failures.append(f"signed snapshot missing: {snapshot_path}; recover by publishing a signed snapshot")
         elif not os.access(snapshot_path, os.R_OK) or not os.access(snapshot_source, os.R_OK):
@@ -361,8 +428,10 @@ if args.update_src:
         sys.exit(0)
     if not tree.is_dir() or tree.is_symlink() or not source.is_dir():
         raise SystemExit("broker tree or checkout src missing")
-    if previous.exists() or staging.exists() or update_manifest.exists():
-        raise SystemExit("source update backup or manifest exists; undo first")
+    backups, incomplete = completed_update_leftovers()
+    if incomplete:
+        raise SystemExit(incomplete)
+    rotate_completed_update(backups)
     for item in source.rglob("*"):
         if item.is_symlink():
             raise SystemExit(f"symlink in source tree: {item}")
@@ -637,6 +706,7 @@ try:
                  "AGENT_CREW_CEA_MODE": "enforce",
                  "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS,SNAPSHOT_ROLLBACK",
                  "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE": "/opt/agent_crew-authz/snapshot.pub",
+                 "AGENT_CREW_CEA_SNAPSHOT_PATH": "/home/truhojun/alfred/governance/cea_policy_snapshot.json",
                  "AGENT_CREW_CEA_SNAPSHOT_HWM_FILE": "/opt/agent_crew-authz/state/snapshot-hwm.json"}
     retained = [line for line in (existing_content or "").splitlines()
                 if line.split("=", 1)[0] not in
