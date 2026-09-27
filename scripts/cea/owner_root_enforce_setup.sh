@@ -221,16 +221,20 @@ def stop_legacy(pid):
     legacy_event("stopped", pid)
 
 def rehearsal_broker_env():
-    from agent_crew.queue import TaskQueue
     db = path("/rehearsal/broker.db")
-    TaskQueue(str(db))
-    return {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1",
-            "PYTHONPATH": str(tree / "src"),
+    staged_source = staging if staging.exists() else tree / "src"
+    staged_python = venv_stage / "bin/python" if venv_stage.exists() else venv / "bin/python"
+    broker_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": str(staged_source),
             "AGENT_CREW_CEA_BROKER_DB": str(db),
             "AGENT_CREW_CEA_CALLER_TOKENS": str(tree / "caller-tokens.json"
                                                  if (tree / "caller-tokens.json").exists()
                                                  else args.caller_tokens),
             "AGENT_CREW_CEA_MODE": "shadow"}
+    subprocess.run([str(staged_python), "-c",
+                    "from agent_crew.queue import TaskQueue; import sys; TaskQueue(sys.argv[1])",
+                    str(db)], check=True, env=broker_env)
+    return broker_env
 
 def start_managed():
     if privileged:
@@ -258,7 +262,7 @@ def spawn_rehearsal_orphan():
     sock.mkdir(mode=0o710, parents=True)
     sock.chmod(0o710)
     env = rehearsal_broker_env()
-    process = subprocess.Popen([sys.executable, "-m", "agent_crew.cea.broker",
+    process = subprocess.Popen([str(venv_stage / "bin/python"), "-m", "agent_crew.cea.broker",
                                 "--sock-dir", str(sock), "--client-uid", str(uid),
                                 "--degraded"],
                                env=env, stdin=subprocess.DEVNULL,
