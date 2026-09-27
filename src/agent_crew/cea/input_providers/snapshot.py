@@ -24,14 +24,15 @@ Missing / unreadable / malformed file ⇒ ``available=False``. Older than
 """
 from __future__ import annotations
 
-import calendar
 import base64
 import binascii
 import hashlib
 import hmac
 import json
+import math
 import os
 import time
+from datetime import datetime, timezone
 from typing import Callable, Optional
 
 from agent_crew.cea.intent import Intent
@@ -50,10 +51,13 @@ def _canonical(body: dict) -> bytes:
 
 def _epoch(ts) -> Optional[float]:
     if isinstance(ts, (int, float)):
-        return float(ts)
+        return float(ts) if math.isfinite(ts) else None
     if isinstance(ts, str):
         try:
-            return float(calendar.timegm(time.strptime(ts.replace("Z", ""), "%Y-%m-%dT%H:%M:%S")))
+            parsed = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
         except ValueError:
             return None
     return None
@@ -114,10 +118,15 @@ class CanonicalPolicySnapshotReader:
                     status = SignatureStatus.INVALID
         else:
             status = SignatureStatus.UNKEYED if isinstance(sig, dict) else SignatureStatus.UNSIGNED
+        now = self._clock()
         decisions, in_scope = [], []
         for d in doc.get("decisions") or ():
             if not isinstance(d, dict) or not d.get("decision_id") or not d.get("body_hash"):
                 return self._unavailable()      # a malformed record is not a partial snapshot
+            if "expires_at" in d:
+                expiry = _epoch(d["expires_at"])
+                if expiry is None or expiry <= now:
+                    continue  # Expiry is per decision, so other valid records remain usable.
             # ⛔`principals`, `build_commits` and `runtimes` are not decoration.
             #   Without them every record this reader produces has empty tuples,
             #   and `SnapshotLooseningAuthority` refuses conditions 3 and 4 for
@@ -134,7 +143,7 @@ class CanonicalPolicySnapshotReader:
             if _in_scope(d.get("scope") or {}, intent):
                 in_scope.append(rev)
         produced = _epoch(doc.get("produced_at"))
-        age = None if produced is None else max(0.0, self._clock() - produced)
+        age = None if produced is None else max(0.0, now - produced)
         fresh = age is not None and age <= self.max_age_seconds
         return PolicySnapshotRef(
             generation=generation, hash="sha256:" + hashlib.sha256(canon).hexdigest(),

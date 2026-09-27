@@ -176,6 +176,50 @@ def test_snapshot_reader_missing_unkeyed_stale(tmp_path):
     assert auth.decision == "BLOCK" and "policy_snapshot_signature:UNKEYED" in auth.receipt["reason"]["text"]
 
 
+def test_snapshot_decision_expiry_excludes_only_expired_records(tmp_path):
+    from agent_crew.queue import SnapshotLooseningAuthority
+
+    now = 2_000_000_000.0
+    p = tmp_path / "snap.json"
+    p.write_text(json.dumps({
+        "generation": 8, "produced_at": now, "tier": "T0",
+        "signature": {"alg": "ed25519", "key_id": "k", "value": "v"},
+        "decisions": [
+            {"decision_id": "T0-expired", "body_hash": "a" * 32, "expires_at": now - 1,
+             "principals": ["owner:hojun"], "build_commits": ["build"],
+             "runtimes": ["alfred"], "scope": {"project": "alfred"}},
+            {"decision_id": "T0-current", "body_hash": "b" * 32,
+             "expires_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now + 10)),
+             "principals": ["owner:hojun"], "build_commits": ["build"],
+             "runtimes": ["alfred"], "scope": {"project": "alfred"}},
+            {"decision_id": "T0-malformed", "body_hash": "c" * 32,
+             "expires_at": "not-a-timestamp", "scope": {"project": "alfred"}},
+        ],
+    }))
+    tick = [now]
+    reader = CanonicalPolicySnapshotReader(str(p), clock=lambda: tick[0],
+                                           verifier=lambda body, sig: SignatureStatus.VALID)
+    snap = reader.current(intent())
+    assert snap.available
+    assert [d.decision_id for d in snap.decisions] == ["T0-current"]
+    authority = SnapshotLooseningAuthority(reader, build_commit="build", runtime="alfred")
+    assert authority.verify(frm="STOPPED", to="ACTIVE", who="owner:hojun",
+                            decision_id="T0-current").granted
+    assert not authority.verify(frm="STOPPED", to="ACTIVE", who="owner:hojun",
+                                decision_id="T0-expired").granted
+    tick[0] = now + 10
+    assert reader.current().decisions == ()
+    assert not authority.verify(frm="STOPPED", to="ACTIVE", who="owner:hojun",
+                                decision_id="T0-current").granted
+    class NoHumanGate:
+        def state(self, intent, snapshot):
+            return HumanGate(HumanGateState.NOT_REQUIRED)
+
+    admitted = engine_with(fixture_client(), snapshots=reader, gates=NoHumanGate())._authorize_authenticated(
+        mem_conn(), intent(), caller("cron:a", CallerProvenance.CRON))
+    assert admitted.decision == "BLOCK" and admitted.code == "NO_AUTHORITY"
+
+
 def test_runtime_provider_reads_row_readonly_and_fails_closed(tmp_path):
     from agent_crew.queue import TaskQueue
     db = tmp_path / "q.db"

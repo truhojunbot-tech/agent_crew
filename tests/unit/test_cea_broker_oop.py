@@ -21,7 +21,8 @@ def test_broker_socket_selects_client_only_when_opted_in():
     assert not isinstance(get_engine(config=replace(config, broker_socket=None)), BrokerDecisionClient)
 
 
-def test_unreachable_broker_uses_embedded_engine_with_explicit_reason(monkeypatch):
+@pytest.mark.parametrize("mode", ["enforce", "shadow", "test"])
+def test_unreachable_broker_respects_embedded_mode(monkeypatch, mode):
     observed = []
 
     class Embedded:
@@ -29,18 +30,81 @@ def test_unreachable_broker_uses_embedded_engine_with_explicit_reason(monkeypatc
             observed.append(config)
 
         def authorize(self, conn, intent, caller, *, retry=False):
-            return Authorization(receipt={"downgrade_reason": observed[-1].fallback_reason},
+            observed.append("authorize")
+            return Authorization(receipt={"downgrade_reason": observed[0].fallback_reason},
                                  http_status=409, code="EMBEDDED_ENFORCE_FORBIDDEN")
 
+        def refuse(self, conn, intent, caller, *, code, text):
+            observed.append("refuse")
+            return Authorization(receipt={"decision": "BLOCK", "reason": {"code": code},
+                                          "signature": {"status": "UNVERIFIED"}},
+                                 http_status=403, code=code)
+
     monkeypatch.setattr("agent_crew.cea.service.AuthorizationEngine", Embedded)
-    client = BrokerDecisionClient(EngineConfig(mode="enforce", broker_socket="/missing.sock"))
+    client = BrokerDecisionClient(EngineConfig(mode=mode, broker_socket="/missing.sock"))
     monkeypatch.setattr(client.broker, "decision", lambda request: {"error": "broker_unreachable"})
     intent = Intent(identity=IntentIdentity(project="alfred", work_class=WorkClass.IMPLEMENT,
                     target=Target(repo="example/alfred", base_ref="main", scope_anchors=())),
                     task_id="t", task_type="implement", description="test")
     result = client.authorize(None, intent, object())
-    assert result.receipt["downgrade_reason"] == "broker_unreachable"
-    assert observed[0].mode == "enforce" and observed[0].broker_socket is None
+    assert observed[0].mode == mode and observed[0].broker_socket is None
+    if mode == "enforce":
+        assert observed[1] == "refuse"
+        assert result.http_status == 403 and result.code == "BROKER_UNREACHABLE"
+        assert result.receipt["signature"]["status"] != "VERIFIED"
+    else:
+        assert observed[1] == "authorize"
+        assert result.receipt["downgrade_reason"] == "broker_unreachable"
+
+
+@pytest.mark.parametrize("broker_error", ["broker_unreachable", "backend_failed"])
+def test_enforce_broker_outage_records_unsigned_refusal(monkeypatch, broker_error):
+    import sqlite3
+    from agent_crew.cea.auth import in_process_caller
+    from agent_crew.cea import store
+
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    client = BrokerDecisionClient(EngineConfig(mode="enforce", broker_socket="/missing.sock"))
+    monkeypatch.setattr(client.broker, "decision", lambda request: {"error": broker_error})
+    intent = Intent(identity=IntentIdentity(project="alfred", work_class=WorkClass.IMPLEMENT,
+                    target=Target(repo="example/alfred", base_ref="main", scope_anchors=())),
+                    task_id="outage", task_type="implement", description="test")
+    auth = client.authorize(conn, intent, in_process_caller())
+    assert auth.http_status == 403 and auth.code == "BROKER_UNREACHABLE"
+    assert auth.receipt["decision"] == "BLOCK"
+    assert auth.receipt["signature"]["status"] == "UNVERIFIED"
+    assert store.current_receipt(conn, auth.receipt["receipt_id"])["reason"]["code"] == "BROKER_UNREACHABLE"
+
+
+def test_enforce_broker_outage_enqueue_returns_403_reason(tmp_path, monkeypatch):
+    from agent_crew.cea.auth import in_process_caller
+    from agent_crew.cea.refusal_http import refusal_payload
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import AdmissionRefused, TaskQueue
+
+    config = EngineConfig(mode="enforce", broker_socket="/missing.sock")
+    client = BrokerDecisionClient(config)
+    monkeypatch.setattr(client.broker, "decision", lambda request: {"error": "broker_unreachable"})
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    task = TaskRequest(task_id="outage", task_type="implement", description="test",
+                       project="alfred")
+    intent = Intent(identity=IntentIdentity(project="alfred", work_class=WorkClass.IMPLEMENT,
+                    target=Target(repo="alfred", base_ref="main", scope_anchors=())),
+                    task_id="outage", task_type="implement", description="test")
+    conn = queue._connect()
+    try:
+        receipt = client.authorize(conn, intent, in_process_caller()).receipt
+        conn.commit()
+    finally:
+        conn.close()
+    monkeypatch.setattr(queue, "cea_engine", lambda *args: client)
+    monkeypatch.setattr(queue, "cea_config", lambda *args: config)
+    with pytest.raises(AdmissionRefused) as exc:
+        queue.enqueue_with_receipt(task, receipt)
+    status, body = refusal_payload(exc.value)
+    assert status == 403 and body["reason"].startswith("BROKER_UNREACHABLE:")
+    assert queue.get_task_status("outage") is None
 
 
 def test_user_writable_ancestor_prevents_verified(tmp_path):

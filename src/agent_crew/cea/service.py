@@ -202,14 +202,21 @@ class BrokerDecisionClient(UnixSocketEngineClient):
     def authorize(self, conn, intent: Intent, caller: Optional[Caller] = None, *,
                   retry: bool = False) -> Authorization:
         reply = self.broker.decision(encode_intent(intent, self.credential(), retry=retry))
-        if reply.get("error") == "broker_unreachable":
-            if self._fallback is None:
-                config = replace(self.config, broker_socket=None, endpoint=None,
-                                 fallback_reason="broker_unreachable")
-                self._fallback = AuthorizationEngine(config=config, **self.providers)
-            return self._fallback.authorize(conn, intent, caller, retry=retry)
         if reply.get("code") == "UNAUTHENTICATED":
             raise EngineError("401 UNAUTHENTICATED: broker rejected adapter credential")
+        if reply.get("error") == "broker_unreachable" or (
+                "error" in reply and not self.config.embedded_authorization_permitted):
+            if self._fallback is None:
+                config = replace(self.config, broker_socket=None, endpoint=None,
+                                 fallback_reason="broker_unreachable",
+                                 key_path=(self.config.key_path if self.config.embedded_authorization_permitted
+                                           else None))
+                self._fallback = AuthorizationEngine(config=config, **self.providers)
+            if not self.config.embedded_authorization_permitted:
+                return self._fallback.refuse(
+                    conn, intent, caller, code="BROKER_UNREACHABLE",
+                    text="CEA broker unreachable; embedded authorization is forbidden in enforce mode")
+            return self._fallback.authorize(conn, intent, caller, retry=retry)
         if "error" in reply:
             raise EngineError(str(reply["error"]))
         return Authorization(receipt=reply["receipt"], http_status=int(reply["http_status"]),
