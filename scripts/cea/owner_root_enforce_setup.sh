@@ -200,7 +200,7 @@ def verified_legacy():
     uid, sock = legacy_identity()
     if (sock / "broker.pid").exists():
         return None
-    return lifecycle.verified_orphan_pid(sock, uid)
+    return lifecycle.verified_orphan_pid(sock, uid, allow_degraded=args.rehearse)
 
 def legacy_event(event, pid):
     if not pid:
@@ -215,9 +215,9 @@ def stop_legacy(pid):
     if not pid:
         return
     uid, sock = legacy_identity()
-    if lifecycle.verified_orphan_pid(sock, uid) != pid:
+    if lifecycle.verified_orphan_pid(sock, uid, allow_degraded=args.rehearse) != pid:
         raise RuntimeError(f"legacy broker PID {pid} changed before stop")
-    lifecycle.stop(sock / "broker.pid", sock, uid)
+    lifecycle.stop(sock / "broker.pid", sock, uid, allow_degraded=args.rehearse)
     legacy_event("stopped", pid)
 
 def start_managed():
@@ -230,7 +230,8 @@ def start_managed():
                       "PYTHONPATH": str(tree / "src"),
                       "AGENT_CREW_CEA_CALLER_TOKENS": str(tree / "caller-tokens.json")}
         lifecycle.start(sock / "broker.pid", sock, uid, tree / "caller-tokens.json",
-                        str(venv / "bin/python"), str(uid), env=broker_env)
+                        str(venv / "bin/python"), str(uid), env=broker_env,
+                        degraded=args.rehearse)
         lifecycle.health(sock, tree / "caller-tokens.json", uid)
 
 def preview_legacy_plan():
@@ -250,7 +251,8 @@ def spawn_rehearsal_orphan():
            "PYTHONPATH": str(tree / "src"),
            "AGENT_CREW_CEA_CALLER_TOKENS": str(args.caller_tokens)}
     process = subprocess.Popen([sys.executable, "-m", "agent_crew.cea.broker",
-                                "--sock-dir", str(sock), "--client-uid", str(uid)],
+                                "--sock-dir", str(sock), "--client-uid", str(uid),
+                                "--degraded"],
                                env=env, stdin=subprocess.DEVNULL,
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     deadline = time.monotonic() + 10
@@ -258,7 +260,7 @@ def spawn_rehearsal_orphan():
         if process.poll() is not None:
             raise RuntimeError(f"rehearsal orphan exited early: {process.stderr.read().decode()}")
         try:
-            if lifecycle.verified_orphan_pid(sock, uid) == process.pid:
+            if lifecycle.verified_orphan_pid(sock, uid, allow_degraded=True) == process.pid:
                 say(f"rehearsal legacy orphan pid {process.pid} ready (isolated socket)")
                 return process
         except lifecycle.LifecycleError:
@@ -908,7 +910,7 @@ if args.update_src:
     if args.rehearse:
         if legacy_pid:
             uid, sock = legacy_identity()
-            lifecycle.stop(sock / "broker.pid", sock, uid)
+            lifecycle.stop(sock / "broker.pid", sock, uid, allow_degraded=True)
         say("rehearsal complete: isolated pinned-venv staging and self-tests passed; no live changes made")
     else:
         say("source update complete; broker restart required to load new source (not performed by this script): sudo -n -u crew-authz /usr/local/libexec/crew-authz/broker-launch.sh --restart")

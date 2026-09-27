@@ -43,7 +43,9 @@ def _process_uid(pid: int) -> int | None:
         return None
 
 
-def _exact_broker_cmd(cmd: list[str] | None, sock_dir: Path) -> bool:
+def _exact_broker_cmd(cmd: list[str] | None, sock_dir: Path, *, allow_degraded: bool = False) -> bool:
+    if allow_degraded and cmd and cmd[-1] == "--degraded":
+        cmd = cmd[:-1]
     if not cmd or len(cmd) not in (5, 7):
         return False
     if cmd[1:5] != ["-m", "agent_crew.cea.broker", "--sock-dir", str(sock_dir)]:
@@ -65,7 +67,7 @@ def _socket_peer(sock_path: Path) -> tuple[int, int] | None:
         raise LifecycleError(f"cannot verify socket peer at {sock_path}: {exc}") from exc
 
 
-def verified_orphan_pid(sock_dir: Path, service_uid: int) -> int | None:
+def verified_orphan_pid(sock_dir: Path, service_uid: int, *, allow_degraded: bool = False) -> int | None:
     """Identify a no-pidfile broker by the connected socket peer, not PID scans."""
     peer = _socket_peer(sock_dir / "broker.sock")
     if peer is None:
@@ -73,7 +75,7 @@ def verified_orphan_pid(sock_dir: Path, service_uid: int) -> int | None:
     pid, peer_uid = peer
     if pid <= 1 or peer_uid != service_uid or _process_uid(pid) != service_uid:
         raise LifecycleError(f"socket peer PID {pid} is not broker uid {service_uid}")
-    if not _exact_broker_cmd(_cmdline(pid), sock_dir):
+    if not _exact_broker_cmd(_cmdline(pid), sock_dir, allow_degraded=allow_degraded):
         raise LifecycleError(f"socket peer PID {pid} is not this broker; refusing to signal")
     if _start_time(pid) is None:
         raise LifecycleError(f"cannot verify socket peer PID {pid} start time")
@@ -135,16 +137,18 @@ def health(sock_dir: Path, tokens_path: Path, service_uid: int) -> None:
         raise LifecycleError(f"authenticated health failed: {exc}") from exc
 
 
-def stop(pidfile: Path, sock_dir: Path, service_uid: int, *, timeout: float = 10) -> None:
+def stop(pidfile: Path, sock_dir: Path, service_uid: int, *, timeout: float = 10,
+         allow_degraded: bool = False) -> None:
     pid = _broker_pid(pidfile, sock_dir, service_uid)
     orphan = pid is None
     if orphan:
-        pid = verified_orphan_pid(sock_dir, service_uid)
+        pid = verified_orphan_pid(sock_dir, service_uid, allow_degraded=allow_degraded)
     if pid is None:
         print("broker already stopped", flush=True)
         return
     born = _start_time(pid)
-    if born is None or _process_uid(pid) != service_uid or not _exact_broker_cmd(_cmdline(pid), sock_dir):
+    if born is None or _process_uid(pid) != service_uid or not _exact_broker_cmd(
+            _cmdline(pid), sock_dir, allow_degraded=allow_degraded):
         raise LifecycleError(f"broker PID {pid} changed before signal; refusing")
     if orphan and _socket_peer(sock_dir / "broker.sock") != (pid, service_uid):
         raise LifecycleError(f"broker socket peer changed before signal; refusing PID {pid}")
@@ -163,7 +167,7 @@ def stop(pidfile: Path, sock_dir: Path, service_uid: int, *, timeout: float = 10
 
 def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
           python: str, client_uid: str, *, timeout: float = 10,
-          env: dict[str, str] | None = None) -> None:
+          env: dict[str, str] | None = None, degraded: bool = False) -> None:
     old = _broker_pid(pidfile, sock_dir, service_uid)
     if old is not None:
         health(sock_dir, tokens_path, service_uid)
@@ -180,8 +184,11 @@ def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
                 raise LifecycleError("broker socket answers without a verified pidfile; refusing double start")
     log = sock_dir / "broker.log"
     with log.open("ab") as output:
-        proc = subprocess.Popen([python, "-m", "agent_crew.cea.broker", "--sock-dir", str(sock_dir),
-                                 "--client-uid", client_uid], stdin=subprocess.DEVNULL,
+        command = [python, "-m", "agent_crew.cea.broker", "--sock-dir", str(sock_dir),
+                   "--client-uid", client_uid]
+        if degraded:
+            command.append("--degraded")
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                 stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
                                 env=env)
     born = _start_time(proc.pid)
