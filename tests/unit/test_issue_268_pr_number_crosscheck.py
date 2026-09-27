@@ -89,7 +89,7 @@ def test_no_cross_check_is_possible_so_nothing_is_claimed(reported, requested):
 
 
 def _result(**kw):
-    base = dict(task_id="review-268", status="completed", summary="approve: LGTM",
+    base = dict(task_id="review-268", status="completed", summary="approve: LGTM after checking the full change and tests",
                 verdict="approve", findings=[FINDING], pr_number=REPORTED)
     base.update(kw)
     return TaskResult(**base)
@@ -117,7 +117,7 @@ def test_the_held_summary_names_both_pr_numbers_and_the_reported_status():
     assert PR_MISMATCH_MARKER in held.summary
     assert f"#{REQUESTED}" in held.summary and f"#{REPORTED}" in held.summary
     assert "completed" in held.summary, "the status the agent actually reported is lost"
-    assert "approve: LGTM" in held.summary, "the agent's own summary was discarded"
+    assert "approve: LGTM after checking the full change and tests" in held.summary, "the agent's own summary was discarded"
 
 
 def test_holding_preserves_the_evidence_it_is_holding():
@@ -172,7 +172,7 @@ def _enqueue(c, task_id, task_type, ctx):
 
 
 def _submit(c, task_id, **kw):
-    body = dict(task_id=task_id, status="completed", summary="request_changes: broken",
+    body = dict(task_id=task_id, status="completed", summary="request_changes: the reported change is still broken",
                 verdict="request_changes", findings=[FINDING], pr_number=REPORTED)
     body.update(kw)
     return c.post(f"/tasks/{task_id}/result", json=body)
@@ -275,7 +275,7 @@ def test_http_a_mismatched_approval_produces_no_follow_up_at_all(tmp_db, monkeyp
     with TestClient(_server(tmp_db, _Push())) as c:
         _enqueue(c, "review-appr", "review",
                  {"pr_number": REQUESTED, "no_tester": True})
-        _submit(c, "review-appr", verdict="approve", findings=[], summary="approve: LGTM")
+        _submit(c, "review-appr", verdict="approve", findings=[], summary="approve: LGTM after checking the full change and tests")
 
     spawned = [t.task_type for t in TaskQueue(tmp_db).list_tasks()
                if t.task_id != "review-appr"]
@@ -302,7 +302,7 @@ def test_mcp_a_mismatched_result_is_held_on_this_transport_too(tmp_db, monkeypat
     q.dequeue(role="reviewer")
 
     out = _mcp_submit(tmp_db, task_id="review-mcp", status="completed",
-                      summary="request_changes: broken", verdict="request_changes",
+                      summary="request_changes: the reported change is still broken", verdict="request_changes",
                       findings=[FINDING], pr_number=REPORTED)
 
     assert out.get("acknowledged") is True, out
@@ -324,7 +324,7 @@ def test_mcp_an_agreeing_result_still_cascades(tmp_db, monkeypatch):
     q.dequeue(role="reviewer")
 
     out = _mcp_submit(tmp_db, task_id="review-mcp-ok", status="completed",
-                      summary="request_changes: broken", verdict="request_changes",
+                      summary="request_changes: the reported change is still broken", verdict="request_changes",
                       findings=[FINDING], pr_number=REQUESTED)
 
     assert out.get("held") is None
@@ -421,7 +421,7 @@ def test_mcp_accepts_the_same_spellings(tmp_db, monkeypatch):
     q.dequeue(role="reviewer")
 
     out = _mcp_submit(tmp_db, task_id="review-mcp-hash", status="completed",
-                      summary="request_changes: broken", verdict="request_changes",
+                      summary="request_changes: the reported change is still broken", verdict="request_changes",
                       findings=[FINDING], pr_number=f"#{REQUESTED}")
 
     assert out.get("acknowledged") is True and out.get("held") is None, out

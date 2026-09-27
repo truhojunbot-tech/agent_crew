@@ -161,7 +161,12 @@ class TaskResult:
             elif isinstance(finding, dict):
                 required = ("severity", "file", "line", "title", "detail")
                 if any(key not in finding or finding[key] in (None, "") for key in required):
-                    raise ValueError(f"findings[{index}] must have severity, file, line, title, detail")
+                    # Existing internal result producers carry provenance and
+                    # legacy finding objects. The review intake validator below
+                    # rejects malformed worker findings; keep internal payloads
+                    # intact so suppression and feedback retain that metadata.
+                    normalized_findings.append(finding)
+                    continue
                 normalized_findings.append(
                     f"{finding['severity']} {finding['file']}:{finding['line']} - "
                     f"{finding['title']}: {finding['detail']}")
@@ -209,6 +214,9 @@ def validate_review_result(result: TaskResult) -> Optional[str]:
     if len(result.summary.strip()) < 40:
         return "review summary must be at least 40 characters for a final verdict"
     for index, finding in enumerate(result.findings):
+        if not isinstance(finding, str):
+            return (f"findings[{index}] must be a string or an object with "
+                    "severity, file, line, title, detail")
         if len(finding.strip()) < 10:
             return f"findings[{index}] must be at least 10 characters for a final verdict"
     return None

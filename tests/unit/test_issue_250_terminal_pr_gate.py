@@ -218,7 +218,8 @@ def test_an_open_pr_still_gets_review_and_test_cascades(q):
     impl_id = _implement(q)
     assert auto_enqueue_review(q, impl_id, PR, pr_state_fn=_state("open")) is not None
 
-    review_id = _review(q, verdict="approve", findings=[], summary="lgtm")
+    review_id = _review(q, verdict="approve", findings=[], summary="lgtm",
+                        context={"allow_duplicate_review": True})
     assert auto_enqueue_test(q, review_id, pr_state_fn=_state("open")) is not None
 
 
@@ -252,7 +253,7 @@ def _enqueue_review(c, task_id):
 def _result(c, task_id):
     return c.post(f"/tasks/{task_id}/result",
                   json={"task_id": task_id, "status": "completed",
-                        "summary": "request_changes: still broken",
+                        "summary": "request_changes: the cap is still broken after review",
                         "verdict": "request_changes", "findings": [FINDING],
                         "pr_number": PR})
 

@@ -45,11 +45,11 @@ from agent_crew.pipeline import (
 )
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
-    validate_review_result,
 )
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
-    AdmissionRefused, CompletedReviewRejected, LateResultRejected, PausedError as _PausedError, TaskQueue,
+    AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
+    LateResultRejected, PausedError as _PausedError, TaskQueue,
 )
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
@@ -223,10 +223,6 @@ def build_mcp_server(
         result, mismatch = hold_mismatched_pr_result(task_id, result, _task_ctx)
         _artifact_held = None
         _task = next((item for item in queue.list_tasks() if item.task_id == task_id), None)
-        if _task is not None and _task.task_type == "review":
-            _review_error = validate_review_result(result)
-            if _review_error:
-                return {"acknowledged": False, "error": _review_error}
         try:
             _runtime_paused = queue.get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
@@ -259,7 +255,8 @@ def build_mcp_server(
         _nonce, _presenter = result.take_executor_binding()
         try:
             task_type = queue.submit_result(task_id, result, nonce=_nonce,
-                                            presenter=_presenter)
+                                            presenter=_presenter,
+                                            validate_review=True)
             capture_result_best_effort(queue.db_path, task_id, result)
         except AdmissionRefused as exc:
             # Both transports or neither: HTTP answers 409 for a refused P2
@@ -275,6 +272,11 @@ def build_mcp_server(
                     "task_id": task_id, "prior_status": exc.status, "error": str(exc)}
         except CompletedReviewRejected as exc:
             return {"acknowledged": False, "accepted": False, "error": str(exc)}
+        except DuplicateReviewResult:
+            return {"acknowledged": True, "task_id": task_id, "task_type": "review",
+                    "duplicate": True}
+        except InvalidReviewResult as exc:
+            return {"acknowledged": False, "error": str(exc)}
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
         # #348: mirror HTTP's post-commit, fail-soft persistence. This is
