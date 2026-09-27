@@ -257,6 +257,8 @@ def run():
                 time.sleep(.1)
             else:
                 raise RuntimeError("degraded broker socket did not appear")
+            if (home / "sock" / "broker.sock").lstat().st_gid != (home / "sock").lstat().st_gid:
+                raise RuntimeError("broker socket gid differs from validated client directory")
             server = subprocess.Popen([sys.executable, "-m", "uvicorn", "agent_crew.server:app",
                                        "--host", "127.0.0.1", "--port", str(port)], env=env,
                                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,

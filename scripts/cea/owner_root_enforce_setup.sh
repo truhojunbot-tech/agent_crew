@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CREW_AUTHZ_LAUNCHER_SOURCE="$SCRIPT_DIR/broker-launch.sh"
 export CREW_AUTHZ_SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+export CREW_AUTHZ_SOURCE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 python3 - "$@" <<'PY'
 import argparse
 import json
@@ -23,6 +24,7 @@ mode.add_argument("--undo", action="store_true")
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
 p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
 p.add_argument("--root-prefix", type=Path, help=argparse.SUPPRESS)
+p.add_argument("--update-src", action="store_true", help="update broker source from this clean checkout")
 args = p.parse_args()
 if args.root_prefix and os.environ.get("AGENT_CREW_OWNER_SETUP_TESTING") != "1":
     p.error("--root-prefix is reserved for isolated tests")
@@ -66,8 +68,80 @@ if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snaps
     snapshot_source = path(str(snapshot_source))
 source_launcher = Path(os.environ["CREW_AUTHZ_LAUNCHER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
+source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
 if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
     p.error("invalid source commit")
+
+if args.update_src:
+    source = source_root / "src"
+    installed = tree / "src"
+    previous = tree / "src.old"
+    staging = tree / "src.new"
+    marker = tree / "SRC_COMMIT"
+    update_manifest = manifest_dir / "src-update.json"
+    if args.undo:
+        if not update_manifest.is_file():
+            raise SystemExit(f"no source update manifest: {update_manifest}")
+        saved = json.loads(update_manifest.read_text())
+        if installed.exists():
+            shutil.rmtree(installed)
+        if staging.exists():
+            shutil.rmtree(staging)
+        if saved["had_src"]:
+            if not previous.is_dir():
+                raise SystemExit(f"source backup missing: {previous}")
+            os.replace(previous, installed)
+        if saved["old_commit"] is None:
+            marker.unlink(missing_ok=True)
+        else:
+            marker.write_text(saved["old_commit"])
+            os.chmod(marker, 0o644)
+            if not fake:
+                run("chown", "root:root", str(marker))
+        update_manifest.unlink()
+        say("source update undo complete")
+        sys.exit(0)
+    say(f"stage clean checkout {source_root} ({source_commit}) into {staging}")
+    say(f"backup {installed} to {previous}; write {marker}; record {update_manifest}")
+    if not args.apply:
+        say("dry-run: no changes made")
+        sys.exit(0)
+    if not tree.is_dir() or tree.is_symlink() or not source.is_dir():
+        raise SystemExit("broker tree or checkout src missing")
+    if previous.exists() or staging.exists() or update_manifest.exists():
+        raise SystemExit("source update backup or manifest exists; undo first")
+    if not fake and run("git", "-C", str(source_root), "status", "--porcelain", capture=True).stdout.strip():
+        raise SystemExit(f"source checkout is dirty: {source_root}")
+    for item in source.rglob("*"):
+        if item.is_symlink():
+            raise SystemExit(f"symlink in source tree: {item}")
+    old_commit = marker.read_text() if marker.is_file() else None
+    manifest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    update_manifest.write_text(json.dumps({"had_src": installed.is_dir(),
+                                           "old_commit": old_commit, "new_commit": source_commit}, indent=2))
+    os.chmod(update_manifest, 0o600)
+    try:
+        shutil.copytree(source, staging)
+        for directory, dirs, files in os.walk(staging):
+            for name in dirs + files:
+                item = Path(directory) / name
+                os.chmod(item, stat.S_IMODE(item.stat().st_mode) & ~0o022)
+                if not fake:
+                    run("chown", "root:root", str(item))
+        if not fake:
+            run("chown", "root:root", str(staging))
+        if installed.exists():
+            os.replace(installed, previous)
+        os.replace(staging, installed)
+        marker.write_text(source_commit + "\n")
+        os.chmod(marker, 0o644)
+        if not fake:
+            run("chown", "root:root", str(marker))
+    except Exception:
+        say(f"source update failed; restore with --undo --update-src using {update_manifest}")
+        raise
+    say("source update complete")
+    sys.exit(0)
 
 targets = [tree, launcher.parent, sudoers]
 def originals():

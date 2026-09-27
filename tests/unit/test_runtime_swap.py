@@ -1,6 +1,9 @@
 """Runtime swap gates run against disposable files, never live listeners."""
 import json
+import os
+import socket
 import subprocess
+import threading
 
 import pytest
 
@@ -162,6 +165,52 @@ def test_spawn_captured_env_preserves_spaces_and_drops_old_agent_source(tmp_path
     assert captured['env']['PYTHONPATH'] == f'{new}:/other/lib'
 
 
+def test_broker_probe_uses_client_group_and_connects(tmp_path, monkeypatch):
+    import scripts.spawn_from_env as spawn
+    import grp
+    directory = tmp_path / 'sock'
+    directory.mkdir()
+    path = directory / 'broker.sock'
+    listener = socket.socket(socket.AF_UNIX)
+    listener.bind(str(path))
+    alternate = next((gid for gid in os.getgroups() if gid != os.getegid()), None)
+    if alternate is None:
+        listener.close()
+        pytest.skip('no distinct supplementary group')
+    os.chown(directory, -1, alternate)
+    os.chmod(directory, 0o710)
+    os.chown(path, -1, alternate)
+    os.chmod(path, 0o660)
+    listener.listen(1)
+    accepted = []
+    thread = threading.Thread(target=lambda: accepted.append(listener.accept()[0]), daemon=True)
+    thread.start()
+    env_file = tmp_path / 'env.nul'
+    env_file.write_bytes(b'HOME=/tmp\0')
+    cea_file = tmp_path / 'cea.env'
+    cea_file.write_text(f'AGENT_CREW_CEA_BROKER_SOCKET={path}\n')
+    command = spawn.client_command(spawn.launch_env(env_file, cea_file, tmp_path), ['python3', '-c', 'pass'])
+    assert command[:3] == ['sg', grp.getgrgid(os.stat(directory).st_gid).gr_name, '-c']
+    try:
+        spawn.probe_broker(env_file, cea_file, tmp_path)
+        thread.join(timeout=5)
+        assert accepted
+    finally:
+        for peer in accepted:
+            peer.close()
+        listener.close()
+
+
+def test_broker_probe_refuses_missing_socket(tmp_path):
+    import scripts.spawn_from_env as spawn
+    env_file = tmp_path / 'env.nul'
+    env_file.write_bytes(b'HOME=/tmp\0')
+    cea_file = tmp_path / 'cea.env'
+    cea_file.write_text(f'AGENT_CREW_CEA_BROKER_SOCKET={tmp_path / "missing.sock"}\n')
+    with pytest.raises((FileNotFoundError, RuntimeError, KeyError)):
+        spawn.probe_broker(env_file, cea_file, tmp_path)
+
+
 def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch):
     swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
     evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
@@ -185,3 +234,20 @@ def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch):
         swap.main(['demo', 'a' * 40, 'go'])
     assert len(killed) == 1
     assert (evidence / 'tasks.db.pre').exists()
+
+
+def test_go_broker_probe_failure_keeps_old_server(tmp_path, monkeypatch):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    evidence.mkdir(parents=True)
+    (evidence / 'preflight.json').write_text(json.dumps({
+        'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid()}))
+    (evidence / 'env.pre.nul').write_bytes(b'X=Y\0')
+    killed = []
+    monkeypatch.setattr(swap.os, 'kill', lambda *args: killed.append(args))
+    def fail_probe(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, args[0])
+    monkeypatch.setattr(swap.subprocess, 'run', fail_probe)
+    with pytest.raises(subprocess.CalledProcessError):
+        swap.main(['demo', 'a' * 40, 'go'])
+    assert killed == []

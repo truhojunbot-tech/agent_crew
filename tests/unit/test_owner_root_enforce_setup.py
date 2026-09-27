@@ -161,3 +161,30 @@ def test_incomplete_apply_requires_undo_before_retry(tmp_path):
     undo = _run(tmp_path, "--undo")
     assert undo.returncode == 0, undo.stderr
     assert not manifest_path.exists()
+
+
+def test_update_src_dry_run_apply_and_undo(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    installed = tree / "src"
+    installed.mkdir()
+    (installed / "old.py").write_text("original")
+    dry = _run(tmp_path, "--update-src")
+    assert dry.returncode == 0, dry.stderr
+    assert "dry-run: no changes made" in dry.stdout
+    assert (installed / "old.py").read_text() == "original"
+    assert not (tree / "src.old").exists()
+    applied = _run(tmp_path, "--apply", "--update-src")
+    assert applied.returncode == 0, applied.stderr
+    assert (tree / "src.old" / "old.py").read_text() == "original"
+    assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
+    assert (tree / "SRC_COMMIT").read_text().strip() == subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=SCRIPT.parent.parent.parent, text=True).strip()
+    assert (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").is_file()
+    repeat = _run(tmp_path, "--apply", "--update-src")
+    assert repeat.returncode != 0 and "undo first" in repeat.stderr
+    undo = _run(tmp_path, "--undo", "--update-src")
+    assert undo.returncode == 0, undo.stderr
+    assert (installed / "old.py").read_text() == "original"
+    assert (tree / "SRC_COMMIT").read_text() == "old-build\n"
+    assert not (tree / "src.old").exists()
+    assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()

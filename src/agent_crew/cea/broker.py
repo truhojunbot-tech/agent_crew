@@ -503,12 +503,21 @@ class Broker:
         except FileNotFoundError:
             pass
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.bind(self.sock_path)
-        # Connect needs write on the socket inode. Group only: the directory is
-        # 0710 to the client group, so group is exactly the set that can traverse.
-        os.chmod(self.sock_path, 0o660)
-        s.listen(64)
-        self._sock = s
+        try:
+            s.bind(self.sock_path)
+            # The broker's primary gid can differ from the validated client gid.
+            os.chown(self.sock_path, -1, st.st_gid)
+            os.chmod(self.sock_path, 0o660)
+            bound = os.lstat(self.sock_path)
+            if (not stat.S_ISSOCK(bound.st_mode) or bound.st_uid != os.geteuid()
+                    or bound.st_gid != st.st_gid or stat.S_IMODE(bound.st_mode) != 0o660):
+                raise BrokerRefused(f"socket ownership or mode changed: {self.sock_path}")
+            s.listen(64)
+            self._sock = s
+        except Exception:
+            s.close()
+            os.unlink(self.sock_path)
+            raise
 
     def serve_forever(self) -> None:
         assert self._sock is not None, "bind() first"

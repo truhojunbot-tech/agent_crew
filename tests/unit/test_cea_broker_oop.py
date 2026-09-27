@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import pytest
 from dataclasses import replace
 
 from agent_crew.cea.broker import (
@@ -86,6 +87,7 @@ def test_broker_remote_decisions_enforce_only_runtime_code(tmp_path):
                     integrity_paths=(str(tmp_path),), decision_engine=eng,
                     connect=lambda: sqlite3.connect(str(db)), authenticator=auth)
     broker.bind()
+    assert os.lstat(broker.sock_path).st_gid == os.lstat(sockdir).st_gid
     thread = threading.Thread(target=broker.serve_forever, daemon=True)
     thread.start()
     client = BrokerClient(broker.sock_path, expected_uid=os.geteuid())
@@ -106,6 +108,32 @@ def test_broker_remote_decisions_enforce_only_runtime_code(tmp_path):
         assert blocked["code"] in enforce_codes
         assert allowed["code"] == "OK" and allowed["receipt"]["decision"] == "ALLOW"
         assert advisory["code"] not in enforce_codes
+    finally:
+        broker.close()
+
+
+def test_bind_assigns_validated_client_gid_before_chmod(tmp_path, monkeypatch):
+    from agent_crew.cea import broker as broker_module
+    directory = tmp_path / "socket"
+    directory.mkdir(mode=0o710)
+    alternate = next((gid for gid in os.getgroups() if gid != os.getegid()), None)
+    if alternate is None:
+        pytest.skip("no supplementary group available for distinct broker/client gid")
+    os.chown(directory, -1, alternate)
+    broker = Broker(str(directory), degraded=True, client_uids=(os.geteuid(),))
+    real_chown = broker_module.os.chown
+    calls = []
+
+    def record_chown(path, uid, gid):
+        calls.append((path, uid, gid))
+        return real_chown(path, uid, gid)
+
+    monkeypatch.setattr(broker_module.os, "chown", record_chown)
+    try:
+        broker.bind()
+        assert calls == [(broker.sock_path, -1, os.lstat(directory).st_gid)]
+        assert os.lstat(broker.sock_path).st_gid == os.lstat(directory).st_gid
+        assert os.lstat(broker.sock_path).st_gid != os.getegid()
     finally:
         broker.close()
 
