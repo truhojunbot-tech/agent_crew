@@ -139,10 +139,23 @@ def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch, 
 
     assert task.status == "timed_out", "a timeout is still reported as a failure"
     assert task.error_info["reason"] == "dispatcher_timeout"
+    assert task.error_info["timeout_limit_s"] == 0.05
+    assert task.error_info["last_output_age_s"] >= 0
+    assert "last output" in task.summary
     assert task.error_info["final"] is False, (
         "a timeout must say it is not a final verdict — that is the whole "
         "distinction the consumer needs"
     )
+
+
+def test_idle_timeout_reports_its_limit_and_output_age(tmp_path, monkeypatch, *, unused_tcp_port):
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_IDLE_TIMEOUT", "0.02")
+    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="hang", unused_tcp_port=unused_tcp_port)
+    assert task.status == "timed_out"
+    assert task.error_info["reason"] == "dispatcher_idle_timeout"
+    assert task.error_info["timeout_limit_s"] == 0.02
+    assert task.error_info["last_output_age_s"] >= 0.02
+    assert "last output" in task.summary
 
 
 def test_a_clean_exit_without_a_result_is_also_timed_out(tmp_path, monkeypatch, *, unused_tcp_port):

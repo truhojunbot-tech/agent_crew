@@ -1177,26 +1177,11 @@ _HEARTBEAT_INTERVAL_S = float(os.getenv("AGENT_CREW_HEARTBEAT_INTERVAL", "30"))
 
 
 def _dispatch_timeout_for_role(role: str, task_context: Optional[dict] = None) -> float:
-    """Hard wall-clock timeout (seconds) for a dispatched subprocess.
+    """Absolute dispatch cap; output silence has a separate idle limit.
 
-    ``implement`` tasks routinely run longer than review/test — they write
-    code across a real codebase and run test suites, not just read and
-    verdict — and a single shared 900s default was killing legitimately
-    still-working (not stuck) implementer subprocesses with
-    ``dispatcher_timeout`` (observed live on alpha_engine 2026-08-27: 3
-    consecutive kills on tasks whose own dispatch log showed them still
-    actively producing tool calls right up to the kill). ``implementer``
-    gets a longer default; every other role keeps the original 900s.
-
-    Both defaults remain overridable: ``AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER``
-    for the implementer role specifically, else ``AGENT_CREW_DISPATCH_TIMEOUT``
-    for that role or any other — so setting only the generic var still
-    raises every role uniformly, matching pre-existing behavior for anyone
-    already relying on it.
-
-    A task can set ``context.dispatch_timeout_s`` for its own dispatch. A
-    positive finite value takes precedence over the role/env default and is
-    capped at 3600 seconds. Invalid values leave the role/env default intact.
+    The per-task context override takes precedence and is capped at one hour.
+    Existing generic and implementer environment overrides remain supported;
+    reviewers can also set ``AGENT_CREW_DISPATCH_TIMEOUT_REVIEWER``.
     """
     if isinstance(task_context, dict):
         value = task_context.get("dispatch_timeout_s")
@@ -1208,12 +1193,62 @@ def _dispatch_timeout_for_role(role: str, task_context: Optional[dict] = None) -
             else:
                 if math.isfinite(task_timeout) and task_timeout > 0:
                     return min(task_timeout, 3600.0)
-    default = "1800" if role == "implementer" else "900"
-    if role == "implementer":
-        env_value = os.getenv("AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER")
+    default = "900" if role == "tester" else "3600"
+    if role in ("implementer", "reviewer"):
+        env_value = os.getenv(f"AGENT_CREW_DISPATCH_TIMEOUT_{role.upper()}")
         if env_value is not None:
             return float(env_value)
     return float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", default))
+
+
+def _dispatch_idle_timeout() -> float:
+    """Seconds without dispatch output before stopping the subprocess."""
+    try:
+        value = float(os.getenv("AGENT_CREW_DISPATCH_IDLE_TIMEOUT", "600"))
+    except (ValueError, OverflowError):
+        return 600.0
+    return value if math.isfinite(value) and value > 0 else 600.0
+
+
+async def _wait_for_dispatch_activity(
+    proc, log_path: str, initial_offset: int, *, hard_timeout_s: float,
+    idle_timeout_s: float, on_progress,
+) -> tuple[Optional[str], float]:
+    """Wait for a child while observing growth in its dedicated dispatch log.
+
+    The caller wrote its task marker before ``initial_offset``. Only bytes
+    written by this child count as progress. Return the fired limit and the
+    age of the last output; a clean process exit returns no limit.
+    """
+    started = last_output = time.monotonic()
+    offset = initial_offset
+    wait_task = asyncio.create_task(proc.wait())
+    try:
+        while True:
+            now = time.monotonic()
+            try:
+                size = os.path.getsize(log_path)
+            except OSError:
+                size = offset
+            if size > offset:
+                offset = size
+                last_output = now
+                on_progress()
+            if wait_task.done():
+                await wait_task
+                return None, now - last_output
+            if now - started >= hard_timeout_s:
+                return "dispatcher_timeout", now - last_output
+            if now - last_output >= idle_timeout_s:
+                return "dispatcher_idle_timeout", now - last_output
+            delay = min(_HEARTBEAT_INTERVAL_S, hard_timeout_s - (now - started),
+                        idle_timeout_s - (now - last_output))
+            await asyncio.wait({wait_task}, timeout=max(delay, 0.001))
+    finally:
+        if not wait_task.done():
+            wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wait_task
 
 
 #: Cap on the agy/Antigravity conversation the tester resumes with
@@ -4108,7 +4143,8 @@ def create_app(
     # instead of just inferrable (#202 acceptance criterion).
     _seen_context_keys_this_process: set[str] = set()
 
-    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed") -> bool:
+    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed",
+                        details: Optional[dict] = None) -> bool:
         """End a task only when it is still in_progress (agent may have submitted first).
 
         `status` distinguishes two things the dispatcher used to conflate (#265):
@@ -4125,19 +4161,23 @@ def create_app(
         tasks = q().list_tasks(status="in_progress")
         if any(t.task_id == task_id for t in tasks):
             try:
+                summary = reason
+                if details and "last_output_age_s" in details:
+                    summary += f" (last output {details['last_output_age_s']:.1f}s ago)"
                 q().submit_result(
                     task_id,
-                    TaskResult(task_id=task_id, status=status, summary=reason,
-                               error_info={"reason": reason, "final": status == "failed"}),
+                    TaskResult(task_id=task_id, status=status, summary=summary,
+                               error_info={"reason": reason, "final": status == "failed",
+                                           **(details or {})}),
                     dispatcher_failed=status == "failed",
                 )
                 capture_result_best_effort(db_path, task_id, TaskResult(
-                    task_id=task_id, status=status, summary=reason))
+                    task_id=task_id, status=status, summary=summary))
                 _attr = q().get_attribution(task_id)
                 record_context_event(
                     _context_events_path,
                     "task_failed" if status == "failed" else "task_timed_out",
-                    task_id=task_id, reason=reason,
+                    task_id=task_id, reason=reason, **(details or {}),
                     project=(_attr or {}).get("project"),
                     role=(_attr or {}).get("role"),
                     agent=(_attr or {}).get("agent"),
@@ -4184,17 +4224,6 @@ def create_app(
                 agent = _override
         wt = wt_override or worktree_map.get(role)
         return agent, wt
-
-    async def _process_heartbeat(task_id: str, proc) -> None:
-        """Record, while `proc` runs, that the dispatcher still sees it alive (G12).
-
-        Observation only: it reads `proc.returncode` and writes one column. It
-        ends by itself when the process exits, so a path that forgets to
-        cancel it cannot leave it running.
-        """
-        while proc.returncode is None:
-            q().record_heartbeat(task_id, source="process_alive")
-            await asyncio.sleep(_HEARTBEAT_INTERVAL_S)
 
     async def _dispatch_task(task: TaskRequest, role: str) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
@@ -4964,12 +4993,14 @@ def create_app(
             # dispatch itself was decided before the prompt was built.
             q().bind_dispatch_target(task.task_id, target=f"pid:{proc.pid}",
                                      lease_owner=f"{agent}:pid:{proc.pid}")
-            _heartbeat = asyncio.create_task(_process_heartbeat(task.task_id, proc))
-            _timed_out = False
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=timeout_secs)
-            except asyncio.TimeoutError:
-                _timed_out = True
+            _idle_timeout_secs = _dispatch_idle_timeout()
+            _timeout_reason, _last_output_age = await _wait_for_dispatch_activity(
+                proc, log_path, _task_log_start_offset,
+                hard_timeout_s=timeout_secs, idle_timeout_s=_idle_timeout_secs,
+                on_progress=lambda: q().record_heartbeat(
+                    task.task_id, source="output_progress"),
+            )
+            if _timeout_reason:
                 # Kill the entire process group, not just the direct child.
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -4979,8 +5010,8 @@ def create_app(
                     proc.kill()
                 except ProcessLookupError:
                     pass
-                logger.error(f"dispatcher: timeout {timeout_secs}s task={task.task_id}")
-            _heartbeat.cancel()
+                logger.error("dispatcher: %s task=%s last_output_age=%.1fs",
+                             _timeout_reason, task.task_id, _last_output_age)
             # Inspect the dispatch log tail for upstream errors — applies to
             # both clean exit AND timeout (#190). Claude can return rc=0 with
             # api_error_status:429; gemini-cli often hangs on retry loops past
@@ -5051,7 +5082,14 @@ def create_app(
                     append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
             except Exception:
                 logger.exception("dispatcher: terminal telemetry enrichment failed for task=%s", task.task_id)
-            if _transient in _TRANSIENT_RETRIABLE_TAGS:
+            if _timeout_reason:
+                # The task receipt, error_info, and event all carry the fired
+                # limit and output age for post-mortem inspection.
+                _fail_if_active(task.task_id, _timeout_reason, status="timed_out",
+                                details={"last_output_age_s": round(_last_output_age, 3),
+                                         "timeout_limit_s": (timeout_secs if _timeout_reason == "dispatcher_timeout"
+                                                             else _idle_timeout_secs)})
+            elif _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
                 if _n <= _MAX_TRANSIENT_RETRY:
@@ -5084,15 +5122,6 @@ def create_app(
                     "failing without retry (quota reset / migration required)"
                 )
                 _fail_if_active(task.task_id, _transient)
-            elif _timed_out:
-                # #265: NOT `failed`. The dispatcher stopped waiting; the worker
-                # may still be running and may still POST — measured on
-                # alpha_engine, six tasks in one day were marked failed and later
-                # turned completed, with their commits already pushed. A consumer
-                # reading status at notification time saw a false failure and
-                # would have re-issued work that was already done (including one
-                # task that had already opened a PR).
-                _fail_if_active(task.task_id, "dispatcher_timeout", status="timed_out")
             elif proc.returncode != 0:
                 _fail_if_active(task.task_id, f"exit_{proc.returncode}")
             else:
