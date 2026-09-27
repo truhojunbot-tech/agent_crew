@@ -132,3 +132,113 @@ def test_cross_project_needs_explicit_flag(tmp_path, monkeypatch, command):
         allowed = CliRunner().invoke(crew, [*args, "--allow-cross-project"])
     assert "Cross-project" in allowed.output
     assert "--allow-cross-project" not in allowed.output
+
+
+@pytest.mark.parametrize("command", [
+    ["run", "task"], ["task", "cancel", "id"],
+    ["task", "expire-stale", "--dry-run"], ["discuss", "topic"],
+])
+def test_instance_marker_routes_all_commands(tmp_path, monkeypatch, command):
+    base = tmp_path / "crew"
+    base.mkdir()
+    repo = _repo(tmp_path / "repo")
+    _state(base, "alfred", repo_path=str(repo))
+    _state(base, "quota-ops", repo_path=str(_repo(tmp_path / "quota")))
+    instance = repo / "instances" / "Quota" / "nested"
+    instance.mkdir(parents=True)
+    (instance.parent / ".crew-project").write_text("quota-ops\n")
+    monkeypatch.chdir(instance)
+    assert _auto_detect_project(str(base)) == "quota-ops"
+    with patch("agent_crew.cli._read_state", side_effect=RuntimeError("selected project")) as read:
+        result = CliRunner().invoke(crew, [*command, "--base", str(base)])
+    assert isinstance(result.exception, RuntimeError)
+    assert read.call_args.args == (str(base), "quota-ops")
+
+
+@pytest.mark.parametrize("command", [
+    ["run", "task"], ["task", "cancel", "id"],
+    ["task", "expire-stale", "--dry-run"], ["discuss", "topic"],
+])
+def test_unmarked_instance_refuses_all_commands(tmp_path, monkeypatch, command):
+    base = tmp_path / "crew"
+    base.mkdir()
+    repo = _repo(tmp_path / "repo")
+    _state(base, "alfred", repo_path=str(repo))
+    instance = repo / "instances" / "bot"
+    instance.mkdir(parents=True)
+    monkeypatch.chdir(instance)
+    assert _auto_detect_project(str(base)) is None
+    result = CliRunner().invoke(crew, [*command, "--base", str(base)])
+    assert result.exit_code != 0
+    assert "--project" in result.output and ".crew-project" in result.output
+
+
+def test_nearest_marker_wins_and_unregistered_marker_refuses(tmp_path, monkeypatch):
+    base = tmp_path / "crew"
+    base.mkdir()
+    repo = _repo(tmp_path / "repo")
+    _state(base, "alfred", repo_path=str(repo))
+    _state(base, "quota-ops")
+    instance = repo / "instances" / "Quota"
+    instance.mkdir(parents=True)
+    (repo / ".crew-project").write_text("alfred\n")
+    (instance / ".crew-project").write_text("quota-ops\n")
+    monkeypatch.chdir(instance)
+    assert _auto_detect_project(str(base)) == "quota-ops"
+    (instance / ".crew-project").write_text("missing\n")
+    result = CliRunner().invoke(crew, ["run", "task", "--base", str(base)])
+    assert result.exit_code != 0 and "not registered" in result.output
+
+
+@pytest.mark.parametrize("command", [
+    ["run", "task"], ["task", "cancel", "id"],
+    ["task", "expire-stale", "--dry-run"], ["discuss", "topic"],
+])
+def test_marker_is_cwd_project_for_cross_project_check(tmp_path, monkeypatch, command):
+    base = tmp_path / "crew"
+    base.mkdir()
+    repo = _repo(tmp_path / "repo")
+    _state(base, "alfred", repo_path=str(repo))
+    _state(base, "quota-ops")
+    instance = repo / "instances" / "Quota"
+    instance.mkdir(parents=True)
+    (instance / ".crew-project").write_text("quota-ops\n")
+    monkeypatch.chdir(instance)
+    args = [*command, "--project", "alfred", "--base", str(base)]
+    denied = CliRunner().invoke(crew, args)
+    assert denied.exit_code != 0 and "--allow-cross-project" in denied.output
+    with patch("agent_crew.cli._read_state", side_effect=RuntimeError("selected project")) as read:
+        allowed = CliRunner().invoke(crew, [*args, "--allow-cross-project"])
+    assert isinstance(allowed.exception, RuntimeError)
+    assert "Cross-project" in allowed.output
+    assert read.call_args.args == (str(base), "alfred")
+
+
+def test_repo_root_and_crew_worktree_still_resolve(tmp_path, monkeypatch):
+    base = tmp_path / "crew"
+    base.mkdir()
+    repo = _repo(tmp_path / "repo")
+    subprocess.run(["git", "-C", str(repo), "commit", "--allow-empty", "-qm", "init"],
+                   check=True, env={**os.environ, "GIT_AUTHOR_NAME": "test", "GIT_AUTHOR_EMAIL": "test@example.com",
+                                    "GIT_COMMITTER_NAME": "test", "GIT_COMMITTER_EMAIL": "test@example.com"})
+    worktree = tmp_path / "crew-worker"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", "--detach", str(worktree)], check=True)
+    _state(base, "alfred", repo_path=str(repo), worktrees={"codex": str(worktree)})
+    monkeypatch.chdir(repo)
+    assert _auto_detect_project(str(base)) == "alfred"
+    monkeypatch.chdir(worktree)
+    assert _auto_detect_project(str(base)) == "alfred"
+
+
+def test_unmarked_instance_allows_explicit_project(tmp_path, monkeypatch):
+    base = tmp_path / "crew"
+    base.mkdir()
+    repo = _repo(tmp_path / "repo")
+    _state(base, "alfred", repo_path=str(repo))
+    instance = repo / "instances" / "bot"
+    instance.mkdir(parents=True)
+    monkeypatch.chdir(instance)
+    with patch("agent_crew.cli._read_state", side_effect=RuntimeError("selected project")) as read:
+        result = CliRunner().invoke(crew, ["run", "task", "--project", "alfred", "--base", str(base)])
+    assert isinstance(result.exception, RuntimeError)
+    assert read.call_args.args == (str(base), "alfred")

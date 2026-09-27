@@ -164,6 +164,33 @@ def _matching_projects(base: str) -> list[str]:
     root = os.path.expanduser(base)
     if cwd_identity is None or not os.path.isdir(root):
         return []
+    cwd = os.path.realpath(os.getcwd())
+    top = cwd_identity[0]
+    # The nearest marker is authoritative, including when several crews share
+    # a Git repository. Never silently fall back from a broken marker.
+    directory = cwd
+    while True:
+        marker = os.path.join(directory, ".crew-project")
+        if os.path.exists(marker):
+            try:
+                with open(marker) as stream:
+                    lines = stream.read().splitlines()
+            except OSError as exc:
+                raise click.ClickException(f"Cannot read {marker}: {exc}") from exc
+            if (len(lines) != 1 or not lines[0] or lines[0] != lines[0].strip()
+                    or lines[0] in (".", "..") or os.sep in lines[0]):
+                raise click.ClickException(f"Invalid .crew-project marker at {marker}: expected one project name.")
+            project = lines[0]
+            if not os.path.isfile(_state_path(root, project)):
+                raise click.ClickException(f".crew-project marker at {marker} names {project!r}, which is not registered.")
+            return [project]
+        if directory == top:
+            break
+        directory = os.path.dirname(directory)
+    # A bot instance inherits its parent's Git identity but is not necessarily
+    # the parent's crew project. Require an explicit project in this subtree.
+    if "instances" in os.path.relpath(cwd, top).split(os.sep):
+        return []
     exact_matches = []
     common_matches = []
     try:
@@ -211,7 +238,7 @@ def _select_project(base: str, project: str, allow_cross_project: bool) -> str:
     if not project:
         if len(matches) != 1:
             reason = ("matches multiple projects: " + ", ".join(matches)) if matches else "matches no registered project"
-            raise click.ClickException(f"Current repository {reason}; specify --project (or --db).")
+            raise click.ClickException(f"Current repository {reason}; specify --project (or --db), or add a .crew-project marker.")
         return matches[0]
     if len(matches) == 1 and matches[0] != project:
         if not allow_cross_project:
