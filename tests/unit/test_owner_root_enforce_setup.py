@@ -188,3 +188,36 @@ def test_update_src_dry_run_apply_and_undo(tmp_path):
     assert (tree / "SRC_COMMIT").read_text() == "old-build\n"
     assert not (tree / "src.old").exists()
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
+
+
+def test_unreadable_broker_env_reports_error_but_source_preview_does_not_need_it(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    env_file = tree / "broker.env"
+    env_file.chmod(0)
+    dry = _run(tmp_path)
+    assert dry.returncode != 0
+    assert "broker.env is not readable" in dry.stderr
+    assert "Traceback" not in dry.stderr
+    source_preview = _run(tmp_path, "--update-src")
+    assert source_preview.returncode == 0, source_preview.stderr
+    assert "dry-run: no changes made" in source_preview.stdout
+
+
+def test_main_undo_refuses_outstanding_source_update(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    applied = _run(tmp_path, "--apply", "--caller-tokens",
+                   "/home/truhojun/.verify-private/tokens.json")
+    assert applied.returncode == 0, applied.stderr
+    updated = _run(tmp_path, "--apply", "--update-src")
+    assert updated.returncode == 0, updated.stderr
+    source_manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
+    assert source_manifest.is_file()
+    blocked = _run(tmp_path, "--undo")
+    assert blocked.returncode != 0
+    assert "undo --update-src first" in blocked.stderr
+    assert source_manifest.is_file()
+    assert (tree / "src" / "agent_crew" / "cea" / "broker.py").is_file()
+    source_undo = _run(tmp_path, "--undo", "--update-src")
+    assert source_undo.returncode == 0, source_undo.stderr
+    main_undo = _run(tmp_path, "--undo")
+    assert main_undo.returncode == 0, main_undo.stderr

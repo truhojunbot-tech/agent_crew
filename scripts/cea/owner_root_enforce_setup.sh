@@ -38,6 +38,15 @@ def run(*cmd, capture=False):
     return subprocess.run(cmd, check=True, text=True, capture_output=capture)
 def say(message):
     print(message, flush=True)
+def read_broker_env(config):
+    if not config.exists():
+        return ""
+    try:
+        return config.read_text()
+    except PermissionError as exc:
+        raise SystemExit(
+            f"broker.env is not readable: {config}; run --dry-run as root to validate and print the plan"
+        ) from exc
 
 tree = path("/opt/agent_crew-authz")
 launcher = path("/usr/local/libexec/crew-authz/broker-launch.sh")
@@ -53,10 +62,10 @@ created_parents = []
 token_source = args.caller_tokens
 if token_source and fake and token_source.is_absolute():
     token_source = path(str(token_source))
-if token_source is None:
+if token_source is None and not (args.undo or args.update_src):
     env_file = tree / "broker.env"
     if env_file.exists():
-        for line in env_file.read_text().splitlines():
+        for line in read_broker_env(env_file).splitlines():
             match = re.fullmatch(r"AGENT_CREW_CEA_CALLER_TOKENS=['\"]?([^'\"]+)['\"]?", line.strip())
             if match:
                 candidate = Path(match.group(1))
@@ -157,6 +166,9 @@ def check_safe():
         raise RuntimeError(f"missing launcher source: {source_launcher}")
 
 if args.undo:
+    update_manifest = manifest_dir / "src-update.json"
+    if update_manifest.exists():
+        raise SystemExit(f"source update is outstanding; run --undo --update-src first: {update_manifest}")
     if not manifest_file.is_file():
         raise SystemExit(f"no apply manifest: {manifest_file}")
     manifest = json.loads(manifest_file.read_text())
