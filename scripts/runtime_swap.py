@@ -152,6 +152,8 @@ def main(argv=None) -> int:
     if args.step == "preflight":
         (evidence / "env.pre.nul").write_bytes((Path("/proc") / str(pid) / "environ").read_bytes())
         (evidence / "env.pre.nul").chmod(0o600)
+        subprocess.run([sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"), "--probe-broker",
+                        str(evidence / "env.pre.nul"), str(cea_file), str(checkout / "src")], check=True)
         (evidence / "cmdline.pre.nul").write_bytes((Path("/proc") / str(pid) / "cmdline").read_bytes())
         (evidence / "cwd.pre").write_text(os.readlink(Path("/proc") / str(pid) / "cwd"))
         write_json(evidence / "health.pre.json", health)
@@ -168,6 +170,9 @@ def main(argv=None) -> int:
             raise RuntimeError("listener changed since preflight")
         if not (evidence / "env.pre.nul").is_file():
             raise RuntimeError("captured environment missing")
+        # Recheck immediately before the process boundary; permissions may have changed.
+        subprocess.run([sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"), "--probe-broker",
+                        str(evidence / "env.pre.nul"), str(cea_file), str(checkout / "src")], check=True)
         # Back up before the irreversible process boundary. SQLite backup is consistent
         # even with WAL enabled; retain the original state and pause files verbatim.
         with sqlite3.connect(db_path) as source, sqlite3.connect(evidence / "tasks.db.pre") as target:

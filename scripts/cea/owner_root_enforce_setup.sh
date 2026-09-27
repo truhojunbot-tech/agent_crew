@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CREW_AUTHZ_LAUNCHER_SOURCE="$SCRIPT_DIR/broker-launch.sh"
 export CREW_AUTHZ_SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
+export CREW_AUTHZ_SOURCE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 python3 - "$@" <<'PY'
 import argparse
 import json
@@ -24,6 +25,7 @@ mode.add_argument("--undo", action="store_true")
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
 p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
 p.add_argument("--root-prefix", type=Path, help=argparse.SUPPRESS)
+p.add_argument("--update-src", action="store_true", help="update broker source from this clean checkout")
 args = p.parse_args()
 if args.root_prefix and os.environ.get("AGENT_CREW_OWNER_SETUP_TESTING") != "1":
     p.error("--root-prefix is reserved for isolated tests")
@@ -43,6 +45,8 @@ def read_broker_env(config):
     try:
         return config.read_text()
     except PermissionError as exc:
+        if not args.apply and not args.undo:
+            return None
         raise SystemExit(
             f"broker.env is not readable: {config}; run --dry-run as root to validate and print the plan"
         ) from exc
@@ -61,10 +65,10 @@ created_parents = []
 token_source = args.caller_tokens
 if token_source and fake and token_source.is_absolute():
     token_source = path(str(token_source))
-if token_source is None:
+if token_source is None and not (args.undo or args.update_src):
     env_file = tree / "broker.env"
     if env_file.exists():
-        for line in read_broker_env(env_file).splitlines():
+        for line in (read_broker_env(env_file) or "").splitlines():
             match = re.fullmatch(r"AGENT_CREW_CEA_CALLER_TOKENS=['\"]?([^'\"]+)['\"]?", line.strip())
             if match:
                 candidate = Path(match.group(1))
@@ -76,8 +80,102 @@ if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snaps
     snapshot_source = path(str(snapshot_source))
 source_launcher = Path(os.environ["CREW_AUTHZ_LAUNCHER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
+source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
 if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
     p.error("invalid source commit")
+
+def preinstall_selftest(tokens):
+    if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") != "1":
+        say("fake-root: skipped cross-uid pre-install self-test")
+        return
+    command = [sys.executable, str(source_root / "scripts/cea/broker_group_sandbox.py"),
+               "--source-root", str(source_root), "--caller-tokens", str(tokens)]
+    if not fake:
+        command.append("--cross-uid")
+    result = subprocess.run(command, text=True, capture_output=True, timeout=60)
+    if result.returncode:
+        raise SystemExit(f"pre-install broker self-test failed before changes: {result.stderr.strip()}")
+    evidence = json.loads(result.stdout)
+    if not evidence.get("pass") or not evidence.get("authenticated"):
+        raise SystemExit(f"pre-install broker self-test failed before changes: {evidence}")
+    say("pre-install broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
+
+if args.update_src:
+    if not args.apply and not args.undo and (tree / "broker.env").exists() and not os.access(tree / "broker.env", os.R_OK):
+        say("existing broker.env unreadable as non-root; validated at apply")
+    source = source_root / "src"
+    installed = tree / "src"
+    previous = tree / "src.old"
+    staging = tree / "src.new"
+    marker = tree / "SRC_COMMIT"
+    update_manifest = manifest_dir / "src-update.json"
+    if args.undo:
+        if not update_manifest.is_file():
+            raise SystemExit(f"no source update manifest: {update_manifest}")
+        saved = json.loads(update_manifest.read_text())
+        if installed.exists():
+            shutil.rmtree(installed)
+        if staging.exists():
+            shutil.rmtree(staging)
+        if saved["had_src"]:
+            if not previous.is_dir():
+                raise SystemExit(f"source backup missing: {previous}")
+            os.replace(previous, installed)
+        if saved["old_commit"] is None:
+            marker.unlink(missing_ok=True)
+        else:
+            marker.write_text(saved["old_commit"])
+            os.chmod(marker, 0o644)
+            if not fake:
+                run("chown", "root:root", str(marker))
+        update_manifest.unlink()
+        say("source update undo complete")
+        sys.exit(0)
+    say(f"stage clean checkout {source_root} ({source_commit}) into {staging}")
+    say(f"backup {installed} to {previous}; write {marker}; record {update_manifest}")
+    if not args.apply:
+        say("dry-run: no changes made")
+        sys.exit(0)
+    if not tree.is_dir() or tree.is_symlink() or not source.is_dir():
+        raise SystemExit("broker tree or checkout src missing")
+    if previous.exists() or staging.exists() or update_manifest.exists():
+        raise SystemExit("source update backup or manifest exists; undo first")
+    if not fake and run("git", "-C", str(source_root), "status", "--porcelain", capture=True).stdout.strip():
+        raise SystemExit(f"source checkout is dirty: {source_root}")
+    for item in source.rglob("*"):
+        if item.is_symlink():
+            raise SystemExit(f"symlink in source tree: {item}")
+    source_tokens = token_source or tree / "caller-tokens.json"
+    if (not fake or os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1") and not source_tokens.is_file():
+        raise SystemExit(f"caller tokens missing for source update self-test: {source_tokens}")
+    preinstall_selftest(source_tokens)
+    old_commit = marker.read_text() if marker.is_file() else None
+    manifest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    update_manifest.write_text(json.dumps({"had_src": installed.is_dir(),
+                                           "old_commit": old_commit, "new_commit": source_commit}, indent=2))
+    os.chmod(update_manifest, 0o600)
+    try:
+        shutil.copytree(source, staging)
+        for directory, dirs, files in os.walk(staging):
+            for name in dirs + files:
+                item = Path(directory) / name
+                os.chmod(item, stat.S_IMODE(item.stat().st_mode) & ~0o022)
+                if not fake:
+                    run("chown", "root:root", str(item))
+        if not fake:
+            run("chown", "root:root", str(staging))
+        if installed.exists():
+            os.replace(installed, previous)
+        os.replace(staging, installed)
+        marker.write_text(source_commit + "\n")
+        os.chmod(marker, 0o644)
+        if not fake:
+            run("chown", "root:root", str(marker))
+    except Exception:
+        say(f"source update failed; restore with --undo --update-src using {update_manifest}")
+        raise
+    say("source update complete")
+    sys.exit(0)
 
 targets = [tree, launcher.parent, sudoers]
 def originals():
@@ -142,6 +240,9 @@ def validate_broker_env(content):
     return values
 
 if args.undo:
+    update_manifest = manifest_dir / "src-update.json"
+    if update_manifest.exists():
+        raise SystemExit(f"source update is outstanding; run --undo --update-src first: {update_manifest}")
     if not manifest_file.is_file():
         raise SystemExit(f"no apply manifest: {manifest_file}")
     manifest = json.loads(manifest_file.read_text())
@@ -175,14 +276,15 @@ if config.is_symlink():
     raise SystemExit(f"refusing symlink: {config}")
 existing_content = read_broker_env(config)
 try:
-    parse_broker_env(existing_content)
+    if existing_content is not None:
+        parse_broker_env(existing_content)
     overrides = {"AGENT_CREW_AUTHZ_CLIENT_GROUP": "crew-authz-clients",
                  "AGENT_CREW_CEA_BROKER_DB": "/home/truhojun/.agent_crew/alfred/tasks.db",
                  "AGENT_CREW_CEA_CALLER_TOKENS": "/opt/agent_crew-authz/caller-tokens.json",
                  "AGENT_CREW_CEA_MODE": "enforce",
                  "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS",
                  "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE": "/opt/agent_crew-authz/snapshot.pub"}
-    retained = [line for line in existing_content.splitlines()
+    retained = [line for line in (existing_content or "").splitlines()
                 if line.split("=", 1)[0] not in
                 (set(overrides) | {"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"})]
     final_content = "\n".join(retained + [f"{key}={shlex.quote(value)}"
@@ -190,7 +292,10 @@ try:
     validate_broker_env(final_content)
 except ValueError as exc:
     raise SystemExit(str(exc)) from exc
-say("broker.env validation passed (bash -n and clean-env source round-trip)")
+if existing_content is not None:
+    say("broker.env validation passed (bash -n and clean-env source round-trip)")
+else:
+    say("existing broker.env unreadable as non-root; validated at apply")
 plan = [
     "create dedicated crew-authz-clients group; add truhojun and crew-authz if absent",
     f"install acl if missing; save ACLs, grant crew-authz x on {crew_dir}, rwx on {alfred_dir}, rw on {db}",
@@ -247,6 +352,7 @@ try:
         raise ValueError("expected an Ed25519 public key")
 except (ImportError, ValueError) as exc:
     raise SystemExit(f"invalid Ed25519 public key {snapshot_source}: {exc}") from exc
+preinstall_selftest(token_source)
 for base in (manifest_dir, launcher.parent, tree, sudoers.parent):
     missing = []
     current = base

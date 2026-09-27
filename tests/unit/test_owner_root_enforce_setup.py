@@ -67,10 +67,10 @@ def test_dry_run_reports_unreadable_existing_broker_env(tmp_path, extra_args):
     config = tree / "broker.env"
     config.chmod(0o000)
     result = _run(tmp_path, "--dry-run", *extra_args)
-    assert result.returncode != 0
-    assert "broker.env is not readable" in result.stderr
-    assert "run --dry-run as root" in result.stderr
-    assert "Traceback" not in result.stderr
+    assert result.returncode == 0, result.stderr
+    assert "existing broker.env unreadable as non-root; validated at apply" in result.stdout
+    assert "PLAN $" in result.stdout
+    assert "dry-run: no changes made" in result.stdout
     assert not (tmp_path / "var/lib/crew-authz").exists()
 
 
@@ -176,6 +176,117 @@ def test_incomplete_apply_requires_undo_before_retry(tmp_path):
     undo = _run(tmp_path, "--undo")
     assert undo.returncode == 0, undo.stderr
     assert not manifest_path.exists()
+
+
+def test_update_src_dry_run_apply_and_undo(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    installed = tree / "src"
+    installed.mkdir()
+    (installed / "old.py").write_text("original")
+    dry = _run(tmp_path, "--update-src")
+    assert dry.returncode == 0, dry.stderr
+    assert "dry-run: no changes made" in dry.stdout
+    assert (installed / "old.py").read_text() == "original"
+    assert not (tree / "src.old").exists()
+    applied = _run(tmp_path, "--apply", "--update-src")
+    assert applied.returncode == 0, applied.stderr
+    assert (tree / "src.old" / "old.py").read_text() == "original"
+    assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
+    assert (tree / "SRC_COMMIT").read_text().strip() == subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=SCRIPT.parent.parent.parent, text=True).strip()
+    assert (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").is_file()
+    repeat = _run(tmp_path, "--apply", "--update-src")
+    assert repeat.returncode != 0 and "undo first" in repeat.stderr
+    undo = _run(tmp_path, "--undo", "--update-src")
+    assert undo.returncode == 0, undo.stderr
+    assert (installed / "old.py").read_text() == "original"
+    assert (tree / "SRC_COMMIT").read_text() == "old-build\n"
+    assert not (tree / "src.old").exists()
+    assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
+
+
+def test_unreadable_broker_env_previews_print_plans(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    env_file = tree / "broker.env"
+    env_file.chmod(0)
+    dry = _run(tmp_path)
+    assert dry.returncode == 0, dry.stderr
+    assert "existing broker.env unreadable as non-root; validated at apply" in dry.stdout
+    assert "PLAN $" in dry.stdout
+    source_preview = _run(tmp_path, "--update-src")
+    assert source_preview.returncode == 0, source_preview.stderr
+    assert "existing broker.env unreadable as non-root; validated at apply" in source_preview.stdout
+    assert "dry-run: no changes made" in source_preview.stdout
+
+
+def test_main_undo_refuses_outstanding_source_update(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    applied = _run(tmp_path, "--apply", "--caller-tokens",
+                   "/home/truhojun/.verify-private/tokens.json")
+    assert applied.returncode == 0, applied.stderr
+    updated = _run(tmp_path, "--apply", "--update-src")
+    assert updated.returncode == 0, updated.stderr
+    source_manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
+    assert source_manifest.is_file()
+    blocked = _run(tmp_path, "--undo")
+    assert blocked.returncode != 0
+    assert "undo --update-src first" in blocked.stderr
+    assert source_manifest.is_file()
+    assert (tree / "src" / "agent_crew" / "cea" / "broker.py").is_file()
+    source_undo = _run(tmp_path, "--undo", "--update-src")
+    assert source_undo.returncode == 0, source_undo.stderr
+    main_undo = _run(tmp_path, "--undo")
+    assert main_undo.returncode == 0, main_undo.stderr
+
+
+def test_preinstall_selftest_failure_changes_no_fake_root_files(tmp_path):
+    tree, token, _ = _seed(tmp_path)
+    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--apply", "--caller-tokens",
+         "/home/truhojun/.verify-private/tokens.json", "--root-prefix", str(tmp_path)],
+        text=True, capture_output=True,
+        env={**os.environ, "AGENT_CREW_OWNER_SETUP_TESTING": "1",
+             "AGENT_CREW_OWNER_SETUP_SELFTEST": "1"},
+    )
+    assert result.returncode != 0
+    assert "pre-install broker self-test failed before changes" in result.stderr
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")) == before
+    assert not (tree / "caller-tokens.json").exists()
+
+
+def test_group_sandbox_authenticated_authorize(tmp_path):
+    _, token, _ = _seed(tmp_path)
+    token.write_text(json.dumps({"adapters": {"sandbox-token": {
+        "principal": "cron:sandbox", "provenance": "cron"}}}))
+    script = SCRIPT.with_name("broker_group_sandbox.py")
+    result = subprocess.run(["python3", str(script), "--caller-tokens", str(token)],
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout)
+    assert evidence["pass"] and evidence["authenticated"]
+    assert evidence["socket_mode"] == "0660"
+    assert evidence["peer_uid"] == os.geteuid()
+
+
+def test_fake_apply_and_source_update_run_preinstall_proof(tmp_path):
+    tree, token, _ = _seed(tmp_path)
+    token.write_text(json.dumps({"adapters": {"sandbox-token": {
+        "principal": "cron:sandbox", "provenance": "cron"}}}))
+    env = {**os.environ, "AGENT_CREW_OWNER_SETUP_TESTING": "1",
+           "AGENT_CREW_OWNER_SETUP_SELFTEST": "1"}
+    apply = subprocess.run(
+        ["bash", str(SCRIPT), "--apply", "--caller-tokens",
+         "/home/truhojun/.verify-private/tokens.json", "--root-prefix", str(tmp_path)],
+        text=True, capture_output=True, env=env, timeout=60)
+    assert apply.returncode == 0, apply.stderr
+    assert '"authenticated": true' in apply.stdout
+    update = subprocess.run(
+        ["bash", str(SCRIPT), "--apply", "--update-src", "--root-prefix", str(tmp_path)],
+        text=True, capture_output=True, env=env, timeout=60)
+    assert update.returncode == 0, update.stderr
+    assert '"authenticated": true' in update.stdout
+    assert (tree / "src" / "agent_crew" / "cea" / "broker.py").is_file()
 
 
 def test_broker_env_quoted_values_round_trip(tmp_path):

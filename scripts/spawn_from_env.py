@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import re
+import grp
+import os
+import shlex
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +26,7 @@ def parse_env(raw: bytes) -> dict[str, str]:
     return env
 
 
-def spawn(env_file: Path, cea_file: Path, log: Path, port: int, source: Path) -> int:
+def launch_env(env_file: Path, cea_file: Path, source: Path) -> dict[str, str]:
     try:
         from .runtime_swap import parse_env_file
     except ImportError:  # executed as a file by runtime_swap.py
@@ -39,17 +43,47 @@ def spawn(env_file: Path, cea_file: Path, log: Path, port: int, source: Path) ->
              and not (Path(entry) / "agent_crew").is_dir()]
     env["PYTHONPATH"] = ":".join([str(source), *other])
     env.update(parse_env_file(cea_file))
+    return env
+
+
+def client_command(env: dict[str, str], command: list[str]) -> list[str]:
+    """Start with the socket's client group, even when this login predates usermod."""
+    sock = env.get("AGENT_CREW_CEA_BROKER_SOCKET")
+    if not sock:
+        return command
+    group = grp.getgrgid(os.stat(Path(sock).parent).st_gid).gr_name
+    return ["sg", group, "-c", shlex.join(command)]
+
+
+def probe_broker(env_file: Path, cea_file: Path, source: Path) -> None:
+    env = launch_env(env_file, cea_file, source)
+    sock = env.get("AGENT_CREW_CEA_BROKER_SOCKET")
+    if not sock:
+        return
+    code = "import socket,sys; s=socket.socket(socket.AF_UNIX); s.settimeout(5); s.connect(sys.argv[1]); s.close()"
+    probe = subprocess.run(client_command(env, [sys.executable, "-c", code, sock]),
+                           env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=10)
+    if probe.returncode:
+        raise RuntimeError(f"new server cannot connect to broker socket {sock}: {probe.stderr.strip()}")
+
+
+def spawn(env_file: Path, cea_file: Path, log: Path, port: int, source: Path) -> int:
+    env = launch_env(env_file, cea_file, source)
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("ab") as output:
         process = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "agent_crew.server:app", "--host", "127.0.0.1",
-             "--port", str(port), "--log-level", "info"], env=env,
+            client_command(env, [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
+                                 "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"]), env=env,
             stdin=subprocess.DEVNULL, stdout=output, stderr=output, start_new_session=True)
     return process.pid
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 6:
-        raise SystemExit("usage: spawn_from_env.py ENV_NUL CEA_ENV LOG PORT NEW_SRC")
-    print(spawn(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]),
-                int(sys.argv[4]), Path(sys.argv[5])))
+    if len(sys.argv) == 5 and sys.argv[1] == "--probe-broker":
+        probe_broker(Path(sys.argv[2]), Path(sys.argv[3]), Path(sys.argv[4]))
+    elif len(sys.argv) == 6:
+        print(spawn(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]),
+                    int(sys.argv[4]), Path(sys.argv[5])))
+    else:
+        raise SystemExit("usage: spawn_from_env.py [--probe-broker ENV_NUL CEA_ENV NEW_SRC | ENV_NUL CEA_ENV LOG PORT NEW_SRC]")
