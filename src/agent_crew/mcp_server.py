@@ -48,7 +48,8 @@ from agent_crew.protocol import (
 )
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
-    AdmissionRefused, LateResultRejected, PausedError as _PausedError, TaskQueue,
+    AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
+    LateResultRejected, PausedError as _PausedError, TaskQueue,
 )
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
@@ -166,7 +167,7 @@ def build_mcp_server(
         status: str = "completed",
         summary: str = "",
         verdict: Optional[str] = None,
-        findings: Optional[list[str]] = None,
+        findings: Optional[list[Union[str, dict]]] = None,
         # `int | str` for the same reason as the HTTP body: agents write PR
         # numbers as `#268`, and a transport that 422s on the spelling throws
         # the whole result away (review of PR #270).
@@ -254,7 +255,8 @@ def build_mcp_server(
         _nonce, _presenter = result.take_executor_binding()
         try:
             task_type = queue.submit_result(task_id, result, nonce=_nonce,
-                                            presenter=_presenter)
+                                            presenter=_presenter,
+                                            validate_review=True)
             capture_result_best_effort(queue.db_path, task_id, result)
         except AdmissionRefused as exc:
             # Both transports or neither: HTTP answers 409 for a refused P2
@@ -268,6 +270,13 @@ def build_mcp_server(
             # lock); only the evidence event was committed, so no cascade.
             return {"acknowledged": False, "late_result": True, "accepted": False,
                     "task_id": task_id, "prior_status": exc.status, "error": str(exc)}
+        except CompletedReviewRejected as exc:
+            return {"acknowledged": False, "accepted": False, "error": str(exc)}
+        except DuplicateReviewResult:
+            return {"acknowledged": True, "task_id": task_id, "task_type": "review",
+                    "duplicate": True}
+        except InvalidReviewResult as exc:
+            return {"acknowledged": False, "error": str(exc)}
         except ValueError as e:
             return {"acknowledged": False, "error": str(e)}
         # #348: mirror HTTP's post-commit, fail-soft persistence. This is

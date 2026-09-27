@@ -64,7 +64,9 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import (AdmissionRefused, DuplicateReviewError, LateResultRejected, TaskAlreadyExistsError,
+from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError,
+                              DuplicateReviewResult, InvalidReviewResult, LateResultRejected,
+                              TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -6188,7 +6190,9 @@ def create_app(
         _nonce, _presenter = result.take_executor_binding()
         try:
             task_type = q().submit_result(task_id, result, nonce=_nonce,
-                                          presenter=_presenter)
+                                          presenter=_presenter,
+                                          allow_review_replay=_REPLAYING.get(),
+                                          validate_review=not _REPLAYING.get())
             capture_result_best_effort(db_path, task_id, result)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
@@ -6248,6 +6252,12 @@ def create_app(
                 "task_id": task_id, "prior_status": exc.status,
                 "reason": str(exc),
             })
+        except CompletedReviewRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except DuplicateReviewResult:
+            return {"status": "ok", "duplicate": True}
+        except InvalidReviewResult as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")

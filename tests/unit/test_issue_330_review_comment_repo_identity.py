@@ -55,7 +55,7 @@ def _result_payload(task_id, pr_number, verdict="approve", findings=None):
     return {
         "task_id": task_id,
         "status": "completed",
-        "summary": "looks good",
+        "summary": "Reviewed the PR changes and approved the implementation",
         "verdict": verdict,
         "findings": findings if findings is not None else [],
         "pr_number": pr_number,
@@ -175,7 +175,7 @@ def test_coordinator_managed_cascade_suppression_unchanged(tmp_db, tmp_path, mon
 
     _submit(
         _app(tmp_db, state_path), "review-330-coordinator", 335,
-        context={"coordinator_managed": True}, verdict="request_changes", findings=["fix this"],
+        context={"coordinator_managed": True}, verdict="request_changes", findings=["Fix the reported code path"],
     )
 
     assert not [task for task in TaskQueue(tmp_db).list_tasks() if task.task_type == "implement"]

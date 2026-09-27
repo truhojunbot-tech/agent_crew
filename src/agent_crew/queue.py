@@ -33,6 +33,7 @@ from agent_crew.context_identity import CONTEXT_SCHEMA_VERSION
 from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY, normalize_pr_number as _normalize_pr_number,
+    validate_review_result,
 )
 from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_telemetry_adapter
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
@@ -86,6 +87,21 @@ class LateResultRejected(RuntimeError):
     def __init__(self, status: str):
         self.status = status
         super().__init__(f"LATE_RESULT_REJECTED: task already {status}")
+
+
+class CompletedReviewRejected(RuntimeError):
+    """A published review verdict cannot be replaced after its cascade ran."""
+
+    def __init__(self):
+        super().__init__("review already completed; submit a new review task instead")
+
+
+class DuplicateReviewResult(RuntimeError):
+    """An identical completed review was already stored and cascaded."""
+
+
+class InvalidReviewResult(ValueError):
+    """A worker's review is incomplete and must stay active."""
 
 
 ResultBeforeCommit = Callable[[sqlite3.Connection, object, float], None]
@@ -3709,7 +3725,9 @@ class TaskQueue:
                       before_commit: Optional[ResultBeforeCommit] = None,
                       consume_receipt: bool = True,
                       expected_status: Optional[str] = None,
-                      dispatcher_failed: bool = False) -> str:
+                      dispatcher_failed: bool = False,
+                      allow_review_replay: bool = False,
+                      validate_review: bool = False) -> str:
         """Submit a task result. Returns the task_type of the completed task
         (so push-model callers can decide what to push next).
 
@@ -3756,6 +3774,16 @@ class TaskQueue:
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             prior_status = row["status"]
+            if (row["task_type"] == "review" and prior_status == "completed"
+                    and not allow_review_replay):
+                stored = conn.execute(
+                    "SELECT result_json FROM cascade_outbox WHERE parent_task_id=?",
+                    (task_id,)).fetchone()
+                if stored is not None and json.loads(stored["result_json"]) == json.loads(_result_to_json(result)):
+                    conn.execute("ROLLBACK")
+                    raise DuplicateReviewResult()
+                conn.execute("ROLLBACK")
+                raise CompletedReviewRejected()
             system_failed = False
             if prior_status == "failed":
                 # The execution history is best-effort instrumentation; its
@@ -3803,6 +3831,11 @@ class TaskQueue:
                 )
                 conn.execute("COMMIT")
                 raise LateResultRejected(prior_status)
+            if row["task_type"] == "review" and validate_review:
+                review_error = validate_review_result(result)
+                if review_error:
+                    conn.execute("ROLLBACK")
+                    raise InvalidReviewResult(review_error)
             if expected_status is not None and row["status"] != expected_status:
                 conn.execute("ROLLBACK")
                 raise RuntimeError(

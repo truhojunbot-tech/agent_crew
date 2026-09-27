@@ -29,7 +29,7 @@ def test_system_terminal_result_is_evidence_only(tmp_db, ended):
     with TestClient(app) as client:
         response = client.post("/tasks/review-late/result", json={
             "task_id": "review-late", "status": "completed", "summary": "late review",
-            "verdict": "request_changes", "findings": ["fix this"],
+            "verdict": "request_changes", "findings": ["Fix the missing validation"],
             "commit": "a" * 40,
         })
     assert response.status_code == 409
@@ -134,7 +134,7 @@ def test_reported_failure_with_final_metadata_can_be_revised(tmp_db):
         })
         assert reported.status_code == 200
         response = client.post("/tasks/review-revised/result", json={
-            "task_id": "review-revised", "status": "completed", "summary": "revised",
+            "task_id": "review-revised", "status": "completed", "summary": "Reviewed the revised work and approved the changes.",
             "verdict": "approve", "findings": [],
         })
     assert response.status_code == 200
@@ -206,12 +206,12 @@ def test_in_progress_result_still_completes(tmp_db):
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
         response = client.post("/tasks/review-live/result", json={
-            "task_id": "review-live", "status": "completed", "summary": "done",
-            "verdict": "request_changes", "findings": ["fix this"],
+            "task_id": "review-live", "status": "completed", "summary": "Reviewed the live work and approved the changes.",
+            "verdict": "request_changes", "findings": ["Fix the missing validation"],
         })
     assert response.status_code == 200
     task = next(t for t in q.list_tasks() if t.task_id == "review-live")
     assert (task.status, task.verdict, task.summary) == (
-        "completed", "request_changes", "done")
+        "completed", "request_changes", "Reviewed the live work and approved the changes.")
     assert not [e for e in q.get_exec_state("review-live")["events"]
                 if e["event"] == "late_result"]

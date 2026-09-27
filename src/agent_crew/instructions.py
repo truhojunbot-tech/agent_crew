@@ -187,7 +187,7 @@ time a result is skipped — there is no fallback.
 | `branch` | string | code tasks | The pushed branch; report it as a field, not only in prose. |
 | `commit` | string | code tasks | Full pushed commit SHA; report it as a field, not only in prose. |
 | `verdict` | enum\\|null | reviewers only | `approve` \\| `request_changes` \\| `null` |
-| `findings` | string[] | reviewers only | Actionable issues. Empty array for non-reviewers. |
+| `findings` | string[] or finding objects[] | reviewers only | Actionable issues. Objects require severity, file, line, title, detail. Empty array for non-reviewers. |
 | `pr_number` | int\\|null | if opened | GitHub PR number, otherwise `null`. |
 
 ### Canonical POST template
@@ -523,6 +523,12 @@ you set `verdict: "approve"`:
 
 Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
 `findings`.
+Each finding may be a descriptive string (at least 10 characters), or an object
+with `severity`, `file`, `line`, `title`, and `detail`; objects are stored as
+`SEVERITY file:line - title: detail`. A final review summary must be at least
+40 characters. Short diagnostic payloads are rejected and leave the task active.
+After a review completes, further results for that task receive a conflict;
+start a new review task to revise the verdict.
 
 ### ⛔ Review the commit you were given — do not re-fetch
 

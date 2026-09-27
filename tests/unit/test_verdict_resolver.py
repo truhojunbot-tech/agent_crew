@@ -45,7 +45,9 @@ class TestResolveVerdict:
         assert _resolve_verdict(_result(verdict="", findings=[])) == "approve"
 
     def test_empty_string_verdict_with_findings_is_request_changes(self):
-        result = _result(verdict="", findings=[{"severity": "high", "msg": "x"}])
+        result = _result(verdict="", findings=[{"severity": "high", "file": "loop.py",
+                                                "line": 1, "title": "Bug",
+                                                "detail": "The result needs changes"}])
         assert _resolve_verdict(result) == "request_changes"
 
     def test_unknown_verdict_with_findings_is_request_changes(self):

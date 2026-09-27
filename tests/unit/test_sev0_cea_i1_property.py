@@ -457,7 +457,7 @@ def _drive_r3(kind, db, live, monkeypatch):
                                        role="reviewer", agent="codex")
             c.post("/tasks/rev-s/result", json={
                 "task_id": "rev-s", "status": "completed", "verdict": "approve",
-                "summary": "lgtm", "pr_number": 42,
+                "summary": "Reviewed the current PR head and approved the changes", "pr_number": 42,
                 "executor_binding": {"nonce": nonce, "presenter": "codex"}})
     else:
         raise AssertionError(f"no driver for {kind}")
