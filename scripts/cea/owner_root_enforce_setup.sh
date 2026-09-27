@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -36,6 +37,15 @@ def run(*cmd, capture=False):
     return subprocess.run(cmd, check=True, text=True, capture_output=capture)
 def say(message):
     print(message, flush=True)
+def read_broker_env(config):
+    if not config.exists():
+        return ""
+    try:
+        return config.read_text()
+    except PermissionError as exc:
+        raise SystemExit(
+            f"broker.env is not readable: {config}; run --dry-run as root to validate and print the plan"
+        ) from exc
 
 tree = path("/opt/agent_crew-authz")
 launcher = path("/usr/local/libexec/crew-authz/broker-launch.sh")
@@ -54,7 +64,7 @@ if token_source and fake and token_source.is_absolute():
 if token_source is None:
     env_file = tree / "broker.env"
     if env_file.exists():
-        for line in env_file.read_text().splitlines():
+        for line in read_broker_env(env_file).splitlines():
             match = re.fullmatch(r"AGENT_CREW_CEA_CALLER_TOKENS=['\"]?([^'\"]+)['\"]?", line.strip())
             if match:
                 candidate = Path(match.group(1))
@@ -81,6 +91,55 @@ def check_safe():
         raise RuntimeError(f"missing tasks DB: {db}")
     if not source_launcher.is_file():
         raise RuntimeError(f"missing launcher source: {source_launcher}")
+
+def parse_broker_env(content):
+    values = {}
+    for number, line in enumerate(content.splitlines(), 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = re.fullmatch(r"([A-Z_][A-Z0-9_]*)=(.*)", line)
+        if not match:
+            raise ValueError(f"broker.env line {number}: expected KEY=VALUE")
+        key, encoded = match.groups()
+        if key.endswith("_CMD"):
+            raise ValueError(f"broker.env line {number}: {key} is forbidden")
+        if key.startswith("LD_") or key in {"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PATH", "IFS"}:
+            raise ValueError(f"broker.env line {number}: shell control variable {key} is forbidden")
+        if key in values:
+            raise ValueError(f"broker.env line {number}: duplicate {key}")
+        try:
+            decoded = shlex.split(encoded)
+        except ValueError as exc:
+            raise ValueError(f"broker.env line {number}: invalid quoting: {exc}") from exc
+        if encoded == "":
+            value = ""
+        elif len(decoded) == 1 and (re.fullmatch(r"'[^']*'", encoded)
+                                         or shlex.quote(decoded[0]) == encoded):
+            value = decoded[0]
+        else:
+            raise ValueError(f"broker.env line {number}: value must be shell-safe or single-quoted")
+        values[key] = value
+    return values
+
+def sourced_env(content):
+    command = ["env", "-i", "bash", "--noprofile", "--norc", "-c",
+               'set -a; source /dev/stdin; /usr/bin/env -0']
+    result = subprocess.run(command, input=content, text=True, capture_output=True)
+    if result.returncode:
+        raise ValueError(f"broker.env source failed: {result.stderr.strip()}")
+    return dict(part.decode().split("=", 1) for part in result.stdout.encode().split(b"\0") if part)
+
+def validate_broker_env(content):
+    values = parse_broker_env(content)
+    syntax = subprocess.run(["bash", "-n"], input=content, text=True, capture_output=True)
+    if syntax.returncode:
+        raise ValueError(f"broker.env bash -n failed: {syntax.stderr.strip()}")
+    baseline = sourced_env("")
+    if set(values) & set(baseline):
+        raise ValueError("broker.env overrides a baseline shell variable")
+    if sourced_env(content) != {**baseline, **values}:
+        raise ValueError("broker.env source round-trip differs from intended keys or values")
+    return values
 
 if args.undo:
     if not manifest_file.is_file():
@@ -111,6 +170,27 @@ if args.undo:
     sys.exit(0)
 
 check_safe()
+config = tree / "broker.env"
+if config.is_symlink():
+    raise SystemExit(f"refusing symlink: {config}")
+existing_content = read_broker_env(config)
+try:
+    parse_broker_env(existing_content)
+    overrides = {"AGENT_CREW_AUTHZ_CLIENT_GROUP": "crew-authz-clients",
+                 "AGENT_CREW_CEA_BROKER_DB": "/home/truhojun/.agent_crew/alfred/tasks.db",
+                 "AGENT_CREW_CEA_CALLER_TOKENS": "/opt/agent_crew-authz/caller-tokens.json",
+                 "AGENT_CREW_CEA_MODE": "enforce",
+                 "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS",
+                 "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE": "/opt/agent_crew-authz/snapshot.pub"}
+    retained = [line for line in existing_content.splitlines()
+                if line.split("=", 1)[0] not in
+                (set(overrides) | {"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"})]
+    final_content = "\n".join(retained + [f"{key}={shlex.quote(value)}"
+                                             for key, value in overrides.items()]) + "\n"
+    validate_broker_env(final_content)
+except ValueError as exc:
+    raise SystemExit(str(exc)) from exc
+say("broker.env validation passed (bash -n and clean-env source round-trip)")
 plan = [
     "create dedicated crew-authz-clients group; add truhojun and crew-authz if absent",
     f"install acl if missing; save ACLs, grant crew-authz x on {crew_dir}, rwx on {alfred_dir}, rw on {db}",
@@ -227,18 +307,7 @@ try:
     (tree / "snapshot.key").unlink(missing_ok=True)
     shutil.copyfile(snapshot_source, tree / "snapshot.pub")
     os.chmod(tree / "snapshot.pub", 0o644)
-    config = tree / "broker.env"
-    lines = config.read_text().splitlines() if config.exists() else []
-    overrides = {"AGENT_CREW_AUTHZ_CLIENT_GROUP": "crew-authz-clients",
-                 "AGENT_CREW_CEA_BROKER_DB": "/home/truhojun/.agent_crew/alfred/tasks.db",
-                 "AGENT_CREW_CEA_CALLER_TOKENS": "/opt/agent_crew-authz/caller-tokens.json",
-                 "AGENT_CREW_CEA_MODE": "enforce",
-                 "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS",
-                 "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE": "/opt/agent_crew-authz/snapshot.pub"}
-    lines = [line for line in lines if line.split("=", 1)[0] not in
-             (set(overrides) | {"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"})]
-    lines += [f"{key}={value}" for key, value in overrides.items()]
-    config.write_text("\n".join(lines) + "\n")
+    config.write_text(final_content)
     os.chmod(config, 0o640)
     (tree / "SRC_COMMIT").write_text(source_commit + "\n")
     for directory, dirs, files in os.walk(tree):

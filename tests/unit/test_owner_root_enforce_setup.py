@@ -2,7 +2,9 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -56,6 +58,19 @@ def test_dry_run_changes_nothing_and_does_not_show_secrets(tmp_path):
     assert "private" not in result.stdout
     assert (tree / "SRC_COMMIT").read_bytes() == before
     assert sudoers.read_text() == "old sudoers\n"
+    assert not (tmp_path / "var/lib/crew-authz").exists()
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--caller-tokens", "/home/truhojun/.verify-private/tokens.json")])
+def test_dry_run_reports_unreadable_existing_broker_env(tmp_path, extra_args):
+    tree, _, _ = _seed(tmp_path)
+    config = tree / "broker.env"
+    config.chmod(0o000)
+    result = _run(tmp_path, "--dry-run", *extra_args)
+    assert result.returncode != 0
+    assert "broker.env is not readable" in result.stderr
+    assert "run --dry-run as root" in result.stderr
+    assert "Traceback" not in result.stderr
     assert not (tmp_path / "var/lib/crew-authz").exists()
 
 
@@ -161,3 +176,47 @@ def test_incomplete_apply_requires_undo_before_retry(tmp_path):
     undo = _run(tmp_path, "--undo")
     assert undo.returncode == 0, undo.stderr
     assert not manifest_path.exists()
+
+
+def test_broker_env_quoted_values_round_trip(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    owner_note = "owner's two words"
+    (tree / "broker.env").write_text(
+        "AGENT_CREW_CEA_CREDIT_CLASS='{" + '"gemini":"plan"' + "}'\n"
+        "AGENT_CREW_CEA_NOTE='two words'\n"
+        f"AGENT_CREW_CEA_OWNER_NOTE={shlex.quote(owner_note)}\n"
+    )
+    dry = _run(tmp_path)
+    assert dry.returncode == 0, dry.stderr
+    assert "broker.env validation passed" in dry.stdout
+    applied = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    assert applied.returncode == 0, applied.stderr
+    config = (tree / "broker.env").read_text()
+    assert "AGENT_CREW_CEA_CREDIT_CLASS='{" + '"gemini":"plan"' + "}'" in config
+    assert "AGENT_CREW_CEA_NOTE='two words'" in config
+    assert f"AGENT_CREW_CEA_OWNER_NOTE={shlex.quote(owner_note)}" in config
+
+
+@pytest.mark.parametrize("line", [
+    "AGENT_CREW_CEA_NOTE=two words",
+    "AGENT_CREW_CEA_MEMORY_CMD=python3 /tmp/admission_inputs.py",
+    'AGENT_CREW_CEA_CREDIT_CLASS={"gemini":"plan"}',
+    "AGENT_CREW_CEA_MEMORY_CMD='python3 /tmp/admission_inputs.py'",
+    "AGENT_CREW_CEA_NOTE=$(touch {fake_root}/sentinel)",
+    "export AGENT_CREW_CEA_MODE=enforce",
+])
+def test_invalid_existing_broker_env_refused_before_apply(tmp_path, line):
+    tree, _, _ = _seed(tmp_path)
+    config = tree / "broker.env"
+    line = line.replace("{fake_root}", str(tmp_path))
+    config.write_text(line + "\n")
+    dry = _run(tmp_path)
+    assert dry.returncode != 0
+    assert "broker.env" in dry.stderr
+    assert config.read_text() == line + "\n"
+    applied = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    assert applied.returncode != 0
+    assert "broker.env" in applied.stderr
+    assert config.read_text() == line + "\n"
+    assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce").exists()
+    assert not (tmp_path / "sentinel").exists()
