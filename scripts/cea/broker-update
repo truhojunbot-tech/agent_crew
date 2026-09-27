@@ -22,7 +22,7 @@ STATE = Path("/var/lib/crew-authz")
 REMOTE = "https://github.com/truhojunbot-tech/agent_crew.git"
 SNAPSHOT = Path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
-SAFE_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
+SAFE_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "HOME": "/nonexistent",
             "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
 
@@ -190,13 +190,13 @@ def run_update(sha: str, *, root=ROOT, state=STATE, snapshot=SNAPSHOT,
                      "--snapshot-pubkey", str(root / "snapshot.pub"), "--snapshot-path", str(snapshot)]
         result = subprocess.run(rehearsal, env=SAFE_ENV, text=True, capture_output=True)
         if result.returncode:
-            raise Refused(f"owner rehearsal failed: {result.stderr[-500:] or result.stdout[-500:]}")
+            raise Refused(f"owner rehearsal failed: {result.stderr[-4000:] or result.stdout[-500:]}")
         if not rehearse:
             result = subprocess.run(["bash", str(setup), "--apply", "--update-src",
                 "--caller-tokens", str(tokens), "--snapshot-pubkey", str(root / "snapshot.pub"),
                 "--snapshot-path", str(snapshot)], env=SAFE_ENV, text=True, capture_output=True)
             if result.returncode:
-                raise Refused(f"owner source update failed: {result.stderr[-500:] or result.stdout[-500:]}")
+                raise Refused(f"owner source update failed: {result.stderr[-4000:] or result.stdout[-500:]}")
     return {"sha": sha, "pr": decision["pr_number"], "reviewed_head": reviewed_head,
             "t0_decision_id": decision["decision_id"], "snapshot_generation": ref.generation,
             "snapshot_hash": ref.hash, "result": "rehearsed" if rehearse else "updated"}

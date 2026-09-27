@@ -116,6 +116,7 @@ def test_bad_sha_and_caller_env_not_used(monkeypatch, tmp_path):
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/tmp/attacker-config")
     assert "PYTHONPATH" not in update.SAFE_ENV
     assert update.SAFE_ENV["GIT_CONFIG_GLOBAL"] == "/dev/null"
+    assert "/usr/sbin" in update.SAFE_ENV["PATH"].split(":")  # owner apply runs visudo
     assert update.REMOTE.startswith("https://github.com/truhojunbot-tech/")
 
 
@@ -204,12 +205,26 @@ def test_fake_root_full_gate_and_successful_rehearsal(monkeypatch, tmp_path):
                     reason="set RUN_BROKER_UPDATER_REHEARSAL=1 for real fetch and pinned venv")
 def test_real_nonroot_updater_rehearsal(tmp_path):
     assert os.geteuid() != 0
-    merged, _, reviewed = _git("rev-list", "--parents", "-n", "1", "origin/main").split()
-    root, snapshot, *_ = _fixture(tmp_path, sha=merged, reviewed_head=reviewed)
+    # Make a local reviewed merge from this checkout. origin/main may predate
+    # the updater and its pinned-venv rehearsal fixes while the PR is open.
+    source = tmp_path / "reviewed-repo"
+    _git("clone", "--no-hardlinks", str(SCRIPT.parents[2]), str(source))
+    reviewed = _git("rev-parse", "HEAD", cwd=source)
+    _git("checkout", "-b", "main", "origin/main", cwd=source)
+    _git("-c", "user.name=Updater Test", "-c", "user.email=updater@test.invalid",
+         "merge", "--no-ff", reviewed, "-m", "reviewed merge", cwd=source)
+    merged = _git("rev-parse", "HEAD", cwd=source)
+    root, snapshot, key, *_ = _fixture(tmp_path, sha=merged, reviewed_head=reviewed)
+    (root / "snapshot.pub").write_bytes(key.public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
     shutil.copytree(SCRIPT.parents[2] / "src", root / "src", dirs_exist_ok=True)
+    (root / "src").chmod(0o755)
     tokens = Path("/home/truhojun/.agent_crew/alfred-cea/caller-tokens.json")
     shutil.copyfile(tokens, root / "caller-tokens.json")
     (root / "caller-tokens.json").chmod(0o400)
-    details = update.run_update(merged, root=root, state=tmp_path / "private",
-                                snapshot=snapshot, rehearse=True)
+    completed = subprocess.run(["python3", str(SCRIPT), "--rehearse", merged],
+        env={**os.environ, "AGENT_CREW_BROKER_UPDATE_REHEARSE_ROOT": str(tmp_path),
+             "AGENT_CREW_BROKER_UPDATE_REHEARSE_REMOTE": str(source)},
+        check=True, capture_output=True, text=True)
+    details = json.loads(completed.stdout)
     assert details["result"] == "rehearsed"
