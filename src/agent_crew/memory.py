@@ -74,6 +74,12 @@ class MemoryResult:
     items: tuple[MemoryItem, ...] = ()
     latency_ms: float = 0.0
     error_type: str = ""
+    dropped_cross_project: int = 0
+
+
+def same_memory_project(request_project: str, item_project: str) -> bool:
+    """A memory record crosses this boundary only for its exact project."""
+    return bool(request_project) and item_project == request_project
 
 
 class MemoryProvider(Protocol):
@@ -132,8 +138,8 @@ class FakeMemoryProvider:
 def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryResult:
     """Fail-soft wrapper used solely for telemetry at the dispatch seam.
 
-    It permits project-local and fleet-scope items; the storage adapter enforces
-    the full hierarchy before items cross this boundary.
+    Only exact project matches cross this boundary, including for fleet-scoped
+    storage records returned by a provider.
     """
     started = perf_counter()
     name = getattr(provider, "name", provider.__class__.__name__)
@@ -141,7 +147,7 @@ def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryR
     try:
         result = provider.retrieve(request)
         scoped = tuple(item for item in result.items
-                       if request.project and item.project in ("", request.project))
+                       if same_memory_project(request.project, item.project))
         state = result.state
         if state == "results" and not scoped:
             state = "empty"
@@ -152,6 +158,8 @@ def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryR
             items=scoped,
             latency_ms=(perf_counter() - started) * 1000,
             error_type=result.error_type,
+            dropped_cross_project=(result.dropped_cross_project
+                                   + len(result.items) - len(scoped)),
         )
     except TimeoutError as exc:
         return MemoryResult(
@@ -207,6 +215,7 @@ def shadow_telemetry(result: MemoryResult, request: MemoryRequest | None = None)
         "provider": result.provider,
         "backend": result.backend,
         "state": result.state,
+        "dropped_cross_project": result.dropped_cross_project,
         "latency_ms": round(result.latency_ms, 3),
         "error_type": result.error_type or None,
         "result_ids": [item.item_id for item in result.items],
