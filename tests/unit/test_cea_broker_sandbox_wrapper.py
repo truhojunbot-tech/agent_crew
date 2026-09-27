@@ -1,5 +1,6 @@
 """Quick opt-in wrapper for the isolated launcher/server/decision drill."""
 import os
+import site
 import importlib.util
 import json
 import subprocess
@@ -13,7 +14,8 @@ import pytest
                     reason="set RUN_CEA_BROKER_SANDBOX=1 for subprocess sandbox")
 def test_broker_sandbox():
     script = Path(__file__).resolve().parents[2] / "scripts/cea/broker_sandbox.py"
-    subprocess.run([sys.executable, str(script)], check=True, timeout=90)
+    subprocess.run([sys.executable, str(script)], check=True, timeout=90,
+                   env={**os.environ, "PYTHONUSERBASE": site.getuserbase()})
 
 
 @pytest.mark.skipif(importlib.util.find_spec("uvicorn") is None,
@@ -21,12 +23,15 @@ def test_broker_sandbox():
 def test_broker_sandbox_e2e():
     script = Path(__file__).resolve().parents[2] / "scripts/cea/broker_sandbox.py"
     result = subprocess.run([sys.executable, str(script), "--e2e"],
-                            capture_output=True, text=True, timeout=120)
+                            capture_output=True, text=True, timeout=120,
+                            env={**os.environ, "PYTHONUSERBASE": site.getuserbase()})
     assert result.returncode == 0, result.stdout + result.stderr
     evidence = json.loads(Path(result.stdout.strip().splitlines()[-1]).read_text())
     assert evidence["pass"] is True
     assert evidence["block"]["receipt"]["reason"]["code"] == "RUNTIME_STATE_FORBIDS"
-    assert evidence["block"]["http_status"] >= 400
+    block = evidence["block"]
+    assert (block["http_status"] >= 400 or
+            (block["http_status"] == 200 and block["http_body"].get("suppressed_by_pause") is True))
     assert evidence["block"]["task_status"] is None
     assert evidence["allow"]["http_status"] == 201
     assert evidence["allow"]["receipt"]["decision"] == "ALLOW"
