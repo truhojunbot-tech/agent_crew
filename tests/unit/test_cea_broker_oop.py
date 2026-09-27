@@ -55,7 +55,7 @@ def test_user_writable_ancestor_prevents_verified(tmp_path):
     assert b.handle(os.getpid(), os.geteuid(), {"op": "status"})["downgrade_reason"] == BROKER_TREE_USER_WRITABLE
 
 
-def test_broker_remote_decisions_enforce_only_runtime_code(tmp_path):
+def test_broker_remote_decisions_enforce_only_runtime_code(tmp_path, monkeypatch):
     """Sandbox policy: runtime forbids stops; other blocks remain advisory."""
     import sqlite3
     import threading
@@ -69,6 +69,16 @@ def test_broker_remote_decisions_enforce_only_runtime_code(tmp_path):
     from agent_crew.cea.intent import CallerProvenance
     from agent_crew.cea.runtime_state import RuntimeState
     from agent_crew.cea.service import encode_intent
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    signing = Ed25519PrivateKey.generate()
+    private = tmp_path / "receipt-signing.key"
+    private.write_bytes(signing.private_bytes(serialization.Encoding.Raw,
+                        serialization.PrivateFormat.Raw, serialization.NoEncryption()))
+    marker = tmp_path / "SRC_COMMIT"
+    marker.write_text("sandbox-build")
+    monkeypatch.setenv("AGENT_CREW_CEA_RECEIPT_SIGNING_KEY_FILE", str(private))
+    monkeypatch.setenv("AGENT_CREW_AUTHZ_SRC_COMMIT_PATH", str(marker))
 
     db = tmp_path / "receipts.db"
     token = "sandbox-token"

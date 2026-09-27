@@ -325,10 +325,30 @@ class Broker:
         conn = self.connect()
         try:
             auth = self.decision_engine._authorize_authenticated(conn, intent, caller, retry=retry)
+            from agent_crew.cea import signed_receipt
+            from agent_crew.cea import store as receipt_store
+            private_path = os.environ.get("AGENT_CREW_CEA_RECEIPT_SIGNING_KEY_FILE",
+                                          signed_receipt.DEFAULT_PRIVATE)
+            try:
+                private = signed_receipt.load_private(private_path)
+                commit_path = os.environ.get("AGENT_CREW_AUTHZ_SRC_COMMIT_PATH",
+                                             "/opt/agent_crew-authz/SRC_COMMIT")
+                build_commit = Path(commit_path).read_text().strip()
+                if not build_commit:
+                    raise ValueError("empty broker build commit")
+            except (OSError, ValueError) as exc:
+                conn.rollback()
+                return {"error": "RECEIPT_SIGNING_UNAVAILABLE", "detail": type(exc).__name__}
+            payload = signed_receipt.payload_hash(
+                task_type=intent.task_type, branch=intent.identity.target.base_ref,
+                description=intent.description, context=intent.extra.get("dispatch_context") or {})
+            signed = signed_receipt.sign(auth.receipt, private, payload=payload,
+                                         build_commit=build_commit)
+            receipt_store.record_receipt(conn, signed, recorded_by="broker", note="ed25519 dispatch grant")
             conn.commit()
         finally:
             conn.close()
-        return {"receipt": auth.receipt, "http_status": auth.http_status,
+        return {"receipt": signed, "http_status": auth.http_status,
                 "code": auth.code, "reused": auth.reused,
                 "existing_receipt_id": auth.existing_receipt_id}
 

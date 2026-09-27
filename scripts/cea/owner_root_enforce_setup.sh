@@ -157,7 +157,9 @@ def installed_selftest():
     if result.returncode:
         raise RuntimeError(f"installed broker self-test failed: {result.stderr.strip()}")
     evidence = json.loads(result.stdout)
-    if not evidence.get("pass") or not evidence.get("authenticated") or not evidence.get("schema_valid") or evidence.get("downgrade_reason") is not None:
+    if (not evidence.get("pass") or not evidence.get("authenticated") or
+            not evidence.get("schema_valid") or not evidence.get("signed_receipt_valid") or
+            not evidence.get("tampered_receipt_rejected") or evidence.get("downgrade_reason") is not None):
         raise RuntimeError(f"installed broker self-test failed: {evidence}")
     say("installed broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
 
@@ -310,10 +312,11 @@ if args.update_src:
                 shutil.rmtree(live)
             if saved.get("had_" + name) and backup.exists():
                 os.replace(backup, live)
-        for name in ("caller-tokens.json",):
+        for name in ("caller-tokens.json", "receipt-signing.key", "receipt-signing.pub"):
             live, backup = tree / name, tree / (name + ".old")
             live.unlink(missing_ok=True)
-            if saved.get("had_tokens") and backup.exists():
+            had = "had_tokens" if name == "caller-tokens.json" else "had_" + name
+            if saved.get(had) and backup.exists():
                 os.replace(backup, live)
         old_launcher = launcher.with_name("broker-launch.old")
         if saved.get("had_launcher") and old_launcher.exists():
@@ -354,8 +357,11 @@ if args.update_src:
     schema_stage = tree / "tests.new"
     venv_stage = tree / "venv.new"
     token_stage = tree / "caller-tokens.new"
+    private_stage = tree / "receipt-signing.key.new"
+    public_stage = tree / "receipt-signing.pub.new"
     launcher_stage = launcher.with_name("broker-launch.new")
-    staged_paths = (staging, schema_stage, venv_stage, token_stage, launcher_stage)
+    staged_paths = (staging, schema_stage, venv_stage, token_stage, private_stage,
+                    public_stage, launcher_stage)
     if any(item.exists() for item in staged_paths):
         raise SystemExit("staged update files exist; inspect and remove before retrying")
     try:
@@ -371,6 +377,30 @@ if args.update_src:
             import pwd
             authz = pwd.getpwnam("crew-authz")
             os.chown(token_stage, authz.pw_uid, authz.pw_gid)
+        from cryptography.hazmat.primitives import serialization
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        old_private, old_public = tree / "receipt-signing.key", tree / "receipt-signing.pub"
+        if old_private.exists() != old_public.exists():
+            raise RuntimeError("incomplete receipt signing keypair; recover the missing key")
+        if old_private.exists():
+            private_bytes, public_bytes = old_private.read_bytes(), old_public.read_bytes()
+            signing_key = Ed25519PrivateKey.from_private_bytes(private_bytes)
+            if signing_key.public_key().public_bytes(serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw) != public_bytes:
+                raise RuntimeError("receipt signing keypair mismatch")
+        else:
+            signing_key = Ed25519PrivateKey.generate()
+            private_bytes = signing_key.private_bytes(serialization.Encoding.Raw,
+                serialization.PrivateFormat.Raw, serialization.NoEncryption())
+            public_bytes = signing_key.public_key().public_bytes(serialization.Encoding.Raw,
+                serialization.PublicFormat.Raw)
+        private_stage.write_bytes(private_bytes)
+        public_stage.write_bytes(public_bytes)
+        os.chmod(private_stage, 0o400)
+        os.chmod(public_stage, 0o644)
+        if not fake:
+            os.chown(private_stage, authz.pw_uid, authz.pw_gid)
+            os.chown(public_stage, 0, 0)
         launcher_stage.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_launcher, launcher_stage)
         os.chmod(launcher_stage, 0o755)
@@ -384,14 +414,19 @@ if args.update_src:
     old_commit = marker.read_text() if marker.is_file() else None
     saved = {"had_src": installed.is_dir(), "had_tests": (tree / "tests").is_dir(),
              "had_venv": venv.is_dir(), "had_tokens": (tree / "caller-tokens.json").is_file(),
+             "had_receipt-signing.key": (tree / "receipt-signing.key").is_file(),
+             "had_receipt-signing.pub": (tree / "receipt-signing.pub").is_file(),
              "had_launcher": launcher.is_file(), "old_commit": old_commit,
              "new_commit": source_commit, "tree_mode": stat.S_IMODE(tree.stat().st_mode)}
     swaps = [(installed, previous, staging), (tree / "tests", tree / "tests.old", schema_stage),
              (venv, tree / "venv.old", venv_stage),
              (tree / "caller-tokens.json", tree / "caller-tokens.json.old", token_stage),
+             (tree / "receipt-signing.key", tree / "receipt-signing.key.old", private_stage),
+             (tree / "receipt-signing.pub", tree / "receipt-signing.pub.old", public_stage),
              (launcher, launcher.with_name("broker-launch.old"), launcher_stage)]
     try:
-        for stage, (live, backup, new) in zip(("src", "schema", "venv", "tokens", "launcher"), swaps):
+        for stage, (live, backup, new) in zip(("src", "schema", "venv", "tokens", "receipt-key",
+                                               "receipt-pubkey", "launcher"), swaps):
             if backup.exists():
                 raise RuntimeError(f"update backup already exists: {backup}")
             if live.exists():

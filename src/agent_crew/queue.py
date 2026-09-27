@@ -18,6 +18,7 @@ from agent_crew.cea import adapters as _cea_adapters
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import cascade_contract as _cea_cascade
 from agent_crew.cea import store as _cea_store
+from agent_crew.cea import signed_receipt as _signed_receipt
 from agent_crew.cea import validator as _cea_validator
 from agent_crew.cea.auth import in_process_caller as _cea_in_process_caller
 from agent_crew.cea.engine import EngineConfig as _CeaEngineConfig, get_engine as _cea_get_engine
@@ -475,7 +476,8 @@ def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None,
         description=task.description or "",
         coordinator_id=(str(ctx["coordinator_id"]) if ctx.get("coordinator_id") else None),
         idempotency_key=(str(ctx["idempotency_key"]) if ctx.get("idempotency_key") else None),
-        parent_receipt_id=(str(ctx["parent_receipt_id"]) if ctx.get("parent_receipt_id") else None))
+        parent_receipt_id=(str(ctx["parent_receipt_id"]) if ctx.get("parent_receipt_id") else None),
+        extra={"dispatch_context": ctx})
 
 
 logger = logging.getLogger(__name__)
@@ -3298,6 +3300,44 @@ class TaskQueue:
         must ``ROLLBACK`` and treat the task as not taken. The caller holds the
         ``BEGIN IMMEDIATE``; nothing here commits.
         """
+        # A worker can write arbitrary queue rows and receipts in tasks.db.
+        # Verify the broker's public-key grant against the row being claimed,
+        # before any state change or subprocess spawn.
+        row = conn.execute("SELECT task_type, branch, description, context, receipt_id, project "
+                           "FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        try:
+            receipt_id, signed = self._cea_receipt_for_task_on(conn, task_id)
+        except (ValueError, TypeError, KeyError):
+            receipt_id, signed = (row["receipt_id"] if row else None), None
+        mode = self.cea_config(row["project"] if row else None).mode
+        if mode in ("enforce", "test"):
+            verified, nonce = False, None
+            if row is not None and signed is not None:
+                try:
+                    public = _signed_receipt.load_public(os.environ.get(
+                        "AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE", _signed_receipt.DEFAULT_PUBLIC))
+                    verified, nonce = _signed_receipt.verify(signed, public, task_id=task_id,
+                        receipt_id=receipt_id, payload=_signed_receipt.payload_hash(
+                            task_type=row["task_type"], branch=row["branch"],
+                            description=row["description"], context=json.loads(row["context"] or "{}")))
+                except (OSError, ValueError, TypeError, KeyError):
+                    verified = False
+            if verified and mode == "enforce":
+                # A separate claim table survives receipt-row replacement. The
+                # INSERT is atomic under the dequeue transaction's write lock.
+                conn.execute("CREATE TABLE IF NOT EXISTS signed_receipt_spent "
+                             "(nonce TEXT PRIMARY KEY, receipt_id TEXT NOT NULL, spent_at REAL NOT NULL)")
+                try:
+                    conn.execute("INSERT INTO signed_receipt_spent VALUES (?, ?, ?)",
+                                 (nonce, receipt_id, time.time()))
+                except sqlite3.IntegrityError:
+                    verified = False
+            if mode == "test":
+                self._append_exec_event_on(conn, task_id, "signed_receipt_check", time.time(),
+                                           outcome="VALID" if verified else "REFUSED_UNSIGNED_RECEIPT")
+            elif not verified:
+                logger.warning("cea: REFUSED_UNSIGNED_RECEIPT task=%s receipt=%s", task_id, receipt_id)
+                return False, None
         gate = self._cea_claim_gate(conn, task_id, agent=agent, role=role)
         if gate is None:
             # A row with no receipt at all — admitted before step 2c, or by a

@@ -324,17 +324,26 @@ def test_update_src_is_repeatable_without_owner_cleanup(tmp_path):
     assert (tree / "tests").stat().st_mode & 0o777 == 0o755
     assert (tree / "tests/cea_contract/receipt.schema.json").stat().st_mode & 0o777 == 0o644
     assert (tree / "caller-tokens.json").stat().st_mode & 0o777 == 0o400
+    private = tree / "receipt-signing.key"
+    public = tree / "receipt-signing.pub"
+    assert private.stat().st_mode & 0o777 == 0o400
+    assert public.stat().st_mode & 0o777 == 0o644
+    pair_before = (private.read_bytes(), public.read_bytes())
+    assert Ed25519PrivateKey.from_private_bytes(pair_before[0]).public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw) == pair_before[1]
     assert (tree / "SRC_COMMIT").read_text().strip() == subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=SCRIPT.parent.parent.parent, text=True).strip()
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
     repeat = _run(tmp_path, "--apply", "--update-src")
     assert repeat.returncode == 0, repeat.stdout + repeat.stderr
+    assert (private.read_bytes(), public.read_bytes()) == pair_before
     assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
     assert not (tree / "src.old").exists()
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
 
 
-@pytest.mark.parametrize("stage", ["src", "schema", "venv", "tokens", "launcher", "selftest"])
+@pytest.mark.parametrize("stage", ["src", "schema", "venv", "tokens", "receipt-key",
+                                   "receipt-pubkey", "launcher", "selftest"])
 def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     tree, _, _ = _seed(tmp_path)
     launcher = tmp_path / "usr/local/libexec/crew-authz/broker-launch.sh"
@@ -343,12 +352,19 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
         tree / "tests/cea_contract/receipt.schema.json": b"old schema",
         tree / "venv/bin/python": b"old python",
         tree / "caller-tokens.json": b"old tokens",
+        tree / "receipt-signing.key": Ed25519PrivateKey.generate().private_bytes(
+            serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+            serialization.NoEncryption()),
         launcher: b"old launcher",
     }
+    old_key = Ed25519PrivateKey.from_private_bytes(paths[tree / "receipt-signing.key"])
+    paths[tree / "receipt-signing.pub"] = old_key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     for path, contents in paths.items():
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(contents)
     (tree / "caller-tokens.json").chmod(0o400)
+    (tree / "receipt-signing.key").chmod(0o400)
     before = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in paths}
     result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
                   "/home/truhojun/.verify-private/tokens.json",
@@ -358,7 +374,8 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     assert {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in paths} == before
     assert (tree / "SRC_COMMIT").read_text() == "old-build\n"
     for name in ("src.old", "src.new", "tests.old", "tests.new", "venv.old", "venv.new",
-                 "caller-tokens.json.old", "caller-tokens.new"):
+                 "caller-tokens.json.old", "caller-tokens.new", "receipt-signing.key.old",
+                 "receipt-signing.key.new", "receipt-signing.pub.old", "receipt-signing.pub.new"):
         assert not (tree / name).exists()
     assert not launcher.with_name("broker-launch.old").exists()
     assert not launcher.with_name("broker-launch.new").exists()
@@ -371,6 +388,8 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
                (tree / "tests", tree / "tests.old", True),
                (tree / "venv", tree / "venv.old", True),
                (tree / "caller-tokens.json", tree / "caller-tokens.json.old", False),
+               (tree / "receipt-signing.key", tree / "receipt-signing.key.old", False),
+               (tree / "receipt-signing.pub", tree / "receipt-signing.pub.old", False),
                (launcher, launcher.with_name("broker-launch.old"), False)]
     for live, backup, directory in entries:
         live.parent.mkdir(parents=True, exist_ok=True)
@@ -386,6 +405,8 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
     manifest.parent.mkdir(parents=True)
     manifest.write_text(json.dumps({"had_src": True, "had_tests": True, "had_venv": True,
                                     "had_tokens": True, "had_launcher": True,
+                                    "had_receipt-signing.key": True,
+                                    "had_receipt-signing.pub": True,
                                     "old_commit": "old-build\n"}))
     result = _run(tmp_path, "--undo", "--update-src")
     assert result.returncode == 0, result.stderr
