@@ -1,0 +1,249 @@
+#!/opt/agent_crew-authz/venv/bin/python -I
+"""Root-only, T0-gated broker source update. See docs/cea_broker_oop_deploy.md.
+
+The test/rehearsal root is deliberately unavailable to a sudo caller. Production
+paths, remote, and command arguments are fixed here rather than caller supplied.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path("/opt/agent_crew-authz")
+STATE = Path("/var/lib/crew-authz")
+REMOTE = "https://github.com/truhojunbot-tech/agent_crew.git"
+SNAPSHOT = Path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")
+SHA = re.compile(r"[0-9a-f]{40}\Z")
+SAFE_ENV = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
+            "PYTHONNOUSERSITE": "1", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0"}
+
+
+class Refused(RuntimeError):
+    pass
+
+
+def command(*argv, cwd=None):
+    return subprocess.run(argv, cwd=cwd, env=SAFE_ENV, text=True, capture_output=True,
+                          check=True).stdout.strip()
+
+
+def secure_directory(path: Path):
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or (path.stat().st_mode & 0o022):
+        raise Refused(f"writable or linked protected directory: {path}")
+    if os.geteuid() == 0 and path.stat().st_uid != 0:
+        raise Refused(f"non-root protected directory: {path}")
+
+
+def secure_file(path: Path, *, owner_root=True):
+    if path.is_symlink() or not path.is_file():
+        raise Refused(f"missing or linked pinned file: {path}")
+    info = path.stat()
+    if info.st_mode & 0o022 or (owner_root and os.geteuid() == 0 and info.st_uid != 0):
+        raise Refused(f"writable or non-root pinned file: {path}")
+
+
+def audit(state: Path, item: dict):
+    secure_directory(state)
+    log = state / "broker-update.log"
+    if log.exists():
+        secure_file(log)
+    fd = os.open(log, os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, (json.dumps(item, sort_keys=True) + "\n").encode())
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def verified_t0(sha: str, *, root: Path, snapshot: Path, now=None):
+    # The sudo caller's PYTHONPATH is never used. Import the installed, root-owned code.
+    source = root / "src"
+    if source.is_symlink() or not source.is_dir() or source.stat().st_mode & 0o022:
+        raise Refused("missing or writable installed source")
+    if os.geteuid() == 0 and source.stat().st_uid != 0:
+        raise Refused("non-root installed source")
+    installed_src = str(root / "src")
+    if installed_src not in sys.path:
+        sys.path.insert(0, installed_src)
+    from agent_crew.cea.input_providers.snapshot import (
+        CanonicalPolicySnapshotReader, ed25519_verifier, _canonical, _epoch)
+    from agent_crew.cea.providers import SignatureStatus
+
+    pub = root / "snapshot.pub"
+    hwm_dir = root / "state"
+    hwm = hwm_dir / "snapshot-hwm.json"
+    secure_file(pub)
+    if hwm_dir.is_symlink() or not hwm_dir.is_dir() or hwm_dir.stat().st_mode & 0o077:
+        raise Refused("missing or exposed snapshot high-water directory")
+    secure_file(hwm, owner_root=False)
+    if hwm.stat().st_mode & 0o077:
+        raise Refused("exposed snapshot high-water mark")
+    if os.geteuid() == 0:
+        service_uid = pwd.getpwnam("crew-authz").pw_uid
+        if hwm_dir.stat().st_uid != service_uid or hwm.stat().st_uid != service_uid:
+            raise Refused("snapshot high-water mark not owned by crew-authz")
+    clock = (lambda: now) if now is not None else time.time
+    try:
+        ref = CanonicalPolicySnapshotReader(str(snapshot),
+            verifier=ed25519_verifier(pub.read_bytes()), clock=clock).current()
+    except Exception as exc:
+        raise Refused(f"snapshot verification failed: {exc}") from exc
+    if ref.signature is not SignatureStatus.VALID or not ref.available:
+        raise Refused("snapshot invalid, stale, or rolled back")
+    # The broker owns this mark. A root-side check must not advance it and make
+    # the replacement file unreadable to crew-authz on its next decision.
+    try:
+        mark = json.loads(hwm.read_text())
+        generation, old_hash = mark["generation"], mark["content_hash"]
+        if (type(generation) is not int or generation < 0 or
+                not isinstance(old_hash, str) or not old_hash.startswith("sha256:") or
+                ref.generation < generation or
+                (ref.generation == generation and ref.hash != old_hash)):
+            raise Refused("SNAPSHOT_ROLLBACK")
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise Refused("unreadable snapshot high-water mark") from exc
+    doc = json.loads(snapshot.read_bytes())
+    body = {key: value for key, value in doc.items() if key != "signature"}
+    digest = "sha256:" + hashlib.sha256(_canonical(body)).hexdigest()
+    if digest != ref.hash:
+        raise Refused("snapshot changed after verification")
+    owner_pub = root / "owner-t0.pub"
+    if owner_pub.exists():
+        secure_file(owner_pub)
+        owner_verify = ed25519_verifier(owner_pub.read_bytes())
+    else:
+        owner_verify = None
+    matches = []
+    for decision in doc.get("decisions", []):
+        if not isinstance(decision, dict) or decision.get("scope") != "broker-update" or decision.get("sha") != sha:
+            continue
+        expiry = _epoch(decision.get("expires_at"))
+        if (not decision.get("decision_id") or not decision.get("body_hash") or
+                expiry is None or expiry <= clock() or
+                not SHA.fullmatch(str(decision.get("reviewed_head", ""))) or
+                type(decision.get("pr_number")) is not int or decision["pr_number"] < 1):
+            continue
+        if owner_verify is not None:
+            signature = decision.get("owner_signature")
+            signed = {k: v for k, v in decision.items() if k != "owner_signature"}
+            if owner_verify(_canonical(signed), signature) is not SignatureStatus.VALID:
+                continue
+        matches.append(decision)
+    if len(matches) != 1:
+        raise Refused("no unique unexpired signed owner T0 for exact sha and reviewed head")
+    return matches[0], ref
+
+
+def fetch_source(sha: str, *, state: Path, remote=REMOTE):
+    secure_directory(state)
+    mirror = state / "src-mirror"
+    if not mirror.exists():
+        command("git", "init", "--bare", str(mirror))
+        mirror.chmod(0o700)
+    secure_directory(mirror)
+    command("git", "-C", str(mirror), "fetch", "--no-tags", "--force", remote,
+            "+refs/heads/main:refs/remotes/origin/main")
+    try:
+        kind = command("git", "-C", str(mirror), "cat-file", "-t", sha)
+    except subprocess.CalledProcessError as exc:
+        raise Refused("sha is not a commit") from exc
+    if kind != "commit":
+        raise Refused("sha is not a commit")
+    if subprocess.run(["git", "-C", str(mirror), "merge-base", "--is-ancestor", sha,
+                       "refs/remotes/origin/main"], env=SAFE_ENV).returncode:
+        raise Refused("sha is not reachable from fetched origin/main")
+    parents = command("git", "-C", str(mirror), "rev-list", "--parents", "-n", "1", sha).split()
+    if len(parents) != 3:
+        raise Refused("sha must be a two-parent reviewed merge commit")
+    return mirror, parents[2]
+
+
+def run_update(sha: str, *, root=ROOT, state=STATE, snapshot=SNAPSHOT,
+               remote=REMOTE, rehearse=False):
+    if not SHA.fullmatch(sha):
+        raise Refused("argument must be one full lowercase 40-hex sha")
+    secure_directory(state)
+    secure_directory(root)
+    decision, ref = verified_t0(sha, root=root, snapshot=snapshot)
+    mirror, reviewed_head = fetch_source(sha, state=state, remote=remote)
+    if reviewed_head != decision["reviewed_head"]:
+        raise Refused("merge second parent differs from T0 reviewed_head")
+    with tempfile.TemporaryDirectory(prefix="broker-update-", dir=state) as workspace:
+        checkout = Path(workspace) / "checkout"
+        command("git", "clone", "--no-hardlinks", "--no-checkout", str(mirror), str(checkout))
+        command("git", "-C", str(checkout), "checkout", "--detach", sha)
+        setup = checkout / "scripts/cea/owner_root_enforce_setup.sh"
+        tokens = root / "caller-tokens.json"
+        secure_file(tokens, owner_root=False)
+        rehearsal = ["bash", str(setup), "--rehearse", "--update-src", "--caller-tokens", str(tokens),
+                     "--snapshot-pubkey", str(root / "snapshot.pub"), "--snapshot-path", str(snapshot)]
+        result = subprocess.run(rehearsal, env=SAFE_ENV, text=True, capture_output=True)
+        if result.returncode:
+            raise Refused(f"owner rehearsal failed: {result.stderr[-500:] or result.stdout[-500:]}")
+        if not rehearse:
+            result = subprocess.run(["bash", str(setup), "--apply", "--update-src",
+                "--caller-tokens", str(tokens), "--snapshot-pubkey", str(root / "snapshot.pub"),
+                "--snapshot-path", str(snapshot)], env=SAFE_ENV, text=True, capture_output=True)
+            if result.returncode:
+                raise Refused(f"owner source update failed: {result.stderr[-500:] or result.stdout[-500:]}")
+    return {"sha": sha, "pr": decision["pr_number"], "reviewed_head": reviewed_head,
+            "t0_decision_id": decision["decision_id"], "snapshot_generation": ref.generation,
+            "snapshot_hash": ref.hash, "result": "rehearsed" if rehearse else "updated"}
+
+
+def main(argv=None):
+    args = sys.argv[1:] if argv is None else argv
+    rehearse = len(args) == 2 and args[0] == "--rehearse"
+    sha = args[1] if rehearse else args[0] if len(args) == 1 else ""
+    if not SHA.fullmatch(sha):
+        print("broker-update: expected one full 40-hex sha", file=sys.stderr)
+        return 2
+    if not rehearse and os.geteuid() != 0:
+        print("broker-update: root required", file=sys.stderr)
+        return 2
+    if rehearse and os.geteuid() == 0:
+        print("broker-update: rehearse must run as non-root", file=sys.stderr)
+        return 2
+    # Rehearsal may use isolated caller-owned fixtures. This branch is never
+    # reached by the sudoers one-argument invocation and never applies a swap.
+    options = {}
+    audit_state = STATE
+    if rehearse:
+        fixture = os.environ.get("AGENT_CREW_BROKER_UPDATE_REHEARSE_ROOT")
+        if fixture:
+            fixture_root = Path(fixture).resolve()
+            options = {"root": fixture_root / "opt/agent_crew-authz",
+                       "state": fixture_root / "var/lib/crew-authz",
+                       "snapshot": fixture_root / "snapshot.json",
+                       "remote": os.environ.get("AGENT_CREW_BROKER_UPDATE_REHEARSE_REMOTE", REMOTE)}
+            audit_state = options["state"]
+    try:
+        details = run_update(sha, rehearse=rehearse, **options)
+        audit(audit_state, details)
+        print(json.dumps(details, sort_keys=True))
+        return 0
+    except (Refused, OSError, subprocess.CalledProcessError, ValueError) as exc:
+        details = {"sha": sha, "pr": None, "t0_decision_id": None,
+                   "snapshot_generation": None, "snapshot_hash": None,
+                   "result": "refused", "reason": str(exc)}
+        try:
+            audit(audit_state, details)
+        except (OSError, Refused):
+            pass
+        print(f"broker-update: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
