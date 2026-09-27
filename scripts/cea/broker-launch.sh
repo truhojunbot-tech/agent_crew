@@ -13,6 +13,7 @@
 #   (default)   refuse unless euid == crew-authz; exec the broker.
 #   --check     print uid, ptrace_scope, socket-dir perms, python import; exit 0/1.
 #   --degraded  run in the caller's uid; the broker NEVER issues VERIFIED.
+# Live broker lifecycle is managed separately from the owner update script.
 #
 # Tests inject a fake euid with AGENT_CREW_AUTHZ_FAKE_EUID. It only moves this
 # script's gate: the Python broker re-checks the real euid and refuses, so the
@@ -38,11 +39,6 @@ for arg in "$@"; do
   case "$arg" in
     --check) MODE="check" ;;
     --degraded) MODE="degraded" ;;
-    --start) MODE="start" ;;
-    --stop) MODE="stop" ;;
-    --restart) MODE="restart" ;;
-    --health) MODE="health" ;;
-    --foreground) MODE="run" ;;
     *) echo "broker-launch: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -58,7 +54,6 @@ SOCK_DIR="${AGENT_CREW_AUTHZ_SOCK_DIR:-/tmp/crew-authz-${SERVICE_UID:-none}}"
 CLIENT_UID="${AGENT_CREW_AUTHZ_CLIENT_UID:-1000}"
 CLIENT_GROUP="${AGENT_CREW_AUTHZ_CLIENT_GROUP:-truhojun}"
 PTRACE_SCOPE_FILE="${AGENT_CREW_AUTHZ_PTRACE_SCOPE_FILE:-/proc/sys/kernel/yama/ptrace_scope}"
-PIDFILE="$SOCK_DIR/broker.pid"
 export PYTHONNOUSERSITE=1
 
 ptrace_scope() { cat "$PTRACE_SCOPE_FILE" 2>/dev/null || echo "unknown"; }
@@ -152,100 +147,6 @@ PY
   s="$(ptrace_scope)"; [[ "$s" =~ ^[0-9]+$ && "$s" -ge 1 ]] || { echo "FAIL: ptrace_scope must be >=1"; ok=1; }
   [[ "$EUID_NOW" == "$SERVICE_UID" ]] || echo "NOTE: not running as $SERVICE_USER (only --degraded would start)"
   exit "$ok"
-fi
-
-verified_pid() {
-  [[ -f "$PIDFILE" && ! -L "$PIDFILE" ]] || return 1
-  local pid cmd uid
-  pid="$(cat "$PIDFILE")"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  [[ -r "/proc/$pid/cmdline" ]] || return 1
-  uid="$(stat -c %u "/proc/$pid")"
-  [[ "$uid" == "$SERVICE_UID" ]] || return 1
-  cmd="$(tr '\0' ' ' < "/proc/$pid/cmdline")"
-  [[ "$cmd" == *" -m agent_crew.cea.broker --sock-dir $SOCK_DIR "* ]] || return 1
-  local exe
-  exe="$(readlink -f "/proc/$pid/exe")" || return 1
-  [[ "$exe" == "$(readlink -f "$PYTHON")" || "$exe" == /usr/bin/python* ]] || return 1
-  echo "$pid"
-}
-
-adopt_legacy_broker() {
-  [[ ! -e "$PIDFILE" && -S "$SOCK_DIR/broker.sock" ]] || return 1
-  local candidate count=0 proc
-  for proc in /proc/[0-9]*; do
-    [[ -r "$proc/cmdline" ]] || continue
-    [[ "$(stat -c %u "$proc" 2>/dev/null)" == "$SERVICE_UID" ]] || continue
-    if tr '\0' ' ' < "$proc/cmdline" | grep -Fq " -m agent_crew.cea.broker --sock-dir $SOCK_DIR "; then
-      candidate="${proc##*/}"
-      count=$((count + 1))
-    fi
-  done
-  [[ "$count" -eq 1 ]] || return 1
-  printf '%s\n' "$candidate" > "$PIDFILE"
-  chmod 0600 "$PIDFILE"
-  verified_pid >/dev/null || { rm -f -- "$PIDFILE"; return 1; }
-}
-
-if [[ "$MODE" == "stop" || "$MODE" == "restart" || "$MODE" == "health" || "$MODE" == "start" ]]; then
-  [[ -n "$SERVICE_UID" && "$EUID_NOW" == "$SERVICE_UID" ]] || {
-    echo "broker-launch: lifecycle requires $SERVICE_USER" >&2; exit 3; }
-  if [[ "$MODE" == "health" ]]; then
-    pid="$(verified_pid)" || { echo "broker not running or pidfile invalid" >&2; exit 1; }
-    PYTHONPATH="$PYPATH" "$PYTHON" - "$SOCK_DIR/broker.sock" <<'PY'
-import json, socket, sys
-with socket.socket(socket.AF_UNIX) as conn:
-    conn.settimeout(2)
-    conn.connect(sys.argv[1])
-    conn.sendall(b'{"op":"status"}\n')
-    result = json.loads(conn.makefile("rb").readline())
-    if not result.get("ok"):
-        raise SystemExit(f"broker unhealthy: {result}")
-    print(json.dumps(result))
-PY
-    exit 0
-  fi
-  if [[ "$MODE" == "stop" || "$MODE" == "restart" ]]; then
-    if [[ "$MODE" == "restart" && ! -e "$PIDFILE" ]]; then
-      adopt_legacy_broker || true
-    fi
-    if pid="$(verified_pid)"; then
-      kill -TERM "$pid"
-      for _ in {1..100}; do
-        [[ -d "/proc/$pid" ]] || break
-        sleep .05
-      done
-      [[ ! -d "/proc/$pid" ]] || { echo "broker did not stop" >&2; exit 1; }
-      rm -f -- "$PIDFILE"
-    elif [[ "$MODE" == "stop" || -e "$PIDFILE" || -S "$SOCK_DIR/broker.sock" ]]; then
-      echo "broker pidfile invalid; refusing stop" >&2; exit 1
-    fi
-    [[ "$MODE" == "stop" ]] && exit 0
-  fi
-  if [[ "$MODE" == "start" ]]; then
-    if verified_pid >/dev/null; then echo "broker already running" >&2; exit 1; fi
-    if [[ -e "$PIDFILE" || -S "$SOCK_DIR/broker.sock" ]]; then
-      echo "broker pidfile or socket exists without a verified process; refusing start" >&2; exit 1
-    fi
-  fi
-  prepare_dir
-  "$0" --check || exit 1
-  if [[ -n "${AGENT_CREW_AUTHZ_DRY_RUN:-}" ]]; then
-    echo "would start broker using $PYTHON"; exit 0
-  fi
-  nohup "$0" --foreground >"$SOCK_DIR/broker.log" 2>&1 </dev/null &
-  pid=$!
-  printf '%s\n' "$pid" >"$PIDFILE"
-  chmod 0600 "$PIDFILE"
-  for _ in {1..100}; do
-    if verified_pid >/dev/null && [[ -S "$SOCK_DIR/broker.sock" ]]; then
-      "$0" --health && exit 0
-    fi
-    kill -0 "$pid" 2>/dev/null || break
-    sleep .05
-  done
-  echo "broker failed to start; see $SOCK_DIR/broker.log" >&2
-  exit 1
 fi
 
 s="$(ptrace_scope)"

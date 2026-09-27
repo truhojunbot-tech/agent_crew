@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Owner-only, offline phase-2 broker installation. See docs/cea_broker_oop_deploy.md.
+# Owner-only, offline phase-2 broker installation. No live broker is restarted.
+# See docs/cea_broker_oop_deploy.md.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CREW_AUTHZ_LAUNCHER_SOURCE="$SCRIPT_DIR/broker-launch.sh"
@@ -143,6 +144,8 @@ def build_venv(destination):
     os.chmod(destination, 0o755)
 
 def installed_selftest():
+    if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_FAIL_STAGE") == "selftest":
+        raise RuntimeError("injected update failure: selftest")
     if fake:
         say("fake-root: skipped cross-uid installed-path self-test")
         return
@@ -315,6 +318,8 @@ if args.update_src:
         old_launcher = launcher.with_name("broker-launch.old")
         if saved.get("had_launcher") and old_launcher.exists():
             os.replace(old_launcher, launcher)
+        elif not saved.get("had_launcher"):
+            launcher.unlink(missing_ok=True)
         if saved["old_commit"] is None:
             marker.unlink(missing_ok=True)
         else:
@@ -386,12 +391,14 @@ if args.update_src:
              (tree / "caller-tokens.json", tree / "caller-tokens.json.old", token_stage),
              (launcher, launcher.with_name("broker-launch.old"), launcher_stage)]
     try:
-        for live, backup, new in swaps:
+        for stage, (live, backup, new) in zip(("src", "schema", "venv", "tokens", "launcher"), swaps):
             if backup.exists():
                 raise RuntimeError(f"update backup already exists: {backup}")
             if live.exists():
                 os.replace(live, backup)
             os.replace(new, live)
+            if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_FAIL_STAGE") == stage:
+                raise RuntimeError(f"injected update failure: {stage}")
         os.chmod(tree, 0o755)
         if not fake:
             os.chown(tree, 0, 0)
@@ -405,7 +412,6 @@ if args.update_src:
             say(check.rstrip())
             if "downgrade_reason=none" not in check:
                 raise RuntimeError("installed broker --check still downgraded")
-            run("sudo", "-n", "-u", "crew-authz", str(launcher), "--restart")
         # A successful update is committed: its temporary backups must not
         # block the next one-command update. Failure above still rolls back.
         for _, backup, _ in swaps:
@@ -428,7 +434,7 @@ if args.update_src:
         else: marker.write_text(old_commit)
         update_manifest.unlink(missing_ok=True)
         raise
-    say("source update complete")
+    say("source update complete; broker restart required to load new source (not performed by this script)")
     sys.exit(0)
 
 targets = [tree, launcher.parent, sudoers]
