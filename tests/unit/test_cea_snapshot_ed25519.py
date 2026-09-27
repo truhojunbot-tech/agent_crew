@@ -78,6 +78,33 @@ def test_ed25519_wrong_key_id_key_and_missing_block(tmp_path, keys):
     assert CanonicalPolicySnapshotReader(str(path), verifier=ed25519_verifier(other)).current().signature is SignatureStatus.INVALID
 
 
+@pytest.mark.parametrize("bad_signature", [None, "not-a-dict", 42])
+def test_configured_verifier_rejects_missing_or_non_dict_signature(tmp_path, keys, bad_signature):
+    private, raw, _ = keys
+    doc = signed_doc(private, raw)
+    if bad_signature is None:
+        del doc["signature"]
+    else:
+        doc["signature"] = bad_signature
+    path = write_doc(tmp_path, doc)
+    reader = CanonicalPolicySnapshotReader(str(path), verifier=ed25519_verifier(raw))
+    assert reader.current().signature is SignatureStatus.INVALID
+
+
+def test_unconfigured_reader_retains_unsigned_and_unkeyed_states(tmp_path, keys):
+    private, raw, _ = keys
+    doc = signed_doc(private, raw)
+    path = write_doc(tmp_path, doc)
+    reader = CanonicalPolicySnapshotReader(str(path))
+    assert reader.current().signature is SignatureStatus.UNKEYED
+    del doc["signature"]
+    write_doc(tmp_path, doc)
+    assert reader.current().signature is SignatureStatus.UNSIGNED
+    doc["signature"] = "not-a-dict"
+    write_doc(tmp_path, doc)
+    assert reader.current().signature is SignatureStatus.UNSIGNED
+
+
 def test_pubkey_precedes_hmac_without_fallback(tmp_path, keys):
     private, raw, _ = keys
     path = write_doc(tmp_path, signed_doc(private, raw, include_ed25519=False))

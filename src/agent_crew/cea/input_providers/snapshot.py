@@ -104,11 +104,14 @@ class CanonicalPolicySnapshotReader:
         sig = doc.get("signature")
         body = {k: v for k, v in doc.items() if k != "signature"}
         canon = _canonical(body)
-        if self.verifier is not None and isinstance(sig, dict):
-            try:
-                status = self.verifier(canon, sig)
-            except Exception:                    # noqa: BLE001 — a verifier that throws did not verify
+        if self.verifier is not None:
+            if not isinstance(sig, dict):
                 status = SignatureStatus.INVALID
+            else:
+                try:
+                    status = self.verifier(canon, sig)
+                except Exception:                # noqa: BLE001 — a verifier that throws did not verify
+                    status = SignatureStatus.INVALID
         else:
             status = SignatureStatus.UNKEYED if isinstance(sig, dict) else SignatureStatus.UNSIGNED
         decisions, in_scope = [], []
