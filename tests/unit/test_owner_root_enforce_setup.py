@@ -61,6 +61,19 @@ def test_dry_run_changes_nothing_and_does_not_show_secrets(tmp_path):
     assert not (tmp_path / "var/lib/crew-authz").exists()
 
 
+@pytest.mark.parametrize("extra_args", [(), ("--caller-tokens", "/home/truhojun/.verify-private/tokens.json")])
+def test_dry_run_reports_unreadable_existing_broker_env(tmp_path, extra_args):
+    tree, _, _ = _seed(tmp_path)
+    config = tree / "broker.env"
+    config.chmod(0o000)
+    result = _run(tmp_path, "--dry-run", *extra_args)
+    assert result.returncode != 0
+    assert "broker.env is not readable" in result.stderr
+    assert "run --dry-run as root" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert not (tmp_path / "var/lib/crew-authz").exists()
+
+
 def test_apply_and_undo_restore_existing_files(tmp_path):
     tree, token, sudoers = _seed(tmp_path)
     old_mode = tree.stat().st_mode & 0o777

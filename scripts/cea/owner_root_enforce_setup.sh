@@ -37,6 +37,15 @@ def run(*cmd, capture=False):
     return subprocess.run(cmd, check=True, text=True, capture_output=capture)
 def say(message):
     print(message, flush=True)
+def read_broker_env(config):
+    if not config.exists():
+        return ""
+    try:
+        return config.read_text()
+    except PermissionError as exc:
+        raise SystemExit(
+            f"broker.env is not readable: {config}; run --dry-run as root to validate and print the plan"
+        ) from exc
 
 tree = path("/opt/agent_crew-authz")
 launcher = path("/usr/local/libexec/crew-authz/broker-launch.sh")
@@ -55,7 +64,7 @@ if token_source and fake and token_source.is_absolute():
 if token_source is None:
     env_file = tree / "broker.env"
     if env_file.exists():
-        for line in env_file.read_text().splitlines():
+        for line in read_broker_env(env_file).splitlines():
             match = re.fullmatch(r"AGENT_CREW_CEA_CALLER_TOKENS=['\"]?([^'\"]+)['\"]?", line.strip())
             if match:
                 candidate = Path(match.group(1))
@@ -164,7 +173,7 @@ check_safe()
 config = tree / "broker.env"
 if config.is_symlink():
     raise SystemExit(f"refusing symlink: {config}")
-existing_content = config.read_text() if config.exists() else ""
+existing_content = read_broker_env(config)
 try:
     parse_broker_env(existing_content)
     overrides = {"AGENT_CREW_AUTHZ_CLIENT_GROUP": "crew-authz-clients",
