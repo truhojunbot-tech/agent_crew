@@ -7,6 +7,7 @@ export CREW_AUTHZ_SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
 export CREW_AUTHZ_SOURCE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 python3 - "$@" <<'PY'
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -81,6 +82,11 @@ if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snaps
 source_launcher = Path(os.environ["CREW_AUTHZ_LAUNCHER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
 source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
+schema_source = source_root / "tests/cea_contract/receipt.schema.json"
+requirements = source_root / "scripts/cea/broker-requirements.txt"
+venv = tree / "venv"
+schema_installed = tree / "tests/cea_contract/receipt.schema.json"
+SCHEMA_BLOB = "41e7ebf271830790f6aae80a413e51edf7805fcd"
 if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
     p.error("invalid source commit")
 
@@ -99,6 +105,58 @@ def preinstall_selftest(tokens):
     if not evidence.get("pass") or not evidence.get("authenticated"):
         raise SystemExit(f"pre-install broker self-test failed before changes: {evidence}")
     say("pre-install broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
+
+def normalize(root_dir):
+    """Copy source modes never confer write access on the protected broker tree."""
+    for parent, dirs, files in os.walk(root_dir):
+        for name in dirs + files:
+            item = Path(parent) / name
+            if item.is_symlink():
+                raise RuntimeError(f"symlink in staged broker tree: {item}")
+            os.chmod(item, 0o755 if item.is_dir() else 0o644)
+            if not fake:
+                os.chown(item, 0, 0)
+    os.chmod(root_dir, 0o755)
+    if not fake:
+        os.chown(root_dir, 0, 0)
+
+def build_venv(destination):
+    if fake:
+        (destination / "bin").mkdir(parents=True)
+        (destination / "bin/python").write_text("fake pinned broker python\n")
+        say("fake-root: pinned venv build represented without installing packages")
+        return
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/nonexistent",
+           "PYTHONNOUSERSITE": "1", "PIP_CONFIG_FILE": "/dev/null"}
+    subprocess.run(["/usr/bin/python3", "-m", "venv", str(destination)], check=True, env=env)
+    subprocess.run([str(destination / "bin/python"), "-m", "pip", "install", "--disable-pip-version-check",
+                    "--no-cache-dir", "-r", str(requirements)], check=True, env=env)
+    # The interpreter is a system symlink; normalize every file around it.
+    for parent, dirs, files in os.walk(destination):
+        for name in dirs + files:
+            item = Path(parent) / name
+            if item.is_symlink():
+                continue
+            os.chown(item, 0, 0)
+            os.chmod(item, 0o755 if item.is_dir() or os.access(item, os.X_OK) else 0o644)
+    os.chown(destination, 0, 0)
+    os.chmod(destination, 0o755)
+
+def installed_selftest():
+    if fake:
+        say("fake-root: skipped cross-uid installed-path self-test")
+        return
+    command = [sys.executable, str(source_root / "scripts/cea/broker_group_sandbox.py"),
+               "--installed-root", str(tree)]
+    if not fake:
+        command.append("--cross-uid")
+    result = subprocess.run(command, capture_output=True, text=True, timeout=90)
+    if result.returncode:
+        raise RuntimeError(f"installed broker self-test failed: {result.stderr.strip()}")
+    evidence = json.loads(result.stdout)
+    if not evidence.get("pass") or not evidence.get("authenticated") or not evidence.get("schema_valid") or evidence.get("downgrade_reason") is not None:
+        raise RuntimeError(f"installed broker self-test failed: {evidence}")
+    say("installed broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
 
 def apply_preconditions(source_update=False):
     """Return failures visible before root changes, plus checks requiring root."""
@@ -126,6 +184,22 @@ def apply_preconditions(source_update=False):
         failures.append(f"checkout src missing: {source_root / 'src'}")
     elif any(item.is_symlink() for item in (source_root / "src").rglob("*")):
         failures.append(f"symlink in checkout src: {source_root / 'src'}")
+    if not schema_source.is_file() or subprocess.run(["git", "hash-object", str(schema_source)],
+            capture_output=True, text=True).stdout.strip() != SCHEMA_BLOB:
+        failures.append(f"frozen receipt schema missing or wrong blob: {schema_source}; recover with: git checkout -- tests/cea_contract/receipt.schema.json")
+    if not requirements.is_file():
+        failures.append(f"pinned broker requirements missing: {requirements}; recover by restoring checkout")
+    if source_update:
+        if not venv.is_dir():
+            unverified.append(f"pinned venv absent at {venv}; --update-src will build it")
+        elif not (venv / "bin/python").exists():
+            failures.append(f"pinned venv has no python: {venv}; recover with: --undo --update-src")
+        elif not fake and os.access(venv / "bin/python", os.X_OK):
+            check = subprocess.run([str(venv / "bin/python"), "-c",
+                "import jsonschema,cryptography,httpx; assert hasattr(jsonschema,'Draft202012Validator')"],
+                env={"HOME": "/nonexistent", "PYTHONNOUSERSITE": "1"}, capture_output=True)
+            if check.returncode:
+                unverified.append(f"pinned venv dependencies at {venv} will be refreshed")
     if fake:
         actual_commit = os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_GIT_COMMIT", source_commit)
         dirty = os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_GIT_STATUS", "")
@@ -227,6 +301,20 @@ if args.update_src:
             if not previous.is_dir():
                 raise SystemExit(f"source backup missing: {previous}")
             os.replace(previous, installed)
+        for name in ("tests", "venv"):
+            live, backup = tree / name, tree / (name + ".old")
+            if live.exists():
+                shutil.rmtree(live)
+            if saved.get("had_" + name) and backup.exists():
+                os.replace(backup, live)
+        for name in ("caller-tokens.json",):
+            live, backup = tree / name, tree / (name + ".old")
+            live.unlink(missing_ok=True)
+            if saved.get("had_tokens") and backup.exists():
+                os.replace(backup, live)
+        old_launcher = launcher.with_name("broker-launch.old")
+        if saved.get("had_launcher") and old_launcher.exists():
+            os.replace(old_launcher, launcher)
         if saved["old_commit"] is None:
             marker.unlink(missing_ok=True)
         else:
@@ -253,31 +341,92 @@ if args.update_src:
     source_tokens = token_source or tree / "caller-tokens.json"
     if (not fake or os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1") and not source_tokens.is_file():
         raise SystemExit(f"caller tokens missing for source update self-test: {source_tokens}")
-    preinstall_selftest(source_tokens)
-    old_commit = marker.read_text() if marker.is_file() else None
-    manifest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    update_manifest.write_text(json.dumps({"had_src": installed.is_dir(),
-                                           "old_commit": old_commit, "new_commit": source_commit}, indent=2))
-    os.chmod(update_manifest, 0o600)
+    if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
+        preinstall_selftest(source_tokens)
+    # All expensive and fallible preparation happens before any installed path
+    # is changed. The installed-path test follows the atomic swaps below; a
+    # failure restores every previous path before this command returns.
+    schema_stage = tree / "tests.new"
+    venv_stage = tree / "venv.new"
+    token_stage = tree / "caller-tokens.new"
+    launcher_stage = launcher.with_name("broker-launch.new")
+    staged_paths = (staging, schema_stage, venv_stage, token_stage, launcher_stage)
+    if any(item.exists() for item in staged_paths):
+        raise SystemExit("staged update files exist; inspect and remove before retrying")
     try:
         shutil.copytree(source, staging)
-        for directory, dirs, files in os.walk(staging):
-            for name in dirs + files:
-                item = Path(directory) / name
-                os.chmod(item, stat.S_IMODE(item.stat().st_mode) & ~0o022)
-                if not fake:
-                    run("chown", "root:root", str(item))
+        normalize(staging)
+        (schema_stage / "cea_contract").mkdir(parents=True)
+        shutil.copyfile(schema_source, schema_stage / "cea_contract/receipt.schema.json")
+        normalize(schema_stage)
+        build_venv(venv_stage)
+        shutil.copyfile(source_tokens, token_stage)
+        os.chmod(token_stage, 0o400)
         if not fake:
-            run("chown", "root:root", str(staging))
-        if installed.exists():
-            os.replace(installed, previous)
-        os.replace(staging, installed)
+            import pwd
+            authz = pwd.getpwnam("crew-authz")
+            os.chown(token_stage, authz.pw_uid, authz.pw_gid)
+        launcher_stage.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_launcher, launcher_stage)
+        os.chmod(launcher_stage, 0o755)
+        if not fake:
+            os.chown(launcher_stage, 0, 0)
+    except Exception:
+        for item in staged_paths:
+            if item.is_dir(): shutil.rmtree(item)
+            else: item.unlink(missing_ok=True)
+        raise
+    old_commit = marker.read_text() if marker.is_file() else None
+    saved = {"had_src": installed.is_dir(), "had_tests": (tree / "tests").is_dir(),
+             "had_venv": venv.is_dir(), "had_tokens": (tree / "caller-tokens.json").is_file(),
+             "had_launcher": launcher.is_file(), "old_commit": old_commit,
+             "new_commit": source_commit, "tree_mode": stat.S_IMODE(tree.stat().st_mode)}
+    swaps = [(installed, previous, staging), (tree / "tests", tree / "tests.old", schema_stage),
+             (venv, tree / "venv.old", venv_stage),
+             (tree / "caller-tokens.json", tree / "caller-tokens.json.old", token_stage),
+             (launcher, launcher.with_name("broker-launch.old"), launcher_stage)]
+    try:
+        for live, backup, new in swaps:
+            if backup.exists():
+                raise RuntimeError(f"update backup already exists: {backup}")
+            if live.exists():
+                os.replace(live, backup)
+            os.replace(new, live)
+        os.chmod(tree, 0o755)
+        if not fake:
+            os.chown(tree, 0, 0)
         marker.write_text(source_commit + "\n")
         os.chmod(marker, 0o644)
         if not fake:
             run("chown", "root:root", str(marker))
+        installed_selftest()
+        if not fake:
+            check = run("sudo", "-n", "-u", "crew-authz", str(launcher), "--check", capture=True).stdout
+            say(check.rstrip())
+            if "downgrade_reason=none" not in check:
+                raise RuntimeError("installed broker --check still downgraded")
+            run("sudo", "-n", "-u", "crew-authz", str(launcher), "--restart")
+        # A successful update is committed: its temporary backups must not
+        # block the next one-command update. Failure above still rolls back.
+        for _, backup, _ in swaps:
+            if backup.is_dir(): shutil.rmtree(backup)
+            else: backup.unlink(missing_ok=True)
+        update_manifest.unlink(missing_ok=True)
     except Exception:
-        say(f"source update failed; restore with --undo --update-src using {update_manifest}")
+        for live, backup, new in reversed(swaps):
+            if backup.exists():
+                if live.is_dir(): shutil.rmtree(live)
+                else: live.unlink(missing_ok=True)
+                os.replace(backup, live)
+            elif new.exists() is False and live.exists():
+                if live.is_dir(): shutil.rmtree(live)
+                else: live.unlink(missing_ok=True)
+            if new.is_dir(): shutil.rmtree(new)
+            else: new.unlink(missing_ok=True)
+        os.chmod(tree, saved["tree_mode"])
+        if old_commit is None: marker.unlink(missing_ok=True)
+        else: marker.write_text(old_commit)
+        update_manifest.unlink(missing_ok=True)
         raise
     say("source update complete")
     sys.exit(0)
@@ -415,7 +564,7 @@ plan = [
     "create dedicated crew-authz-clients group; add truhojun and crew-authz if absent",
     f"install acl if missing; save ACLs, grant crew-authz x on {crew_dir}, rwx on {alfred_dir}, rw on {db}",
     f"backup existing broker tree, launcher directory and sudoers in {manifest_dir}",
-    f"copy caller tokens to {tree / 'caller-tokens.json'} root:crew-authz 0640",
+    f"copy caller tokens to {tree / 'caller-tokens.json'} crew-authz:crew-authz 0400",
     f"copy Ed25519 public key {snapshot_source} to {tree / 'snapshot.pub'} root:crew-authz 0644; remove staged HMAC key",
     f"copy launcher to {launcher} root:root 0755; root-own broker tree and remove group/other write",
     f"validate temporary sudoers with visudo -cf, then install {sudoers} 0440",
@@ -436,7 +585,7 @@ commands = [
     f"setfacl -m u:crew-authz:rwx {alfred_dir}",
     f"setfacl -m u:crew-authz:rw- {db}",
     f"install -m 0755 {source_launcher} {launcher}",
-    f"install -m 0640 <caller tokens> {tree / 'caller-tokens.json'}",
+    f"install -m 0400 <caller tokens> {tree / 'caller-tokens.json'}",
     f"install -m 0644 {snapshot_source} {tree / 'snapshot.pub'}",
     "chown root:crew-authz <broker.env, caller tokens and snapshot.pub>",
     f"chown root:root <broker tree entries except keys under {tree}>",
@@ -468,7 +617,10 @@ try:
         raise ValueError("expected an Ed25519 public key")
 except (ImportError, ValueError) as exc:
     raise SystemExit(f"invalid Ed25519 public key {snapshot_source}: {exc}") from exc
-preinstall_selftest(token_source)
+# The installed-path proof runs after staging, against the exact paths the
+# launcher will use. The manifest permits undo if any later root operation fails.
+if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
+    preinstall_selftest(token_source)
 for base in (manifest_dir, launcher.parent, tree, sudoers.parent):
     missing = []
     current = base
@@ -525,23 +677,37 @@ try:
     shutil.copyfile(source_launcher, launcher)
     os.chmod(launcher, 0o755)
     shutil.copyfile(token_source, tree / "caller-tokens.json")
-    os.chmod(tree / "caller-tokens.json", 0o640)
+    os.chmod(tree / "caller-tokens.json", 0o400)
     (tree / "snapshot.key").unlink(missing_ok=True)
     shutil.copyfile(snapshot_source, tree / "snapshot.pub")
     os.chmod(tree / "snapshot.pub", 0o644)
     config.write_text(final_content)
     os.chmod(config, 0o640)
     (tree / "SRC_COMMIT").write_text(source_commit + "\n")
+    if not (tree / "src").exists():
+        shutil.copytree(source_root / "src", tree / "src")
+    normalize(tree / "src")
+    schema_installed.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(schema_source, schema_installed)
+    normalize(tree / "tests")
+    if not venv.exists():
+        build_venv(venv)
     for directory, dirs, files in os.walk(tree):
         for name in dirs + files:
             item = Path(directory) / name
             if item.is_symlink():
+                if item.is_relative_to(venv):
+                    continue  # venv/bin/python is a root-owned interpreter symlink
                 raise RuntimeError(f"symlink in broker tree: {item}")
-            os.chmod(item, stat.S_IMODE(item.stat().st_mode) & ~0o022)
+            if item != tree / "caller-tokens.json":
+                os.chmod(item, 0o755 if item.is_dir() or os.access(item, os.X_OK) else 0o644)
             if not fake:
-                group = "crew-authz" if item.name in ("caller-tokens.json", "snapshot.pub", "broker.env") else "root"
-                run("chown", f"root:{group}", str(item))
-    os.chmod(tree, stat.S_IMODE(tree.stat().st_mode) & ~0o022)
+                if item.name == "caller-tokens.json":
+                    run("chown", "crew-authz:crew-authz", str(item))
+                else:
+                    group = "crew-authz" if item.name in ("snapshot.pub", "broker.env") else "root"
+                    run("chown", f"root:{group}", str(item))
+    os.chmod(tree, 0o755)
     if not fake:
         run("chown", "root:root", str(tree))
         run("chown", "root:root", str(launcher))
@@ -554,6 +720,7 @@ try:
         run("visudo", "-cf", str(temp))
     os.replace(temp, sudoers)
     if not fake:
+        installed_selftest()
         check = run("sudo", "-u", "crew-authz", str(launcher), "--check", capture=True).stdout
         say(check.rstrip())
         if "downgrade_reason=none" not in check:

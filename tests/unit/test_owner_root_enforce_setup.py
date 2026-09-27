@@ -12,6 +12,36 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/cea/owner_root_enforce_setup.sh"
 
 
+def test_broker_import_and_schema_in_clean_environment():
+    root = SCRIPT.parents[2]
+    result = subprocess.run(
+        ["env", "-i", "HOME=/nonexistent", "PYTHONNOUSERSITE=1",
+         f"PYTHONPATH={root / 'src'}", "python3", "-c",
+         "from agent_crew.cea import broker; from agent_crew.cea.schema import load_schema; "
+         "assert load_schema()['$schema'].endswith('2020-12/schema')"],
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_missing_schema_fails_at_first_use(monkeypatch, tmp_path):
+    from agent_crew.cea import schema
+    schema.load_schema.cache_clear()
+    monkeypatch.setattr(schema, "_schema_path", lambda: tmp_path / "missing.schema.json")
+    with pytest.raises(FileNotFoundError):
+        schema.load_schema()
+    schema.load_schema.cache_clear()
+
+
+def test_broker_refuses_startup_without_installed_schema(monkeypatch, tmp_path, capsys):
+    from agent_crew.cea import broker, schema
+    schema.load_schema.cache_clear()
+    monkeypatch.setattr(schema, "_schema_path", lambda: tmp_path / "missing.schema.json")
+    assert broker.main(["--sock-dir", str(tmp_path / "socket")]) == 3
+    assert "receipt schema unavailable" in capsys.readouterr().err
+    schema.load_schema.cache_clear()
+
+
 def _run(root, *args, extra_env=None):
     return subprocess.run(
         ["bash", str(SCRIPT), *args, "--root-prefix", str(root)],
@@ -172,7 +202,7 @@ def test_apply_and_undo_restore_existing_files(tmp_path):
     result = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert result.returncode == 0, result.stderr
     assert (tree / "caller-tokens.json").read_text() == token.read_text()
-    assert (tree / "caller-tokens.json").stat().st_mode & 0o777 == 0o640
+    assert (tree / "caller-tokens.json").stat().st_mode & 0o777 == 0o400
     assert not (tree / "snapshot.key").exists()
     assert (tree / "snapshot.pub").read_bytes() == (
         tmp_path / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub").read_bytes()
@@ -272,7 +302,7 @@ def test_incomplete_apply_requires_undo_before_retry(tmp_path):
     assert not manifest_path.exists()
 
 
-def test_update_src_dry_run_apply_and_undo(tmp_path):
+def test_update_src_is_repeatable_without_owner_cleanup(tmp_path):
     tree, _, _ = _seed(tmp_path)
     installed = tree / "src"
     installed.mkdir()
@@ -284,18 +314,14 @@ def test_update_src_dry_run_apply_and_undo(tmp_path):
     assert not (tree / "src.old").exists()
     applied = _run(tmp_path, "--apply", "--update-src", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert applied.returncode == 0, applied.stderr
-    assert (tree / "src.old" / "old.py").read_text() == "original"
+    assert not (tree / "src.old").exists()
     assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
     assert (tree / "SRC_COMMIT").read_text().strip() == subprocess.check_output(
         ["git", "rev-parse", "HEAD"], cwd=SCRIPT.parent.parent.parent, text=True).strip()
-    assert (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").is_file()
+    assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
     repeat = _run(tmp_path, "--apply", "--update-src")
-    assert repeat.returncode != 0 and "WOULD ABORT: source update" in repeat.stdout
-    assert "--undo --update-src" in repeat.stdout
-    undo = _run(tmp_path, "--undo", "--update-src")
-    assert undo.returncode == 0, undo.stderr
-    assert (installed / "old.py").read_text() == "original"
-    assert (tree / "SRC_COMMIT").read_text() == "old-build\n"
+    assert repeat.returncode == 0, repeat.stdout + repeat.stderr
+    assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
     assert not (tree / "src.old").exists()
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
 
@@ -319,17 +345,15 @@ def test_main_undo_refuses_outstanding_source_update(tmp_path):
     applied = _run(tmp_path, "--apply", "--caller-tokens",
                    "/home/truhojun/.verify-private/tokens.json")
     assert applied.returncode == 0, applied.stderr
-    updated = _run(tmp_path, "--apply", "--update-src")
-    assert updated.returncode == 0, updated.stderr
     source_manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
+    source_manifest.write_text('{}')
     assert source_manifest.is_file()
     blocked = _run(tmp_path, "--undo")
     assert blocked.returncode != 0
     assert "undo --update-src first" in blocked.stderr
     assert source_manifest.is_file()
     assert (tree / "src" / "agent_crew" / "cea" / "broker.py").is_file()
-    source_undo = _run(tmp_path, "--undo", "--update-src")
-    assert source_undo.returncode == 0, source_undo.stderr
+    source_manifest.unlink()
     main_undo = _run(tmp_path, "--undo")
     assert main_undo.returncode == 0, main_undo.stderr
 
