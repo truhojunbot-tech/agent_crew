@@ -108,3 +108,44 @@ def test_broker_remote_decisions_enforce_only_runtime_code(tmp_path):
         assert advisory["code"] not in enforce_codes
     finally:
         broker.close()
+
+
+def test_main_wires_authorize_with_same_tree_downgrade_as_attest(tmp_path, monkeypatch, capsys):
+    """Exercise the production CLI branch with an isolated database and writable tree."""
+    from agent_crew.cea import broker as broker_module
+    from agent_crew.cea.auth import DenyAllAuthenticator
+    from agent_crew.cea.engine import AuthorizationEngine
+
+    db = tmp_path / "tasks.db"
+    db.touch()
+    launcher = tmp_path / "broker-launch.sh"
+    launcher.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("AGENT_CREW_CEA_BROKER_DB", str(db))
+    monkeypatch.setenv("AGENT_CREW_AUTHZ_LAUNCHER_PATH", str(launcher))
+    monkeypatch.setenv("AGENT_CREW_AUTHZ_SRC_COMMIT_PATH", str(tmp_path / "SRC_COMMIT"))
+    monkeypatch.setenv("AGENT_CREW_CEA_REGISTRY_PATH", str(tmp_path / "registry.json"))
+    monkeypatch.setenv("AGENT_CREW_CEA_SNAPSHOT_PATH", str(tmp_path / "snapshot.json"))
+    monkeypatch.setenv("AGENT_CREW_CEA_MEMORY_CMD", str(tmp_path / "missing-memory"))
+    monkeypatch.setenv("AGENT_CREW_CEA_QUOTA_CACHE_DIR", str(tmp_path / "quota"))
+    monkeypatch.delenv("AGENT_CREW_CEA_CALLER_TOKENS", raising=False)
+    counts = []
+    original = broker_module.writable_broker_tree
+
+    def measured_tree(*paths, **kwargs):
+        counts.append((paths, kwargs))
+        return original(*paths, **kwargs)
+
+    def inspect_preflight(self):
+        assert self.tree_writable
+        assert isinstance(self.decision_engine, AuthorizationEngine)
+        assert self.decision_engine.config.fallback_reason == BROKER_TREE_USER_WRITABLE
+        assert isinstance(self.authenticator, DenyAllAuthenticator)
+        assert callable(self.connect)
+        assert self.handle(os.getpid(), os.geteuid(), {"op": "status"})["downgrade_reason"] == BROKER_TREE_USER_WRITABLE
+        return {"downgrade_reason": BROKER_TREE_USER_WRITABLE}
+
+    monkeypatch.setattr(broker_module, "writable_broker_tree", measured_tree)
+    monkeypatch.setattr(Broker, "preflight", inspect_preflight)
+    assert broker_module.main(["--sock-dir", str(tmp_path / "sock"), "--degraded", "--check"]) == 0
+    assert len(counts) == 1
+    assert BROKER_TREE_USER_WRITABLE in capsys.readouterr().out

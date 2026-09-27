@@ -649,7 +649,7 @@ def main(argv=None) -> int:
     ap.add_argument("--degraded", action="store_true")
     ap.add_argument("--check", action="store_true")
     a = ap.parse_args(argv)
-    decision_kwargs = {}
+    b = Broker(a.sock_dir, degraded=a.degraded, client_uids=tuple(a.client_uid or (1000,)))
     db_path = os.environ.get("AGENT_CREW_CEA_BROKER_DB")
     if db_path:
         import sqlite3
@@ -657,19 +657,13 @@ def main(argv=None) -> int:
         from agent_crew.cea.engine import AuthorizationEngine, EngineConfig
         from agent_crew.cea.wiring import build_wiring
         config = EngineConfig.from_env()
-        if writable_broker_tree(os.environ.get("AGENT_CREW_AUTHZ_LAUNCHER_PATH", ""), __file__,
-                                os.environ.get("AGENT_CREW_AUTHZ_SRC_COMMIT_PATH", "/opt/agent_crew-authz/SRC_COMMIT"),
-                                *( [os.environ["AGENT_CREW_AUTHZ_CONFIG_PATH"]]
-                                   if os.environ.get("AGENT_CREW_AUTHZ_CONFIG_PATH") and
-                                   os.path.exists(os.environ["AGENT_CREW_AUTHZ_CONFIG_PATH"]) else []),
-                                tree_root=str(Path(__file__).resolve().parents[2])):
+        # Attestation and authorization must use the same integrity result.
+        if b.tree_writable:
             config = dataclasses.replace(config, fallback_reason=BROKER_TREE_USER_WRITABLE)
         wiring = build_wiring(db_path=db_path)
-        decision_kwargs = {"decision_engine": AuthorizationEngine(config=config, **wiring.providers),
-                           "connect": lambda: sqlite3.connect(db_path),
-                           "authenticator": authenticator_from_env()}
-    b = Broker(a.sock_dir, degraded=a.degraded, client_uids=tuple(a.client_uid or (1000,)),
-               **decision_kwargs)
+        b.decision_engine = AuthorizationEngine(config=config, **wiring.providers)
+        b.connect = lambda: sqlite3.connect(db_path)
+        b.authenticator = authenticator_from_env()
     try:
         report = b.preflight()
     except BrokerRefused as exc:
