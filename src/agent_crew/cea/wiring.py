@@ -31,6 +31,8 @@ env                                      meaning
 ``AGENT_CREW_CEA_SNAPSHOT_KEY_FILE``     HMAC key the snapshot signature is checked with;
                                          absent ⇒ snapshot UNKEYED/UNSIGNED ⇒ unverified
                                          input ⇒ BLOCK, exactly as before this module
+``AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE``  Ed25519 public key (PEM or raw); takes precedence
+                                         over the HMAC key when both are configured
 ``AGENT_CREW_CEA_MEMORY_CMD``            L2/L3 provider command (``python3 …/admission_inputs.py``)
 ``AGENT_CREW_CEA_QUOTA_CACHE_DIR``       Qouta ``<dir>/<provider>_monitor/quota_cache.json``
 ``AGENT_CREW_CEA_CODEX_AUTH_PATH``       Codex account identity JSON (default ``~/.codex/auth.json``)
@@ -233,16 +235,28 @@ def build_wiring(env: Optional[dict] = None, *, db_path: Optional[str] = None,
 def _snapshot(env: dict):
     """(reader | None, status, verifier_configured)."""
     from agent_crew.cea.input_providers.snapshot import (
-        CanonicalPolicySnapshotReader, hmac_sha256_verifier)
+        CanonicalPolicySnapshotReader, ed25519_verifier, hmac_sha256_verifier)
+    from agent_crew.cea.providers import SignatureStatus
 
     path = _first(env, "AGENT_CREW_CEA_SNAPSHOT_PATH",
                   "AGENT_CREW_CEA_POLICY_SNAPSHOT") or DEFAULT_SNAPSHOT_PATH
     if not _readable_file(path):
         return None, ProviderStatus("snapshots", False, f"no readable snapshot at {path}"), False
 
+    public_key_path = _first(env, "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE")
     key_path = _first(env, "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE")
     verifier, note = None, ""
-    if not key_path:
+    verified_key = False
+    if public_key_path:
+        try:
+            with open(public_key_path, "rb") as fh:
+                verifier = ed25519_verifier(fh.read())
+            verified_key = True
+            note = f"ed25519 verified against {public_key_path}"
+        except Exception as exc:  # noqa: BLE001 — invalid key cannot fall back to HMAC
+            verifier = lambda body, signature: SignatureStatus.INVALID
+            note = f"ed25519 public key {public_key_path} unusable ({exc!r}); snapshot stays unverified"
+    elif not key_path:
         note = "unkeyed — AGENT_CREW_CEA_SNAPSHOT_KEY_FILE unset, so the snapshot is an " \
                "unverified input and admission BLOCKs (P7)"
     else:
@@ -254,6 +268,7 @@ def _snapshot(env: dict):
             note = f"key file {key_path} unreadable ({exc.strerror}); snapshot stays unverified"
         if key:
             verifier = hmac_sha256_verifier(key)
+            verified_key = True
             note = f"hmac-sha256 verified against {key_path}"
         elif not note:
             note = f"key file {key_path} is empty; snapshot stays unverified"
@@ -262,7 +277,7 @@ def _snapshot(env: dict):
         reader = CanonicalPolicySnapshotReader(path, verifier=verifier, env=env)
     except Exception as exc:                     # noqa: BLE001
         return None, ProviderStatus("snapshots", False, f"reader construction failed: {exc!r}"), False
-    return reader, ProviderStatus("snapshots", True, f"{path}; {note}"), verifier is not None
+    return reader, ProviderStatus("snapshots", True, f"{path}; {note}"), verified_key
 
 
 def _memory_client(env: dict):
