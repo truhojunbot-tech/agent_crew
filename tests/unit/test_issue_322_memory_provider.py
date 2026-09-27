@@ -16,6 +16,7 @@ from agent_crew.memory import (
     NullMemoryProvider,
     MemoryResult,
     shadow_retrieve,
+    shadow_telemetry,
 )
 from agent_crew.memory_runtime import (
     MemoryRecord, MemoryScope, RuntimeMemoryProvider, SQLiteMemoryStorage,
@@ -166,6 +167,7 @@ class _CrossProjectProvider:
     def retrieve(self, request):
         return MemoryResult(provider=self.name, backend=self.backend, state="results", items=(
             _item("project-a", "project-a"), _item("project-b", "project-b"),
+            _item("project-less", ""),
         ))
 
 
@@ -184,6 +186,9 @@ def test_existing_shadow_db_wires_runtime_provider_without_live_read_flag(
         "episodic", "episode-1", {"link": "git:episode-1", "topic": "prior result"},
         MemoryScope(project="project-a"),
     ))
+    storage.put(MemoryRecord(
+        "episodic", "unscoped-episode", {"topic": "unscoped result"}, MemoryScope(),
+    ))
     monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
     monkeypatch.delenv("AGENT_CREW_ADR001_MEMORY_ENABLED", raising=False)
     cmd, _, events, _ = _dispatch_snapshot(
@@ -194,6 +199,7 @@ def test_existing_shadow_db_wires_runtime_provider_without_live_read_flag(
     assert events[0]["backend"] == "sqlite"
     assert events[0]["state"] == "results"
     assert events[0]["result_ids"] == ["episode-1"]
+    assert events[0]["dropped_cross_project"] == 1
     assert "prior result" not in " ".join(map(str, cmd)).lower()
 
 
@@ -255,6 +261,8 @@ def test_shadow_retrieve_defense_in_depth_removes_cross_project_provider_items()
 
     assert result.state == "results"
     assert [item.item_id for item in result.items] == ["project-a"]
+    assert result.dropped_cross_project == 2
+    assert shadow_telemetry(result)["dropped_cross_project"] == 2
 
 
 def test_shadow_results_leave_baseline_prompt_and_dispatch_byte_identical(tmp_path, monkeypatch, *, unused_tcp_port):

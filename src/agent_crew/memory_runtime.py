@@ -246,9 +246,10 @@ def owner_statement_history(storage: MemoryStorage, project: str,
 def _scoped_owner_records(storage: MemoryStorage, project: str) -> list[MemoryRecord]:
     if not project:
         raise ValueError("owner project is required")
+    from .memory import same_memory_project
     records = [r for r in storage.retrieve(MemoryScope(project=project))
                if r.layer == "authoritative" and r.value.get("kind") == "owner_statement"
-               and r.scope.project == project]
+               and same_memory_project(project, r.scope.project)]
     for record in records:
         value = record.value
         expected = owner_statement_key(project, "telegram", str(value.get("chat_id") or ""),
@@ -297,7 +298,7 @@ class RuntimeMemoryProvider:
         self.fleet = fleet
 
     def retrieve(self, request):
-        from .memory import MemoryItem, MemoryResult
+        from .memory import MemoryItem, MemoryResult, same_memory_project
 
         # This adapter is only used by the shadow dispatch seam. Its flag is
         # AGENT_CREW_SHADOW_MEMORY_ENABLED; the live-read flag belongs solely
@@ -311,6 +312,9 @@ class RuntimeMemoryProvider:
         allowed = set(request.memory_types) if request.memory_types else {"procedural", "episodic"}
         records = [record for record in records if record.layer in allowed
                    and record.layer in {"procedural", "episodic"}]
+        scoped = [record for record in records
+                  if same_memory_project(request.project, record.scope.project)]
+        dropped = len(records) - len(scoped)
         items = tuple(MemoryItem(
             item_id=record.key,
             project=record.scope.project,
@@ -318,9 +322,10 @@ class RuntimeMemoryProvider:
             source_ref=str(record.value.get("link") or record.value.get("source_ref") or record.key),
             excerpt=str(record.value.get("topic") or record.value.get("text") or ""),
             rank=index,
-        ) for index, record in enumerate(records[:max(0, request.limit)], 1))
+        ) for index, record in enumerate(scoped[:max(0, request.limit)], 1))
         return MemoryResult(provider=self.name, backend=self.backend,
-                            state="results" if items else "empty", items=items)
+                            state="results" if items else "empty", items=items,
+                            dropped_cross_project=dropped)
 
 
 def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: MemoryScope) -> dict:
