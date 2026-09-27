@@ -19,8 +19,10 @@ from agent_crew.memory_runtime import RuntimeMemoryProvider, SQLiteMemoryStorage
 PROJECTS = ("alfred", "agent_crew", "quota-ops")
 BUILD = "a138976"
 TERMINAL = frozenset({"completed", "failed", "needs_human", "timed_out"})
-# These are local fixture prefixes; real task IDs are retained in the denominator.
+# Known local fixture families and exact IDs from the #430 incident. Keep short
+# IDs exact so a real task beginning with "impl-r" or "rev-s" stays in the sample.
 TEST_PREFIXES = ("test-", "t-e2e", "t-http-", "t-mcp-", "adm-", "ctl-", "cxc")
+TEST_IDS = frozenset({"t-mcp", "done-attempt", "impl-r", "rev-s"})
 
 
 def read_only(path: Path) -> sqlite3.Connection:
@@ -29,7 +31,7 @@ def read_only(path: Path) -> sqlite3.Connection:
 
 
 def is_test_id(task_id: str) -> bool:
-    return task_id.startswith(TEST_PREFIXES)
+    return task_id in TEST_IDS or task_id.startswith(TEST_PREFIXES)
 
 
 def select_tasks(db: sqlite3.Connection, build: str = BUILD) -> list[dict]:
