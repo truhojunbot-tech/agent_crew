@@ -46,6 +46,7 @@ from agent_crew.pipeline import (
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
 )
+from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
     AdmissionRefused, LateResultRejected, PausedError as _PausedError, TaskQueue,
 )
@@ -254,6 +255,7 @@ def build_mcp_server(
         try:
             task_type = queue.submit_result(task_id, result, nonce=_nonce,
                                             presenter=_presenter)
+            capture_result_best_effort(queue.db_path, task_id, result)
         except AdmissionRefused as exc:
             # Both transports or neither: HTTP answers 409 for a refused P2
             # RESULT, so MCP refuses the same submission rather than letting

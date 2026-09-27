@@ -336,10 +336,31 @@ observe (task↔context attribution, retry/fallback lineage, restart recovery).
 | `AGENT_CREW_MAIN_BRANCH` | `main` | Default main branch name |
 | `AGENT_CREW_SHADOW_MEMORY_ENABLED` | off | Enable bounded, telemetry-only memory retrieval at dispatch |
 | `AGENT_CREW_SHADOW_MEMORY_DB` | unset | Existing SQLite memory file for shadow retrieval (canonical path: `~/.agent_crew/memory/adr001_memory.db`); missing files use the null provider |
+| `AGENT_CREW_SHADOW_MEMORY_CAPTURE_ENABLED` | on when DB set | Independent switch for best-effort terminal-result capture (`0` disables writes) |
 | `AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS` | `0.05` | Maximum wait for a shadow retrieval before dispatch continues |
 | `GH_TOKEN` / `GITHUB_TOKEN` | — | GitHub API token (for triage/PR features) |
 | `TELEGRAM_BOT_TOKEN` | — | Telegram bot token (for notifications) |
 | `TELEGRAM_CHAT_ID` | — | Telegram chat ID for notifications |
+
+When `AGENT_CREW_SHADOW_MEMORY_DB` names an existing file, terminal task results
+also capture project-scoped episodic, decision, and failure evidence in that
+file. Capture is best-effort and does not enable `AGENT_CREW_ADR001_MEMORY_ENABLED`
+or promote procedural candidates. Live reconstruction includes only
+authoritative, checkpoint, and procedural layers; captured episodic, decision,
+and failure evidence remains in shadow retrieval. Capture batches its writes
+and retains at most 900 task/episode rows per project. Rejected captures and
+their latency appear as `shadow_memory_capture` context events.
+
+To import historical evidence, run
+`PYTHONPATH=src python3 scripts/import_shadow_memory.py DB --episodes-jsonl FILE --project PROJECT`,
+or use `--blackboard-jsonl FILE` for Blackboard JSONL. Import defaults to a
+dry run; add `--apply` to write. For a `Quota` source,
+provide a repo URL or name that identifies `quota-ops` or `quota-core`.
+Unknown or ambiguous project names are rejected. To preview authoritative
+project-key migration, run
+`PYTHONPATH=src python3 scripts/migrate_memory_project_keys.py DB`, then repeat
+with `--apply` after reviewing its counts. Apply creates `DB.bak` first; the
+server never runs this migration.
 
 ## License
 

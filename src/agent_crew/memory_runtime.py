@@ -11,7 +11,8 @@ from contextlib import closing
 from dataclasses import dataclass, asdict
 from typing import Optional, Protocol
 
-LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic"})
+LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
+                    "decision", "failure_pattern"})
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,15 @@ class SQLiteMemoryStorage:
             self._migrate_legacy_generation_zero(db)
             db.commit()
 
+    @classmethod
+    def existing(cls, path: str) -> "SQLiteMemoryStorage":
+        """Use a provisioned shadow DB without running schema migration on POST."""
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        instance = cls.__new__(cls)
+        instance.path = path
+        return instance
+
     @staticmethod
     def _migrate_legacy_generation_zero(db: sqlite3.Connection) -> None:
         rows = db.execute("SELECT layer,key,value,scope,version,created FROM adr001_memory WHERE json_extract(scope, '$.context_generation') = 0").fetchall()
@@ -133,6 +143,41 @@ class SQLiteMemoryStorage:
                 ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
                 WHERE excluded.version > adr001_memory.version""",
                 (record.layer, record.key, json.dumps(record.value), _canonical_scope_json(record.scope), record.version, time.time())); db.commit()
+
+    def put_many_shadow(self, records: list[MemoryRecord], *, retire_keys: tuple[str, ...] = (),
+                        max_rows_per_project: int = 900) -> None:
+        """Batch derived evidence in one bounded transaction, pruning old captures."""
+        if not records:
+            return
+        project = records[0].scope.project
+        if not project or any(r.scope.project != project or r.layer not in {
+                "episodic", "decision", "failure_pattern"} for r in records):
+            raise ValueError("shadow batch requires one project and derived layers")
+        with closing(sqlite3.connect(self.path, timeout=0.05)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            for record in records:
+                scope = _canonical_scope_json(record.scope)
+                prior = db.execute("SELECT value,version FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
+                                   (record.layer, record.key, scope)).fetchone()
+                if prior and json.loads(prior[0]) == record.value:
+                    continue
+                version = prior[1] + 1 if prior else 1
+                db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
+                    ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,
+                    version=excluded.version,created=excluded.created""",
+                    (record.layer, record.key, json.dumps(record.value), scope,
+                     version, time.time()))
+            for key in retire_keys:
+                db.execute("DELETE FROM adr001_memory WHERE layer='failure_pattern' AND key=? AND scope=?",
+                           (key, _canonical_scope_json(records[0].scope)))
+            db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
+                SELECT rowid FROM adr001_memory
+                WHERE layer IN ('episodic','decision','failure_pattern')
+                  AND json_extract(scope, '$.project')=?
+                  AND (key GLOB 'task:*' OR key GLOB 'episode:*')
+                ORDER BY created DESC,rowid DESC LIMIT -1 OFFSET ?)""",
+                (project, max_rows_per_project))
+            db.commit()
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
         fields = asdict(scope)
         clauses, params = [], []
@@ -165,6 +210,41 @@ class SQLiteMemoryStorage:
             specificity = _scope_specificity(record.scope)
             return (-relevance, -specificity, record.key)
         return sorted(result, key=rank)
+
+    def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int
+                        ) -> tuple[list[MemoryRecord], int]:
+        """Bound parsing to recent candidates and count project-less drops."""
+        if not scope.project or not layers or limit <= 0:
+            return [], 0
+        clauses, params = [], []
+        for name, value in asdict(scope).items():
+            if name == "project":
+                continue
+            path = f"$.{name}"
+            if name == "context_generation":
+                clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
+                               "OR json_extract(scope, ?) = 0 OR json_extract(scope, ?) = ?)")
+                params.extend((path, path, path, path, value))
+            else:
+                clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
+                               "OR json_extract(scope, ?) = ?)")
+                params.extend((path, path, path, value))
+        base = ("layer IN (" + ",".join("?" for _ in layers) + ") AND "
+                + " AND ".join(clauses)
+                + " AND json_extract(value,'$.invalidated_at') IS NULL"
+                + " AND json_extract(value,'$.superseded_at') IS NULL"
+                + " AND COALESCE(json_extract(value,'$.superseded'),0)=0")
+        args = [*sorted(layers), *params]
+        with closing(sqlite3.connect(self.path, timeout=0.05)) as db:
+            dropped = db.execute("SELECT count(*) FROM adr001_memory WHERE " + base +
+                " AND COALESCE(json_extract(scope,'$.project'),'')=''", args).fetchone()[0]
+            rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
+                + base + " AND json_extract(scope,'$.project')=? "
+                "ORDER BY created DESC,rowid DESC LIMIT ?",
+                [*args, scope.project, min(limit, 50)]).fetchall()
+        records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+                                version) for layer, key, value, record_scope, version in rows]
+        return [r for r in records if _scope_applies(r.scope, scope)], dropped
 
 
 def owner_statement_key(project: str, channel: str, chat_id: str,
@@ -308,13 +388,16 @@ class RuntimeMemoryProvider:
         scope = MemoryScope(fleet=self.fleet, project=request.project,
                             issue=request.issue, task_id=request.task_id,
                             context_generation=request.context_generation)
-        records = self.storage.retrieve(scope, query=request.retrieval_query)
-        allowed = set(request.memory_types) if request.memory_types else {"procedural", "episodic"}
-        records = [record for record in records if record.layer in allowed
-                   and record.layer in {"procedural", "episodic"}]
-        scoped = [record for record in records
-                  if same_memory_project(request.project, record.scope.project)]
-        dropped = len(records) - len(scoped)
+        allowed = set(request.memory_types) if request.memory_types else {
+            "procedural", "episodic", "decision", "failure_pattern"}
+        allowed &= {"procedural", "episodic", "decision", "failure_pattern"}
+        if isinstance(self.storage, SQLiteMemoryStorage):
+            scoped, dropped = self.storage.retrieve_shadow(scope, allowed, request.limit)
+        else:
+            records = [record for record in self.storage.retrieve(scope,
+                query=request.retrieval_query) if record.layer in allowed]
+            scoped = [r for r in records if same_memory_project(request.project, r.scope.project)]
+            dropped = len(records) - len(scoped)
         items = tuple(MemoryItem(
             item_id=record.key,
             project=record.scope.project,
@@ -331,7 +414,9 @@ class RuntimeMemoryProvider:
 def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: MemoryScope) -> dict:
     """Quality-first pack: authoritative refs are always included; no budget trimming."""
     if not memory_enabled(): return {"enabled": False, "records": []}
-    records = storage.retrieve(scope, query=f"{role} {task_id}") + storage.retrieve(scope, exact_key=task_id)
+    live_layers = {"authoritative", "checkpoint", "procedural"}
+    records = [r for r in storage.retrieve(scope, query=f"{role} {task_id}")
+               + storage.retrieve(scope, exact_key=task_id) if r.layer in live_layers]
     # Truth and checkpoint state are mandatory quality inputs, independent of
     # lexical relevance or any future economics budget.
     records += [r for r in storage.retrieve(scope) if r.layer in {"authoritative", "checkpoint"}]
