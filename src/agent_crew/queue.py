@@ -4639,9 +4639,9 @@ class TaskQueue:
         """Latest observed sign of life. Snapshot only — a heartbeat every
         tick in the history would bury the transitions it exists for.
 
-        ``source`` says who observed it (`pane_busy`, `process_alive`,
-        `worker_checkpoint`). None of the three is the agent asserting
-        progress, and the column must not be read as if it were.
+        ``source`` says what was observed (`pane_busy`, `output_progress`,
+        `worker_checkpoint`). ``output_progress`` means the dispatcher's
+        subprocess log grew; it is the activity signal used by the idle timer.
         """
         at = time.time() if ts is None else ts
         conn = self._connect()

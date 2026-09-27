@@ -439,7 +439,10 @@ def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
         returncode = None
 
         async def wait(self):
-            await asyncio.sleep(0.05)                  # long enough for a heartbeat
+            await asyncio.sleep(0.02)
+            with open(self.log_path, "ab") as stream:
+                stream.write(b'{"type":"progress"}\n')
+            await asyncio.sleep(0.03)
             self.returncode = 0
             return 0
 
@@ -447,7 +450,9 @@ def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
             return b"", b""
 
     async def _fake_exec(*cmd, **kwargs):
-        return _Proc()
+        proc = _Proc()
+        proc.log_path = kwargs["stdout"].name
+        return proc
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
@@ -479,7 +484,7 @@ def test_dispatcher_path_records_pid_lease_and_heartbeat(tmp_path, monkeypatch):
     # (`_end_lease_on`), so the bound owner is no longer on the row.
     assert state["lease_owner"] is None
     assert dispatched["lease_expires_at"] == pytest.approx(dispatched["at"] + 600.0)
-    assert state["last_heartbeat_source"] == "process_alive"
+    assert state["last_heartbeat_source"] == "output_progress"
     assert state["last_heartbeat_at"] >= state["dispatched_at"]
 
 
