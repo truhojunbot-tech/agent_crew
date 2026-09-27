@@ -4,6 +4,7 @@
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export CREW_AUTHZ_LAUNCHER_SOURCE="$SCRIPT_DIR/broker-launch.sh"
+export CREW_AUTHZ_UPDATER_SOURCE="$SCRIPT_DIR/broker-update"
 export CREW_AUTHZ_SOURCE_COMMIT="$(git -C "$SCRIPT_DIR" rev-parse HEAD)"
 export CREW_AUTHZ_SOURCE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
 python3 - "$@" <<'PY'
@@ -29,6 +30,7 @@ mode.add_argument("--undo", action="store_true")
 mode.add_argument("--rehearse", action="store_true", help="run a real isolated update without root")
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
 p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
+p.add_argument("--owner-t0-pubkey", type=Path, help="separate owner T0 Ed25519 public key required to enable root updater sudoers grant")
 p.add_argument("--snapshot-path", type=Path, help="canonical signed snapshot to seed the rollback guard")
 p.add_argument("--root-prefix", type=Path, help=argparse.SUPPRESS)
 p.add_argument("--update-src", action="store_true", help="update broker source from this clean checkout")
@@ -57,6 +59,9 @@ if args.rehearse:
          path("/home/truhojun/alfred/governance/ssot-producer-ed25519.pub")),
         (args.snapshot_path or Path("/home/truhojun/alfred/governance/cea_policy_snapshot.json"),
          path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")))
+    if args.owner_t0_pubkey:
+        rehearsal_inputs += ((args.owner_t0_pubkey,
+                              path("/rehearsal/owner-t0.pub")),)
     for source_input, destination in rehearsal_inputs:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_input, destination)
@@ -68,6 +73,8 @@ if args.rehearse:
     args.caller_tokens = path("/rehearsal/caller-tokens.json")
     args.snapshot_pubkey = None
     args.snapshot_path = None
+    if args.owner_t0_pubkey:
+        args.owner_t0_pubkey = path("/rehearsal/owner-t0.pub")
 def run(*cmd, capture=False):
     return subprocess.run(cmd, check=True, text=True, capture_output=capture)
 def say(message):
@@ -86,7 +93,10 @@ def read_broker_env(config):
 
 tree = path("/opt/agent_crew-authz")
 launcher = path("/usr/local/libexec/crew-authz/broker-launch.sh")
+updater = launcher.with_name("broker-update")
 sudoers = path("/etc/sudoers.d/crew-authz-broker")
+launcher_sudoers = "truhojun ALL=(crew-authz) NOPASSWD: /usr/local/libexec/crew-authz/broker-launch.sh\n"
+updater_sudoers = "truhojun ALL=(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*\n"
 db = path("/home/truhojun/.agent_crew/alfred/tasks.db")
 crew_dir = path("/home/truhojun/.agent_crew")
 alfred_dir = db.parent
@@ -109,12 +119,22 @@ if token_source is None and not (args.undo or args.update_src):
                     token_source = path(str(candidate)) if fake else candidate
                 break
 snapshot_source = args.snapshot_pubkey or path("/home/truhojun/alfred/governance/ssot-producer-ed25519.pub")
+owner_t0_source = args.owner_t0_pubkey
+if fake and owner_t0_source and owner_t0_source.is_absolute() and not owner_t0_source.is_relative_to(root):
+    owner_t0_source = path(str(owner_t0_source))
+pinned_owner_t0 = tree / "owner-t0.pub"
+existing_owner_t0 = (args.update_src and pinned_owner_t0.is_file() and
+                     not pinned_owner_t0.is_symlink() and
+                     not pinned_owner_t0.stat().st_mode & 0o022 and
+                     (not privileged or pinned_owner_t0.stat().st_uid == 0))
+sudoers_content = launcher_sudoers + (updater_sudoers if owner_t0_source or existing_owner_t0 else "")
 if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snapshot_source.is_relative_to(root):
     snapshot_source = path(str(snapshot_source))
 snapshot_path = args.snapshot_path or path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")
 if fake and args.snapshot_path and snapshot_path.is_absolute() and not snapshot_path.is_relative_to(root):
     snapshot_path = path(str(snapshot_path))
 source_launcher = Path(os.environ["CREW_AUTHZ_LAUNCHER_SOURCE"])
+source_updater = Path(os.environ["CREW_AUTHZ_UPDATER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
 source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
 sys.path.insert(0, str(source_root / "src"))
@@ -130,7 +150,9 @@ def update_backups():
     # Keep this list aligned with the update's atomic swap list below.
     return [tree / (name + ".old") for name in
             ("src", "tests", "venv", "state", "caller-tokens.json",
-             "receipt-signing.key", "receipt-signing.pub")] + [launcher.with_name("broker-launch.old")]
+             "receipt-signing.key", "receipt-signing.pub")] + [launcher.with_name("broker-launch.old"),
+             updater.with_name("broker-update.old"), sudoers.with_name("crew-authz-broker.old"),
+             tree / "snapshot.pub.old", tree / "owner-t0.pub.old"]
 
 def completed_update_leftovers():
     """Return rotatable backups, or a reason an earlier update needs recovery."""
@@ -140,6 +162,9 @@ def completed_update_leftovers():
     staged += [tree / name for name in ("caller-tokens.new", "receipt-signing.key.new",
                                         "receipt-signing.pub.new")]
     staged.append(launcher.with_name("broker-launch.new"))
+    staged.append(updater.with_name("broker-update.new"))
+    staged.extend((sudoers.with_name("crew-authz-broker.new"), tree / "snapshot.pub.new",
+                   tree / "owner-t0.pub.new"))
     if any(item.exists() for item in staged):
         return [], "source update staging exists; inspect and remove it before retrying"
     backups = [item for item in update_backups() if item.exists()]
@@ -296,6 +321,10 @@ def apply_preconditions(source_update=False):
         failures.append(f"frozen receipt schema missing or wrong blob: {schema_source}; recover with: git checkout -- tests/cea_contract/receipt.schema.json")
     if not requirements.is_file():
         failures.append(f"pinned broker requirements missing: {requirements}; recover by restoring checkout")
+    if not source_updater.is_file() or source_updater.is_symlink():
+        failures.append(f"updater source missing or linked: {source_updater}")
+    if owner_t0_source and (not owner_t0_source.is_file() or owner_t0_source.is_symlink()):
+        failures.append(f"owner T0 public key missing or linked: {owner_t0_source}")
     if source_update:
         broker_config = tree / "broker.env"
         broker_content = read_broker_env(broker_config)
@@ -465,6 +494,18 @@ if args.update_src:
             os.replace(old_launcher, launcher)
         elif not saved.get("had_launcher"):
             launcher.unlink(missing_ok=True)
+        old_updater = updater.with_name("broker-update.old")
+        if saved.get("had_updater") and old_updater.exists():
+            os.replace(old_updater, updater)
+        elif not saved.get("had_updater"):
+            updater.unlink(missing_ok=True)
+        for live, backup, key in ((sudoers, sudoers.with_name("crew-authz-broker.old"), "had_sudoers"),
+                                  (tree / "snapshot.pub", tree / "snapshot.pub.old", "had_snapshot_pub"),
+                                  (tree / "owner-t0.pub", tree / "owner-t0.pub.old", "had_owner_t0_pub")):
+            if saved.get(key) and backup.exists():
+                os.replace(backup, live)
+            elif not saved.get(key):
+                live.unlink(missing_ok=True)
         if saved["old_commit"] is None:
             marker.unlink(missing_ok=True)
         else:
@@ -503,8 +544,13 @@ if args.update_src:
     public_stage = tree / "receipt-signing.pub.new"
     state_stage = tree / "state.new"
     launcher_stage = launcher.with_name("broker-launch.new")
+    updater_stage = updater.with_name("broker-update.new")
+    sudoers_stage = sudoers.with_name("crew-authz-broker.new")
+    snapshot_pub_stage = tree / "snapshot.pub.new"
+    owner_t0_stage = tree / "owner-t0.pub.new"
     staged_paths = (staging, schema_stage, venv_stage, token_stage, private_stage,
-                    public_stage, state_stage, launcher_stage)
+                    public_stage, state_stage, launcher_stage, updater_stage,
+                    sudoers_stage, snapshot_pub_stage, owner_t0_stage)
     if any(item.exists() for item in staged_paths):
         raise SystemExit("staged update files exist; inspect and remove before retrying")
     try:
@@ -584,8 +630,23 @@ if args.update_src:
         launcher_stage.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_launcher, launcher_stage)
         os.chmod(launcher_stage, 0o755)
+        shutil.copyfile(source_updater, updater_stage)
+        os.chmod(updater_stage, 0o755)
+        shutil.copyfile(snapshot_source, snapshot_pub_stage)
+        os.chmod(snapshot_pub_stage, 0o644)
+        if owner_t0_source:
+            shutil.copyfile(owner_t0_source, owner_t0_stage)
+            os.chmod(owner_t0_stage, 0o644)
+        sudoers_stage.parent.mkdir(parents=True, exist_ok=True)
+        sudoers_stage.write_text(sudoers_content)
+        os.chmod(sudoers_stage, 0o440)
         if privileged:
             os.chown(launcher_stage, 0, 0)
+            os.chown(updater_stage, 0, 0)
+            os.chown(snapshot_pub_stage, 0, 0)
+            if owner_t0_source: os.chown(owner_t0_stage, 0, 0)
+            os.chown(sudoers_stage, 0, 0)
+            run("visudo", "-cf", str(sudoers_stage))
     except Exception:
         for item in staged_paths:
             if item.is_dir(): shutil.rmtree(item)
@@ -597,7 +658,11 @@ if args.update_src:
              "had_venv": venv.is_dir(), "had_tokens": (tree / "caller-tokens.json").is_file(),
              "had_receipt-signing.key": (tree / "receipt-signing.key").is_file(),
              "had_receipt-signing.pub": (tree / "receipt-signing.pub").is_file(),
-             "had_launcher": launcher.is_file(), "old_commit": old_commit,
+             "had_launcher": launcher.is_file(), "had_updater": updater.is_file(),
+             "had_sudoers": sudoers.is_file(),
+             "had_snapshot_pub": (tree / "snapshot.pub").is_file(),
+             "had_owner_t0_pub": (tree / "owner-t0.pub").is_file(),
+             "old_commit": old_commit,
              "new_commit": source_commit, "tree_mode": stat.S_IMODE(tree.stat().st_mode)}
     swaps = [(installed, previous, staging), (tree / "tests", tree / "tests.old", schema_stage),
              (venv, tree / "venv.old", venv_stage),
@@ -605,10 +670,16 @@ if args.update_src:
              (tree / "caller-tokens.json", tree / "caller-tokens.json.old", token_stage),
              (tree / "receipt-signing.key", tree / "receipt-signing.key.old", private_stage),
              (tree / "receipt-signing.pub", tree / "receipt-signing.pub.old", public_stage),
-             (launcher, launcher.with_name("broker-launch.old"), launcher_stage)]
+             (launcher, launcher.with_name("broker-launch.old"), launcher_stage),
+             (updater, updater.with_name("broker-update.old"), updater_stage),
+             (sudoers, sudoers.with_name("crew-authz-broker.old"), sudoers_stage),
+             (tree / "snapshot.pub", tree / "snapshot.pub.old", snapshot_pub_stage)]
+    if owner_t0_source:
+        swaps.append((tree / "owner-t0.pub", tree / "owner-t0.pub.old", owner_t0_stage))
     try:
         for stage, (live, backup, new) in zip(("src", "schema", "venv", "state", "tokens", "receipt-key",
-                                               "receipt-pubkey", "launcher"), swaps):
+                                               "receipt-pubkey", "launcher", "updater", "sudoers", "snapshot-pubkey",
+                                               "owner-t0-pubkey"), swaps):
             if backup.exists():
                 raise RuntimeError(f"update backup already exists: {backup}")
             if live.exists():
@@ -669,6 +740,8 @@ def check_safe():
         raise RuntimeError(f"missing tasks DB: {db}")
     if not source_launcher.is_file():
         raise RuntimeError(f"missing launcher source: {source_launcher}")
+    if not source_updater.is_file() or source_updater.is_symlink():
+        raise RuntimeError(f"missing or linked updater source: {source_updater}")
 
 def parse_broker_env(content):
     values = {}
@@ -795,6 +868,7 @@ plan = [
     f"copy caller tokens to {tree / 'caller-tokens.json'} crew-authz:crew-authz 0400",
     f"copy Ed25519 public key {snapshot_source} to {tree / 'snapshot.pub'} root:crew-authz 0644; remove staged HMAC key",
     f"copy launcher to {launcher} root:root 0755; root-own broker tree and remove group/other write",
+    f"install root-owned updater {updater} 0755 and single-argument sudoers rule",
     f"validate temporary sudoers with visudo -cf, then install {sudoers} 0440",
     f"write {tree / 'SRC_COMMIT'} = {source_commit}",
     f"sudo -u crew-authz {launcher} --check; require downgrade_reason=none",
@@ -813,6 +887,7 @@ commands = [
     f"setfacl -m u:crew-authz:rwx {alfred_dir}",
     f"setfacl -m u:crew-authz:rw- {db}",
     f"install -m 0755 {source_launcher} {launcher}",
+    f"install -m 0755 {source_updater} {updater}",
     f"install -m 0400 <caller tokens> {tree / 'caller-tokens.json'}",
     f"install -m 0644 {snapshot_source} {tree / 'snapshot.pub'}",
     "chown root:crew-authz <broker.env, caller tokens and snapshot.pub>",
@@ -917,11 +992,16 @@ try:
         run("chown", "root:root", str(launcher.parent))
     shutil.copyfile(source_launcher, launcher)
     os.chmod(launcher, 0o755)
+    shutil.copyfile(source_updater, updater)
+    os.chmod(updater, 0o755)
     shutil.copyfile(token_source, tree / "caller-tokens.json")
     os.chmod(tree / "caller-tokens.json", 0o400)
     (tree / "snapshot.key").unlink(missing_ok=True)
     shutil.copyfile(snapshot_source, tree / "snapshot.pub")
     os.chmod(tree / "snapshot.pub", 0o644)
+    if owner_t0_source:
+        shutil.copyfile(owner_t0_source, tree / "owner-t0.pub")
+        os.chmod(tree / "owner-t0.pub", 0o644)
     config.write_text(final_content)
     os.chmod(config, 0o640)
     (tree / "SRC_COMMIT").write_text(source_commit + "\n")
@@ -952,9 +1032,10 @@ try:
     if privileged:
         run("chown", "root:root", str(tree))
         run("chown", "root:root", str(launcher))
+        run("chown", "root:root", str(updater))
     sudoers.parent.mkdir(parents=True, exist_ok=True)
     temp = sudoers.with_name("crew-authz-broker.pending")
-    temp.write_text("truhojun ALL=(crew-authz) NOPASSWD: /usr/local/libexec/crew-authz/broker-launch.sh\n")
+    temp.write_text(sudoers_content)
     os.chmod(temp, 0o440)
     if privileged:
         run("chown", "root:root", str(temp))

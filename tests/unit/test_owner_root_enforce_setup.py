@@ -221,6 +221,10 @@ def test_apply_and_undo_restore_existing_files(tmp_path):
     assert "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE" not in (tree / "broker.env").read_text()
     assert "crew-authz-clients" in (tree / "broker.env").read_text()
     assert "libexec/crew-authz/broker-launch.sh" in sudoers.read_text()
+    updater = tmp_path / "usr/local/libexec/crew-authz/broker-update"
+    assert updater.is_file() and updater.stat().st_mode & 0o777 == 0o755
+    assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update" not in sudoers.read_text()
+    assert not (tree / "owner-t0.pub").exists()
     assert (tmp_path / "var/lib/crew-authz/owner-root-enforce/manifest.json").exists()
     repeat = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert repeat.returncode == 0, repeat.stderr
@@ -247,6 +251,39 @@ def test_public_key_source_can_be_overridden(tmp_path):
     assert result.returncode == 0, result.stderr
     assert (tree / "snapshot.pub").read_bytes() == alternate.read_bytes()
     assert "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE" not in (tree / "broker.env").read_text()
+
+
+def test_optional_owner_t0_pubkey_is_installed_and_undone(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    source = tmp_path / "owner-t0.pub"
+    source.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    applied = _run(tmp_path, "--apply", "--caller-tokens",
+                   "/home/truhojun/.verify-private/tokens.json", "--owner-t0-pubkey", str(source))
+    assert applied.returncode == 0, applied.stderr
+    installed = tree / "owner-t0.pub"
+    assert installed.read_bytes() == source.read_bytes()
+    assert installed.stat().st_mode & 0o777 == 0o644
+    sudoers = tmp_path / "etc/sudoers.d/crew-authz-broker"
+    assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*" in sudoers.read_text()
+    undone = _run(tmp_path, "--undo")
+    assert undone.returncode == 0, undone.stderr
+    assert not installed.exists()
+
+
+def test_source_update_retains_grant_for_installed_owner_key(tmp_path):
+    tree, _, sudoers = _seed(tmp_path)
+    source = tmp_path / "owner-t0.pub"
+    source.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    installed = tree / "owner-t0.pub"
+    installed.write_bytes(source.read_bytes())
+    installed.chmod(0o644)
+    result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert installed.read_bytes() == source.read_bytes()
+    assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*" in sudoers.read_text()
 
 
 def test_apply_requires_ed25519_public_key(tmp_path):
@@ -445,7 +482,7 @@ def test_update_src_refuses_symlinked_snapshot_state(tmp_path):
 
 
 @pytest.mark.parametrize("stage", ["src", "schema", "venv", "state", "tokens", "receipt-key",
-                                   "receipt-pubkey", "launcher", "selftest"])
+                                   "receipt-pubkey", "launcher", "updater", "sudoers", "snapshot-pubkey", "selftest"])
 def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     tree, _, _ = _seed(tmp_path)
     launcher = tmp_path / "usr/local/libexec/crew-authz/broker-launch.sh"
@@ -459,6 +496,9 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
             serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
             serialization.NoEncryption()),
         launcher: b"old launcher",
+        launcher.with_name("broker-update"): b"old updater",
+        tmp_path / "etc/sudoers.d/crew-authz-broker": b"old sudoers",
+        tree / "snapshot.pub": b"old snapshot pubkey",
     }
     old_key = Ed25519PrivateKey.from_private_bytes(paths[tree / "receipt-signing.key"])
     paths[tree / "receipt-signing.pub"] = old_key.public_key().public_bytes(
@@ -485,6 +525,8 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
         assert not (tree / name).exists()
     assert not launcher.with_name("broker-launch.old").exists()
     assert not launcher.with_name("broker-launch.new").exists()
+    assert not launcher.with_name("broker-update.old").exists()
+    assert not launcher.with_name("broker-update.new").exists()
 
 
 def test_update_src_undo_restores_every_saved_component(tmp_path):
@@ -497,7 +539,12 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
                (tree / "caller-tokens.json", tree / "caller-tokens.json.old", False),
                (tree / "receipt-signing.key", tree / "receipt-signing.key.old", False),
                (tree / "receipt-signing.pub", tree / "receipt-signing.pub.old", False),
-               (launcher, launcher.with_name("broker-launch.old"), False)]
+               (launcher, launcher.with_name("broker-launch.old"), False),
+               (launcher.with_name("broker-update"), launcher.with_name("broker-update.old"), False),
+               (tmp_path / "etc/sudoers.d/crew-authz-broker",
+                tmp_path / "etc/sudoers.d/crew-authz-broker.old", False),
+               (tree / "snapshot.pub", tree / "snapshot.pub.old", False),
+               (tree / "owner-t0.pub", tree / "owner-t0.pub.old", False)]
     for live, backup, directory in entries:
         live.parent.mkdir(parents=True, exist_ok=True)
         if directory:
@@ -513,6 +560,8 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
     manifest.write_text(json.dumps({"had_src": True, "had_tests": True, "had_venv": True,
                                     "had_state": True,
                                     "had_tokens": True, "had_launcher": True,
+                                    "had_updater": True, "had_sudoers": True,
+                                    "had_snapshot_pub": True, "had_owner_t0_pub": True,
                                     "had_receipt-signing.key": True,
                                     "had_receipt-signing.pub": True,
                                     "old_commit": "old-build\n"}))
