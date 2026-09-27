@@ -19,7 +19,7 @@ DEFAULT_PUBLIC = "/opt/agent_crew-authz/receipt-signing.pub"
 DISPATCH_BINDING = "signed_dispatch"
 VOLATILE_CONTEXT = frozenset({"cea_enqueue", "cea_cascade", "push_refusals",
     "push_refusal_reason", "push_not_before", "test_lock_defer_count",
-    "test_lock_first_deferred_at"})
+    "test_lock_first_deferred_at", "risk_declaration", "risk_tier_shadow"})
 
 
 def payload_hash(*, task_type: str, branch: str, description: str, context: dict) -> str:
@@ -99,15 +99,24 @@ def verify_signature(receipt: dict, public) -> bool:
 
 
 def verify(receipt: dict, public, *, task_id: str, payload: str,
-           receipt_id: str, now: float | None = None) -> tuple[bool, str | None]:
-    """Check cryptographic validity, exact task binding, ALLOW and freshness."""
+           receipt_id: str, now: float | None = None,
+           enforce_codes: frozenset[str] | None = None) -> tuple[bool, str | None]:
+    """Check signature and binding; staged enforcement admits advisory decisions."""
     if not verify_signature(receipt, public):
         return False, None
     binding = receipt["provenance"][DISPATCH_BINDING]
-    if (receipt.get("decision") != "ALLOW" or receipt.get("task_id") != task_id
+    decision = receipt.get("decision")
+    reason = receipt.get("reason") or {}
+    code = reason.get("code") if isinstance(reason, dict) else None
+    if decision not in ("ALLOW", "BLOCK", "REVIEW", "HUMAN_GATE"):
+        return False, None
+    if decision != "ALLOW" and (enforce_codes is None or not isinstance(code, str)
+                                or not code or code in enforce_codes):
+        return False, None
+    if (receipt.get("task_id") != task_id
             or receipt.get("receipt_id") != receipt_id
             or binding.get("task_id") != task_id or binding.get("receipt_id") != receipt_id
-            or binding.get("decision") != "ALLOW" or binding.get("payload_hash") != payload
+            or binding.get("decision") != decision or binding.get("payload_hash") != payload
             or not binding.get("serving_build_commit") or not binding.get("nonce")):
         return False, None
     try:

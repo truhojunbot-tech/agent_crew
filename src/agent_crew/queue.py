@@ -3315,7 +3315,11 @@ class TaskQueue:
             receipt_id, signed = self._cea_receipt_for_task_on(conn, task_id)
         except (ValueError, TypeError, KeyError):
             receipt_id, signed = (row["receipt_id"] if row else None), None
-        mode = self.cea_config(row["project"] if row else None).mode
+        # The signed receipt fixes the rollout project. The task row is worker
+        # writable and must not be able to select a weaker ENFORCE_CODES set.
+        claim_config = (self.cea_config_for_receipt(signed) if signed is not None
+                        else self.cea_config(row["project"] if row else None))
+        mode = claim_config.mode
         if mode in ("enforce", "test"):
             verified, nonce = False, None
             if row is not None and signed is not None:
@@ -3323,7 +3327,8 @@ class TaskQueue:
                     public = _signed_receipt.load_public(os.environ.get(
                         "AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE", _signed_receipt.DEFAULT_PUBLIC))
                     verified, nonce = _signed_receipt.verify(signed, public, task_id=task_id,
-                        receipt_id=receipt_id, payload=_signed_receipt.payload_hash(
+                        receipt_id=receipt_id, enforce_codes=claim_config.enforce_codes,
+                        payload=_signed_receipt.payload_hash(
                             task_type=row["task_type"], branch=row["branch"],
                             description=row["description"], context=json.loads(row["context"] or "{}")))
                 except (OSError, ValueError, TypeError, KeyError):
