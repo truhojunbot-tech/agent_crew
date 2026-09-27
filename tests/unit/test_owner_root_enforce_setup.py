@@ -1,5 +1,8 @@
 """Offline owner setup contract: all mutations stay under a fake root."""
 import json
+import base64
+import hashlib
+from datetime import datetime, timezone
 import os
 from pathlib import Path
 import shlex
@@ -68,8 +71,15 @@ def _seed(root):
     token.chmod(0o600)
     pubkey = root / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub"
     pubkey.parent.mkdir(parents=True)
-    pubkey.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
+    signing_key = Ed25519PrivateKey.generate()
+    pubkey.write_bytes(signing_key.public_key().public_bytes(
         serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    raw = signing_key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    body = {"generation": 2, "produced_at": datetime.now(timezone.utc).isoformat(), "decisions": []}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    (pubkey.parent / "control_policy_snapshot.json").write_text(json.dumps({**body,
+        "signature": {"ed25519": {"key_id": hashlib.sha256(raw).hexdigest()[:16],
+                                  "value": base64.b64encode(signing_key.sign(canonical)).decode()}}}))
     sudoers = root / "etc/sudoers.d/crew-authz-broker"
     sudoers.parent.mkdir(parents=True)
     sudoers.write_text("old sudoers\n")
@@ -319,6 +329,10 @@ def test_update_src_is_repeatable_without_owner_cleanup(tmp_path):
     assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
     assert (tree / "tests/cea_contract/receipt.schema.json").is_file()
     assert (tree / "venv/bin/python").is_file()
+    mark = tree / "state/snapshot-hwm.json"
+    assert json.loads(mark.read_text())["generation"] == 2
+    assert (tree / "state").stat().st_mode & 0o777 == 0o700
+    assert mark.stat().st_mode & 0o777 == 0o600
     assert (tree / "caller-tokens.json").is_file()
     assert (tmp_path / "usr/local/libexec/crew-authz/broker-launch.sh").is_file()
     assert (tree / "tests").stat().st_mode & 0o777 == 0o755
@@ -342,7 +356,20 @@ def test_update_src_is_repeatable_without_owner_cleanup(tmp_path):
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
 
 
-@pytest.mark.parametrize("stage", ["src", "schema", "venv", "tokens", "receipt-key",
+def test_update_src_refuses_symlinked_snapshot_state(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    state = tree / "state"
+    state.mkdir()
+    (state / "snapshot-hwm.json").symlink_to(tmp_path / "elsewhere.json")
+    result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json")
+    assert result.returncode != 0
+    assert "snapshot state contains a symlink" in result.stderr
+    assert not (tree / "state.new").exists()
+    assert (state / "snapshot-hwm.json").is_symlink()
+
+
+@pytest.mark.parametrize("stage", ["src", "schema", "venv", "state", "tokens", "receipt-key",
                                    "receipt-pubkey", "launcher", "selftest"])
 def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     tree, _, _ = _seed(tmp_path)
@@ -351,6 +378,7 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
         tree / "src/old.py": b"old source",
         tree / "tests/cea_contract/receipt.schema.json": b"old schema",
         tree / "venv/bin/python": b"old python",
+        tree / "state/snapshot-hwm.json": b'{"generation": 1, "content_hash": "sha256:old"}',
         tree / "caller-tokens.json": b"old tokens",
         tree / "receipt-signing.key": Ed25519PrivateKey.generate().private_bytes(
             serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
@@ -364,6 +392,8 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(contents)
     (tree / "caller-tokens.json").chmod(0o400)
+    (tree / "state").chmod(0o700)
+    (tree / "state/snapshot-hwm.json").chmod(0o600)
     (tree / "receipt-signing.key").chmod(0o400)
     before = {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in paths}
     result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
@@ -374,6 +404,7 @@ def test_update_failure_restores_all_installed_paths(tmp_path, stage):
     assert {path: (path.read_bytes(), path.stat().st_mode & 0o777) for path in paths} == before
     assert (tree / "SRC_COMMIT").read_text() == "old-build\n"
     for name in ("src.old", "src.new", "tests.old", "tests.new", "venv.old", "venv.new",
+                 "state.old", "state.new",
                  "caller-tokens.json.old", "caller-tokens.new", "receipt-signing.key.old",
                  "receipt-signing.key.new", "receipt-signing.pub.old", "receipt-signing.pub.new"):
         assert not (tree / name).exists()
@@ -387,6 +418,7 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
     entries = [(tree / "src", tree / "src.old", True),
                (tree / "tests", tree / "tests.old", True),
                (tree / "venv", tree / "venv.old", True),
+               (tree / "state", tree / "state.old", True),
                (tree / "caller-tokens.json", tree / "caller-tokens.json.old", False),
                (tree / "receipt-signing.key", tree / "receipt-signing.key.old", False),
                (tree / "receipt-signing.pub", tree / "receipt-signing.pub.old", False),
@@ -404,6 +436,7 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
     manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(json.dumps({"had_src": True, "had_tests": True, "had_venv": True,
+                                    "had_state": True,
                                     "had_tokens": True, "had_launcher": True,
                                     "had_receipt-signing.key": True,
                                     "had_receipt-signing.pub": True,

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Disposable socket ownership and authenticated cross-process broker proof."""
 import argparse
+import base64
 import grp
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -13,6 +15,20 @@ import subprocess
 import sys
 import tempfile
 import time
+
+
+def write_signed_snapshot(path, key, generation):
+    from datetime import datetime, timezone
+    from cryptography.hazmat.primitives import serialization
+    body = {"generation": generation, "produced_at": datetime.now(timezone.utc).isoformat(),
+            "decisions": []}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    path.write_text(json.dumps({**body, "signature": {"ed25519": {
+        "key_id": hashlib.sha256(raw).hexdigest()[:16],
+        "value": base64.b64encode(key.sign(canonical)).decode()}}}))
+    path.chmod(0o644)
+    return "sha256:" + hashlib.sha256(canonical).hexdigest()
 
 
 def client(sock, credential, expected_uid):
@@ -122,6 +138,18 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None):
             signing_public.chmod(0o644)
             if cross_uid:
                 os.chown(signing_private, broker_uid, broker_gid)
+        snapshot_key = Ed25519PrivateKey.generate()
+        snapshot_pub = root / "snapshot.pub"
+        snapshot_pub.write_bytes(snapshot_key.public_key().public_bytes(
+            serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+        snapshot_pub.chmod(0o644)
+        snapshot_file = root / "snapshot.json"
+        snapshot_hash = write_signed_snapshot(snapshot_file, snapshot_key, 2)
+        mark = private / "snapshot-hwm.json"
+        mark.write_text(json.dumps({"generation": 2, "content_hash": snapshot_hash}))
+        mark.chmod(0o600)
+        if cross_uid:
+            os.chown(mark, broker_uid, broker_gid)
         sockdir = root / "sock"
         sockdir.mkdir()
         if cross_uid:
@@ -149,7 +177,10 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None):
                    AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE=str(signing_public),
                    AGENT_CREW_CEA_CALLER_TOKENS=str(tokens), AGENT_CREW_CEA_MODE="enforce",
                    AGENT_CREW_CEA_REGISTRY_PATH=str(root / "absent-registry.json"),
-                   AGENT_CREW_CEA_SNAPSHOT_PATH=str(root / "absent-snapshot.json"),
+                   AGENT_CREW_CEA_SNAPSHOT_PATH=str(snapshot_file),
+                   AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE=str(snapshot_pub),
+                   AGENT_CREW_CEA_SNAPSHOT_HWM_FILE=str(mark),
+                   AGENT_CREW_CEA_ENFORCE_CODES="RUNTIME_STATE_FORBIDS,SNAPSHOT_ROLLBACK",
                    AGENT_CREW_CEA_QUOTA_CACHE_DIR=str(root / "absent-quota"),
                    AGENT_CREW_CEA_CODEX_AUTH_PATH=str(root / "absent-auth.json"))
         if installed_root:
@@ -192,8 +223,18 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None):
                 broker.terminate()
                 _, broker_error = broker.communicate(timeout=5)
                 raise RuntimeError(f"client failed: {result.stderr.strip()} broker: {broker_error}")
+            first = json.loads(result.stdout)
+            write_signed_snapshot(snapshot_file, snapshot_key, 1)
+            rollback = subprocess.run(client_cmd, env=client_env, capture_output=True, text=True, timeout=20)
+            if rollback.returncode:
+                raise RuntimeError(f"rollback client failed: {rollback.stderr.strip()}")
+            rollback_receipt = json.loads(rollback.stdout)
+            rollback_refused = rollback_receipt.get("decision") == "BLOCK" and rollback_receipt.get("authorize_code") == "SNAPSHOT_ROLLBACK"
+            if not rollback_refused:
+                raise RuntimeError(f"rollback was not refused: {rollback_receipt}")
             return {"pass": True, "cross_uid": cross_uid, "socket_uid": st.st_uid,
-                    "socket_gid": st.st_gid, "socket_mode": "0660", **json.loads(result.stdout)}
+                    "socket_gid": st.st_gid, "socket_mode": "0660", **first,
+                    "snapshot_rollback_refused": rollback_refused}
         finally:
             broker.terminate()
             try:

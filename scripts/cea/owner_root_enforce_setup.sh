@@ -26,6 +26,7 @@ mode.add_argument("--apply", action="store_true")
 mode.add_argument("--undo", action="store_true")
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
 p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
+p.add_argument("--snapshot-path", type=Path, help="canonical signed snapshot to seed the rollback guard")
 p.add_argument("--root-prefix", type=Path, help=argparse.SUPPRESS)
 p.add_argument("--update-src", action="store_true", help="update broker source from this clean checkout")
 args = p.parse_args()
@@ -80,6 +81,9 @@ if token_source is None and not (args.undo or args.update_src):
 snapshot_source = args.snapshot_pubkey or path("/home/truhojun/alfred/governance/ssot-producer-ed25519.pub")
 if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snapshot_source.is_relative_to(root):
     snapshot_source = path(str(snapshot_source))
+snapshot_path = args.snapshot_path or path("/home/truhojun/alfred/governance/control_policy_snapshot.json")
+if fake and args.snapshot_path and snapshot_path.is_absolute() and not snapshot_path.is_relative_to(root):
+    snapshot_path = path(str(snapshot_path))
 source_launcher = Path(os.environ["CREW_AUTHZ_LAUNCHER_SOURCE"])
 source_commit = os.environ["CREW_AUTHZ_SOURCE_COMMIT"]
 source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
@@ -159,7 +163,8 @@ def installed_selftest():
     evidence = json.loads(result.stdout)
     if (not evidence.get("pass") or not evidence.get("authenticated") or
             not evidence.get("schema_valid") or not evidence.get("signed_receipt_valid") or
-            not evidence.get("tampered_receipt_rejected") or evidence.get("downgrade_reason") is not None):
+            not evidence.get("tampered_receipt_rejected") or
+            not evidence.get("snapshot_rollback_refused") or evidence.get("downgrade_reason") is not None):
         raise RuntimeError(f"installed broker self-test failed: {evidence}")
     say("installed broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
 
@@ -195,6 +200,21 @@ def apply_preconditions(source_update=False):
     if not requirements.is_file():
         failures.append(f"pinned broker requirements missing: {requirements}; recover by restoring checkout")
     if source_update:
+        if not snapshot_path.is_file() or snapshot_path.is_symlink():
+            failures.append(f"signed snapshot missing: {snapshot_path}; recover by publishing a signed snapshot")
+        elif not os.access(snapshot_path, os.R_OK) or not os.access(snapshot_source, os.R_OK):
+            unverified.append(f"signed snapshot or public key unreadable as non-root: {snapshot_path}")
+        else:
+            try:
+                sys.path.insert(0, str(source_root / "src"))
+                from agent_crew.cea.input_providers.snapshot import CanonicalPolicySnapshotReader, ed25519_verifier
+                from agent_crew.cea.providers import SignatureStatus
+                current = CanonicalPolicySnapshotReader(str(snapshot_path),
+                    verifier=ed25519_verifier(snapshot_source.read_bytes())).current()
+                if current.signature is not SignatureStatus.VALID or not current.available:
+                    failures.append(f"current snapshot is not signed and fresh: {snapshot_path}; recover by publishing a signed snapshot")
+            except Exception as exc:
+                failures.append(f"snapshot verification failed: {exc}; recover by publishing a signed snapshot")
         if not venv.is_dir():
             unverified.append(f"pinned venv absent at {venv}; --update-src will build it")
         elif not (venv / "bin/python").exists():
@@ -306,7 +326,7 @@ if args.update_src:
             if not previous.is_dir():
                 raise SystemExit(f"source backup missing: {previous}")
             os.replace(previous, installed)
-        for name in ("tests", "venv"):
+        for name in ("tests", "venv", "state"):
             live, backup = tree / name, tree / (name + ".old")
             if live.exists():
                 shutil.rmtree(live)
@@ -359,9 +379,10 @@ if args.update_src:
     token_stage = tree / "caller-tokens.new"
     private_stage = tree / "receipt-signing.key.new"
     public_stage = tree / "receipt-signing.pub.new"
+    state_stage = tree / "state.new"
     launcher_stage = launcher.with_name("broker-launch.new")
     staged_paths = (staging, schema_stage, venv_stage, token_stage, private_stage,
-                    public_stage, launcher_stage)
+                    public_stage, state_stage, launcher_stage)
     if any(item.exists() for item in staged_paths):
         raise SystemExit("staged update files exist; inspect and remove before retrying")
     try:
@@ -371,6 +392,33 @@ if args.update_src:
         shutil.copyfile(schema_source, schema_stage / "cea_contract/receipt.schema.json")
         normalize(schema_stage)
         build_venv(venv_stage)
+        if not fake:
+            import pwd
+            authz = pwd.getpwnam("crew-authz")
+        sys.path.insert(0, str(staging))
+        from agent_crew.cea.input_providers.snapshot import (
+            CanonicalPolicySnapshotReader, check_high_water_mark, ed25519_verifier)
+        from agent_crew.cea.providers import SignatureStatus
+        verifier = ed25519_verifier(snapshot_source.read_bytes())
+        current = CanonicalPolicySnapshotReader(str(snapshot_path), verifier=verifier).current()
+        if current.signature is not SignatureStatus.VALID or not current.available:
+            raise RuntimeError(f"current snapshot is not signed and fresh: {snapshot_path}")
+        if (tree / "state").exists():
+            if (tree / "state").is_symlink() or any(
+                    item.is_symlink() for item in (tree / "state").rglob("*")):
+                raise RuntimeError("snapshot state contains a symlink")
+            shutil.copytree(tree / "state", state_stage, symlinks=True)
+        else:
+            state_stage.mkdir()
+        os.chmod(state_stage, 0o700)
+        if not fake:
+            os.chown(state_stage, authz.pw_uid, authz.pw_gid)
+        if check_high_water_mark(str(state_stage / "snapshot-hwm.json"),
+                                 current.generation, current.hash, bootstrap=True):
+            raise RuntimeError("current signed snapshot conflicts with existing high-water mark")
+        os.chmod(state_stage / "snapshot-hwm.json", 0o600)
+        if not fake:
+            os.chown(state_stage / "snapshot-hwm.json", authz.pw_uid, authz.pw_gid)
         shutil.copyfile(source_tokens, token_stage)
         os.chmod(token_stage, 0o400)
         if not fake:
@@ -413,6 +461,7 @@ if args.update_src:
         raise
     old_commit = marker.read_text() if marker.is_file() else None
     saved = {"had_src": installed.is_dir(), "had_tests": (tree / "tests").is_dir(),
+             "had_state": (tree / "state").is_dir(),
              "had_venv": venv.is_dir(), "had_tokens": (tree / "caller-tokens.json").is_file(),
              "had_receipt-signing.key": (tree / "receipt-signing.key").is_file(),
              "had_receipt-signing.pub": (tree / "receipt-signing.pub").is_file(),
@@ -420,12 +469,13 @@ if args.update_src:
              "new_commit": source_commit, "tree_mode": stat.S_IMODE(tree.stat().st_mode)}
     swaps = [(installed, previous, staging), (tree / "tests", tree / "tests.old", schema_stage),
              (venv, tree / "venv.old", venv_stage),
+             (tree / "state", tree / "state.old", state_stage),
              (tree / "caller-tokens.json", tree / "caller-tokens.json.old", token_stage),
              (tree / "receipt-signing.key", tree / "receipt-signing.key.old", private_stage),
              (tree / "receipt-signing.pub", tree / "receipt-signing.pub.old", public_stage),
              (launcher, launcher.with_name("broker-launch.old"), launcher_stage)]
     try:
-        for stage, (live, backup, new) in zip(("src", "schema", "venv", "tokens", "receipt-key",
+        for stage, (live, backup, new) in zip(("src", "schema", "venv", "state", "tokens", "receipt-key",
                                                "receipt-pubkey", "launcher"), swaps):
             if backup.exists():
                 raise RuntimeError(f"update backup already exists: {backup}")
@@ -585,8 +635,9 @@ try:
                  "AGENT_CREW_CEA_BROKER_DB": "/home/truhojun/.agent_crew/alfred/tasks.db",
                  "AGENT_CREW_CEA_CALLER_TOKENS": "/opt/agent_crew-authz/caller-tokens.json",
                  "AGENT_CREW_CEA_MODE": "enforce",
-                 "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS",
-                 "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE": "/opt/agent_crew-authz/snapshot.pub"}
+                 "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS,SNAPSHOT_ROLLBACK",
+                 "AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE": "/opt/agent_crew-authz/snapshot.pub",
+                 "AGENT_CREW_CEA_SNAPSHOT_HWM_FILE": "/opt/agent_crew-authz/state/snapshot-hwm.json"}
     retained = [line for line in (existing_content or "").splitlines()
                 if line.split("=", 1)[0] not in
                 (set(overrides) | {"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"})]

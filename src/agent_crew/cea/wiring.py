@@ -33,6 +33,8 @@ env                                      meaning
                                          input ⇒ BLOCK, exactly as before this module
 ``AGENT_CREW_CEA_SNAPSHOT_PUBKEY_FILE``  Ed25519 public key (PEM or raw); takes precedence
                                          over the HMAC key when both are configured
+``AGENT_CREW_CEA_SNAPSHOT_HWM_FILE``     Private generation/hash high-water mark; required
+                                         for signed snapshots in enforce mode
 ``AGENT_CREW_CEA_MEMORY_CMD``            L2/L3 provider command (``python3 …/admission_inputs.py``)
 ``AGENT_CREW_CEA_QUOTA_CACHE_DIR``       Qouta ``<dir>/<provider>_monitor/quota_cache.json``
 ``AGENT_CREW_CEA_CODEX_AUTH_PATH``       Codex account identity JSON (default ``~/.codex/auth.json``)
@@ -199,7 +201,7 @@ def build_wiring(env: Optional[dict] = None, *, db_path: Optional[str] = None,
     providers: dict = {}
     statuses: list[ProviderStatus] = []
 
-    snapshot_reader, snapshot_status, snapshot_verified = _snapshot(e)
+    snapshot_reader, snapshot_status, snapshot_verified = _snapshot(e, mode=mode)
     statuses.append(snapshot_status)
     if snapshot_reader is not None:
         providers["snapshots"] = snapshot_reader
@@ -232,7 +234,7 @@ def build_wiring(env: Optional[dict] = None, *, db_path: Optional[str] = None,
                   authority_reason=authority_reason, mode=mode, endpoint=None)
 
 
-def _snapshot(env: dict):
+def _snapshot(env: dict, *, mode: str = "shadow"):
     """(reader | None, status, verifier_configured)."""
     from agent_crew.cea.input_providers.snapshot import (
         CanonicalPolicySnapshotReader, ed25519_verifier, hmac_sha256_verifier)
@@ -274,7 +276,12 @@ def _snapshot(env: dict):
             note = f"key file {key_path} is empty; snapshot stays unverified"
 
     try:
-        reader = CanonicalPolicySnapshotReader(path, verifier=verifier, env=env)
+        hwm_path = _first(env, "AGENT_CREW_CEA_SNAPSHOT_HWM_FILE")
+        if not hwm_path and verified_key:
+            hwm_path = ("/opt/agent_crew-authz/state/snapshot-hwm.json" if mode == "enforce"
+                        else path + ".hwm")
+        reader = CanonicalPolicySnapshotReader(path, verifier=verifier, env=env,
+            hwm_path=hwm_path or None, hwm_enforce=mode == "enforce")
     except Exception as exc:                     # noqa: BLE001
         return None, ProviderStatus("snapshots", False, f"reader construction failed: {exc!r}"), False
     return reader, ProviderStatus("snapshots", True, f"{path}; {note}"), verified_key

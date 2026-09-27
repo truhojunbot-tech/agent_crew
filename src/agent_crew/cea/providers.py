@@ -68,6 +68,7 @@ class PolicySnapshotRef:
     human_gate_predicates: tuple[dict, ...] = ()
     """J8 — the snapshot's gate predicates. A gate exists only if a record here says so;
     a self-asserted flag on the request is never an input."""
+    rollback_status: Optional[str] = None
 
 
 @runtime_checkable

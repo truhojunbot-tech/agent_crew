@@ -31,6 +31,9 @@ import hmac
 import json
 import math
 import os
+import fcntl
+import tempfile
+from contextlib import contextmanager
 import time
 from datetime import datetime, timezone
 from typing import Callable, Optional
@@ -43,6 +46,58 @@ DEFAULT_SNAPSHOT = "/home/truhojun/alfred/governance/control_policy_snapshot.jso
 DEFAULT_MAX_AGE_SECONDS = 24 * 3600
 
 Verifier = Callable[[bytes, dict], SignatureStatus]
+
+
+@contextmanager
+def _directory_fd(path: str):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def check_high_water_mark(path: str, generation: int, content_hash: str, *,
+                          bootstrap: bool = False) -> Optional[str]:
+    """Compare and atomically advance a signed snapshot's generation.
+
+    The owner installer alone may bootstrap an absent enforce mark. Locking the
+    private directory serializes readers so an older concurrent read cannot
+    replace a newer mark. An invalid or unreadable mark always fails closed.
+    """
+    directory = os.path.dirname(os.path.abspath(path))
+    try:
+        with _directory_fd(directory) as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW), "r", encoding="utf-8") as fh:
+                    old = json.load(fh)
+                old_generation = old["generation"]
+                old_hash = old["content_hash"]
+                if type(old_generation) is not int or old_generation < 0 or not isinstance(old_hash, str) or not old_hash.startswith("sha256:"):
+                    return "SNAPSHOT_ROLLBACK"
+            except FileNotFoundError:
+                if not bootstrap:
+                    return "SNAPSHOT_ROLLBACK"
+                old_generation, old_hash = -1, ""
+            if generation < old_generation or (generation == old_generation and content_hash != old_hash):
+                return "SNAPSHOT_ROLLBACK"
+            if generation > old_generation:
+                fd, temporary = tempfile.mkstemp(prefix=".snapshot-hwm-", dir=directory)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                        json.dump({"generation": generation, "content_hash": content_hash}, fh, sort_keys=True)
+                        fh.flush()
+                        os.fsync(fh.fileno())
+                    os.chmod(temporary, 0o600)
+                    os.replace(temporary, path)
+                    os.fsync(lock)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+            return None
+    except (OSError, ValueError, KeyError, TypeError):
+        return "SNAPSHOT_ROLLBACK"
 
 
 def _canonical(body: dict) -> bytes:
@@ -86,12 +141,15 @@ def _in_scope(scope: dict, intent: Optional[Intent]) -> bool:
 class CanonicalPolicySnapshotReader:
     def __init__(self, path: Optional[str] = None, *, verifier: Optional[Verifier] = None,
                  max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS, clock=time.time,
-                 env: Optional[dict] = None):
+                 env: Optional[dict] = None, hwm_path: Optional[str] = None,
+                 hwm_enforce: bool = False):
         e = os.environ if env is None else env
         self.path = path or (e.get("AGENT_CREW_CEA_POLICY_SNAPSHOT") or "").strip() or DEFAULT_SNAPSHOT
         self.verifier = verifier
         self.max_age_seconds = max_age_seconds
         self._clock = clock
+        self.hwm_path = hwm_path
+        self.hwm_enforce = hwm_enforce
 
     def _unavailable(self) -> PolicySnapshotRef:
         return PolicySnapshotRef(generation=0, hash="", produced_at=None, decisions=(), available=False)
@@ -119,6 +177,17 @@ class CanonicalPolicySnapshotReader:
         else:
             status = SignatureStatus.UNKEYED if isinstance(sig, dict) else SignatureStatus.UNSIGNED
         now = self._clock()
+        content_hash = "sha256:" + hashlib.sha256(canon).hexdigest()
+        rollback_status = None
+        if self.hwm_path and status is SignatureStatus.VALID:
+            rollback_status = check_high_water_mark(self.hwm_path, generation, content_hash,
+                                                     bootstrap=not self.hwm_enforce)
+        elif self.hwm_path and self.hwm_enforce:
+            rollback_status = "SNAPSHOT_ROLLBACK"
+        if rollback_status and self.hwm_enforce:
+            return PolicySnapshotRef(generation=generation, hash=content_hash,
+                                     produced_at=None, decisions=(), signature=status,
+                                     available=False, rollback_status=rollback_status)
         decisions, in_scope = [], []
         for d in doc.get("decisions") or ():
             if not isinstance(d, dict) or not d.get("decision_id") or not d.get("body_hash"):
@@ -146,9 +215,10 @@ class CanonicalPolicySnapshotReader:
         age = None if produced is None else max(0.0, now - produced)
         fresh = age is not None and age <= self.max_age_seconds
         return PolicySnapshotRef(
-            generation=generation, hash="sha256:" + hashlib.sha256(canon).hexdigest(),
+            generation=generation, hash=content_hash,
             produced_at=produced, decisions=tuple(decisions), in_scope=tuple(in_scope),
             signature=status, age_seconds=age, available=fresh, tier=doc.get("tier"),
+            rollback_status=rollback_status,
             review_test_matrix=dict(doc.get("review_test_matrix") or {}),
             human_gate_predicates=tuple(p for p in doc.get("human_gate_predicates") or ()
                                         if isinstance(p, dict)))
