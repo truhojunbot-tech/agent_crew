@@ -451,12 +451,12 @@ def test_update_src_undo_restores_every_saved_component(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["--start", "--stop", "--restart", "--health"])
-def test_lifecycle_modes_are_out_of_scope_for_this_launcher(tmp_path, mode):
+def test_lifecycle_modes_require_service_uid(tmp_path, mode):
     launcher = SCRIPT.with_name("broker-launch.sh")
     result = subprocess.run(["bash", str(launcher), mode], text=True, capture_output=True,
                             env={**os.environ, "AGENT_CREW_AUTHZ_CONFIG": str(tmp_path / "missing.env")})
-    assert result.returncode == 2
-    assert f"unknown argument: {mode}" in result.stderr
+    assert result.returncode == 3
+    assert "lifecycle requires crew-authz" in result.stderr
 
 
 def test_unreadable_broker_env_previews_print_plans(tmp_path):

@@ -303,6 +303,12 @@ class Broker:
             return self.spawn(req)
         if op == "authorize":
             return self._authorize(req)
+        if op == "health":
+            # A socket connection alone does not prove that the installed
+            # broker can load its caller credentials.
+            token = req.get("credential")
+            caller = self.authenticator.authenticate(token) if self.authenticator else None
+            return {"ok": True} if caller is not None else {"ok": False, "error": "UNAUTHENTICATED"}
         if op == "status":
             return {"ok": True, "degraded": self.degraded, "registrations": len(self._regs),
                     "downgrade_reason": BROKER_TREE_USER_WRITABLE if self.tree_writable else None}

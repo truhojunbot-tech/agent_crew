@@ -519,7 +519,7 @@ if args.update_src:
         else: marker.write_text(old_commit)
         update_manifest.unlink(missing_ok=True)
         raise
-    say("source update complete; broker restart required to load new source (not performed by this script)")
+    say("source update complete; broker restart required to load new source (not performed by this script): sudo -n -u crew-authz /usr/local/libexec/crew-authz/broker-launch.sh --restart")
     sys.exit(0)
 
 targets = [tree, launcher.parent, sudoers]
