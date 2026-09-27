@@ -13,6 +13,7 @@
 #   (default)   refuse unless euid == crew-authz; exec the broker.
 #   --check     print uid, ptrace_scope, socket-dir perms, python import; exit 0/1.
 #   --degraded  run in the caller's uid; the broker NEVER issues VERIFIED.
+#   --start|--stop|--restart|--health  managed lifecycle as crew-authz.
 # Live broker lifecycle is managed separately from the owner update script.
 #
 # Tests inject a fake euid with AGENT_CREW_AUTHZ_FAKE_EUID. It only moves this
@@ -35,10 +36,15 @@ fi
 
 SERVICE_USER="crew-authz"
 MODE="run"
+if [[ $# -gt 1 ]]; then echo "broker-launch: exactly one mode is allowed" >&2; exit 2; fi
 for arg in "$@"; do
   case "$arg" in
     --check) MODE="check" ;;
     --degraded) MODE="degraded" ;;
+    --start) MODE="start" ;;
+    --stop) MODE="stop" ;;
+    --restart) MODE="restart" ;;
+    --health) MODE="health" ;;
     *) echo "broker-launch: unknown argument: $arg" >&2; exit 2 ;;
   esac
 done
@@ -158,10 +164,20 @@ if [[ "$MODE" == "run" && ( -z "$SERVICE_UID" || "$EUID_NOW" != "$SERVICE_UID" )
   echo "broker-launch: euid $EUID_NOW is not $SERVICE_USER (${SERVICE_UID:-missing}); refusing (use --degraded for an in-uid broker that never issues VERIFIED)" >&2
   exit 3
 fi
+if [[ "$MODE" == "start" || "$MODE" == "stop" || "$MODE" == "restart" || "$MODE" == "health" ]]; then
+  if [[ -z "$SERVICE_UID" || "$EUID_NOW" != "$SERVICE_UID" ]]; then
+    echo "broker-launch: lifecycle requires $SERVICE_USER via the sudoers-pinned launcher" >&2; exit 3
+  fi
+fi
 
 prepare_dir
 integrity_report >&2
 export PYTHONPATH="$PYPATH"
+if [[ "$MODE" == "start" || "$MODE" == "stop" || "$MODE" == "restart" || "$MODE" == "health" ]]; then
+  "$PYTHON" -m agent_crew.cea.broker_lifecycle "$MODE" "$SOCK_DIR" "$SERVICE_UID" \
+    "${AGENT_CREW_CEA_CALLER_TOKENS:-/opt/agent_crew-authz/caller-tokens.json}" "$PYTHON" "$CLIENT_UID"
+  exit $?
+fi
 ARGS=(--sock-dir "$SOCK_DIR" --client-uid "$CLIENT_UID")
 [[ "$MODE" == "degraded" ]] && ARGS+=(--degraded)
 if [[ -n "${AGENT_CREW_AUTHZ_DRY_RUN:-}" ]]; then

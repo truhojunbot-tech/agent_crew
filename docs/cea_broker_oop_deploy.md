@@ -33,3 +33,14 @@ The broker socket has group `crew-authz-clients` and mode 0660. A crew server st
 ## Rollback
 
 Unset `AGENT_CREW_CEA_BROKER_SOCKET`, swap the crew server back to the recorded pre-change build with `scripts/runtime_swap.sh`, and verify `/health`, process PID/port, and a fresh receipt. Stop the broker after the server no longer points at its socket. Do not alter the live sudoers rule outside the phase-2 owner step. Preserve the evidence and failed receipts for review.
+
+## Broker lifecycle after a source update
+
+The owner `--apply --update-src` stages the launcher byte for byte and verifies its SHA-256. It does not stop or start the live broker. After accepting the update, the coordinator uses the existing sudoers entry:
+
+```sh
+sudo -n -u crew-authz /usr/local/libexec/crew-authz/broker-launch.sh --restart
+sudo -n -u crew-authz /usr/local/libexec/crew-authz/broker-launch.sh --health
+```
+
+`--start`, `--stop`, `--restart`, and `--health` require the crew-authz uid. The launcher keeps `broker.pid` in its crew-authz-owned socket directory. Before signalling a PID it checks `/proc/<pid>/cmdline`, its start time, and its uid against this broker and socket directory. A stale PID is discarded; a foreign PID is refused without a signal. Stop sends SIGTERM and waits up to ten seconds; it does not send SIGKILL. Health connects to `broker.sock`, verifies the peer uid, and sends an authenticated no-op using the installed caller-token table. Restart reports failure if stop, start, or health fails; an owner can inspect `broker.log` in the socket directory. The broker is not restarted by the root update script.
