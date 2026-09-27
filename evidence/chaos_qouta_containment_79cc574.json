@@ -1,0 +1,86 @@
+{
+  "cases": [
+    {
+      "budget_state": "CONSTRAINED",
+      "case": "missing/duplicate",
+      "defense": "capability_registry_owner_conflict",
+      "dispatched": false,
+      "http_status": 423,
+      "receipt_outcome": "HUMAN_GATE",
+      "receipt_reason": {
+        "code": "OWNER_CONFLICT",
+        "text": "J5: this intent reuses a capability owned elsewhere with no verified owner approval (\u00a76.2); the owner decides, the engine does not"
+      },
+      "registry_match": "shared-blackboard-poster"
+    },
+    {
+      "budget_state": "CONSTRAINED",
+      "case": "missing/novel",
+      "defense": "review_contract",
+      "dispatched": null,
+      "http_status": 201,
+      "receipt_outcome": "REVIEW",
+      "receipt_reason": {
+        "code": "IDENTITY_UNVERIFIED_REVIEW_REQUIRED",
+        "text": "P2a: the review/test contract is an identity claim and the executor/caller binding is UNVERIFIED under a shared uid; admitted only with the named independent reviewer"
+      },
+      "registry_match": null
+    },
+    {
+      "budget_state": "CONSTRAINED",
+      "case": "empty/duplicate",
+      "defense": "capability_registry_owner_conflict",
+      "dispatched": false,
+      "http_status": 423,
+      "receipt_outcome": "HUMAN_GATE",
+      "receipt_reason": {
+        "code": "OWNER_CONFLICT",
+        "text": "J5: this intent reuses a capability owned elsewhere with no verified owner approval (\u00a76.2); the owner decides, the engine does not"
+      },
+      "registry_match": "shared-blackboard-poster"
+    },
+    {
+      "budget_state": "CONSTRAINED",
+      "case": "empty/novel",
+      "defense": "review_contract",
+      "dispatched": null,
+      "http_status": 201,
+      "receipt_outcome": "REVIEW",
+      "receipt_reason": {
+        "code": "IDENTITY_UNVERIFIED_REVIEW_REQUIRED",
+        "text": "P2a: the review/test contract is an identity claim and the executor/caller binding is UNVERIFIED under a shared uid; admitted only with the named independent reviewer"
+      },
+      "registry_match": null
+    },
+    {
+      "budget_state": "CONSTRAINED",
+      "case": "stale/duplicate",
+      "defense": "capability_registry_owner_conflict",
+      "dispatched": false,
+      "http_status": 423,
+      "receipt_outcome": "HUMAN_GATE",
+      "receipt_reason": {
+        "code": "OWNER_CONFLICT",
+        "text": "J5: this intent reuses a capability owned elsewhere with no verified owner approval (\u00a76.2); the owner decides, the engine does not"
+      },
+      "registry_match": "shared-blackboard-poster"
+    },
+    {
+      "budget_state": "CONSTRAINED",
+      "case": "stale/novel",
+      "defense": "review_contract",
+      "dispatched": null,
+      "http_status": 201,
+      "receipt_outcome": "REVIEW",
+      "receipt_reason": {
+        "code": "IDENTITY_UNVERIFIED_REVIEW_REQUIRED",
+        "text": "P2a: the review/test contract is an identity claim and the executor/caller binding is UNVERIFIED under a shared uid; admitted only with the named independent reviewer"
+      },
+      "registry_match": null
+    }
+  ],
+  "credit_class": "plan",
+  "passed": true,
+  "sandbox": "temporary HOME, quota, registry and queue; TestClient HTTP; tmux shim; free loopback port",
+  "scenario": "#428 / alfred#51"
+}
