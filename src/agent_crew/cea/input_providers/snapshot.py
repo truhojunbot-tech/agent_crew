@@ -25,6 +25,8 @@ Missing / unreadable / malformed file ⇒ ``available=False``. Older than
 from __future__ import annotations
 
 import calendar
+import base64
+import binascii
 import hashlib
 import hmac
 import json
@@ -158,4 +160,42 @@ def hmac_sha256_verifier(key: bytes) -> Verifier:
         expected = hmac.new(key, body, hashlib.sha256).hexdigest()
         return SignatureStatus.VALID if hmac.compare_digest(expected, value) \
             else SignatureStatus.INVALID
+    return verify
+
+
+def ed25519_verifier(public_key_bytes: bytes) -> Verifier:
+    """Verify ``signature.ed25519`` over the canonical snapshot body.
+
+    The optional cryptography dependency is imported only when this verifier is
+    configured. A public key may be raw Ed25519 bytes or PEM SubjectPublicKeyInfo.
+    """
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+    if len(public_key_bytes) == 32:
+        public_key = Ed25519PublicKey.from_public_bytes(public_key_bytes)
+    else:
+        public_key = serialization.load_pem_public_key(public_key_bytes)
+        if not isinstance(public_key, Ed25519PublicKey):
+            raise ValueError("snapshot public key is not Ed25519")
+    raw = public_key.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    key_id = hashlib.sha256(raw).hexdigest()[:16]
+
+    def verify(body: bytes, signature: dict) -> SignatureStatus:
+        nested = signature.get("ed25519") if isinstance(signature, dict) else None
+        if not isinstance(nested, dict) or nested.get("key_id") != key_id:
+            return SignatureStatus.INVALID
+        value = nested.get("value")
+        if not isinstance(value, str):
+            return SignatureStatus.INVALID
+        try:
+            decoded = base64.b64decode(value, validate=True)
+            if len(decoded) != 64:
+                return SignatureStatus.INVALID
+            public_key.verify(decoded, body)
+        except (ValueError, binascii.Error, InvalidSignature):
+            return SignatureStatus.INVALID
+        return SignatureStatus.VALID
+
     return verify
