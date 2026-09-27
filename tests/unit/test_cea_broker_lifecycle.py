@@ -58,6 +58,39 @@ def test_stale_pidfile_is_removed(tmp_path):
     life.stop(pidfile, tmp_path, os.geteuid())  # idempotent
 
 
+def test_verified_orphan_is_adopted_and_stopped(tmp_path, monkeypatch):
+    pid = 424242
+    expected = [sys.executable, "-m", "agent_crew.cea.broker", "--sock-dir", str(tmp_path),
+                "--client-uid", "1000"]
+    monkeypatch.setattr(life, "_socket_peer", lambda path: (pid, os.geteuid()))
+    monkeypatch.setattr(life, "_cmdline", lambda target: expected if target == pid else None)
+    monkeypatch.setattr(life, "_start_time", lambda target: "123")
+    monkeypatch.setattr(life, "_process_uid", lambda target: os.geteuid())
+    assert life.verified_orphan_pid(tmp_path, os.geteuid()) == pid
+    signals = []
+    monkeypatch.setattr(life.os, "kill", lambda target, sig: signals.append((target, sig)))
+    monkeypatch.setattr(life, "_cmdline", lambda target: None if signals else expected)
+    life.stop(tmp_path / "broker.pid", tmp_path, os.geteuid())
+    assert signals == [(pid, signal.SIGTERM)]
+
+
+@pytest.mark.parametrize("bad", ["uid", "peer_uid", "cmd", "sock_dir", "extra_arg"])
+def test_orphan_refuses_unverified_peer(tmp_path, monkeypatch, bad):
+    pid = 424242
+    cmd = [sys.executable, "-m", "agent_crew.cea.broker", "--sock-dir", str(tmp_path),
+           "--client-uid", "1000"]
+    if bad == "cmd": cmd[2] = "unrelated.module"
+    if bad == "sock_dir": cmd[4] = str(tmp_path / "other")
+    if bad == "extra_arg": cmd.append("--degraded")
+    monkeypatch.setattr(life, "_socket_peer", lambda path: (pid, os.geteuid() + (bad == "peer_uid")))
+    monkeypatch.setattr(life, "_cmdline", lambda target: cmd)
+    monkeypatch.setattr(life, "_start_time", lambda target: "123")
+    monkeypatch.setattr(life, "_process_uid", lambda target: os.geteuid() + (bad == "uid"))
+    monkeypatch.setattr(life.os, "kill", lambda *args: pytest.fail("signalled unverified PID"))
+    with pytest.raises(life.LifecycleError):
+        life.stop(tmp_path / "broker.pid", tmp_path, os.geteuid())
+
+
 def test_foreign_pid_is_never_signalled(tmp_path, monkeypatch):
     pidfile = tmp_path / "broker.pid"
     pidfile.write_text(json.dumps({"pid": os.getpid(), "start_time": life._start_time(os.getpid())}))
@@ -105,7 +138,10 @@ def test_stop_sends_only_sigterm_to_verified_pid(tmp_path, monkeypatch):
     monkeypatch.setattr(life, "_broker_pid", lambda *args: 123)
     calls = []
     monkeypatch.setattr(life.os, "kill", lambda pid, sig: calls.append((pid, sig)))
-    monkeypatch.setattr(life, "_cmdline", lambda pid: None)
+    monkeypatch.setattr(life, "_cmdline", lambda pid: None if calls else
+        [sys.executable, "-m", "agent_crew.cea.broker", "--sock-dir", str(tmp_path)])
+    monkeypatch.setattr(life, "_start_time", lambda pid: "123")
+    monkeypatch.setattr(life, "_process_uid", lambda pid: os.geteuid())
     life.stop(pidfile, tmp_path, os.geteuid())
     assert calls == [(123, signal.SIGTERM)]
     assert not pidfile.exists()

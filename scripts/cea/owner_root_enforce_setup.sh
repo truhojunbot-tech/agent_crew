@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Owner-only, offline phase-2 broker installation. No live broker is restarted.
+# Owner-only phase-2 broker installation. A verified legacy broker is replaced
+# during apply; an already managed broker remains running during source updates.
 # See docs/cea_broker_oop_deploy.md.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -21,6 +22,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 p = argparse.ArgumentParser(description="Offline, reversible root broker setup")
 mode = p.add_mutually_exclusive_group()
@@ -73,6 +75,10 @@ if args.rehearse:
     rehearsal_tree.mkdir(parents=True)
     shutil.copytree(Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"]) / "src", rehearsal_tree / "src")
     (rehearsal_tree / "SRC_COMMIT").write_text("rehearsal-prior\n")
+    schema_rehearsal = rehearsal_tree / "tests/cea_contract/receipt.schema.json"
+    schema_rehearsal.parent.mkdir(parents=True)
+    shutil.copyfile(Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"]) / "tests/cea_contract/receipt.schema.json",
+                    schema_rehearsal)
     args.caller_tokens = path("/rehearsal/caller-tokens.json")
     args.snapshot_pubkey = None
     args.snapshot_path = None
@@ -149,6 +155,7 @@ source_root = Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"])
 sys.path.insert(0, str(source_root / "src"))
 sys.path.insert(0, str(source_root / "scripts/cea"))
 from owner_selftest_expectations import assert_installed_selftest
+from agent_crew.cea import broker_lifecycle as lifecycle
 schema_source = source_root / "tests/cea_contract/receipt.schema.json"
 requirements = source_root / "scripts/cea/broker-requirements.txt"
 venv = tree / "venv"
@@ -156,6 +163,109 @@ schema_installed = tree / "tests/cea_contract/receipt.schema.json"
 SCHEMA_BLOB = "41e7ebf271830790f6aae80a413e51edf7805fcd"
 if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
     p.error("invalid source commit")
+
+def legacy_identity():
+    """Return service uid and socket path; fake/rehearsal roots stay isolated."""
+    if privileged:
+        import pwd
+        uid = pwd.getpwnam("crew-authz").pw_uid
+        sock = Path(os.environ.get("AGENT_CREW_AUTHZ_SOCK_DIR", f"/tmp/crew-authz-{uid}"))
+    else:
+        uid = os.geteuid()
+        sock = path(f"/tmp/crew-authz-{uid}")
+    return uid, sock
+
+def preview_legacy():
+    """Non-root preview uses /proc only; apply re-verifies the socket peer."""
+    uid, sock = legacy_identity()
+    try:
+        if (sock / "broker.pid").exists():
+            return None
+    except PermissionError:
+        # The intended 0710 socket directory is not traversable by an owner
+        # shell until its client group is active. Root apply checks the pidfile.
+        pass
+    matches = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdecimal():
+            pid = int(entry.name)
+            if lifecycle._process_uid(pid) == uid and lifecycle._exact_broker_cmd(
+                    lifecycle._cmdline(pid), sock):
+                matches.append(pid)
+    if len(matches) > 1:
+        raise RuntimeError(f"multiple legacy broker candidates for {sock}: {matches}")
+    return matches[0] if matches else None
+
+def verified_legacy():
+    uid, sock = legacy_identity()
+    if (sock / "broker.pid").exists():
+        return None
+    return lifecycle.verified_orphan_pid(sock, uid)
+
+def legacy_event(event, pid):
+    if not pid:
+        return
+    manifest_dir.mkdir(parents=True, exist_ok=True)
+    with (manifest_dir / "legacy-broker.jsonl").open("a") as log:
+        log.write(json.dumps({"event": event, "pid": pid,
+                              "time": datetime.now(timezone.utc).isoformat(),
+                              "commit": source_commit}) + "\n")
+
+def stop_legacy(pid):
+    if not pid:
+        return
+    uid, sock = legacy_identity()
+    if lifecycle.verified_orphan_pid(sock, uid) != pid:
+        raise RuntimeError(f"legacy broker PID {pid} changed before stop")
+    lifecycle.stop(sock / "broker.pid", sock, uid)
+    legacy_event("stopped", pid)
+
+def start_managed():
+    if privileged:
+        run("sudo", "-n", "-u", "crew-authz", str(launcher), "--start")
+        run("sudo", "-n", "-u", "crew-authz", str(launcher), "--health")
+    else:
+        uid, sock = legacy_identity()
+        broker_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1",
+                      "PYTHONPATH": str(tree / "src"),
+                      "AGENT_CREW_CEA_CALLER_TOKENS": str(tree / "caller-tokens.json")}
+        lifecycle.start(sock / "broker.pid", sock, uid, tree / "caller-tokens.json",
+                        str(venv / "bin/python"), str(uid), env=broker_env)
+        lifecycle.health(sock, tree / "caller-tokens.json", uid)
+
+def preview_legacy_plan():
+    pid = preview_legacy()
+    if pid:
+        say(f"WOULD STOP legacy broker pid {pid}; verify socket peer and uid at apply")
+    return pid
+
+def spawn_rehearsal_orphan():
+    """Exercise the real no-pidfile transition in a disposable socket tree."""
+    if not args.rehearse:
+        return None
+    uid, sock = legacy_identity()
+    sock.mkdir(mode=0o710, parents=True)
+    sock.chmod(0o710)
+    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1",
+           "PYTHONPATH": str(tree / "src"),
+           "AGENT_CREW_CEA_CALLER_TOKENS": str(args.caller_tokens)}
+    process = subprocess.Popen([sys.executable, "-m", "agent_crew.cea.broker",
+                                "--sock-dir", str(sock), "--client-uid", str(uid)],
+                               env=env, stdin=subprocess.DEVNULL,
+                               stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(f"rehearsal orphan exited early: {process.stderr.read().decode()}")
+        try:
+            if lifecycle.verified_orphan_pid(sock, uid) == process.pid:
+                say(f"rehearsal legacy orphan pid {process.pid} ready (isolated socket)")
+                return process
+        except lifecycle.LifecycleError:
+            pass
+        time.sleep(0.1)
+    process.terminate()
+    raise RuntimeError("rehearsal orphan did not bind its isolated socket")
 
 def update_backups():
     # Keep this list aligned with the update's atomic swap list below.
@@ -544,6 +654,8 @@ if args.update_src:
         sys.exit(0)
     say(f"stage clean checkout {source_root} ({source_commit}) into {staging}")
     say(f"backup {installed} to {previous}; write {marker}; record {update_manifest}")
+    if not args.apply:
+        preview_legacy_plan()
     report_preconditions(source_update=True)
     if not args.apply:
         say("dry-run: no changes made")
@@ -716,7 +828,16 @@ if args.update_src:
         stage_names.append("owner-t0-pubkey")
     if args.owner_reviewer_id:
         stage_names.append("owner-reviewer")
+    rehearsal_orphan = None
+    legacy_pid = None
     try:
+        rehearsal_orphan = spawn_rehearsal_orphan()
+        legacy_pid = verified_legacy()
+        if legacy_pid:
+            saved["legacy_broker_pid"] = legacy_pid
+            manifest_dir.mkdir(parents=True, exist_ok=True)
+            update_manifest.write_text(json.dumps(saved, indent=2) + "\n")
+            stop_legacy(legacy_pid)
         for stage, (live, backup, new) in zip(stage_names, swaps):
             if backup.exists():
                 raise RuntimeError(f"update backup already exists: {backup}")
@@ -747,6 +868,10 @@ if args.update_src:
             installed_selftest(launcher_check=check)
         else:
             installed_selftest()
+        if legacy_pid:
+            start_managed()
+            legacy_event("managed_started", legacy_pid)
+            say(f"legacy broker pid {legacy_pid} replaced by managed broker")
         # A successful update is committed: its temporary backups must not
         # block the next one-command update. Failure above still rolls back.
         for _, backup, _ in swaps:
@@ -768,8 +893,22 @@ if args.update_src:
         if old_commit is None: marker.unlink(missing_ok=True)
         else: marker.write_text(old_commit)
         update_manifest.unlink(missing_ok=True)
+        if legacy_pid:
+            try:
+                start_managed()
+                legacy_event("rollback_started", legacy_pid)
+            except Exception as restart_error:
+                say(f"BROKER DOWN: run sudo -n -u crew-authz {launcher} --start ({restart_error})")
         raise
+    finally:
+        if rehearsal_orphan:
+            if rehearsal_orphan.poll() is None:
+                rehearsal_orphan.terminate()  # disposable rehearsal process only
+            rehearsal_orphan.wait(timeout=2)
     if args.rehearse:
+        if legacy_pid:
+            uid, sock = legacy_identity()
+            lifecycle.stop(sock / "broker.pid", sock, uid)
         say("rehearsal complete: isolated pinned-venv staging and self-tests passed; no live changes made")
     else:
         say("source update complete; broker restart required to load new source (not performed by this script): sudo -n -u crew-authz /usr/local/libexec/crew-authz/broker-launch.sh --restart")
@@ -946,6 +1085,8 @@ commands = [
 ]
 for command in commands:
     say(f"PLAN $ {command}")
+if not args.apply:
+    preview_legacy_plan()
 report_preconditions()
 if not args.apply:
     say("dry-run: no changes made")
@@ -1009,7 +1150,13 @@ if privileged:
         acl_file.write_text(run("getfacl", "-p", str(crew_dir), str(alfred_dir), str(db), capture=True).stdout)
 manifest_file.write_text(json.dumps(manifest, indent=2))
 os.chmod(manifest_file, 0o600)
+legacy_pid = None
 try:
+    legacy_pid = verified_legacy()
+    if legacy_pid:
+        manifest["legacy_broker_pid"] = legacy_pid
+        manifest_file.write_text(json.dumps(manifest, indent=2))
+        stop_legacy(legacy_pid)
     if privileged:
         if not shutil.which("setfacl"):
             run("apt-get", "update")
@@ -1100,10 +1247,19 @@ try:
             raise RuntimeError("broker check still downgraded")
     else:
         say("fake-root: skipped user/group/ACL and launcher execution")
+    if legacy_pid:
+        start_managed()
+        legacy_event("managed_started", legacy_pid)
     manifest["completed"] = True
     manifest_file.write_text(json.dumps(manifest, indent=2))
     say("apply complete")
 except Exception:
+    if legacy_pid:
+        try:
+            start_managed()
+            legacy_event("rollback_started", legacy_pid)
+        except Exception as restart_error:
+            say(f"BROKER DOWN: run sudo -n -u crew-authz {launcher} --start ({restart_error})")
     say(f"apply failed; restore with --undo using {manifest_file}")
     raise
 PY
