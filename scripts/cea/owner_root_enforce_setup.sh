@@ -220,15 +220,25 @@ def stop_legacy(pid):
     lifecycle.stop(sock / "broker.pid", sock, uid, allow_degraded=args.rehearse)
     legacy_event("stopped", pid)
 
+def rehearsal_broker_env():
+    from agent_crew.queue import TaskQueue
+    db = path("/rehearsal/broker.db")
+    TaskQueue(str(db))
+    return {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1",
+            "PYTHONPATH": str(tree / "src"),
+            "AGENT_CREW_CEA_BROKER_DB": str(db),
+            "AGENT_CREW_CEA_CALLER_TOKENS": str(tree / "caller-tokens.json"
+                                                 if (tree / "caller-tokens.json").exists()
+                                                 else args.caller_tokens),
+            "AGENT_CREW_CEA_MODE": "shadow"}
+
 def start_managed():
     if privileged:
         run("sudo", "-n", "-u", "crew-authz", str(launcher), "--start")
         run("sudo", "-n", "-u", "crew-authz", str(launcher), "--health")
     else:
         uid, sock = legacy_identity()
-        broker_env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1",
-                      "PYTHONPATH": str(tree / "src"),
-                      "AGENT_CREW_CEA_CALLER_TOKENS": str(tree / "caller-tokens.json")}
+        broker_env = rehearsal_broker_env()
         lifecycle.start(sock / "broker.pid", sock, uid, tree / "caller-tokens.json",
                         str(venv / "bin/python"), str(uid), env=broker_env,
                         degraded=args.rehearse)
@@ -247,9 +257,7 @@ def spawn_rehearsal_orphan():
     uid, sock = legacy_identity()
     sock.mkdir(mode=0o710, parents=True)
     sock.chmod(0o710)
-    env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1",
-           "PYTHONPATH": str(tree / "src"),
-           "AGENT_CREW_CEA_CALLER_TOKENS": str(args.caller_tokens)}
+    env = rehearsal_broker_env()
     process = subprocess.Popen([sys.executable, "-m", "agent_crew.cea.broker",
                                 "--sock-dir", str(sock), "--client-uid", str(uid),
                                 "--degraded"],
