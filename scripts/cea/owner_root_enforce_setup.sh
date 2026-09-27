@@ -19,12 +19,14 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 
 p = argparse.ArgumentParser(description="Offline, reversible root broker setup")
 mode = p.add_mutually_exclusive_group()
 mode.add_argument("--dry-run", action="store_true", help="print plan only (default)")
 mode.add_argument("--apply", action="store_true")
 mode.add_argument("--undo", action="store_true")
+mode.add_argument("--rehearse", action="store_true", help="run a real isolated update without root")
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
 p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
 p.add_argument("--snapshot-path", type=Path, help="canonical signed snapshot to seed the rollback guard")
@@ -34,11 +36,35 @@ args = p.parse_args()
 if args.root_prefix and os.environ.get("AGENT_CREW_OWNER_SETUP_TESTING") != "1":
     p.error("--root-prefix is reserved for isolated tests")
 fake = args.root_prefix is not None
-if not fake and (args.apply or args.undo) and os.geteuid() != 0:
+if args.rehearse and (not args.update_src or args.root_prefix):
+    p.error("--rehearse requires --update-src and cannot use --root-prefix")
+if not fake and not args.rehearse and (args.apply or args.undo) and os.geteuid() != 0:
     p.error("--apply and --undo require root")
-root = args.root_prefix.resolve() if fake else Path("/")
+rehearsal_dir = tempfile.TemporaryDirectory(prefix="crew-owner-rehearse-") if args.rehearse else None
+root = (Path(rehearsal_dir.name) if rehearsal_dir else
+        args.root_prefix.resolve() if fake else Path("/"))
+privileged = not (fake or args.rehearse)
+if args.rehearse:
+    args.apply = True
 def path(name):
     return root / name.lstrip("/")
+if args.rehearse:
+    # Copy inputs, never alter the host's broker installation or token table.
+    if not args.caller_tokens:
+        p.error("--rehearse requires --caller-tokens")
+    rehearsal_inputs = ((args.caller_tokens.expanduser(), path("/rehearsal/caller-tokens.json")),
+        (args.snapshot_pubkey or Path("/home/truhojun/alfred/governance/ssot-producer-ed25519.pub"),
+         path("/home/truhojun/alfred/governance/ssot-producer-ed25519.pub")),
+        (args.snapshot_path or Path("/home/truhojun/alfred/governance/cea_policy_snapshot.json"),
+         path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")))
+    for source_input, destination in rehearsal_inputs:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source_input, destination)
+    path("/rehearsal/caller-tokens.json").chmod(0o600)
+    path("/opt/agent_crew-authz").mkdir(parents=True)
+    args.caller_tokens = path("/rehearsal/caller-tokens.json")
+    args.snapshot_pubkey = None
+    args.snapshot_path = None
 def run(*cmd, capture=False):
     return subprocess.run(cmd, check=True, text=True, capture_output=capture)
 def say(message):
@@ -141,15 +167,18 @@ def rotate_completed_update(backups):
         say(f"ROTATED {backup} -> {destination}")
     (manifest_dir / "src-update.json").unlink(missing_ok=True)
 
-def preinstall_selftest(tokens):
+def preinstall_selftest(tokens, interpreter):
     if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") != "1":
         say("fake-root: skipped cross-uid pre-install self-test")
         return
-    command = [sys.executable, str(source_root / "scripts/cea/broker_group_sandbox.py"),
+    command = [str(interpreter), str(source_root / "scripts/cea/broker_group_sandbox.py"),
                "--source-root", str(source_root), "--caller-tokens", str(tokens)]
     if not fake:
+        command.extend(("--python", str(interpreter)))
+    if privileged:
         command.append("--cross-uid")
-    result = subprocess.run(command, text=True, capture_output=True, timeout=60)
+    result = subprocess.run(command, text=True, capture_output=True, timeout=90,
+                            env=None if fake else {"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1"})
     if result.returncode:
         raise SystemExit(f"pre-install broker self-test failed before changes: {result.stderr.strip()}")
     evidence = json.loads(result.stdout)
@@ -165,10 +194,10 @@ def normalize(root_dir):
             if item.is_symlink():
                 raise RuntimeError(f"symlink in staged broker tree: {item}")
             os.chmod(item, 0o755 if item.is_dir() else 0o644)
-            if not fake:
+            if privileged:
                 os.chown(item, 0, 0)
     os.chmod(root_dir, 0o755)
-    if not fake:
+    if privileged:
         os.chown(root_dir, 0, 0)
 
 def build_venv(destination):
@@ -188,29 +217,35 @@ def build_venv(destination):
             item = Path(parent) / name
             if item.is_symlink():
                 continue
-            os.chown(item, 0, 0)
+            if privileged:
+                os.chown(item, 0, 0)
             os.chmod(item, 0o755 if item.is_dir() or os.access(item, os.X_OK) else 0o644)
-    os.chown(destination, 0, 0)
+    if privileged:
+        os.chown(destination, 0, 0)
     os.chmod(destination, 0o755)
 
 def installed_selftest():
     if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_FAIL_STAGE") == "selftest":
         raise RuntimeError("injected update failure: selftest")
+    command = [str(venv / "bin/python"), str(source_root / "scripts/cea/broker_group_sandbox.py"),
+               "--installed-root", str(tree)]
     if fake:
+        if os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_CAPTURE_SELFTEST_ARGV") == "1":
+            say("fake-root installed self-test argv: " + json.dumps(command))
         say("fake-root: skipped cross-uid installed-path self-test")
         return
-    command = [sys.executable, str(source_root / "scripts/cea/broker_group_sandbox.py"),
-               "--installed-root", str(tree)]
-    if not fake:
+    if privileged:
         command.append("--cross-uid")
-    result = subprocess.run(command, capture_output=True, text=True, timeout=90)
+    result = subprocess.run(command, capture_output=True, text=True, timeout=90,
+                            env={"PATH": "/usr/local/bin:/usr/bin:/bin", "PYTHONNOUSERSITE": "1"})
     if result.returncode:
         raise RuntimeError(f"installed broker self-test failed: {result.stderr.strip()}")
     evidence = json.loads(result.stdout)
     if (not evidence.get("pass") or not evidence.get("authenticated") or
             not evidence.get("schema_valid") or not evidence.get("signed_receipt_valid") or
             not evidence.get("tampered_receipt_rejected") or
-            not evidence.get("snapshot_rollback_refused") or evidence.get("downgrade_reason") is not None):
+            not evidence.get("snapshot_rollback_refused") or
+            evidence.get("downgrade_reason") != ("BROKER_TREE_USER_WRITABLE" if args.rehearse else None)):
         raise RuntimeError(f"installed broker self-test failed: {evidence}")
     say("installed broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
 
@@ -415,7 +450,7 @@ if args.update_src:
         else:
             marker.write_text(saved["old_commit"])
             os.chmod(marker, 0o644)
-            if not fake:
+            if privileged:
                 run("chown", "root:root", str(marker))
         update_manifest.unlink()
         say("source update undo complete")
@@ -438,8 +473,6 @@ if args.update_src:
     source_tokens = token_source or tree / "caller-tokens.json"
     if (not fake or os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1") and not source_tokens.is_file():
         raise SystemExit(f"caller tokens missing for source update self-test: {source_tokens}")
-    if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
-        preinstall_selftest(source_tokens)
     # All expensive and fallible preparation happens before any installed path
     # is changed. The installed-path test follows the atomic swaps below; a
     # failure restores every previous path before this command returns.
@@ -461,7 +494,10 @@ if args.update_src:
         shutil.copyfile(schema_source, schema_stage / "cea_contract/receipt.schema.json")
         normalize(schema_stage)
         build_venv(venv_stage)
-        if not fake:
+        if not fake or os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
+            preinstall_selftest(source_tokens, venv_stage / "bin/python" if not fake
+                                else Path(shutil.which("python3")))
+        if privileged:
             import pwd
             authz = pwd.getpwnam("crew-authz")
         sys.path.insert(0, str(staging))
@@ -480,17 +516,17 @@ if args.update_src:
         else:
             state_stage.mkdir()
         os.chmod(state_stage, 0o700)
-        if not fake:
+        if privileged:
             os.chown(state_stage, authz.pw_uid, authz.pw_gid)
         if check_high_water_mark(str(state_stage / "snapshot-hwm.json"),
                                  current.generation, current.hash, bootstrap=True):
             raise RuntimeError("current signed snapshot conflicts with existing high-water mark")
         os.chmod(state_stage / "snapshot-hwm.json", 0o600)
-        if not fake:
+        if privileged:
             os.chown(state_stage / "snapshot-hwm.json", authz.pw_uid, authz.pw_gid)
         shutil.copyfile(source_tokens, token_stage)
         os.chmod(token_stage, 0o400)
-        if not fake:
+        if privileged:
             import pwd
             authz = pwd.getpwnam("crew-authz")
             os.chown(token_stage, authz.pw_uid, authz.pw_gid)
@@ -515,13 +551,13 @@ if args.update_src:
         public_stage.write_bytes(public_bytes)
         os.chmod(private_stage, 0o400)
         os.chmod(public_stage, 0o644)
-        if not fake:
+        if privileged:
             os.chown(private_stage, authz.pw_uid, authz.pw_gid)
             os.chown(public_stage, 0, 0)
         launcher_stage.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_launcher, launcher_stage)
         os.chmod(launcher_stage, 0o755)
-        if not fake:
+        if privileged:
             os.chown(launcher_stage, 0, 0)
     except Exception:
         for item in staged_paths:
@@ -554,14 +590,14 @@ if args.update_src:
             if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_FAIL_STAGE") == stage:
                 raise RuntimeError(f"injected update failure: {stage}")
         os.chmod(tree, 0o755)
-        if not fake:
+        if privileged:
             os.chown(tree, 0, 0)
         marker.write_text(source_commit + "\n")
         os.chmod(marker, 0o644)
-        if not fake:
+        if privileged:
             run("chown", "root:root", str(marker))
         installed_selftest()
-        if not fake:
+        if privileged:
             check = run("sudo", "-n", "-u", "crew-authz", str(launcher), "--check", capture=True).stdout
             say(check.rstrip())
             if "downgrade_reason=none" not in check:
@@ -588,7 +624,10 @@ if args.update_src:
         else: marker.write_text(old_commit)
         update_manifest.unlink(missing_ok=True)
         raise
-    say("source update complete; broker restart required to load new source (not performed by this script): sudo -n -u crew-authz /usr/local/libexec/crew-authz/broker-launch.sh --restart")
+    if args.rehearse:
+        say("rehearsal complete: isolated pinned-venv staging and self-tests passed; no live changes made")
+    else:
+        say("source update complete; broker restart required to load new source (not performed by this script): sudo -n -u crew-authz /usr/local/libexec/crew-authz/broker-launch.sh --restart")
     sys.exit(0)
 
 targets = [tree, launcher.parent, sudoers]
@@ -667,7 +706,7 @@ if args.undo:
         elif item.exists():
             item.unlink()
     run("tar", "--acls", "--xattrs", "--numeric-owner", "-xf", str(archive), "-C", str(root))
-    if not fake:
+    if privileged:
         if acl_file.exists():
             run("setfacl", "--restore", str(acl_file))
         for user in manifest["added_users"]:
@@ -781,8 +820,17 @@ except (ImportError, ValueError) as exc:
     raise SystemExit(f"invalid Ed25519 public key {snapshot_source}: {exc}") from exc
 # The installed-path proof runs after staging, against the exact paths the
 # launcher will use. The manifest permits undo if any later root operation fails.
-if fake and os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
-    preinstall_selftest(token_source)
+if not fake or os.environ.get("AGENT_CREW_OWNER_SETUP_SELFTEST") == "1":
+    if venv.is_dir():
+        preinstall_selftest(token_source, venv / "bin/python")
+    elif fake:
+        preinstall_selftest(token_source, Path(shutil.which("python3")))
+    else:
+        with tempfile.TemporaryDirectory(prefix="crew-broker-preinstall-") as stage_dir:
+            os.chmod(stage_dir, 0o755)
+            temporary_venv = Path(stage_dir) / "venv"
+            build_venv(temporary_venv)
+            preinstall_selftest(token_source, temporary_venv / "bin/python")
 for base in (manifest_dir, launcher.parent, tree, sudoers.parent):
     missing = []
     current = base
@@ -802,13 +850,13 @@ members = [str(x.relative_to(root)) for x in before]
 # produces a valid empty archive that --undo can extract in the first-install case.
 run("tar", "--acls", "--xattrs", "--numeric-owner", "-cf", str(archive),
     "-C", str(root), *(members or ["-T", "/dev/null"]))
-if not fake:
+if privileged:
     if shutil.which("getfacl"):
         acl_file.write_text(run("getfacl", "-p", str(crew_dir), str(alfred_dir), str(db), capture=True).stdout)
 manifest_file.write_text(json.dumps(manifest, indent=2))
 os.chmod(manifest_file, 0o600)
 try:
-    if not fake:
+    if privileged:
         if not shutil.which("setfacl"):
             run("apt-get", "update")
             run("apt-get", "install", "-y", "acl")
@@ -834,7 +882,7 @@ try:
     tree.mkdir(parents=True, exist_ok=True)
     launcher.parent.mkdir(parents=True, exist_ok=True)
     os.chmod(launcher.parent, stat.S_IMODE(launcher.parent.stat().st_mode) & ~0o022)
-    if not fake:
+    if privileged:
         run("chown", "root:root", str(launcher.parent))
     shutil.copyfile(source_launcher, launcher)
     os.chmod(launcher, 0o755)
@@ -863,25 +911,25 @@ try:
                 raise RuntimeError(f"symlink in broker tree: {item}")
             if item != tree / "caller-tokens.json":
                 os.chmod(item, 0o755 if item.is_dir() or os.access(item, os.X_OK) else 0o644)
-            if not fake:
+            if privileged:
                 if item.name == "caller-tokens.json":
                     run("chown", "crew-authz:crew-authz", str(item))
                 else:
                     group = "crew-authz" if item.name in ("snapshot.pub", "broker.env") else "root"
                     run("chown", f"root:{group}", str(item))
     os.chmod(tree, 0o755)
-    if not fake:
+    if privileged:
         run("chown", "root:root", str(tree))
         run("chown", "root:root", str(launcher))
     sudoers.parent.mkdir(parents=True, exist_ok=True)
     temp = sudoers.with_name("crew-authz-broker.pending")
     temp.write_text("truhojun ALL=(crew-authz) NOPASSWD: /usr/local/libexec/crew-authz/broker-launch.sh\n")
     os.chmod(temp, 0o440)
-    if not fake:
+    if privileged:
         run("chown", "root:root", str(temp))
         run("visudo", "-cf", str(temp))
     os.replace(temp, sudoers)
-    if not fake:
+    if privileged:
         installed_selftest()
         check = run("sudo", "-u", "crew-authz", str(launcher), "--check", capture=True).stdout
         say(check.rstrip())

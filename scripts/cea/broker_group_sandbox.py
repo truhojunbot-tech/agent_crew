@@ -61,7 +61,7 @@ def client(sock, credential, expected_uid):
             "downgrade_reason": reply["receipt"].get("downgrade_reason")}
 
 
-def proof(source_root, token_source, *, cross_uid, installed_root=None):
+def proof(source_root, token_source, *, cross_uid, installed_root=None, python=None):
     import secrets
     broker_uid = pwd.getpwnam("crew-authz").pw_uid if cross_uid else os.geteuid()
     broker_gid = pwd.getpwnam("crew-authz").pw_gid if cross_uid else os.getegid()
@@ -161,16 +161,16 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None):
         db = private / "receipts.db"
         # The production broker opens an already initialized task database.
         sys.path.insert(0, str(staged))
-        if not installed_root:
+        if not installed_root and not python:
             sys.path.insert(1, str(user_site))
         from agent_crew.queue import TaskQueue
         TaskQueue(str(db))
         if cross_uid:
             os.chown(db, broker_uid, broker_gid)
         env = ({"PATH": "/usr/local/bin:/usr/bin:/bin",
-                "PYTHONNOUSERSITE": "1"} if installed_root else
+                "PYTHONNOUSERSITE": "1"} if installed_root or python else
                {k: v for k, v in os.environ.items() if not k.startswith("AGENT_CREW_")})
-        env.update(PYTHONPATH=(str(staged) if installed_root else os.pathsep.join((str(staged), str(user_site)))),
+        env.update(PYTHONPATH=(str(staged) if installed_root or python else os.pathsep.join((str(staged), str(user_site)))),
                    AGENT_CREW_AUTHZ_SRC_COMMIT_PATH=str(commit_marker),
                    AGENT_CREW_CEA_BROKER_DB=str(db),
                    AGENT_CREW_CEA_RECEIPT_SIGNING_KEY_FILE=str(signing_private),
@@ -186,7 +186,7 @@ def proof(source_root, token_source, *, cross_uid, installed_root=None):
         if installed_root:
             env["AGENT_CREW_AUTHZ_LAUNCHER_PATH"] = str(installed_root.parent.parent / "usr/local/libexec/crew-authz/broker-launch.sh")
             env["AGENT_CREW_AUTHZ_CONFIG_PATH"] = str(installed_root / "broker.env")
-        python = str(installed_root / "venv/bin/python") if installed_root else sys.executable
+        python = str(installed_root / "venv/bin/python") if installed_root else (python or sys.executable)
         broker_cmd = [python, "-m", "agent_crew.cea.broker", "--sock-dir", str(sockdir),
                       "--client-uid", str(client_uid)]
         if cross_uid:
@@ -250,6 +250,7 @@ def main():
     parser.add_argument("--caller-tokens", type=Path)
     parser.add_argument("--cross-uid", action="store_true")
     parser.add_argument("--installed-root", type=Path)
+    parser.add_argument("--python", type=Path, help="pinned interpreter for preinstall proof")
     parser.add_argument("--client", nargs=2, metavar=("SOCKET", "EXPECTED_UID"))
     args = parser.parse_args()
     if args.client:
@@ -260,8 +261,13 @@ def main():
     if not args.caller_tokens:
         parser.error("--caller-tokens is required")
     if not args.cross_uid and os.getegid() != grp.getgrnam("crew-authz-clients").gr_gid:
-        command = [sys.executable, str(Path(__file__).resolve()), "--source-root", str(args.source_root),
+        command = [str(args.python or (args.installed_root / "venv/bin/python" if args.installed_root else sys.executable)),
+                   str(Path(__file__).resolve()), "--source-root", str(args.source_root),
                    "--caller-tokens", str(args.caller_tokens)]
+        if args.installed_root:
+            command.extend(("--installed-root", str(args.installed_root)))
+        if args.python:
+            command.extend(("--python", str(args.python)))
         result = subprocess.run(["sg", "crew-authz-clients", "-c", shlex.join(command)],
                                 capture_output=True, text=True, timeout=60)
         if result.returncode:
@@ -269,7 +275,7 @@ def main():
         print(result.stdout, end="")
         return
     print(json.dumps(proof(args.source_root, args.caller_tokens, cross_uid=args.cross_uid,
-                           installed_root=args.installed_root), sort_keys=True))
+                           installed_root=args.installed_root, python=str(args.python) if args.python else None), sort_keys=True))
 
 
 if __name__ == "__main__":

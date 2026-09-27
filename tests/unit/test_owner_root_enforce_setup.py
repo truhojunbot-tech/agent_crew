@@ -616,6 +616,28 @@ def test_fake_apply_and_source_update_run_preinstall_proof(tmp_path):
     assert (tree / "src" / "agent_crew" / "cea" / "broker.py").is_file()
 
 
+def test_installed_selftest_argv_uses_installed_venv(tmp_path):
+    tree, token, _ = _seed(tmp_path)
+    result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json",
+                  extra_env={"AGENT_CREW_OWNER_SETUP_TEST_CAPTURE_SELFTEST_ARGV": "1"})
+    assert result.returncode == 0, result.stderr
+    expected = [str(tree / "venv/bin/python"), str(SCRIPT.with_name("broker_group_sandbox.py")),
+                "--installed-root", str(tree)]
+    assert "fake-root installed self-test argv: " + json.dumps(expected) in result.stdout
+
+
+@pytest.mark.skipif(os.environ.get("RUN_OWNER_REHEARSAL") != "1",
+                    reason="set RUN_OWNER_REHEARSAL=1 for the real pinned-venv rehearsal")
+def test_owner_rehearsal_with_real_venv():
+    token = Path.home() / ".agent_crew/alfred-cea/caller-tokens.json"
+    result = subprocess.run(["bash", str(SCRIPT), "--rehearse", "--update-src",
+                             "--caller-tokens", str(token)], capture_output=True, text=True, timeout=300)
+    assert result.returncode == 0, result.stderr + result.stdout
+    assert '"downgrade_reason": "BROKER_TREE_USER_WRITABLE"' in result.stdout
+    assert "rehearsal complete" in result.stdout
+
+
 def test_broker_env_quoted_values_round_trip(tmp_path):
     tree, _, _ = _seed(tmp_path)
     owner_note = "owner's two words"
