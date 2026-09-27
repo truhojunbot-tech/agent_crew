@@ -416,6 +416,21 @@ def test_snapshot_default_and_broker_path_mismatch(tmp_path):
     assert "HWM seed path" in bad.stdout and "differs from broker snapshot path" in bad.stdout
 
 
+def test_update_src_accepts_existing_broker_env_without_snapshot_path(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    config = tree / "broker.env"
+    config.write_text("\n".join(
+        line for line in config.read_text().splitlines()
+        if not line.startswith("AGENT_CREW_CEA_SNAPSHOT_PATH=")
+    ) + "\n")
+    args = ("--update-src", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    preview = _run(tmp_path, *args)
+    assert preview.returncode == 0, preview.stdout + preview.stderr
+    applied = _run(tmp_path, "--apply", *args)
+    assert applied.returncode == 0, applied.stdout + applied.stderr
+    assert (tree / "state/snapshot-hwm.json").is_file()
+
+
 def test_update_src_refuses_symlinked_snapshot_state(tmp_path):
     tree, _, _ = _seed(tmp_path)
     state = tree / "state"

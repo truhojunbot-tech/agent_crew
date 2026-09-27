@@ -67,7 +67,7 @@ WIRED = "WIRED"
 UNAVAILABLE = "UNAVAILABLE"
 
 DEFAULT_REGISTRY_PATH = "/home/truhojun/alfred/governance/capability_registry.json"
-DEFAULT_SNAPSHOT_PATH = "/home/truhojun/alfred/governance/control_policy_snapshot.json"
+DEFAULT_SNAPSHOT_PATH = "/home/truhojun/alfred/governance/cea_policy_snapshot.json"
 DEFAULT_MEMORY_CMD = "python3 /home/truhojun/alfred/tools/admission_inputs.py"
 
 #: Provider slots, in the order the startup log prints them. These are exactly the
