@@ -34,7 +34,7 @@ def _signature(key, public, body):
                          "value": base64.b64encode(key.sign(encoded)).decode()}}
 
 
-def _fixture(tmp_path, *, sha="a" * 40, expiry=None, owner_key=False, reviewed_head="b" * 40):
+def _fixture(tmp_path, *, sha="a" * 40, expiry=None, owner_key=True, reviewed_head="b" * 40):
     root = tmp_path / "opt/agent_crew-authz"
     state = root / "state"
     state.mkdir(parents=True)
@@ -81,6 +81,12 @@ def test_signed_exact_t0_and_separate_owner_key(tmp_path):
                                           ensure_ascii=False).encode()).hexdigest()}))
     mark.chmod(0o600)
     with pytest.raises(update.Refused, match="owner T0"):
+        update.verified_t0("a" * 40, root=root, snapshot=snapshot)
+
+
+def test_snapshot_producer_signature_alone_cannot_authorize_update(tmp_path):
+    root, snapshot, *_ = _fixture(tmp_path, owner_key=False)
+    with pytest.raises(update.Refused, match="owner T0 public key"):
         update.verified_t0("a" * 40, root=root, snapshot=snapshot)
 
 

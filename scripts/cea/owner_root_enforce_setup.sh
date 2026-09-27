@@ -30,7 +30,7 @@ mode.add_argument("--undo", action="store_true")
 mode.add_argument("--rehearse", action="store_true", help="run a real isolated update without root")
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
 p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
-p.add_argument("--owner-t0-pubkey", type=Path, help="optional separate owner T0 Ed25519 public key")
+p.add_argument("--owner-t0-pubkey", type=Path, help="separate owner T0 Ed25519 public key required to enable root updater sudoers grant")
 p.add_argument("--snapshot-path", type=Path, help="canonical signed snapshot to seed the rollback guard")
 p.add_argument("--root-prefix", type=Path, help=argparse.SUPPRESS)
 p.add_argument("--update-src", action="store_true", help="update broker source from this clean checkout")
@@ -95,8 +95,8 @@ tree = path("/opt/agent_crew-authz")
 launcher = path("/usr/local/libexec/crew-authz/broker-launch.sh")
 updater = launcher.with_name("broker-update")
 sudoers = path("/etc/sudoers.d/crew-authz-broker")
-sudoers_content = ("truhojun ALL=(crew-authz) NOPASSWD: /usr/local/libexec/crew-authz/broker-launch.sh\n"
-                   "truhojun ALL=(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*\n")
+launcher_sudoers = "truhojun ALL=(crew-authz) NOPASSWD: /usr/local/libexec/crew-authz/broker-launch.sh\n"
+updater_sudoers = "truhojun ALL=(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*\n"
 db = path("/home/truhojun/.agent_crew/alfred/tasks.db")
 crew_dir = path("/home/truhojun/.agent_crew")
 alfred_dir = db.parent
@@ -122,6 +122,12 @@ snapshot_source = args.snapshot_pubkey or path("/home/truhojun/alfred/governance
 owner_t0_source = args.owner_t0_pubkey
 if fake and owner_t0_source and owner_t0_source.is_absolute() and not owner_t0_source.is_relative_to(root):
     owner_t0_source = path(str(owner_t0_source))
+pinned_owner_t0 = tree / "owner-t0.pub"
+existing_owner_t0 = (args.update_src and pinned_owner_t0.is_file() and
+                     not pinned_owner_t0.is_symlink() and
+                     not pinned_owner_t0.stat().st_mode & 0o022 and
+                     (not privileged or pinned_owner_t0.stat().st_uid == 0))
+sudoers_content = launcher_sudoers + (updater_sudoers if owner_t0_source or existing_owner_t0 else "")
 if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snapshot_source.is_relative_to(root):
     snapshot_source = path(str(snapshot_source))
 snapshot_path = args.snapshot_path or path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")

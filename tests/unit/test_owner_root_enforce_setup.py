@@ -223,7 +223,8 @@ def test_apply_and_undo_restore_existing_files(tmp_path):
     assert "libexec/crew-authz/broker-launch.sh" in sudoers.read_text()
     updater = tmp_path / "usr/local/libexec/crew-authz/broker-update"
     assert updater.is_file() and updater.stat().st_mode & 0o777 == 0o755
-    assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*" in sudoers.read_text()
+    assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update" not in sudoers.read_text()
+    assert not (tree / "owner-t0.pub").exists()
     assert (tmp_path / "var/lib/crew-authz/owner-root-enforce/manifest.json").exists()
     repeat = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert repeat.returncode == 0, repeat.stderr
@@ -263,9 +264,26 @@ def test_optional_owner_t0_pubkey_is_installed_and_undone(tmp_path):
     installed = tree / "owner-t0.pub"
     assert installed.read_bytes() == source.read_bytes()
     assert installed.stat().st_mode & 0o777 == 0o644
+    sudoers = tmp_path / "etc/sudoers.d/crew-authz-broker"
+    assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*" in sudoers.read_text()
     undone = _run(tmp_path, "--undo")
     assert undone.returncode == 0, undone.stderr
     assert not installed.exists()
+
+
+def test_source_update_retains_grant_for_installed_owner_key(tmp_path):
+    tree, _, sudoers = _seed(tmp_path)
+    source = tmp_path / "owner-t0.pub"
+    source.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo))
+    installed = tree / "owner-t0.pub"
+    installed.write_bytes(source.read_bytes())
+    installed.chmod(0o644)
+    result = _run(tmp_path, "--apply", "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert installed.read_bytes() == source.read_bytes()
+    assert "(root) NOPASSWD: /usr/local/libexec/crew-authz/broker-update [0-9a-f]*" in sudoers.read_text()
 
 
 def test_apply_requires_ed25519_public_key(tmp_path):

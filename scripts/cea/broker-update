@@ -119,11 +119,10 @@ def verified_t0(sha: str, *, root: Path, snapshot: Path, now=None):
     if digest != ref.hash:
         raise Refused("snapshot changed after verification")
     owner_pub = root / "owner-t0.pub"
-    if owner_pub.exists():
-        secure_file(owner_pub)
-        owner_verify = ed25519_verifier(owner_pub.read_bytes())
-    else:
-        owner_verify = None
+    if not owner_pub.is_file() or owner_pub.is_symlink():
+        raise Refused("owner T0 public key missing")
+    secure_file(owner_pub)
+    owner_verify = ed25519_verifier(owner_pub.read_bytes())
     matches = []
     for decision in doc.get("decisions", []):
         if not isinstance(decision, dict) or decision.get("scope") != "broker-update" or decision.get("sha") != sha:
@@ -134,11 +133,10 @@ def verified_t0(sha: str, *, root: Path, snapshot: Path, now=None):
                 not SHA.fullmatch(str(decision.get("reviewed_head", ""))) or
                 type(decision.get("pr_number")) is not int or decision["pr_number"] < 1):
             continue
-        if owner_verify is not None:
-            signature = decision.get("owner_signature")
-            signed = {k: v for k, v in decision.items() if k != "owner_signature"}
-            if owner_verify(_canonical(signed), signature) is not SignatureStatus.VALID:
-                continue
+        signature = decision.get("owner_signature")
+        signed = {k: v for k, v in decision.items() if k != "owner_signature"}
+        if owner_verify(_canonical(signed), signature) is not SignatureStatus.VALID:
+            continue
         matches.append(decision)
     if len(matches) != 1:
         raise Refused("no unique unexpired signed owner T0 for exact sha and reviewed head")
