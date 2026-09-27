@@ -10,7 +10,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, List, Optional
 
 from agent_crew.anomaly import _extract_repo_from_url, auto_detect_expected_repos
@@ -2704,6 +2704,12 @@ class TaskQueue:
             receipt, task_id=task.task_id,
             current=_cea_callsites.current_inputs(engine, receipt),
             config=self.cea_config(scope))
+        reason = receipt.get("reason")
+        if (not gate.proceed and isinstance(reason, dict)
+                and reason.get("code") == "BROKER_UNREACHABLE"):
+            text = str(reason.get("text") or "CEA broker unavailable")
+            gate = replace(gate, result=replace(gate.result,
+                                                reason=f"BROKER_UNREACHABLE: {text}"))
         context["cea_enqueue"] = gate.as_record()
         # §11.1 row 13 / §11.2 #14: the review/test contract is decided HERE —
         # once, on the admission path, where T1 already is — and stored on the
