@@ -59,21 +59,37 @@ def migrate(path: Path, *, apply: bool = False) -> dict:
         backup = path.with_name(path.name + ".bak")
         if backup.exists():
             raise FileExistsError(backup)
-        with closing(sqlite3.connect(backup)) as destination:
-            source.backup(destination)
-    with closing(sqlite3.connect(path)) as db:
-        db.execute("BEGIN IMMEDIATE")
         try:
-            # Recheck under the write lock; never apply a stale dry-run plan.
-            current, planned, latest = plan(db)
-            if current != old or latest != counts:
-                raise RuntimeError("memory DB changed after backup; migration refused")
-            db.execute("DELETE FROM adr001_memory WHERE layer='authoritative'")
-            db.executemany("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)", planned)
-            db.commit()
+            with closing(sqlite3.connect(backup)) as destination:
+                source.backup(destination)
         except Exception:
-            db.rollback()
+            backup.unlink(missing_ok=True)
             raise
+    committed = False
+    try:
+        with closing(sqlite3.connect(path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                # Recheck under the write lock; never apply a stale dry-run plan.
+                current, planned, latest = plan(db)
+                if current != old or latest != counts:
+                    raise RuntimeError("memory DB changed after backup; migration refused")
+                # Owner put() rightly refuses mutation. This one-shot identity
+                # rewrite preserves verified text/text_sha256 and only changes
+                # project scopes, owner keys, and supersedes links atomically.
+                db.execute("DELETE FROM adr001_memory WHERE layer='authoritative'")
+                db.executemany("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)", planned)
+                db.commit()
+                committed = True
+            except Exception:
+                db.rollback()
+                raise
+    except Exception:
+        # This invocation created the backup. A refused transaction left the
+        # source untouched, so remove only our backup to permit a safe retry.
+        if not committed:
+            backup.unlink(missing_ok=True)
+        raise
     return {**counts, "dry_run": False, "backup": str(backup)}
 
 

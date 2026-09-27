@@ -1269,6 +1269,11 @@ def task_issue_number(task) -> Optional[int]:
 
 
 class TaskQueue:
+    @property
+    def db_path(self) -> str:
+        """Path for post-commit observers shared by HTTP and MCP transports."""
+        return self._db_path
+
     def __init__(self, db_path: str, *, telemetry_adapter: Optional[TaskTelemetryAdapter] = None,
                  read_only: bool = False, runtime_authority=None,
                  cea_config=None, cea_providers=None):

@@ -255,7 +255,7 @@ def build_mcp_server(
         try:
             task_type = queue.submit_result(task_id, result, nonce=_nonce,
                                             presenter=_presenter)
-            capture_result_best_effort(queue._db_path, task_id, result)
+            capture_result_best_effort(queue.db_path, task_id, result)
         except AdmissionRefused as exc:
             # Both transports or neither: HTTP answers 409 for a refused P2
             # RESULT, so MCP refuses the same submission rather than letting
