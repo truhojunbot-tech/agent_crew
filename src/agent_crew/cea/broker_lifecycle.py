@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import struct
 import subprocess
 import sys
 import time
@@ -33,6 +34,52 @@ def _start_time(pid: int) -> str | None:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
     except (OSError, IndexError):
         return None
+
+
+def _process_uid(pid: int) -> int | None:
+    try:
+        return Path(f"/proc/{pid}").stat().st_uid
+    except OSError:
+        return None
+
+
+def _exact_broker_cmd(cmd: list[str] | None, sock_dir: Path, *, allow_degraded: bool = False) -> bool:
+    if allow_degraded and cmd and cmd[-1] == "--degraded":
+        cmd = cmd[:-1]
+    if not cmd or len(cmd) not in (5, 7):
+        return False
+    if cmd[1:5] != ["-m", "agent_crew.cea.broker", "--sock-dir", str(sock_dir)]:
+        return False
+    return len(cmd) == 5 or (cmd[5] == "--client-uid" and cmd[6].isdigit())
+
+
+def _socket_peer(sock_path: Path) -> tuple[int, int] | None:
+    if not sock_path.exists():
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(1)
+            connection.connect(str(sock_path))
+            pid, uid, _ = struct.unpack("3i", connection.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")))
+            return pid, uid
+    except OSError as exc:
+        raise LifecycleError(f"cannot verify socket peer at {sock_path}: {exc}") from exc
+
+
+def verified_orphan_pid(sock_dir: Path, service_uid: int, *, allow_degraded: bool = False) -> int | None:
+    """Identify a no-pidfile broker by the connected socket peer, not PID scans."""
+    peer = _socket_peer(sock_dir / "broker.sock")
+    if peer is None:
+        return None
+    pid, peer_uid = peer
+    if pid <= 1 or peer_uid != service_uid or _process_uid(pid) != service_uid:
+        raise LifecycleError(f"socket peer PID {pid} is not broker uid {service_uid}")
+    if not _exact_broker_cmd(_cmdline(pid), sock_dir, allow_degraded=allow_degraded):
+        raise LifecycleError(f"socket peer PID {pid} is not this broker; refusing to signal")
+    if _start_time(pid) is None:
+        raise LifecycleError(f"cannot verify socket peer PID {pid} start time")
+    return pid
 
 
 def _broker_pid(pidfile: Path, sock_dir: Path, service_uid: int) -> int | None:
@@ -90,11 +137,21 @@ def health(sock_dir: Path, tokens_path: Path, service_uid: int) -> None:
         raise LifecycleError(f"authenticated health failed: {exc}") from exc
 
 
-def stop(pidfile: Path, sock_dir: Path, service_uid: int, *, timeout: float = 10) -> None:
+def stop(pidfile: Path, sock_dir: Path, service_uid: int, *, timeout: float = 10,
+         allow_degraded: bool = False) -> None:
     pid = _broker_pid(pidfile, sock_dir, service_uid)
+    orphan = pid is None
+    if orphan:
+        pid = verified_orphan_pid(sock_dir, service_uid, allow_degraded=allow_degraded)
     if pid is None:
         print("broker already stopped", flush=True)
         return
+    born = _start_time(pid)
+    if born is None or _process_uid(pid) != service_uid or not _exact_broker_cmd(
+            _cmdline(pid), sock_dir, allow_degraded=allow_degraded):
+        raise LifecycleError(f"broker PID {pid} changed before signal; refusing")
+    if orphan and _socket_peer(sock_dir / "broker.sock") != (pid, service_uid):
+        raise LifecycleError(f"broker socket peer changed before signal; refusing PID {pid}")
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -102,12 +159,15 @@ def stop(pidfile: Path, sock_dir: Path, service_uid: int, *, timeout: float = 10
             pidfile.unlink(missing_ok=True)
             print(f"broker stopped pid={pid}", flush=True)
             return
+        if _start_time(pid) != born:
+            raise LifecycleError(f"broker PID {pid} changed after SIGTERM")
         time.sleep(0.1)
     raise LifecycleError(f"broker PID {pid} did not stop after SIGTERM within {timeout:g}s; no SIGKILL sent")
 
 
 def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
-          python: str, client_uid: str, *, timeout: float = 10) -> None:
+          python: str, client_uid: str, *, timeout: float = 10,
+          env: dict[str, str] | None = None, degraded: bool = False) -> None:
     old = _broker_pid(pidfile, sock_dir, service_uid)
     if old is not None:
         health(sock_dir, tokens_path, service_uid)
@@ -124,9 +184,13 @@ def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
                 raise LifecycleError("broker socket answers without a verified pidfile; refusing double start")
     log = sock_dir / "broker.log"
     with log.open("ab") as output:
-        proc = subprocess.Popen([python, "-m", "agent_crew.cea.broker", "--sock-dir", str(sock_dir),
-                                 "--client-uid", client_uid], stdin=subprocess.DEVNULL,
-                                stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+        command = [python, "-m", "agent_crew.cea.broker", "--sock-dir", str(sock_dir),
+                   "--client-uid", client_uid]
+        if degraded:
+            command.append("--degraded")
+        proc = subprocess.Popen(command, stdin=subprocess.DEVNULL,
+                                stdout=output, stderr=subprocess.STDOUT, start_new_session=True,
+                                env=env)
     born = _start_time(proc.pid)
     if born is None:
         raise LifecycleError("broker exited before its PID could be recorded")
@@ -134,6 +198,7 @@ def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
     tmp.write_text(json.dumps({"pid": proc.pid, "start_time": born}) + "\n")
     tmp.replace(pidfile)
     deadline = time.monotonic() + timeout
+    last_health_error = None
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             pidfile.unlink(missing_ok=True)
@@ -142,13 +207,15 @@ def start(pidfile: Path, sock_dir: Path, service_uid: int, tokens_path: Path,
             health(sock_dir, tokens_path, service_uid)
             print(f"broker started pid={proc.pid}; authenticated health ok", flush=True)
             return
-        except LifecycleError:
+        except LifecycleError as exc:
+            last_health_error = exc
             time.sleep(0.1)
     try:
-        stop(pidfile, sock_dir, service_uid)
+        stop(pidfile, sock_dir, service_uid, allow_degraded=degraded)
     except LifecycleError as exc:
         raise LifecycleError(f"broker failed authenticated health; cleanup failed: {exc}; see {log}") from exc
-    raise LifecycleError(f"broker failed authenticated health within {timeout:g}s; stopped; see {log}")
+    raise LifecycleError(f"broker failed authenticated health within {timeout:g}s: "
+                         f"{last_health_error}; stopped; see {log}")
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -721,6 +721,10 @@ def test_owner_rehearsal_with_real_venv():
                              "--caller-tokens", str(token)], capture_output=True, text=True, timeout=300)
     assert result.returncode == 0, result.stderr + result.stdout
     assert '"downgrade_reason": "BROKER_TREE_USER_WRITABLE"' in result.stdout
+    assert "rehearsal legacy orphan pid " in result.stdout
+    assert "broker stopped pid=" in result.stdout
+    assert "replaced by managed broker" in result.stdout
+    assert "broker started pid=" in result.stdout
     assert "rehearsal complete" in result.stdout
 
 
