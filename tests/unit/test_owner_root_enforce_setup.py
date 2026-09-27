@@ -2,7 +2,9 @@
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
+import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
@@ -56,6 +58,19 @@ def test_dry_run_changes_nothing_and_does_not_show_secrets(tmp_path):
     assert "private" not in result.stdout
     assert (tree / "SRC_COMMIT").read_bytes() == before
     assert sudoers.read_text() == "old sudoers\n"
+    assert not (tmp_path / "var/lib/crew-authz").exists()
+
+
+@pytest.mark.parametrize("extra_args", [(), ("--caller-tokens", "/home/truhojun/.verify-private/tokens.json")])
+def test_dry_run_reports_unreadable_existing_broker_env(tmp_path, extra_args):
+    tree, _, _ = _seed(tmp_path)
+    config = tree / "broker.env"
+    config.chmod(0o000)
+    result = _run(tmp_path, "--dry-run", *extra_args)
+    assert result.returncode == 0, result.stderr
+    assert "existing broker.env unreadable as non-root; validated at apply" in result.stdout
+    assert "PLAN $" in result.stdout
+    assert "dry-run: no changes made" in result.stdout
     assert not (tmp_path / "var/lib/crew-authz").exists()
 
 
@@ -190,16 +205,17 @@ def test_update_src_dry_run_apply_and_undo(tmp_path):
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").exists()
 
 
-def test_unreadable_broker_env_reports_error_but_source_preview_does_not_need_it(tmp_path):
+def test_unreadable_broker_env_previews_print_plans(tmp_path):
     tree, _, _ = _seed(tmp_path)
     env_file = tree / "broker.env"
     env_file.chmod(0)
     dry = _run(tmp_path)
-    assert dry.returncode != 0
-    assert "broker.env is not readable" in dry.stderr
-    assert "Traceback" not in dry.stderr
+    assert dry.returncode == 0, dry.stderr
+    assert "existing broker.env unreadable as non-root; validated at apply" in dry.stdout
+    assert "PLAN $" in dry.stdout
     source_preview = _run(tmp_path, "--update-src")
     assert source_preview.returncode == 0, source_preview.stderr
+    assert "existing broker.env unreadable as non-root; validated at apply" in source_preview.stdout
     assert "dry-run: no changes made" in source_preview.stdout
 
 
@@ -221,3 +237,97 @@ def test_main_undo_refuses_outstanding_source_update(tmp_path):
     assert source_undo.returncode == 0, source_undo.stderr
     main_undo = _run(tmp_path, "--undo")
     assert main_undo.returncode == 0, main_undo.stderr
+
+
+def test_preinstall_selftest_failure_changes_no_fake_root_files(tmp_path):
+    tree, token, _ = _seed(tmp_path)
+    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    result = subprocess.run(
+        ["bash", str(SCRIPT), "--apply", "--caller-tokens",
+         "/home/truhojun/.verify-private/tokens.json", "--root-prefix", str(tmp_path)],
+        text=True, capture_output=True,
+        env={**os.environ, "AGENT_CREW_OWNER_SETUP_TESTING": "1",
+             "AGENT_CREW_OWNER_SETUP_SELFTEST": "1"},
+    )
+    assert result.returncode != 0
+    assert "pre-install broker self-test failed before changes" in result.stderr
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")) == before
+    assert not (tree / "caller-tokens.json").exists()
+
+
+def test_group_sandbox_authenticated_authorize(tmp_path):
+    _, token, _ = _seed(tmp_path)
+    token.write_text(json.dumps({"adapters": {"sandbox-token": {
+        "principal": "cron:sandbox", "provenance": "cron"}}}))
+    script = SCRIPT.with_name("broker_group_sandbox.py")
+    result = subprocess.run(["python3", str(script), "--caller-tokens", str(token)],
+                            text=True, capture_output=True, timeout=60)
+    assert result.returncode == 0, result.stderr
+    evidence = json.loads(result.stdout)
+    assert evidence["pass"] and evidence["authenticated"]
+    assert evidence["socket_mode"] == "0660"
+    assert evidence["peer_uid"] == os.geteuid()
+
+
+def test_fake_apply_and_source_update_run_preinstall_proof(tmp_path):
+    tree, token, _ = _seed(tmp_path)
+    token.write_text(json.dumps({"adapters": {"sandbox-token": {
+        "principal": "cron:sandbox", "provenance": "cron"}}}))
+    env = {**os.environ, "AGENT_CREW_OWNER_SETUP_TESTING": "1",
+           "AGENT_CREW_OWNER_SETUP_SELFTEST": "1"}
+    apply = subprocess.run(
+        ["bash", str(SCRIPT), "--apply", "--caller-tokens",
+         "/home/truhojun/.verify-private/tokens.json", "--root-prefix", str(tmp_path)],
+        text=True, capture_output=True, env=env, timeout=60)
+    assert apply.returncode == 0, apply.stderr
+    assert '"authenticated": true' in apply.stdout
+    update = subprocess.run(
+        ["bash", str(SCRIPT), "--apply", "--update-src", "--root-prefix", str(tmp_path)],
+        text=True, capture_output=True, env=env, timeout=60)
+    assert update.returncode == 0, update.stderr
+    assert '"authenticated": true' in update.stdout
+    assert (tree / "src" / "agent_crew" / "cea" / "broker.py").is_file()
+
+
+def test_broker_env_quoted_values_round_trip(tmp_path):
+    tree, _, _ = _seed(tmp_path)
+    owner_note = "owner's two words"
+    (tree / "broker.env").write_text(
+        "AGENT_CREW_CEA_CREDIT_CLASS='{" + '"gemini":"plan"' + "}'\n"
+        "AGENT_CREW_CEA_NOTE='two words'\n"
+        f"AGENT_CREW_CEA_OWNER_NOTE={shlex.quote(owner_note)}\n"
+    )
+    dry = _run(tmp_path)
+    assert dry.returncode == 0, dry.stderr
+    assert "broker.env validation passed" in dry.stdout
+    applied = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    assert applied.returncode == 0, applied.stderr
+    config = (tree / "broker.env").read_text()
+    assert "AGENT_CREW_CEA_CREDIT_CLASS='{" + '"gemini":"plan"' + "}'" in config
+    assert "AGENT_CREW_CEA_NOTE='two words'" in config
+    assert f"AGENT_CREW_CEA_OWNER_NOTE={shlex.quote(owner_note)}" in config
+
+
+@pytest.mark.parametrize("line", [
+    "AGENT_CREW_CEA_NOTE=two words",
+    "AGENT_CREW_CEA_MEMORY_CMD=python3 /tmp/admission_inputs.py",
+    'AGENT_CREW_CEA_CREDIT_CLASS={"gemini":"plan"}',
+    "AGENT_CREW_CEA_MEMORY_CMD='python3 /tmp/admission_inputs.py'",
+    "AGENT_CREW_CEA_NOTE=$(touch {fake_root}/sentinel)",
+    "export AGENT_CREW_CEA_MODE=enforce",
+])
+def test_invalid_existing_broker_env_refused_before_apply(tmp_path, line):
+    tree, _, _ = _seed(tmp_path)
+    config = tree / "broker.env"
+    line = line.replace("{fake_root}", str(tmp_path))
+    config.write_text(line + "\n")
+    dry = _run(tmp_path)
+    assert dry.returncode != 0
+    assert "broker.env" in dry.stderr
+    assert config.read_text() == line + "\n"
+    applied = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
+    assert applied.returncode != 0
+    assert "broker.env" in applied.stderr
+    assert config.read_text() == line + "\n"
+    assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce").exists()
+    assert not (tmp_path / "sentinel").exists()
