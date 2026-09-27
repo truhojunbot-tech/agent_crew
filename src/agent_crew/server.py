@@ -32,6 +32,7 @@ from agent_crew.memory import (
     shadow_retrieve_bounded,
     shadow_telemetry,
 )
+from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.context_identity import (
     append_attribution_jsonl,
     detect_context_compaction,
@@ -2688,6 +2689,7 @@ def create_app(
                 os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.05"))
         except ValueError:
             shadow_memory_timeout_seconds = 0.05
+
     if worktree_map is None:
         worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
     if watchdog_interval is None:
@@ -4112,6 +4114,8 @@ def create_app(
                                error_info={"reason": reason, "final": status == "failed"}),
                     dispatcher_failed=status == "failed",
                 )
+                capture_result_best_effort(db_path, task_id, TaskResult(
+                    task_id=task_id, status=status, summary=reason))
                 _attr = q().get_attribution(task_id)
                 record_context_event(
                     _context_events_path,
@@ -6185,6 +6189,7 @@ def create_app(
         try:
             task_type = q().submit_result(task_id, result, nonce=_nonce,
                                           presenter=_presenter)
+            capture_result_best_effort(db_path, task_id, result)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
             # outside submit_result's STOP-atomic transaction: a telemetry-like

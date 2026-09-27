@@ -11,7 +11,8 @@ from contextlib import closing
 from dataclasses import dataclass, asdict
 from typing import Optional, Protocol
 
-LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic"})
+LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
+                    "decision", "failure_pattern"})
 
 
 @dataclass(frozen=True)
@@ -309,9 +310,10 @@ class RuntimeMemoryProvider:
                             issue=request.issue, task_id=request.task_id,
                             context_generation=request.context_generation)
         records = self.storage.retrieve(scope, query=request.retrieval_query)
-        allowed = set(request.memory_types) if request.memory_types else {"procedural", "episodic"}
+        allowed = set(request.memory_types) if request.memory_types else {
+            "procedural", "episodic", "decision", "failure_pattern"}
         records = [record for record in records if record.layer in allowed
-                   and record.layer in {"procedural", "episodic"}]
+                   and record.layer in {"procedural", "episodic", "decision", "failure_pattern"}]
         scoped = [record for record in records
                   if same_memory_project(request.project, record.scope.project)]
         dropped = len(records) - len(scoped)
