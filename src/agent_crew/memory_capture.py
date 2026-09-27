@@ -42,6 +42,13 @@ def _optional_generation(value) -> int | None:
         return None
 
 
+def _optional_issue(value) -> str:
+    """Only an existing scalar issue identifier can become scope identity."""
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return ""
+    return str(value).strip()
+
+
 def canonical_project(name: str, *, repo: str = "") -> str:
     """Resolve one owner/bot name; ambiguous Quota requires a repository."""
     token = str(name or "").strip().lower()
@@ -74,7 +81,7 @@ def capture_task_outcome(storage: SQLiteMemoryStorage, *, project: str, repo: st
     layers = ["episodic", "decision"]
     if status in {"failed", "needs_human", "timed_out"}:
         layers.append("failure_pattern")
-    scope = MemoryScope(project=canonical, task_id=task_id, issue=str(issue or ""),
+    scope = MemoryScope(project=canonical, task_id=task_id, issue=_optional_issue(issue),
                         worktree=str(worktree or ""),
                         provider_session=str(provider_session or ""),
                         context_generation=_optional_generation(context_generation))
@@ -110,7 +117,7 @@ def capture_episode(storage: SQLiteMemoryStorage, episode: dict, *, project: str
     if outcome.startswith("failed") or outcome == "needs_human":
         layers.append("failure_pattern")
     scope = MemoryScope(project=canonical, task_id=task_id,
-                        issue=str(episode.get("issue") or ""),
+                        issue=_optional_issue(episode.get("issue")),
                         worktree=str(episode.get("worktree") or ""),
                         provider_session=str(episode.get("provider_session")
                                              or episode.get("provider_session_id") or ""),

@@ -48,8 +48,24 @@ def _scope_specificity(scope: MemoryScope) -> int:
     return sum(value not in ("", None) for value in asdict(scope).values())
 
 
-def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope) -> bool:
+def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
+                   *, strict: bool = True) -> bool:
     """Return whether a stored scope applies to a query under ADR-001 order."""
+    if not strict:
+        # Shadow comparisons can use evidence from a prior task when the
+        # request omits a dimension. A named fleet remains an exact boundary.
+        if record_scope.project != query_scope.project:
+            return False
+        if record_scope.fleet != query_scope.fleet:
+            return False
+        for name in ("worktree", "issue", "task_id", "context_generation",
+                     "provider_session"):
+            wanted = getattr(query_scope, name)
+            actual = getattr(record_scope, name)
+            unset = ("", None, 0) if name == "context_generation" else ("", None)
+            if wanted not in unset and actual not in (*unset, wanted):
+                return False
+        return True
     record_fields = list(asdict(record_scope).items())
     query_fields = dict(asdict(query_scope))
     # Generation zero was the legacy representation of unset.  Preserve that
@@ -157,6 +173,10 @@ class SQLiteMemoryStorage:
             db.execute("BEGIN IMMEDIATE")
             for record in records:
                 scope = _canonical_scope_json(record.scope)
+                old_version = db.execute(
+                    "SELECT MAX(version) FROM adr001_memory WHERE layer=? AND key=? "
+                    "AND json_extract(scope,'$.project')=?",
+                    (record.layer, record.key, project)).fetchone()[0] or 0
                 # A later result may know more scope fields than the first
                 # capture. These task/episode keys identify one observation;
                 # keep its newest scope without leaving an older duplicate.
@@ -167,7 +187,7 @@ class SQLiteMemoryStorage:
                                    (record.layer, record.key, scope)).fetchone()
                 if prior and json.loads(prior[0]) == record.value:
                     continue
-                version = prior[1] + 1 if prior else 1
+                version = old_version + 1
                 db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
                     ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,
                     version=excluded.version,created=excluded.created""",
@@ -232,7 +252,10 @@ class SQLiteMemoryStorage:
             if name != "fleet" and value in ("", None):
                 continue
             path = f"$.{name}"
-            if name == "context_generation":
+            if name == "fleet":
+                clauses.append("COALESCE(json_extract(scope, ?),'') = ?")
+                params.extend((path, value))
+            elif name == "context_generation":
                 clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
                                "OR json_extract(scope, ?) = 0 OR json_extract(scope, ?) = ?)")
                 params.extend((path, path, path, path, value))
@@ -255,11 +278,7 @@ class SQLiteMemoryStorage:
                 [*args, scope.project, min(limit, 50)]).fetchall()
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
-        return [r for r in records if all(
-            (getattr(scope, name) in ("", None) and name != "fleet")
-            or getattr(r.scope, name) in ("", None, 0, getattr(scope, name))
-            for name in ("fleet", "worktree", "issue", "task_id",
-                         "context_generation", "provider_session"))], dropped
+        return [r for r in records if _scope_applies(r.scope, scope, strict=False)], dropped
 
 
 def owner_statement_key(project: str, channel: str, chat_id: str,
