@@ -1,0 +1,23 @@
+# CEA broker decision deployment (#427, alfred#51)
+
+This change is **off by default**. `AGENT_CREW_CEA_BROKER_SOCKET` selects the broker decision client. The broker speaks the existing authenticated engine service intent format through a new `authorize` operation. A missing or unreachable socket falls back to the embedded engine and stamps `downgrade_reason: broker_unreachable` on its receipt. Embedded `enforce` still refuses authorization, so a failed broker cannot grant work.
+
+## Phase 1: integrity by convention
+
+The live sudoers rule currently points to `/home/truhojun/alfred/tools/cea/broker-launch.sh`. Its path and the broker source tree have user-writable ancestors. This phase is a policy gate for honest mistakes, **not** an adversarial isolation boundary. The launcher `--check` and broker inspect file and ancestor ownership/modes. A writable or non-root-owned component forces `BROKER_TREE_USER_WRITABLE` on all decision receipts and prevents any `VERIFIED` executor attestation. `BLOCKED` peer/registration evidence still takes precedence.
+
+1. Build and stage `/opt/agent_crew-authz/src` from the reviewed commit; keep `src.old`, write `/opt/agent_crew-authz/SRC_COMMIT`, and verify both source and launcher SHA-256. Do this as a separate, manual T0 action. `scripts/cea/install_broker.sh` stages the tracked launcher byte-identically at the existing pinned path with mode 0755 and verifies SHA-256; it does not edit sudoers or start the broker.
+2. Write `/opt/agent_crew-authz/broker.env` with `AGENT_CREW_CEA_BROKER_DB` pointing to the alfred queue DB, `AGENT_CREW_CEA_CALLER_TOKENS` to the private adapter token table, `AGENT_CREW_CEA_MODE=enforce`, and `AGENT_CREW_CEA_ENFORCE_CODES=RUNTIME_STATE_FORBIDS`. The broker's own input paths and signing key must be configured there as documented in `cea/wiring.py`. Its token file must be readable by `crew-authz` and mode 0600 or 0400. The launcher sources this fixed config path after sudo clears the caller environment.
+3. Run `AGENT_CREW_CEA_BROKER_LAUNCHER=/home/truhojun/alfred/tools/cea/broker-launch.sh scripts/cea/start_broker.sh --check`. Inspect the reported downgrade. Start the broker through the same configurable launcher path. Check the socket and test a credentialed decision before changing the crew server.
+4. In a sandbox, run `python3 scripts/cea/broker_sandbox.py` and `RUN_CEA_BROKER_SANDBOX=1 pytest -q tests/unit/test_cea_broker_sandbox_wrapper.py`. Evidence is written to `evidence/cea_broker_sandbox_<sha7>.json`. The decision assertions use a separate isolated broker with injected providers; the launched degraded broker and free-port server are smoke checks. This does **not** constitute a live deploy test.
+5. Prepare the T0 swap with `scripts/runtime_swap.sh`: target project `alfred`, exact build SHA and artifact SHA-256, launch command, before/after process PID and port, broker socket path and owner/mode, token-table path and mode, source commit, `--check` output, allowed reason-code set, receipt IDs for blocked/allowed/advisory probes, and rollback owner. Set `AGENT_CREW_CEA_BROKER_SOCKET` on the crew server only during the approved swap. The socket path alone does not make a receipt `VERIFIED`.
+
+The broker launcher path is configurable with `AGENT_CREW_CEA_BROKER_LAUNCHER`; the default in `scripts/cea/start_broker.sh` is the phase-2 root-owned path. The old path must be specified explicitly and is phase 1 only.
+
+## Phase 2: owner root step
+
+`scripts/cea/install_broker_root.sh <full-build-sha>` prints the exact one-time root commands from the coordinator decision; it never executes them. The owner reviews and runs them during a T0. The launcher moves to `/usr/local/libexec/crew-authz/broker-launch.sh`, and the broker source tree becomes root-owned. Recheck every ancestor and the broker receipt downgrade before making any isolation claim. Every later broker code update requires another root installation into `/opt/agent_crew-authz`.
+
+## Rollback
+
+Unset `AGENT_CREW_CEA_BROKER_SOCKET`, swap the crew server back to the recorded pre-change build with `scripts/runtime_swap.sh`, and verify `/health`, process PID/port, and a fresh receipt. Stop the broker after the server no longer points at its socket. Do not alter the live sudoers rule outside the phase-2 owner step. Preserve the evidence and failed receipts for review.
