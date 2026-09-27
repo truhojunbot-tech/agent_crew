@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import time
+import urllib.error
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -88,6 +89,90 @@ def test_snapshot_producer_signature_alone_cannot_authorize_update(tmp_path):
     root, snapshot, *_ = _fixture(tmp_path, owner_key=False)
     with pytest.raises(update.Refused, match="owner T0 public key"):
         update.verified_t0("a" * 40, root=root, snapshot=snapshot)
+
+
+def _review(state="APPROVED", *, review_id=1, user_id=10932361, commit="b" * 40):
+    return {"id": review_id, "user": {"id": user_id, "login": "owner"},
+            "state": state, "commit_id": commit,
+            "submitted_at": f"2026-09-27T00:00:{review_id:02d}Z"}
+
+
+@pytest.mark.parametrize("changes,expected", [
+    ({}, True),
+    ({"review_commit": "c" * 40}, False),
+    ({"later_state": "CHANGES_REQUESTED"}, False),
+    ({"later_state": "DISMISSED"}, False),
+    ({"wrong_id": True}, False),
+    ({"unmerged": True}, False),
+    ({"merge_sha": "c" * 40}, False),
+    ({"head_sha": "c" * 40}, False),
+])
+def test_github_owner_review_gate(changes, expected):
+    decision = {"pr_number": 474, "reviewed_head": "b" * 40}
+    pr = {"merged_at": None if changes.get("unmerged") else "2026-09-27T00:00:00Z",
+          "merge_commit_sha": changes.get("merge_sha", "a" * 40),
+          "head": {"sha": changes.get("head_sha", "b" * 40)}}
+    reviews = [_review(user_id=42 if changes.get("wrong_id") else 10932361,
+                       commit=changes.get("review_commit", "b" * 40))]
+    if changes.get("later_state"):
+        reviews.append(_review(changes["later_state"], review_id=2))
+    def fetch(path):
+        return pr if path == "/pulls/474" else reviews
+    assert update.github_owner_approved(decision, "a" * 40, 10932361, fetch) is expected
+
+
+def test_github_review_pagination_and_api_failure(tmp_path, monkeypatch):
+    decision = {"pr_number": 474, "reviewed_head": "b" * 40}
+    pr = {"merged_at": "2026-09-27T00:00:00Z", "merge_commit_sha": "a" * 40,
+          "head": {"sha": "b" * 40}}
+    first = [_review("APPROVED", review_id=1)] + [_review(user_id=42, review_id=2)] * 99
+    def fetch(path):
+        if path == "/pulls/474": return pr
+        return first if path.endswith("page=1") else [_review("DISMISSED", review_id=3)]
+    assert not update.github_owner_approved(decision, "a" * 40, 10932361, fetch)
+    root, snapshot, *_ = _fixture(tmp_path, owner_key=False)
+    (root / "owner-reviewer.json").write_text('{"user_id": 10932361}\n')
+    (root / "owner-reviewer.json").chmod(0o644)
+    monkeypatch.setattr(update, "github_json", lambda path: (_ for _ in ()).throw(update.Refused("HTTP 403 rate limit")))
+    with pytest.raises(update.Refused, match="HTTP 403"):
+        update.verified_t0("a" * 40, root=root, snapshot=snapshot)
+
+
+def test_github_owner_approval_authorizes_valid_t0(tmp_path, monkeypatch):
+    root, snapshot, *_ = _fixture(tmp_path, owner_key=False)
+    (root / "owner-reviewer.json").write_text('{"user_id": 10932361}\n')
+    (root / "owner-reviewer.json").chmod(0o644)
+    def fetch(path):
+        if path == "/pulls/469":
+            return {"merged_at": "2026-09-27T00:00:00Z", "merge_commit_sha": "a" * 40,
+                    "head": {"sha": "b" * 40}}
+        return [_review()]
+    monkeypatch.setattr(update, "github_json", fetch)
+    decision, _ = update.verified_t0("a" * 40, root=root, snapshot=snapshot)
+    assert decision["pr_number"] == 469
+
+
+def test_github_fetch_refuses_http_errors_and_redirects(monkeypatch):
+    class Opener:
+        def open(self, request, timeout):
+            raise urllib.error.HTTPError(request.full_url, 403, "rate limit", {}, None)
+    monkeypatch.setattr(update.urllib.request, "build_opener", lambda *handlers: Opener())
+    with pytest.raises(update.Refused, match="GitHub review unavailable"):
+        update.github_json("/pulls/474")
+
+
+def test_reviewer_configuration_must_be_protected(tmp_path):
+    root = tmp_path / "root"
+    root.mkdir()
+    config = root / "owner-reviewer.json"
+    config.write_text('{"user_id": 10932361}')
+    config.chmod(0o666)
+    with pytest.raises(update.Refused, match="writable"):
+        update.owner_reviewer_id(root)
+    config.unlink()
+    config.symlink_to(tmp_path / "elsewhere")
+    with pytest.raises(update.Refused, match="linked"):
+        update.owner_reviewer_id(root)
 
 
 @pytest.mark.parametrize("change,reason", [

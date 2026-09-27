@@ -31,6 +31,7 @@ mode.add_argument("--rehearse", action="store_true", help="run a real isolated u
 p.add_argument("--caller-tokens", type=Path, help="private adapter token table to copy")
 p.add_argument("--snapshot-pubkey", type=Path, help="Ed25519 public key PEM source")
 p.add_argument("--owner-t0-pubkey", type=Path, help="separate owner T0 Ed25519 public key required to enable root updater sudoers grant")
+p.add_argument("--owner-reviewer-id", type=int, help="pinned numeric GitHub owner reviewer ID for root updater approval")
 p.add_argument("--snapshot-path", type=Path, help="canonical signed snapshot to seed the rollback guard")
 p.add_argument("--root-prefix", type=Path, help=argparse.SUPPRESS)
 p.add_argument("--update-src", action="store_true", help="update broker source from this clean checkout")
@@ -40,6 +41,8 @@ if args.root_prefix and os.environ.get("AGENT_CREW_OWNER_SETUP_TESTING") != "1":
 fake = args.root_prefix is not None
 if args.rehearse and (not args.update_src or args.root_prefix):
     p.error("--rehearse requires --update-src and cannot use --root-prefix")
+if args.owner_reviewer_id is not None and args.owner_reviewer_id < 1:
+    p.error("--owner-reviewer-id must be a positive integer")
 if not fake and not args.rehearse and (args.apply or args.undo) and os.geteuid() != 0:
     p.error("--apply and --undo require root")
 rehearsal_dir = tempfile.TemporaryDirectory(prefix="crew-owner-rehearse-") if args.rehearse else None
@@ -123,11 +126,17 @@ owner_t0_source = args.owner_t0_pubkey
 if fake and owner_t0_source and owner_t0_source.is_absolute() and not owner_t0_source.is_relative_to(root):
     owner_t0_source = path(str(owner_t0_source))
 pinned_owner_t0 = tree / "owner-t0.pub"
-existing_owner_t0 = (args.update_src and pinned_owner_t0.is_file() and
+pinned_owner_reviewer = tree / "owner-reviewer.json"
+existing_owner_t0 = (pinned_owner_t0.is_file() and
                      not pinned_owner_t0.is_symlink() and
                      not pinned_owner_t0.stat().st_mode & 0o022 and
                      (not privileged or pinned_owner_t0.stat().st_uid == 0))
-sudoers_content = launcher_sudoers + (updater_sudoers if owner_t0_source or existing_owner_t0 else "")
+existing_owner_reviewer = (pinned_owner_reviewer.is_file() and
+                           not pinned_owner_reviewer.is_symlink() and
+                           not pinned_owner_reviewer.stat().st_mode & 0o022 and
+                           (not privileged or pinned_owner_reviewer.stat().st_uid == 0))
+sudoers_content = launcher_sudoers + (updater_sudoers if
+    owner_t0_source or existing_owner_t0 or args.owner_reviewer_id or existing_owner_reviewer else "")
 if fake and args.snapshot_pubkey and snapshot_source.is_absolute() and not snapshot_source.is_relative_to(root):
     snapshot_source = path(str(snapshot_source))
 snapshot_path = args.snapshot_path or path("/home/truhojun/alfred/governance/cea_policy_snapshot.json")
@@ -154,7 +163,7 @@ def update_backups():
             ("src", "tests", "venv", "state", "caller-tokens.json",
              "receipt-signing.key", "receipt-signing.pub")] + [launcher.with_name("broker-launch.old"),
              updater.with_name("broker-update.old"), sudoers.with_name("crew-authz-broker.old"),
-             tree / "snapshot.pub.old", tree / "owner-t0.pub.old"]
+             tree / "snapshot.pub.old", tree / "owner-t0.pub.old", tree / "owner-reviewer.json.old"]
 
 def completed_update_leftovers():
     """Return rotatable backups, or a reason an earlier update needs recovery."""
@@ -166,7 +175,7 @@ def completed_update_leftovers():
     staged.append(launcher.with_name("broker-launch.new"))
     staged.append(updater.with_name("broker-update.new"))
     staged.extend((sudoers.with_name("crew-authz-broker.new"), tree / "snapshot.pub.new",
-                   tree / "owner-t0.pub.new"))
+                   tree / "owner-t0.pub.new", tree / "owner-reviewer.json.new"))
     if any(item.exists() for item in staged):
         return [], "source update staging exists; inspect and remove it before retrying"
     backups = [item for item in update_backups() if item.exists()]
@@ -326,6 +335,17 @@ def apply_preconditions(source_update=False):
         failures.append(f"updater source missing or linked: {source_updater}")
     if owner_t0_source and (not owner_t0_source.is_file() or owner_t0_source.is_symlink()):
         failures.append(f"owner T0 public key missing or linked: {owner_t0_source}")
+    if pinned_owner_reviewer.exists() or pinned_owner_reviewer.is_symlink():
+        if not existing_owner_reviewer and args.update_src:
+            failures.append(f"owner reviewer config is linked or writable: {pinned_owner_reviewer}; recover by replacing as root")
+        elif existing_owner_reviewer:
+            try:
+                reviewer = json.loads(pinned_owner_reviewer.read_text())
+                if (not isinstance(reviewer, dict) or set(reviewer) != {"user_id"} or
+                        type(reviewer["user_id"]) is not int or reviewer["user_id"] < 1):
+                    raise ValueError("invalid owner reviewer ID")
+            except (OSError, ValueError) as exc:
+                failures.append(f"owner reviewer config invalid: {exc}; recover by replacing as root")
     if source_update:
         broker_config = tree / "broker.env"
         broker_content = read_broker_env(broker_config)
@@ -458,6 +478,10 @@ def report_preconditions(source_update=False):
         raise SystemExit(1)
 
 if args.update_src:
+    if args.owner_reviewer_id:
+        say(f"owner reviewer ID {args.owner_reviewer_id}: pin {pinned_owner_reviewer} root:root 0644; updater sudoers grant enabled")
+    elif existing_owner_reviewer:
+        say(f"owner reviewer config retained at {pinned_owner_reviewer}; updater sudoers grant enabled")
     if not args.apply and not args.undo and (tree / "broker.env").exists() and not os.access(tree / "broker.env", os.R_OK):
         say("existing broker.env unreadable as non-root; validated at apply")
     source = source_root / "src"
@@ -502,7 +526,8 @@ if args.update_src:
             updater.unlink(missing_ok=True)
         for live, backup, key in ((sudoers, sudoers.with_name("crew-authz-broker.old"), "had_sudoers"),
                                   (tree / "snapshot.pub", tree / "snapshot.pub.old", "had_snapshot_pub"),
-                                  (tree / "owner-t0.pub", tree / "owner-t0.pub.old", "had_owner_t0_pub")):
+                                  (tree / "owner-t0.pub", tree / "owner-t0.pub.old", "had_owner_t0_pub"),
+                                  (tree / "owner-reviewer.json", tree / "owner-reviewer.json.old", "had_owner_reviewer")):
             if saved.get(key) and backup.exists():
                 os.replace(backup, live)
             elif not saved.get(key):
@@ -549,9 +574,10 @@ if args.update_src:
     sudoers_stage = sudoers.with_name("crew-authz-broker.new")
     snapshot_pub_stage = tree / "snapshot.pub.new"
     owner_t0_stage = tree / "owner-t0.pub.new"
+    owner_reviewer_stage = tree / "owner-reviewer.json.new"
     staged_paths = (staging, schema_stage, venv_stage, token_stage, private_stage,
                     public_stage, state_stage, launcher_stage, updater_stage,
-                    sudoers_stage, snapshot_pub_stage, owner_t0_stage)
+                    sudoers_stage, snapshot_pub_stage, owner_t0_stage, owner_reviewer_stage)
     if any(item.exists() for item in staged_paths):
         raise SystemExit("staged update files exist; inspect and remove before retrying")
     try:
@@ -638,6 +664,9 @@ if args.update_src:
         if owner_t0_source:
             shutil.copyfile(owner_t0_source, owner_t0_stage)
             os.chmod(owner_t0_stage, 0o644)
+        if args.owner_reviewer_id:
+            owner_reviewer_stage.write_text(json.dumps({"user_id": args.owner_reviewer_id}) + "\n")
+            os.chmod(owner_reviewer_stage, 0o644)
         sudoers_stage.parent.mkdir(parents=True, exist_ok=True)
         sudoers_stage.write_text(sudoers_content)
         os.chmod(sudoers_stage, 0o440)
@@ -646,6 +675,7 @@ if args.update_src:
             os.chown(updater_stage, 0, 0)
             os.chown(snapshot_pub_stage, 0, 0)
             if owner_t0_source: os.chown(owner_t0_stage, 0, 0)
+            if args.owner_reviewer_id: os.chown(owner_reviewer_stage, 0, 0)
             os.chown(sudoers_stage, 0, 0)
             run("visudo", "-cf", str(sudoers_stage))
     except Exception:
@@ -663,6 +693,7 @@ if args.update_src:
              "had_sudoers": sudoers.is_file(),
              "had_snapshot_pub": (tree / "snapshot.pub").is_file(),
              "had_owner_t0_pub": (tree / "owner-t0.pub").is_file(),
+             "had_owner_reviewer": pinned_owner_reviewer.is_file(),
              "old_commit": old_commit,
              "new_commit": source_commit, "tree_mode": stat.S_IMODE(tree.stat().st_mode)}
     swaps = [(installed, previous, staging), (tree / "tests", tree / "tests.old", schema_stage),
@@ -677,10 +708,16 @@ if args.update_src:
              (tree / "snapshot.pub", tree / "snapshot.pub.old", snapshot_pub_stage)]
     if owner_t0_source:
         swaps.append((tree / "owner-t0.pub", tree / "owner-t0.pub.old", owner_t0_stage))
+    if args.owner_reviewer_id:
+        swaps.append((pinned_owner_reviewer, tree / "owner-reviewer.json.old", owner_reviewer_stage))
+    stage_names = ["src", "schema", "venv", "state", "tokens", "receipt-key",
+                   "receipt-pubkey", "launcher", "updater", "sudoers", "snapshot-pubkey"]
+    if owner_t0_source:
+        stage_names.append("owner-t0-pubkey")
+    if args.owner_reviewer_id:
+        stage_names.append("owner-reviewer")
     try:
-        for stage, (live, backup, new) in zip(("src", "schema", "venv", "state", "tokens", "receipt-key",
-                                               "receipt-pubkey", "launcher", "updater", "sudoers", "snapshot-pubkey",
-                                               "owner-t0-pubkey"), swaps):
+        for stage, (live, backup, new) in zip(stage_names, swaps):
             if backup.exists():
                 raise RuntimeError(f"update backup already exists: {backup}")
             if live.exists():
@@ -743,7 +780,8 @@ def originals():
     # Backup whole broker tree: phase 2 changes ownership/mode recursively.
     return [x for x in targets if x.exists()]
 def check_safe():
-    for item in [tree, launcher.parent, sudoers, db, crew_dir, alfred_dir]:
+    for item in [tree, launcher.parent, sudoers, db, crew_dir, alfred_dir,
+                 pinned_owner_reviewer]:
         if item.is_symlink():
             raise RuntimeError(f"refusing symlink: {item}")
     if not db.is_file():
@@ -1012,6 +1050,9 @@ try:
     if owner_t0_source:
         shutil.copyfile(owner_t0_source, tree / "owner-t0.pub")
         os.chmod(tree / "owner-t0.pub", 0o644)
+    if args.owner_reviewer_id:
+        pinned_owner_reviewer.write_text(json.dumps({"user_id": args.owner_reviewer_id}) + "\n")
+        os.chmod(pinned_owner_reviewer, 0o644)
     config.write_text(final_content)
     os.chmod(config, 0o640)
     (tree / "SRC_COMMIT").write_text(source_commit + "\n")
