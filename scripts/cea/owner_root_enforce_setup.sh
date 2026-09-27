@@ -61,7 +61,10 @@ if args.rehearse:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source_input, destination)
     path("/rehearsal/caller-tokens.json").chmod(0o600)
-    path("/opt/agent_crew-authz").mkdir(parents=True)
+    rehearsal_tree = path("/opt/agent_crew-authz")
+    rehearsal_tree.mkdir(parents=True)
+    shutil.copytree(Path(os.environ["CREW_AUTHZ_SOURCE_ROOT"]) / "src", rehearsal_tree / "src")
+    (rehearsal_tree / "SRC_COMMIT").write_text("rehearsal-prior\n")
     args.caller_tokens = path("/rehearsal/caller-tokens.json")
     args.snapshot_pubkey = None
     args.snapshot_path = None
