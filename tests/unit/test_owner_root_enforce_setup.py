@@ -12,11 +12,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts/cea/owner_root_enforce_setup.sh"
 
 
-def _run(root, *args):
+def _run(root, *args, extra_env=None):
     return subprocess.run(
         ["bash", str(SCRIPT), *args, "--root-prefix", str(root)],
         text=True, capture_output=True,
-        env={**os.environ, "AGENT_CREW_OWNER_SETUP_TESTING": "1"},
+        env={**os.environ, "AGENT_CREW_OWNER_SETUP_TESTING": "1", **(extra_env or {})},
     )
 
 
@@ -26,6 +26,7 @@ def _seed(root):
     (tree / "SRC_COMMIT").write_text("old-build\n")
     (tree / "broker.env").write_text(
         "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE=/opt/agent_crew-authz/snapshot.key\n"
+        "AGENT_CREW_CEA_CALLER_TOKENS=/home/truhojun/.verify-private/tokens.json\n"
     )
     (tree / "snapshot.key").write_bytes(b"old-secret")
     db = root / "home/truhojun/.agent_crew/alfred/tasks.db"
@@ -34,6 +35,7 @@ def _seed(root):
     token = root / "home/truhojun/.verify-private/tokens.json"
     token.parent.mkdir(parents=True)
     token.write_text('{"private":"token"}')
+    token.chmod(0o600)
     pubkey = root / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub"
     pubkey.parent.mkdir(parents=True)
     pubkey.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
@@ -59,6 +61,96 @@ def test_dry_run_changes_nothing_and_does_not_show_secrets(tmp_path):
     assert (tree / "SRC_COMMIT").read_bytes() == before
     assert sudoers.read_text() == "old sudoers\n"
     assert not (tmp_path / "var/lib/crew-authz").exists()
+
+
+@pytest.mark.parametrize("blocker,expected", [
+    ("src_old", "source update backup exists"),
+    ("src_new", "source update staging exists"),
+    ("update_manifest", "source update manifest exists"),
+    ("dirty_checkout", "source checkout is dirty"),
+    ("wrong_commit", "differs from expected"),
+    ("token_mode", "caller token mode 0644"),
+])
+def test_source_update_preview_reports_apply_blockers(tmp_path, blocker, expected):
+    tree, token, _ = _seed(tmp_path)
+    extra_env = {}
+    if blocker == "src_old":
+        (tree / "src.old").mkdir()
+    elif blocker == "src_new":
+        (tree / "src.new").mkdir()
+    elif blocker == "update_manifest":
+        manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}")
+    elif blocker == "dirty_checkout":
+        extra_env["AGENT_CREW_OWNER_SETUP_TEST_GIT_STATUS"] = " M src/agent_crew/cea/broker.py"
+    elif blocker == "wrong_commit":
+        extra_env["AGENT_CREW_OWNER_SETUP_TEST_GIT_COMMIT"] = "0" * 40
+    elif blocker == "token_mode":
+        token.chmod(0o644)
+    before = (tree / "SRC_COMMIT").read_bytes()
+    result = _run(tmp_path, "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json", extra_env=extra_env)
+    assert result.returncode != 0
+    assert "WOULD ABORT:" in result.stdout and expected in result.stdout
+    assert "UNVERIFIED as non-root:" in result.stdout
+    assert (tree / "SRC_COMMIT").read_bytes() == before
+    assert not (tree / "src" / "agent_crew").exists()
+    if blocker == "src_old":
+        assert "--undo --update-src" not in result.stdout
+        assert f"mv -- {tree / 'src.old'} {tree / 'src.old.saved'}" in result.stdout
+    if blocker == "update_manifest":
+        assert "--undo --update-src" in result.stdout
+
+
+@pytest.mark.parametrize("blocker,expected", [
+    ("missing_pubkey", "missing snapshot public key"),
+    ("unsafe_sudoers", "refusing symlink"),
+    ("incomplete_manifest", "incomplete apply manifest"),
+    ("outstanding_update", "source update manifest exists"),
+])
+def test_full_preview_reports_apply_blockers(tmp_path, blocker, expected):
+    tree, _, sudoers = _seed(tmp_path)
+    if blocker == "missing_pubkey":
+        (tmp_path / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub").unlink()
+    elif blocker == "unsafe_sudoers":
+        sudoers.unlink()
+        sudoers.symlink_to(tree / "SRC_COMMIT")
+    elif blocker == "incomplete_manifest":
+        manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/manifest.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text('{"completed":false}')
+    elif blocker == "outstanding_update":
+        manifest = tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text("{}")
+    result = _run(tmp_path)
+    assert result.returncode != 0
+    assert f"WOULD ABORT: {expected}" in result.stdout
+    assert not (tree / "caller-tokens.json").exists()
+
+
+def test_preview_marks_restricted_manifest_unverified(tmp_path):
+    _seed(tmp_path)
+    manifest_dir = tmp_path / "var/lib/crew-authz/owner-root-enforce"
+    manifest_dir.mkdir(parents=True)
+    manifest_dir.chmod(0)
+    try:
+        result = _run(tmp_path, "--update-src", "--caller-tokens",
+                      "/home/truhojun/.verify-private/tokens.json")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert f"UNVERIFIED as non-root: source update manifest in restricted directory: {manifest_dir}" in result.stdout
+    finally:
+        manifest_dir.chmod(0o700)
+
+
+def test_private_read_only_caller_tokens_mode_is_allowed(tmp_path):
+    _, token, _ = _seed(tmp_path)
+    token.chmod(0o400)
+    result = _run(tmp_path, "--update-src", "--caller-tokens",
+                  "/home/truhojun/.verify-private/tokens.json")
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "WOULD ABORT: caller token mode" not in result.stdout
 
 
 @pytest.mark.parametrize("extra_args", [(), ("--caller-tokens", "/home/truhojun/.verify-private/tokens.json")])
@@ -124,7 +216,7 @@ def test_apply_requires_ed25519_public_key(tmp_path):
     result = _run(tmp_path, "--apply", "--caller-tokens",
                   "/home/truhojun/.verify-private/tokens.json")
     assert result.returncode != 0
-    assert "missing snapshot public key" in result.stderr
+    assert "WOULD ABORT: missing snapshot public key" in result.stdout
     assert not (tmp_path / "var/lib/crew-authz/owner-root-enforce").exists()
 
 
@@ -142,6 +234,7 @@ def test_first_apply_with_no_backup_targets_can_be_undone(tmp_path):
     token = tmp_path / "home/truhojun/.verify-private/tokens.json"
     token.parent.mkdir(parents=True)
     token.write_text('{"private":"token"}')
+    token.chmod(0o600)
     pubkey = tmp_path / "home/truhojun/alfred/governance/ssot-producer-ed25519.pub"
     pubkey.parent.mkdir(parents=True)
     pubkey.write_bytes(Ed25519PrivateKey.generate().public_key().public_bytes(
@@ -171,7 +264,8 @@ def test_incomplete_apply_requires_undo_before_retry(tmp_path):
     manifest_path.write_text(json.dumps(manifest))
     retry = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert retry.returncode != 0
-    assert "incomplete apply; undo first" in retry.stderr
+    assert "WOULD ABORT: incomplete apply manifest" in retry.stdout
+    assert "--undo" in retry.stdout
     assert manifest_path.exists()
     undo = _run(tmp_path, "--undo")
     assert undo.returncode == 0, undo.stderr
@@ -183,12 +277,12 @@ def test_update_src_dry_run_apply_and_undo(tmp_path):
     installed = tree / "src"
     installed.mkdir()
     (installed / "old.py").write_text("original")
-    dry = _run(tmp_path, "--update-src")
+    dry = _run(tmp_path, "--update-src", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert dry.returncode == 0, dry.stderr
     assert "dry-run: no changes made" in dry.stdout
     assert (installed / "old.py").read_text() == "original"
     assert not (tree / "src.old").exists()
-    applied = _run(tmp_path, "--apply", "--update-src")
+    applied = _run(tmp_path, "--apply", "--update-src", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert applied.returncode == 0, applied.stderr
     assert (tree / "src.old" / "old.py").read_text() == "original"
     assert (installed / "agent_crew" / "cea" / "broker.py").is_file()
@@ -196,7 +290,8 @@ def test_update_src_dry_run_apply_and_undo(tmp_path):
         ["git", "rev-parse", "HEAD"], cwd=SCRIPT.parent.parent.parent, text=True).strip()
     assert (tmp_path / "var/lib/crew-authz/owner-root-enforce/src-update.json").is_file()
     repeat = _run(tmp_path, "--apply", "--update-src")
-    assert repeat.returncode != 0 and "undo first" in repeat.stderr
+    assert repeat.returncode != 0 and "WOULD ABORT: source update" in repeat.stdout
+    assert "--undo --update-src" in repeat.stdout
     undo = _run(tmp_path, "--undo", "--update-src")
     assert undo.returncode == 0, undo.stderr
     assert (installed / "old.py").read_text() == "original"
@@ -213,7 +308,7 @@ def test_unreadable_broker_env_previews_print_plans(tmp_path):
     assert dry.returncode == 0, dry.stderr
     assert "existing broker.env unreadable as non-root; validated at apply" in dry.stdout
     assert "PLAN $" in dry.stdout
-    source_preview = _run(tmp_path, "--update-src")
+    source_preview = _run(tmp_path, "--update-src", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert source_preview.returncode == 0, source_preview.stderr
     assert "existing broker.env unreadable as non-root; validated at apply" in source_preview.stdout
     assert "dry-run: no changes made" in source_preview.stdout
@@ -297,7 +392,7 @@ def test_broker_env_quoted_values_round_trip(tmp_path):
         "AGENT_CREW_CEA_NOTE='two words'\n"
         f"AGENT_CREW_CEA_OWNER_NOTE={shlex.quote(owner_note)}\n"
     )
-    dry = _run(tmp_path)
+    dry = _run(tmp_path, "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")
     assert dry.returncode == 0, dry.stderr
     assert "broker.env validation passed" in dry.stdout
     applied = _run(tmp_path, "--apply", "--caller-tokens", "/home/truhojun/.verify-private/tokens.json")

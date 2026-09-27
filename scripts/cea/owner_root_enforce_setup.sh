@@ -100,6 +100,112 @@ def preinstall_selftest(tokens):
         raise SystemExit(f"pre-install broker self-test failed before changes: {evidence}")
     say("pre-install broker self-test JSON: " + json.dumps(evidence, sort_keys=True))
 
+def apply_preconditions(source_update=False):
+    """Return failures visible before root changes, plus checks requiring root."""
+    failures, unverified = [], []
+    update_manifest = manifest_dir / "src-update.json"
+    previous = tree / "src.old"
+    staging = tree / "src.new"
+    undo_update = f"sudo {shlex.quote(str(source_root / 'scripts/cea/owner_root_enforce_setup.sh'))} --undo --update-src"
+    manifest_visible = not manifest_dir.exists() or os.access(manifest_dir, os.X_OK)
+    tree_visible = not tree.exists() or os.access(tree, os.X_OK)
+    if not manifest_visible:
+        unverified.append(f"source update manifest in restricted directory: {manifest_dir}")
+    elif update_manifest.exists():
+        failures.append(f"source update manifest exists: {update_manifest}; recover with: {undo_update}")
+    if not tree_visible:
+        unverified.append(f"source backup and staging in restricted directory: {tree}")
+    else:
+        if previous.exists():
+            recovery = undo_update if manifest_visible and update_manifest.exists() else (
+                f"mv -- {shlex.quote(str(previous))} {shlex.quote(str(previous) + '.saved')}")
+            failures.append(f"source update backup exists: {previous}; recover with: {recovery}")
+        if staging.exists():
+            failures.append(f"source update staging exists: {staging}; inspect and remove it before retrying")
+    if not (source_root / "src").is_dir():
+        failures.append(f"checkout src missing: {source_root / 'src'}")
+    elif any(item.is_symlink() for item in (source_root / "src").rglob("*")):
+        failures.append(f"symlink in checkout src: {source_root / 'src'}")
+    if fake:
+        actual_commit = os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_GIT_COMMIT", source_commit)
+        dirty = os.environ.get("AGENT_CREW_OWNER_SETUP_TEST_GIT_STATUS", "")
+    else:
+        actual_commit = run("git", "-C", str(source_root), "rev-parse", "HEAD", capture=True).stdout.strip()
+        dirty = run("git", "-C", str(source_root), "status", "--porcelain", "--untracked-files=all",
+                    capture=True).stdout
+        # The dispatcher supplies this local instruction file outside Git.
+        dirty = "\n".join(line for line in dirty.splitlines() if line != "?? AGENTS.md")
+    if actual_commit != source_commit:
+        failures.append(f"checkout commit {actual_commit} differs from expected {source_commit}")
+    if dirty.strip():
+        failures.append(f"source checkout is dirty: {source_root}")
+    if source_update:
+        if not tree.is_dir() or tree.is_symlink():
+            failures.append(f"broker tree missing or symlink: {tree}")
+        tokens = token_source or tree / "caller-tokens.json"
+    else:
+        if not db.is_file() or db.is_symlink():
+            failures.append(f"tasks DB missing or symlink: {db}")
+        if not source_launcher.is_file() or source_launcher.is_symlink():
+            failures.append(f"launcher source missing or symlink: {source_launcher}")
+        if any(item.is_symlink() for item in (tree, launcher.parent, crew_dir, alfred_dir)):
+            failures.append("unsafe symlink in broker or queue path")
+        tokens = token_source
+        if manifest_visible and manifest_file.exists():
+            try:
+                old = json.loads(manifest_file.read_text())
+                if not (old.get("completed") and launcher.is_file() and sudoers.is_file()):
+                    failures.append(f"incomplete apply manifest: {manifest_file}; recover with: "
+                                    f"sudo {shlex.quote(str(source_root / 'scripts/cea/owner_root_enforce_setup.sh'))} --undo")
+            except PermissionError:
+                unverified.append(f"apply manifest contents: {manifest_file}")
+            except (ValueError, OSError) as exc:
+                failures.append(f"invalid apply manifest: {manifest_file}: {exc}")
+        if snapshot_source.parent.exists() and not os.access(snapshot_source.parent, os.X_OK):
+            unverified.append(f"snapshot public key in restricted directory: {snapshot_source.parent}")
+        elif not snapshot_source.is_file() or snapshot_source.is_symlink():
+            failures.append(f"missing snapshot public key: {snapshot_source}")
+        elif os.access(snapshot_source, os.R_OK):
+            try:
+                from cryptography.hazmat.primitives import serialization
+                from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+                if not isinstance(serialization.load_pem_public_key(snapshot_source.read_bytes()), Ed25519PublicKey):
+                    failures.append(f"invalid Ed25519 public key: {snapshot_source}")
+            except (ImportError, ValueError) as exc:
+                failures.append(f"invalid Ed25519 public key {snapshot_source}: {exc}")
+        else:
+            unverified.append(f"snapshot public key contents: {snapshot_source}")
+        if sudoers.is_symlink() or sudoers.parent.is_symlink() or (sudoers.exists() and not sudoers.is_file()):
+            failures.append(f"unsafe sudoers path: {sudoers}")
+    if tokens is None:
+        if existing_content is None and not source_update:
+            unverified.append(f"caller token source in unreadable broker.env: {config}")
+        else:
+            failures.append("caller token source missing; recover with: --caller-tokens /path/to/private/tokens.json")
+    elif tokens.parent.exists() and not os.access(tokens.parent, os.X_OK):
+        unverified.append(f"caller token source in restricted directory: {tokens.parent}")
+    elif not tokens.is_file() or tokens.is_symlink():
+        failures.append(f"caller token source missing or symlink: {tokens}; recover with: --caller-tokens /path/to/private/tokens.json")
+    else:
+        mode = stat.S_IMODE(tokens.stat().st_mode)
+        if mode not in (0o400, 0o440, 0o600, 0o640):
+            failures.append(f"caller token mode {mode:04o} at {tokens}; recover with: chmod 600 {shlex.quote(str(tokens))}")
+        if not os.access(tokens, os.R_OK):
+            unverified.append(f"caller token contents: {tokens}")
+    if os.geteuid() != 0:
+        unverified.extend(["ACL, group and user changes", "visudo validation and sudoers install",
+                           "cross-UID broker self-test and launcher --check"])
+    return failures, unverified
+
+def report_preconditions(source_update=False):
+    failures, unverified = apply_preconditions(source_update)
+    for check in unverified:
+        say(f"UNVERIFIED as non-root: {check}")
+    for reason in failures:
+        say(f"WOULD ABORT: {reason}")
+    if failures:
+        raise SystemExit(1)
+
 if args.update_src:
     if not args.apply and not args.undo and (tree / "broker.env").exists() and not os.access(tree / "broker.env", os.R_OK):
         say("existing broker.env unreadable as non-root; validated at apply")
@@ -133,6 +239,7 @@ if args.update_src:
         sys.exit(0)
     say(f"stage clean checkout {source_root} ({source_commit}) into {staging}")
     say(f"backup {installed} to {previous}; write {marker}; record {update_manifest}")
+    report_preconditions(source_update=True)
     if not args.apply:
         say("dry-run: no changes made")
         sys.exit(0)
@@ -140,8 +247,6 @@ if args.update_src:
         raise SystemExit("broker tree or checkout src missing")
     if previous.exists() or staging.exists() or update_manifest.exists():
         raise SystemExit("source update backup or manifest exists; undo first")
-    if not fake and run("git", "-C", str(source_root), "status", "--porcelain", capture=True).stdout.strip():
-        raise SystemExit(f"source checkout is dirty: {source_root}")
     for item in source.rglob("*"):
         if item.is_symlink():
             raise SystemExit(f"symlink in source tree: {item}")
@@ -270,9 +375,17 @@ if args.undo:
     say("undo complete")
     sys.exit(0)
 
-check_safe()
+try:
+    check_safe()
+except RuntimeError as exc:
+    if not args.apply:
+        say(f"WOULD ABORT: {exc}")
+        raise SystemExit(1) from exc
+    raise
 config = tree / "broker.env"
 if config.is_symlink():
+    if not args.apply:
+        say(f"WOULD ABORT: refusing symlink: {config}")
     raise SystemExit(f"refusing symlink: {config}")
 existing_content = read_broker_env(config)
 try:
@@ -291,6 +404,8 @@ try:
                                              for key, value in overrides.items()]) + "\n"
     validate_broker_env(final_content)
 except ValueError as exc:
+    if not args.apply:
+        say(f"WOULD ABORT: {exc}")
     raise SystemExit(str(exc)) from exc
 if existing_content is not None:
     say("broker.env validation passed (bash -n and clean-env source round-trip)")
@@ -331,6 +446,7 @@ commands = [
 ]
 for command in commands:
     say(f"PLAN $ {command}")
+report_preconditions()
 if not args.apply:
     say("dry-run: no changes made")
     sys.exit(0)
