@@ -11,6 +11,18 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
+@pytest.fixture(autouse=True)
+def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
+    """Keep inherited server memory flags and HOME paths out of every test.
+
+    Capture tests can opt in within their own body with an explicit tmp DB.
+    """
+    for key in tuple(os.environ):
+        if key.startswith(("AGENT_CREW_SHADOW_MEMORY_", "AGENT_CREW_ADR001_")):
+            monkeypatch.delenv(key)
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+
 #: Every function in `agent_crew.github` that MUTATES something on GitHub.
 #: Reads (`get_repo`, `pr_state`, `pr_head_sha`, `branch_has_pr`, …) are left
 #: alone: they are safe, and blocking them would push tests toward mocking the
