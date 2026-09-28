@@ -75,6 +75,26 @@ def test_all_rules_priority_and_no_ac():
     assert block.index("INJECT WARNING") < block.index("--- [issue]")
 
 
+@pytest.mark.parametrize(
+    "task_id,task_type,requires_review",
+    [
+        ("impl-tok31-fixround-x", "implement", False),
+        ("fix-foo", "implement", True),
+        ("impl-foo", "fix", True),
+    ],
+)
+def test_fix_round_identification_uses_prefix_or_task_type(task_id, task_type, requires_review):
+    items = [
+        cpack.Artifact("issue", "issue://1", cpack.TYPE_ISSUE),
+        cpack.Artifact("ac", "issue://1#ac", cpack.TYPE_AC),
+    ]
+    pack = cpack.ContextPack(task_id, "implementer", cpack.MODE_LEXICAL, items=items)
+    signals = cpack.is_sufficient(pack, task_type=task_type).missing_signals
+    assert bool(signals) is requires_review
+    if requires_review:
+        assert signals[0].startswith("fix round requires linked_review")
+
+
 def test_builder_marks_no_ac_only_for_complete_issue(monkeypatch):
     monkeypatch.setattr(cpack.LexicalRepoProvider, "retrieve", lambda self, query: [])
     ctx = {"issue": 1, "issue_title": "A", "issue_body": "Body with no criteria"}
