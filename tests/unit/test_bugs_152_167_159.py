@@ -59,6 +59,31 @@ class _RecordingPush:
         self.calls.append((pane_id, text))
 
 
+@pytest.mark.parametrize(
+    ("reason", "expected_retry"),
+    [("dispatcher_timeout", False), ("dispatcher_idle_timeout", True), ("generic_failure", True)],
+)
+def test_auto_retry_skips_only_dispatcher_timeout(tmp_db, reason, expected_retry):
+    app = create_app(
+        db_path=tmp_db, pane_map={"implementer": "%100"}, port=8100,
+        push_fn=_RecordingPush(), watchdog_disabled=True, fallback_disabled=True,
+    )
+    with TestClient(app) as client:
+        assert _post_task(client, "timeout-retry-probe").status_code == 201
+        response = client.post("/tasks/timeout-retry-probe/result", json={
+            "task_id": "timeout-retry-probe", "status": "failed",
+            "summary": reason, "error_info": {"reason": reason},
+        })
+        assert response.status_code == 200
+
+    tasks = TaskQueue(tmp_db).list_tasks()
+    retry = [task for task in tasks if task.task_id == "retry-timeout-retry-probe-a1"]
+    assert len(retry) == int(expected_retry)
+    assert next(task for task in tasks if task.task_id == "timeout-retry-probe").context.get("retry_attempt", 0) == 0
+    if expected_retry:
+        assert retry[0].context["retry_attempt"] == 1
+
+
 class _PaneState:
     def __init__(self):
         self.busy: dict = {}

@@ -5930,6 +5930,15 @@ def create_app(
             if not tasks:
                 return
             original_task = tasks[0]
+            # The dispatcher records the fired limit in the durable task row.
+            # Reissuing a hard-cap timeout starts the same long run over again.
+            error_info = original_task.error_info or {}
+            if error_info.get("reason") == "dispatcher_timeout":
+                logger.info(
+                    "_auto_retry_failed_task: skipping retry for %s (reason=dispatcher_timeout)",
+                    task_id,
+                )
+                return
 
             # #167: use the DB context retry_attempt, not result.retry_count.
             # Agents always submit retry_count=0 (they don't track it); the DB
