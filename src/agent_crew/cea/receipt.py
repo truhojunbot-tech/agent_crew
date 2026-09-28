@@ -114,6 +114,11 @@ class DecisionRev:
     runtimes: tuple[str, ...] = ()
     """The runtimes this record covers. Empty ⇒ covers none: a decision that does
     not name the runtime it loosens is not a decision about this runtime."""
+    project: Optional[str] = None
+    """The project the record's ``scope.project`` names; ``None`` ⇒ not project-scoped
+    (absent or ``*``). Two projects may reuse one ``decision_id``, so a lookup by id
+    alone can resolve another project's record (#463 item 4). Snapshot-only, like
+    ``supersedes``."""
 
 
 @dataclass(frozen=True)
