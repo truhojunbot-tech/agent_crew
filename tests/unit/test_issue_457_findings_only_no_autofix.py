@@ -135,6 +135,31 @@ def test_remote_default_branch_from_origin_head(q, tmp_path):
                             repo_cwd=str(repo)) == fix_task_id(other, 1)
 
 
+def test_mcp_no_checkout_resolves_trunk_from_repo_identity(q, monkeypatch):
+    """MCP supplies repo but no checkout; a trunk review cannot create a fix."""
+    looked_up = []
+    def default_branch(repo):
+        looked_up.append(repo)
+        return "trunk"
+    monkeypatch.setattr("agent_crew.pipeline._repo_default_branch", default_branch)
+    review_id = _review(q, branch="trunk")
+    assert auto_enqueue_fix(q, review_id, repo="owner/repo", pr_state_fn=_open,
+                            require_repo_default=True) is None
+    assert looked_up == ["owner/repo"]
+    assert _implement_ids(q) == []
+    other = _review(q, branch=FEATURE)
+    assert auto_enqueue_fix(q, other, repo="owner/repo", pr_state_fn=_open,
+                            require_repo_default=True) == fix_task_id(other, 1)
+
+
+def test_mcp_no_checkout_fails_closed_when_default_unknown(q, monkeypatch):
+    monkeypatch.setattr("agent_crew.pipeline._repo_default_branch", lambda repo: "")
+    review_id = _review(q, branch=FEATURE)
+    assert auto_enqueue_fix(q, review_id, repo="owner/repo", pr_state_fn=_open,
+                            require_repo_default=True) is None
+    assert _implement_ids(q) == []
+
+
 # ── 3. eligible feature-branch review is unchanged ───────────────────────
 
 

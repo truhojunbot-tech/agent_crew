@@ -360,7 +360,8 @@ def build_mcp_server(
             # context.repo (if any) is the only signal available here —
             # unlike the HTTP wrapper, there is no process-cwd fallback to
             # avoid, only "use what the task context already names."
-            auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "")
+            auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "",
+                             require_repo_default=True)
         if result.status == "failed":
             auto_fallback_failed_task(queue, task_id, result, task_type)
 
