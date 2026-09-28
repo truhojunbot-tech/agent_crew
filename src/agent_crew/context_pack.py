@@ -219,17 +219,20 @@ class ContextPack:
             "budget": dict(self.budget or {}),
         }
 
-    def to_prompt_block(self) -> str:
+    def to_prompt_block(self, inject_gate: Optional["InjectGate"] = None) -> str:
         """Render the pack for the task prompt.
 
         Every item states its type, provenance and revision so the agent can
         weigh it — and conflicts are printed as conflicts rather than being
         silently resolved in favour of whichever scored higher.
         """
-        if not self.items and not self.degraded:
+        if not self.items and not self.degraded and inject_gate is None:
             return ""
         lines = [f"=== CONTEXT PACK {self.pack_id} (mode={self.mode}, "
                  f"{self.selected_count} items, ~{self.total_tokens} tok) ==="]
+        if inject_gate is not None and not inject_gate.ok:
+            lines.append("⚠️ INJECT WARNING (ok=False):")
+            lines.extend(f"  - {signal}" for signal in inject_gate.missing_signals)
         if self.degraded:
             lines.append(
                 f"!! DEGRADED: {self.degraded_reason} — this pack is incomplete. "
@@ -250,6 +253,33 @@ class ContextPack:
                 lines.append(f"  - {c}")
         lines.append("=== END CONTEXT PACK ===")
         return "\n".join(lines)
+
+
+@dataclass
+class InjectGate:
+    ok: bool
+    missing_signals: list = field(default_factory=list)
+
+
+def is_sufficient(pack: ContextPack, *, task_type: str = "", retry_of: str = "") -> InjectGate:
+    """Describe missing context for a fresh session; never block injection."""
+    signals = []
+    types = {item.artifact_type for item in pack.items}
+    if TYPE_ISSUE not in types:
+        signals.append("issue artifact missing — agent cannot identify what it is fixing")
+    no_ac = any(item.artifact_type == TYPE_ISSUE and
+                "no_ac=true" in (item.provenance or "") for item in pack.items)
+    if TYPE_AC not in types and not no_ac:
+        signals.append("AC artifact missing — acceptance bar unknown; "
+                       "annotate no_ac=true in IssueProvider if issue has none")
+    if ("fix" in (task_type or "").lower() or "fix" in pack.task_id.lower()) and TYPE_REVIEW not in types:
+        signals.append("fix round requires linked_review — prior findings unknown; "
+                       "reviewer may re-raise same issues")
+    if retry_of and not any(item.artifact_type == TYPE_EPISODE and
+                            retry_of in item.artifact_id for item in pack.items):
+        signals.append(f"retry of {retry_of} but no episodic record — "
+                       "prior failure reason unknown")
+    return InjectGate(ok=not signals, missing_signals=signals)
 
 
 # ── retrieval providers ───────────────────────────────────────────────
@@ -667,6 +697,10 @@ def shadow_enabled() -> bool:
     return os.getenv("AGENT_CREW_CONTEXT_PACK_SHADOW", "").lower() in ("1", "true", "yes", "on")
 
 
+def inject_gate_enabled() -> bool:
+    return os.getenv("AGENT_CREW_CONTEXT_PACK_INJECT_GATE", "").lower() in ("1", "true", "yes", "on")
+
+
 #: Bounded `gh` lookup for an issue body the ingest path did not persist.
 ISSUE_BODY_FETCH_TIMEOUT_S = 15.0
 
@@ -1021,6 +1055,10 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
             # issues have none — so it is stated, not flagged as degraded.
             logger.info("context_pack: issue #%s has no acceptance-criteria "
                         "section", issue)
+            if not IssueProvider.extract_ac(body) and not body_is_truncated(ctx, body):
+                for artifact in pack.items:
+                    if artifact.artifact_type == TYPE_ISSUE:
+                        artifact.provenance += "; no_ac=true"
         if matched and shadow_path:
             _record_shadow(shadow_path, matched, task_id)
         return pack
