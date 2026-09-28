@@ -663,6 +663,10 @@ def enabled() -> bool:
     return os.getenv("AGENT_CREW_CONTEXT_PACK", "").lower() in ("1", "true", "yes", "on")
 
 
+def shadow_enabled() -> bool:
+    return os.getenv("AGENT_CREW_CONTEXT_PACK_SHADOW", "").lower() in ("1", "true", "yes", "on")
+
+
 #: Bounded `gh` lookup for an issue body the ingest path did not persist.
 ISSUE_BODY_FETCH_TIMEOUT_S = 15.0
 

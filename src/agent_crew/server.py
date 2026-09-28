@@ -4946,6 +4946,53 @@ def create_app(
             except Exception:
                 logger.exception(
                     f"dispatcher: context pack telemetry failed for {task.task_id}")
+        elif _cpack.shadow_enabled():
+            # Observe the whole pack without changing the signed task row or
+            # the bytes sent to the provider. Shadow failures cannot gate dispatch.
+            try:
+                _shadow_pack = _cpack.build_pack_for_task(
+                    _ctx if isinstance(_ctx, dict) else {},
+                    task_id=task.task_id, task_type=task.task_type, role=role,
+                    repo_path=wt, branch=task.branch,
+                    episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
+                    procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
+                    shadow_path=os.path.join(_state_dir, "procedure_shadow.jsonl"),
+                )
+                _identity = {
+                    "task_id": task.task_id,
+                    "project": _project,
+                    "role": role,
+                    "agent": agent,
+                    "context_id": _ctx_info["context_id"],
+                    "context_generation": _ctx_info["context_generation"],
+                }
+                _telemetry = _shadow_pack.telemetry()
+                _shadowed = (set(_telemetry) & set(_identity)) - {"role"}
+                if _shadowed:
+                    logger.warning(
+                        "dispatcher: context pack telemetry carries dispatch "
+                        "identity keys %s for task=%s; the dispatcher's values "
+                        "win and the pack's are dropped (#258)",
+                        sorted(_shadowed), task.task_id,
+                    )
+                _item_types = {item.artifact_type for item in _shadow_pack.items}
+                record_context_event(
+                    _context_events_path, "context_pack_built",
+                    **{
+                        **_telemetry, **_identity,
+                        "shadow": True,
+                        "advisory": True,
+                        "pack_tokens": _cpack.estimate_tokens(_shadow_pack.to_prompt_block()),
+                        "warm_context_tokens": _ctx_cap_info.get("context_tokens"),
+                        "context_policy": _ctx_info["context_policy"],
+                        "has_issue": _cpack.TYPE_ISSUE in _item_types,
+                        "has_acceptance_criteria": _cpack.TYPE_AC in _item_types,
+                        "has_linked_review": _cpack.TYPE_REVIEW in _item_types,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "dispatcher: context pack shadow failed for %s", task.task_id)
 
         # #322: Shadow-only optional durable-memory observation.  This sits
         # after the baseline message (including any Context Pack) is complete,

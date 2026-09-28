@@ -93,7 +93,7 @@ def test_a_real_dispatch_writes_the_event(tmp_path, monkeypatch, *, unused_tcp_p
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -162,7 +162,7 @@ def test_the_dispatch_records_nothing_when_the_pack_is_disabled(tmp_path, monkey
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    state_file.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -221,7 +221,7 @@ def _dispatch_with_pack_telemetry(tmp_path, monkeypatch, extra_telemetry, *, unu
     wt.mkdir()
     (wt / ".git").mkdir()
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"worktrees": {"claude": str(wt)}, "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -321,3 +321,128 @@ def test_role_alone_is_not_reported_as_a_collision(tmp_path, monkeypatch, caplog
         _dispatch_with_pack_telemetry(tmp_path, monkeypatch, {}, unused_tcp_port=unused_tcp_port)
 
     assert not [r for r in caplog.records if "dispatch identity keys" in r.message]
+
+
+def _shadow_dispatch(tmp_path, monkeypatch, port, *, live=False, shadow=False, broken=False):
+    import asyncio
+    from fastapi.testclient import TestClient
+    from agent_crew import context_pack as cpack
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import TaskQueue
+    from agent_crew.server import create_app
+
+    tmp_path.mkdir()
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "worktrees": {"claude": str(wt)},
+        "role_agents": {"implementer": "claude", "reviewer": "claude", "tester": "claude"},
+    }))
+    db = str(tmp_path / "t.db")
+    commands = []
+    patches = []
+    recalled = []
+
+    async def fake_exec(*cmd, **kwargs):
+        commands.append(cmd)
+
+        class Process:
+            returncode = 0
+            pid = 1
+
+            async def communicate(self):
+                return b"", b""
+
+            async def wait(self):
+                return 0
+
+        return Process()
+
+    real_patch = TaskQueue.patch_context
+    real_recalled = TaskQueue.record_required_context_recalled
+
+    def spy_patch(self, task_id, patch):
+        patches.append(patch)
+        return real_patch(self, task_id, patch)
+
+    def spy_recalled(self, *args, **kwargs):
+        recalled.append((args, kwargs))
+        return real_recalled(self, *args, **kwargs)
+
+    monkeypatch.setattr(TaskQueue, "patch_context", spy_patch)
+    monkeypatch.setattr(TaskQueue, "record_required_context_recalled", spy_recalled)
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", fake_exec)
+    monkeypatch.setattr("agent_crew.server._format_task_message", lambda *a, **k: "baseline message")
+    monkeypatch.setattr("agent_crew.server.claude_context_exceeds_cap", lambda *a, **k: (False, {"context_tokens": 321}))
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK", "1" if live else "0")
+    monkeypatch.setenv("AGENT_CREW_CONTEXT_PACK_SHADOW", "1" if shadow else "0")
+    if broken:
+        def raise_build(*args, **kwargs):
+            raise RuntimeError("shadow build failed")
+        monkeypatch.setattr(cpack, "build_pack_for_task", raise_build)
+
+    app = create_app(db_path=db, pane_map={}, port=port, state_path=str(state),
+                     project="agent_crew", watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        q = TaskQueue(db)
+        q.enqueue(TaskRequest(
+            task_id="shadow-t", task_type="implement", description="do it", branch="main",
+            context={"issue": 42, "repo": "org/repo", "issue_title": "widget",
+                     "issue_body": "## Acceptance criteria\n- [ ] works\n"},
+        ))
+        task = q.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+        row_context = q.get_task_context("shadow-t")
+
+    path = tmp_path / "context_events.jsonl"
+    events = [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    built = [event for event in events if event["event_type"] == "context_pack_built"]
+    assert commands
+    command = commands[0]
+    result = {"message": command[command.index("-p") + 1], "events": built,
+              "patches": patches, "recalled": recalled, "row_context": row_context}
+    monkeypatch.undo()
+    return result
+
+
+def test_shadow_pack_is_advisory_and_keeps_prompt_and_task_unchanged(tmp_path, monkeypatch, unused_tcp_port):
+    off = _shadow_dispatch(tmp_path / "off", monkeypatch, unused_tcp_port)
+    shadow = _shadow_dispatch(tmp_path / "shadow", monkeypatch, unused_tcp_port + 1, shadow=True)
+    assert off["events"] == []
+    assert shadow["message"] == off["message"]
+    assert shadow["patches"] == off["patches"]
+    assert shadow["recalled"] == []
+    assert "context_pack_hash" not in shadow["row_context"]
+    assert len(shadow["events"]) == 1
+    event = shadow["events"][0]
+    assert event["shadow"] is True and event["advisory"] is True
+    assert event["pack_tokens"] > 0
+    assert event["warm_context_tokens"] == 321
+    assert event["context_policy"] in {"fresh", "resume"}
+    assert event["context_pack_hash"] and event["degraded"] is False
+    assert event["has_issue"] is True
+    assert event["has_acceptance_criteria"] is True
+    assert event["has_linked_review"] is False
+
+
+def test_shadow_build_error_does_not_change_dispatch(tmp_path, monkeypatch, unused_tcp_port):
+    off = _shadow_dispatch(tmp_path / "off", monkeypatch, unused_tcp_port)
+    broken = _shadow_dispatch(tmp_path / "broken", monkeypatch, unused_tcp_port + 1,
+                              shadow=True, broken=True)
+    assert broken["message"] == off["message"]
+    assert broken["events"] == []
+    assert broken["patches"] == off["patches"]
+    assert broken["recalled"] == []
+
+
+def test_live_pack_overrides_shadow_without_a_second_event(tmp_path, monkeypatch, unused_tcp_port):
+    result = _shadow_dispatch(tmp_path / "live", monkeypatch, unused_tcp_port,
+                              live=True, shadow=True)
+    assert len(result["events"]) == 1
+    assert "shadow" not in result["events"][0]
+    assert "=== CONTEXT PACK" in result["message"]
