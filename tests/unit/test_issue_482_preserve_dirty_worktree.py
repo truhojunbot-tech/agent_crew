@@ -90,13 +90,39 @@ def test_protocol_files_alone_are_not_worth_a_stash(tmp_path):
 
 
 def test_a_non_repo_does_not_raise(tmp_path):
-    assert _stash_dirty_worktree(str(tmp_path), "t-x") == ""
+    assert _stash_dirty_worktree(str(tmp_path), "t-x") is None
+
+
+def test_stash_failure_is_distinct_from_a_clean_tree(tmp_path):
+    wt = _repo(tmp_path / "wt")
+    _dirty(wt)
+    (wt / ".git" / "refs" / "stash.lock").write_text("locked")
+
+    assert _stash_dirty_worktree(str(wt), "t-fail") is None
+    assert (wt / "app.py").read_text() == "x = 2  # shadow_enabled\n"
+    assert (wt / "test_shadow.py").exists()
+    assert _stashes(wt) == []
+
+
+def test_pre_dispatch_refuses_failed_stash_in_real_worktree(tmp_path):
+    from agent_crew.server import WorktreeUnhealthy, _prepare_worktree_for_task_inner
+
+    wt = _repo(tmp_path / "wt")
+    _dirty(wt)
+    (wt / ".git" / "refs" / "stash.lock").write_text("locked")
+
+    with pytest.raises(WorktreeUnhealthy, match="manual recovery required"):
+        _prepare_worktree_for_task_inner(str(wt), "t-fail", "main", "implementer")
+
+    assert (wt / "app.py").read_text() == "x = 2  # shadow_enabled\n"
+    assert (wt / "test_shadow.py").exists()
+    assert _stashes(wt) == []
 
 
 # ── the real post-task reset path ─────────────────────────────────────
 
 
-def _dispatch(tmp_path, monkeypatch, unused_tcp_port, *, outcome):
+def _dispatch(tmp_path, monkeypatch, unused_tcp_port, *, outcome, stash_failure=False):
     """Drive `_dispatch_task` end to end; the fake worker dirties the worktree
     while it "runs", exactly like codex editing files before exiting."""
     from fastapi.testclient import TestClient
@@ -113,6 +139,8 @@ def _dispatch(tmp_path, monkeypatch, unused_tcp_port, *, outcome):
 
     async def _fake_exec(*cmd, **kwargs):
         _dirty(wt)
+        if stash_failure:
+            (wt / ".git" / "refs" / "stash.lock").write_text("locked")
         if outcome == "completed":
             TaskQueue(db).submit_result("t-1", TaskResult(
                 task_id="t-1", status="completed", summary="done"))
@@ -164,6 +192,18 @@ def test_failed_task_leaves_a_named_stash_and_a_clean_tree(tmp_path, monkeypatch
     assert row.error_info["wip_worktree"] == str(wt)
 
 
+def test_failed_task_preserves_dirty_tree_when_stash_fails(tmp_path, monkeypatch, unused_tcp_port):
+    wt, row = _dispatch(tmp_path, monkeypatch, unused_tcp_port,
+                        outcome="exit_1", stash_failure=True)
+
+    assert row.status == "failed"
+    assert row.error_info["wip_stash_error"] == "manual_recovery_required"
+    assert row.error_info["wip_worktree"] == str(wt)
+    assert (wt / "app.py").read_text() == "x = 2  # shadow_enabled\n"
+    assert (wt / "test_shadow.py").exists()
+    assert _stashes(wt) == []
+
+
 def test_successful_task_is_reset_as_before_without_a_stash(tmp_path, monkeypatch, unused_tcp_port):
     wt, row = _dispatch(tmp_path, monkeypatch, unused_tcp_port, outcome="completed")
 
@@ -206,3 +246,30 @@ def test_orphan_requeue_stashes_only_a_dirty_worktree(tmp_db, tmp_path, monkeypa
         assert _stashes(wt) == []
         assert not (body.get("error_info") or {}).get("wip_stash")
     assert os.path.isdir(wt)
+
+
+def test_orphan_stash_failure_requires_recovery_without_reset(tmp_db, tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    wt = _repo(tmp_path / "wt")
+    q = TaskQueue(tmp_db)
+    q.enqueue(TaskRequest(task_id="orphan-1", task_type="implement", description="d",
+                          branch="main", context={"role": "implementer"}))
+    assert q.dequeue(role="implementer", claim_source="dispatcher").task_id == "orphan-1"
+    _dirty(wt)
+    (wt / ".git" / "refs" / "stash.lock").write_text("locked")
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", "60")
+    app = create_app(db_path=tmp_db, pane_map={}, worktree_map={"implementer": str(wt)},
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        body = client.get("/tasks/orphan-1").json()
+
+    assert body["status"] == "failed"
+    assert body["error_info"]["wip_stash_error"] == "manual_recovery_required"
+    assert body["error_info"]["wip_worktree"] == str(wt)
+    assert (wt / "app.py").read_text() == "x = 2  # shadow_enabled\n"
+    assert (wt / "test_shadow.py").exists()
+    assert _stashes(wt) == []

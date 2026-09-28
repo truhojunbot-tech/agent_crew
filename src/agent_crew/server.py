@@ -695,16 +695,16 @@ _WIP_STASH_EXCLUDES = (
 )
 
 
-def _stash_dirty_worktree(worktree_path: str, task_id: str) -> str:
+def _stash_dirty_worktree(worktree_path: str, task_id: str) -> Optional[str]:
     """#482: save uncommitted provider work before a destructive reset.
 
     A failed task (e.g. codex hitting its usage limit right before `git
     commit`) used to lose its finished-but-uncommitted change to the
     `checkout .` / `clean -fd` that follows. Same `git stash push -u` as the
     pre-dispatch prep, but named after the task so it can be found and
-    resumed. Returns the stash commit SHA, or "" when there was nothing to
-    save (a clean tree creates no stash) or the stash could not be made.
-    Never raises: the reset must still run.
+    resumed. Returns the stash commit SHA, "" for a confirmed clean tree,
+    or None when status/stash could not be verified. A failed stash must
+    never permit the destructive reset.
     """
     pathspec = ["--", ".", *_WIP_STASH_EXCLUDES]
     try:
@@ -712,7 +712,11 @@ def _stash_dirty_worktree(worktree_path: str, task_id: str) -> str:
             ["git", "-C", worktree_path, "status", "--porcelain", *pathspec],
             capture_output=True, text=True, timeout=30,
         )
-        if status.returncode != 0 or not status.stdout.strip():
+        if status.returncode != 0:
+            logger.warning("could not inspect worktree %s for task=%s: %s",
+                           worktree_path, task_id, status.stderr.strip())
+            return None
+        if not status.stdout.strip():
             return ""
         before = subprocess.run(
             ["git", "-C", worktree_path, "rev-parse", "-q", "--verify", "refs/stash"],
@@ -730,14 +734,14 @@ def _stash_dirty_worktree(worktree_path: str, task_id: str) -> str:
         if push.returncode != 0 or not after or after == before:
             logger.warning("stash of dirty worktree %s for task=%s failed: %s",
                            worktree_path, task_id, push.stderr.strip())
-            return ""
+            return None
         logger.warning("preserved uncommitted work of task=%s in %s as stash %s",
                        task_id, worktree_path, after)
         return after
     except Exception:  # noqa: BLE001
         logger.exception("stash of dirty worktree %s for task=%s failed",
                          worktree_path, task_id)
-        return ""
+        return None
 
 
 def _prepare_worktree_for_task_inner(
@@ -783,11 +787,24 @@ def _prepare_worktree_for_task_inner(
     # D-state. This can't fix that specific case (nothing userspace can),
     # but it bounds every OTHER local git op here so one slow/stuck call
     # fails that single task instead of being able to hang indefinitely.
-    subprocess.run(
+    _pre_stash = subprocess.run(
         ["git", "-C", worktree_path, "stash", "push", "-u",
          "-m", f"agent_crew pre-{task_id[:8]}"],
         capture_output=True, text=True, timeout=30,
     )
+    if _pre_stash.returncode != 0:
+        # Some callers use a directory that has not been initialized as a Git
+        # worktree yet. Only a real repository can contain work that a later
+        # checkout would destroy after a failed stash.
+        _is_repo = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if _is_repo.returncode == 0 and _is_repo.stdout.strip() == "true":
+            raise WorktreeUnhealthy(
+                f"{role} {task_id}: cannot stash worktree {worktree_path}; "
+                "manual recovery required before dispatch"
+            )
     # Fetch all remote branches so the target ref is up to date.
     fetch = subprocess.run(
         ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
@@ -3108,6 +3125,15 @@ def create_app(
             if wt and os.path.isdir(wt):
                 # #482: an orphan's uncommitted work is saved, not discarded.
                 _wip = _stash_dirty_worktree(wt, task.task_id)
+                if _wip is None:
+                    logger.error("dispatcher: stash failed for orphan %s in %s; "
+                                 "manual recovery required; refusing reset and requeue",
+                                 task.task_id, wt)
+                    tq.force_fail(task.task_id, "worktree stash failed; manual recovery required", {
+                        "reason": "wip_stash_failed", "wip_stash_error": "manual_recovery_required",
+                        "wip_worktree": wt,
+                    })
+                    continue
                 if _wip:
                     try:
                         tq.annotate_error_info(task.task_id, {
@@ -5449,31 +5475,43 @@ def create_app(
             # uncommitted work (codex hit its limit right before `git commit`).
             # Stash it first, named after the task; completed tasks are reset
             # exactly as before.
+            _reset_safe = False
             try:
                 if wt and q().get_task_status(task.task_id) != "completed":
                     _wip = _stash_dirty_worktree(wt, task.task_id)
+                    if _wip is None:
+                        logger.error("dispatcher: stash failed for %s task=%s in %s; "
+                                     "manual recovery required; refusing reset", role,
+                                     task.task_id, wt)
+                        q().annotate_error_info(task.task_id, {
+                            "wip_stash_error": "manual_recovery_required", "wip_worktree": wt})
+                    else:
+                        _reset_safe = True
                     if _wip:
                         q().annotate_error_info(task.task_id, {
                             "wip_stash": _wip, "wip_worktree": wt})
+                else:
+                    _reset_safe = True
             except Exception:
                 logger.exception(f"dispatcher: wip stash failed for {role} task={task.task_id}")
-            try:
-                subprocess.run(
-                    ["git", "-C", wt, "checkout", "."],
-                    capture_output=True,
-                )
-                subprocess.run(
-                    [
-                        "git", "-C", wt, "clean", "-fd",
-                        "-e", ".claude/CLAUDE.md",
-                        "-e", "AGENTS.md",
-                        "-e", "GEMINI.md",
-                    ],
-                    capture_output=True,
-                )
-                logger.debug(f"dispatcher: worktree reset after task={task.task_id} role={role}")
-            except Exception:
-                logger.exception(f"dispatcher: worktree reset failed for {role} task={task.task_id}")
+            if _reset_safe:
+                try:
+                    subprocess.run(
+                        ["git", "-C", wt, "checkout", "."],
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git", "-C", wt, "clean", "-fd",
+                            "-e", ".claude/CLAUDE.md",
+                            "-e", "AGENTS.md",
+                            "-e", "GEMINI.md",
+                        ],
+                        capture_output=True,
+                    )
+                    logger.debug(f"dispatcher: worktree reset after task={task.task_id} role={role}")
+                except Exception:
+                    logger.exception(f"dispatcher: worktree reset failed for {role} task={task.task_id}")
             # Re-apply agent_crew protocol files for every role we host. Idempotent —
             # implementer's .claude/CLAUDE.md is overwritten; AGENTS.md/GEMINI.md get
             # the marker block re-merged onto the project's content.
