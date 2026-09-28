@@ -125,6 +125,12 @@ def _strs(value) -> tuple[str, ...]:
     return tuple(str(v) for v in value)
 
 
+def _scope_project(scope) -> Optional[str]:
+    """``scope.project`` as a string, or ``None`` when the record is not project-scoped."""
+    project = scope.get("project") if isinstance(scope, dict) else None
+    return None if project in (None, "*") else str(project)
+
+
 def _in_scope(scope: dict, intent: Optional[Intent]) -> bool:
     if intent is None:
         return True
@@ -207,7 +213,8 @@ class CanonicalPolicySnapshotReader:
                               supersedes=_strs(d.get("supersedes")),
                               principals=_strs(d.get("principals")),
                               build_commits=_strs(d.get("build_commits")),
-                              runtimes=_strs(d.get("runtimes")))
+                              runtimes=_strs(d.get("runtimes")),
+                              project=_scope_project(d.get("scope")))
             decisions.append(rev)
             if _in_scope(d.get("scope") or {}, intent):
                 in_scope.append(rev)

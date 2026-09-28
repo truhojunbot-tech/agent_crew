@@ -1051,10 +1051,12 @@ class SnapshotLooseningAuthority:
        was contained; a later build was never reviewed under it.
     """
 
-    def __init__(self, snapshots, *, build_commit: Optional[str] = None, runtime: str = ""):
+    def __init__(self, snapshots, *, build_commit: Optional[str] = None, runtime: str = "",
+                 project: Optional[str] = None):
         self._snapshots = snapshots
         self._build_commit = build_commit
         self._runtime = runtime
+        self._project = project or None
 
     def _build(self) -> Optional[str]:
         if self._build_commit is not None:
@@ -1084,12 +1086,24 @@ class SnapshotLooseningAuthority:
                        f"an unverified snapshot is an unavailable input (P7)")
 
         records = tuple(snap.in_scope or ()) or tuple(snap.decisions or ())
-        rec = next((r for r in records if r.decision_id == did), None)
-        if rec is None:
+        # #463 item 4: two projects may reuse one decision_id, so the id alone does
+        # not name a record. Resolve by (project, decision_id): another project's
+        # record is never a candidate, and more than one candidate is ambiguous and
+        # refused rather than resolved by snapshot order.
+        matches = [r for r in records if r.decision_id == did
+                   and (self._project is None or r.project in (None, self._project))]
+        if not matches:
+            where = f" for project {self._project!r}" if self._project else ""
             return LooseningVerdict(
-                False, f"decision_id {did!r} names no record in the signed snapshot "
+                False, f"decision_id {did!r} names no record in the signed snapshot{where} "
                        f"(generation {snap.generation}); a caller-supplied id is a nonce, not an "
                        f"authorisation (P6)")
+        if len(matches) > 1:
+            return LooseningVerdict(
+                False, f"decision_id {did!r} names {len(matches)} records in the signed snapshot "
+                       f"(projects {[r.project for r in matches]}); an ambiguous id is not an "
+                       f"authorisation (P6)")
+        rec = matches[0]
         if who not in (rec.principals or ()):
             return LooseningVerdict(
                 False, f"decision {did!r} does not authorise principal {who!r} "

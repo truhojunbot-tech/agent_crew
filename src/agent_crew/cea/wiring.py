@@ -401,7 +401,8 @@ def _authority(snapshot_reader, verifier_configured: bool, project: Optional[str
                       "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE unset)")
     try:
         from agent_crew.queue import SnapshotLooseningAuthority
-        authority = SnapshotLooseningAuthority(snapshot_reader, runtime=project or "")
+        authority = SnapshotLooseningAuthority(snapshot_reader, runtime=project or "",
+                                               project=project)
     except Exception as exc:                     # noqa: BLE001
         return None, f"RefuseAllLoosening (authority construction failed: {exc!r})"
     return authority, "SnapshotLooseningAuthority over the verified snapshot"
