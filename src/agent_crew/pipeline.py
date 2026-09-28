@@ -852,6 +852,68 @@ def review_fix_max_rounds() -> int:
         return DEFAULT_REVIEW_FIX_MAX_ROUNDS
 
 
+#: Per-task opt-out for the review→fix transition (#457). A review dispatched
+#: as a red-team / audit pass reports findings for a human to triage; a
+#: ``request_changes`` verdict from it is not a request for an implementer.
+FINDINGS_ONLY_KEY = "findings_only"
+
+
+def _normalize_branch(name) -> str:
+    ref = str(name or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+    return ref
+
+
+def _repo_default_branch(repo: str) -> str:
+    """Ask GitHub for the named repository's default, without using process cwd."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+        return ""
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", repo, "--json", "defaultBranchRef"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return _normalize_branch((json.loads(result.stdout or "{}")
+                                      .get("defaultBranchRef") or {}).get("name"))
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        logger.debug("_repo_default_branch: lookup failed for %s", repo)
+    return ""
+
+
+def _default_branches(review_ctx: dict, repo_cwd: str = "", *,
+                      repo: str = "", require_repo_default: bool = False) -> Optional[set]:
+    """Branches an automated fix must never target (#457).
+
+    The same sources the dispatcher already trusts for "the base": the
+    configured ``AGENT_CREW_MAIN_BRANCH`` (default ``main``), the task's own
+    ``base_branch``, and — when a checkout is available — the remote's
+    advertised ``origin/HEAD``. MCP has no checkout, so it requires the
+    named repository's GitHub default branch and fails closed if unavailable.
+    """
+    names = {_normalize_branch(os.getenv("AGENT_CREW_MAIN_BRANCH") or "main"),
+             _normalize_branch(review_ctx.get("base_branch"))}
+    if repo_cwd:
+        try:
+            head = _git(repo_cwd, "symbolic-ref", "--quiet", "--short",
+                        "refs/remotes/origin/HEAD", timeout=10)
+            if head.returncode == 0:
+                names.add(_normalize_branch(head.stdout))
+        except Exception:
+            logger.debug("_default_branches: origin/HEAD lookup failed in %s", repo_cwd)
+    # MCP has no checkout. Its explicit repository identity must supply a
+    # verified default branch; assuming `main` would allow a fix on `trunk`.
+    if require_repo_default:
+        remote_default = _repo_default_branch(repo)
+        if not remote_default:
+            return None
+        names.add(remote_default)
+    names.discard("")
+    return names
+
+
 def _record_risk_tier_shadow(queue: TaskQueue, task, actual_action: str) -> None:
     """Append a best-effort counterfactual receipt without changing work.
 
@@ -1072,6 +1134,7 @@ def auto_enqueue_fix(
     head_sha_fn=None,
     repo: str = "",
     repo_cwd: str = "",
+    require_repo_default: bool = False,
     suppress_side_effects: bool = False,
 ) -> Optional[str]:
     """Create the fix task that follows a ``request_changes`` review (#244).
@@ -1135,6 +1198,32 @@ def auto_enqueue_fix(
             logger.warning(
                 f"auto_enqueue_fix: skipping cross-project fix — review "
                 f"project={review_project!r}, server project={server_project!r}"
+            )
+            return None
+
+        # #457: a findings-only review (red-team / audit) reports; it does not
+        # commission a fix. Checked before any gate with side effects so such a
+        # review neither spends a round nor announces budget exhaustion.
+        if review_ctx.get(FINDINGS_ONLY_KEY):
+            logger.info(
+                f"auto_enqueue_fix: {review_task_id} is findings_only — findings "
+                f"recorded, no automated fix (#457)"
+            )
+            return None
+        # #457: a fix commits to the reviewed branch. On the default branch that
+        # would be an unreviewed direct push, so never automate it.
+        default_branches = _default_branches(
+            review_ctx, repo_cwd, repo=repo,
+            require_repo_default=require_repo_default)
+        if default_branches is None:
+            logger.warning(
+                "auto_enqueue_fix: %s cannot verify default branch for %r — "
+                "not creating an automated fix (#457)", review_task_id, repo)
+            return None
+        if _normalize_branch(review_task.branch) in default_branches:
+            logger.warning(
+                f"auto_enqueue_fix: {review_task_id} reviewed default branch "
+                f"{review_task.branch!r} — not creating an automated fix (#457)"
             )
             return None
 

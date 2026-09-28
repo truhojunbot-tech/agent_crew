@@ -36,7 +36,10 @@ def test_crew_run_adopts_server_fix_after_request_changes(tmp_db, monkeypatch):
         return original(queue, task_id)
 
     monkeypatch.setattr(TaskQueue, "get_result", result_with_server_cascade)
+    # #457: a feature branch — an automated fix never targets the default
+    # branch, which is what `crew run` uses when none is given.
     result = CliRunner().invoke(crew, ["run", "implement", "--db", tmp_db,
+                                        "--branch", "agent/codex/unified-successor",
                                         "--max-iter", "2", "--timeout", "2"])
     assert isinstance(result.exception, RuntimeError), result.output
     tasks = TaskQueue(tmp_db).list_tasks()

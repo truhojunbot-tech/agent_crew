@@ -5843,7 +5843,8 @@ def create_app(
         base = ctx if isinstance(ctx, dict) else {}
         context = {k: v for k, v in base.items()
                    if k in ("pr_number", "repo", "project", "no_tester",
-                            "coordinator_managed", "checklist_layers")}
+                            "coordinator_managed", "checklist_layers",
+                            "findings_only")}
         context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
                         "expected_head_sha": head})
         try:
