@@ -6399,6 +6399,37 @@ class TaskQueue:
         return {"observed_tasks": observed, "unobserved_tasks": len(rows) - observed,
                 "total_tokens": total, "by_issue": by_issue}
 
+    def annotate_error_info(self, task_id: str, extra: dict) -> None:
+        """Merge ``extra`` into a task's error_info without touching its status.
+
+        #482: records where a failed/orphaned task's uncommitted work was
+        stashed, next to the reason it ended.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT error_info FROM tasks WHERE task_id = ?",
+                               (task_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return
+            try:
+                info = json.loads(row["error_info"]) if row["error_info"] else {}
+            except (TypeError, ValueError):
+                info = {}
+            if not isinstance(info, dict):
+                info = {"previous": info}
+            info.update(extra)
+            conn.execute("UPDATE tasks SET error_info = ? WHERE task_id = ?",
+                         (json.dumps(info), task_id))
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def force_fail(self, task_id: str, summary: str, error_info: Optional[dict] = None) -> Optional[str]:
         """Mark an in_progress task as failed (used by the watchdog when a pane
         has been silent past the timeout). Returns the task_type so callers can
