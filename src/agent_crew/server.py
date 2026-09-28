@@ -4946,6 +4946,41 @@ def create_app(
             except Exception:
                 logger.exception(
                     f"dispatcher: context pack telemetry failed for {task.task_id}")
+        elif (agent == "claude" and _cpack.inject_gate_enabled() and _ctx_over
+              and _ctx_cap_info.get("tripped_by") == "tokens"
+              and _ctx_info["context_policy"] == "fresh"):
+            # The token cap already chose a fresh session. The gate only
+            # describes missing context; it cannot change that decision.
+            try:
+                _gate_pack = _cpack.build_pack_for_task(
+                    _ctx if isinstance(_ctx, dict) else {},
+                    task_id=task.task_id, task_type=task.task_type, role=role,
+                    repo_path=wt, branch=task.branch,
+                    episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
+                    procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
+                    shadow_path=os.path.join(_state_dir, "procedure_shadow.jsonl"),
+                )
+                _gate = _cpack.is_sufficient(
+                    _gate_pack, task_type=task.task_type,
+                    retry_of=str(_retry_of or _ctx.get("retry_of") or "") if isinstance(_ctx, dict) else "",
+                )
+                _block = _gate_pack.to_prompt_block(inject_gate=_gate)
+                _identity = {
+                    "task_id": task.task_id, "project": _project, "role": role,
+                    "agent": agent, "context_id": _ctx_info["context_id"],
+                    "context_generation": _ctx_info["context_generation"],
+                }
+                if _block:
+                    record_context_event(
+                        _context_events_path, "inject_gate",
+                        **{**_gate_pack.telemetry(), **_identity,
+                           "ok": _gate.ok, "missing_signals": _gate.missing_signals,
+                           "pack_tokens": _cpack.estimate_tokens(_block),
+                           "fresh_reason": "token_cap"},
+                    )
+                    message = _block + "\n\n" + message
+            except Exception:
+                logger.exception("dispatcher: context pack inject gate failed for %s", task.task_id)
         elif _cpack.shadow_enabled():
             # Observe the whole pack without changing the signed task row or
             # the bytes sent to the provider. Shadow failures cannot gate dispatch.
