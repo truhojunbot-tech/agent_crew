@@ -7,7 +7,7 @@ import threading
 
 import pytest
 
-from scripts.runtime_swap import parse_args, parse_env_file, check_checkout, require_empty_queue
+from scripts.runtime_swap import parse_args, parse_env_file, check_checkout, require_no_running_work
 
 
 def test_argument_parsing_rejects_short_sha_and_unknown_step():
@@ -51,12 +51,14 @@ def test_checkout_refuses_dirty_and_sha_mismatch(tmp_path):
         check_checkout(repo, sha)
 
 
-def test_nonempty_queue_refused():
-    with pytest.raises(RuntimeError, match='queue not empty'):
-        require_empty_queue([{'status': 'pending'}])
-    with pytest.raises(RuntimeError, match='queue not empty'):
-        require_empty_queue({'tasks': [{'status': 'in_progress'}]})
-    require_empty_queue([{'status': 'completed'}])
+def test_queue_check_allows_pending_but_refuses_running_and_malformed():
+    require_no_running_work([{'status': 'pending'}])
+    require_no_running_work([{'status': 'completed'}])
+    with pytest.raises(RuntimeError, match='queue not idle: 1 in-progress task'):
+        require_no_running_work({'tasks': [{'status': 'pending'}, {'status': 'in_progress'}]})
+    for payload in ({'tasks': 'invalid'}, 'invalid', [{'status': 'pending'}, None]):
+        with pytest.raises(RuntimeError, match='task response malformed'):
+            require_no_running_work(payload)
 
 
 def test_stop_interlock_requires_health_and_database(tmp_path):
@@ -93,8 +95,8 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     with sqlite3.connect(db) as conn:
         conn.execute('CREATE TABLE runtime_stop (id INTEGER PRIMARY KEY, paused INTEGER)')
         conn.execute('INSERT INTO runtime_stop VALUES (1, 1)')
-        conn.execute('CREATE TABLE tasks (status TEXT)')
-        conn.execute("INSERT INTO tasks VALUES ('completed')")
+        conn.execute('CREATE TABLE tasks (task_id TEXT PRIMARY KEY, status TEXT)')
+        conn.execute("INSERT INTO tasks VALUES ('done-1', 'completed')")
     (directory / 'state.json').write_text(json.dumps({'port': 8765, 'db': str(db)}))
     (directory / 'pause.json').write_text('{"paused": true}')
     (directory / 'cea.env').write_text('AGENT_CREW_CEA_MODE=shadow\n')
@@ -123,12 +125,33 @@ def test_main_preflight_and_post_count_mismatch(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match='counts changed'):
         swap.main(['demo', 'a' * 40, 'post'])
     (evidence / 'counts.pre.json').write_text('[ ["completed", 1] ]')
+    (evidence / 'pending.pre.json').write_text('[]')
     assert swap.main(['demo', 'a' * 40, 'post']) == 0
     assert not (evidence / 'env.pre.nul').exists()
     assert (evidence / 'env.pre.sha256').exists()
     with sqlite3.connect(db) as conn:
-        conn.execute("INSERT INTO tasks VALUES ('failed')")
+        conn.execute("INSERT INTO tasks VALUES ('failed-1', 'failed')")
     with pytest.raises(RuntimeError, match='counts changed'):
+        swap.main(['demo', 'a' * 40, 'post'])
+
+
+def test_pending_only_preflight_and_post_requires_same_ids(tmp_path, monkeypatch):
+    import sqlite3
+    swap, _, db = _swap_fixture(tmp_path, monkeypatch)
+    with sqlite3.connect(db) as conn:
+        conn.execute("INSERT INTO tasks VALUES ('pending-1', 'pending')")
+    monkeypatch.setattr(swap, 'api', lambda port, path: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}} if path == '/health' else [{'task_id': 'pending-1', 'status': 'pending'}])
+    assert swap.main(['demo', 'a' * 40, 'preflight']) == 0
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    (evidence / 'counts.pre.json').write_text(json.dumps([['completed', 1], ['pending', 1]]))
+    (evidence / 'pending.pre.json').write_text(json.dumps(['pending-1']))
+    assert swap.main(['demo', 'a' * 40, 'post']) == 0
+    assert json.loads((evidence / 'counts.post.json').read_text()) == [['completed', 1], ['pending', 1]]
+    assert json.loads((evidence / 'pending.post.json').read_text()) == ['pending-1']
+    with sqlite3.connect(db) as conn:
+        conn.execute("DELETE FROM tasks WHERE task_id='pending-1'")
+        conn.execute("INSERT INTO tasks VALUES ('pending-2', 'pending')")
+    with pytest.raises(RuntimeError, match='pending task IDs changed'):
         swap.main(['demo', 'a' * 40, 'post'])
 
 
@@ -234,6 +257,7 @@ def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch):
         swap.main(['demo', 'a' * 40, 'go'])
     assert len(killed) == 1
     assert (evidence / 'tasks.db.pre').exists()
+    assert json.loads((evidence / 'pending.pre.json').read_text()) == []
 
 
 def test_go_broker_probe_failure_keeps_old_server(tmp_path, monkeypatch):

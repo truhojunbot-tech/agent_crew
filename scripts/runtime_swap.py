@@ -80,13 +80,18 @@ def prepare_checkout(path: Path, sha: str) -> None:
     check_checkout(path, sha)
 
 
-def require_empty_queue(payload) -> None:
-    tasks = payload if isinstance(payload, list) else payload.get("tasks", [])
-    if not isinstance(tasks, list):
+def require_no_running_work(payload) -> None:
+    if isinstance(payload, list):
+        tasks = payload
+    elif isinstance(payload, dict):
+        tasks = payload.get("tasks")
+    else:
+        tasks = None
+    if not isinstance(tasks, list) or any(not isinstance(task, dict) for task in tasks):
         raise RuntimeError("task response malformed")
-    active = [task for task in tasks if task.get("status") in {"pending", "in_progress"}]
-    if active:
-        raise RuntimeError(f"queue not empty: {len(active)} active task(s)")
+    running = [task for task in tasks if task.get("status") == "in_progress"]
+    if running:
+        raise RuntimeError(f"queue not idle: {len(running)} in-progress task(s)")
 
 
 def api(port: int, path: str):
@@ -107,6 +112,12 @@ def listener_pid(port: int) -> int:
 def counts(db_path: Path) -> list[tuple[str, int]]:
     with sqlite3.connect(db_path) as db:
         return db.execute("SELECT status, count(*) FROM tasks GROUP BY status ORDER BY status").fetchall()
+
+
+def pending_task_ids(db_path: Path) -> list[str]:
+    with sqlite3.connect(db_path) as db:
+        return [row[0] for row in db.execute(
+            "SELECT task_id FROM tasks WHERE status='pending' ORDER BY task_id")]
 
 
 def paused(db_path: Path, health: dict) -> None:
@@ -143,7 +154,7 @@ def main(argv=None) -> int:
     prepare_checkout(checkout, args.sha)
     health = api(port, "/health")
     paused(db_path, health)
-    require_empty_queue(api(port, "/tasks"))
+    require_no_running_work(api(port, "/tasks"))
     pid = listener_pid(port)
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.parent.chmod(0o700)
@@ -183,6 +194,7 @@ def main(argv=None) -> int:
         if (directory / "pause.json").exists():
             shutil.copy2(directory / "pause.json", evidence / "pause.json.pre")
         write_json(evidence / "counts.pre.json", counts(db_path))
+        write_json(evidence / "pending.pre.json", pending_task_ids(db_path))
         os.kill(pid, signal.SIGTERM)
         for _ in range(30):
             time.sleep(1)
@@ -215,9 +227,14 @@ def main(argv=None) -> int:
     # post: all evidence gates are mandatory and failures are explicit.
     if health.get("build", {}).get("commit") != args.sha:
         raise RuntimeError(f"build SHA differs: {health.get('build', {}).get('commit')} != {args.sha}")
-    if counts(db_path) != [tuple(row) for row in json.loads((evidence / "counts.pre.json").read_text())]:
+    post_counts = counts(db_path)
+    if post_counts != [tuple(row) for row in json.loads((evidence / "counts.pre.json").read_text())]:
         raise RuntimeError("task status counts changed across swap")
-    write_json(evidence / "counts.post.json", counts(db_path))
+    post_pending = pending_task_ids(db_path)
+    if post_pending != json.loads((evidence / "pending.pre.json").read_text()):
+        raise RuntimeError("pending task IDs changed across swap")
+    write_json(evidence / "counts.post.json", post_counts)
+    write_json(evidence / "pending.post.json", post_pending)
     write_json(evidence / "health.post.json", health)
     # The captured environment can carry provider tokens. It is needed only
     # until a verified post; retain its digest, not its secret contents.
