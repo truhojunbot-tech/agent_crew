@@ -5930,6 +5930,20 @@ def create_app(
             if not tasks:
                 return
             original_task = tasks[0]
+            # Opt-in for projects where repeating an agent-reported implement
+            # failure has proved wasteful. Read per call so the default retry
+            # behavior remains unchanged when the flag is unset.
+            error_info = original_task.error_info
+            if (
+                os.getenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "1") == "0"
+                and task_type == "implement"
+                and not (isinstance(error_info, dict) and error_info.get("reason"))
+            ):
+                logger.info(
+                    "_auto_retry_failed_task: skipping retry for %s: agent-reported implement failure; retry would repeat the same work",
+                    task_id,
+                )
+                return
 
             # #167: use the DB context retry_attempt, not result.retry_count.
             # Agents always submit retry_count=0 (they don't track it); the DB
