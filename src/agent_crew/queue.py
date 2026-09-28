@@ -4669,10 +4669,17 @@ class TaskQueue:
                       "outcome": gate.outcome.value, "reason": gate.reason,
                       "enforced": gate.enforced, "nonce_spent": spent}
             if not gate.enforced and gate.outcome.value != "PROCEED":
+                # #409: the gate's reason prose ("… re-admission requires …")
+                #   reads as a refusal on its own. Label it on the go path so no
+                #   field of the answer contradicts `go`. The enforced answer
+                #   never reaches here and stays byte-identical.
+                shadow = gate_config.mode == "shadow"
                 answer.update(advisory=True, shadow_outcome=gate.outcome.value,
+                              reason=("shadow (not enforced): " if shadow else
+                                      "advisory (not enforced): ") + str(gate.reason),
                               instruction=(
                                   "shadow mode: not enforced — proceed; decide on go only"
-                                  if gate_config.mode == "shadow" else
+                                  if shadow else
                                   "advisory verdict: not enforced — proceed; decide on go only"))
                 if gate.review_required:
                     answer["review_required"] = True
