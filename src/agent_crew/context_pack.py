@@ -272,7 +272,7 @@ def is_sufficient(pack: ContextPack, *, task_type: str = "", retry_of: str = "")
     if TYPE_AC not in types and not no_ac:
         signals.append("AC artifact missing — acceptance bar unknown; "
                        "annotate no_ac=true in IssueProvider if issue has none")
-    if ("fix" in (task_type or "").lower() or "fix" in pack.task_id.lower()) and TYPE_REVIEW not in types:
+    if ("fix" in (task_type or "").lower() or pack.task_id.startswith("fix-")) and TYPE_REVIEW not in types:
         signals.append("fix round requires linked_review — prior findings unknown; "
                        "reviewer may re-raise same issues")
     if retry_of and not any(item.artifact_type == TYPE_EPISODE and
