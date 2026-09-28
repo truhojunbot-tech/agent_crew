@@ -198,6 +198,7 @@ class CanonicalPolicySnapshotReader:
         for d in doc.get("decisions") or ():
             if not isinstance(d, dict) or not d.get("decision_id") or not d.get("body_hash"):
                 return self._unavailable()      # a malformed record is not a partial snapshot
+            expiry = None
             if "expires_at" in d:
                 expiry = _epoch(d["expires_at"])
                 if expiry is None or expiry <= now:
@@ -214,7 +215,7 @@ class CanonicalPolicySnapshotReader:
                               principals=_strs(d.get("principals")),
                               build_commits=_strs(d.get("build_commits")),
                               runtimes=_strs(d.get("runtimes")),
-                              project=_scope_project(d.get("scope")))
+                              project=_scope_project(d.get("scope")), expires_at=expiry)
             decisions.append(rev)
             if _in_scope(d.get("scope") or {}, intent):
                 in_scope.append(rev)

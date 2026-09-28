@@ -1089,8 +1089,9 @@ class SnapshotLooseningAuthority:
         records = tuple(snap.in_scope or ()) or tuple(snap.decisions or ())
         # #463 item 4: two projects may reuse one decision_id, so the id alone does
         # not name a record. Resolve by (project, decision_id): another project's
-        # record is never a candidate, and more than one candidate is ambiguous and
-        # refused rather than resolved by snapshot order.
+        # record is never a candidate. The producer may expand one decision into
+        # per-capability records; those are one authority only when every field
+        # relevant to loosening agrees (#494).
         matches = [r for r in records if r.decision_id == did
                    and (self._project is None or r.project in (None, self._project))]
         if not matches:
@@ -1099,7 +1100,9 @@ class SnapshotLooseningAuthority:
                 False, f"decision_id {did!r} names no record in the signed snapshot{where} "
                        f"(generation {snap.generation}); a caller-supplied id is a nonce, not an "
                        f"authorisation (P6)")
-        if len(matches) > 1:
+        authorities = {(r.project, r.body_hash, r.principals, r.build_commits,
+                        r.runtimes, r.supersedes, r.expires_at) for r in matches}
+        if len(authorities) > 1:
             return LooseningVerdict(
                 False, f"decision_id {did!r} names {len(matches)} records in the signed snapshot "
                        f"(projects {[r.project for r in matches]}); an ambiguous id is not an "

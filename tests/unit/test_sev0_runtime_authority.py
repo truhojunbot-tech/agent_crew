@@ -316,3 +316,56 @@ def test_production_reader_and_wiring_key_the_lookup_by_project(tmp_path):
         auth._build_commit = BUILD
         assert auth.verify(frm="STOPPED", to="ACTIVE", who=own, decision_id="D-1").granted
         assert not auth.verify(frm="STOPPED", to="ACTIVE", who=other, decision_id="D-1").granted
+
+
+def test_one_decision_expanded_across_capabilities_can_loosen(tmp_path):
+    records = tuple(DecisionRev(decision_id="D-MULTI", body_hash="a" * 32,
+                                principals=("owner:a",), build_commits=(BUILD,),
+                                runtimes=("agent_crew",), project="agent_crew",
+                                expires_at=1234567890.0) for _ in range(3))
+    q = TaskQueue(str(tmp_path / "tasks.db"), runtime_authority=scoped(
+        "agent_crew", records=records))
+    stop(q)
+    q.set_stop_epoch(False, who="owner:a", decision_id="D-MULTI")
+    assert q.get_runtime_state()["state"] == "ACTIVE"
+
+
+@pytest.mark.parametrize("changed", ["body_hash", "principals", "expires_at"])
+def test_same_project_records_with_different_authority_refuse(changed):
+    base = dict(decision_id="D-MULTI", body_hash="a" * 32,
+                principals=("owner:a",), build_commits=(BUILD,),
+                runtimes=("agent_crew",), project="agent_crew", expires_at=1234567890.0)
+    other = {**base, changed: {"body_hash": "b" * 32,
+                              "principals": ("owner:b",),
+                              "expires_at": 1234567891.0}[changed]}
+    v = scoped("agent_crew", records=(DecisionRev(**base), DecisionRev(**other))).verify(
+        frm="STOPPED", to="ACTIVE", who="owner:a", decision_id="D-MULTI")
+    assert not v.granted and "ambiguous id" in v.reason
+
+
+def test_reader_and_wiring_accept_one_decision_expanded_by_capability(tmp_path):
+    import json
+    import time
+
+    from agent_crew.cea.input_providers.snapshot import CanonicalPolicySnapshotReader
+    from agent_crew.cea.wiring import _authority
+
+    now = time.time()
+    expiry = now + 300
+    path = tmp_path / "snapshot.json"
+    common = {"decision_id": "D-MULTI", "body_hash": "a" * 32,
+              "principals": ["owner:a"], "build_commits": [BUILD],
+              "runtimes": ["agent_crew"], "expires_at": expiry}
+    path.write_text(json.dumps({"generation": 9, "produced_at": now,
+                                "decisions": [{**common, "scope": {"project": "agent_crew",
+                                                               "capability_id": cap}}
+                                              for cap in ("one", "two", "three")],
+                                "signature": {"alg": "x", "key_id": "k", "value": "v"}}))
+    reader = CanonicalPolicySnapshotReader(str(path), clock=lambda: now,
+                                           verifier=lambda body, sig: SignatureStatus.VALID)
+    assert len(reader.current().decisions) == 3
+    assert {r.expires_at for r in reader.current().decisions} == {expiry}
+    auth, _ = _authority(reader, True, "agent_crew")
+    auth._build_commit = BUILD
+    assert auth.verify(frm="STOPPED", to="ACTIVE", who="owner:a",
+                       decision_id="D-MULTI").granted
