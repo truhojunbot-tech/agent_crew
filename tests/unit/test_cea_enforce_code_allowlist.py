@@ -76,3 +76,7 @@ def test_advisory_start_response_says_go_and_keeps_real_outcome(tmp_path):
     assert answer["advisory"] is True and answer["review_required"] is True
     assert answer["enforced"] is False
     assert answer["instruction"] == "advisory verdict: not enforced — proceed; decide on go only"
+    # #409: the reason prose is labelled, so it cannot be read as a refusal.
+    assert answer["reason"].startswith("advisory (not enforced): ")
+    assert "shadow" not in answer["reason"]
+

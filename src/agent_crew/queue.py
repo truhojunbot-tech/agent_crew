@@ -4,6 +4,7 @@ import copy
 import fcntl
 import hashlib
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -2731,7 +2732,12 @@ class TaskQueue:
             if self._stop_active_in_txn(conn, point=_cea_validator.ValidationPoint.ENQUEUE):
                 conn.execute("ROLLBACK")
                 raise PausedError(f"enqueue blocked by runtime STOP (task_id={task.task_id})")
-            duplicate_id = self._duplicate_review_in_txn(conn, task, context)
+            admit_at = time.time()
+            reservation_ttl = self.review_reservation_ttl()
+            expired_reservations: list = []
+            duplicate_id = self._duplicate_review_in_txn(
+                conn, task, context, now=admit_at, ttl=reservation_ttl,
+                expired=expired_reservations)
             if duplicate_id:
                 if context.get("allow_duplicate_review") is True:
                     self._append_exec_event_on(
@@ -2746,6 +2752,18 @@ class TaskQueue:
                         existing_task_id=duplicate_id, code=DuplicateReviewError.code)
                     conn.commit()
                     raise DuplicateReviewError(duplicate_id)
+            # #415: written in the admission transaction, so the event exists
+            # iff the stale reservation actually let this task in.
+            for stale_id, since in expired_reservations:
+                self._append_exec_event_on(
+                    conn, stale_id, "review_reservation_expired", admit_at,
+                    admitted_task_id=task.task_id, reserved_since=since,
+                    age_seconds=round(admit_at - since, 3),
+                    ttl_seconds=reservation_ttl)
+                logger.warning(
+                    "review reservation expired: pending unpinned %s (%.0fs >= ttl %.0fs) "
+                    "no longer blocks %s", stale_id, admit_at - since,
+                    reservation_ttl, task.task_id)
             if (task.task_type == "implement"
                     and context.get("allow_parallel_implement") is True):
                 cap = self._max_open_implement()
@@ -2853,15 +2871,44 @@ class TaskQueue:
             logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
         return task.task_id
 
+    #: #415: how long a pending, unpinned review/test may reserve its PR or
+    #: branch. Same bound as the reviewer's absolute dispatch cap
+    #: (``AGENT_CREW_DISPATCH_TIMEOUT_REVIEWER`` default): a reservation that
+    #: has waited longer than a review may even run is not about to run — its
+    #: provider is exhausted or its pane is gone. Override with
+    #: ``AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS``.
+    REVIEW_RESERVATION_TTL = 3600.0
+
+    @classmethod
+    def review_reservation_ttl(cls) -> float:
+        try:
+            value = float(os.getenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS",
+                                    cls.REVIEW_RESERVATION_TTL))
+        except (TypeError, ValueError, OverflowError):
+            return cls.REVIEW_RESERVATION_TTL
+        return (value if math.isfinite(value) and value > 0
+                else cls.REVIEW_RESERVATION_TTL)
+
     @staticmethod
     def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict, *,
-                                 dispatch: bool = False) -> Optional[str]:
+                                 dispatch: bool = False,
+                                 now: Optional[float] = None,
+                                 ttl: Optional[float] = None,
+                                 expired: Optional[list] = None) -> Optional[str]:
         """Find a standing review/test of this target under the write lock.
 
         Pending reviews without a pin will use the current head at dispatch, so
         they reserve their PR or branch at enqueue. Once a task has prepared
         its head, only an in-progress or judged-complete task at that exact SHA
         can suppress it.
+
+        #415: that reservation is bounded. When ``now`` and ``ttl`` are given, a
+        pending unpinned row that entered pending (``created_at``, or the
+        ``last_activity_at`` a requeue stamps) at least ``ttl`` seconds before
+        ``now`` stops reserving; it is appended to ``expired`` as
+        ``(task_id, reserved_since)`` for the caller to record. The row itself
+        is untouched, and if it is dispatched later the dispatch-time check
+        still refuses it against whatever review has pinned that head.
         """
         if task.task_type not in ("review", "test"):
             return None
@@ -2876,7 +2923,8 @@ class TaskQueue:
         if pr is None and not task.branch:
             return None
         rows = conn.execute(
-            "SELECT task_id, branch, pr_number, context, status FROM tasks "
+            "SELECT task_id, branch, pr_number, context, status, created_at, "
+            "last_activity_at FROM tasks "
             "WHERE project=? AND task_type=? AND task_id<>? "
             "AND (status IN ('pending', 'in_progress') "
             "OR (status='completed' AND (task_type='test' "
@@ -2907,6 +2955,12 @@ class TaskQueue:
             if row["status"] == "pending" and dispatch:
                 continue
             if row["status"] == "pending" and old_sha is None and not dispatch:
+                since = max(float(row["created_at"] or 0.0),
+                            float(row["last_activity_at"] or 0.0))
+                if now is not None and ttl is not None and now - since >= ttl:
+                    if expired is not None:
+                        expired.append((row["task_id"], since))
+                    continue
                 return row["task_id"]
             if sha is not None and old_sha == sha:
                 return row["task_id"]
@@ -4669,10 +4723,17 @@ class TaskQueue:
                       "outcome": gate.outcome.value, "reason": gate.reason,
                       "enforced": gate.enforced, "nonce_spent": spent}
             if not gate.enforced and gate.outcome.value != "PROCEED":
+                # #409: the gate's reason prose ("… re-admission requires …")
+                #   reads as a refusal on its own. Label it on the go path so no
+                #   field of the answer contradicts `go`. The enforced answer
+                #   never reaches here and stays byte-identical.
+                shadow = gate_config.mode == "shadow"
                 answer.update(advisory=True, shadow_outcome=gate.outcome.value,
+                              reason=("shadow (not enforced): " if shadow else
+                                      "advisory (not enforced): ") + str(gate.reason),
                               instruction=(
                                   "shadow mode: not enforced — proceed; decide on go only"
-                                  if gate_config.mode == "shadow" else
+                                  if shadow else
                                   "advisory verdict: not enforced — proceed; decide on go only"))
                 if gate.review_required:
                     answer["review_required"] = True
@@ -6337,6 +6398,37 @@ class TaskQueue:
                     bucket["total_tokens"] += task_total
         return {"observed_tasks": observed, "unobserved_tasks": len(rows) - observed,
                 "total_tokens": total, "by_issue": by_issue}
+
+    def annotate_error_info(self, task_id: str, extra: dict) -> None:
+        """Merge ``extra`` into a task's error_info without touching its status.
+
+        #482: records where a failed/orphaned task's uncommitted work was
+        stashed, next to the reason it ended.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT error_info FROM tasks WHERE task_id = ?",
+                               (task_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return
+            try:
+                info = json.loads(row["error_info"]) if row["error_info"] else {}
+            except (TypeError, ValueError):
+                info = {}
+            if not isinstance(info, dict):
+                info = {"previous": info}
+            info.update(extra)
+            conn.execute("UPDATE tasks SET error_info = ? WHERE task_id = ?",
+                         (json.dumps(info), task_id))
+            conn.execute("COMMIT")
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
 
     def force_fail(self, task_id: str, summary: str, error_info: Optional[dict] = None) -> Optional[str]:
         """Mark an in_progress task as failed (used by the watchdog when a pane

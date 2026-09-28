@@ -450,6 +450,32 @@ def test_shadow_block_start_is_explicitly_advisory(tmp_path):
     assert answer["instruction"] == "shadow mode: not enforced — proceed; decide on go only"
 
 
+def _start_answer(tmp_path, mode):
+    q = queue(tmp_path, mode=mode, wired=True, name=f"{mode}.db")
+    q.enqueue(task(task_type="review", context=admitted()))
+    q.dequeue(agent="codex", role="reviewer")
+    nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
+    return q.start_execution("t1", nonce, presenter="gemini")
+
+
+def test_shadow_start_reason_is_labelled_not_enforced(tmp_path):
+    """#409: on go the reason prose must not read as an enforced refusal."""
+    shadow = _start_answer(tmp_path, "shadow")
+    enforced = _start_answer(tmp_path, "test")
+    assert shadow["go"] is True and enforced["go"] is False
+    assert shadow["reason"].startswith("shadow (not enforced): ")
+    # Same gate verdict underneath: only the label differs, nothing is dropped.
+    assert shadow["reason"] == "shadow (not enforced): " + enforced["reason"]
+    assert shadow["outcome"] == enforced["outcome"] == "BLOCK"
+
+
+def test_enforced_start_reason_carries_no_shadow_label(tmp_path):
+    answer = _start_answer(tmp_path, "test")
+    assert answer["go"] is False and answer["enforced"] is True
+    assert "not enforced" not in answer["reason"]
+    assert not answer["reason"].startswith(("shadow", "advisory"))
+
+
 def test_enforced_block_start_response_is_unchanged(tmp_path):
     q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted()))
