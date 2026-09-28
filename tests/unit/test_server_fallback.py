@@ -29,7 +29,8 @@ def _task_payload(task_id="t1", task_type="implement", description="do work"):
     }
 
 
-def _result(task_id, status="failed", summary="rate limit reached", findings=None):
+def _result(task_id, status="failed", summary="rate limit reached", findings=None,
+            error_info=None):
     return {
         "task_id": task_id,
         "status": status,
@@ -37,6 +38,7 @@ def _result(task_id, status="failed", summary="rate limit reached", findings=Non
         "verdict": None,
         "findings": findings or [],
         "pr_number": None,
+        "error_info": error_info,
     }
 
 
@@ -80,7 +82,11 @@ def test_successor_cea_blocks_belong_to_own_receipt(tmp_db, summary, successor_p
         })
 
         response = client.post("/tasks/receipt-parent/result",
-                               json=_result("receipt-parent", summary=summary))
+                               json=_result(
+                                   "receipt-parent", summary=summary,
+                                   error_info={"reason": "infrastructure_failure"}
+                                   if summary == "worker failed" else None,
+                               ))
         assert response.status_code == 200
 
     tasks = queue.list_tasks()
