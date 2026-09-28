@@ -135,7 +135,10 @@ def test_dispatch_uses_task_context_timeout_without_server_restart(
 def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch, *, unused_tcp_port):
     """★The ask: "failed" and "we stopped waiting" must be distinguishable,
     and the DISPATCHER has to be the one making that distinction."""
-    task = _dispatch_outcome(tmp_path, monkeypatch, behaviour="hang", unused_tcp_port=unused_tcp_port)
+    task, db = _dispatch_outcome(
+        tmp_path, monkeypatch, behaviour="hang", unused_tcp_port=unused_tcp_port,
+        return_db=True,
+    )
 
     assert task.status == "timed_out", "a timeout is still reported as a failure"
     assert task.error_info["reason"] == "dispatcher_timeout"
@@ -146,6 +149,8 @@ def test_a_dispatcher_timeout_ends_the_task_as_timed_out(tmp_path, monkeypatch, 
         "a timeout must say it is not a final verdict — that is the whole "
         "distinction the consumer needs"
     )
+    assert [row.task_id for row in TaskQueue(db).list_tasks()] == [task.task_id]
+    assert task.context.get("retry_attempt", 0) == 0
 
 
 def test_idle_timeout_reports_its_limit_and_output_age(tmp_path, monkeypatch, *, unused_tcp_port):

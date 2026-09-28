@@ -40,7 +40,7 @@ def _post_task(client, task_id="t1", task_type="implement", priority=3, ctx=None
     })
 
 
-def _post_result(client, task_id, status="completed", summary="done"):
+def _post_result(client, task_id, status="completed", summary="done", error_info=None):
     return client.post(f"/tasks/{task_id}/result", json={
         "task_id": task_id,
         "status": status,
@@ -48,6 +48,7 @@ def _post_result(client, task_id, status="completed", summary="done"):
         "verdict": None,
         "findings": [],
         "pr_number": None,
+        "error_info": error_info,
     })
 
 
@@ -60,26 +61,38 @@ class _RecordingPush:
 
 
 @pytest.mark.parametrize(
-    ("reason", "expected_retry"),
-    [("dispatcher_timeout", False), ("dispatcher_idle_timeout", True), ("generic_failure", True)],
+    ("task_type", "error_info", "expected_retry"),
+    [
+        ("implement", None, False),
+        ("implement", {"reason": "infrastructure_failure"}, True),
+        ("review", None, True),
+        ("test", None, True),
+    ],
 )
-def test_auto_retry_skips_only_dispatcher_timeout(tmp_db, reason, expected_retry):
+def test_auto_retry_skips_agent_reported_implement_failure(
+    tmp_db, task_type, error_info, expected_retry,
+):
     app = create_app(
         db_path=tmp_db, pane_map={"implementer": "%100"}, port=8100,
         push_fn=_RecordingPush(), watchdog_disabled=True, fallback_disabled=True,
     )
     with TestClient(app) as client:
-        assert _post_task(client, "timeout-retry-probe").status_code == 201
-        response = client.post("/tasks/timeout-retry-probe/result", json={
-            "task_id": "timeout-retry-probe", "status": "failed",
-            "summary": reason, "error_info": {"reason": reason},
+        assert _post_task(
+            client, "self-report-probe", task_type=task_type,
+            ctx={"pr_number": 123} if task_type == "review" else None,
+        ).status_code == 201
+        response = client.post("/tasks/self-report-probe/result", json={
+            "task_id": "self-report-probe", "status": "failed",
+            "summary": "agent failed", "error_info": error_info,
         })
         assert response.status_code == 200
 
     tasks = TaskQueue(tmp_db).list_tasks()
-    retry = [task for task in tasks if task.task_id == "retry-timeout-retry-probe-a1"]
+    retry = [task for task in tasks if task.task_id == "retry-self-report-probe-a1"]
     assert len(retry) == int(expected_retry)
-    assert next(task for task in tasks if task.task_id == "timeout-retry-probe").context.get("retry_attempt", 0) == 0
+    original = next(task for task in tasks if task.task_id == "self-report-probe")
+    assert original.context.get("retry_attempt", 0) == 0
+    assert original.error_info == error_info
     if expected_retry:
         assert retry[0].context["retry_attempt"] == 1
 
@@ -336,7 +349,8 @@ class TestDispatchOnResult:
             # _try_push_next fires → retry-A gets dispatched (has lower priority).
             # OR B gets dispatched first if B has higher priority.
             # Either way, a push fires.
-            _post_result(client, "A", status="failed", summary="generic failure")
+            _post_result(client, "A", status="failed", summary="generic failure",
+                         error_info={"reason": "infrastructure_failure"})
 
         # Either B or retry-A pushed — at minimum one additional push.
         assert len(push.calls) >= 2, "A push must fire after failed result + pending tasks"
@@ -471,7 +485,8 @@ class TestFallbackCancellation:
             # Enqueue a task that has already been retried twice (at max).
             _post_task(client, "A", ctx={"retry_attempt": 2})
             # Agent submits failure with retry_count=0 (agents never fill this).
-            _post_result(client, "A", status="failed", summary="generic failure")
+            _post_result(client, "A", status="failed", summary="generic failure",
+                         error_info={"reason": "infrastructure_failure"})
 
         q = TaskQueue(tmp_db)
         # The retry task must NOT have been created — check pending + in_progress.

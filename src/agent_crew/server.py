@@ -5930,12 +5930,14 @@ def create_app(
             if not tasks:
                 return
             original_task = tasks[0]
-            # The dispatcher records the fired limit in the durable task row.
-            # Reissuing a hard-cap timeout starts the same long run over again.
-            error_info = original_task.error_info or {}
-            if error_info.get("reason") == "dispatcher_timeout":
+            # Agent-reported implement failures have no infrastructure reason.
+            # Retrying them restarts the same work from scratch.
+            error_info = original_task.error_info
+            if task_type == "implement" and not (
+                isinstance(error_info, dict) and error_info.get("reason")
+            ):
                 logger.info(
-                    "_auto_retry_failed_task: skipping retry for %s (reason=dispatcher_timeout)",
+                    "_auto_retry_failed_task: skipping retry for %s: agent-reported implement failure; retry would repeat the same work",
                     task_id,
                 )
                 return
