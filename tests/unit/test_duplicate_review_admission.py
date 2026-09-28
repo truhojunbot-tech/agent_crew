@@ -200,9 +200,9 @@ def test_refusal_does_not_commit_other_transaction_writes(queue, monkeypatch):
     queue.enqueue(task("first"))
     original = TaskQueue._duplicate_review_in_txn
 
-    def with_prior_write(conn, task_request, context):
+    def with_prior_write(conn, task_request, context, **kwargs):
         conn.execute("UPDATE tasks SET description='unrelated write' WHERE task_id='first'")
-        return original(conn, task_request, context)
+        return original(conn, task_request, context, **kwargs)
 
     monkeypatch.setattr(TaskQueue, "_duplicate_review_in_txn", staticmethod(with_prior_write))
     with pytest.raises(DuplicateReviewError):
@@ -268,3 +268,104 @@ def test_http_refusal_names_existing_task(tmp_path):
     assert response.status_code == 409
     assert response.json() == {"detail": {"error": "DUPLICATE_REVIEW",
                                           "existing_task_id": "first"}}
+
+
+# ── #415: a pending unpinned reservation is bounded ──────────────────────────
+
+def _age_row(queue, task_id, seconds):
+    conn = queue._connect()
+    try:
+        conn.execute("UPDATE tasks SET created_at = created_at - ? WHERE task_id=?",
+                     (seconds, task_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _events(queue, task_id, event):
+    conn = queue._connect()
+    try:
+        return [json.loads(r["fields"]) for r in conn.execute(
+            "SELECT fields FROM task_exec_events WHERE task_id=? AND event=?",
+            (task_id, event)).fetchall()]
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("kind", ["review", "test"])
+def test_active_unpinned_reservation_still_refuses(queue, kind, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS", "600")
+    queue.enqueue(task("reserver", kind=kind, sha=None))
+    _age_row(queue, "reserver", 599)
+    with pytest.raises(DuplicateReviewError) as exc:
+        queue.enqueue(task("second", kind=kind, sha=SHA_A))
+    assert exc.value.existing_task_id == "reserver"
+    assert _events(queue, "reserver", "review_reservation_expired") == []
+
+
+@pytest.mark.parametrize("kind", ["review", "test"])
+def test_stale_unpinned_reservation_stops_blocking_and_is_recorded(queue, kind, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS", "600")
+    queue.enqueue(task("abandoned", kind=kind, sha=None))
+    _age_row(queue, "abandoned", 600)
+    assert queue.enqueue(task("fresh", kind=kind, sha=SHA_A)) == "fresh"
+    # The stale row is left as it is; only its reservation lapsed.
+    assert queue.get_task_status("abandoned") == "pending"
+    [event] = _events(queue, "abandoned", "review_reservation_expired")
+    assert event["admitted_task_id"] == "fresh"
+    assert event["ttl_seconds"] == 600.0
+    assert event["age_seconds"] >= 600.0
+    assert _events(queue, "fresh", "duplicate_review_refused") == []
+
+
+def test_requeue_restarts_the_reservation_clock(queue, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS", "600")
+    queue.enqueue(task("requeued", sha=None))
+    _age_row(queue, "requeued", 10_000)
+    conn = queue._connect()
+    try:
+        conn.execute("UPDATE tasks SET last_activity_at=strftime('%s','now') "
+                     "WHERE task_id='requeued'")
+        conn.commit()
+    finally:
+        conn.close()
+    with pytest.raises(DuplicateReviewError):
+        queue.enqueue(task("second", sha=SHA_A))
+
+
+def test_admission_after_expiry_keeps_duplicate_protection(queue, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS", "600")
+    queue.enqueue(task("abandoned", sha=None))
+    _age_row(queue, "abandoned", 3600)
+    queue.enqueue(task("legit", sha=None))
+    # The legitimate review now holds the reservation itself.
+    with pytest.raises(DuplicateReviewError) as exc:
+        queue.enqueue(task("third", sha=SHA_A))
+    assert exc.value.existing_task_id == "legit"
+    assert [e["admitted_task_id"] for e in
+            _events(queue, "abandoned", "review_reservation_expired")] == ["legit"]
+    # Whichever of the two dispatches second is refused at its pinned head.
+    first = queue.dequeue(role="reviewer")
+    assert queue.record_prepared_review_base(first.task_id, {"reviewed_sha": SHA_A})
+    second = queue.dequeue(role="reviewer")
+    assert {first.task_id, second.task_id} == {"abandoned", "legit"}
+    assert not queue.record_prepared_review_base(second.task_id, {"reviewed_sha": SHA_A})
+    assert queue.get_task_status(second.task_id) == "blocked"
+
+
+def test_refused_admission_records_no_expiry(queue, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS", "600")
+    queue.enqueue(task("abandoned", sha=None))
+    _age_row(queue, "abandoned", 3600)
+    queue.enqueue(task("active", sha=SHA_A))
+    with pytest.raises(DuplicateReviewError) as exc:
+        queue.enqueue(task("third", sha=SHA_A))
+    assert exc.value.existing_task_id == "active"
+    assert [e["admitted_task_id"] for e in
+            _events(queue, "abandoned", "review_reservation_expired")] == ["active"]
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "0", "-5", "inf", "nan"])
+def test_invalid_ttl_falls_back_to_default(raw, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS", raw)
+    assert TaskQueue.review_reservation_ttl() == TaskQueue.REVIEW_RESERVATION_TTL
