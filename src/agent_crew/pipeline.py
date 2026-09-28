@@ -852,6 +852,42 @@ def review_fix_max_rounds() -> int:
         return DEFAULT_REVIEW_FIX_MAX_ROUNDS
 
 
+#: Per-task opt-out for the review→fix transition (#457). A review dispatched
+#: as a red-team / audit pass reports findings for a human to triage; a
+#: ``request_changes`` verdict from it is not a request for an implementer.
+FINDINGS_ONLY_KEY = "findings_only"
+
+
+def _normalize_branch(name) -> str:
+    ref = str(name or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+    return ref
+
+
+def _default_branches(review_ctx: dict, repo_cwd: str = "") -> set:
+    """Branches an automated fix must never target (#457).
+
+    The same sources the dispatcher already trusts for "the base": the
+    configured ``AGENT_CREW_MAIN_BRANCH`` (default ``main``), the task's own
+    ``base_branch``, and — when a checkout is available — the remote's
+    advertised ``origin/HEAD``.
+    """
+    names = {_normalize_branch(os.getenv("AGENT_CREW_MAIN_BRANCH") or "main"),
+             _normalize_branch(review_ctx.get("base_branch"))}
+    if repo_cwd:
+        try:
+            head = _git(repo_cwd, "symbolic-ref", "--quiet", "--short",
+                        "refs/remotes/origin/HEAD", timeout=10)
+            if head.returncode == 0:
+                names.add(_normalize_branch(head.stdout))
+        except Exception:
+            logger.debug("_default_branches: origin/HEAD lookup failed in %s", repo_cwd)
+    names.discard("")
+    return names
+
+
 def _record_risk_tier_shadow(queue: TaskQueue, task, actual_action: str) -> None:
     """Append a best-effort counterfactual receipt without changing work.
 
@@ -1135,6 +1171,24 @@ def auto_enqueue_fix(
             logger.warning(
                 f"auto_enqueue_fix: skipping cross-project fix — review "
                 f"project={review_project!r}, server project={server_project!r}"
+            )
+            return None
+
+        # #457: a findings-only review (red-team / audit) reports; it does not
+        # commission a fix. Checked before any gate with side effects so such a
+        # review neither spends a round nor announces budget exhaustion.
+        if review_ctx.get(FINDINGS_ONLY_KEY):
+            logger.info(
+                f"auto_enqueue_fix: {review_task_id} is findings_only — findings "
+                f"recorded, no automated fix (#457)"
+            )
+            return None
+        # #457: a fix commits to the reviewed branch. On the default branch that
+        # would be an unreviewed direct push, so never automate it.
+        if _normalize_branch(review_task.branch) in _default_branches(review_ctx, repo_cwd):
+            logger.warning(
+                f"auto_enqueue_fix: {review_task_id} reviewed default branch "
+                f"{review_task.branch!r} — not creating an automated fix (#457)"
             )
             return None
 
