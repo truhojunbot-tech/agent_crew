@@ -101,7 +101,6 @@ def test_retry_child_drops_parent_result_refs_and_empty_result_stays_empty(tmp_p
                            if getattr(route, "path", "") == "/tasks/{task_id}/result")
             return handler("impl-parent", TaskResult(
                 task_id="impl-parent", status="failed", summary="ordinary failure",
-                error_info={"reason": "infrastructure_failure"},
             ))
 
     asyncio.run(submit_failed_parent())

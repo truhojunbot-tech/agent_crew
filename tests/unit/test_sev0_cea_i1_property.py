@@ -441,7 +441,6 @@ def _drive_r3(kind, db, live, monkeypatch):
                                        role="implementer")
             c.post("/tasks/impl-r/result", json={
                 "task_id": "impl-r", "status": "failed", "summary": "tests failed",
-                "error_info": {"reason": "infrastructure_failure"},
                 "executor_binding": {"nonce": nonce, "presenter": "claude"}})
     elif kind == "stale_review_http":
         from agent_crew import server as server_mod

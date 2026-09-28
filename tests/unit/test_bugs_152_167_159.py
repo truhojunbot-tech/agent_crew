@@ -61,17 +61,23 @@ class _RecordingPush:
 
 
 @pytest.mark.parametrize(
-    ("task_type", "error_info", "expected_retry"),
+    ("task_type", "error_info", "retry_flag", "expected_retry"),
     [
-        ("implement", None, False),
-        ("implement", {"reason": "infrastructure_failure"}, True),
-        ("review", None, True),
-        ("test", None, True),
+        ("implement", None, None, True),
+        ("implement", None, "1", True),
+        ("implement", None, "0", False),
+        ("implement", {"reason": "infrastructure_failure"}, "0", True),
+        ("review", None, "0", True),
+        ("test", None, "0", True),
     ],
 )
 def test_auto_retry_skips_agent_reported_implement_failure(
-    tmp_db, task_type, error_info, expected_retry,
+    tmp_db, monkeypatch, task_type, error_info, retry_flag, expected_retry,
 ):
+    if retry_flag is None:
+        monkeypatch.delenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", retry_flag)
     app = create_app(
         db_path=tmp_db, pane_map={"implementer": "%100"}, port=8100,
         push_fn=_RecordingPush(), watchdog_disabled=True, fallback_disabled=True,
@@ -349,8 +355,7 @@ class TestDispatchOnResult:
             # _try_push_next fires → retry-A gets dispatched (has lower priority).
             # OR B gets dispatched first if B has higher priority.
             # Either way, a push fires.
-            _post_result(client, "A", status="failed", summary="generic failure",
-                         error_info={"reason": "infrastructure_failure"})
+            _post_result(client, "A", status="failed", summary="generic failure")
 
         # Either B or retry-A pushed — at minimum one additional push.
         assert len(push.calls) >= 2, "A push must fire after failed result + pending tasks"
@@ -485,8 +490,7 @@ class TestFallbackCancellation:
             # Enqueue a task that has already been retried twice (at max).
             _post_task(client, "A", ctx={"retry_attempt": 2})
             # Agent submits failure with retry_count=0 (agents never fill this).
-            _post_result(client, "A", status="failed", summary="generic failure",
-                         error_info={"reason": "infrastructure_failure"})
+            _post_result(client, "A", status="failed", summary="generic failure")
 
         q = TaskQueue(tmp_db)
         # The retry task must NOT have been created — check pending + in_progress.

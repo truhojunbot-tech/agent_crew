@@ -29,8 +29,7 @@ def _task_payload(task_id="t1", task_type="implement", description="do work"):
     }
 
 
-def _result(task_id, status="failed", summary="rate limit reached", findings=None,
-            error_info=None):
+def _result(task_id, status="failed", summary="rate limit reached", findings=None):
     return {
         "task_id": task_id,
         "status": status,
@@ -38,7 +37,6 @@ def _result(task_id, status="failed", summary="rate limit reached", findings=Non
         "verdict": None,
         "findings": findings or [],
         "pr_number": None,
-        "error_info": error_info,
     }
 
 
@@ -82,11 +80,7 @@ def test_successor_cea_blocks_belong_to_own_receipt(tmp_db, summary, successor_p
         })
 
         response = client.post("/tasks/receipt-parent/result",
-                               json=_result(
-                                   "receipt-parent", summary=summary,
-                                   error_info={"reason": "infrastructure_failure"}
-                                   if summary == "worker failed" else None,
-                               ))
+                               json=_result("receipt-parent", summary=summary))
         assert response.status_code == 200
 
     tasks = queue.list_tasks()
@@ -216,7 +210,6 @@ def test_u_fb04_non_rate_limit_failure_skips_fallback(tmp_db):
                 "impl-4",
                 summary="syntax error in foo.py",
                 findings=["unexpected indent"],
-                error_info={"reason": "infrastructure_failure"},
             ),
         )
 
@@ -242,10 +235,7 @@ def test_u_fb05_disabled_via_env(tmp_db, monkeypatch):
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-5"))
-        client.post(
-            "/tasks/impl-5/result",
-            json=_result("impl-5", summary="rate limit", error_info={"reason": "infrastructure_failure"}),
-        )
+        client.post("/tasks/impl-5/result", json=_result("impl-5", summary="rate limit"))
 
     # No fallback path was taken; the existing retry path was used instead.
     fallback_tasks = [
