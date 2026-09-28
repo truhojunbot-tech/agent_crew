@@ -216,6 +216,7 @@ def test_u_fb04_non_rate_limit_failure_skips_fallback(tmp_db):
                 "impl-4",
                 summary="syntax error in foo.py",
                 findings=["unexpected indent"],
+                error_info={"reason": "infrastructure_failure"},
             ),
         )
 
@@ -241,7 +242,10 @@ def test_u_fb05_disabled_via_env(tmp_db, monkeypatch):
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-5"))
-        client.post("/tasks/impl-5/result", json=_result("impl-5", summary="rate limit"))
+        client.post(
+            "/tasks/impl-5/result",
+            json=_result("impl-5", summary="rate limit", error_info={"reason": "infrastructure_failure"}),
+        )
 
     # No fallback path was taken; the existing retry path was used instead.
     fallback_tasks = [
