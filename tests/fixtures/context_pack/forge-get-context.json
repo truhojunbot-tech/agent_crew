@@ -1,0 +1,30 @@
+{
+  "context_items": [
+    {
+      "chunk_id": "crew-adr-17",
+      "content": "Decision about dispatch context",
+      "source_file": "docs/adr/0017-context.md",
+      "score": 0.82,
+      "raw_score": 0.79,
+      "source_reliability": 0.9,
+      "reliability_label": "high",
+      "match_type": "hybrid",
+      "tags": ["adr", "dispatch"],
+      "metadata": {"revision": "abc123"}
+    },
+    {
+      "chunk_id": "crew-spec-9",
+      "content": "A contextual specification",
+      "source_file": "docs/context-spec.md",
+      "score": 0.5,
+      "raw_score": 0.4,
+      "source_reliability": 0.5,
+      "reliability_label": "community",
+      "match_type": "vector",
+      "tags": ["spec"],
+      "metadata": {}
+    }
+  ],
+  "retrieval_trace": {"domain": "crew"},
+  "context_quality": {"coverage": 0.8}
+}
