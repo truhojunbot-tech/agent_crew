@@ -119,6 +119,8 @@ class DecisionRev:
     (absent or ``*``). Two projects may reuse one ``decision_id``, so a lookup by id
     alone can resolve another project's record (#463 item 4). Snapshot-only, like
     ``supersedes``."""
+    expires_at: Optional[float] = None
+    """Parsed expiry of this signed record, retained for ambiguity checks (#494)."""
 
 
 @dataclass(frozen=True)
