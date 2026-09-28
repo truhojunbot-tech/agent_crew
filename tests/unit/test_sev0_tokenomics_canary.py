@@ -83,6 +83,66 @@ def test_applied_for_the_pinned_task_when_the_condition_holds(monkeypatch):
     assert decision.standing_review_task_id == "review-impl-1-r0"
 
 
+def test_project_pin_applies_only_to_the_serving_project(monkeypatch):
+    monkeypatch.setenv(canary.CANARY_ENV, "project:alfred")
+    task = _review("review-impl-1-r1", parent="impl-1", sha=SHA_A)
+    for project, applied, reason in (
+        ("alfred", True, "standing_request_changes_on_identical_sha"),
+        ("agent_crew", False, "condition_holds_not_the_pinned_task"),
+        (None, False, "condition_holds_not_the_pinned_task"),
+    ):
+        decision = canary.evaluate_review_dispatch(
+            task, reviewed_sha=SHA_A,
+            standing_lookup=_standing("request_changes"), project=project)
+        assert decision.applied is applied
+        assert decision.reason == reason
+        assert decision.pinned_task_id == "project:alfred"
+
+
+@pytest.mark.parametrize("pin, expected", [
+    ("project:Alfred_2-x", "Alfred_2-x"),
+    ("project:alfred\n", None),
+    ("project:", None),
+    ("project:1alfred", None),
+])
+def test_project_pin_parser_requires_exact_syntax(pin, expected):
+    assert canary.pin_project(pin) == expected
+
+
+@pytest.mark.parametrize("pin", ["project:", "project:1alfred", "project:alfred/other", "project:alfred!"])
+def test_malformed_project_pin_never_applies(monkeypatch, pin):
+    monkeypatch.setenv(canary.CANARY_ENV, pin)
+    decision = canary.evaluate_review_dispatch(
+        _review("review-impl-1-r1", parent="impl-1", sha=SHA_A),
+        reviewed_sha=SHA_A, standing_lookup=_standing("request_changes"),
+        project="alfred")
+    assert decision.applied is False
+    assert decision.reason == "condition_holds_not_the_pinned_task"
+
+
+def test_task_id_pin_still_matches_parent_regardless_of_project(monkeypatch):
+    monkeypatch.setenv(canary.CANARY_ENV, "impl-1")
+    decision = canary.evaluate_review_dispatch(
+        _review("review-impl-1-r1", parent="impl-1", sha=SHA_A),
+        reviewed_sha=SHA_A, standing_lookup=_standing("request_changes"),
+        project="unrelated")
+    assert decision.applied is True
+
+
+def test_project_pin_never_enables_round_cap_and_unset_rolls_back(monkeypatch):
+    monkeypatch.setenv(canary.CANARY_ENV, "project:alfred")
+    monkeypatch.setenv(canary.ROUNDS_CAP_ENV, "1")
+    assert canary.rounds_cap_enabled() is False
+    monkeypatch.delenv(canary.CANARY_ENV)
+    assert canary.rounds_cap_enabled() is False
+    decision = canary.evaluate_review_dispatch(
+        _review("review-impl-1-r1", parent="impl-1", sha=SHA_A),
+        reviewed_sha=SHA_A, standing_lookup=_standing("request_changes"),
+        project="alfred")
+    assert decision.applied is False
+    assert decision.reason == "condition_holds_canary_unarmed"
+
+
 def test_the_review_tasks_own_id_does_not_expand_the_owner_pinned_lineage(monkeypatch):
     """§11 arms the parent implement task, never a review task id."""
     monkeypatch.setenv(canary.CANARY_ENV, "review-impl-1-r1")

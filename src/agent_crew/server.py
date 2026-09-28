@@ -3417,6 +3417,7 @@ def create_app(
             decision = _canary.evaluate_review_dispatch(
                 task, reviewed_sha=reviewed_sha or "",
                 standing_lookup=q().standing_request_changes_review,
+                project=_server_identity()["project"],
             )
         except Exception:
             logger.exception(

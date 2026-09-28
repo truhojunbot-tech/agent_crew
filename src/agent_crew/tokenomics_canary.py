@@ -15,10 +15,8 @@ produced an ``approve``; the measured effect is >= 64,223,256 cache-read and
   behaviour immediately, with no restart and no state to unwind. That is the
   entire rollback plan — one stateless dispatch-time boolean.
 
-⛔Scope is one task by construction. The pin names the IMPLEMENT (parent) task
-  id, so only reviews in that one lineage can ever be suppressed. Every other
-  task in the fleet stays shadow: it is evaluated, a receipt records what would
-  have happened, and the review dispatches exactly as before.
+⛔The pin names an IMPLEMENT task id or a ``project:<name>`` scope; other
+  dispatches stay shadow and receive the same measurement receipt.
 
 The separate round-cap switch below reuses the same lineage pin. Its cascade
 decision is reversible by unsetting that switch and restarting the server.
@@ -41,7 +39,8 @@ ROUNDS_CAP_ENV = "AGENT_CREW_TOKENOMICS_CANARY_ROUNDS_CAP"
 
 def rounds_cap_enabled(env: Optional[dict] = None) -> bool:
     source = os.environ if env is None else env
-    return source.get(ROUNDS_CAP_ENV) == "1" and bool(canary_pin(source))
+    pin = canary_pin(source)
+    return source.get(ROUNDS_CAP_ENV) == "1" and bool(pin) and not pin.startswith("project:")
 
 #: The one recommendation kind the matched evidence supports.
 RECOMMENDATION_KIND = "suppress_identical_sha_rereview"
@@ -64,6 +63,7 @@ REUSED_FROM_KEY = "canary_reused_from"
 #: abbreviation cannot be compared for identity, and identity is the whole
 #: condition here.
 _OBJECT_ID_RE = re.compile(r"\A[0-9a-fA-F]{40}(?:[0-9a-fA-F]{24})?\Z")
+_PROJECT_PIN_RE = re.compile(r"project:([A-Za-z][A-Za-z0-9_-]*)\Z")
 
 
 def reuse_findings(findings, standing_review_task_id: str) -> list:
@@ -91,7 +91,7 @@ def reuse_findings(findings, standing_review_task_id: str) -> list:
 
 
 def canary_pin(env: Optional[dict] = None) -> str:
-    """The armed task id, read fresh on every call.
+    """The armed task or project pin, read fresh on every call.
 
     ⛔Read per dispatch, never cached at import. A cached pin would mean
       arming and — far more importantly — DISARMING require a server restart,
@@ -99,6 +99,12 @@ def canary_pin(env: Optional[dict] = None) -> str:
     """
     source = os.environ if env is None else env
     return (source.get(CANARY_ENV) or "").strip()
+
+
+def pin_project(pin: str) -> Optional[str]:
+    """Return the project named by a valid project pin, if any."""
+    match = _PROJECT_PIN_RE.fullmatch(pin)
+    return match.group(1) if match else None
 
 
 @dataclass
@@ -171,13 +177,15 @@ def _target_of(task) -> tuple[str, Optional[int], str]:
     return ("", None, "")
 
 
-def _is_pinned(task, pin: str) -> bool:
+def _is_pinned(task, pin: str, project: Optional[str] = None) -> bool:
     """Does the pin name this review's lineage?
 
-    The pin is the IMPLEMENT task id (``context.prev_task_id``).  The owner
-    named that identity explicitly; accepting the review id would create a
-    second, undocumented armed surface.
+    A task-id pin names ``context.prev_task_id``; a project pin names the
+    serving project. A review task's own id is never a task-id pin target.
     """
+    if pin.startswith("project:"):
+        pinned_project = pin_project(pin)
+        return pinned_project is not None and project == pinned_project
     ctx = task.context if isinstance(getattr(task, "context", None), dict) else {}
     parent = (ctx.get("prev_task_id") or "").strip()
     return pin == parent and bool(pin)
@@ -189,6 +197,7 @@ def evaluate_review_dispatch(
     reviewed_sha: str,
     standing_lookup: Callable[..., Optional[dict]],
     pin: Optional[str] = None,
+    project: Optional[str] = None,
 ) -> CanaryDecision:
     """Decide whether THIS review dispatch is the one to suppress.
 
@@ -255,7 +264,7 @@ def evaluate_review_dispatch(
             applied=False, reason="condition_holds_canary_unarmed",
             standing_review_task_id=standing_id, counterfactual=counterfactual,
             extra=extra, **base)
-    if not _is_pinned(task, pin):
+    if not _is_pinned(task, pin, project):
         return CanaryDecision(
             applied=False, reason="condition_holds_not_the_pinned_task",
             standing_review_task_id=standing_id, counterfactual=counterfactual,
