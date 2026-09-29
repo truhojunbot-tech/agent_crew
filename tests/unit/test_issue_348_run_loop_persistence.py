@@ -149,10 +149,12 @@ class _LoopQueue:
         return next(self.results)
 
 
-def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main"):
+def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main", existing_tasks=None):
     import agent_crew.loop as loop
 
     queue = _LoopQueue(results)
+    if existing_tasks is not None:
+        queue.list_tasks = lambda: existing_tasks
     dispatched = []
 
     def enqueue_implement(queue, task, branch, context=None, port=0):
@@ -172,6 +174,44 @@ def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main"):
         "--branch", branch, "--no-tester", "--max-iter", str(max_iter),
     ])
     return invocation, dispatched
+
+
+def test_run_loop_stops_after_failed_implement_without_review(tmp_path, monkeypatch):
+    results = [TaskResult(task_id="impl-1", status="failed", summary="no artifact")]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "ended failed" in invocation.output
+    assert "server owns retry/fallback/cascade" in invocation.output
+
+
+def test_run_loop_adopts_persisted_server_review(tmp_path, monkeypatch):
+    review_id = "review-impl-1-r0"
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id=review_id, status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    existing = [TaskRequest(task_id=review_id, task_type="review", description="review",
+                            branch="main", context={"prev_task_id": "impl-1"})]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=existing)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert f"Reviewing... ({review_id})" in invocation.output
+
+
+def test_run_loop_enqueues_review_when_no_persisted_successor(tmp_path, monkeypatch):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=[])
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
 
 
 def test_run_loop_reviews_and_reimplements_on_reported_ref(tmp_path, monkeypatch):
