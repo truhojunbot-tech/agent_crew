@@ -2618,6 +2618,12 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         impl_start = time.time()
         impl_result = _wait(impl_id)
         impl_elapsed = int(time.time() - impl_start)
+        if impl_result.status != "completed":
+            click.echo(
+                f"[{iteration}/{max_iter}] Implement task {impl_id} ended {impl_result.status}; "
+                "server owns retry/fallback/cascade. Stopping loop."
+            )
+            return
         _loop_pr_number = _loop_pr_number or getattr(impl_result, "pr_number", None)
         reported_branch = getattr(impl_result, "branch", "") or ""
         if run_branch_context["crew_run_branch"] and reported_branch and reported_branch != branch:
@@ -2654,8 +2660,10 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         # from spinning the same loop with review tasks.
         _review_attempts = 0
         while True:
-            review_id = enqueue_review(queue, task, impl_branch or branch,
-                                       prev_task_id=impl_id, context=review_context, port=_run_port)
+            review_id = enqueue_review(
+                queue, task, impl_branch or branch,
+                prev_task_id=impl_id, context=review_context, port=_run_port,
+            )
             click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
             review_start = time.time()
             review_result = _wait(review_id)
