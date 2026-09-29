@@ -149,10 +149,11 @@ class _LoopQueue:
         return next(self.results)
 
 
-def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main", existing_tasks=None):
+def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main", existing_tasks=None,
+              queue_override=None, timeout=None, project=""):
     import agent_crew.loop as loop
 
-    queue = _LoopQueue(results)
+    queue = queue_override or _LoopQueue(results)
     if existing_tasks is not None:
         queue.list_tasks = lambda: existing_tasks
     dispatched = []
@@ -174,10 +175,15 @@ def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main", existin
     monkeypatch.setattr(loop, "enqueue_implement", enqueue_implement)
     monkeypatch.setattr(loop, "enqueue_review", enqueue_review)
     runner = CliRunner()
-    invocation = runner.invoke(crew, [
+    args = [
         "run", "implement persistence", "--db", str(tmp_path / "tasks.db"),
         "--branch", branch, "--no-tester", "--max-iter", str(max_iter),
-    ])
+    ]
+    if timeout is not None:
+        args += ["--timeout", str(timeout)]
+    if project:
+        args += ["--project", project]
+    invocation = runner.invoke(crew, args)
     return invocation, dispatched
 
 
@@ -189,6 +195,88 @@ def test_run_loop_stops_after_failed_implement_without_review(tmp_path, monkeypa
     assert [kind for kind, *_ in dispatched] == ["implement"]
     assert "ended failed" in invocation.output
     assert "server owns retry/fallback/cascade" in invocation.output
+
+
+class _WaitClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class _WaitQueue:
+    def __init__(self, clock, finish_at=None, status="in_progress"):
+        self.clock = clock
+        self.finish_at = finish_at
+        self.status = status
+
+    def get_result(self, task_id):
+        if task_id == "impl-1" and self.finish_at is not None and self.clock.now >= self.finish_at:
+            return TaskResult(task_id="impl-1", status="completed", summary="done")
+        if task_id == "review-1":
+            return TaskResult(task_id="review-1", status="completed", summary="approved",
+                              verdict="approve", findings=[])
+        return None
+
+    def get_task_status(self, task_id):
+        return self.status
+
+
+def test_run_waits_for_server_running_without_pane_after_wrapper_deadline(tmp_path, monkeypatch):
+    import time
+    import urllib.request
+
+    clock = _WaitClock()
+    queue = _WaitQueue(clock, finish_at=5.0)
+    monkeypatch.setattr(time, "time", clock.time)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr("agent_crew.cli._read_state", lambda *args: {
+        "port": 18001, "pane_ids": [], "worktrees": {}})
+    monkeypatch.setattr("agent_crew.cli._port_listening", lambda *args, **kwargs: True)
+    monkeypatch.setattr("agent_crew.cli._verify_delivery", lambda *args, **kwargs: True)
+    posts = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: posts.append(args))
+
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, [], queue_override=queue,
+                                       timeout=1, project="sandbox")
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert "server still running" in invocation.output
+    assert not [args for args in posts if getattr(args[0], "full_url", "").endswith(
+        "/tasks/impl-1/result")]
+
+
+def test_run_pending_at_wrapper_deadline_still_exits(tmp_path, monkeypatch):
+    import time
+
+    clock = _WaitClock()
+    monkeypatch.setattr(time, "time", clock.time)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, [], queue_override=_WaitQueue(clock, status="pending"), timeout=1)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "Task queued" in invocation.output
+
+
+def test_run_nonrunning_without_result_keeps_wrapper_failure(tmp_path, monkeypatch):
+    import time
+
+    clock = _WaitClock()
+    monkeypatch.setattr(time, "time", clock.time)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, [], queue_override=_WaitQueue(clock, status="failed"), timeout=1)
+
+    assert invocation.exit_code != 0
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "auto-failed for queue cleanup" in invocation.output
 
 
 def test_run_loop_adopts_persisted_server_review(tmp_path, monkeypatch):

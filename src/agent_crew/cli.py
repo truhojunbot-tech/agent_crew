@@ -2417,6 +2417,38 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             )
             raise click.exceptions.Exit(0)
 
+        # The dispatcher owns a running task and enforces its own hard and
+        # output-idle limits. A pane-less provider has no tmux activity for
+        # this wrapper to inspect, so its deadline cannot decide failure.
+        if task_status_now == "in_progress":
+            click.echo(
+                f"  Wrapper deadline reached for {task_id!r}; server still running. "
+                "Waiting for its result or terminal status."
+            )
+            last_progress_print = time.time()
+            while True:
+                result = queue.get_result(task_id)
+                if result is not None:
+                    return result
+                task_status_now = queue.get_task_status(task_id)
+                if task_status_now != "in_progress":
+                    # A timeout or cancellation may have no TaskResult row.
+                    result = queue.get_result(task_id)
+                    if result is not None:
+                        return result
+                    raise click.ClickException(
+                        f"task {task_id!r} ended {task_status_now or 'unknown'} "
+                        "without a result; server owns the terminal state."
+                    )
+                now = time.time()
+                if now - last_progress_print >= 60:
+                    click.echo(
+                        f"  Waiting for server-owned task {task_id!r} "
+                        f"({int(now - start_time)}s elapsed; still in_progress)."
+                    )
+                    last_progress_print = now
+                time.sleep(2)
+
         # Wrapper deadline hit before the agent posted a result. Don't blanket-
         # auto-fail (#92): if the pane shows the agent is still actively working,
         # extend the deadline rather than killing legitimate long tasks. Cap the
