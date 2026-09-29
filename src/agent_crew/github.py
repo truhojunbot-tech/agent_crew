@@ -371,6 +371,72 @@ def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
         return True
 
 
+def pr_number_for_branch(branch: str, repo: Optional[str] = None,
+                          timeout: float = 15.0) -> Optional[int]:
+    """Like `branch_has_pr`, but returns the PR number instead of a bool.
+
+    #496: a `claude_cloud` dispatch has no local callback to this
+    dispatcher, so a PR is discovered the same way `branch_has_pr` already
+    does — by branch name — and the number is what the review cascade
+    (`pipeline.auto_enqueue_review`) actually needs. Unlike `branch_has_pr`,
+    this fails CLOSED (returns ``None``) on any error: "unknown" must never
+    be read as "PR exists", the way it can be for a skip-a-futile-retry
+    decision.
+    """
+    if not branch or not check_gh_installed():
+        return None
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return None
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--head", branch,
+             "--state", "all", "--json", "number", "--limit", "1"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        rows = json.loads(result.stdout or "[]")
+        if not rows:
+            return None
+        number = rows[0].get("number")
+        return int(number) if isinstance(number, int) else None
+    except Exception:
+        return None
+
+
+def branch_head_commit_message(branch: str, repo: Optional[str] = None,
+                                timeout: float = 15.0) -> Optional[str]:
+    """The HEAD commit message on a remote branch, via `gh api` (no local
+    fetch needed).
+
+    #496: a cloud session's terminal outcome (ALREADY_FIXED, BLOCKED_FOR_CLOUD,
+    NEEDS_DECISION, FAILED) does not require a PR, so PR discovery alone
+    cannot observe it. This reads the same signal the issue's own contract
+    asks a cloud session to leave behind (a final outcome line), from a
+    branch that may exist with no open PR. Returns ``None`` — never a
+    guess — on any error, missing branch, or missing `gh` installation.
+    """
+    if not branch or not check_gh_installed():
+        return None
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return None
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{branch}", "--jq", ".commit.message"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        message = (result.stdout or "").strip()
+        return message or None
+    except Exception:
+        return None
+
+
 def get_pr_url(repo: Optional[str], pr_number: str) -> str:
     """Format a PR URL from repo and PR number."""
     if not repo:
