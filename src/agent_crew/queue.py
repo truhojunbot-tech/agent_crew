@@ -5203,6 +5203,20 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def get_dispatched_at(self, task_id: str) -> float:
+        """#499 r0 HIGH: when ``record_dispatch`` last stamped this task, or
+        ``0.0`` if it was never dispatched (or does not exist). Used to age
+        out a ``claude_cloud`` dispatch that GitHub can never confirm (no PR,
+        no branch) instead of leaving it in_progress forever."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT dispatched_at FROM tasks WHERE task_id = ?", (task_id,),
+            ).fetchone()
+            return float(row["dispatched_at"] or 0.0) if row else 0.0
+        finally:
+            conn.close()
+
     def count_in_progress_by_dispatch_channel(self, channel: str) -> int:
         """#496: how many in_progress tasks were handed out over ``channel``
         (the same vocabulary as ``record_dispatch`` — ``tmux_pane``,

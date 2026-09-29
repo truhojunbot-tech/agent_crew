@@ -4006,6 +4006,18 @@ def create_app(
         - ``timed_out`` — task_ids that we auto-failed
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        # #499 r0 HIGH: claude_cloud dispatches have no pane and are
+        # otherwise invisible to this pane-oriented watchdog (every check
+        # below resolves a pane per row and skips rows with none) — without
+        # this, a cloud dispatch never completes and permanently occupies a
+        # concurrency slot. Reconciled here, on the SAME periodic trigger
+        # this watchdog already runs on, rather than a new scheduler.
+        # Independent of pane_map so a cloud-only deployment (no tmux panes
+        # configured at all) still reconciles.
+        try:
+            _claude_cloud.reconcile_all_cloud_tasks(q())
+        except Exception:
+            logger.exception("watchdog: claude_cloud reconciliation failed")
         if not pane_map:
             return actions
 

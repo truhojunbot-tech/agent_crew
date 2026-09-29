@@ -41,23 +41,39 @@ surface instead of a local tmux pane. Opt-in, default OFF
   commit message) — `reconcile_cloud_dispatch` / `reconcile_all_cloud_tasks`.
   A true `ALREADY_FIXED` that touches nothing and pushes no branch is **not
   observable** this way; this is an acknowledged gap in the parent system,
-  not something this PR invents a workaround for.
-- **Wiring reconciliation into a periodic trigger is left to the
-  operator/coordinator.** `reconcile_all_cloud_tasks` contains no polling
-  loop of its own — it is meant to be called from whatever already exists
-  (cron, `crew triage --watch`, a future `crew` subcommand). Adding that
-  wiring here would be a new scheduler, which is out of scope.
-- **The exact CLI resume syntax for same-session fix continuation**
-  (`claude --cloud <session_id> "<prompt>"`) is inferred from the single
-  observed launch, not confirmed by the coordinator. `dispatch_cloud_for_role`
-  gates every launch (fresh or resume) through the same fail-closed output
-  parser and routes any resume that doesn't parse through the existing
-  fallback — it never silently claims a resume worked.
-- **Watchdog reaping of a stalled cloud dispatch** — `server._watchdog_tick`
-  resolves a pane per in-progress task (`_resolve_pane_for_row`); a
-  `claude_cloud` dispatch has no pane, so it is not currently reaped by the
-  existing idle-timeout watchdog. Out of scope here; flagged for a follow-up
-  decision rather than bolted on speculatively.
+  not something this PR invents a workaround for. Past
+  `AGENT_CREW_CLOUD_STALE_SECONDS` (default 4h) with neither signal, the
+  dispatch is resolved to `needs_human` anyway (PR #499 r0 HIGH fix) — the
+  outcome stays genuinely unknown, but the concurrency slot is freed and a
+  human gets an actionable row instead of a silent permanent hang.
+
+**Fixed during PR #499 r0 independent review (4 HIGH, all reproduced and
+fixed on the same branch — see `tests/unit/test_pr499_r0_claude_cloud_review.py`):**
+
+- `reconcile_all_cloud_tasks` is now called from `server._watchdog_tick` —
+  the SAME periodic `asyncio` loop this server already runs
+  (`_watchdog_loop`), independent of `pane_map` so a cloud-only deployment
+  with no tmux panes configured still reconciles. Before this fix, a
+  dispatched `claude_cloud` task had no production caller at all: it never
+  completed, never entered review, and permanently occupied a concurrency
+  slot.
+- Production dispatch (`dispatch_cloud_for_role`) now resolves the repo via
+  `_resolve_task_repo` — the task's own `context["repo"]` (the same key
+  `pipeline.auto_enqueue_review`/`_auto_enqueue_fix` already read) falling
+  back to `github.get_repo()` — before building the prompt. Before this fix
+  the production call site never passed a repo, so `build_cloud_task_prompt`
+  silently omitted the `Repository:` line even though a cloud session does
+  not inherit the dispatcher's cwd.
+- `reconcile_cloud_dispatch`'s PR_READY path now calls
+  `pipeline.auto_enqueue_review` **before** `queue.submit_result` and, if it
+  does not confirm a review (exception or a legitimate skip — both come back
+  as `None`), leaves the task `in_progress` for the next reconciliation pass
+  to retry, rather than marking it `completed` first. `auto_enqueue_review`
+  mints a deterministic review task id, so a retry is a safe no-op once the
+  review already exists. Before this fix, an enqueue exception was logged
+  and swallowed AFTER the task was already marked completed — the task would
+  never be retried because a completed task no longer appears in
+  `list_in_progress_by_dispatch_channel`.
 
 ## What this PR does NOT do
 
@@ -76,6 +92,7 @@ site every other backend already goes through.
 | `AGENT_CREW_CLOUD_ENABLED` | off | Opt-in kill switch. |
 | `AGENT_CREW_CLOUD_MAX_CONCURRENCY` | `3` | Max concurrent `claude_cloud` in-progress dispatches. |
 | `AGENT_CREW_CLOUD_CLI_PATH` | `claude` | Override the CLI binary path. |
+| `AGENT_CREW_CLOUD_STALE_SECONDS` | `14400` (4h) | How long a no-PR/no-commit-signal dispatch may sit `in_progress` before reconciliation resolves it to `needs_human` (PR #499 r0 HIGH fix). |
 
 An operator additionally opts a specific role in via
 `role_agents.<role> = "claude_cloud"` (role_mapping.py) — by default no role

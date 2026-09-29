@@ -96,6 +96,33 @@ def cloud_cli_path() -> str:
     return (os.getenv(_ENV_CLI_PATH) or "claude").strip() or "claude"
 
 
+_ENV_STALE_SECONDS = "AGENT_CREW_CLOUD_STALE_SECONDS"
+#: #499 r0 HIGH: a no-PR terminal outcome (ALREADY_FIXED/BLOCKED_FOR_CLOUD/
+#: NEEDS_DECISION/FAILED with nothing pushed) cannot be observed via GitHub
+#: at all — this is the backstop that keeps it from occupying a concurrency
+#: slot forever. 4 hours comfortably exceeds every observed dispatch in the
+#: issue's own cohort ledger (#487-#491, all resolved within ~1-2 hours).
+DEFAULT_STALE_SECONDS = 4 * 3600
+
+
+def cloud_stale_seconds() -> float:
+    """Read at call time — same idiom as ``cloud_max_concurrency``."""
+    raw = (os.getenv(_ENV_STALE_SECONDS) or "").strip()
+    if not raw:
+        return DEFAULT_STALE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("claude_cloud: invalid %s=%r, using default %s",
+                        _ENV_STALE_SECONDS, raw, DEFAULT_STALE_SECONDS)
+        return DEFAULT_STALE_SECONDS
+    if value <= 0:
+        logger.warning("claude_cloud: %s=%s must be positive, using default %s",
+                        _ENV_STALE_SECONDS, value, DEFAULT_STALE_SECONDS)
+        return DEFAULT_STALE_SECONDS
+    return value
+
+
 # ---------------------------------------------------------------------------
 # CLI capability probe (acceptance test 1) — fail closed on anything else.
 # ---------------------------------------------------------------------------
@@ -303,6 +330,31 @@ def _resolve_resume_session_id(queue: TaskQueue, task: TaskRequest) -> Optional[
     return session_id or None
 
 
+def _resolve_task_repo(task: TaskRequest, explicit_repo: Optional[str]) -> str:
+    """#499 r0 HIGH: a cloud session does not inherit the dispatcher's cwd,
+    so ``build_cloud_task_prompt`` must be told the repo explicitly — a bare
+    ``repo=""`` silently produced a prompt with no repository at all.
+
+    Precedence: an explicitly passed ``repo`` (caller override) > the task's
+    OWN ``context["repo"]`` (the registered repo it was created against —
+    the same key ``pipeline.auto_enqueue_review``/``_auto_enqueue_fix``
+    already read) > ``github.get_repo()`` (the dispatcher process's own
+    checkout — correct for a single-project deployment, which is what every
+    existing call to ``get_repo()`` in this codebase already assumes).
+    """
+    if explicit_repo:
+        return explicit_repo
+    ctx = task.context if isinstance(task.context, dict) else {}
+    ctx_repo = ctx.get("repo")
+    if isinstance(ctx_repo, str) and ctx_repo.strip():
+        return ctx_repo.strip()
+    try:
+        return _github.get_repo() or ""
+    except Exception:
+        logger.exception("claude_cloud: get_repo() failed while resolving prompt repo")
+        return ""
+
+
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                           reason: str) -> CloudDispatchOutcome:
     """Fail closed without losing the task (acceptance test 3): force_fail
@@ -362,7 +414,8 @@ def dispatch_cloud_for_role(
         return CloudDispatchOutcome(False, task_id=task.task_id, skipped_reason="admission_refused")
 
     resume_session_id = _resolve_resume_session_id(queue, task)
-    prompt = build_cloud_task_prompt(task, repo=repo or "")
+    effective_repo = _resolve_task_repo(task, repo)
+    prompt = build_cloud_task_prompt(task, repo=effective_repo)
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(prompt, cli_path=cli_path))
 
@@ -462,17 +515,34 @@ def reconcile_cloud_dispatch(
     detection." This is that detection, built entirely from existing/added
     github.py reads:
 
-    1. A PR for the task's branch → acceptance test 5: submit the SAME
-       ``TaskResult`` shape a local provider would, then call the SAME
-       ``pipeline.auto_enqueue_review`` — the existing review pipeline picks
-       it up completely unchanged.
+    1. A PR for the task's branch → acceptance test 5: create the SAME
+       review task ``pipeline.auto_enqueue_review`` would for a local
+       provider's completed result BEFORE marking this task completed
+       (#499 r0 HIGH — see the note below), so the existing review pipeline
+       picks it up completely unchanged.
     2. No PR, but the branch's HEAD commit carries one of the other four
        terminal tokens → recorded via the SAME ``submit_result``, with NO PR
        required (acceptance test 4), and a failed outcome still goes through
        the SAME ``auto_fallback_failed_task`` a local failure would.
-    3. Neither → ``still_dispatched``; a session with no pushed branch at all
-       (e.g. a true ALREADY_FIXED that touched nothing) is not observable
-       this way — see the module docstring's documented gap.
+    3. Neither, and the dispatch is still within its staleness budget →
+       ``still_dispatched``. Past the budget (``cloud_stale_seconds``), the
+       task is resolved to ``needs_human`` anyway (#499 r0 HIGH) — a session
+       with no pushed branch at all (e.g. a true ALREADY_FIXED that touched
+       nothing) is genuinely unobservable via GitHub, and leaving it
+       in_progress forever would both hide the outcome and permanently
+       occupy a concurrency slot.
+
+    #499 r0 HIGH: ``auto_enqueue_review`` is called BEFORE ``submit_result``
+    here, not after. It reads the task's CURRENT row (branch/context) plus
+    the ``result`` argument directly — it does not require the task to
+    already be marked completed — so calling it first costs nothing. Calling
+    it after would let an enqueue failure (it swallows its own exceptions and
+    returns ``None`` for "cross-project guard, missing impl task, exception"
+    alike) mark the task ``completed`` with NO review ever created and NO
+    way to retry, since a completed task no longer appears in
+    ``list_in_progress_by_dispatch_channel``. ``auto_enqueue_review`` mints a
+    deterministic review task id, so retrying it on the next pass is a safe
+    no-op once the review already exists.
     """
     pr_number_for_branch_fn = pr_number_for_branch_fn or _github.pr_number_for_branch
     pr_head_sha_fn = pr_head_sha_fn or _github.pr_head_sha
@@ -491,17 +561,39 @@ def reconcile_cloud_dispatch(
             summary=f"claude_cloud: PR #{pr_number} discovered for branch {branch}",
             pr_number=pr_number, branch=branch, commit=head_sha,
         )
-        queue.submit_result(task.task_id, result)
         try:
             from agent_crew.pipeline import auto_enqueue_review
-            auto_enqueue_review(queue, task.task_id, pr_number, pr_state_fn=pr_state_fn)
+            review_id = auto_enqueue_review(queue, task.task_id, pr_number,
+                                            pr_state_fn=pr_state_fn, result=result)
         except Exception:
-            logger.exception("claude_cloud: auto_enqueue_review failed for %s", task.task_id)
+            logger.exception("claude_cloud: auto_enqueue_review raised for %s", task.task_id)
+            review_id = None
+        if review_id is None:
+            logger.warning(
+                "claude_cloud: auto_enqueue_review did not confirm a review for %s "
+                "(pr=%s) — leaving in_progress to retry on the next pass",
+                task.task_id, pr_number)
+            return CloudReconciliationOutcome(
+                task.task_id, "still_dispatched", pr_number=pr_number,
+                detail="review not yet confirmed for discovered PR; will retry")
+        queue.submit_result(task.task_id, result)
         return CloudReconciliationOutcome(task.task_id, "pr_ready", pr_number=pr_number)
 
     message = commit_message_fn(branch, repo=repo)
     outcome = parse_terminal_outcome(message) if message else None
     if outcome is None:
+        age = time.time() - queue.get_dispatched_at(task.task_id)
+        if age > cloud_stale_seconds():
+            stale_result = TaskResult(
+                task_id=task.task_id, status="needs_human",
+                summary=(f"claude_cloud: no PR and no recognized outcome for branch "
+                        f"{branch} after {int(age)}s (budget {int(cloud_stale_seconds())}s) — "
+                        f"unobservable via GitHub, needs manual investigation")[:4000],
+                branch=branch,
+            )
+            queue.submit_result(task.task_id, stale_result)
+            return CloudReconciliationOutcome(task.task_id, "needs_decision",
+                                              detail="stale: no observable outcome")
         return CloudReconciliationOutcome(task.task_id, "still_dispatched",
                                           detail=f"no PR yet for branch {branch}")
 
