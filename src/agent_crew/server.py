@@ -6526,9 +6526,10 @@ def create_app(
 
     @app.post("/tasks/{task_id}/result", status_code=200)
     def submit_result(task_id: str, result: TaskResult):
-        """Accept active results; system-ended rows return HTTP 409 with
-        ``late_result=true`` and ``accepted=false``. The queue stores their
-        submitted summary, verdict and commit only in ``task_exec_events``.
+        """Accept active results; keep rejected late payloads as exec events.
+
+        System-ended rows return HTTP 409. A late original whose fallback
+        owns the lineage returns an acknowledged, ignored result instead.
         """
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
         # Capture context before marking done — we need the agent name for
@@ -6597,6 +6598,30 @@ def create_app(
         # Queue admission now refuses a timeout, cancel or dispatcher failure
         # under the write lock, so those statuses never reach revision logging.
         _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
+        _adopted_fallback_id = None
+        if (_task is not None and _task.task_type == "implement"
+                and _prior in ("failed", "timed_out") and result.status == "completed"):
+            _fallbacks = [
+                t for t in q().list_tasks()
+                if t.task_id.startswith("fallback-")
+                and isinstance(t.context, dict)
+                and t.context.get("original_task_id") == task_id
+            ]
+            # Only an unfinished, unique fallback may be withdrawn. The queue
+            # checks the same lineage under its result write lock; if this
+            # snapshot is stale, the fallback still wins and the late result
+            # is retained as evidence only.
+            if len(_fallbacks) == 1 and _fallbacks[0].status in ("pending", "in_progress"):
+                _fallback_id = _fallbacks[0].task_id
+                try:
+                    _cancelled = cancel_task(_fallback_id)
+                    if isinstance(_cancelled, dict) and _cancelled.get("status") == "cancelled":
+                        _adopted_fallback_id = _fallback_id
+                        logger.info("POST /tasks/%s/result: adopted late original; "
+                                    "cancelled fallback %s", task_id, _fallback_id)
+                except Exception:
+                    logger.exception("POST /tasks/%s/result: fallback cancellation failed",
+                                     task_id)
         # §2.2 / P2 RESULT. Popped, not read: the nonce is a spent credential
         # and must not reach `result_json`. `presenter` defaults to the task's
         # dispatch agent only when the worker did not name itself — an asserted
@@ -6606,7 +6631,8 @@ def create_app(
             task_type = q().submit_result(task_id, result, nonce=_nonce,
                                           presenter=_presenter,
                                           allow_review_replay=_REPLAYING.get(),
-                                          validate_review=not _REPLAYING.get())
+                                          validate_review=not _REPLAYING.get(),
+                                          adopted_fallback_task_id=_adopted_fallback_id)
             capture_result_best_effort(db_path, task_id, result)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
@@ -6661,6 +6687,9 @@ def create_app(
             # late_result evidence event. No attribution or cascade may follow.
             from fastapi.responses import JSONResponse
             logger.warning("POST /tasks/%s/result: %s", task_id, exc)
+            if exc.fallback_task_id:
+                return {"status": "ignored_late_result",
+                        "fallback_task_id": exc.fallback_task_id}
             return JSONResponse(status_code=409, content={
                 "late_result": True, "accepted": False,
                 "task_id": task_id, "prior_status": exc.status,
