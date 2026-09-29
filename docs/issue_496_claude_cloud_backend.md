@@ -75,6 +75,19 @@ fixed on the same branch — see `tests/unit/test_pr499_r0_claude_cloud_review.p
   never be retried because a completed task no longer appears in
   `list_in_progress_by_dispatch_channel`.
 
+**Fixed during PR #499 r1 independent review (1 HIGH, reproduced and fixed
+on the same branch — see `tests/unit/test_pr499_r1_claude_cloud_review.py`):**
+
+- `reconcile_cloud_dispatch` now resolves each task's OWN `context["repo"]`
+  via `_resolve_task_repo` (the SAME helper the r0 dispatch-side fix added)
+  before every GitHub lookup. Before this fix, `reconcile_all_cloud_tasks`
+  reconciled a whole batch of in-progress tasks with one shared `repo`
+  (`None` from the watchdog's call), which fell through to
+  `github.get_repo()` — the dispatcher's OWN cwd — for every task
+  regardless of what repo it was actually registered against. A batch that
+  spans more than one repo could miss a task's real PR entirely or match a
+  same-named branch in the wrong repo.
+
 ## What this PR does NOT do
 
 No new orchestrator, scheduler, review pipeline, quota system, deploy path,

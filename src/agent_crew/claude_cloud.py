@@ -553,9 +553,18 @@ def reconcile_cloud_dispatch(
     if not branch:
         return CloudReconciliationOutcome(task.task_id, "unknown_outcome", detail="no branch on task")
 
-    pr_number = pr_number_for_branch_fn(branch, repo=repo)
+    # #499 r1 HIGH: resolve THIS task's own repo (context["repo"], the same
+    # key dispatch already reads via `_resolve_task_repo`) before any GitHub
+    # lookup. `reconcile_all_cloud_tasks` reconciles a batch of tasks that
+    # may span more than one repo; a single `repo`/`None` applied to every
+    # task fell through to `github.get_repo()` (the dispatcher's OWN cwd),
+    # which can name a different repository than the task's — silently
+    # missing the real PR or matching one in the wrong repo entirely.
+    effective_repo = _resolve_task_repo(task, repo)
+
+    pr_number = pr_number_for_branch_fn(branch, repo=effective_repo)
     if pr_number:
-        head_sha = pr_head_sha_fn(pr_number, repo=repo) or ""
+        head_sha = pr_head_sha_fn(pr_number, repo=effective_repo) or ""
         result = TaskResult(
             task_id=task.task_id, status="completed",
             summary=f"claude_cloud: PR #{pr_number} discovered for branch {branch}",
@@ -579,7 +588,7 @@ def reconcile_cloud_dispatch(
         queue.submit_result(task.task_id, result)
         return CloudReconciliationOutcome(task.task_id, "pr_ready", pr_number=pr_number)
 
-    message = commit_message_fn(branch, repo=repo)
+    message = commit_message_fn(branch, repo=effective_repo)
     outcome = parse_terminal_outcome(message) if message else None
     if outcome is None:
         age = time.time() - queue.get_dispatched_at(task.task_id)
@@ -626,10 +635,15 @@ def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None
                               ) -> List[CloudReconciliationOutcome]:
     """Reconcile every currently in_progress ``claude_cloud`` dispatch.
 
-    Not wired to a scheduler here — see the module docstring. An operator or
-    the coordinator calls this from whatever periodic mechanism already
-    exists (cron, `crew triage --watch`); this function contains no polling
-    loop of its own.
+    Called from ``server._watchdog_tick`` on its existing periodic loop — no
+    polling loop of its own here.
+
+    ``repo`` is an optional override applied to every task in this batch
+    (mainly for callers/tests that already know a single answer). Left
+    unset (the production/watchdog call), each task resolves its OWN repo
+    from ``context["repo"]`` inside ``reconcile_cloud_dispatch`` (#499 r1
+    HIGH) — a batch can span more than one repo, and a single fallback
+    would silently apply the dispatcher's own cwd to every task instead.
     """
     tasks = queue.list_in_progress_by_dispatch_channel(DISPATCH_CHANNEL)
     return [reconcile_cloud_dispatch(queue, t, repo=repo) for t in tasks]
