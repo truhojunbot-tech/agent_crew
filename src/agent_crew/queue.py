@@ -5203,6 +5203,65 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def get_dispatched_at(self, task_id: str) -> float:
+        """#499 r0 HIGH: when ``record_dispatch`` last stamped this task, or
+        ``0.0`` if it was never dispatched (or does not exist). Used to age
+        out a ``claude_cloud`` dispatch that GitHub can never confirm (no PR,
+        no branch) instead of leaving it in_progress forever."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT dispatched_at FROM tasks WHERE task_id = ?", (task_id,),
+            ).fetchone()
+            return float(row["dispatched_at"] or 0.0) if row else 0.0
+        finally:
+            conn.close()
+
+    def count_in_progress_by_dispatch_channel(self, channel: str) -> int:
+        """#496: how many in_progress tasks were handed out over ``channel``
+        (the same vocabulary as ``record_dispatch`` — ``tmux_pane``,
+        ``claude_p``, ``codex_exec``, ``gemini_cli``, ``api``, and now
+        ``claude_cloud``). Used to enforce a per-channel concurrency ceiling
+        without a new scheduler: the caller checks this before dequeuing."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks "
+                "WHERE status = 'in_progress' AND dispatch_channel = ?",
+                (channel,),
+            ).fetchone()
+            return int(row["n"]) if row else 0
+        finally:
+            conn.close()
+
+    def list_in_progress_by_dispatch_channel(self, channel: str) -> List[TaskRequest]:
+        """#496: in_progress tasks dispatched over ``channel``, for a
+        completion-reconciliation pass (there is no live callback channel
+        for a cloud session — see ``claude_cloud.reconcile_cloud_dispatch``)."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE status = 'in_progress' AND dispatch_channel = ? "
+                "ORDER BY priority ASC, created_at ASC",
+                (channel,),
+            ).fetchall()
+            return [
+                TaskRequest(
+                    task_id=r["task_id"], task_type=r["task_type"], description=r["description"],
+                    branch=r["branch"], priority=r["priority"], context=json.loads(r["context"]),
+                    project=r["project"] if r["project"] else "", status=r["status"],
+                    summary=r["summary"] or "", verdict=r["verdict"],
+                    findings=json.loads(r["findings"]) if r["findings"] else [],
+                    pr_number=r["pr_number"],
+                    error_info=json.loads(r["error_info"]) if r["error_info"] else None,
+                    status_changed_at=(r["status_changed_at"]
+                                       if "status_changed_at" in r.keys() else 0.0),
+                )
+                for r in rows
+            ]
+        finally:
+            conn.close()
+
     def has_discuss_in_progress_for_agent(self, agent: str) -> bool:
         """Per-agent busy check for discuss tasks. Needed because discuss tasks
         fan out to different panes (one per agent) and the coarse `has_in_progress`

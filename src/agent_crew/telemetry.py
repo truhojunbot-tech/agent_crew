@@ -22,6 +22,11 @@ class TaskTelemetry:
     context_pack_hash: Optional[str] = None
     model: Optional[str] = None
     provider_session_id: Optional[str] = None
+    #: #496: distinguishes a fresh Cloud dispatch from persistent/local
+    #: execution for the Fresh vs Fresh+Context-Pack vs Persistent
+    #: comparison. ``None`` means "not recorded" (local providers, or a
+    #: cloud policy this build predates) — never inferred from provider name.
+    execution_policy: Optional[str] = None
 
 
 class TaskTelemetryAdapter(Protocol):

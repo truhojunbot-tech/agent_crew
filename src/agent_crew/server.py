@@ -71,6 +71,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
+from agent_crew import claude_cloud as _claude_cloud
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
@@ -3619,6 +3620,22 @@ def create_app(
                 "if no MCP client is active they will accumulate until the watchdog auto-fails them."
             )
             return
+        # #496: a role mapped to the claude_cloud backend has no tmux pane at
+        # all — dispatch_cloud_for_role reuses the SAME STOP/pause gate
+        # (dequeue) and CEA admission gate (record_dispatch) this function
+        # uses below, then hands off to `claude --cloud` instead of a pane
+        # push. Every other check below (pane busy, context-by-pane-capture,
+        # worktree-via-tmux) is tmux-specific and does not apply here. This
+        # branch only fires when an operator has explicitly opted a role
+        # into claude_cloud (role_mapping.py); by default no role resolves to
+        # it, so existing local dispatch is unchanged.
+        if _DISPATCH_ROLE_TO_AGENT.get(role, "") == _claude_cloud.CLOUD_PROVIDER_NAME:
+            try:
+                _claude_cloud.dispatch_cloud_for_role(
+                    q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""))
+            except Exception:
+                logger.exception(f"_try_push_next: claude_cloud dispatch failed for role={role}")
+            return
         if not pane_map:
             logger.debug(f"_try_push_next: no pane_map")
             return
@@ -3989,6 +4006,18 @@ def create_app(
         - ``timed_out`` — task_ids that we auto-failed
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        # #499 r0 HIGH: claude_cloud dispatches have no pane and are
+        # otherwise invisible to this pane-oriented watchdog (every check
+        # below resolves a pane per row and skips rows with none) — without
+        # this, a cloud dispatch never completes and permanently occupies a
+        # concurrency slot. Reconciled here, on the SAME periodic trigger
+        # this watchdog already runs on, rather than a new scheduler.
+        # Independent of pane_map so a cloud-only deployment (no tmux panes
+        # configured at all) still reconciles.
+        try:
+            _claude_cloud.reconcile_all_cloud_tasks(q())
+        except Exception:
+            logger.exception("watchdog: claude_cloud reconciliation failed")
         if not pane_map:
             return actions
 
