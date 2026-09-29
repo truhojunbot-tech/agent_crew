@@ -2658,27 +2658,12 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         # #301 stopped outright here; retrying covers the transient case, and
         # the cap keeps the structural case (a branch this repo does not have)
         # from spinning the same loop with review tasks.
-        existing_review_id = None
-        if hasattr(queue, "list_tasks"):
-            reviews = [t for t in queue.list_tasks()
-                       if t.task_type == "review"
-                       and isinstance(t.context, dict)
-                       and t.context.get("prev_task_id") == impl_id]
-            if len(reviews) > 1:
-                click.echo(
-                    f"[{iteration}/{max_iter}] Expected at most one review for {impl_id}; "
-                    f"found {len(reviews)}. Stopping."
-                )
-                return
-            if reviews:
-                existing_review_id = reviews[0].task_id
         _review_attempts = 0
         while True:
-            review_id = existing_review_id or enqueue_review(
+            review_id = enqueue_review(
                 queue, task, impl_branch or branch,
                 prev_task_id=impl_id, context=review_context, port=_run_port,
             )
-            existing_review_id = None
             click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
             review_start = time.time()
             review_result = _wait(review_id)

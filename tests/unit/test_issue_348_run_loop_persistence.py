@@ -162,6 +162,11 @@ def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main", existin
         return f"impl-{len([x for x in dispatched if x[0] == 'implement'])}"
 
     def enqueue_review(queue, task, branch, prev_task_id=None, context=None, port=0):
+        for existing in existing_tasks or []:
+            if (existing.task_type == "review"
+                    and existing.context.get("prev_task_id") == prev_task_id
+                    and existing.status not in {"failed", "timed_out", "blocked"}):
+                return existing.task_id
         dispatched.append(("review", branch, context or {}))
         return f"review-{len([x for x in dispatched if x[0] == 'review'])}"
 
@@ -212,6 +217,40 @@ def test_run_loop_enqueues_review_when_no_persisted_successor(tmp_path, monkeypa
 
     assert invocation.exit_code == 0, invocation.output
     assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+
+
+def test_run_loop_ignores_dead_persisted_review(tmp_path, monkeypatch):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    existing = [TaskRequest(task_id="review-dead", task_type="review", description="review",
+                            branch="main", context={"prev_task_id": "impl-1"}, status="failed")]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=existing)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert "Reviewing... (review-1)" in invocation.output
+
+
+def test_run_loop_adopts_live_review_among_dead_reviews(tmp_path, monkeypatch):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-live", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    existing = [
+        TaskRequest(task_id="review-dead", task_type="review", description="review",
+                    branch="main", context={"prev_task_id": "impl-1"}, status="timed_out"),
+        TaskRequest(task_id="review-live", task_type="review", description="review",
+                    branch="main", context={"prev_task_id": "impl-1"}, status="pending"),
+    ]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=existing)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "Reviewing... (review-live)" in invocation.output
 
 
 def test_run_loop_reviews_and_reimplements_on_reported_ref(tmp_path, monkeypatch):
