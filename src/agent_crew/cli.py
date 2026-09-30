@@ -2251,6 +2251,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
 
     from agent_crew.loop import (
         DEFAULT_MAX_ITER,
+        _adapter_project,
         build_feedback,
         enqueue_implement,
         enqueue_review,
@@ -2619,11 +2620,12 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     # coordinator_managed is provenance only (§7.2). The loop adopts the
     # server's persisted successors below; this flag never decides a transition.
     # A rerun may find the first implement task still queued or executing.
-    # Adopt before syncing worktrees: resetting a worker's active checkout
-    # would damage the very attempt we are trying to resume waiting for.
+    # Adopt before syncing worktrees: an in-progress worker's checkout must
+    # stay intact, while a pending worker still needs the fresh base sync.
     _adopted_impl_id = None
+    _adopted_impl_status = None
     if hasattr(queue, "list_tasks"):
-        _run_project = project or getattr(queue, "project_identity", "") or ""
+        _run_project = _adapter_project(queue, project)
         _matches = [
             existing for existing in queue.list_tasks()
             if existing.task_type == "implement"
@@ -2639,13 +2641,14 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             return
         if _matches:
             _adopted_impl_id = _matches[0].task_id
+            _adopted_impl_status = _matches[0].status
             click.echo(f"(task already in flight, adopted {_adopted_impl_id})")
 
     # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the
     # implementer always branches off the most recent merged state.
     _sync_landed_bases: dict = {}
-    if _run_worktrees and not _adopted_impl_id:
+    if _run_worktrees and _adopted_impl_status != "in_progress":
         click.echo(f"Syncing worktrees to origin/{branch}...")
         _sync_landed_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=branch)
 

@@ -279,6 +279,34 @@ def test_run_does_not_sync_worktree_when_adopting_running_task(tmp_path, monkeyp
     assert len(sync_calls) == 1  # normal post-completion sync remains
 
 
+def test_run_syncs_worktree_before_waiting_for_adopted_pending_task(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_crew.cli._read_state", lambda *args: {
+        "port": 0, "pane_ids": [], "worktrees": {"codex": "/unused/worktree"}})
+    sync_calls = []
+    monkeypatch.setattr("agent_crew.cli._sync_worktrees_to_main",
+                        lambda *args, **kwargs: sync_calls.append((args, kwargs)) or {})
+    results = [
+        TaskResult(task_id="impl-existing", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+
+    class AssertPendingSynced(_LoopQueue):
+        def get_result(self, task_id):
+            if task_id == "impl-existing":
+                assert len(sync_calls) == 1, "pending worktree needs pre-run sync"
+            return super().get_result(task_id)
+
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, results, project="sandbox",
+        queue_override=AssertPendingSynced(results),
+        existing_tasks=[_inflight_impl(status="pending", project="sandbox")])
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["review"]
+    assert len(sync_calls) == 2  # pre-run sync plus normal post-completion sync
+
+
 class _WaitClock:
     def __init__(self):
         self.now = 0.0
