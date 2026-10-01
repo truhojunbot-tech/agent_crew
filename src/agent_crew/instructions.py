@@ -530,6 +530,8 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks \\
     "reviewer": """\
 ## Role: reviewer
 
+<bounded_pytest>
+
 You review the coder's PR across three layers — all three must pass before
 you set `verdict: "approve"`:
 
@@ -630,6 +632,8 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks \\
 """,
     "tester": """\
 ## Role: tester
+
+<bounded_pytest>
 
 You check out the PR branch, run the tests the diff actually needs, and
 independently review the diff for requirement coverage — do not rubber-stamp
@@ -818,6 +822,30 @@ timeout (default 900s). An explicit POST with `status: failed` and a reason in
 """
 
 
+_BOUNDED_PYTEST = """\
+### Bounded pytest runs (#340)
+
+Bound **every** pytest invocation, including a fallback run. At task receipt,
+note the start time. Before each run, set `N` to the smaller of 600 seconds and
+half the remaining dispatch budget in whole seconds. Use
+`context.dispatch_timeout_s` from the task block; if absent, use a conservative
+900-second budget (the tester default), giving at most 450 seconds. Subtract
+elapsed time since task receipt
+before halving. If no time remains, do not start pytest.
+
+```bash
+timeout -k 10 "$N" python -m pytest <test paths and options>
+```
+
+If the full suite exits 124 or 137 (timeout or forced kill), rerun a targeted
+subset covering the files changed by the PR and their direct tests, again with
+a freshly computed `N` and the same timeout wrapper. State in the result that
+the full suite was not completed and why. Record each command, exit status,
+and any completed test counts; never report a timed-out run as a pass. If the
+targeted run also times out, report it as incomplete too.
+"""
+
+
 def generate(role: str, project: str, port: int, agent: str = "",
              delivery: str | None = None, worktree_path: str = "") -> str:
     """Render the role's instruction file.
@@ -838,6 +866,8 @@ def generate(role: str, project: str, port: int, agent: str = "",
         delivery = os.getenv("AGENT_CREW_DELIVERY", "both").strip().lower()
     resolved_agent = agent or _DEFAULT_AGENT_FOR_ROLE.get(role, role)
     section = _ROLE_SECTIONS.get(role, f"## Role: {role}\n")
+    if "<bounded_pytest>" in section:
+        section = section.replace("<bounded_pytest>", _BOUNDED_PYTEST)
     if delivery == "dispatcher":
         # Headless mode: task delivered via `claude -p "..."`. No loop needed.
         # Override: skip Alfred CLAUDE.md, do the single task, POST result, exit.
