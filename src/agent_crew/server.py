@@ -1591,8 +1591,12 @@ def codex_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
         size, session = codex_session_size_for_id(session_id, home=home), session_id
     else:
         size, session = codex_session_size(cwd, home=home)
+    # Codex has no token-window reading here. The rollout-size cap is the
+    # explicit fallback signal for deciding whether to resume this session.
     info = {"bytes": size, "conversation_id": session, "cap_mb": cap,
-            "provider": "codex"}
+            "provider": "codex", "context_tokens": None,
+            "tripped_by": "rollout_size_fallback",
+            "reason": "token_unavailable_rollout_size_fallback"}
     if not cap or cap <= 0 or not size:
         return (False, info)
     return (size > cap * 1048576, info)
@@ -4678,6 +4682,8 @@ def create_app(
                     context_tokens=_ctx_cap_info.get("context_tokens"),
                     cap_tokens=_ctx_cap_info.get("cap_tokens", 0),
                     tripped_by=_ctx_cap_info.get("tripped_by", ""),
+                    **({"reason": _ctx_cap_info["reason"]}
+                       if _ctx_cap_info.get("reason") else {}),
                 )
             elif _ctx_cap_info:
                 # #288: the normal-traffic row. #285 computed the window on
@@ -5455,13 +5461,24 @@ def create_app(
                     append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
             except Exception:
                 logger.exception("dispatcher: terminal telemetry enrichment failed for task=%s", task.task_id)
+            _codex_no_result_details = {}
+            if agent == "codex" and _codex_session:
+                # Stat only the rollout this worker actually resumed. A missing
+                # file is unknown, not a measured zero-byte conversation.
+                _rollout_bytes = codex_session_size_for_id(_codex_session)
+                _codex_no_result_details = {
+                    "provider_session_id": _codex_session,
+                    "codex_rollout_bytes": _rollout_bytes or None,
+                    "codex_context_cap_mb": _codex_cap_mb,
+                }
             if _timeout_reason:
                 # The task receipt, error_info, and event all carry the fired
                 # limit and output age for post-mortem inspection.
                 _fail_if_active(task.task_id, _timeout_reason, status="timed_out",
                                 details={"last_output_age_s": round(_last_output_age, 3),
                                          "timeout_limit_s": (timeout_secs if _timeout_reason == "dispatcher_timeout"
-                                                             else _idle_timeout_secs)})
+                                                             else _idle_timeout_secs),
+                                         **_codex_no_result_details})
             elif _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
@@ -5496,12 +5513,14 @@ def create_app(
                 )
                 _fail_if_active(task.task_id, _transient)
             elif proc.returncode != 0:
-                _fail_if_active(task.task_id, f"exit_{proc.returncode}")
+                _fail_if_active(task.task_id, f"exit_{proc.returncode}",
+                                details=_codex_no_result_details)
             else:
                 # Same reasoning: the process is gone without a result, but the
                 # POST can still be in flight. "We did not observe a result" is
                 # not "the work failed".
-                _fail_if_active(task.task_id, "no_result_submitted", status="timed_out")
+                _fail_if_active(task.task_id, "no_result_submitted", status="timed_out",
+                                details=_codex_no_result_details)
         except Exception:
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")

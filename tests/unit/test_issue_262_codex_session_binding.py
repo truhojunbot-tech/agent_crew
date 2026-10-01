@@ -134,7 +134,11 @@ def _dispatch(tmp_path, monkeypatch, *, policy="resume", bound_session="", unuse
     wt.mkdir(exist_ok=True)
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {"codex": str(wt)}}))
+    state.write_text(json.dumps({"roles": [
+        {"role": "implementer", "agent": "claude", "worktree": str(tmp_path / "claude")},
+        {"role": "reviewer", "agent": "codex", "worktree": str(wt)},
+        {"role": "tester", "agent": "gemini", "worktree": str(tmp_path / "gemini")},
+    ]}))
     db = str(tmp_path / "t.db")
     spawned = {}
 
@@ -243,7 +247,11 @@ def test_the_binding_is_recorded_at_dispatch_not_only_afterwards(tmp_path, monke
     wt.mkdir(exist_ok=True)
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {"codex": str(wt)}}))
+    state.write_text(json.dumps({"roles": [
+        {"role": "implementer", "agent": "claude", "worktree": str(tmp_path / "claude")},
+        {"role": "reviewer", "agent": "codex", "worktree": str(wt)},
+        {"role": "tester", "agent": "gemini", "worktree": str(tmp_path / "gemini")},
+    ]}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):
@@ -436,12 +444,17 @@ def test_a_rollout_over_the_cap_trips(tmp_path):
     assert over is True
     assert info["provider"] == "codex" and info["conversation_id"] == "big"
     assert info["bytes"] > 3 * 1024 * 1024
+    assert info["context_tokens"] is None
+    assert info["tripped_by"] == "rollout_size_fallback"
 
 
 def test_a_rollout_under_the_cap_does_not(tmp_path):
     _rollout(tmp_path, "2026-09-04", "2026-09-04T10-00-00", A)
 
-    assert sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path)[0] is False
+    over, info = sv.codex_context_exceeds_cap(A, max_mb=2, home=tmp_path)
+    assert over is False
+    assert info["context_tokens"] is None
+    assert info["tripped_by"] == "rollout_size_fallback"
 
 
 @pytest.mark.parametrize("cap", [0, -1])
@@ -471,7 +484,11 @@ def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a", unused_tcp_p
     wt.mkdir(exist_ok=True)
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {"codex": str(wt)}}))
+    state.write_text(json.dumps({"roles": [
+        {"role": "implementer", "agent": "claude", "worktree": str(tmp_path / "claude")},
+        {"role": "reviewer", "agent": "codex", "worktree": str(wt)},
+        {"role": "tester", "agent": "gemini", "worktree": str(tmp_path / "gemini")},
+    ]}))
     db = str(tmp_path / "t.db")
     spawned = {}
 
@@ -498,7 +515,10 @@ def _codex_dispatch(tmp_path, monkeypatch, *, over, bound="sess-a", unused_tcp_p
                         lambda cwd, *a, **k: (over, {"bytes": 99 * 1048576,
                                                      "conversation_id": bound,
                                                      "cap_mb": 64,
-                                                     "provider": "codex"}))
+                                                     "provider": "codex",
+                                                     "context_tokens": None,
+                                                     "tripped_by": "rollout_size_fallback",
+                                                     "reason": "token_unavailable_rollout_size_fallback"}))
 
     app = create_app(db_path=db, pane_map={}, port=unused_tcp_port, state_path=str(state),
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
@@ -522,6 +542,9 @@ def test_an_over_cap_codex_session_is_not_resumed(tmp_path, monkeypatch, *, unus
     assert cmd[:2] == ["codex", "exec"]
     assert event is not None and event["provider"] == "codex"
     assert event["bytes"] == 99 * 1048576 and event["cap_mb"] == 64
+    assert event["context_tokens"] is None
+    assert event["tripped_by"] == "rollout_size_fallback"
+    assert event["reason"] == "token_unavailable_rollout_size_fallback"
 
 
 def test_an_under_cap_codex_session_still_resumes(tmp_path, monkeypatch, *, unused_tcp_port):
