@@ -7249,12 +7249,20 @@ def create_app(
             except ValueError:
                 logger.warning("expire_stale: candidate disappeared: %s", candidate)
                 continue
+            except Exception:
+                logger.exception("expire_stale: cancel failed task_id=%s", candidate)
+                continue
             if not signal["cancelled"]:
                 continue
             cancelled.append(candidate)
             signal_outcomes[candidate] = signal["cancel_signal_outcome"]
-            terminations[candidate] = _stop_worker_for_ended_task(
-                candidate, reason=_CANCEL_REASON_STALE_LEASE)
+            try:
+                terminations[candidate] = _stop_worker_for_ended_task(
+                    candidate, reason=_CANCEL_REASON_STALE_LEASE)
+            except Exception:
+                logger.exception("expire_stale: worker termination failed task_id=%s",
+                                 candidate)
+                terminations[candidate] = "stop_error"
         if task_id is None:
             logger.warning("POST /tasks/expire-stale: GLOBAL sweep cancelled %s", cancelled)
             return {"cancelled": cancelled, "dry_run": False, "scope": "global",
