@@ -2317,6 +2317,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         enqueue_review,
         enqueue_test,
         handle_review_result,
+        INVALID_REVIEW_RESULT,
         next_review_action,
         REVIEW_RETRY_MAX,
         handle_test_result,
@@ -2844,6 +2845,13 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             )
             return
 
+        if outcome == INVALID_REVIEW_RESULT:
+            click.echo(
+                f"[{iteration}/{max_iter}] ❌ Invalid review result: explicit verdict "
+                "and consistent findings required. Stopping without a fix round."
+            )
+            return
+
         if outcome == "approved":
             click.echo(f"[{iteration}/{max_iter}] ✅ Review approved ({review_elapsed}s)")
             # Auto-resolve any pending gates before proceeding
@@ -3267,6 +3275,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             build_feedback,
             enqueue_review,
             handle_review_result,
+            INVALID_REVIEW_RESULT,
             next_review_action,
             REVIEW_RETRY_MAX,
         )
@@ -3326,6 +3335,13 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
                     f"Review task did not run after {REVIEW_RETRY_MAX} retries "
                     f"(status={getattr(review_result, 'status', '?')}). Stopping "
                     f"rather than re-implementing against empty feedback."
+                )
+                return
+
+            if outcome == INVALID_REVIEW_RESULT:
+                click.echo(
+                    "Invalid review result: explicit verdict and consistent findings "
+                    "required. Stopping without a fix round."
                 )
                 return
 

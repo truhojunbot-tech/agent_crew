@@ -233,26 +233,32 @@ class TestRecoverResetStale:
         assert "fresh" not in cancelled
 
     def test_expire_stale_via_http_endpoint(self, tmp_db):
-        """POST /tasks/expire-stale returns the cancelled task list."""
+        """The endpoint previews by default, then cancels an explicit stale id."""
         app, _ = _make_app(tmp_db)
-        q = TaskQueue(tmp_db)
-        q.enqueue(TaskRequest(
-            task_id="ep1", task_type="implement",
-            description="endpoint task", branch="main",
-        ))
-        conn = sqlite3.connect(tmp_db)
-        conn.execute(
-            "UPDATE tasks SET status='in_progress', last_activity_at=? WHERE task_id='ep1'",
-            (time.time() - 1200,),
-        )
-        conn.commit()
-        conn.close()
-
         with TestClient(app) as client:
-            resp = client.post("/tasks/expire-stale?older_than=600")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert "ep1" in body["cancelled"]
+            q = TaskQueue(tmp_db)
+            q.enqueue(TaskRequest(
+                task_id="ep1", task_type="implement",
+                description="endpoint task", branch="main",
+            ))
+            conn = sqlite3.connect(tmp_db)
+            conn.execute(
+                "UPDATE tasks SET status='in_progress', last_activity_at=? WHERE task_id='ep1'",
+                (time.time() - 1200,),
+            )
+            conn.commit()
+            conn.close()
+
+            preview = client.post("/tasks/expire-stale?older_than=600")
+            assert preview.status_code == 200
+            assert preview.json()["would_cancel"] == ["ep1"]
+            assert q.get_task_status("ep1") == "in_progress"
+            cancelled = client.post(
+                "/tasks/expire-stale?older_than=600&task_id=ep1&dry_run=false"
+            )
+            assert cancelled.status_code == 200
+            assert cancelled.json()["cancelled"] == ["ep1"]
+            assert "cancel_signal_outcome" in cancelled.json()
 
 
 # ---------------------------------------------------------------------------

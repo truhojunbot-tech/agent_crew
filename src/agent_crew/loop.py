@@ -183,6 +183,10 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
 _KNOWN_LAYERS = {"test_quality", "code_quality", "business_gap"}
 
 
+#: Returned when the review result violates the contract. Not a verdict.
+INVALID_REVIEW_RESULT = "invalid_review_result"
+
+
 def _resolve_verdict(result: TaskResult) -> str:
     """Map a TaskResult to one of {"approve", "request_changes"}.
 
@@ -192,22 +196,45 @@ def _resolve_verdict(result: TaskResult) -> str:
     re-implementation round (issue #100 — codex, after a clean pass, sent
     null/[] and the loop ran 4 unnecessary iterations).
 
-    Defensive read:
+    Fail-closed contract (owner 2026-09-23):
     - dispatcher failure (timeout/exit_X/no_result) → ``request_changes``
       (NEVER silently approve a crashed/quota-exhausted review)
-    - explicit ``approve`` → ``approve``
-    - any value with non-empty findings → ``request_changes``
-    - missing/None verdict + empty findings on a completed task → ``approve``
+    - explicit ``approve`` with no findings → ``approve``
+    - explicit ``request_changes`` with at least one finding → ``request_changes``
+    - anything else → ``invalid_review_result``: missing/None/unknown verdict,
+      ``approve`` carrying findings, ``request_changes`` carrying none.
+
+    ``invalid_review_result`` is not a verdict. Callers must stop on it:
+    no merge, test enqueue, or fix round. A malformed review says nothing
+    about the work, so it cannot authorize a successor.
     """
     status = getattr(result, "status", None)
     if status and status != "completed":
         return "request_changes"
-    if result.verdict == "approve":
-        return "approve"
+
     findings = result.findings or []
-    if not result.verdict and not findings:
-        return "approve"
-    return "request_changes"
+    verdict = result.verdict
+
+    # ⛔The reviewer's intent is NOT inferred any more (owner 2026-09-23).
+    #   The previous fallbacks — `null + no findings -> approve` and
+    #   `null + findings -> request_changes` — both invented a verdict the
+    #   reviewer never gave. Measured cost on alpha_engine PR #5676: three
+    #   rounds came back `verdict=None` with provenance lines parked in
+    #   `findings` (`provider=codex; model=...; task_id=...`), so the second
+    #   fallback stamped `request_changes` on a review whose own prose said
+    #   the change was fine, and each stamp auto-spawned a fix -> retry-fix ->
+    #   retry-retry-fix chain that could never succeed.
+    if verdict not in ("approve", "request_changes"):
+        return INVALID_REVIEW_RESULT
+
+    # ⛔Contract, not heuristics: `findings` carries requested changes only.
+    #   Provenance, scope limits and runtime caveats belong in `summary`/`notes`,
+    #   so anything sitting in `findings` is read as a requested change.
+    if verdict == "approve" and findings:
+        return INVALID_REVIEW_RESULT
+    if verdict == "request_changes" and not findings:
+        return INVALID_REVIEW_RESULT
+    return verdict
 
 
 def handle_review_result(
@@ -250,6 +277,9 @@ def handle_review_result(
         return "review_failed"
 
     verdict = _resolve_verdict(result)
+    if verdict == INVALID_REVIEW_RESULT:
+        # A malformed review authorizes no successor or escalation round.
+        return INVALID_REVIEW_RESULT
     if iteration >= max_iter and verdict != "approve":
         if queue is not None:
             gate = GateRequest(

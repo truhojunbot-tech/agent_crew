@@ -56,7 +56,7 @@ Three defects, each tested separately below:
 
 import pytest
 
-from agent_crew.loop import build_feedback, handle_review_result
+from agent_crew.loop import INVALID_REVIEW_RESULT, build_feedback, handle_review_result
 from agent_crew.protocol import TaskResult
 
 
@@ -96,11 +96,20 @@ def test_an_approval_is_untouched():
                                 iteration=1, max_iter=3) == "approved"
 
 
-def test_a_clean_review_with_nothing_to_say_is_still_an_approval():
-    """#208: reviewers post verdict=None with no findings when they have nothing
-    to flag. That is an approval and must not be swept into the new outcome."""
+def test_a_clean_review_with_nothing_to_say_is_no_longer_inferred_as_approval():
+    """⛔REVERSED by the owner decision of 2026-09-23 (was #208's rule).
+
+    `verdict=None` + no findings used to be read as an approval. It is not: the
+    reviewer said nothing, and inferring a verdict from silence is what let a
+    malformed result drive merges and fix rounds. It now resolves to
+    `invalid_review_result`; the CLI must stop without merging, testing, or
+    spawning a fix round. This preserves #100 without inventing approval.
+
+    The reviewer's obligation is to set `verdict` explicitly; see
+    `tests/unit/test_review_result_contract.py` for the full contract.
+    """
     assert handle_review_result(_review(status="completed", verdict=None, findings=[]),
-                                iteration=1, max_iter=3) == "approved"
+                                iteration=1, max_iter=3) == INVALID_REVIEW_RESULT
 
 
 def test_a_failed_review_does_not_consume_an_escalation_round():
@@ -210,11 +219,15 @@ def test_both_cli_loops_stop_instead_of_re_implementing():
     #   COLLECTION on a supported interpreter, taking every test in it down
     #   before one could run (review of PR #303).
     stop_guards = source.count('outcome == "review_failed"')
+    invalid_guards = source.count('outcome == INVALID_REVIEW_RESULT')
     retry_calls = source.count("next_review_action(")
 
     assert stop_guards == 2, (
         f"each review loop must stop on a review that did not run; "
         f"found {stop_guards} guard(s)")
+    assert invalid_guards == 2, (
+        f"each review loop must stop before enqueuing a fix for an invalid review; "
+        f"found {invalid_guards} guard(s)")
     # #302: and each must RETRY before it stops, or the retry budget is dead
     # code that no loop ever consults.
     assert retry_calls == 2, (

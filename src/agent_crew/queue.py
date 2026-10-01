@@ -5209,9 +5209,12 @@ class TaskQueue:
             conn.close()
 
     def expire_stale(self, older_than_seconds: float = 600.0, *,
-                     on_cancelled: Optional[Callable[[str], None]] = None) -> List[str]:
-        """Cancel in_progress tasks whose last_activity_at is older than
-        ``older_than_seconds``. Returns list of cancelled task_ids.
+                     on_cancelled: Optional[Callable[[str], None]] = None,
+                     dry_run: bool = False) -> List[str]:
+        """Preview or cancel in_progress tasks whose last_activity_at is stale.
+
+        ``dry_run=True`` returns the selected IDs without changing any row.
+        The caller may scope a subsequent cancellation to these IDs.
 
         ⛔Every expiry goes through :meth:`cancel`, one task per transaction, and
           never a bulk ``UPDATE ... SET status = 'cancelled'``. The bulk UPDATE
@@ -5236,6 +5239,8 @@ class TaskQueue:
             candidates = [r["task_id"] for r in rows]
         finally:
             conn.close()
+        if dry_run:
+            return candidates
         cancelled: List[str] = []
         for task_id in candidates:
             try:

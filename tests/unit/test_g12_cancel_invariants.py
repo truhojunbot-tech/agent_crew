@@ -269,7 +269,9 @@ def _expire(app, db, task_id, *, pid):
         with TestClient(app) as client:
             q, nonce = _dispatched_stale_task(db, task_id)
             app.state.active_dispatch_processes[task_id] = _FakeProc(pid=pid)
-            body = client.post("/tasks/expire-stale?older_than=600").json()
+            # The endpoint previews by default; explicitly confirm the sweep
+            # to exercise the authoritative cancellation invariant.
+            body = client.post("/tasks/expire-stale?older_than=600&dry_run=false").json()
             return q, nonce, body
     finally:
         for timer in list(app.state.cancel_kill_timers.values()):

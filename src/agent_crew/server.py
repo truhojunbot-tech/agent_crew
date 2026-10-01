@@ -152,6 +152,7 @@ def cancel_task_with_signal(
     queue: TaskQueue, task_id: str, *, state_path: Optional[str],
     pane_map: Optional[dict], events_path: str,
     reason: str = _CANCEL_REASON_ATTEMPT,
+    expected_status: Optional[str] = None,
 ) -> dict:
     """Cancel in the DB and signal only its server-recorded, project-owned pane.
 
@@ -162,7 +163,8 @@ def cancel_task_with_signal(
     is signalled — ``cancelled`` is False and ``status`` names the refusing
     status. An unknown id raises ValueError.
     """
-    cancelled, prior_status, bound_pane = queue.cancel_with_binding(task_id, reason=reason)
+    cancelled, prior_status, bound_pane = queue.cancel_with_binding(
+        task_id, reason=reason, expected_status=expected_status)
     if prior_status is None:
         raise ValueError(f"Task not found: {task_id!r}")
     if not cancelled:
@@ -1084,6 +1086,14 @@ def _prepare_worktree_for_task_inner(
     return _worktree_head(worktree_path)
 
 
+def _expire_stale_supports_dry_run(queue) -> bool:
+    """Does this queue's ``expire_stale`` accept ``dry_run``? Probed, not assumed."""
+    import inspect
+    try:
+        return "dry_run" in inspect.signature(queue.expire_stale).parameters
+    except (TypeError, ValueError):
+        return False
+
 class _DispatchSlot:
     """A dispatch that has been decided, whose child may not exist yet.
 
@@ -1128,7 +1138,12 @@ def _review_result_is_actionable(result) -> bool:
       A skipped cascade is recoverable; the provider invocations those rounds
       spent are not. That asymmetry is the whole argument (#250).
     """
-    return getattr(result, "status", None) in (None, "completed")
+    if getattr(result, "status", None) not in (None, "completed"):
+        return False
+    # ⛔#5676: a completed review used to be "actionable" on status alone, so a
+    #   `request_changes` with nothing to change still enqueued a fix. A fix
+    #   round needs something to fix.
+    return bool(result.findings or [])
 
 
 _DEFAULT_ROLE_TO_AGENT = dict(DEFAULT_ROLE_TO_AGENT)
@@ -6966,6 +6981,19 @@ def create_app(
                                 logger.warning(f"POST /tasks/{task_id}/result: review comment 존재 확인 "
                                                f"불가(unknown) → fail-closed 미게시(재확인 대기)")
                                 _do_post = False
+                        # ⛔A malformed review result says nothing about the work, so it
+                        #   must not be published as a verdict. `_resolve_verdict` returns
+                        #   INVALID_REVIEW_RESULT for a missing/unknown verdict, an
+                        #   `approve` carrying findings, or a `request_changes` carrying
+                        #   none (owner decision 2026-09-23).
+                        if _do_post and _resolve_verdict(result) not in ("approve", "request_changes"):
+                            logger.warning(
+                                f"POST /tasks/{task_id}/result: review result violates the "
+                                f"contract (verdict={result.verdict!r}, findings="
+                                f"{len(result.findings or [])}) — no comment posted, no "
+                                f"transition taken"
+                            )
+                            _do_post = False
                         if _do_post:
                             _reviewer_agent = next(
                                 (k for k in (pane_map or {}) if k in ("claude", "codex", "gemini")),
@@ -7177,25 +7205,78 @@ def create_app(
                 "lease_tracking": _leased is not None, "force": force}
 
     @app.post("/tasks/expire-stale", status_code=200)
-    def expire_stale_tasks(older_than: float = 600.0):
-        """Cancel in_progress tasks idle longer than ``older_than`` seconds.
-        Returns list of cancelled task_ids.
+    def expire_stale_tasks(
+        older_than: float = 600.0,
+        task_id: Optional[str] = None,
+        dry_run: bool = True,
+    ):
+        """Preview stale work by default; cancel only a scoped or explicit sweep.
 
-        An expiry is a cancel: it goes through the same authoritative
-        transaction (status, receipt REVOKED, nonces spent, end event) and then
-        the same worker termination the DELETE performs — just with
-        ``STALE_LEASE`` as the recorded reason. Before this, expiry wrote the
-        status directly and stopped there, leaving a live receipt, a spendable
-        nonce and an unsignalled child behind (r2 review of 4a49338).
+        A confirmed expiry uses the same authoritative cancel transaction and
+        worker termination as the per-task cancel route. The preview returns
+        candidate IDs without mutation; the caller must opt in with
+        ``dry_run=false`` before any cancellation occurs.
         """
-        terminations: dict[str, str] = {}
+        candidates = q().expire_stale(older_than_seconds=older_than, dry_run=True) \
+            if _expire_stale_supports_dry_run(q()) else None
+        if candidates is None:
+            raise HTTPException(
+                status_code=501,
+                detail="queue backend has no expire_stale(dry_run=...) — "
+                       "refusing to guess the stale set",
+            )
+        if task_id is not None:
+            candidates = [candidate for candidate in candidates if candidate == task_id]
+            if not candidates:
+                return {"cancelled": [], "dry_run": dry_run, "scope": task_id,
+                        "reason": "task_id not among the stale in_progress tasks"}
+        if dry_run:
+            logger.info("POST /tasks/expire-stale: preview would cancel %s", candidates)
+            return {"would_cancel": candidates, "dry_run": True,
+                    "scope": task_id or "global"}
 
-        def _stop(task_id: str) -> None:
-            terminations[task_id] = _stop_worker_for_ended_task(
-                task_id, reason=_CANCEL_REASON_STALE_LEASE)
-
-        cancelled = q().expire_stale(older_than_seconds=older_than, on_cancelled=_stop)
-        return {"cancelled": cancelled, "worker_termination": terminations}
+        cancelled = []
+        signal_outcomes = {}
+        terminations = {}
+        for candidate in candidates:
+            try:
+                signal = cancel_task_with_signal(
+                    q(), candidate, state_path=state_path, pane_map=pane_map,
+                    events_path=_context_events_path,
+                    reason=_CANCEL_REASON_STALE_LEASE,
+                    expected_status="in_progress",
+                )
+            except ValueError:
+                logger.warning("expire_stale: candidate disappeared: %s", candidate)
+                continue
+            except Exception:
+                logger.exception("expire_stale: cancel failed task_id=%s", candidate)
+                continue
+            if not signal["cancelled"]:
+                continue
+            cancelled.append(candidate)
+            signal_outcomes[candidate] = signal["cancel_signal_outcome"]
+            try:
+                terminations[candidate] = _stop_worker_for_ended_task(
+                    candidate, reason=_CANCEL_REASON_STALE_LEASE)
+            except Exception:
+                logger.exception("expire_stale: worker termination failed task_id=%s",
+                                 candidate)
+                terminations[candidate] = "stop_error"
+        if task_id is None:
+            logger.warning("POST /tasks/expire-stale: GLOBAL sweep cancelled %s", cancelled)
+            return {"cancelled": cancelled, "dry_run": False, "scope": "global",
+                    "cancel_signal_outcomes": signal_outcomes,
+                    "worker_termination": terminations}
+        response = {"cancelled": cancelled, "dry_run": False, "scope": task_id,
+                    "worker_termination": terminations}
+        if cancelled:
+            response.update({
+                "worker_reachable": signal["worker_reachable"],
+                "cancel_signal_outcome": signal["cancel_signal_outcome"],
+                "pane_exit_observed": signal["pane_exit_observed"],
+            })
+        return response
 
     @app.post("/gates", status_code=201)
     def post_gate(gate: GateRequest):
