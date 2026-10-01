@@ -135,6 +135,25 @@ def test_project_pin_applies_narrow_fresh_cap(tmp_path, monkeypatch):
     assert queue.get_tokenomics_shadow_receipt(ROOT)["canary_applied"] == 1
 
 
+def test_project_pin_uses_server_project_for_legacy_review(q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(q, fix_round=0)
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (review,))
+    task = next(task for task in q.list_tasks() if task.task_id == review)
+    from agent_crew.pipeline import _successor_project
+    assert _successor_project(q, task) != "agent_crew"
+    assert _successor_project(q, task, "agent_crew") == "agent_crew"
+
+    assert auto_enqueue_fix(q, review, server_project="agent_crew",
+                            pr_state_fn=lambda _: "open",
+                            already_announced_fn=lambda *a, **kw: False,
+                            repo="owner/repo") is not None
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
+
+
 @pytest.mark.parametrize("produced,age,mtime_age,expected_reason", [
     (False, 0, 0, "cap_not_reached"),
     (False, 0, 2, "contract_missing_or_stale"),

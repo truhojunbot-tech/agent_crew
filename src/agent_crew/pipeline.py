@@ -945,10 +945,11 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
         current = tasks_by_id[prev]
 
 
-def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue) -> bool:
+def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
+                      server_project: Optional[str] = None) -> bool:
     return _tokenomics_canary._is_pinned(
         review_task, _tokenomics_canary.canary_pin(),
-        project=_successor_project(queue, review_task),
+        project=_successor_project(queue, review_task, server_project),
         lineage_root=_lineage_root_task_id(tasks_by_id, review_task))
 
 
@@ -1043,11 +1044,12 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task,
 
 
 def _canary_round_cap(tasks_by_id: dict, review_task,
-                      baseline_cap: int, queue: TaskQueue) -> tuple[int, Optional[dict], str]:
+                      baseline_cap: int, queue: TaskQueue,
+                      server_project: Optional[str] = None) -> tuple[int, Optional[dict], str]:
     """Return the narrowed cap only for the pinned lineage and a fresh contract."""
     if not _tokenomics_canary.rounds_cap_enabled():
         return baseline_cap, None, "switch_off"
-    if not _round_cap_pinned(tasks_by_id, review_task, queue):
+    if not _round_cap_pinned(tasks_by_id, review_task, queue, server_project):
         return baseline_cap, None, "not_pinned"
     try:
         citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
@@ -1271,9 +1273,9 @@ def auto_enqueue_fix(
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
         max_rounds, canary_citation, canary_reason = _canary_round_cap(
-            tasks_by_id, review_task, baseline_cap, queue)
+            tasks_by_id, review_task, baseline_cap, queue, server_project)
         canary_pinned = (_tokenomics_canary.rounds_cap_enabled()
-                         and _round_cap_pinned(tasks_by_id, review_task, queue))
+                         and _round_cap_pinned(tasks_by_id, review_task, queue, server_project))
         if canary_pinned:
             try:
                 queue.record_shadow_rounds_vs_cap(
