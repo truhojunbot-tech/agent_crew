@@ -4165,13 +4165,15 @@ class TaskQueue:
             logger.exception("task telemetry adapter failed for %s", task_id)
             return TaskTelemetry()
 
-    def record_task_telemetry(self, task_id: str, telemetry: TaskTelemetry) -> None:
+    def record_task_telemetry(self, task_id: str, telemetry: TaskTelemetry,
+                              *, only_missing: bool = False) -> None:
         """Persist terminal provider-response observations after process exit."""
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             now = time.time()
-            self._store_task_telemetry(conn, task_id, telemetry, now)
+            self._store_task_telemetry(conn, task_id, telemetry, now,
+                                       only_missing=only_missing)
             conn.commit()
             # #334 may write final provider usage after submit_result. Refresh
             # the shadow receipt only after that telemetry is durable.
@@ -4299,6 +4301,11 @@ class TaskQueue:
     ) -> list[tuple[str, int | str | None]]:
         """Derive one task's usage from its session's last durable cumulative row."""
         cumulative = {field: getattr(telemetry, field) for field in usage_fields}
+        # A result POST can precede Codex's terminal turn.completed. The
+        # null adapter observation must not erase usage already captured for
+        # this task, nor create a fake all-null cumulative baseline.
+        if all(value is None for value in cumulative.values()):
+            return []
         session = telemetry.provider_session_id or attribution["provider_session_id"]
         index = attribution["session_task_index"] or 0
         previous = None
@@ -4337,7 +4344,8 @@ class TaskQueue:
 
     @staticmethod
     def _store_task_telemetry(
-        conn: sqlite3.Connection, task_id: str, telemetry: TaskTelemetry, now: float
+        conn: sqlite3.Connection, task_id: str, telemetry: TaskTelemetry, now: float,
+        *, only_missing: bool = False,
     ) -> None:
         """Persist only observed values so absent provider fields remain NULL."""
         context_pack_hash = telemetry.context_pack_hash
@@ -4358,20 +4366,38 @@ class TaskQueue:
         )
         values = [getattr(telemetry, field) for field in fields]
         attribution = conn.execute(
-            "SELECT agent, project, provider_session_id, session_task_index "
+            "SELECT agent, project, provider_session_id, session_task_index, "
+            "codex_thread_cumulative "
             "FROM task_attribution WHERE task_id=?", (task_id,)
         ).fetchone()
         if attribution is not None and attribution["agent"] == "codex":
             observed = TaskQueue._codex_token_observations(
                 conn, task_id, telemetry, attribution, fields[:6],
             )
+            if only_missing and attribution["codex_thread_cumulative"]:
+                try:
+                    old_cumulative = json.loads(attribution["codex_thread_cumulative"])
+                except (TypeError, ValueError):
+                    old_cumulative = {}
+                if isinstance(old_cumulative, dict):
+                    for index, (field, value) in enumerate(observed):
+                        if field == "codex_thread_cumulative":
+                            merged = {**json.loads(value), **{
+                                key: old for key, old in old_cumulative.items()
+                                if old is not None
+                            }}
+                            observed[index] = (field, json.dumps(merged))
             observed.extend((field, value) for field, value in zip(fields[6:], values[6:])
                             if value is not None)
         else:
             observed = [(field, value) for field, value in zip(fields, values) if value is not None]
         if context_pack_hash is not None:
             observed.append(("context_pack_hash", context_pack_hash))
-        assignments = [f"{field}=?" for field, _ in observed]
+        assignments = [
+            f"{field}=COALESCE({field}, ?)" if only_missing and field != "codex_thread_cumulative"
+            else f"{field}=?"
+            for field, _ in observed
+        ]
         params = [value for _, value in observed]
         # Dispatch attribution is authoritative when it named a model/session;
         # a transcript fills only an absent value, never rewrites lineage.
