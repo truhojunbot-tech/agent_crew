@@ -1,5 +1,6 @@
 import json
 import dataclasses
+import subprocess
 
 import pytest
 from fastapi.testclient import TestClient
@@ -12,6 +13,22 @@ from agent_crew.server import create_app
 
 SHA_A = "a" * 40
 SHA_B = "b" * 40
+
+
+def test_branch_head_lookup_uses_exact_remote_ref(monkeypatch):
+    from agent_crew import github
+
+    calls = []
+
+    def run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, f"{SHA_A}\trefs/heads/fix/topic\n", "")
+
+    monkeypatch.setattr(github.subprocess, "run", run)
+    assert github.branch_head_sha("fix/topic", "owner/repo") == SHA_A
+    assert calls[0][0] == ["git", "ls-remote", "--exit-code",
+                           "https://github.com/owner/repo.git", "refs/heads/fix/topic"]
+    assert calls[0][1]["timeout"] == 5.0
 
 
 @pytest.fixture
@@ -186,6 +203,62 @@ def test_completed_verdict_blocks_rereview(queue, verdict):
                                             summary="reviewed", verdict=verdict))
     with pytest.raises(DuplicateReviewError):
         queue.enqueue(task("second"))
+
+
+def test_branch_only_review_resolves_standing_approved_head(queue, monkeypatch):
+    from agent_crew import github
+
+    queue.enqueue(task("approved", pr=None, sha=SHA_A))
+    queue.submit_result("approved", TaskResult(
+        task_id="approved", status="completed", summary="reviewed", verdict="approve"))
+    lookups = []
+
+    def head(branch, repo):
+        lookups.append((branch, repo))
+        return SHA_A
+
+    monkeypatch.setattr(github, "branch_head_sha", head)
+
+    with pytest.raises(DuplicateReviewError) as exc:
+        queue.enqueue(task("coordinator", pr=None, sha=None))
+
+    assert exc.value.existing_task_id == "approved"
+    assert lookups == [("feature", "owner/repo")]
+    assert [t.task_id for t in queue.list_tasks()] == ["approved"]
+    assert _events(queue, "coordinator", "duplicate_review_refused") == [
+        {"code": DuplicateReviewError.code, "existing_task_id": "approved"}]
+
+
+def test_unresolvable_review_head_records_skip_and_enqueues(queue, monkeypatch):
+    from agent_crew import github
+
+    queue.enqueue(task("approved", pr=None, sha=SHA_A))
+    queue.submit_result("approved", TaskResult(
+        task_id="approved", status="completed", summary="reviewed", verdict="approve"))
+    monkeypatch.setattr(github, "branch_head_sha", lambda branch, repo: "")
+
+    assert queue.enqueue(task("coordinator", pr=None, sha=None)) == "coordinator"
+    assert _events(queue, "coordinator", "duplicate_check_skipped_unknown_head") == [
+        {"branch": "feature"}]
+    assert "reviewed_sha" not in queue.get_task_context("coordinator")
+
+
+def test_pr_only_review_resolves_standing_head(queue, monkeypatch):
+    from agent_crew import github
+
+    queue.enqueue(task("approved", sha=SHA_A))
+    queue.submit_result("approved", TaskResult(
+        task_id="approved", status="completed", summary="reviewed", verdict="approve"))
+    lookups = []
+
+    def head(pr, *, repo, timeout):
+        lookups.append((pr, repo, timeout))
+        return SHA_A
+
+    monkeypatch.setattr(github, "pr_head_sha", head)
+    with pytest.raises(DuplicateReviewError):
+        queue.enqueue(task("coordinator", sha=None))
+    assert lookups == [(23, "owner/repo", 5.0)]
 
 
 def test_completed_test_without_verdict_blocks_retest(queue):

@@ -303,6 +303,23 @@ def pr_head_sha(pr_number: int, repo: Optional[str] = None,
         return ""
 
 
+def branch_head_sha(branch: str, repo: str, timeout: float = 5.0) -> str:
+    """Return a repository branch's current commit, or ``""`` if unknown."""
+    if (not branch or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+            or branch.startswith("-") or "\n" in branch):
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--exit-code", f"https://github.com/{repo}.git",
+             f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        sha = (result.stdout or "").split("\t", 1)[0].strip().lower()
+        return sha if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else ""
+    except Exception:
+        return ""
+
+
 def post_discussion_comment(
     issue_number: int,
     topic: str,
