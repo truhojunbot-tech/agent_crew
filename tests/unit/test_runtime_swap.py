@@ -7,7 +7,8 @@ import threading
 
 import pytest
 
-from scripts.runtime_swap import parse_args, parse_env_file, check_checkout, require_no_running_work
+from scripts.runtime_swap import (parse_args, parse_env_file, check_checkout,
+                                  complete_environ, require_no_running_work)
 
 
 def test_argument_parsing_rejects_short_sha_and_unknown_step():
@@ -228,6 +229,28 @@ def test_main_refuses_mismatched_preflight(tmp_path, monkeypatch):
     (evidence / 'preflight.json').write_text(json.dumps({'sha': 'b' * 40, 'project': 'demo', 'port': 8765}))
     with pytest.raises(RuntimeError, match='does not match'):
         swap.main(['demo', 'a' * 40, 'go'])
+
+
+@pytest.mark.parametrize('captured', [b'', b'X=Y'])
+def test_go_refuses_incomplete_captured_env_before_signalling(tmp_path, monkeypatch, captured):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    evidence.mkdir(parents=True)
+    (evidence / 'preflight.json').write_text(json.dumps({
+        'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid(),
+    }))
+    (evidence / 'env.pre.nul').write_bytes(captured)
+    signalled = []
+    monkeypatch.setattr(swap.os, 'kill', lambda *args: signalled.append(args))
+
+    with pytest.raises(RuntimeError, match='captured environment missing or incomplete'):
+        swap.main(['demo', 'a' * 40, 'go'])
+    assert signalled == []
+    assert not (evidence / 'tasks.db.pre').exists()
+
+
+def test_complete_environ_preserves_valid_capture():
+    assert complete_environ(b'X=Y\0') == b'X=Y\0'
 
 
 def test_spawn_captured_env_preserves_spaces_and_drops_old_agent_source(tmp_path, monkeypatch):
