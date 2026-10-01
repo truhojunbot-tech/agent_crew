@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import hashlib
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -132,7 +133,25 @@ def test_shadow_sqlite_wait_is_bounded_by_capture_timeout(monkeypatch):
     monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.01")
     assert shadow_sqlite_timeout_seconds() == 0.01
     monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.2")
-    assert shadow_sqlite_timeout_seconds() == 0.05
+    assert shadow_sqlite_timeout_seconds() == 0.2
+    assert shadow_sqlite_timeout_seconds(capture=True) == 0.05
+
+
+def test_raised_shadow_timeout_waits_for_locked_retrieval_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.3")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    scope = MemoryScope(project="agent_crew")
+    storage.put_many_shadow([MemoryRecord("episodic", "task:locked", {}, scope)])
+    holder = sqlite3.connect(storage.path, check_same_thread=False)
+    holder.execute("BEGIN EXCLUSIVE")
+    unlock = threading.Timer(0.12, holder.rollback)
+    unlock.start()
+    try:
+        rows, _ = storage.retrieve_shadow(scope, {"episodic"}, 10)
+    finally:
+        unlock.join(timeout=1)
+        holder.close()
+    assert [row.key for row in rows] == ["task:locked"]
 
 
 def test_result_capture_without_attribution_table_and_bad_issue(tmp_path, monkeypatch):

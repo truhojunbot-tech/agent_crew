@@ -20,8 +20,8 @@ SHADOW_RETRIEVAL_MAX_ROWS = 50
 SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS = 0.05
 
 
-def shadow_sqlite_timeout_seconds() -> float:
-    """Keep shadow DB waits within both the capture and configured time budgets."""
+def shadow_sqlite_timeout_seconds(*, capture: bool = False) -> float:
+    """Use the configured wait for retrieval; bound synchronous capture waits."""
     try:
         configured = float(os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS",
                                      str(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS)))
@@ -29,7 +29,7 @@ def shadow_sqlite_timeout_seconds() -> float:
         configured = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
     if not math.isfinite(configured) or configured <= 0:
         configured = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
-    return min(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS, configured)
+    return min(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS, configured) if capture else configured
 
 
 @dataclass(frozen=True)
@@ -186,7 +186,7 @@ class SQLiteMemoryStorage:
         if not project or any(r.scope.project != project or r.layer not in {
                 "episodic", "decision", "failure_pattern"} for r in records):
             raise ValueError("shadow batch requires one project and derived layers")
-        with closing(sqlite3.connect(self.path, timeout=shadow_sqlite_timeout_seconds())) as db:
+        with closing(sqlite3.connect(self.path, timeout=shadow_sqlite_timeout_seconds(capture=True))) as db:
             db.execute("BEGIN IMMEDIATE")
             for record in records:
                 scope = _canonical_scope_json(record.scope)

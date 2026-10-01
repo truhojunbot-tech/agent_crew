@@ -145,7 +145,7 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
         path = Path(shadow_db).expanduser()
         if not path.is_file():
             raise FileNotFoundError(path)
-        timeout_seconds = shadow_sqlite_timeout_seconds()
+        timeout_seconds = shadow_sqlite_timeout_seconds(capture=True)
         with closing(sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True,
                                      timeout=timeout_seconds)) as db:
             row = db.execute("SELECT project,context FROM tasks WHERE task_id=?",
