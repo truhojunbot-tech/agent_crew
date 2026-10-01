@@ -1178,6 +1178,7 @@ def setup(project: str, agents: str, base: str):
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
@@ -1236,6 +1237,7 @@ def setup(project: str, agents: str, base: str):
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
@@ -1900,6 +1902,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
@@ -2309,6 +2312,22 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     if max_iter <= 0:
         max_iter = DEFAULT_MAX_ITER
 
+    # A live port can have been recycled for another project. Verify before
+    # opening the queue or enqueuing work into the wrong server (#362).
+    if project:
+        _identity_state = _read_state(base, project)
+        _identity_port = (_identity_state or {}).get("port")
+        if _identity_port:
+            if not _port_listening(_identity_port, timeout=5.0):
+                raise click.ClickException(
+                    f"Server at port {_identity_port} unreachable — "
+                    "check crew status or run crew recover")
+            from agent_crew.project_identity import ProjectIdentityError, verify_server_identity
+            try:
+                verify_server_identity(f"http://127.0.0.1:{_identity_port}", project)
+            except ProjectIdentityError as exc:
+                raise click.ClickException(str(exc)) from exc
+
     queue = _writable_queue(db, base=base, project=project)
 
     wait_timeout = float(timeout)
@@ -2342,7 +2361,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         req = _urllib_req.Request(
             f"http://127.0.0.1:{_run_port}/tasks/{task_id}/result",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Agent-Crew-Project": project},
             method="POST",
         )
         try:

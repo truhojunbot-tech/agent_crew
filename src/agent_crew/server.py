@@ -17,7 +17,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
-from fastapi import Body, FastAPI, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
@@ -2659,7 +2659,7 @@ def _default_push(pane_id: str, text: str) -> None:
     )
 
 
-def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mcp_mode: bool = False) -> str:
+def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, project: str = "", mcp_mode: bool = False) -> str:
     """Watchdog nudge: agent has been silent past the heartbeat threshold.
 
     In MCP mode (#162) emits a short one-liner — agents already have
@@ -2676,6 +2676,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
             f"If still working call bump_activity(task_id='{task_id}'). "
             f"If done or blocked call submit_result(...)."
         )
+    identity_header = f"    -H 'X-Agent-Crew-Project: {project}' \\\n" if project else ""
     return (
         f"=== AGENT_CREW REMINDER ===\n"
         f"task_id: {task_id}\n"
@@ -2687,6 +2688,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
         f"\n"
         f"1) FINISHED — POST status=\"completed\":\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"{identity_header}"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"completed\","
         f"\"summary\":\"...\",\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
@@ -2695,6 +2697,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
         f"   status=\"failed\". The fallback policy will reroute this task\n"
         f"   to the next agent in the chain automatically:\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"{identity_header}"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"failed\","
         f"\"summary\":\"API stream timeout — partial response, no recovery\","
@@ -2744,7 +2747,7 @@ def _guard_description(task: TaskRequest) -> str:
 
 
 def _format_task_message(task: TaskRequest, port: int,
-                         nonce: Optional[str] = None) -> str:
+                         nonce: Optional[str] = None, *, project: str = "") -> str:
     """The block a worker receives — and, when one was minted, its dispatch nonce.
 
     ADR P4/§2.2: the nonce is single-use, presented once at ``/start`` for a
@@ -2761,6 +2764,7 @@ def _format_task_message(task: TaskRequest, port: int,
     would just move the lie one hop downstream.
     """
     ctx = json.dumps(task.context, ensure_ascii=False)
+    identity_header = f"-H 'X-Agent-Crew-Project: {project}' " if project else ""
     description = _guard_description(task)
     result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
                    f"\"summary\":\"...\",\"findings\":[]}}")
@@ -2773,6 +2777,7 @@ def _format_task_message(task: TaskRequest, port: int,
             f"FIRST, before any work, ask for the go/no-go — the nonce is single-use "
             f"and this call spends it:\n"
             f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/start "
+            f"{identity_header}"
             f"-H 'Content-Type: application/json' "
             f"-d '{{\"nonce\":\"{nonce}\"}}'\n"
             f"It answers {{\"go\": true|false}}. Decide ONLY on the go field. "
@@ -2792,6 +2797,7 @@ def _format_task_message(task: TaskRequest, port: int,
         + start_step
         + f"Do the work described above, then POST result: "
         f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
+        f"{identity_header}"
         f"-H 'Content-Type: application/json' "
         f"-d '{result_body}'"
     )
@@ -2833,6 +2839,7 @@ def create_app(
     memory_provider: Optional[MemoryProvider] = None,
     shadow_memory_enabled: Optional[bool] = None,
     shadow_memory_timeout_seconds: Optional[float] = None,
+    identity_required: Optional[bool] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -2869,6 +2876,8 @@ def create_app(
     """
     logger.info("Context Pack effective enabled=%s (AGENT_CREW_CONTEXT_PACK=%r)",
                 _cpack.enabled(), os.environ.get("AGENT_CREW_CONTEXT_PACK"))
+    if identity_required is None:
+        identity_required = bool(os.getenv("AGENT_CREW_PROJECT"))
     _codex_cap_mb = _codex_context_cap_mb(state_path)
     _codex_mode = _codex_session_mode(state_path)
     logger.info("Codex context cap effective=%s MB", _codex_cap_mb)
@@ -3891,7 +3900,8 @@ def create_app(
         except AdmissionRefused as exc:
             logger.warning("_try_push_next: dispatch refused for %s — %s", task.task_id, exc)
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port, nonce=_nonce))
+        push_fn(guarded_pane_id, _format_task_message(
+            task, port, nonce=_nonce, project=_server_identity()["project"]))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
@@ -3994,7 +4004,8 @@ def create_app(
         except AdmissionRefused as exc:
             logger.warning("_try_push_discuss: dispatch refused for %s — %s", task.task_id, exc)
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port, nonce=_nonce))
+        push_fn(guarded_pane_id, _format_task_message(
+            task, port, nonce=_nonce, project=_server_identity()["project"]))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
@@ -4206,7 +4217,9 @@ def create_app(
                     continue
                 else:
                     try:
-                        push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
+                        push_fn(pane_id, _format_reminder_message(
+                            task_id, port, idle_for, project=_server_identity()["project"],
+                            mcp_mode=not _push_enabled))
                     except Exception:
                         logger.exception(
                             f"watchdog: failed to push reminder for {task_id}"
@@ -4947,7 +4960,8 @@ def create_app(
             logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
             _release_dispatch_slot(task.task_id, _slot)
             return
-        message = _format_task_message(task, port, nonce=_dispatch_nonce)
+        message = _format_task_message(
+            task, port, nonce=_dispatch_nonce, project=_server_identity()["project"])
         if _renew_previous_session:
             _summary = codex_latest_compaction_summary(_renew_previous_session)
             _seed = "summary_and_checkpoint" if _summary else "checkpoint_only"
@@ -6202,6 +6216,20 @@ def create_app(
         return {"project": name, "db_path": db_path, "port": port or 0,
                 "state_path": state_path or ""}
 
+    def _require_project_identity(client_project: Optional[str]) -> None:
+        if not identity_required:
+            return
+        server_project = _server_identity()["project"]
+        if client_project and client_project == server_project:
+            return
+        logger.error("#362 project identity rejected task transport: expected project=%r, server project=%r",
+                     client_project, server_project)
+        if not client_project:
+            raise HTTPException(status_code=428, detail="X-Agent-Crew-Project is required")
+        raise HTTPException(status_code=409, detail=(
+            f"project identity mismatch: expected project={client_project!r}, "
+            f"server project={server_project!r}"))
+
     @app.get("/health")
     def health():
         """Liveness plus the build this process is actually running (#248).
@@ -6416,7 +6444,9 @@ def create_app(
         return {"task_id": task_id}
 
     @app.get("/tasks/next")
-    def get_next_task(role: str = "", agent: str = ""):
+    def get_next_task(role: str = "", agent: str = "",
+                      x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         # #172: in MCP-only mode the LLM must use the get_next_task MCP tool,
         # not curl-poll this HTTP endpoint — block to prevent idle token burn.
         if not _push_enabled:
@@ -6518,7 +6548,9 @@ def create_app(
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
 
     @app.post("/tasks/{task_id}/start", status_code=200)
-    def start_task(task_id: str, body: dict = Body(default_factory=dict)):
+    def start_task(task_id: str, body: dict = Body(default_factory=dict),
+                   x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         """P2 EXECUTE_START — the pane's one-shot go/no-go before it starts work.
 
         ``{"nonce": "<the dispatch nonce from the task block>"}`` →
@@ -6542,12 +6574,14 @@ def create_app(
             raise HTTPException(status_code=500, detail=str(exc))
 
     @app.post("/tasks/{task_id}/result", status_code=200)
-    def submit_result(task_id: str, result: TaskResult):
+    def submit_result(task_id: str, result: TaskResult,
+                      x_agent_crew_project: Optional[str] = Header(default=None)):
         """Accept active results; keep rejected late payloads as exec events.
 
         System-ended rows return HTTP 409. A late original whose fallback
         owns the lineage returns an acknowledged, ignored result instead.
         """
+        _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
@@ -7285,5 +7319,6 @@ app = create_app(
     db_path=os.path.expanduser(os.getenv("AGENT_CREW_DB", "~/.agent_crew/default.db")),
     pane_map=_load_pane_map(),
     port=int(os.getenv("AGENT_CREW_PORT", "0") or 0),
+    project=os.getenv("AGENT_CREW_PROJECT") or None,
     state_path=os.path.expanduser(os.getenv("AGENT_CREW_STATE", "")) or None,
 )

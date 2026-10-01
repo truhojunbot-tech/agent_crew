@@ -127,6 +127,23 @@ available.
 
 ## Polling Loop (session start)
 
+## Server identity check (#362)
+
+Before receiving a task or submitting a result, check that this port still
+serves this project. Stop if `/health` is unavailable or reports another project:
+
+```bash
+EXPECTED_PROJECT="<project>"
+ACTUAL_PROJECT=$(curl -fsS http://127.0.0.1:<port>/health 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("project", ""))' 2>/dev/null)
+if [ "$ACTUAL_PROJECT" != "$EXPECTED_PROJECT" ]; then
+  echo "agent_crew identity verification failed: expected project=$EXPECTED_PROJECT, server project=${ACTUAL_PROJECT:-unavailable}. Do not receive a task or submit a result." >&2
+  exit 1
+fi
+```
+
+Include `X-Agent-Crew-Project: <project>` on every worker HTTP poll, start,
+and result POST.
+
 At session start and after each task completes, poll every 30 seconds for the
 next task so no task is missed even if a push is delayed:
 
@@ -135,7 +152,7 @@ next task so no task is missed even if a push is delayed:
 get_next_task(agent="<your-agent-name>")
 
 # Or via HTTP fallback:
-curl -s http://127.0.0.1:<port>/tasks/next?role=<role>
+curl -s -H "X-Agent-Crew-Project: <project>" http://127.0.0.1:<port>/tasks/next?role=<role>
 ```
 
 If the response is `null` / empty, wait 30 seconds and try again.
@@ -839,6 +856,10 @@ def generate(role: str, project: str, port: int, agent: str = "",
             "<test_scope>",
             render_scope(load_scope(worktree_path, project)))
     content = body.replace("<project>", project).replace("<port>", str(port))
+    content = content.replace(
+        '-H "Content-Type: application/json"',
+        f'-H "X-Agent-Crew-Project: {project}" \\\n+  -H "Content-Type: application/json"',
+    )
     return content
 
 
