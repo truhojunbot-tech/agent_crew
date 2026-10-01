@@ -1,4 +1,24 @@
+import pytest
+
 from agent_crew.instructions import ROLE_FILES, generate
+
+
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
+@pytest.mark.parametrize("delivery", ["dispatcher", "mcp", "both"])
+def test_review_and_test_pytest_runs_are_bounded(role, delivery):
+    content = generate(role, "myproject", 8123, delivery=delivery)
+    assert 'timeout -k 10 "$N" python -m pytest' in content
+    assert "remaining dispatch budget" in content
+    assert "600" in content
+    assert "124" in content and "137" in content
+    assert "files changed by the PR" in content
+    assert "full suite was not completed" in content
+    assert "never report" in content.lower()
+
+
+def test_implementer_protocol_has_no_pytest_rule():
+    content = generate("implementer", "myproject", 8123, delivery="dispatcher")
+    assert "Bounded pytest runs" not in content
 
 
 def test_u_i01_generate_describes_push_model_and_result_submission():
