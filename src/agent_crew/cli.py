@@ -131,25 +131,31 @@ def _writable_queue(db: str, *, base: str = "", project: str = ""):
     if (isinstance(state, dict)
             and os.path.realpath(str(state.get("db") or "")) == os.path.realpath(db)
             and state.get("port")):
-        port = setup_module.require_project_port(
-            state["port"], str(state.get("project") or ""))
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
-                health = json.loads(response.read().decode())
-        except (urllib.error.URLError, TimeoutError, OSError):
-            # An offline project keeps the existing local CLI behavior.
-            health = None
-        if health is not None:
-            from agent_crew.provenance import build
+            port = setup_module.require_project_port(
+                state["port"], str(state.get("project") or ""))
+        except ValueError as exc:
+            logger.warning("Ignoring corrupt project port in %s: %s", state_path, exc)
+            port = None
+        if port is not None:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                    health = json.loads(response.read().decode())
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                # Unavailable or unreadable health keeps the legacy local CLI path.
+                logger.warning("Cannot read /health for %s: %s", state_path, exc)
+                health = None
+            if health is not None:
+                from agent_crew.provenance import build
 
-            server_commit = str((health.get("build") or {}).get("commit") or "") if isinstance(health, dict) else ""
-            cli_commit = str(build().get("commit") or "")
-            if not server_commit or not cli_commit or server_commit != cli_commit:
-                raise click.ClickException(
-                    f"Refusing writable tasks.db access: server build {server_commit or 'unknown'} "
-                    f"differs from CLI build {cli_commit or 'unknown'}. "
-                    f"Use the server's HTTP API at http://127.0.0.1:{port} or run a matching CLI build."
-                )
+                server_commit = str((health.get("build") or {}).get("commit") or "") if isinstance(health, dict) else ""
+                cli_commit = str(build().get("commit") or "")
+                if not server_commit or not cli_commit or server_commit != cli_commit:
+                    raise click.ClickException(
+                        f"Refusing writable tasks.db access: server build {server_commit or 'unknown'} "
+                        f"differs from CLI build {cli_commit or 'unknown'}. "
+                        f"Use the server's HTTP API at http://127.0.0.1:{port} or run a matching CLI build."
+                    )
     from agent_crew.queue import TaskQueue
 
     return TaskQueue(db)

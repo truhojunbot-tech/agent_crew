@@ -71,6 +71,26 @@ def test_unreachable_server_keeps_writable_queue_behavior(tmp_path, monkeypatch)
     assert _triggers(db)
 
 
+def test_malformed_health_keeps_legacy_queue_behavior(tmp_path, monkeypatch):
+    db, _ = _project(tmp_path)
+    monkeypatch.setattr("urllib.request.urlopen",
+                        lambda url, timeout: io.BytesIO(b"not-json"))
+
+    cli._writable_queue(str(db))
+
+    assert _triggers(db)
+
+
+def test_corrupt_state_port_keeps_legacy_queue_behavior(tmp_path):
+    db, state = _project(tmp_path)
+    state["port"] = "bogus"
+    (db.parent / "state.json").write_text(json.dumps(state))
+
+    cli._writable_queue(str(db))
+
+    assert _triggers(db)
+
+
 def test_status_remains_read_only_on_build_mismatch(tmp_path, monkeypatch):
     db, _ = _project(tmp_path)
     _health(monkeypatch, SERVER_SHA)
