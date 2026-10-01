@@ -67,22 +67,26 @@ def test_u_l04_handle_review_result_no_tester():
 
 # U-L05: handle_review_result verdict=request_changes → "request_changes"
 def test_u_l05_handle_review_result_request_changes():
+    # #376: a rejection is actionable only when it names at least one finding.
     result = TaskResult(
         task_id="r-002",
         status="completed",
         summary="Needs work",
         verdict="request_changes",
+        findings=["src/loop.py:1: correct the reported behavior"],
     )
     assert handle_review_result(result, iteration=1, max_iter=DEFAULT_MAX_ITER) == "request_changes"
 
 
 # U-L06: handle_review_result iteration >= max_iter → "escalate"
 def test_u_l06_handle_review_result_escalate():
+    # #376: exercise the iteration cap with a valid rejection, not silence.
     result = TaskResult(
         task_id="r-003",
         status="completed",
         summary="Still needs work",
         verdict="request_changes",
+        findings=["src/loop.py:1: correct the reported behavior"],
     )
     assert handle_review_result(result, iteration=DEFAULT_MAX_ITER, max_iter=DEFAULT_MAX_ITER) == "escalate"
 

@@ -204,11 +204,9 @@ def _resolve_verdict(result: TaskResult) -> str:
     - anything else → ``invalid_review_result``: missing/None/unknown verdict,
       ``approve`` carrying findings, ``request_changes`` carrying none.
 
-    ``invalid_review_result`` is not a verdict. Every caller compares against
-    ``"approve"``/``"request_changes"``, so it falls through all of them: no
-    merge, no test enqueue, and no fix round. That is deliberate — a malformed
-    review says nothing about the work, and acting on it is how a review that
-    found nothing ended up driving a retry chain.
+    ``invalid_review_result`` is not a verdict. Callers must stop on it:
+    no merge, test enqueue, or fix round. A malformed review says nothing
+    about the work, so it cannot authorize a successor.
     """
     status = getattr(result, "status", None)
     if status and status != "completed":
@@ -279,6 +277,9 @@ def handle_review_result(
         return "review_failed"
 
     verdict = _resolve_verdict(result)
+    if verdict == INVALID_REVIEW_RESULT:
+        # A malformed review authorizes no successor or escalation round.
+        return INVALID_REVIEW_RESULT
     if iteration >= max_iter and verdict != "approve":
         if queue is not None:
             gate = GateRequest(

@@ -29,6 +29,10 @@ BRANCH = "feat/login"
 
 def _submit(client, task_id: str, status: str = "completed",
             summary: str = "done", verdict=None, findings=None):
+    # #376: review submissions must meet the result contract; the short labels
+    # below describe scenarios, not valid worker summaries for the HTTP API.
+    if verdict and len(summary) < 40:
+        summary = f"Reviewed this change and recorded the verdict: {summary}."
     payload = {"task_id": task_id, "status": status,
                "summary": summary, "findings": findings or []}
     if verdict:
@@ -60,7 +64,8 @@ def test_i_lo01_approve_first_review(task_queue, test_client):
     )
     assert outcome == "approved"
 
-    test_id = enqueue_test(task_queue, DESC, BRANCH)
+    # The HTTP review result already cascaded a test; adopt that successor.
+    test_id = enqueue_test(task_queue, DESC, BRANCH, prev_task_id=review_id)
     _submit(test_client, test_id, summary="All tests pass")
 
     assert handle_test_result(_make_result(test_id)) == "passed"
@@ -108,10 +113,13 @@ def test_i_lo03_max_iterations_escalate(task_queue, test_client):
 
     for i in range(1, DEFAULT_MAX_ITER + 1):
         review_id = enqueue_review(task_queue, DESC, BRANCH, prev_task_id=prev_id)
-        _submit(test_client, review_id, summary="Still needs work", verdict="request_changes")
+        # #376: escalation requires a real rejection, not a verdict with no finding.
+        findings = ["code_quality: the login error path still needs a fix"]
+        _submit(test_client, review_id, summary="Still needs work", verdict="request_changes",
+                findings=findings)
 
         outcome = handle_review_result(
-            _make_result(review_id, verdict="request_changes"),
+            _make_result(review_id, verdict="request_changes", findings=findings),
             iteration=i, max_iter=DEFAULT_MAX_ITER,
             queue=task_queue,
         )
@@ -154,7 +162,8 @@ def test_i_lo05_test_failure_reimplements(task_queue, test_client):
     handle_review_result(_make_result(review_id, verdict="approve"),
                          iteration=1, max_iter=DEFAULT_MAX_ITER)
 
-    test_id = enqueue_test(task_queue, DESC, BRANCH)
+    # The HTTP review result already cascaded a test; adopt that successor.
+    test_id = enqueue_test(task_queue, DESC, BRANCH, prev_task_id=review_id)
     _submit(test_client, test_id, status="failed", summary="3 tests failed")
 
     test_outcome = handle_test_result(_make_result(test_id, status="failed"))
