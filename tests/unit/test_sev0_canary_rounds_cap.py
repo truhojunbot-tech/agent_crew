@@ -335,6 +335,34 @@ def test_latest_valid_lineage_receipt_wins_over_future_contract(
         decision_at - 10, timezone.utc).isoformat()
 
 
+def test_real_mtime_receipt_cited_when_live_contract_is_from_future(
+        q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    path = tmp_path / "policy.json"
+    observed_mtime = (datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp()
+    os.utime(path, (observed_mtime, observed_mtime))
+    q.submit_result(ROOT, TaskResult(task_id=ROOT, status="completed", summary="done"))
+    stored = q.get_tokenomics_shadow_receipt(ROOT)
+    assert json.loads(stored["shadow_recommendation_json"])["produced_at"] == (
+        datetime.fromtimestamp(observed_mtime, timezone.utc).isoformat())
+
+    review = _review(q)
+    decision_at = q.get_exec_state(review)["events"][-1]["at"]
+    # The re-emitted live file is newer than the review decision and must not
+    # be used; only the already-stored implementation receipt is eligible.
+    future_mtime = decision_at + 60
+    os.utime(path, (future_mtime, future_mtime))
+    assert _run(q, review) is None
+    row = q.get_tokenomics_shadow_receipt(ROOT)
+    citation = json.loads(row["canary_recommendation_json"])
+    assert citation["decision_source"] == "quota_core_contract"
+    assert citation["cited_task_id"] == ROOT
+    assert citation["produced_at"] == datetime.fromtimestamp(
+        observed_mtime, timezone.utc).isoformat()
+
+
 def test_recently_read_stale_contract_receipt_uses_baseline(q, tmp_path, monkeypatch):
     monkeypatch.setenv(CANARY_ENV, ROOT)
     monkeypatch.setenv(ROUNDS_CAP_ENV, "1")

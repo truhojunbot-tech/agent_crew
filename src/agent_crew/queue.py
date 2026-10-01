@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
 from agent_crew.anomaly import _extract_repo_from_url, auto_detect_expected_repos
@@ -4306,6 +4307,13 @@ class TaskQueue:
         rather than laundering the immutable admission-time receipt.
         """
         shadow = shadow_recommendation_for_task_id(task_id)
+        produced_at = shadow.get("produced_at")
+        if produced_at is None and shadow.get("contract_mtime") is not None:
+            try:
+                produced_at = datetime.fromtimestamp(
+                    shadow["contract_mtime"], timezone.utc).isoformat()
+            except (TypeError, ValueError, OverflowError, OSError):
+                pass
         now = time.time()
         conn = self._connect()
         try:
@@ -4318,7 +4326,7 @@ class TaskQueue:
                        shadow_resolved_at=?, shadow_reason=?, updated_at=?
                    WHERE task_id=?""",
                 (shadow["decision_source"], shadow["policy_version"],
-                 (json.dumps({"produced_at": shadow.get("produced_at"),
+                 (json.dumps({"produced_at": produced_at,
                               "recommendation": shadow["recommendation"]})
                   if shadow["recommendation"] is not None else None), shadow.get("contract_sha"),
                  now, shadow["reason"], now, task_id),
