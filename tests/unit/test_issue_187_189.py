@@ -9,10 +9,8 @@ agents whose shell wrappers strip git's credential helper chain (gemini-
 cli most notably) can still ``git fetch`` against PR branches.
 """
 import json
-import subprocess
 from unittest.mock import patch, MagicMock
 
-import pytest
 from click.testing import CliRunner
 
 import agent_crew.cli as cli
@@ -48,7 +46,8 @@ def test_b187_enqueue_writes_review_task_type_via_http(tmp_path):
         return resp
 
     runner = CliRunner()
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("agent_crew.cli._verify_project_server"), \
+         patch("urllib.request.urlopen", side_effect=fake_urlopen):
         result = runner.invoke(cli.crew, [
             "enqueue", "review", "Review PR #1666",
             "--project", "proj", "--base", str(tmp_path),
@@ -81,12 +80,15 @@ def test_b187_enqueue_test_type(tmp_path):
     captured = {}
     def fake_urlopen(req, timeout=10):
         captured["body"] = json.loads(req.data.decode())
-        r = MagicMock(); r.status = 201
-        r.__enter__ = MagicMock(return_value=r); r.__exit__ = MagicMock(return_value=False)
+        r = MagicMock()
+        r.status = 201
+        r.__enter__ = MagicMock(return_value=r)
+        r.__exit__ = MagicMock(return_value=False)
         return r
 
     runner = CliRunner()
-    with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+    with patch("agent_crew.cli._verify_project_server"), \
+         patch("urllib.request.urlopen", side_effect=fake_urlopen):
         result = runner.invoke(cli.crew, [
             "enqueue", "test", "Verify PR #1666",
             "--project", "proj", "--base", str(tmp_path),

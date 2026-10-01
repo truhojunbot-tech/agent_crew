@@ -607,7 +607,8 @@ def test_u_c43_status_uses_server_when_reachable(tmp_path):
          "branch": "main", "priority": 3, "context": {}, "status": "failed"},
     ]
 
-    def mock_fetch(port, status):
+    def mock_fetch(port, status, project=""):
+        assert project == "proj43"
         return [t for t in server_tasks if t["status"] == status]
 
     runner = CliRunner()
@@ -967,7 +968,7 @@ def test_u_c53_status_lists_queue_in_progress_and_completed_tasks(tmp_path):
         return MagicMock(returncode=0, stdout="", stderr="")
 
     runner = CliRunner()
-    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=lambda _port, status: task_groups[status]), \
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=lambda _port, status, project="": task_groups[status]), \
          patch("agent_crew.cli._validate_pane_map", return_value={"valid": True, "mismatches": [], "suggestions": []}), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run):
         result = runner.invoke(crew, ["status", "proj", "--base", str(tmp_path), "--preview", "0"])

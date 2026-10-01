@@ -5,6 +5,7 @@ import json
 import sqlite3
 
 from click.testing import CliRunner
+from unittest.mock import patch
 
 from agent_crew import cli
 
@@ -34,15 +35,16 @@ def _triggers(db):
 def _health(monkeypatch, commit):
     monkeypatch.setattr("agent_crew.provenance.build", lambda: {"commit": CLI_SHA})
     monkeypatch.setattr("urllib.request.urlopen", lambda url, timeout: io.BytesIO(
-        json.dumps({"build": {"commit": commit}}).encode()))
+        json.dumps({"project": "sample", "build": {"commit": commit}}).encode()))
 
 
 def test_mismatched_served_build_refuses_before_schema_migration(tmp_path, monkeypatch):
     db, _ = _project(tmp_path)
     _health(monkeypatch, SERVER_SHA)
 
-    result = CliRunner().invoke(cli.crew, [
-        "run", "implement a change", "--project", "sample", "--base", str(tmp_path)])
+    with patch("agent_crew.cli._port_listening", return_value=True):
+        result = CliRunner().invoke(cli.crew, [
+            "run", "implement a change", "--project", "sample", "--base", str(tmp_path)])
 
     assert result.exit_code != 0
     assert CLI_SHA in result.output and SERVER_SHA in result.output
