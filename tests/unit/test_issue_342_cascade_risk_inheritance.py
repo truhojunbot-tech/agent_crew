@@ -59,6 +59,26 @@ def test_review_and_fix_inherit_explicit_root_declaration(tmp_db):
     assert queue.get_task_context(fix_id)["risk_declaration"]["inherited_from"] == "risk-root"
 
 
+def test_auto_fix_with_server_finding_keeps_root_risk_facts(tmp_db):
+    """A filename in copied review feedback is not a new architecture declaration."""
+    queue = TaskQueue(tmp_db)
+    _root(queue)
+    review_id = _review(queue)
+    queue.submit_result(review_id, TaskResult(
+        review_id, "completed", "The HTTP task route needs an identity check.",
+        verdict="request_changes",
+        findings=["src/agent_crew/server.py:6376: reject a mismatched project"],
+        pr_number=51))
+    fix_id = auto_enqueue_fix(queue, review_id, pr_state_fn=lambda _: "open",
+                              repo="owner/repo")
+    assert fix_id
+    fix = _attribution(queue, fix_id)
+    assert fix["risk_declaration_source"] == "explicit"
+    assert fix["risk_declaration_confidence"] == "high"
+    assert fix["broad_architecture_change"] == 0
+    assert queue.get_task_context(fix_id)["risk_declaration"]["inherited_from"] == "risk-root"
+
+
 def test_test_task_inherits_explicit_root_declaration(tmp_db):
     queue = TaskQueue(tmp_db)
     _root(queue)
