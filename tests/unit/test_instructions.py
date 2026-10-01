@@ -3,6 +3,18 @@ import pytest
 from agent_crew.instructions import ROLE_FILES, generate
 
 
+@pytest.mark.parametrize("delivery", ["dispatcher", "mcp", "push", "both"])
+def test_reviewer_approve_requires_empty_findings_in_every_delivery(delivery):
+    content = generate("reviewer", "myproject", 8123, delivery=delivery)
+    assert "approve` requires `findings: []`" in content
+    assert "Non-blocking notes, nits, and coverage gaps" in content
+    assert "summary or the GitHub PR comment" in content
+    assert "request_changes` findings list only" in content
+    assert "changes required to approve." in content
+    assert "may be empty on `approve`" not in content
+    assert content.index("approve` requires `findings: []`") < content.index("### Bounded pytest runs")
+
+
 @pytest.mark.parametrize("role", ["reviewer", "tester"])
 @pytest.mark.parametrize("delivery", ["dispatcher", "mcp", "both"])
 def test_review_and_test_pytest_runs_are_bounded(role, delivery):
