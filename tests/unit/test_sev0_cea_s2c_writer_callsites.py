@@ -372,9 +372,11 @@ def test_the_same_intent_under_a_new_task_id_is_refused_as_a_duplicate(tmp_path)
 def test_the_same_idempotency_key_returns_the_existing_receipt(tmp_path):
     q = queue(tmp_path, wired=True)
     ctx = admitted({"idempotency_key": "k1"})
-    q.enqueue(task("t1", task_type="review", context=ctx))
+    # Use an implement task: the separate standing-review guard rejects a
+    # second review before this CEA idempotency assertion can inspect it.
+    q.enqueue(task("t1", task_type="implement", context=ctx))
     first = row(q, "t1")["receipt_id"]
-    q.enqueue(task("t2", task_type="review", context=ctx))
+    q.enqueue(task("t2", task_type="implement", context=ctx))
     assert row(q, "t2")["receipt_id"] == first, \
         "a replayed request is the same work; it does not get a second receipt (P4)"
 
@@ -434,6 +436,33 @@ def test_execute_start_spends_the_nonce_exactly_once(tmp_path):
     assert first["go"] is True and first["nonce_spent"] is True
     second = q.start_execution("t1", nonce, presenter="codex")
     assert second["go"] is False, "P4: a dispatch nonce is single-use"
+
+
+def test_unknown_consumed_status_keeps_allowlisted_replay_no_go(tmp_path):
+    """An ALREADY_COMPLETED allowlist cannot admit unverified consumed work."""
+    q = TaskQueue(
+        str(tmp_path / "consumed-unknown.db"),
+        cea_config=EngineConfig(
+            mode="test", enforce_codes=frozenset({"ALREADY_COMPLETED"})),
+        cea_providers=dict(WIRED),
+    )
+    q.enqueue(task("first", task_type="review", context=admitted()))
+    q.dequeue(agent="codex", role="reviewer")
+    nonce = q.record_dispatch("first", channel="tmux_pane", agent="codex", target="%1")
+    assert q.start_execution("first", nonce, presenter="codex")["go"] is True
+    q.submit_result("first", TaskResult(
+        "first", "completed", "Reviewed and approved the full change successfully.",
+        verdict="approve"), nonce=nonce, presenter="codex")
+    assert receipt_of(q, "first")["state"] == "CONSUMED"
+    # The task row is missing, so completion cannot be established from it.
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("DELETE FROM tasks WHERE task_id='first'")
+
+    with pytest.raises(AdmissionRefused) as refusal:
+        q.enqueue(task("replay", task_type="review", context=admitted()))
+    assert refusal.value.gate.proceed is False
+    assert refusal.value.outcome == "BLOCK"
+    assert q.get_task_status("replay") is None
 
 
 def test_shadow_block_start_is_explicitly_advisory(tmp_path):

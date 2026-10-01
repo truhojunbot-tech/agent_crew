@@ -404,6 +404,9 @@ def test_consumed_completed_task_still_blocks_same_intent(conn, mode):
     set_task_status(conn, first.receipt_id, "completed")
     retry = eng.authorize(conn, _ops("complete-2"), caller())
     assert retry.code == "ALREADY_COMPLETED"
+    assert retry.receipt["reason"]["text"] == (
+        f"this intent completed as receipt {first.receipt_id}; "
+        "re-admission requires a superseding decision record (P4)")
 
 
 @pytest.mark.parametrize("mode", ["shadow", "test"])
@@ -417,6 +420,12 @@ def test_consumed_unknown_task_status_still_blocks_same_intent(conn, mode, missi
     # The task row is already absent in the task_row case.
     retry = eng.authorize(conn, _ops("unknown-2"), caller())
     assert retry.code == "ALREADY_COMPLETED"
+    assert retry.http_status == 409 and retry.decision == "BLOCK"
+    assert retry.receipt["reason"]["code"] == "ALREADY_COMPLETED"
+    assert retry.receipt["reason"]["text"] == (
+        f"completion not verifiable: lineage consumed as receipt {first.receipt_id} "
+        "but task status is unknown; re-admission requires a superseding "
+        "decision record (P4)")
     lineage = receipt_store.lineage_for_intent(conn, first.receipt["intent_hash"])
     assert lineage["receipt_id"] == first.receipt_id
 

@@ -880,15 +880,22 @@ class AuthorizationEngine:
             # CONSUMED only means the receipt ran. Release its claim only for
             # an explicitly known unsuccessful task outcome; missing task data
             # cannot prove that re-admission is safe.
-            if (receipt_store.task_status(conn, prior["task_id"])
-                    in RELEASABLE_CONSUMED_TASK_STATUSES):
+            task_status = receipt_store.task_status(conn, prior["task_id"])
+            if task_status in RELEASABLE_CONSUMED_TASK_STATUSES:
                 receipt_store.release_lineage(conn, ih, lineage["receipt_id"])
                 return None
             # Completed or unverified work retains the replay guard.
+            reason = (
+                f"completion not verifiable: lineage consumed as receipt {lineage['receipt_id']} "
+                "but task status is unknown; re-admission requires a superseding "
+                "decision record (P4)"
+                if task_status is None else
+                f"this intent completed as receipt {lineage['receipt_id']}; "
+                "re-admission requires a superseding decision record (P4)"
+            )
             return Authorization(
                 receipt=self._refusal(intent, caller, ih, "ALREADY_COMPLETED",
-                                     f"this intent completed as receipt {lineage['receipt_id']}; "
-                                     f"re-admission requires a superseding decision record (P4)",
+                                     reason,
                                      conn=conn),
                 http_status=409, code="ALREADY_COMPLETED",
                 existing_receipt_id=lineage["receipt_id"])
