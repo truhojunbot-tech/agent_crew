@@ -300,11 +300,38 @@ def test_revised_outcome_replaces_first_capture(tmp_path):
     storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
     capture_task_outcome(storage, project="agent_crew", repo="agent_crew",
                          task_id="reused", status="failed", summary="first")
+    scope = MemoryScope(project="agent_crew", task_id="reused")
+    assert [r.layer for r in storage.retrieve_shadow(scope, {"failure_pattern"}, 10)[0]] == [
+        "failure_pattern"]
     capture_task_outcome(storage, project="agent_crew", repo="agent_crew",
                          task_id="reused", status="completed", summary="corrected")
-    records = storage.retrieve(MemoryScope(project="agent_crew", task_id="reused"))
+    with sqlite3.connect(storage.path) as db:
+        retired = db.execute(
+            "SELECT value FROM adr001_memory WHERE layer='failure_pattern' "
+            "AND key='task:reused:failure_pattern'").fetchone()
+    assert retired is not None
+    assert json.loads(retired[0])["status"] == "failed"
+    assert json.loads(retired[0])["superseded_at"] > 0
+    assert storage.retrieve_shadow(scope, {"failure_pattern"}, 10)[0] == []
+    records = storage.retrieve(scope)
     assert {r.value["status"] for r in records} == {"completed"}
     assert {r.layer for r in records} == {"episodic", "decision"}
+
+
+def test_completed_episode_supersedes_failed_pattern_without_deleting_it(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    capture_episode(storage, {"task_id": "episode-1", "outcome": "failed"},
+                    project="agent_crew")
+    capture_episode(storage, {"task_id": "episode-1", "outcome": "completed"},
+                    project="agent_crew")
+    with sqlite3.connect(storage.path) as db:
+        retired = db.execute(
+            "SELECT value FROM adr001_memory WHERE layer='failure_pattern' "
+            "AND key='episode:episode-1:failure_pattern'").fetchone()
+    assert retired is not None
+    assert json.loads(retired[0])["superseded_at"] > 0
+    assert storage.retrieve_shadow(MemoryScope(project="agent_crew"),
+                                   {"failure_pattern"}, 10)[0] == []
 
 
 def test_timeout_is_captured_as_failure_evidence(tmp_path):

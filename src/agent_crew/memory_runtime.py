@@ -211,8 +211,14 @@ class SQLiteMemoryStorage:
                     (record.layer, record.key, json.dumps(record.value), scope,
                      version, time.time()))
             for key in retire_keys:
-                db.execute("DELETE FROM adr001_memory WHERE layer='failure_pattern' AND key=? "
-                           "AND json_extract(scope,'$.project')=?", (key, project))
+                # Preserve the failed observation for audit. Both retrieval
+                # paths already exclude values with a superseded_at timestamp;
+                # the ordinary retention prune still ages this row out.
+                db.execute("UPDATE adr001_memory SET value=json_set(value,'$.superseded_at',?) "
+                           "WHERE layer='failure_pattern' AND key=? "
+                           "AND json_extract(scope,'$.project')=? "
+                           "AND json_extract(value,'$.superseded_at') IS NULL",
+                           (time.time(), key, project))
             db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
                 SELECT rowid FROM adr001_memory
                 WHERE layer IN ('episodic','decision','failure_pattern')
