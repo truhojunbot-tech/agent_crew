@@ -134,9 +134,20 @@ def test_codex_resumed_thread_receipt_uses_per_task_delta_and_keeps_cumulative(t
 def test_codex_first_task_and_changed_session_do_not_subtract(tmp_path):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     first, _ = _codex_task(queue, "first", "thread-a", 1, output_tokens=30)
-    renewed, economics = _codex_task(queue, "renewed", "thread-b", 2, output_tokens=7)
+    # A fresh provider session starts a new context generation and index.
+    renewed, economics = _codex_task(queue, "renewed", "thread-b", 1, output_tokens=7)
     assert first["output_tokens"] == 30
     assert renewed["output_tokens"] == economics["output_tokens"] == 7
+
+
+def test_codex_resumed_task_with_missing_earlier_attribution_has_unknown_delta(tmp_path, caplog):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    row, economics = _codex_task(queue, "second", "thread-a", 2,
+                                 uncached_input_tokens=100, output_tokens=20)
+    assert row["uncached_input_tokens"] is economics["uncached_input_tokens"] is None
+    assert row["output_tokens"] is economics["output_tokens"] is None
+    assert json.loads(row["codex_thread_cumulative"])["output_tokens"] == 20
+    assert "no earlier attribution" in caplog.text
 
 
 def test_codex_negative_or_unknown_previous_field_is_null(tmp_path):

@@ -4293,6 +4293,49 @@ class TaskQueue:
             conn.close()
 
     @staticmethod
+    def _codex_token_observations(
+        conn: sqlite3.Connection, task_id: str, telemetry: TaskTelemetry,
+        attribution: sqlite3.Row, usage_fields: tuple[str, ...],
+    ) -> list[tuple[str, int | str | None]]:
+        """Derive one task's usage from its session's last durable cumulative row."""
+        cumulative = {field: getattr(telemetry, field) for field in usage_fields}
+        session = telemetry.provider_session_id or attribution["provider_session_id"]
+        index = attribution["session_task_index"] or 0
+        previous = None
+        if index > 1 and session and session != "unknown":
+            previous = conn.execute(
+                """SELECT codex_thread_cumulative FROM task_attribution
+                   WHERE agent='codex' AND project=? AND provider_session_id=?
+                     AND session_task_index < ? AND task_id != ?
+                   ORDER BY session_task_index DESC, created_at DESC LIMIT 1""",
+                (attribution["project"], session, index, task_id),
+            ).fetchone()
+        if index > 1 and previous is None:
+            logger.warning(
+                "codex usage delta unavailable for task=%s: no earlier attribution "
+                "for session=%s index=%s", task_id, session or "unknown", index,
+            )
+        previous_values = None
+        if previous is not None and previous["codex_thread_cumulative"]:
+            try:
+                previous_values = json.loads(previous["codex_thread_cumulative"])
+            except (TypeError, ValueError):
+                previous_values = None
+        if not isinstance(previous_values, dict):
+            previous_values = {}
+        observed: list[tuple[str, int | str | None]] = []
+        for field, current in cumulative.items():
+            if index <= 1:
+                delta = current
+            else:
+                prior = previous_values.get(field)
+                delta = (current - prior if isinstance(current, int) and
+                         isinstance(prior, int) and current >= prior else None)
+            observed.append((field, delta))
+        observed.append(("codex_thread_cumulative", json.dumps(cumulative)))
+        return observed
+
+    @staticmethod
     def _store_task_telemetry(
         conn: sqlite3.Connection, task_id: str, telemetry: TaskTelemetry, now: float
     ) -> None:
@@ -4319,40 +4362,9 @@ class TaskQueue:
             "FROM task_attribution WHERE task_id=?", (task_id,)
         ).fetchone()
         if attribution is not None and attribution["agent"] == "codex":
-            usage_fields = fields[:6]
-            cumulative = {field: getattr(telemetry, field) for field in usage_fields}
-            session = telemetry.provider_session_id or attribution["provider_session_id"]
-            previous = None
-            session_unknown = not session or session == "unknown"
-            if not session_unknown and attribution["session_task_index"] > 1:
-                previous = conn.execute(
-                    """SELECT codex_thread_cumulative FROM task_attribution
-                       WHERE agent='codex' AND project=? AND provider_session_id=?
-                         AND session_task_index < ? AND task_id != ?
-                       ORDER BY session_task_index DESC, created_at DESC LIMIT 1""",
-                    (attribution["project"], session, attribution["session_task_index"], task_id),
-                ).fetchone()
-            previous_values = None
-            if previous is not None and previous["codex_thread_cumulative"]:
-                try:
-                    previous_values = json.loads(previous["codex_thread_cumulative"])
-                except (TypeError, ValueError):
-                    previous_values = {}
-            if previous is not None and not isinstance(previous_values, dict):
-                previous_values = {}
-            observed = []
-            for field in usage_fields:
-                current = cumulative[field]
-                if previous is None and not (session_unknown and attribution["session_task_index"] > 1):
-                    delta = current
-                elif previous is None:
-                    delta = None
-                else:
-                    prior = previous_values.get(field) if previous_values is not None else None
-                    delta = (current - prior if isinstance(current, int) and
-                             isinstance(prior, int) and current >= prior else None)
-                observed.append((field, delta))
-            observed.append(("codex_thread_cumulative", json.dumps(cumulative)))
+            observed = TaskQueue._codex_token_observations(
+                conn, task_id, telemetry, attribution, fields[:6],
+            )
             observed.extend((field, value) for field, value in zip(fields[6:], values[6:])
                             if value is not None)
         else:
