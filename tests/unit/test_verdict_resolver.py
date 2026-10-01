@@ -73,9 +73,16 @@ class TestHandleReviewResult:
 
     def test_clean_null_at_max_iter_does_not_escalate(self):
         # Malformed feedback must neither consume a fix round nor open a gate.
+        class NoSuccessors:
+            def create_gate(self, *_args, **_kwargs):
+                raise AssertionError("invalid review opened an escalation gate")
+
+            def enqueue(self, *_args, **_kwargs):
+                raise AssertionError("invalid review enqueued a test")
+
         outcome = handle_review_result(
             _result(verdict=None, findings=[]), iteration=5, max_iter=5,
-            no_tester=True,
+            no_tester=False, queue=NoSuccessors(), task_desc="work", branch="topic",
         )
         assert outcome == INVALID_REVIEW_RESULT
 
