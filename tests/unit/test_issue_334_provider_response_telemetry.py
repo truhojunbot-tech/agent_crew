@@ -5,6 +5,7 @@ import json
 import pytest
 
 from agent_crew.protocol import TaskRequest
+from agent_crew.protocol import TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.telemetry import TaskTelemetry
 from agent_crew.telemetry_response import response_log_telemetry, response_telemetry
@@ -194,3 +195,136 @@ def test_codex_log_uses_latest_cumulative_turn_not_sum():
     telemetry = response_log_telemetry("codex", "\n".join(map(json.dumps, records)))
     assert (telemetry.uncached_input_tokens, telemetry.cache_read_tokens,
             telemetry.output_tokens) == (60, 80, 15)
+
+
+def test_codex_result_before_terminal_usage_is_filled_at_exit(tmp_path):
+    from agent_crew.server import _record_exit_response_telemetry
+
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _codex_task(queue, "first", "thread-a", 1,
+                uncached_input_tokens=40, cache_read_tokens=60,
+                output_tokens=10, context_window_tokens=100)
+    queue.enqueue(TaskRequest(task_id="second", task_type="implement", description="d"))
+    queue.record_attribution("second", agent="codex", provider_session_id="thread-a",
+                             session_task_index=2)
+    queue.submit_result("second", TaskResult(task_id="second", status="completed", summary="done"))
+    assert queue.get_attribution("second")["codex_thread_cumulative"] is None
+
+    tail = json.dumps({"type": "turn.completed", "usage": {
+        "input_tokens": 140, "cached_input_tokens": 80, "output_tokens": 15,
+    }})
+    _record_exit_response_telemetry(queue, "second", "codex", tail)
+    row = queue.get_attribution("second")
+    economics = json.loads(queue.get_tokenomics_shadow_receipt("second")["economics_json"])
+    assert (row["uncached_input_tokens"], row["cache_read_tokens"],
+            row["output_tokens"]) == (20, 20, 5)
+    assert economics["output_tokens"] == 5
+    assert economics["codex_thread_cumulative"]["output_tokens"] == 15
+
+
+def test_codex_exit_without_terminal_usage_keeps_receipt_unknown(tmp_path):
+    from agent_crew.server import _record_exit_response_telemetry
+
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="only", task_type="implement", description="d"))
+    queue.record_attribution("only", agent="codex", provider_session_id="thread-a",
+                             session_task_index=1)
+    queue.submit_result("only", TaskResult(task_id="only", status="completed", summary="done"))
+    _record_exit_response_telemetry(queue, "only", "codex", '{"type":"turn.started"}')
+    assert queue.get_attribution("only")["output_tokens"] is None
+    assert queue.get_attribution("only")["codex_thread_cumulative"] is None
+
+
+def test_codex_exit_does_not_overwrite_existing_receipt(tmp_path):
+    from agent_crew.server import _record_exit_response_telemetry
+
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    before, _ = _codex_task(queue, "only", "thread-a", 1, output_tokens=10)
+    queue.submit_result("only", TaskResult(task_id="only", status="completed", summary="done"))
+    assert queue.get_attribution("only")["output_tokens"] == 10
+    _record_exit_response_telemetry(queue, "only", "codex", json.dumps({
+        "type": "turn.completed", "usage": {
+            "input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 999,
+        },
+    }))
+    after = queue.get_attribution("only")
+    assert after["output_tokens"] == before["output_tokens"] == 10
+    assert after["uncached_input_tokens"] == 15
+    cumulative = json.loads(after["codex_thread_cumulative"])
+    assert cumulative["output_tokens"] == 10
+    assert cumulative["uncached_input_tokens"] == 15
+    economics = json.loads(queue.get_tokenomics_shadow_receipt("only")["economics_json"])
+    assert economics["output_tokens"] == 10
+    assert economics["codex_thread_cumulative"] == cumulative
+
+
+@pytest.mark.parametrize("provider,tail", [
+    ("claude", json.dumps({"type": "result", "usage": {"output_tokens": 7}})),
+    ("gemini", json.dumps({"response": {"usageMetadata": {"candidatesTokenCount": 7}}})),
+])
+def test_other_providers_keep_exit_telemetry_path(tmp_path, provider, tail):
+    from agent_crew.server import _record_exit_response_telemetry
+
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="only", task_type="implement", description="d"))
+    queue.record_attribution("only", agent=provider)
+    _record_exit_response_telemetry(queue, "only", provider, tail)
+    assert queue.get_attribution("only")["output_tokens"] == 7
+
+
+def test_dispatch_exit_refreshes_usage_after_result_submission(tmp_path, monkeypatch, unused_tcp_port):
+    import asyncio
+
+    from fastapi.testclient import TestClient
+    from agent_crew import server
+    from agent_crew.server import create_app
+
+    wt = tmp_path / "codex"
+    wt.mkdir()
+    (wt / ".git").mkdir()
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"},
+        "worktrees": {"codex": str(wt)},
+    }))
+    db = str(tmp_path / "tasks.db")
+    observations = []
+
+    async def fake_exec(*cmd, **kwargs):
+        path = kwargs["stdout"].name
+
+        class Process:
+            pid = 4242
+            returncode = None
+
+            async def wait(self):
+                queue = TaskQueue(db)
+                queue.submit_result("exit-usage", TaskResult(
+                    task_id="exit-usage", status="completed", summary="done"))
+                observations.append(queue.get_attribution("exit-usage")["codex_thread_cumulative"])
+                with open(path, "a") as log:
+                    log.write(json.dumps({"type": "turn.completed", "usage": {
+                        "input_tokens": 20, "cached_input_tokens": 5, "output_tokens": 7,
+                    }}) + "\n")
+                self.returncode = 0
+                return 0
+
+        return Process()
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port,
+                     state_path=str(state), project="p", watchdog_disabled=True,
+                     anomaly_disabled=True, fallback_disabled=True)
+    with TestClient(app):
+        queue = TaskQueue(db)
+        queue.enqueue(TaskRequest(task_id="exit-usage", task_type="implement",
+                                  description="d", project="p"))
+        task = queue.dequeue(role="implementer")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+    assert observations == [None]
+    row = TaskQueue(db).get_attribution("exit-usage")
+    assert row["output_tokens"] == 7
+    assert json.loads(row["codex_thread_cumulative"])["output_tokens"] == 7

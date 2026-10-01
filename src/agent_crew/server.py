@@ -1323,6 +1323,21 @@ async def _wait_for_dispatch_activity(
                 await wait_task
 
 
+def _record_exit_response_telemetry(queue: TaskQueue, task_id: str,
+                                    agent: str, task_log_tail: str) -> None:
+    """Refresh usage after the child exits, preserving an earlier Codex receipt."""
+    telemetry = response_log_telemetry(agent, task_log_tail)
+    if agent == "codex":
+        if all(getattr(telemetry, field) is None for field in (
+            "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
+            "output_tokens", "reasoning_tokens", "context_window_tokens",
+        )):
+            return
+        queue.record_task_telemetry(task_id, telemetry, only_missing=True)
+    else:
+        queue.record_task_telemetry(task_id, telemetry)
+
+
 #: Cap on the agy/Antigravity conversation the tester resumes with
 #: `--continue` (#236). 0 disables.
 #:
@@ -5407,8 +5422,7 @@ def create_app(
             except Exception:
                 logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
             try:
-                q().record_task_telemetry(
-                    task.task_id, response_log_telemetry(agent, _task_log_tail))
+                _record_exit_response_telemetry(q(), task.task_id, agent, _task_log_tail)
                 _telemetry_attr = q().get_attribution(task.task_id)
                 if _telemetry_attr:
                     append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
