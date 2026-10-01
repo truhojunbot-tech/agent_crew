@@ -1,6 +1,7 @@
 """A recycled local port must not attach workers from another crew (#362)."""
 
 import json
+import subprocess
 from unittest.mock import MagicMock, patch
 from io import BytesIO
 
@@ -116,6 +117,19 @@ def test_generated_protocol_and_pushed_result_assert_project():
     assert "/health" in text
     assert "Do not receive a task or submit a result" in text
     assert "X-Agent-Crew-Project: alpha" in text
+    start = text.index("curl -sS -X POST http://127.0.0.1:8102/tasks/<task_id>/result")
+    command = text[start:text.index("\n```", start)].replace("<task_id>", "task-1")
+    # Execute with a shell function in place of curl: this checks the real
+    # argument vector without making an HTTP request.
+    parsed = subprocess.run(
+        ["bash", "-c", "curl() { printf '%s\\n' \"$@\"; };\n" + command],
+        capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert parsed[:9] == [
+        "-sS", "-X", "POST", "http://127.0.0.1:8102/tasks/task-1/result",
+        "-H", "X-Agent-Crew-Project: alpha",
+        "-H", "Content-Type: application/json", "-d",
+    ]
     task = TaskRequest(task_id="impl-identity", task_type="implement", description="work")
     assert "-H 'X-Agent-Crew-Project: alpha'" in _format_task_message(
         task, 8102, project="alpha")

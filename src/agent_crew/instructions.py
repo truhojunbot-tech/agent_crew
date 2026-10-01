@@ -858,7 +858,7 @@ def generate(role: str, project: str, port: int, agent: str = "",
     content = body.replace("<project>", project).replace("<port>", str(port))
     content = content.replace(
         '-H "Content-Type: application/json"',
-        f'-H "X-Agent-Crew-Project: {project}" \\\n+  -H "Content-Type: application/json"',
+        f'-H "X-Agent-Crew-Project: {project}" \\\n  -H "Content-Type: application/json"',
     )
     return content
 
