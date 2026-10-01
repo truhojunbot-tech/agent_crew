@@ -83,11 +83,12 @@ class AdmissionRefused(Exception):
 
 
 class LateResultRejected(RuntimeError):
-    """A system-ended task is terminal; retain the late payload as evidence."""
+    """Retain a late payload as evidence without reopening a decided lineage."""
     code = "LATE_RESULT_REJECTED"
 
-    def __init__(self, status: str):
+    def __init__(self, status: str, fallback_task_id: Optional[str] = None):
         self.status = status
+        self.fallback_task_id = fallback_task_id
         super().__init__(f"LATE_RESULT_REJECTED: task already {status}")
 
 
@@ -3849,7 +3850,8 @@ class TaskQueue:
                       expected_status: Optional[str] = None,
                       dispatcher_failed: bool = False,
                       allow_review_replay: bool = False,
-                      validate_review: bool = False) -> str:
+                      validate_review: bool = False,
+                      adopted_fallback_task_id: Optional[str] = None) -> str:
         """Submit a task result. Returns the task_type of the completed task
         (so push-model callers can decide what to push next).
 
@@ -3922,7 +3924,24 @@ class TaskQueue:
                 # authority. Worker-supplied error_info is never sufficient.
                 system_failed = (last_end is not None and last_end["event"]
                                  in ("force_failed", "dispatcher_failed"))
-            if prior_status in ("cancelled", "timed_out") or system_failed:
+            fallback = None
+            adopted_fallback = False
+            if (row["task_type"] == "implement"
+                    and prior_status in ("failed", "timed_out")):
+                # A provider fallback owns this lineage unless the HTTP path
+                # cancelled it first. Check under the result write lock so a
+                # fallback enqueued after the handler's read still wins.
+                fallback = conn.execute(
+                    "SELECT task_id, status FROM tasks WHERE task_id LIKE 'fallback-%' "
+                    "AND json_extract(context, '$.original_task_id') = ? "
+                    "ORDER BY created_at DESC LIMIT 1", (task_id,),
+                ).fetchone()
+                adopted_fallback = bool(
+                    fallback and adopted_fallback_task_id == fallback["task_id"]
+                    and fallback["status"] == "cancelled")
+            ignored_for_fallback = bool(fallback and not adopted_fallback)
+            if ((prior_status in ("cancelled", "timed_out") or system_failed)
+                    and not adopted_fallback) or ignored_for_fallback:
                 # Same write lock as cancel/timeout: evidence is durable, but
                 # the terminal row, receipt, attribution and outbox stay put.
                 evidence = {
@@ -3949,10 +3968,12 @@ class TaskQueue:
                     prior_status=prior_status, status=result.status,
                     summary=result.summary[:4000] if result.summary else result.summary,
                     verdict=result.verdict, commit=result.commit,
+                    fallback_task_id=fallback["task_id"] if ignored_for_fallback else None,
                     include_none=True, **evidence,
                 )
                 conn.execute("COMMIT")
-                raise LateResultRejected(prior_status)
+                raise LateResultRejected(
+                    prior_status, fallback["task_id"] if ignored_for_fallback else None)
             if row["task_type"] == "review" and validate_review:
                 review_error = validate_review_result(result)
                 if review_error:
