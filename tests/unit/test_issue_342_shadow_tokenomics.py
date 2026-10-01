@@ -1,5 +1,9 @@
 """#342 must observe external economics policy without enforcing it."""
 import json
+import os
+from datetime import datetime, timezone
+
+import pytest
 
 from agent_crew.cli import _tokenomics_policy_path
 from agent_crew.protocol import TaskRequest, TaskResult
@@ -122,9 +126,32 @@ def test_completion_refresh_preserves_admission_receipt_and_records_later_decisi
     # Separately-provenanced completion fact.
     assert receipt["shadow_decision_source"] == "quota_core_contract"
     assert receipt["shadow_policy_version"] == "1.0"
-    assert json.loads(receipt["shadow_recommendation_json"])["risk_tier"] == "routine"
+    assert json.loads(receipt["shadow_recommendation_json"])["recommendation"]["risk_tier"] == "routine"
     assert receipt["shadow_contract_sha"]
     assert receipt["shadow_resolved_at"] is not None
+
+
+@pytest.mark.parametrize("produced_at", [None, "2026-09-30T12:00:00+00:00"])
+def test_completion_receipt_uses_contract_mtime_only_without_produced_at(
+        monkeypatch, tmp_path, tmp_db, produced_at):
+    policy = tmp_path / "policy.json"
+    contract = {"contract_version": "1.0", "mode": "shadow",
+                "decisions": [{"task_id": "mtime-receipt", "risk_tier": "routine"}]}
+    if produced_at is not None:
+        contract["produced_at"] = produced_at
+    policy.write_text(json.dumps(contract))
+    observed_mtime = datetime(2026, 10, 1, 11, 0, tzinfo=timezone.utc).timestamp()
+    os.utime(policy, (observed_mtime, observed_mtime))
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest("mtime-receipt", "implement", "change", branch="b"))
+    queue.submit_result("mtime-receipt", TaskResult(
+        task_id="mtime-receipt", status="completed", summary="done"))
+
+    receipt = queue.get_tokenomics_shadow_receipt("mtime-receipt")
+    stored = json.loads(receipt["shadow_recommendation_json"])
+    assert stored["produced_at"] == (produced_at or datetime.fromtimestamp(
+        observed_mtime, timezone.utc).isoformat())
 
 
 def test_completion_refresh_marks_missing_or_corrupt_contract_baseline(monkeypatch, tmp_path, tmp_db):

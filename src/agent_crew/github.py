@@ -2,6 +2,7 @@
 
 import json
 import logging
+import re
 import subprocess
 from typing import Optional
 
@@ -309,6 +310,23 @@ def pr_head_sha(pr_number: int, repo: Optional[str] = None,
         return ""
 
 
+def branch_head_sha(branch: str, repo: str, timeout: float = 5.0) -> str:
+    """Return a repository branch's current commit, or ``""`` if unknown."""
+    if (not branch or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo)
+            or branch.startswith("-") or "\n" in branch):
+        return ""
+    try:
+        result = subprocess.run(
+            ["git", "ls-remote", "--exit-code", f"https://github.com/{repo}.git",
+             f"refs/heads/{branch}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        sha = (result.stdout or "").split("\t", 1)[0].strip().lower()
+        return sha if result.returncode == 0 and re.fullmatch(r"[0-9a-f]{40}", sha) else ""
+    except Exception:
+        return ""
+
+
 def post_discussion_comment(
     issue_number: int,
     topic: str,
@@ -377,6 +395,72 @@ def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
         return True
 
 
+def pr_number_for_branch(branch: str, repo: Optional[str] = None,
+                          timeout: float = 15.0) -> Optional[int]:
+    """Like `branch_has_pr`, but returns the PR number instead of a bool.
+
+    #496: a `claude_cloud` dispatch has no local callback to this
+    dispatcher, so a PR is discovered the same way `branch_has_pr` already
+    does — by branch name — and the number is what the review cascade
+    (`pipeline.auto_enqueue_review`) actually needs. Unlike `branch_has_pr`,
+    this fails CLOSED (returns ``None``) on any error: "unknown" must never
+    be read as "PR exists", the way it can be for a skip-a-futile-retry
+    decision.
+    """
+    if not branch or not check_gh_installed():
+        return None
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return None
+    try:
+        result = subprocess.run(
+            ["gh", "pr", "list", "--repo", repo, "--head", branch,
+             "--state", "all", "--json", "number", "--limit", "1"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        rows = json.loads(result.stdout or "[]")
+        if not rows:
+            return None
+        number = rows[0].get("number")
+        return int(number) if isinstance(number, int) else None
+    except Exception:
+        return None
+
+
+def branch_head_commit_message(branch: str, repo: Optional[str] = None,
+                                timeout: float = 15.0) -> Optional[str]:
+    """The HEAD commit message on a remote branch, via `gh api` (no local
+    fetch needed).
+
+    #496: a cloud session's terminal outcome (ALREADY_FIXED, BLOCKED_FOR_CLOUD,
+    NEEDS_DECISION, FAILED) does not require a PR, so PR discovery alone
+    cannot observe it. This reads the same signal the issue's own contract
+    asks a cloud session to leave behind (a final outcome line), from a
+    branch that may exist with no open PR. Returns ``None`` — never a
+    guess — on any error, missing branch, or missing `gh` installation.
+    """
+    if not branch or not check_gh_installed():
+        return None
+    if not repo:
+        repo = get_repo()
+    if not repo:
+        return None
+    try:
+        result = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{branch}", "--jq", ".commit.message"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if result.returncode != 0:
+            return None
+        message = (result.stdout or "").strip()
+        return message or None
+    except Exception:
+        return None
+
+
 def get_pr_url(repo: Optional[str], pr_number: str) -> str:
     """Format a PR URL from repo and PR number."""
     if not repo:
@@ -412,5 +496,35 @@ def merge_pr(
             timeout=30,
         )
         return result.returncode == 0
+    except Exception:
+        return False
+
+
+def independent_review_succeeded(pr_number: int, repo: str) -> bool:
+    """Require a successful independent-review commit status on the PR head.
+
+    A missing status, failed API call, or changed head is not merge authority.
+    GitHub's combined-status endpoint lists the latest state for each context.
+    """
+    if not repo or not check_gh_installed():
+        return False
+    try:
+        head = subprocess.run(
+            ["gh", "pr", "view", str(pr_number), "--repo", repo,
+             "--json", "headRefOid"],
+            capture_output=True, text=True, timeout=20)
+        if head.returncode != 0:
+            return False
+        sha = json.loads(head.stdout or "{}").get("headRefOid", "")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+            return False
+        status = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{sha}/status"],
+            capture_output=True, text=True, timeout=20)
+        if status.returncode != 0:
+            return False
+        statuses = json.loads(status.stdout or "{}").get("statuses", [])
+        return any(s.get("context") == "crew/independent-review"
+                   and s.get("state") == "success" for s in statuses)
     except Exception:
         return False

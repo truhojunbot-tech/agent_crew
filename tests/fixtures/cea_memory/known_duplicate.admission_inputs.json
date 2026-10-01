@@ -1,0 +1,59 @@
+{
+  "_provenance": "SEV-0 CEA s3 memory-reuse proof fixture (owner 11385 \u00a76). Shape = alfred tools/admission_inputs.py admission-inputs/v1 (alfred sev0/cea-alfred-lineage @e1063eb); entry = alfred governance/incident_memory.json DW-ALFRED-USAGE-METER (curated duplicate_work). Permanent: do not regenerate.",
+  "schema": "admission-inputs/v1",
+  "status": "OK",
+  "capability": {
+    "provider": "E4",
+    "status": "OK",
+    "registry": {
+      "status": "OK",
+      "generation": 1,
+      "hash": "sha256:fixture-capability-registry-g1",
+      "source": "capability_registry.json",
+      "problems": []
+    },
+    "matches": [],
+    "coverage": "COVERED",
+    "declared_capability": {
+      "capability_id": "quota.claude-usage-monitor",
+      "found": true,
+      "owning_project": "quota",
+      "owning_agent": "UNKNOWN",
+      "lifecycle_state": "active",
+      "superseded_by": null
+    }
+  },
+  "incident_memory": {
+    "provider": "incident_memory",
+    "status": "OK",
+    "index": {
+      "schema": "incident-memory/v1",
+      "generation": 1,
+      "hash": "sha256:fixture-incident-memory-g1",
+      "source": "incident_memory.json",
+      "problems": []
+    },
+    "matches": [
+      {
+        "id": "DW-ALFRED-USAGE-METER",
+        "kind": "duplicate_work",
+        "recorded_disposition": "REUSE",
+        "title": "Alfred transcript-summation usage meter",
+        "invariant": "Observation/ops metrics are reused from Qouta (mandatory reuse authority); no parallel meter.",
+        "match": {
+          "confidence": "HIGH",
+          "basis": [
+            "capability_id",
+            "reuse_target",
+            "scope_anchor"
+          ],
+          "matched": [
+            "quota.claude-usage-monitor",
+            "quota.claude-usage-monitor",
+            "quota_cache.json"
+          ]
+        }
+      }
+    ]
+  }
+}

@@ -46,7 +46,8 @@ def response_telemetry(provider: str, response: object) -> TaskTelemetry:
     if provider == "codex":
         usage = _mapping(response.get("usage"))
         raw, read = _token(usage.get("input_tokens")), _token(usage.get("cached_input_tokens"))
-        uncached = raw - read if raw is not None and read is not None else raw
+        uncached = (raw - read if raw is not None and read is not None and raw >= read
+                    else (raw if read is None else None))
         write = _token(usage.get("cache_write_input_tokens"))
         return TaskTelemetry(uncached_input_tokens=uncached, cache_write_tokens=write,
                              cache_read_tokens=read, output_tokens=_token(usage.get("output_tokens")),
@@ -95,7 +96,11 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
         for field in fields:
             value = getattr(item, field)
             if value is not None:
-                if field == "context_window_tokens":
+                if provider == "codex":
+                    # Each turn.completed reports the thread's cumulative usage.
+                    # Keep the last observation; summing turns doubles prior work.
+                    totals[field] = value
+                elif field == "context_window_tokens":
                     peak_context_window = max(peak_context_window or 0, value)
                 elif is_terminal_claude_result and field in ("output_tokens", "reasoning_tokens"):
                     final_values[field] = value
@@ -104,7 +109,8 @@ def response_log_telemetry(provider: str, text: str) -> TaskTelemetry:
         model = item.model or model
         session = item.provider_session_id or session
     totals.update(final_values)
-    totals["context_window_tokens"] = peak_context_window
+    if provider != "codex":
+        totals["context_window_tokens"] = peak_context_window
     if provider == "claude" and not saw_terminal_claude_result:
         totals["output_tokens"] = None
     return TaskTelemetry(**totals, model=model, provider_session_id=session)

@@ -18,12 +18,15 @@ functions, run them first, and *then* call ``_try_push_next``.
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
+import re
 import sqlite3
 import json
 import subprocess
 import uuid
+from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -43,15 +46,33 @@ from agent_crew.protocol import (
     RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError
-from agent_crew.risk_tier import (
-    TIER_0, TIER_1, TIER_2, TIER_3, cascade_metadata, classify_task,
-    effective_fix_round_cap,
-)
+from agent_crew.queue import (TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError,
+                              DuplicateReviewError,
+                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
+from agent_crew import tokenomics_canary as _tokenomics_canary
+# §11.2 #14: the review/test contract comes from admission, already decided.
+# ⛔Do not import ``agent_crew.risk_tier`` here. Asking it again at cascade time
+#   is what made this file a second decision implementation; the static rule in
+#   tests/unit/test_sev0_cea_guard_count.py fails if the import comes back.
+from agent_crew.cea import cascade_contract as _cascade
 
 logger = logging.getLogger(__name__)
 
 MAX_FALLBACK_CHAIN_DEPTH = 3
+
+
+def successor_context(parent_context: object) -> dict:
+    """Copy task metadata without the parent's per-receipt CEA decisions.
+
+    Admission writes fresh ``cea_enqueue`` and ``cea_cascade`` blocks for the
+    successor. A later result writes ``cea_result`` against that same receipt.
+    None of those blocks can be carried over from the parent task.
+    """
+    if not isinstance(parent_context, dict):
+        return {}
+    return {key: value for key, value in parent_context.items()
+            if not key.startswith("cea_")}
 
 #: Automated fix rounds allowed per review lineage (#244). The cap is the
 #: whole reason this transition is safe to automate: a reviewer that keeps
@@ -59,6 +80,7 @@ MAX_FALLBACK_CHAIN_DEPTH = 3
 #: a disagreement no additional round will settle. After the cap the loop stops
 #: and says so on the PR, because the next move is a human's.
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
+CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
 #: Bounds on how much review text is copied into the fix task description.
 MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
@@ -198,14 +220,305 @@ def verify_implement_artifact(
         return False, f"artifact verification unavailable: {type(exc).__name__}"
 
 
+#: Declared completion contracts (#374; owner ruling alfred#51 c5776940407 §4).
+#: The artifact a task must hand back depends on what it was asked to do: a
+#: rebase rewrites history, so its commit cannot descend from the old dispatch
+#: base; a read-only investigation must not commit at all. One commit rule for
+#: every task rejected both structurally. `none` is deliberately absent — a
+#: task with no artifact has nothing a gate can prove.
+ARTIFACT_KIND_CONTEXT_KEY = "artifact_kind"
+ARTIFACT_KINDS = ("commit", "rebase", "report", "review")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+#: A ref name git will not read as an option, a range or a path escape.
+_SAFE_REF_RE = re.compile(r"^(?!-)(?!.*\.\.)[A-Za-z0-9._/-]+$")
+
+
+def declared_artifact_kind(task: Optional[TaskRequest]) -> Optional[str]:
+    """The contract the task declared, or None when it declared none.
+
+    Returned verbatim — an unsupported value is still "declared", so the gate
+    applies and refuses it rather than treating a typo as "no contract".
+    """
+    context = task.context if task is not None and isinstance(task.context, dict) else {}
+    if ARTIFACT_KIND_CONTEXT_KEY not in context:
+        return None
+    return str(context.get(ARTIFACT_KIND_CONTEXT_KEY) or "").strip().lower()
+
+
+def artifact_gate_applies(task: Optional[TaskRequest], result: TaskResult) -> bool:
+    """Whether a completion must prove its artifact before it is accepted.
+
+    * A declared contract is always checked, whatever the task_type.
+    * An undeclared task keeps exactly the #353 rule: an implement task with a
+      recorded dispatch base must prove a commit. This change adds contracts;
+      it does not loosen the default for anyone who did not declare one.
+    """
+    if task is None or result.status != "completed":
+        return False
+    if declared_artifact_kind(task) is not None:
+        return True
+    context = task.context if isinstance(task.context, dict) else {}
+    # #374 (main): a declared `rebase_onto` target is a dispatch base too.
+    return task.task_type == "implement" and bool(
+        context.get("worktree_base_sha") or context.get("reviewed_sha")
+        or "rebase_onto" in context)
+
+
+def verify_task_artifact(
+    task: TaskRequest, result: TaskResult, *, repo_cwd: str,
+    commit_verifier=None,
+) -> tuple[bool, str]:
+    """Check a completion against its declared contract (#374). Fail-closed.
+
+    ``commit_verifier`` is the #353 check; callers pass the name they imported
+    so the commit contract stays the one existing function, unchanged.
+    """
+    kind = declared_artifact_kind(task)
+    if kind is None:            # undeclared → the #353 default; "" is declared, and refused
+        kind = "commit"
+    if kind == "commit":
+        return (commit_verifier or verify_implement_artifact)(task, result, repo_cwd=repo_cwd)
+    if kind == "rebase":
+        return verify_rebase_artifact(task, result, repo_cwd=repo_cwd)
+    if kind == "report":
+        return verify_report_artifact(task, result, repo_cwd=repo_cwd)
+    if kind == "review":
+        return verify_review_artifact(task, result)
+    return False, (f"unsupported artifact_kind {kind!r}; declare one of "
+                   f"{', '.join(ARTIFACT_KINDS)}")
+
+
+def _git(repo_cwd: str, *args: str, timeout: int = 30) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", "-C", repo_cwd, *args],
+                          capture_output=True, text=True, timeout=timeout)
+
+
+def _patch_ids(repo_cwd: str, rev_range: str) -> Optional[list]:
+    """Stable patch-ids of every commit in ``rev_range``, oldest first.
+
+    ``None`` if git cannot say. An empty commit has no patch-id, so it shows
+    up as a *missing* id — which is exactly how the equivalence check below
+    notices one being added or a real one being dropped.
+    """
+    revs = _git(repo_cwd, "rev-list", "--reverse", "--no-merges", rev_range)
+    if revs.returncode != 0:
+        return None
+    ids = []
+    for sha in revs.stdout.split():
+        show = _git(repo_cwd, "show", "--format=", sha)
+        if show.returncode != 0:
+            return None
+        pid = subprocess.run(["git", "-C", repo_cwd, "patch-id", "--stable"],
+                             input=show.stdout, capture_output=True, text=True, timeout=30)
+        if pid.returncode != 0:
+            return None
+        ids.append(pid.stdout.split()[0] if pid.stdout.strip() else None)
+    return ids
+
+
+def _diff_patch_id(repo_cwd: str, old: str, new: str) -> Optional[str]:
+    """Stable patch-id of the whole change ``old..new`` (None if empty/unknown)."""
+    diff = _git(repo_cwd, "diff", old, new)
+    if diff.returncode != 0 or not diff.stdout.strip():
+        return None
+    pid = subprocess.run(["git", "-C", repo_cwd, "patch-id", "--stable"],
+                         input=diff.stdout, capture_output=True, text=True, timeout=30)
+    return pid.stdout.split()[0] if pid.returncode == 0 and pid.stdout.strip() else None
+
+
+def verify_rebase_artifact(
+    task: TaskRequest, result: TaskResult, *, repo_cwd: str,
+) -> tuple[bool, str]:
+    """A rebase is proven by carrying the SAME change onto the declared target.
+
+    Location alone is not proof (review of 37cb8af, P1): any new commit on
+    top of main passes "descends from origin/main and is pushed", including
+    a force-push that threw the dispatched feature away. So:
+
+    * the dispatched head — ``context.rebase_source_sha`` if the coordinator
+      pinned one, else ``worktree_base_sha``, which dispatch records as the
+      branch head it handed out — defines the change: its commits since it
+      forked from the target;
+    * the submitted commit must be pushed on ``origin/<branch>``, descend from
+      ``origin/<rebase_onto>``, and add commits of its own;
+    * and those commits must be patch-equivalent to the dispatched ones, one
+      for one (``git patch-id --stable``), or — for a squash — the whole
+      change must be. An added empty commit or a dropped one breaks the
+      one-for-one match; a changed or unrelated diff breaks both.
+
+    A rebase that needed conflict resolution changes the patch and fails
+    here. That is deliberate: this gate cannot tell a resolution from a
+    rewrite, and a human can.
+    """
+    context = task.context if isinstance(task.context, dict) else {}
+    target = str(context.get("rebase_onto") or "").strip()
+    branch = (result.branch or task.branch or "").strip()
+    commit = (result.commit or "").strip()
+    source = str(context.get("rebase_source_sha") or context.get("worktree_base_sha")
+                 or "").strip()
+    if not repo_cwd:
+        return False, "artifact repository unavailable"
+    if not target:
+        return False, "rebase contract requires context.rebase_onto"
+    if not branch:
+        return False, "rebase contract requires the rebased branch"
+    if not (_SAFE_REF_RE.match(target) and _SAFE_REF_RE.match(branch)):
+        return False, "rebase target or branch is not a plain ref name"
+    if branch == target:
+        return False, "rebased branch is the rebase target"
+    try:
+        if _git(repo_cwd, "fetch", "origin", target, "--quiet", timeout=60).returncode != 0:
+            return False, f"rebase target origin/{target} unavailable"
+        # Fetching the branch first is what #374's second case lacked: after a
+        # force-push the new head is not local until it is fetched.
+        if _git(repo_cwd, "fetch", "origin", branch, "--quiet", timeout=60).returncode != 0:
+            return False, f"rebased branch origin/{branch} is not pushed"
+        head = _git(repo_cwd, "rev-parse", "--verify", f"origin/{branch}^{{commit}}")
+        tip = _git(repo_cwd, "rev-parse", "--verify", f"origin/{target}^{{commit}}")
+        if head.returncode != 0 or tip.returncode != 0:
+            return False, "rebase refs are not resolvable after fetch"
+        head_sha, tip_sha = head.stdout.strip(), tip.stdout.strip()
+        if not commit:
+            commit = head_sha
+            result.commit = commit
+        if _git(repo_cwd, "rev-parse", "--verify", f"{commit}^{{commit}}").returncode != 0:
+            return False, "reported commit is not resolvable after fetching the pushed branch"
+        if commit != head_sha and _git(
+                repo_cwd, "merge-base", "--is-ancestor", commit, head_sha).returncode != 0:
+            return False, f"reported commit is not on the pushed branch origin/{branch}"
+        if commit == tip_sha:
+            return False, f"reported commit is the origin/{target} tip (no artifact)"
+        if source and commit == source:
+            return False, "reported commit is the dispatch base (nothing was rewritten)"
+        if _git(repo_cwd, "merge-base", "--is-ancestor", tip_sha, commit).returncode != 0:
+            return False, f"reported commit does not descend from origin/{target}"
+
+        # ── same content ────────────────────────────────────────────────
+        if not source:
+            return False, "rebase contract requires the dispatched head (worktree_base_sha)"
+        if _git(repo_cwd, "rev-parse", "--verify", f"{source}^{{commit}}").returncode != 0:
+            return False, "dispatched head is not resolvable; cannot prove the same content"
+        fork = _git(repo_cwd, "merge-base", source, tip_sha)
+        if fork.returncode != 0 or not fork.stdout.strip():
+            return False, f"dispatched head shares no history with origin/{target}"
+        fork_sha = fork.stdout.strip()
+        before = _patch_ids(repo_cwd, f"{fork_sha}..{source}")
+        after = _patch_ids(repo_cwd, f"{tip_sha}..{commit}")
+        if before is None or after is None:
+            return False, "patch-ids unavailable; cannot prove the same content"
+        if not before or all(p is None for p in before):
+            return False, f"dispatched head has no changes beyond origin/{target} to rebase"
+        if not after or None in after:
+            return False, "rebased range is empty or contains an empty commit"
+        if after == [p for p in before if p is not None]:
+            return True, (f"rebased {len(after)} commit(s) onto origin/{target} ({tip_sha[:12]}), "
+                          f"patch-equivalent to dispatched {source[:12]}; pushed to origin/{branch}")
+        whole_before = _diff_patch_id(repo_cwd, fork_sha, source)
+        whole_after = _diff_patch_id(repo_cwd, tip_sha, commit)
+        if whole_before and whole_before == whole_after and len(after) < len(before):
+            return True, (f"squashed {len(before)}→{len(after)} commit(s) onto origin/{target}; "
+                          f"same total change as dispatched {source[:12]}")
+        return False, "rebased commits are not patch-equivalent to the dispatched change"
+    except Exception as exc:  # git availability is evidence, not a bypass.
+        return False, f"artifact verification unavailable: {type(exc).__name__}"
+
+
+def verify_report_artifact(
+    task: TaskRequest, result: TaskResult, *, repo_cwd: str,
+) -> tuple[bool, str]:
+    """A report is proven by content the server can hash, not by prose.
+
+    ``result.artifact`` must carry ``sha256`` and either ``body`` (inline) or
+    ``path`` (read at the reported commit from git, never from the
+    filesystem). The content must be non-empty, match its hash, and match
+    ``context.report_format`` (``text`` default, ``markdown``, ``json``).
+    """
+    context = task.context if isinstance(task.context, dict) else {}
+    artifact = result.artifact if isinstance(result.artifact, dict) else None
+    if artifact is None:
+        return False, "report contract requires result.artifact {body|path, sha256}"
+    sha = str(artifact.get("sha256") or "").strip().lower()
+    if not _SHA256_RE.match(sha):
+        return False, "report artifact requires a 64-hex sha256"
+    body = artifact.get("body")
+    path = str(artifact.get("path") or "").strip()
+    if isinstance(body, str) and body:
+        content, source = body, "inline body"
+    elif path:
+        commit = (result.commit or "").strip()
+        branch = (result.branch or task.branch or "").strip()
+        if not commit:
+            return False, "report path requires the commit it was written at"
+        if path.startswith("/") or ".." in path.split("/"):
+            return False, "report path must be repository-relative"
+        if not repo_cwd:
+            return False, "artifact repository unavailable"
+        try:
+            if branch and _SAFE_REF_RE.match(branch):
+                _git(repo_cwd, "fetch", "origin", branch, "--quiet", timeout=60)
+            shown = _git(repo_cwd, "show", f"{commit}:{path}")
+        except Exception as exc:
+            return False, f"artifact verification unavailable: {type(exc).__name__}"
+        if shown.returncode != 0:
+            return False, f"report path {path!r} is not present at the reported commit"
+        content, source = shown.stdout, f"{path}@{commit[:12]}"
+    else:
+        return False, "report artifact requires a non-empty body or a path"
+    if not content.strip():
+        return False, "report is empty"
+    if "\x00" in content:
+        return False, "report is not text"
+    fmt = str(context.get("report_format") or "text").strip().lower()
+    if fmt == "markdown":
+        if not any(line.lstrip().startswith("#") for line in content.splitlines()):
+            return False, "markdown report has no heading"
+    elif fmt == "json":
+        try:
+            json.loads(content)
+        except ValueError:
+            return False, "json report does not parse"
+    elif fmt != "text":
+        return False, f"unsupported report_format {fmt!r}"
+    if hashlib.sha256(content.encode("utf-8")).hexdigest() != sha:
+        return False, "report sha256 does not match its content"
+    return True, f"report {len(content)} chars sha256={sha} ({source})"
+
+
+def verify_review_artifact(task: TaskRequest, result: TaskResult) -> tuple[bool, str]:
+    """A review is proven by a verdict bound to a PR.
+
+    request_changes must say what to change, or the fix cascade has nothing
+    to act on — that is the empty review the gate exists to catch.
+    """
+    context = task.context if isinstance(task.context, dict) else {}
+    if result.verdict not in ("approve", "request_changes"):
+        return False, "review contract requires verdict approve or request_changes"
+    if result.pr_number is None and context.get("pr_number") in (None, "", False):
+        return False, "review contract requires the reviewed pr_number"
+    if result.verdict == "request_changes" and not [f for f in result.findings if str(f).strip()]:
+        return False, "request_changes review has no findings"
+    return True, f"review verdict {result.verdict}"
+
+
 def no_artifact_result(result: TaskResult, detail: str) -> TaskResult:
-    """Preserve the worker report while making the absent artifact terminal."""
+    """Preserve the worker report while making the absent artifact terminal.
+
+    ⛔``executor_binding`` rides along. This rebuilds the result field by field
+      instead of :func:`dataclasses.replace`, so every field it forgets is a
+      field the held result loses — and the nonce is the one the P2 RESULT gate
+      needs. Dropping it made ``/result`` answer 409 ``NONCE_MISSING`` under
+      enforcement, so the held row was never written and the artifact finding
+      the gate had just made was thrown away with it. Invisible until step 4i,
+      because until then RESULT read the process-wide mode and the projects
+      that enforce this gate were enforcing it alone.
+    """
     return TaskResult(
         task_id=result.task_id, status="failed",
         summary=f"[no_artifact] {detail}; worker summary: {result.summary}",
         verdict=result.verdict, findings=result.findings, pr_number=result.pr_number,
         branch=result.branch, commit=result.commit,
-        error_info={"reason": "no_artifact", "detail": detail},
+        error_info={"reason": "no_artifact", "detail": detail}, artifact=result.artifact,
+        executor_binding=result.executor_binding,
     )
 
 
@@ -539,6 +852,251 @@ def review_fix_max_rounds() -> int:
         return DEFAULT_REVIEW_FIX_MAX_ROUNDS
 
 
+#: Per-task opt-out for the review→fix transition (#457). A review dispatched
+#: as a red-team / audit pass reports findings for a human to triage; a
+#: ``request_changes`` verdict from it is not a request for an implementer.
+FINDINGS_ONLY_KEY = "findings_only"
+
+
+def _normalize_branch(name) -> str:
+    ref = str(name or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if ref.startswith(prefix):
+            ref = ref[len(prefix):]
+    return ref
+
+
+def _repo_default_branch(repo: str) -> str:
+    """Ask GitHub for the named repository's default, without using process cwd."""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo or ""):
+        return ""
+    try:
+        result = subprocess.run(
+            ["gh", "repo", "view", repo, "--json", "defaultBranchRef"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return _normalize_branch((json.loads(result.stdout or "{}")
+                                      .get("defaultBranchRef") or {}).get("name"))
+    except (OSError, subprocess.TimeoutExpired, ValueError, AttributeError):
+        logger.debug("_repo_default_branch: lookup failed for %s", repo)
+    return ""
+
+
+def _default_branches(review_ctx: dict, repo_cwd: str = "", *,
+                      repo: str = "", require_repo_default: bool = False) -> Optional[set]:
+    """Branches an automated fix must never target (#457).
+
+    The same sources the dispatcher already trusts for "the base": the
+    configured ``AGENT_CREW_MAIN_BRANCH`` (default ``main``), the task's own
+    ``base_branch``, and — when a checkout is available — the remote's
+    advertised ``origin/HEAD``. MCP has no checkout, so it requires the
+    named repository's GitHub default branch and fails closed if unavailable.
+    """
+    names = {_normalize_branch(os.getenv("AGENT_CREW_MAIN_BRANCH") or "main"),
+             _normalize_branch(review_ctx.get("base_branch"))}
+    if repo_cwd:
+        try:
+            head = _git(repo_cwd, "symbolic-ref", "--quiet", "--short",
+                        "refs/remotes/origin/HEAD", timeout=10)
+            if head.returncode == 0:
+                names.add(_normalize_branch(head.stdout))
+        except Exception:
+            logger.debug("_default_branches: origin/HEAD lookup failed in %s", repo_cwd)
+    # MCP has no checkout. Its explicit repository identity must supply a
+    # verified default branch; assuming `main` would allow a fix on `trunk`.
+    if require_repo_default:
+        remote_default = _repo_default_branch(repo)
+        if not remote_default:
+            return None
+        names.add(remote_default)
+    names.discard("")
+    return names
+
+
+def _record_risk_tier_shadow(queue: TaskQueue, task, actual_action: str) -> None:
+    """Append a best-effort counterfactual receipt without changing work.
+
+    A thin relay: the recorder itself lives in ``cea.cascade_contract`` so this
+    file has no reason to reach for ``risk_tier``.
+    """
+    _cascade.record_shadow(queue, task, actual_action, review_fix_max_rounds())
+
+
+def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
+    """Walk ``prev_task_id`` back to the task this lineage started from.
+
+    quota-core publishes one decision per ORIGINATING task, so every round of
+    a review↔fix lineage has to cite the same root decision — cite the review
+    instead and round 2's recommendation is simply absent, which reads as "the
+    contract said nothing" rather than "we looked in the wrong place".
+
+    ``seen`` is not defensive dressing: contexts are operator-writable JSON, so
+    a cycle is reachable without a code bug, and this runs inside the cascade.
+    """
+    current = task
+    seen = {current.task_id}
+    while True:
+        ctx = current.context if isinstance(current.context, dict) else {}
+        prev = ctx.get("prev_task_id")
+        if not isinstance(prev, str) or prev in seen or prev not in tasks_by_id:
+            return current.task_id
+        seen.add(prev)
+        current = tasks_by_id[prev]
+
+
+def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
+    """Copy only a declared lineage risk; admission still classifies the child."""
+    if context.get("risk_declaration") is not None:
+        return
+    root_id = _lineage_root_task_id(tasks_by_id, parent_task)
+    root = tasks_by_id.get(root_id)
+    root_context = root.context if root and isinstance(root.context, dict) else {}
+    declaration = root_context.get("risk_declaration")
+    if (isinstance(declaration, dict)
+            and declaration.get("declaration_source") == "explicit"
+            and any(isinstance(declaration.get(field), bool) for field in (
+                "safety_or_live_change", "broad_architecture_change",
+                "bounded_routine_fix", "human_gate_required"))):
+        context["risk_declaration"] = {
+            **declaration,
+            "inherited_from": declaration.get("inherited_from") or root_id,
+        }
+
+
+def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
+                      server_project: Optional[str] = None) -> bool:
+    return _tokenomics_canary._is_pinned(
+        review_task, _tokenomics_canary.canary_pin(),
+        project=_successor_project(queue, review_task, server_project),
+        lineage_root=_lineage_root_task_id(tasks_by_id, review_task))
+
+
+def _contract_time(value) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _review_decision_time(queue: TaskQueue, review_task_id: str) -> Optional[datetime]:
+    """Use the durable result event, so replay cannot cite a later contract."""
+    try:
+        state = queue.get_exec_state(review_task_id)
+    except Exception:
+        logger.exception("review result time unavailable for %s", review_task_id)
+        return None
+    events = state.get("events", []) if state else []
+    results = [e["at"] for e in events if e["event"] == "result"]
+    return datetime.fromtimestamp(results[-1], timezone.utc) if results else None
+
+
+def _shadow_rounds_citation(tasks_by_id: dict, review_task,
+                            queue: Optional[TaskQueue] = None) -> dict:
+    """Cite the latest quota-core decision available when this review resolved."""
+    decision_at = _review_decision_time(queue, review_task.task_id) if queue else None
+    current = review_task
+    seen = set()
+    candidates = []
+    while current.task_id not in seen:
+        seen.add(current.task_id)
+        shadow = shadow_recommendation_for_task_id(current.task_id)
+        produced = _contract_time(shadow.get("produced_at"))
+        if shadow.get("produced_at") is None and shadow.get("contract_mtime") is not None:
+            try:
+                produced = datetime.fromtimestamp(shadow["contract_mtime"], timezone.utc)
+                shadow = {**shadow, "produced_at": produced.isoformat()}
+            except (TypeError, ValueError, OverflowError, OSError):
+                produced = None
+        if (shadow.get("decision_source") == "quota_core_contract" and produced
+                and decision_at and produced <= decision_at):
+            candidates.append((produced, current.task_id, shadow))
+        if queue:
+            receipt = queue.get_tokenomics_shadow_receipt(current.task_id)
+            if receipt and receipt.get("shadow_decision_source") == "quota_core_contract":
+                try:
+                    stored = json.loads(receipt.get("shadow_recommendation_json") or "null")
+                except (TypeError, ValueError, OverflowError):
+                    stored = None
+                produced_at = (_contract_time(stored.get("produced_at"))
+                               if isinstance(stored, dict) else None)
+                recommendation = (stored.get("recommendation")
+                                  if isinstance(stored, dict) else None)
+                if (produced_at and decision_at and produced_at <= decision_at
+                        and isinstance(recommendation, dict)):
+                    candidates.append((produced_at, current.task_id, {
+                        "decision_source": "quota_core_contract",
+                        "produced_at": produced_at.isoformat(),
+                        "contract_sha": receipt.get("shadow_contract_sha"),
+                        "recommendation": recommendation,
+                        "reason": receipt.get("shadow_reason"),
+                    }))
+        ctx = current.context if isinstance(current.context, dict) else {}
+        previous = ctx.get("prev_task_id")
+        if not isinstance(previous, str) or previous not in tasks_by_id:
+            break
+        current = tasks_by_id[previous]
+    # Untimed and legacy receipts cannot establish when quota-core decided.
+    cited_task_id = current.task_id
+    shadow = shadow_recommendation_for_task_id(cited_task_id)
+    if candidates:
+        produced, cited_task_id, shadow = max(candidates, key=lambda item: item[0])
+    else:
+        # No eligible contract may supply a recommended value in baseline
+        # telemetry, whether it is untimed or outside this decision window.
+        shadow = {"decision_source": "baseline", "recommendation": None,
+                  "reason": "contract_missing_or_stale"}
+    recommendation = shadow.get("recommendation")
+    recommendation = recommendation if isinstance(recommendation, dict) else {}
+    recommended = recommendation.get("recommended_max_review_fix_rounds")
+    if isinstance(recommended, bool) or not isinstance(recommended, int):
+        recommended = None
+    return {
+        "cited_task_id": cited_task_id,
+        "recommended_max_review_fix_rounds": recommended,
+        "decision_source": shadow.get("decision_source") if candidates else "baseline",
+        "produced_at": shadow.get("produced_at") if candidates else None,
+        "contract_sha": shadow.get("contract_sha"),
+        "rationale": recommendation.get("rationale") or shadow.get("reason"),
+    }
+
+
+def _canary_round_cap(tasks_by_id: dict, review_task,
+                      baseline_cap: int, queue: TaskQueue,
+                      server_project: Optional[str] = None) -> tuple[int, Optional[dict], str]:
+    """Return the narrowed cap only for the pinned lineage and a fresh contract."""
+    if not _tokenomics_canary.rounds_cap_enabled():
+        return baseline_cap, None, "switch_off"
+    if not _round_cap_pinned(tasks_by_id, review_task, queue, server_project):
+        return baseline_cap, None, "not_pinned"
+    try:
+        citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
+    except Exception:
+        logger.exception("quota-core rounds citation unavailable for %s", review_task.task_id)
+        return baseline_cap, None, "contract_missing_or_stale"
+    recommended = citation["recommended_max_review_fix_rounds"]
+    reason = "cap_not_reached"
+    try:
+        produced = _contract_time(citation["produced_at"])
+        decision_at = _review_decision_time(queue, review_task.task_id)
+        current = produced is not None and decision_at is not None
+        if current:
+            age = (decision_at - produced).total_seconds()
+            current = 0 <= age <= CANARY_CONTRACT_MAX_AGE_SECONDS
+    except (ValueError, TypeError):
+        current = False
+    if citation["decision_source"] != "quota_core_contract" or not current:
+        reason = "contract_missing_or_stale"
+    elif recommended is None or recommended < 1:
+        reason = "invalid_recommendation"
+    elif recommended >= baseline_cap:
+        reason = "recommendation_does_not_narrow"
+    else:
+        return recommended, citation, reason
+    return baseline_cap, citation, reason
+
+
 def fix_task_id(review_task_id: str, fix_round: int) -> str:
     """The task id a given review round's fix MUST have.
 
@@ -610,6 +1168,7 @@ def auto_enqueue_fix(
     head_sha_fn=None,
     repo: str = "",
     repo_cwd: str = "",
+    require_repo_default: bool = False,
     suppress_side_effects: bool = False,
 ) -> Optional[str]:
     """Create the fix task that follows a ``request_changes`` review (#244).
@@ -636,7 +1195,6 @@ def auto_enqueue_fix(
         findings, and the failure path already retries or falls back. Spawning
         a fix here would double-handle it AND hand an agent nothing to do;
       * the reviewer requested changes without stating anything actionable;
-      * `coordinator_managed` — `crew run` drives its own loop;
       * cross-project, as in `auto_enqueue_review`;
       * the round cap is reached;
       * a fix task for this review round already exists. The transition is
@@ -669,22 +1227,37 @@ def auto_enqueue_fix(
             return None
 
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-        # Same guard as the other two transitions: `crew run`'s foreground loop
-        # enqueues its own follow-ups, and a second one here would race it.
-        # Checked here rather than only in the caller so the MCP transport gets
-        # the guard too (#123 — both transports run the same cascade).
-        if review_ctx.get("coordinator_managed"):
-            logger.info(
-                f"auto_enqueue_fix: review {review_task_id} is coordinator_managed "
-                f"— skipping"
-            )
-            return None
-
         review_project = review_task.project
         if review_project and server_project and review_project != server_project:
             logger.warning(
                 f"auto_enqueue_fix: skipping cross-project fix — review "
                 f"project={review_project!r}, server project={server_project!r}"
+            )
+            return None
+
+        # #457: a findings-only review (red-team / audit) reports; it does not
+        # commission a fix. Checked before any gate with side effects so such a
+        # review neither spends a round nor announces budget exhaustion.
+        if review_ctx.get(FINDINGS_ONLY_KEY):
+            logger.info(
+                f"auto_enqueue_fix: {review_task_id} is findings_only — findings "
+                f"recorded, no automated fix (#457)"
+            )
+            return None
+        # #457: a fix commits to the reviewed branch. On the default branch that
+        # would be an unreviewed direct push, so never automate it.
+        default_branches = _default_branches(
+            review_ctx, repo_cwd, repo=repo,
+            require_repo_default=require_repo_default)
+        if default_branches is None:
+            logger.warning(
+                "auto_enqueue_fix: %s cannot verify default branch for %r — "
+                "not creating an automated fix (#457)", review_task_id, repo)
+            return None
+        if _normalize_branch(review_task.branch) in default_branches:
+            logger.warning(
+                f"auto_enqueue_fix: {review_task_id} reviewed default branch "
+                f"{review_task.branch!r} — not creating an automated fix (#457)"
             )
             return None
 
@@ -710,16 +1283,77 @@ def auto_enqueue_fix(
             )
             return None
 
-        # Council #39 A-4: the configured value remains a hard ceiling, while
-        # low-risk work stops once an additional fix is less valuable than its
-        # independent review/test cost.
-        max_rounds = effective_fix_round_cap(review_ctx, review_fix_max_rounds())
+        # The operator ceiling remains the baseline. The quota-core citation
+        # below may narrow it only for the pinned canary lineage.
+        contract = _cascade.stored(review_task)
+        if not contract.enforced:
+            _record_risk_tier_shadow(queue, review_task, "fix_legacy_cap")
+        baseline_cap = contract.fix_round_cap(review_fix_max_rounds())
+        tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
+        lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
+        max_rounds, canary_citation, canary_reason = _canary_round_cap(
+            tasks_by_id, review_task, baseline_cap, queue, server_project)
+        canary_pinned = (_tokenomics_canary.rounds_cap_enabled()
+                         and _round_cap_pinned(tasks_by_id, review_task, queue, server_project))
+        if canary_pinned:
+            try:
+                queue.record_shadow_rounds_vs_cap(
+                    lineage_root_id,
+                    recommended=(canary_citation or {}).get(
+                        "recommended_max_review_fix_rounds"),
+                    actual_cap=max_rounds)
+            except Exception:
+                logger.exception("auto_enqueue_fix: canary rounds citation failed for %s", lineage_root_id)
         # The lineage counter rides in the task context, so it survives a
         # server restart and counts ROUNDS rather than tasks. An in-memory
         # per-task_id counter (the transient-retry shape) could not work here:
         # every round mints new task ids, so it would always read zero.
         fix_round = int(review_ctx.get("fix_round") or 0) + 1
+        canary_fired = (canary_pinned and max_rounds < baseline_cap
+                        and fix_round > max_rounds and fix_round <= baseline_cap)
+        if canary_fired and any(t.task_id == fix_task_id(review_task_id, fix_round)
+                                for t in tasks_by_id.values()):
+            # A switch turned on after baseline enqueue cannot retrospectively
+            # claim it suppressed work that already exists.
+            queue.record_tokenomics_canary_receipt(
+                lineage_root_id, decision_source="quota_core_contract",
+                recommendation=canary_citation or {}, applied=False,
+                counterfactual="", reason="fix_already_enqueued",
+                preserve_applied=True)
+            return None
+        if canary_pinned and not canary_fired:
+            try:
+                queue.record_tokenomics_canary_receipt(
+                    lineage_root_id, decision_source=(canary_citation or {}).get(
+                        "decision_source") or "baseline",
+                    recommendation=canary_citation or {}, applied=False,
+                    counterfactual="", reason=(
+                        "baseline_cap_reached" if fix_round > baseline_cap
+                        else canary_reason), preserve_applied=True)
+            except Exception:
+                logger.exception("auto_enqueue_fix: canary shadow receipt failed for %s", review_task_id)
         if max_rounds <= 0 or fix_round > max_rounds:
+            if canary_fired:
+                counterfactual = {
+                    "baseline_cap": baseline_cap, "effective_cap": max_rounds,
+                    "round": fix_round, "would_have_enqueued_fix": True,
+                }
+                try:
+                    queue.hold_tokenomics_canary_fix(
+                        review_task, receipt_task_id=lineage_root_id,
+                        fix_round=fix_round,
+                        recommendation=canary_citation or {},
+                        counterfactual=counterfactual)
+                except Exception:
+                    logger.exception("auto_enqueue_fix: canary HUMAN_GATE failed for %s", review_task_id)
+                    try:
+                        queue.record_tokenomics_canary_receipt(
+                            lineage_root_id, decision_source="quota_core_contract",
+                            recommendation=canary_citation or {}, applied=False,
+                            counterfactual=json.dumps(counterfactual),
+                            reason="human_gate_failed", preserve_applied=True)
+                    except Exception:
+                        logger.exception("auto_enqueue_fix: canary failure receipt failed for %s", lineage_root_id)
             logger.warning(
                 f"auto_enqueue_fix: review {review_task_id} requested changes but "
                 f"the automated fix budget is spent (round {fix_round} > "
@@ -783,6 +1417,7 @@ def auto_enqueue_fix(
             "fix_round": fix_round,
             "review_findings": list(review_result.findings or []),
         }
+        _inherit_root_risk(tasks_by_id, review_task, fix_context)
         if pr_number is not None:
             # #186: lets the dispatcher check out the PR head for this task.
             fix_context["pr_number"] = pr_number
@@ -796,6 +1431,20 @@ def auto_enqueue_fix(
         )
         if implementer_agent:
             fix_context["implementer_agent"] = implementer_agent
+
+        # EGD Step 2 (#51): carry the contract's recommended round budget next
+        # to the cap actually in force, so the gap between them is measurable
+        # before anyone proposes enforcing it. Guarded separately from the
+        # outer handler because that one returns None — losing an observation
+        # must not read as "no fix task was created".
+        citation = None
+        try:
+            citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
+            fix_context["tokenomics_shadow"] = citation
+        except Exception:
+            logger.exception(
+                f"auto_enqueue_fix: shadow rounds citation failed for "
+                f"{review_task_id} — cascade continues on the stored contract")
 
         fix_id = fix_task_id(review_task_id, fix_round)
         # Cheap early-out with a legible log. It is NOT the guard — the
@@ -815,8 +1464,10 @@ def auto_enqueue_fix(
                 description="\n".join(parts),
                 branch=review_task.branch,
                 context=fix_context,
-                project=review_project,
-            ))
+                project=_successor_project(queue, review_task, server_project),
+            ),
+                          ingress="cascade.fix",
+                          _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.
@@ -825,6 +1476,16 @@ def auto_enqueue_fix(
                 f"{review_task_id} — leaving the winner in place"
             )
             return None
+        if citation is not None:
+            try:
+                queue.record_shadow_rounds_vs_cap(
+                    fix_id,
+                    recommended=citation["recommended_max_review_fix_rounds"],
+                    actual_cap=max_rounds)
+            except Exception:
+                logger.exception(
+                    f"auto_enqueue_fix: shadow_rounds_vs_cap receipt failed for "
+                    f"{fix_id} — the fix task itself stands")
         logger.info(
             f"auto_enqueue_fix: enqueued {fix_id} for {review_task_id} "
             f"(round {fix_round}/{max_rounds})"
@@ -998,6 +1659,25 @@ def _announce_fix_budget_exhausted(*, pr_number, review_task_id: str,
             pass
 
 
+def _successor_project(queue, parent_task, server_project: Optional[str] = None) -> str:
+    """The project a cascade successor is admitted under (§7.1 step 2, s4j).
+
+    The parent row is the queue identity that actually applies: a successor
+    belongs to the same project as the task that produced it, which is also
+    what the cross-project guards above compare against. The queue's own
+    directory identity is the fallback for a parent row admitted before
+    ``project`` was populated; the server's project is preferred over that
+    because it was configured rather than inferred.
+    """
+    for candidate in (getattr(parent_task, "project", "") or "",
+                      str(server_project or ""),
+                      getattr(queue, "project_identity", "") or ""):
+        named = str(candidate).strip()
+        if named:
+            return named
+    return ""
+
+
 def auto_enqueue_review(
     queue: TaskQueue,
     impl_task_id: str,
@@ -1025,24 +1705,16 @@ def auto_enqueue_review(
             return None
         impl_task = impl_tasks[0]
         impl_ctx = impl_task.context if isinstance(impl_task.context, dict) else {}
-        risk = cascade_metadata(impl_task.description, impl_ctx)
-        # A review→fix lineage created before Council #39 has no tier receipt.
-        # Do not retroactively alter its already-running cap halfway through.
-        # Fresh implementation tasks receive the classification below.
-        legacy_fix_lineage = "fix_round" in impl_ctx and "risk_tier" not in impl_ctx
-        if legacy_fix_lineage:
-            risk = {}
-            tier = TIER_2
-        else:
-            tier = risk["risk_tier"]
-        # Tier 0 is intentionally implement-only. It remains observable via
-        # its task/result and can still be manually reviewed by an operator.
-        if tier == TIER_0:
-            logger.info("auto_enqueue_review: Tier 0 task %s is implement-only", impl_task_id)
-            return None
-        # Tier 3 contains irreversible/external work. Do not make a new worker
-        # runnable until a human resolves the durable approval gate.
-        if tier == TIER_3 and not impl_ctx.get("tier3_gate_approved"):
+        # The whole review/test contract, as admission decided it (§11.2 #14).
+        # Everything below reads this; nothing below classifies anything.
+        contract = _cascade.stored(impl_task)
+        enforce_risk_tier = contract.enforced
+        risk = dict(contract.metadata)
+        if not enforce_risk_tier:
+            _record_risk_tier_shadow(queue, impl_task, "review_enqueued")
+        # The gate itself is admission's decision; whether it has been resolved
+        # is durable state on the row, which is a read, not a judgement.
+        if enforce_risk_tier and contract.human_gate_required and not impl_ctx.get("tier3_gate_approved"):
             gate_id = f"risk-tier3-{impl_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1166,11 +1838,14 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
-        review_context.update(risk)
-        if impl_ctx.get("tier3_gate_approved"):
+        _inherit_root_risk({t.task_id: t for t in queue.list_tasks()},
+                           impl_task, review_context)
+        if enforce_risk_tier:
+            review_context.update(risk)
+        if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
             review_context["tier3_gate_approved"] = True
-        if tier == TIER_2:
-            review_context["review_mode"] = "adversarial"
+        if enforce_risk_tier and contract.review_mode:
+            review_context["review_mode"] = contract.review_mode
             review_context["instructions"] += "\n\nTier 2: perform an adversarial independent review; actively seek regression and safety gaps."
         if implementer_agent:
             review_context["implementer_agent"] = implementer_agent
@@ -1214,13 +1889,15 @@ def auto_enqueue_review(
             description=compact_desc,
             branch=impl_task.branch,
             context=review_context,
-            project=impl_project,
+            project=_successor_project(queue, impl_task, server_project),
         )
         try:
-            queue.enqueue(review_req)
+            queue.enqueue(review_req, ingress="cascade.review")
         except TaskAlreadyExistsError:
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
+        except DuplicateReviewError as exc:
+            return exc.existing_task_id
         return review_id
     except PausedError:
         # #314 §4 P0-2: STOP race — successor enqueue가 원자 거부됨. 부모(impl) outbox를 reopen해
@@ -1240,6 +1917,7 @@ def auto_enqueue_test(
     review_task_id: str,
     *,
     pane_map: Optional[dict] = None,
+    server_project: Optional[str] = None,
     pr_state_fn=None,
     repo: str = "",
     repo_cwd: str = "",
@@ -1267,13 +1945,32 @@ def auto_enqueue_test(
         # Propagate upstream agent identities so review/test fallback can
         # avoid self-review and self-test (#117).
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-        tier = classify_task(review_task.description, review_ctx)
-        if tier == TIER_0:
-            return None
+        contract = _cascade.stored(review_task)
+        tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
+        if (_tokenomics_canary.rounds_cap_enabled()
+                and _round_cap_pinned(tasks_by_id, review_task, queue, server_project)):
+            try:
+                _, citation, reason = _canary_round_cap(
+                    tasks_by_id, review_task,
+                    contract.fix_round_cap(review_fix_max_rounds()), queue, server_project)
+                queue.record_tokenomics_canary_receipt(
+                    _lineage_root_task_id(tasks_by_id, review_task),
+                    decision_source=(citation or {}).get(
+                        "decision_source") or "baseline",
+                    recommendation=citation or {}, applied=False,
+                    counterfactual="", reason=(
+                        "cap_not_reached" if reason == "cap_not_reached" else reason),
+                    preserve_applied=True)
+            except Exception:
+                logger.exception("auto_enqueue_test: canary receipt failed for %s", review_task_id)
+        enforce_risk_tier = contract.enforced
+        if not enforce_risk_tier:
+            _record_risk_tier_shadow(queue, review_task, "test_enqueued")
         # An approved Tier 3 test gate replays this exact transition.  The
         # durable receipt lives on the reviewed task, so a restart/replay does
         # not create a second gate or strand the already-approved lineage.
-        if tier == TIER_3 and not review_ctx.get("tier3_gate_approved"):
+        if (enforce_risk_tier and contract.human_gate_required
+                and not review_ctx.get("tier3_gate_approved")):
             gate_id = f"risk-tier3-test-{review_task_id}"
             if not any(g.id == gate_id for g in queue.list_gates()):
                 queue.create_gate(GateRequest(
@@ -1296,13 +1993,27 @@ def auto_enqueue_test(
         if _skip_terminal_pr("auto_enqueue_test", review_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
-        test_context: dict = {"prev_task_id": review_task_id, "risk_tier": tier,
-                              "risk_tier_source": review_ctx.get("risk_tier_source", "metadata")}
-        if tier == TIER_1:
-            # #272's tester consumes this as an explicit treatment rather than
-            # guessing scope from the project/provider.
-            test_context["test_scope"] = "targeted"
-            test_context["test_scope_source"] = "risk_tier"
+        test_context: dict = {"prev_task_id": review_task_id}
+        _inherit_root_risk(tasks_by_id, review_task, test_context)
+        # Test the exact revision approved by the reviewer. This is also the
+        # artifact component of the test's CEA intent identity.
+        if review_ctx.get("reviewed_sha"):
+            test_context["reviewed_sha"] = review_ctx["reviewed_sha"]
+        elif review_ctx.get("expected_head_sha"):
+            test_context["expected_head_sha"] = review_ctx["expected_head_sha"]
+        if review_ctx.get("fix_round") is not None:
+            test_context["fix_round"] = review_ctx["fix_round"]
+        if enforce_risk_tier:
+            test_context.update({
+                "risk_tier": contract.tier,
+                "risk_tier_source": review_ctx.get("risk_tier_source", "metadata"),
+            })
+        if (enforce_risk_tier and contract.test_scope
+                and contract.test_scope_source != "risk_tier"):
+            # Preserve independently admitted scope while refusing a legacy
+            # risk-tier treatment that weakens the baseline test requirement.
+            test_context["test_scope"] = contract.test_scope
+            test_context["test_scope_source"] = contract.test_scope_source or "risk_tier"
         if pr_number is not None:
             test_context["pr_number"] = pr_number  # #171: propagate for post-test merge
         if _test_repo:
@@ -1329,11 +2040,14 @@ def auto_enqueue_test(
             description=compact_desc,
             branch=review_task.branch,
             context=test_context,
+            project=_successor_project(queue, review_task, server_project),
         )
         try:
-            queue.enqueue(test_req)
+            queue.enqueue(test_req, ingress="cascade.test")
         except TaskAlreadyExistsError:
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
+        except DuplicateReviewError as exc:
+            return exc.existing_task_id
         return test_id
     except PausedError:
         # #314 §4 P0-2: STOP race — 부모(review) outbox reopen + 전파.
@@ -1347,7 +2061,8 @@ def auto_enqueue_test(
         return None
 
 
-def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Optional[str]:
+def resume_tier3_gate(queue: TaskQueue, gate_id: str, *,
+                      server_project: Optional[str] = None, pr_state_fn=None) -> Optional[str]:
     """Resume the exact Tier 3 successor held by an approved approval gate."""
     gate = next((item for item in queue.list_gates() if item.id == gate_id), None)
     if gate is None or gate.status != "approved":
@@ -1358,11 +2073,13 @@ def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Op
     if gate_id.startswith("risk-tier3-test-"):
         review_task_id = gate_id[len("risk-tier3-test-"):]
         queue.patch_context(review_task_id, {"tier3_gate_approved": True})
-        return auto_enqueue_test(queue, review_task_id, pr_state_fn=pr_state_fn)
+        return auto_enqueue_test(queue, review_task_id, server_project=server_project,
+                                 pr_state_fn=pr_state_fn)
     if gate_id.startswith("risk-tier3-"):
         impl_task_id = gate_id[len("risk-tier3-"):]
         queue.patch_context(impl_task_id, {"tier3_gate_approved": True})
-        return auto_enqueue_review(queue, impl_task_id, pr_state_fn=pr_state_fn)
+        return auto_enqueue_review(queue, impl_task_id, server_project=server_project,
+                                   pr_state_fn=pr_state_fn)
     return None
 
 
@@ -1398,7 +2115,14 @@ def auto_fallback_failed_task(
         if not tasks:
             return False
         original = tasks[0]
-        ctx = dict(original.context) if isinstance(original.context, dict) else {}
+        ctx = successor_context(original.context)
+        copied_risk = ctx.get("risk_declaration")
+        if (isinstance(copied_risk, dict)
+                and copied_risk.get("declaration_source") == "explicit"):
+            ctx["risk_declaration"] = {
+                **copied_risk,
+                "inherited_from": copied_risk.get("inherited_from") or task_id,
+            }
         ctx.pop(RESULT_BRANCH_CONTEXT_KEY, None)
         ctx.pop(RESULT_COMMIT_CONTEXT_KEY, None)
 
@@ -1410,16 +2134,16 @@ def auto_fallback_failed_task(
                 f"auto_fallback: fallback_chain_depth={ctx.get('fallback_chain_depth')} "
                 f">= MAX ({MAX_FALLBACK_CHAIN_DEPTH}) for {task_id} — cancelling chain."
             )
-            # Cancel the original root task so the chain has a definitive
-            # terminal state of "cancelled" (not "failed") in the DB.
+            # Cancel an active root; G12 keeps an already-failed root terminal.
             original_task_id = ctx.get("original_task_id")
             if original_task_id:
                 try:
-                    queue.cancel(original_task_id)
-                    logger.info(
-                        f"auto_fallback: cancelled original task {original_task_id} "
-                        f"due to fallback loop detection"
-                    )
+                    if queue.cancel(original_task_id):
+                        logger.info("auto_fallback: cancelled original task %s due to fallback loop",
+                                    original_task_id)
+                    else:
+                        logger.info("auto_fallback: original task %s already terminal; cancel refused",
+                                    original_task_id)
                 except Exception as e:
                     logger.warning(
                         f"auto_fallback: failed to cancel original task {original_task_id}: {e}"
@@ -1521,9 +2245,13 @@ def auto_fallback_failed_task(
                 branch=original.branch,
                 priority=original.priority,
                 context=new_ctx,
+                # s4j: a fallback is the same work on another provider, so it is
+                # the same project. Naming none admitted project-less.
+                project=_successor_project(queue, original),
             )
             try:
-                queue.enqueue(fallback_req)
+                queue.enqueue(fallback_req, ingress="cascade.fallback",
+                              _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             except TaskAlreadyExistsError:
                 logger.info(f"auto_fallback: {fallback_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(

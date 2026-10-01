@@ -1,20 +1,23 @@
 import asyncio
 import contextlib
 import contextvars
+import dataclasses
 import json
 import logging
 import math
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
@@ -29,6 +32,8 @@ from agent_crew.memory import (
     shadow_retrieve_bounded,
     shadow_telemetry,
 )
+from agent_crew.memory_capture import capture_result_best_effort
+from agent_crew.memory_runtime import SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
 from agent_crew.context_identity import (
     append_attribution_jsonl,
     detect_context_compaction,
@@ -36,6 +41,7 @@ from agent_crew.context_identity import (
     record_context_event,
 )
 from agent_crew.fallback import is_rate_limit_error
+from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
@@ -43,8 +49,12 @@ from agent_crew.pipeline import (
     auto_enqueue_review as _pipeline_auto_enqueue_review,
     auto_enqueue_test as _pipeline_auto_enqueue_test,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
+    successor_context as _successor_context,
     hold_mismatched_pr_result,
+    artifact_gate_applies,
+    declared_artifact_kind,
     no_artifact_result,
+    verify_task_artifact,
     resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
     stale_review_task_id,
@@ -55,9 +65,17 @@ from agent_crew.protocol import (
     GateRequest, TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY,
     RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import TaskAlreadyExistsError, TaskQueue, _ROLE_TO_TYPE, _TYPE_TO_ROLE, task_issue_number
+from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError,
+                              DuplicateReviewResult, InvalidReviewResult, LateResultRejected,
+                              TaskAlreadyExistsError,
+                              TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              _ROLE_TO_TYPE, _TYPE_TO_ROLE)
+from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
+from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
+from agent_crew import claude_cloud as _claude_cloud
+from agent_crew.cea import callsites as _cea_callsites
+from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
-from agent_crew.watch import active_tasks_for_issue
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
     load_scope as _load_test_scope,
@@ -133,11 +151,26 @@ def _recorded_pane_ids(
 def cancel_task_with_signal(
     queue: TaskQueue, task_id: str, *, state_path: Optional[str],
     pane_map: Optional[dict], events_path: str,
+    reason: str = _CANCEL_REASON_ATTEMPT,
+    expected_status: Optional[str] = None,
 ) -> dict:
-    """Cancel in the DB and signal only its server-recorded, project-owned pane."""
-    prior_status, bound_pane = queue.cancel(task_id)
+    """Cancel in the DB and signal only its server-recorded, project-owned pane.
+
+    G12 I-A then #336's pane interrupt: the authoritative cancel (status,
+    receipt REVOKED, nonces spent, end event) commits in
+    ``TaskQueue.cancel_with_binding`` *before* any pane is signalled. A row
+    that is already terminal is refused there as a complete no-op and nothing
+    is signalled — ``cancelled`` is False and ``status`` names the refusing
+    status. An unknown id raises ValueError.
+    """
+    cancelled, prior_status, bound_pane = queue.cancel_with_binding(
+        task_id, reason=reason, expected_status=expected_status)
     if prior_status is None:
         raise ValueError(f"Task not found: {task_id!r}")
+    if not cancelled:
+        return {"status": prior_status, "cancelled": False, "reason": "NOT_ACTIVE",
+                "worker_reachable": False, "cancel_signal_outcome": "not_active",
+                "pane_exit_observed": False}
     outcome = "not_running"
     reachable = False
     pane_exit_observed = False
@@ -185,7 +218,7 @@ def cancel_task_with_signal(
             )
         except Exception:
             logger.exception("cancel_signalled event failed for task=%s", task_id)
-    return {"status": "cancelled", "worker_reachable": reachable,
+    return {"status": "cancelled", "cancelled": True, "worker_reachable": reachable,
             "cancel_signal_outcome": outcome,
             "pane_exit_observed": pane_exit_observed}
 
@@ -657,6 +690,64 @@ def _worktree_head(worktree_path: str) -> str:
         return ""
 
 
+# agent_crew's own per-role protocol files. The post-task reset keeps them and
+# re-writes them, so they are not provider work and never warrant a stash
+# (same exclusions as `cli._sync_worktrees_to_main`).
+_WIP_STASH_EXCLUDES = (
+    ":(exclude).claude/CLAUDE.md", ":(exclude)AGENTS.md", ":(exclude)GEMINI.md",
+    ":(exclude).gemini/settings.json",
+)
+
+
+def _stash_dirty_worktree(worktree_path: str, task_id: str) -> Optional[str]:
+    """#482: save uncommitted provider work before a destructive reset.
+
+    A failed task (e.g. codex hitting its usage limit right before `git
+    commit`) used to lose its finished-but-uncommitted change to the
+    `checkout .` / `clean -fd` that follows. Same `git stash push -u` as the
+    pre-dispatch prep, but named after the task so it can be found and
+    resumed. Returns the stash commit SHA, "" for a confirmed clean tree,
+    or None when status/stash could not be verified. A failed stash must
+    never permit the destructive reset.
+    """
+    pathspec = ["--", ".", *_WIP_STASH_EXCLUDES]
+    try:
+        status = subprocess.run(
+            ["git", "-C", worktree_path, "status", "--porcelain", *pathspec],
+            capture_output=True, text=True, timeout=30,
+        )
+        if status.returncode != 0:
+            logger.warning("could not inspect worktree %s for task=%s: %s",
+                           worktree_path, task_id, status.stderr.strip())
+            return None
+        if not status.stdout.strip():
+            return ""
+        before = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "-q", "--verify", "refs/stash"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        push = subprocess.run(
+            ["git", "-C", worktree_path, "stash", "push", "-u",
+             "-m", f"agent_crew wip {task_id}", *pathspec],
+            capture_output=True, text=True, timeout=30,
+        )
+        after = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "-q", "--verify", "refs/stash"],
+            capture_output=True, text=True, timeout=15,
+        ).stdout.strip()
+        if push.returncode != 0 or not after or after == before:
+            logger.warning("stash of dirty worktree %s for task=%s failed: %s",
+                           worktree_path, task_id, push.stderr.strip())
+            return None
+        logger.warning("preserved uncommitted work of task=%s in %s as stash %s",
+                       task_id, worktree_path, after)
+        return after
+    except Exception:  # noqa: BLE001
+        logger.exception("stash of dirty worktree %s for task=%s failed",
+                         worktree_path, task_id)
+        return None
+
+
 def _prepare_worktree_for_task_inner(
     worktree_path: str,
     task_id: str,
@@ -670,8 +761,8 @@ def _prepare_worktree_for_task_inner(
     # `main` is only a default.  A project can run on a long-lived integration
     # branch; dispatching its worker from origin/main silently makes it edit a
     # stale, different tree (#353).  The explicit context is produced by the
-    # CLI and survives queue/restart; task.branch remains the useful fallback
-    # for callers which do not supply one.
+    # CLI and survives queue/restart. Without one, use the configured default;
+    # task.branch names the output branch for implementers.
     main_branch = str(task_context.get("base_branch") or _WORKTREE_MAIN_BRANCH).strip()
     # #296: is this worktree even usable? Asked BEFORE any other git call,
     # because an interrupted ref update can leave HEAD pointing at a branch that
@@ -700,13 +791,26 @@ def _prepare_worktree_for_task_inner(
     # D-state. This can't fix that specific case (nothing userspace can),
     # but it bounds every OTHER local git op here so one slow/stuck call
     # fails that single task instead of being able to hang indefinitely.
-    subprocess.run(
+    _pre_stash = subprocess.run(
         ["git", "-C", worktree_path, "stash", "push", "-u",
          "-m", f"agent_crew pre-{task_id[:8]}"],
         capture_output=True, text=True, timeout=30,
     )
+    if _pre_stash.returncode != 0:
+        # Some callers use a directory that has not been initialized as a Git
+        # worktree yet. Only a real repository can contain work that a later
+        # checkout would destroy after a failed stash.
+        _is_repo = subprocess.run(
+            ["git", "-C", worktree_path, "rev-parse", "--is-inside-work-tree"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if _is_repo.returncode == 0 and _is_repo.stdout.strip() == "true":
+            raise WorktreeUnhealthy(
+                f"{role} {task_id}: cannot stash worktree {worktree_path}; "
+                "manual recovery required before dispatch"
+            )
     # Fetch all remote branches so the target ref is up to date.
-    subprocess.run(
+    fetch = subprocess.run(
         ["git", "-C", worktree_path, "fetch", "origin", "--quiet"],
         capture_output=True, text=True,
         timeout=60,
@@ -716,6 +820,13 @@ def _prepare_worktree_for_task_inner(
         # Fresh branch per task from the configured base (#140/#353). Use task.branch when
         # set (crew run --branch), otherwise derive from task_id.
         branch = task_branch if task_branch else f"agent/{task_id[:12]}"
+        # #397: task.branch names the output PR branch, not the input base.
+        # Once prepared, the recorded SHA pins a second preparation of the same
+        # task even if origin/main advances between push and dispatch.
+        pinned_base = _object_id_or_empty(task_context.get("worktree_base_sha"))
+        base_ref = pinned_base or f"origin/{main_branch}"
+        base_sha = _branch_ref(worktree_path, base_ref)
+        checkout_base = base_sha or base_ref
         if task_context.get("crew_run_branch"):
             # A foreground run pins the requested branch's CONTENT, not its
             # shared local ref. Preserve local-only commits; otherwise use the
@@ -729,8 +840,7 @@ def _prepare_worktree_for_task_inner(
             else:
                 start = remote or local
             if not start:
-                start = _branch_ref(worktree_path, str(task_context.get("worktree_base_sha") or "")) \
-                    or _branch_ref(worktree_path, f"refs/remotes/origin/{main_branch}")
+                start = base_sha or _branch_ref(worktree_path, f"origin/{main_branch}")
             if not start:
                 raise WorktreeTargetUnresolved(
                     f"implementer {task_id}: neither origin/{branch} nor declared "
@@ -751,14 +861,13 @@ def _prepare_worktree_for_task_inner(
                 raise WorktreeTargetUnresolved(
                     f"implementer {task_id}: could not detach at {start} for {branch}"
                 )
+            return _worktree_head(worktree_path)
         elif not _agent_crew_owns_branch(branch):
-            # #280: somebody else's branch name. Do not create it, do not move
-            # it — start from its own remote tip so the task still sees the code
-            # it was dispatched for, and fall back to main when there is no such
-            # remote (a name that does not exist yet).
-            _checkout_detached(
+            # #280: preserve somebody else's ref. The task still starts from
+            # its declared base, even when its output branch already exists.
+            checkout_ok = _checkout_detached(
                 worktree_path,
-                [f"origin/{branch}", f"origin/{main_branch}"],
+                [checkout_base],
                 what=f"implementer {task_id}",
             )
         else:
@@ -767,25 +876,37 @@ def _prepare_worktree_for_task_inner(
             if not reset_is_safe:
                 logger.warning(
                     f"_prepare_worktree_for_task: refusing to reset owned branch {branch} "
-                    f"at local-only commit {local_sha}; detaching at origin instead (#300)"
+                    f"at local-only commit {local_sha}; detaching at declared base instead (#300)"
                 )
-                _checkout_detached(
+                checkout_ok = _checkout_detached(
                     worktree_path,
-                    [f"origin/{branch}", f"origin/{main_branch}"],
+                    [checkout_base],
                     what=f"implementer {task_id} preserving {branch}",
                 )
             else:
                 r = subprocess.run(
                     ["git", "-C", worktree_path, "checkout", "-B", branch,
-                     f"origin/{main_branch}"],
+                     checkout_base],
                     capture_output=True, text=True, timeout=30,
                 )
-                if r.returncode != 0:
+                checkout_ok = r.returncode == 0
+                if not checkout_ok:
                     logger.warning(
                         f"_prepare_worktree_for_task: implementer checkout {branch} "
-                        f"from origin/{main_branch} failed: {r.stderr.strip()}"
+                        f"from {checkout_base} failed: {r.stderr.strip()}"
                     )
+        # #358: a failed or unresolvable prep has no proven base. Returning the
+        # old HEAD here made an unrelated PR branch look like the dispatch base
+        # (#397). Dispatch continues with explicit unknown; the artifact gate
+        # already refuses a completed implementation with no known base.
+        fresh_base = bool(pinned_base) or fetch.returncode == 0
+        return (base_sha if fresh_base and checkout_ok
+                and _worktree_head(worktree_path) == base_sha else "")
     else:
+        # ⛔The roles have different input commits: an implementer starts from
+        # the declared base so a prior PR head cannot become its dispatch base
+        # (#397). A reviewer or tester must see the PR head's code, not that
+        # base, or it would judge/test a change it never checked out (#286).
         # Reviewer/tester: checkout the PR branch from origin (#141, #186).
         # task.branch holds the base branch (e.g. main), not the PR head.
         # Resolve the actual PR head ref from pr_number when available so
@@ -973,6 +1094,36 @@ def _expire_stale_supports_dry_run(queue) -> bool:
     except (TypeError, ValueError):
         return False
 
+class _DispatchSlot:
+    """A dispatch that has been decided, whose child may not exist yet.
+
+    The registry entry exists from before ``record_dispatch`` commits until the
+    dispatch is over, so the two sides of the handoff always meet: a cancel
+    either finds ``proc`` and signals it, or sets ``cancel_requested`` for the
+    dispatcher to act on the moment the child appears.  ``pid`` delegates so the
+    slot reads like the process it stands in for.
+    """
+
+    __slots__ = ("task_id", "proc", "cancel_requested", "cancel_reason")
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.proc = None
+        self.cancel_requested = False
+        self.cancel_reason = ""
+
+    @property
+    def pid(self):
+        return getattr(self.proc, "pid", None)
+
+    @property
+    def returncode(self):
+        return getattr(self.proc, "returncode", None)
+
+    def __repr__(self) -> str:                    # pragma: no cover - diagnostics
+        return (f"_DispatchSlot(task_id={self.task_id!r}, pid={self.pid!r}, "
+                f"cancel_requested={self.cancel_requested!r})")
+
 
 def _review_result_is_actionable(result) -> bool:
     """Did this review actually review anything?
@@ -1010,7 +1161,7 @@ _DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
 # (억제됐다 replay되는 result의 comment/escalation은 loss 가능하나, 리뷰어 판정상 duplication보다 허용됨.)
 _REPLAYING = contextvars.ContextVar("agent_crew_replaying", default=False)
 
-_LATE_RESULT_STATUSES = frozenset({"failed", "timed_out"})
+_LATE_RESULT_STATUSES = frozenset({"failed"})
 # #314 §5: merge 자동 재시도 상한. 이 횟수 이상 실패(conflict/gh 실패 등)면 자동 재시도 중단 →
 # escalation 대상(무한 재시도 금지). 비가역 상태(closed)는 횟수와 무관하게 즉시 재시도 안 함.
 _MAX_MERGE_ATTEMPTS = 3
@@ -1106,27 +1257,19 @@ def _detect_transient_error_in_log(
     return None
 
 
+#: G12 / D6 `dispatch_channel` for a dispatcher subprocess, by agent.
+_DISPATCH_CHANNEL = {"claude": "claude_p", "codex": "codex_exec", "gemini": "gemini_cli"}
+
+#: Seconds between process-alive heartbeats for a dispatcher subprocess (G12).
+_HEARTBEAT_INTERVAL_S = float(os.getenv("AGENT_CREW_HEARTBEAT_INTERVAL", "30"))
+
+
 def _dispatch_timeout_for_role(role: str, task_context: Optional[dict] = None) -> float:
-    """Hard wall-clock timeout (seconds) for a dispatched subprocess.
+    """Absolute dispatch cap; output silence has a separate idle limit.
 
-    ``implement`` tasks routinely run longer than review/test — they write
-    code across a real codebase and run test suites, not just read and
-    verdict — and a single shared 900s default was killing legitimately
-    still-working (not stuck) implementer subprocesses with
-    ``dispatcher_timeout`` (observed live on alpha_engine 2026-08-27: 3
-    consecutive kills on tasks whose own dispatch log showed them still
-    actively producing tool calls right up to the kill). ``implementer``
-    gets a longer default; every other role keeps the original 900s.
-
-    Both defaults remain overridable: ``AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER``
-    for the implementer role specifically, else ``AGENT_CREW_DISPATCH_TIMEOUT``
-    for that role or any other — so setting only the generic var still
-    raises every role uniformly, matching pre-existing behavior for anyone
-    already relying on it.
-
-    A task can set ``context.dispatch_timeout_s`` for its own dispatch. A
-    positive finite value takes precedence over the role/env default and is
-    capped at 3600 seconds. Invalid values leave the role/env default intact.
+    The per-task context override takes precedence and is capped at one hour.
+    Existing generic and implementer environment overrides remain supported;
+    reviewers can also set ``AGENT_CREW_DISPATCH_TIMEOUT_REVIEWER``.
     """
     if isinstance(task_context, dict):
         value = task_context.get("dispatch_timeout_s")
@@ -1138,12 +1281,77 @@ def _dispatch_timeout_for_role(role: str, task_context: Optional[dict] = None) -
             else:
                 if math.isfinite(task_timeout) and task_timeout > 0:
                     return min(task_timeout, 3600.0)
-    default = "1800" if role == "implementer" else "900"
-    if role == "implementer":
-        env_value = os.getenv("AGENT_CREW_DISPATCH_TIMEOUT_IMPLEMENTER")
+    default = "900" if role == "tester" else "3600"
+    if role in ("implementer", "reviewer"):
+        env_value = os.getenv(f"AGENT_CREW_DISPATCH_TIMEOUT_{role.upper()}")
         if env_value is not None:
             return float(env_value)
     return float(os.getenv("AGENT_CREW_DISPATCH_TIMEOUT", default))
+
+
+def _dispatch_idle_timeout() -> float:
+    """Seconds without dispatch output before stopping the subprocess."""
+    try:
+        value = float(os.getenv("AGENT_CREW_DISPATCH_IDLE_TIMEOUT", "600"))
+    except (ValueError, OverflowError):
+        return 600.0
+    return value if math.isfinite(value) and value > 0 else 600.0
+
+
+async def _wait_for_dispatch_activity(
+    proc, log_path: str, initial_offset: int, *, hard_timeout_s: float,
+    idle_timeout_s: float, on_progress,
+) -> tuple[Optional[str], float]:
+    """Wait for a child while observing growth in its dedicated dispatch log.
+
+    The caller wrote its task marker before ``initial_offset``. Only bytes
+    written by this child count as progress. Return the fired limit and the
+    age of the last output; a clean process exit returns no limit.
+    """
+    started = last_output = time.monotonic()
+    offset = initial_offset
+    wait_task = asyncio.create_task(proc.wait())
+    try:
+        while True:
+            now = time.monotonic()
+            try:
+                size = os.path.getsize(log_path)
+            except OSError:
+                size = offset
+            if size > offset:
+                offset = size
+                last_output = now
+                on_progress()
+            if wait_task.done():
+                await wait_task
+                return None, now - last_output
+            if now - started >= hard_timeout_s:
+                return "dispatcher_timeout", now - last_output
+            if now - last_output >= idle_timeout_s:
+                return "dispatcher_idle_timeout", now - last_output
+            delay = min(_HEARTBEAT_INTERVAL_S, hard_timeout_s - (now - started),
+                        idle_timeout_s - (now - last_output))
+            await asyncio.wait({wait_task}, timeout=max(delay, 0.001))
+    finally:
+        if not wait_task.done():
+            wait_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await wait_task
+
+
+def _record_exit_response_telemetry(queue: TaskQueue, task_id: str,
+                                    agent: str, task_log_tail: str) -> None:
+    """Refresh usage after the child exits, preserving an earlier Codex receipt."""
+    telemetry = response_log_telemetry(agent, task_log_tail)
+    if agent == "codex":
+        if all(getattr(telemetry, field) is None for field in (
+            "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
+            "output_tokens", "reasoning_tokens", "context_window_tokens",
+        )):
+            return
+        queue.record_task_telemetry(task_id, telemetry, only_missing=True)
+    else:
+        queue.record_task_telemetry(task_id, telemetry)
 
 
 #: Cap on the agy/Antigravity conversation the tester resumes with
@@ -1224,6 +1432,22 @@ def _codex_home(home=None):
 CODEX_CONTEXT_MAX_MB = float(os.getenv("AGENT_CREW_CODEX_CONTEXT_MAX_MB", "64"))
 
 
+def _codex_context_cap_mb(state_path=None) -> float:
+    """Resolve launch override, durable project setting, then built-in default."""
+    override = os.environ.get("AGENT_CREW_CODEX_CONTEXT_MAX_MB")
+    if override is not None:
+        return float(override)
+    if state_path:
+        try:
+            with open(state_path) as state_file:
+                value = json.load(state_file).get("codex_context_max_mb")
+            if value is not None:
+                return float(value)
+        except (OSError, ValueError, TypeError, AttributeError):
+            logger.warning("Invalid Codex context cap in %s; using default", state_path)
+    return 64.0
+
+
 def codex_session_for_cwd(cwd: str, *, home=None, limit=None) -> str:
     """The newest Codex session id recorded for ``cwd``, or ``""``."""
     return _codex_session_and_path(cwd, home=home, limit=limit)[0]
@@ -1279,6 +1503,74 @@ def codex_session_size_for_id(session_id: str, *, home=None) -> int:
         return path.stat().st_size
     except OSError:
         return 0
+
+
+def codex_latest_compaction_summary(session_id: str, *, home=None) -> str:
+    """Read the latest plain-text summary from Codex's own rollout.
+
+    A compacted record may contain only encrypted replacement history. In that
+    case there is no portable summary to seed, so the caller uses its durable
+    checkpoint alone. Never use unrelated user messages as a substitute.
+    """
+    path = codex_rollout_path(session_id, home=home)
+    if path is None:
+        return ""
+    summary = ""
+    try:
+        with path.open(errors="replace") as rollout:
+            for line in rollout:
+                if '"compacted"' not in line:
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if record.get("type") != "compacted":
+                    continue
+                payload = record.get("payload") or {}
+                if not isinstance(payload, dict):
+                    continue
+                message = payload.get("message")
+                candidate = message if isinstance(message, str) else ""
+                if not candidate and isinstance(message, dict):
+                    candidate = "\n".join(
+                        part.get("text", "") for part in message.get("content", [])
+                        if isinstance(part, dict) and isinstance(part.get("text"), str))
+                if not candidate:
+                    for item in reversed(payload.get("replacement_history") or []):
+                        if (isinstance(item, dict) and item.get("type") == "compaction"
+                                and isinstance(item.get("text"), str)):
+                            candidate = item["text"]
+                            break
+                summary = candidate.strip()
+    except OSError:
+        return ""
+    return summary[:40000]
+
+
+def codex_thread_id_from_output(output: str) -> str:
+    """Read the session ID emitted by ``codex exec --json``."""
+    for line in output.splitlines():
+        if '"thread.started"' not in line:
+            continue
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if event.get("type") == "thread.started":
+            return str(event.get("thread_id") or "")
+    return ""
+
+
+def _codex_session_mode(state_path: str | None) -> str:
+    if not state_path:
+        return ""
+    try:
+        with open(state_path) as state_file:
+            value = json.load(state_file).get("codex_session_mode")
+        return value if value == "renew_rehydrate" else ""
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
 
 
 def codex_context_exceeds_cap(cwd: str, max_mb=None, *, home=None,
@@ -1875,6 +2167,116 @@ def _pane_has_bash_prompt(pane_id: str) -> bool:
 #: Foreground commands that mean the agent CLI exited (#195 crash signature).
 _DEAD_PANE_COMMANDS = {"bash", "sh", "zsh", "fish", "dash"}
 
+#: Executable names of the agent CLIs a task block may be pushed into (G_DT).
+#: Matched against argv[0] — or argv[1] under an interpreter, because the
+#: codex/gemini CLIs run as `node <path>/codex` and the claude quota wrapper as
+#: `python3 <path>/claude`.
+_AGENT_CLI_NAMES = frozenset({"claude", "codex", "gemini", "agy"})
+#: Refused pushes into one pane before the task ends as needs_human (G_DT).
+_PUSH_REFUSAL_MAX = max(1, int(os.getenv("AGENT_CREW_PUSH_REFUSAL_MAX", "3")))
+#: First backoff after a refused push; doubles per refusal on the same pane.
+_PUSH_REFUSAL_BACKOFF_S = float(os.getenv("AGENT_CREW_PUSH_REFUSAL_BACKOFF_S", "30"))
+#: The native claude binary is `~/.local/share/claude/versions/<semver>`, so
+#: tmux reports `#{pane_current_command}` as e.g. `2.1.185`.
+_CLAUDE_NATIVE_BINARY = re.compile(r"/claude/versions/[^/]+$")
+_INTERPRETER_NAME = re.compile(r"^(python[0-9.]*|node|bun|deno)$")
+#: `crew-log-viewer` (#182) — the process owned panes run in dispatcher mode.
+_LOG_VIEWER_NAMES = frozenset({"crew-log-viewer"})
+_LOG_VIEWER_MODULE = "agent_crew.log_viewer"
+
+
+def _process_identity(args: str) -> str:
+    """``agent`` | ``log_viewer`` | ``""`` for one process command line."""
+    argv = args.split()
+    if not argv:
+        return ""
+    names = [argv[0]]
+    if _INTERPRETER_NAME.match(os.path.basename(argv[0])):
+        if argv[1:3] == ["-m", _LOG_VIEWER_MODULE]:
+            return "log_viewer"
+        if len(argv) > 1:
+            names.append(argv[1])
+    for name in names:
+        base = os.path.basename(name)
+        if base in _LOG_VIEWER_NAMES:
+            return "log_viewer"
+        if base in _AGENT_CLI_NAMES or _CLAUDE_NATIVE_BINARY.search(name):
+            return "agent"
+    return ""
+
+
+def _pane_process_kind(pane_id: str) -> tuple[str, str]:
+    """Classify what a tmux push into ``pane_id`` would land in (G_DT).
+
+    Returns ``(verdict, detail)``; ``verdict`` is one of
+
+    * ``agent`` — an agent CLI runs in the pane's process tree;
+    * ``log_viewer`` — ``crew-log-viewer`` does (dispatcher-mode owned pane);
+    * ``shell`` — only a shell is left (the #195 crash signature);
+    * ``unknown`` — anything else, including a probe that failed.
+
+    Only ``agent`` may receive a push. The caller fails closed on the rest:
+    a task block typed into a log viewer or a bare shell is not delivered —
+    it is lost, or executed as shell input.
+
+    The whole process tree is read, not just ``#{pane_current_command}``:
+    that name alone is ambiguous — ``python3`` is both the log viewer and the
+    claude quota wrapper, ``node`` is codex, gemini, or an unrelated tool.
+    """
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-t", pane_id, "-p",
+             "#{pane_pid}\t#{pane_current_command}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001 — a probe failure refuses, never raises
+        return "unknown", f"tmux_probe_error:{type(exc).__name__}"
+    if r.returncode != 0:
+        return "unknown", "tmux_probe_failed"
+    pane_pid, _, current = r.stdout.strip().partition("\t")
+    if not pane_pid.isdigit():
+        return "unknown", "pane_pid_unavailable"
+    try:
+        ps = subprocess.run(
+            ["ps", "-e", "-o", "pid=,ppid=,args="],
+            capture_output=True, text=True, timeout=3,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return "unknown", f"ps_error:{type(exc).__name__}"
+    if ps.returncode != 0:
+        return "unknown", "ps_failed"
+    children: dict[str, list[str]] = {}
+    args_by_pid: dict[str, str] = {}
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 2:
+            continue
+        pid, ppid = parts[0], parts[1]
+        args_by_pid[pid] = parts[2] if len(parts) > 2 else ""
+        children.setdefault(ppid, []).append(pid)
+    if pane_pid not in args_by_pid:
+        return "unknown", f"pane_pid_{pane_pid}_not_running"
+    kinds: set[str] = set()
+    stack, seen = [pane_pid], set()
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        kind = _process_identity(args_by_pid.get(pid, ""))
+        if kind:
+            kinds.add(kind)
+        stack.extend(children.get(pid, []))
+    detail = f"current_command={current or '?'}"
+    # A log viewer anywhere in the tree wins over an agent: ambiguity refuses.
+    if "log_viewer" in kinds:
+        return "log_viewer", detail
+    if "agent" in kinds:
+        return "agent", detail
+    if current in _DEAD_PANE_COMMANDS:
+        return "shell", detail
+    return "unknown", detail
+
 
 def _pane_liveness(pane_id: str) -> str:
     """``alive`` | ``dead`` | ``unknown`` for the process in ``pane_id`` (#231).
@@ -2272,7 +2674,7 @@ def _default_push(pane_id: str, text: str) -> None:
     )
 
 
-def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mcp_mode: bool = False) -> str:
+def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, project: str = "", mcp_mode: bool = False) -> str:
     """Watchdog nudge: agent has been silent past the heartbeat threshold.
 
     In MCP mode (#162) emits a short one-liner — agents already have
@@ -2289,6 +2691,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
             f"If still working call bump_activity(task_id='{task_id}'). "
             f"If done or blocked call submit_result(...)."
         )
+    identity_header = f"    -H 'X-Agent-Crew-Project: {project}' \\\n" if project else ""
     return (
         f"=== AGENT_CREW REMINDER ===\n"
         f"task_id: {task_id}\n"
@@ -2300,6 +2703,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
         f"\n"
         f"1) FINISHED — POST status=\"completed\":\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"{identity_header}"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"completed\","
         f"\"summary\":\"...\",\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
@@ -2308,6 +2712,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, mc
         f"   status=\"failed\". The fallback policy will reroute this task\n"
         f"   to the next agent in the chain automatically:\n"
         f"  curl -sS -X POST http://127.0.0.1:{port}/tasks/{task_id}/result \\\n"
+        f"{identity_header}"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"failed\","
         f"\"summary\":\"API stream timeout — partial response, no recovery\","
@@ -2356,23 +2761,76 @@ def _guard_description(task: TaskRequest) -> str:
     return f"{guard}\n\n{task.description}"
 
 
-def _format_task_message(task: TaskRequest, port: int) -> str:
+def _format_task_message(task: TaskRequest, port: int,
+                         nonce: Optional[str] = None, *, project: str = "") -> str:
+    """The block a worker receives — and, when one was minted, its dispatch nonce.
+
+    ADR P4/§2.2: the nonce is single-use, presented once at ``/start`` for a
+    go/no-go and once with the result under ``executor_binding``. Handing it to
+    the worker is what makes EXECUTE_START and RESULT *gates* rather than
+    helpers: ``record_dispatch`` minted one from the first day of step 2c, every
+    caller dropped it on the floor, and so under ``enforce`` every result was
+    refused for ``NONCE_MISSING`` while under ``shadow`` the gate recorded a
+    proof nobody had presented (codex cross-repo review of ``8993bdb``, P1 #2).
+
+    ``nonce=None`` reproduces the pre-2b block byte for byte. That is the honest
+    shape for a task with no receipt, and for a runtime whose engine minted
+    nothing: a block that told the worker to present a nonce it was never given
+    would just move the lie one hop downstream.
+    """
     ctx = json.dumps(task.context, ensure_ascii=False)
+    identity_header = f"-H 'X-Agent-Crew-Project: {project}' " if project else ""
     description = _guard_description(task)
+    result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
+                   f"\"summary\":\"...\",\"findings\":[]}}")
+    start_step = ""
+    if nonce:
+        result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
+                       f"\"summary\":\"...\",\"findings\":[],"
+                       f"\"executor_binding\":{{\"nonce\":\"{nonce}\"}}}}")
+        start_step = (
+            f"FIRST, before any work, ask for the go/no-go — the nonce is single-use "
+            f"and this call spends it:\n"
+            f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/start "
+            f"{identity_header}"
+            f"-H 'Content-Type: application/json' "
+            f"-d '{{\"nonce\":\"{nonce}\"}}'\n"
+            f"It answers {{\"go\": true|false}}. Decide ONLY on the go field. "
+            f"go:true means start the work, even if outcome/reason show BLOCK with "
+            f"enforced:false (shadow observation). On go:false, STOP.\n"
+        )
     return (
         f"=== AGENT_CREW TASK ===\n"
         f"task_id: {task.task_id}\n"
         f"task_type: {task.task_type}\n"
         f"branch: {task.branch}\n"
         f"priority: {task.priority}\n"
-        f"context: {ctx}\n"
+        + (f"dispatch_nonce: {nonce}\n" if nonce else "")
+        + f"context: {ctx}\n"
         f"description: {description}\n"
         f"=== END TASK ===\n"
-        f"Do the work described above, then POST result: "
+        + start_step
+        + f"Do the work described above, then POST result: "
         f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
+        f"{identity_header}"
         f"-H 'Content-Type: application/json' "
-        f"-d '{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\",\"summary\":\"...\",\"findings\":[]}}'"
+        f"-d '{result_body}'"
     )
+
+
+def worker_environment(server_env, worktree: str) -> dict[str, str]:
+    """Build a provider environment without server-only memory controls.
+
+    The server may capture into a live shadow DB, but a worker running pytest
+    must not pass that DB path to its own in-test server (#430).
+    """
+    child = {
+        key: value for key, value in server_env.items()
+        if not key.startswith(("AGENT_CREW_SHADOW_MEMORY_", "AGENT_CREW_ADR001_"))
+        and key not in {"PYTHONPATH", "PYTHONHOME"}
+    }
+    child["TELEGRAM_STATE_DIR"] = os.path.join(worktree, ".telegram")
+    return child
 
 
 def create_app(
@@ -2396,6 +2854,7 @@ def create_app(
     memory_provider: Optional[MemoryProvider] = None,
     shadow_memory_enabled: Optional[bool] = None,
     shadow_memory_timeout_seconds: Optional[float] = None,
+    identity_required: Optional[bool] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -2424,13 +2883,35 @@ def create_app(
         each worktree (fetch + branch checkout) before dispatching a task to
         it. Falls back to _load_worktree_map(state_path) if omitted.
     memory_provider: optional project-local historical-memory provider. Its
-        retrieval is shadow telemetry only and can never alter dispatch.
+        retrieval is shadow telemetry only and can never alter dispatch. When
+        omitted, AGENT_CREW_SHADOW_MEMORY_DB selects an existing SQLite memory
+        file; an absent or unusable file falls back to NullMemoryProvider.
     shadow_memory_enabled: explicit opt-in for shadow retrieval. Disabled by
         default, so even an injected provider receives zero calls until enabled.
     """
     logger.info("Context Pack effective enabled=%s (AGENT_CREW_CONTEXT_PACK=%r)",
                 _cpack.enabled(), os.environ.get("AGENT_CREW_CONTEXT_PACK"))
-    _memory_provider = memory_provider or NullMemoryProvider()
+    if identity_required is None:
+        identity_required = bool(os.getenv("AGENT_CREW_PROJECT"))
+    _codex_cap_mb = _codex_context_cap_mb(state_path)
+    _codex_mode = _codex_session_mode(state_path)
+    logger.info("Codex context cap effective=%s MB", _codex_cap_mb)
+    if memory_provider is not None:
+        _memory_provider = memory_provider
+    else:
+        shadow_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()
+        if shadow_db and os.path.isfile(os.path.expanduser(shadow_db)):
+            from agent_crew.memory_runtime import RuntimeMemoryProvider, SQLiteMemoryStorage
+            try:
+                _memory_provider = RuntimeMemoryProvider(
+                    SQLiteMemoryStorage(os.path.expanduser(shadow_db)))
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                logger.warning("AGENT_CREW_SHADOW_MEMORY_DB is unusable: %s", exc)
+                _memory_provider = NullMemoryProvider()
+        else:
+            if shadow_db:
+                logger.warning("AGENT_CREW_SHADOW_MEMORY_DB does not name an existing file: %s", shadow_db)
+            _memory_provider = NullMemoryProvider()
     if shadow_memory_enabled is None:
         shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
             "1", "true", "yes",
@@ -2438,9 +2919,11 @@ def create_app(
     if shadow_memory_timeout_seconds is None:
         try:
             shadow_memory_timeout_seconds = float(
-                os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.05"))
+                os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS",
+                          str(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS)))
         except ValueError:
-            shadow_memory_timeout_seconds = 0.05
+            shadow_memory_timeout_seconds = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
+
     if worktree_map is None:
         worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
     if watchdog_interval is None:
@@ -2489,19 +2972,192 @@ def create_app(
     _push_enabled = _delivery_raw in ("push", "both")
 
     _dispatcher_enabled = os.getenv("AGENT_CREW_DISPATCHER", "0").lower() not in ("0", "false", "no")
+    # Only dispatcher subprocesses live here.  Pane workers cannot be killed
+    # by PID safely, so cancellation still revokes their authorization first.
+    #
+    # Values are either a spawned process (what a test injects directly) or a
+    # `_DispatchSlot` reservation for a dispatch whose child does not exist yet.
+    _active_dispatch_processes: dict[str, object] = {}
+    #: Guards the registry *and* the cancel/spawn handoff it mediates.  Cancel
+    #: arrives on a FastAPI threadpool thread while the dispatcher runs on the
+    #: event loop, so "look up the process, decide, act" has to be one atomic
+    #: step for both of them.  Nothing awaits while holding it.
+    _active_dispatch_lock = threading.Lock()
+    #: Pending SIGTERM→SIGKILL escalation timers, keyed by task_id.  Kept
+    #: addressable so they can be cancelled when the process exits on its own
+    #: (and by tests in teardown).  A bare ``threading.Timer`` holding a real
+    #: ``os.killpg`` is a live weapon: with a stubbed process whose
+    #: ``returncode`` never flips, it fired after the test had torn its
+    #: monkeypatching down and signalled whatever the kernel had since
+    #: recycled that pid to (review of 720ac76).
+    _cancel_kill_timers: dict[str, threading.Timer] = {}
+    #: Grace period between SIGTERM and SIGKILL on cancel.  Env-tunable so
+    #: tests can drive the escalation without a real two-second sleep.
+    _cancel_kill_grace = float(os.getenv("AGENT_CREW_CANCEL_KILL_GRACE", "2.0"))
+
+    def _cancel_pending_kill(task_id: str) -> None:
+        """Defuse a scheduled SIGKILL for ``task_id`` (process already gone)."""
+        timer = _cancel_kill_timers.pop(task_id, None)
+        if timer is not None:
+            timer.cancel()
+
+    def _reserve_dispatch_slot(task_id: str) -> "_DispatchSlot":
+        """Claim the registry entry for a dispatch that is about to be decided.
+
+        ⛔Must happen BEFORE `record_dispatch` commits.  That commit is what
+          makes the attempt visible to a cancel, and the child does not exist
+          until several statements later; in that window the DELETE used to find
+          `None`, answer `pane_worker_not_killable` and kill nothing, after which
+          the dispatcher registered the child and awaited it as a live worker for
+          an already-cancelled task (r2 review of 4a49338, finding 2).  With the
+          reservation in place the cancel has something to find, and the
+          dispatcher's post-spawn re-check under the same lock does the killing.
+        """
+        slot = _DispatchSlot(task_id)
+        with _active_dispatch_lock:
+            _active_dispatch_processes[task_id] = slot
+        return slot
+
+    def _release_dispatch_slot(task_id: str, slot: "_DispatchSlot") -> None:
+        """Drop ``slot`` from the registry — only if it is still the one there,
+        so a later dispatch's entry is never popped by an earlier one's cleanup.
+        """
+        with _active_dispatch_lock:
+            if _active_dispatch_processes.get(task_id) is slot:
+                _active_dispatch_processes.pop(task_id, None)
+
+    def _drop_unspawned_reservation(task_id: str) -> None:
+        """Backstop for the dispatch teardown: a reservation whose child never
+        came into existence (prep raised between the reservation and the spawn)
+        must not outlive the dispatch, or every later cancel for this task is
+        answered `worker_not_spawned_yet` by a slot nobody will ever fill.  A
+        spawned process is left alone — the dispatch's own `finally` owns that.
+        """
+        with _active_dispatch_lock:
+            entry = _active_dispatch_processes.get(task_id)
+            if isinstance(entry, _DispatchSlot) and entry.proc is None:
+                _active_dispatch_processes.pop(task_id, None)
+
+    async def _claim_spawned_child(task_id: str, slot: "_DispatchSlot", proc) -> bool:
+        """Publish ``proc`` into its reserved slot and answer: was it already
+        cancelled?  True means the child has been stopped (or recorded ORPHANED)
+        and the caller must NOT await it as a live worker.
+
+        Both halves of the decision happen under one lock acquisition, so a
+        cancel either sees the process (and signals it itself) or sets the flag
+        this reads — never neither.  The DB status is re-read as well, because a
+        cancel that committed before the slot existed left no flag to see.
+        """
+        with _active_dispatch_lock:
+            slot.proc = proc
+            cancelled = slot.cancel_requested
+            reason = slot.cancel_reason or _CANCEL_REASON_ATTEMPT
+        if not cancelled:
+            try:
+                cancelled = q().get_task_status(task_id) == "cancelled"
+            except Exception:
+                logger.exception("dispatch: cancel re-check failed task=%s", task_id)
+                cancelled = False
+            reason = _CANCEL_REASON_ATTEMPT
+        if not cancelled:
+            return False
+        outcome = _terminate_worker(task_id, proc)
+        logger.warning("dispatch: task=%s was cancelled during handoff — worker %s pid=%s",
+                       task_id, outcome, getattr(proc, "pid", None))
+        if outcome in ("sigterm_sent", "already_exited"):
+            # Reaping, not awaiting a live worker: no result, timeout or failure
+            # handling runs off this wait.  It outlasts the SIGKILL escalation on
+            # purpose, so the only way past it is a child that survived SIGKILL —
+            # which is then honestly recorded as ORPHANED rather than forgotten.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(proc.wait(), timeout=_cancel_kill_grace + 5.0)
+            if getattr(proc, "returncode", None) is None:
+                _record_orphaned_worker(task_id, proc, reason=reason,
+                                        outcome="survived_termination")
+        else:
+            _record_orphaned_worker(task_id, proc, reason=reason, outcome=outcome)
+        return True
+
+    def _record_orphaned_worker(task_id: str, proc, *, reason: str, outcome: str) -> None:
+        """Note a still-running child we could not signal, with its pid."""
+        with contextlib.suppress(Exception):
+            q().record_worker_orphaned(task_id, pid=getattr(proc, "pid", None),
+                                       reason=reason, outcome=outcome)
+
+    def _stop_worker_for_ended_task(task_id: str, *, reason: str) -> str:
+        """I-B for a task whose authoritative end has already committed.
+
+        One code path for the HTTP DELETE and for a stale-lease expiry, so the
+        two cannot drift: a child we own is signalled, a child that cannot be
+        signalled is recorded ORPHANED with its pid, and a dispatch that has
+        been decided but not yet spawned is handed to the dispatcher's own
+        post-spawn re-check instead of being reported as "nothing to kill".
+        """
+        with _active_dispatch_lock:
+            entry = _active_dispatch_processes.get(task_id)
+            if isinstance(entry, _DispatchSlot):
+                entry.cancel_requested = True
+                entry.cancel_reason = reason
+                proc = entry.proc
+                if proc is None:
+                    return "worker_not_spawned_yet"
+            else:
+                proc = entry
+        outcome = _terminate_worker(task_id, proc)
+        if proc is not None and outcome not in ("sigterm_sent", "already_exited"):
+            _record_orphaned_worker(task_id, proc, reason=reason, outcome=outcome)
+        return outcome
+
+    def _terminate_worker(task_id: str, proc) -> str:
+        """Stop the worker for an already-cancelled task.  Returns the state
+        to report, naming what actually happened rather than guessing.
+
+        Only dispatcher subprocesses are ours to signal; a pane worker has no
+        PID we own, so for it the authoritative cancel is the entire remedy.
+        """
+        if isinstance(proc, _DispatchSlot):
+            proc = proc.proc
+        if proc is None:
+            return "pane_worker_not_killable"
+        if getattr(proc, "returncode", None) is not None:
+            return "already_exited"
+        try:
+            # The subprocess owns a session, so this reaches its helpers too.
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            logger.warning("cancel: worker process group unavailable task=%s pid=%s",
+                           task_id, getattr(proc, "pid", None))
+            return "process_group_unavailable"
+
+        def _kill_if_still_alive() -> None:
+            _cancel_kill_timers.pop(task_id, None)
+            if getattr(proc, "returncode", None) is None:
+                with contextlib.suppress(ProcessLookupError, PermissionError):
+                    os.killpg(proc.pid, signal.SIGKILL)
+
+        _cancel_pending_kill(task_id)
+        timer = threading.Timer(_cancel_kill_grace, _kill_if_still_alive)
+        timer.daemon = True
+        _cancel_kill_timers[task_id] = timer
+        timer.start()
+        return "sigterm_sent"
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
+    #: G_DT: tmux pushes refused because the pane runs no agent, by verdict.
+    delivery_guard_refusals: dict[str, int] = {}
 
     def _requeue_orphans() -> None:
-        """On startup, reset in_progress tasks to pending and clean their worktrees.
+        """On startup, reset this dispatcher's in-progress claims to pending.
 
-        In dispatcher mode the server process owns agent subprocesses. A server
-        restart means those subprocesses were killed, so any in_progress task is
-        definitively incomplete and safe to re-queue.
+        Pull and push workers can share the queue in ``both`` delivery mode.
+        Their claims are not ours to reset when this process restarts.
         """
         tq = state["queue"]
-        orphans = tq.list_tasks(status="in_progress")
+        orphans = [
+            task for task in tq.list_tasks(status="in_progress")
+            if tq.get_task_claim_source(task.task_id) == "dispatcher"
+        ]
         if not orphans:
             return
         logger.info(f"dispatcher: re-queuing {len(orphans)} orphaned in_progress task(s)")
@@ -2509,6 +3165,23 @@ def create_app(
             role = task.context.get("role", "")
             wt = worktree_map.get(role) if worktree_map else None
             if wt and os.path.isdir(wt):
+                # #482: an orphan's uncommitted work is saved, not discarded.
+                _wip = _stash_dirty_worktree(wt, task.task_id)
+                if _wip is None:
+                    logger.error("dispatcher: stash failed for orphan %s in %s; "
+                                 "manual recovery required; refusing reset and requeue",
+                                 task.task_id, wt)
+                    tq.force_fail(task.task_id, "worktree stash failed; manual recovery required", {
+                        "reason": "wip_stash_failed", "wip_stash_error": "manual_recovery_required",
+                        "wip_worktree": wt,
+                    })
+                    continue
+                if _wip:
+                    try:
+                        tq.annotate_error_info(task.task_id, {
+                            "wip_stash": _wip, "wip_worktree": wt})
+                    except Exception:
+                        logger.exception(f"dispatcher: could not record stash for {task.task_id}")
                 try:
                     subprocess.run(
                         ["git", "checkout", "."],
@@ -2526,7 +3199,24 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        state["queue"] = TaskQueue(db_path)
+        # ADR P1/P7 — construct the CEA inputs here, in the process that decides.
+        # Before this, production built `TaskQueue(db_path)` with no providers at
+        # all: every input reported unavailable, every receipt was BLOCK, and the
+        # P6 loosening verifier had no production call site, so a signed snapshot
+        # on disk could not restore ACTIVE through this server no matter what it
+        # said. `install_from_env` never raises and never loosens by itself — an
+        # input it cannot read stays UNAVAILABLE, which P7 turns into a recorded
+        # BLOCK inside the engine rather than an exception out here.
+        #
+        # The schema-creating construction happens first and on purpose: the P6
+        # runtime row the runtime provider reads lives in that database, so
+        # wiring before it exists would leave the runtime slot UNAVAILABLE for
+        # the whole life of a first-ever start.
+        TaskQueue(db_path)
+        _cea_wiring = cea_wiring.install_from_env(
+            db_path=db_path, project=project, logger=logger)
+        state["cea_wiring"] = _cea_wiring
+        state["queue"] = TaskQueue(db_path, cea_providers=_cea_wiring.providers)
         # #248: stamp the build into the durable event stream at startup, so a
         # production before/after cohort can be cut on the PROCESS boundary
         # instead of on a GitHub merge time. #247 showed those are not the same
@@ -2593,6 +3283,26 @@ def create_app(
             "status": "ok", "suppressed_by_pause": True, "cascade_suppressed": True,
             "detail": "runtime STOP: execution-producing mutation atomically refused"})
 
+    # SEV-0 CEA s4f (FOLD-IN 5a): a refused admission is an answer, not a crash.
+    # Without this handler `POST /tasks` had no `except AdmissionRefused` (only
+    # TaskAlreadyExistsError -> 409) and no app-level handler, so every enforced
+    # refusal left as a 500 with a traceback — indistinguishable, to a client,
+    # from the server being broken. An app-level handler rather than a try/except
+    # in one route on purpose: AdmissionRefused is raised at three call sites
+    # (enqueue/claim/result), and a per-route catch would give the same refusal a
+    # different shape depending on which door it arrived at, which is exactly the
+    # ingress-equivalence property (§12.1 I1) the ADR asks us to preserve.
+    from agent_crew.queue import AdmissionRefused as _AdmissionRefused
+    from agent_crew.cea.refusal_http import refusal_payload as _refusal_payload
+
+    @app.exception_handler(_AdmissionRefused)
+    async def _admission_refused_handler(request, exc):  # noqa: ANN001
+        status, body = _refusal_payload(exc)
+        logger.warning("admission refused at %s: %s -> HTTP %s (receipt=%s, path=%s)",
+                       body["point"], body["reason"], status, body["receipt_id"],
+                       request.url.path)
+        return _JSONResponse(status_code=status, content=body)
+
     def q() -> TaskQueue:
         return state["queue"]
 
@@ -2608,8 +3318,55 @@ def create_app(
             return False
         return True
 
-    def _guard_tmx_push(task_id: str, target: str) -> str:
-        """Return a live, project-owned pane id or refuse the dispatch."""
+    def _guard_agent_process(task_id: str, target: str, pane_id: str, *,
+                             requeue: bool) -> bool:
+        """Refuse a push into an owned pane that is not running an agent CLI (G_DT).
+
+        #373 answers "is this pane ours?", not "is anything there to read the
+        block?". With AGENT_CREW_DELIVERY=both (the default) and the
+        dispatcher on, owned panes run `crew-log-viewer`, and a push typed
+        there is lost. Fail-closed: only a recognised agent is pushed to.
+
+        The task is backed off, not failed at once: under the dispatcher it is
+        still deliverable, and the refusal is about this pane, not the task.
+        `defer_push_delivery` counts refusals per (task, pane) and sets an
+        exponential `push_not_before` that only the push path's dequeue
+        honours, so the same oldest task cannot hot-loop claim→requeue and
+        starve the ones behind it (review of addc29e, P1). After
+        ``_PUSH_REFUSAL_MAX`` refusals on one pane it ends as `needs_human`:
+        nothing will make that pane an agent without a person.
+        ``requeue=False`` is for callers holding a task that is already
+        running elsewhere (watchdog reminders).
+        """
+        verdict, detail = _pane_process_kind(pane_id)
+        if verdict == "agent":
+            return True
+        reason = f"pane_not_agent_{verdict}"
+        delivery_guard_refusals[reason] = delivery_guard_refusals.get(reason, 0) + 1
+        logger.warning(
+            "refusing tmux dispatch task_id=%s target=%s resolved=%s reason=%s "
+            "detail=%s refusals=%d delivery=%s",
+            task_id, target, pane_id, reason, detail,
+            delivery_guard_refusals[reason], _delivery_raw,
+        )
+        if requeue:
+            count = q().defer_push_delivery(
+                task_id, pane_id, reason,
+                max_refusals=_PUSH_REFUSAL_MAX, backoff_s=_PUSH_REFUSAL_BACKOFF_S)
+            if count is not None and count >= _PUSH_REFUSAL_MAX:
+                logger.error(
+                    "tmux push refused %d times task_id=%s pane=%s reason=%s — needs_human",
+                    count, task_id, pane_id, reason)
+                _fail_if_active(task_id, f"push_refused_{reason}", status="needs_human")
+        return False
+
+    def _guard_tmx_push(task_id: str, target: str, *, require_agent: bool = True) -> str:
+        """Return a live, project-owned pane id or refuse the dispatch.
+
+        ``require_agent=False`` is only for callers that inspect a pane rather
+        than type into it (the watchdog's busy/timeout probe): refusing those
+        would stop a task in a crashed pane from ever timing out.
+        """
         if not _guard_task_existence(task_id, target):
             return ""
         pane_id = _resolve_tmux_pane_target(target)
@@ -2650,14 +3407,17 @@ def create_app(
             )
             q().requeue(task_id)
             return ""
+        if require_agent and not _guard_agent_process(task_id, target, pane_id, requeue=True):
+            return ""
         return pane_id
 
     # Expose the exact push boundary for state-backed guard tests; production
     # dispatch still reaches it only through _try_push_next/_try_push_discuss.
     app.state.guard_tmx_push = _guard_tmx_push
+    app.state.delivery_guard_refusals = delivery_guard_refusals
 
     def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
-                              caller: str) -> None:
+                              caller: str) -> bool:
         """Persist the exact prepared base, including an explicit unknown (#358)."""
         try:
             base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
@@ -2677,14 +3437,213 @@ def create_app(
                         "sync_base_sha": record.get("sha"),
                         "sync_base_status": record.get("status", "unknown"),
                     })
-            q().patch_context(task.task_id, base_context)
+            if role in ("reviewer", "tester"):
+                if not q().record_prepared_review_base(task.task_id, base_context):
+                    return False
+            else:
+                q().patch_context(task.task_id, base_context)
             task.context = {**(task.context or {}), **base_context}
+            return True
         except Exception:
             logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
+            return role == "implementer"  # Preserve the implementer path's prior behavior.
+
+    def _complete_suppressed_review(task: TaskRequest, decision) -> bool:
+        """End a suppressed review as a COMPLETED review carrying the standing verdict.
+
+        ⛔Not `blocked`, and not `failed`. A suppression is "the review was
+          deliberately skipped because a verdict already stands", which is a
+          *reused judgement*, not an absent one. Every consumer that reads a
+          terminal review reads it as a failure otherwise, and each of them
+          then spends exactly what the canary exists to save:
+
+          * `loop.handle_review_result` mapped it to `review_failed`, so
+            `next_review_action` retried it twice and then gave up;
+          * `blocked` is in `loop._DEAD_REVIEW_STATUSES`, so `enqueue_review`
+            refused to reuse the task and minted a fresh `review-<uuid8>` at the
+            identical head — which the canary suppressed again, one more canary
+            receipt each time round;
+          * the server-side cascade (`auto_enqueue_fix`) drops any review whose
+            status is not `completed`, so the fix round never happened and the
+            lineage simply stopped.
+
+          Writing the standing verdict and its findings instead makes both
+          paths take the ordinary `request_changes` branch: the fix step runs
+          exactly as it would have after a real re-review, and the only thing
+          that did not happen is the reviewer invocation.
+
+        Returns ``True`` only once the terminal state is readable in the DB —
+        the caller dispatches normally otherwise, so an unrecordable
+        suppression can never silently swallow a review.
+        """
+        if not any(t.task_id == task.task_id
+                   for t in q().list_tasks(status="in_progress")):
+            return False
+        ctx = task.context if isinstance(task.context, dict) else {}
+        pr_number = ctx.get("pr_number", getattr(task, "pr_number", None))
+        try:
+            pr_number = (int(pr_number)
+                         if pr_number is not None and not isinstance(pr_number, bool)
+                         else None)
+        except (TypeError, ValueError):
+            pr_number = None
+        findings = _canary.reuse_findings(
+            getattr(decision, "standing_findings", None) or [],
+            decision.standing_review_task_id)
+        result = TaskResult(
+            task_id=task.task_id, status="completed", summary=_canary.SUPPRESSED_REASON,
+            verdict="request_changes", findings=findings, pr_number=pr_number,
+        )
+        if not q().suppress_review_atomically(
+            task.task_id, result, decision_source=decision.decision_source,
+            recommendation=decision.recommendation(),
+            counterfactual=decision.counterfactual, reason=decision.reason,
+        ):
+            return False
+        # These audit sinks are deliberately post-commit best effort.  They
+        # cannot turn a committed suppression into a provider dispatch.
+        try:
+            _attr = q().get_attribution(task.task_id)
+            record_context_event(
+                _context_events_path, "task_completed",
+                task_id=task.task_id, reason=_canary.SUPPRESSED_REASON,
+                project=(_attr or {}).get("project"), role=(_attr or {}).get("role"),
+                agent=(_attr or {}).get("agent"), context_id=(_attr or {}).get("context_id"),
+            )
+            if _attr:
+                append_attribution_jsonl(_attr_jsonl_path, _attr)
+        except Exception:
+            logger.exception("tokenomics canary: post-commit audit failed for %s", task.task_id)
+        # ⛔The cascade lives on the HTTP result endpoint, and this result never
+        #   goes through it — the suppression writes it from inside dispatch. So
+        #   drive the same transition here, or the reused verdict is recorded and
+        #   nothing acts on it, which is the lineage stall from the other
+        #   direction. `auto_enqueue_fix` is idempotent per review round and
+        #   swallows its own errors (#244).
+        try:
+            _auto_enqueue_fix(task.task_id, repo=str(ctx.get("repo") or ""))
+        except Exception:
+            logger.exception(
+                "tokenomics canary: fix cascade failed for suppressed review %s",
+                task.task_id)
+        return True
+
+    def _tokenomics_canary_gate(task: TaskRequest, reviewed_sha: str) -> bool:
+        """SEV-0 §11 ONE-TASK canary. ``True`` means this review was suppressed.
+
+        The only behaviour change the matched evidence (quota-core
+        ``sev0/phaseb-80-contract-emitter`` 869a3cf) supports: do not send a
+        reviewer to a commit that a standing ``request_changes`` already
+        describes. Every other review is evaluated, recorded and dispatched
+        exactly as before.
+
+        ⛔Fails open, in three places. An evaluation error, a receipt-write
+          error, or an unarmed pin all end in a normal dispatch. Suppression is
+          the narrow path and it only runs when everything about it is known
+          and written down — a suppression nobody can read afterwards would be
+          indistinguishable from the dispatcher silently losing the task.
+        """
+        try:
+            decision = _canary.evaluate_review_dispatch(
+                task, reviewed_sha=reviewed_sha or "",
+                standing_lookup=q().standing_request_changes_review,
+                project=_server_identity()["project"],
+            )
+        except Exception:
+            logger.exception(
+                f"tokenomics canary: evaluation failed for {task.task_id} — dispatching")
+            return False
+        # Persist an intent-only receipt first. ``applied=true`` is written
+        # only after the terminal transition below is observable in the DB.
+        _recommendation = decision.recommendation()
+        if decision.applied:
+            _recommendation["applied"] = False
+            _recommendation["transition_pending"] = True
+        try:
+            q().record_tokenomics_canary_receipt(
+                task.task_id,
+                decision_source=decision.decision_source,
+                recommendation=_recommendation,
+                applied=False,
+                counterfactual=decision.counterfactual,
+                reason=decision.reason,
+                cea_receipt_id=q().task_receipt_id(task.task_id),
+            )
+        except Exception:
+            # ⛔Dispatch anyway. The receipt IS the canary's output; applying a
+            #   suppression we could not record would spend the experiment and
+            #   produce no measurement.
+            logger.exception(
+                f"tokenomics canary: receipt write failed for {task.task_id} — dispatching")
+            return False
+        if not decision.applied:
+            if decision.extra.get("condition_holds"):
+                logger.info(
+                    f"tokenomics canary (shadow): {task.task_id} would be suppressed "
+                    f"— {decision.reason}; standing request_changes "
+                    f"{decision.standing_review_task_id} on {decision.target} "
+                    f"@ {(decision.reviewed_sha or '?')[:9]}")
+            return False
+        if not _complete_suppressed_review(task, decision):
+            try:
+                _recommendation["transition_pending"] = False
+                q().record_tokenomics_canary_receipt(
+                    task.task_id, decision_source=decision.decision_source,
+                    recommendation=_recommendation, applied=False,
+                    counterfactual=decision.counterfactual,
+                    reason="suppression_transaction_failed",
+                    cea_receipt_id=q().task_receipt_id(task.task_id),
+                )
+            except Exception:
+                logger.exception("tokenomics canary: could not record failed suppression for %s",
+                                 task.task_id)
+            logger.error(
+                "tokenomics canary: could not confirm suppression for %s — dispatching",
+                task.task_id,
+            )
+            return False
+        logger.warning(
+            f"tokenomics canary APPLIED: not dispatching review {task.task_id} — "
+            f"{decision.standing_review_task_id} already stands as request_changes "
+            f"on {decision.target} @ {(decision.reviewed_sha or '?')[:9]}. "
+            f"Counterfactual: {decision.counterfactual}. "
+            f"Roll back by unsetting {_canary.CANARY_ENV} (no restart).")
+        return True
 
     # Expose watchdog tick on app.state so tests can drive it deterministically
     # without the asyncio loop. Production code never reads this attribute.
     app.state.reminded_task_ids = reminded_task_ids
+
+    def _panes_with_in_progress(exclude_task_id: str = "") -> set[str]:
+        """지금 `in_progress` 인 task 들이 점유 중인 **pane 집합**.
+
+        ⭐잠금 키를 `task_type` 에서 **실행 자원**으로 옮기기 위한 조회다
+          (2026-09-23). 같은 task_type 이라는 이유로 빈 pane 이 막히던 결함을 없앤다.
+
+        ⛔열거에 실패하면 **모든 pane 을 바쁜 것으로** 돌려준다(fail-closed).
+          빈 집합을 돌려주면 "아무도 안 바쁘다" 로 읽혀 같은 pane 에 두 task 를
+          밀어넣는다 — 이 함수가 막으려는 바로 그 사고다.
+        """
+        try:
+            busy: set[str] = set()
+            for _t in q().list_tasks(status="in_progress"):
+                if exclude_task_id and _t.task_id == exclude_task_id:
+                    continue
+                _ctx = _t.context if isinstance(_t.context, dict) else {}
+                _ov = (_ctx.get("agent_override") or "").strip().lower()
+                _p = pane_map.get(_ov) if _ov else None
+                if not _p:
+                    _r = _TYPE_TO_ROLE.get(_t.task_type)
+                    _p = pane_map.get(_r) if _r else None
+                if _p:
+                    busy.add(_p)
+            return busy
+        except Exception:
+            logger.exception(
+                "_panes_with_in_progress: could not enumerate in-progress tasks — "
+                "treating every pane as busy (fail-closed)"
+            )
+            return set(pane_map.values())
 
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
@@ -2702,6 +3661,22 @@ def create_app(
                 "if no MCP client is active they will accumulate until the watchdog auto-fails them."
             )
             return
+        # #496: a role mapped to the claude_cloud backend has no tmux pane at
+        # all — dispatch_cloud_for_role reuses the SAME STOP/pause gate
+        # (dequeue) and CEA admission gate (record_dispatch) this function
+        # uses below, then hands off to `claude --cloud` instead of a pane
+        # push. Every other check below (pane busy, context-by-pane-capture,
+        # worktree-via-tmux) is tmux-specific and does not apply here. This
+        # branch only fires when an operator has explicitly opted a role
+        # into claude_cloud (role_mapping.py); by default no role resolves to
+        # it, so existing local dispatch is unchanged.
+        if _DISPATCH_ROLE_TO_AGENT.get(role, "") == _claude_cloud.CLOUD_PROVIDER_NAME:
+            try:
+                _claude_cloud.dispatch_cloud_for_role(
+                    q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""))
+            except Exception:
+                logger.exception(f"_try_push_next: claude_cloud dispatch failed for role={role}")
+            return
         if not pane_map:
             logger.debug(f"_try_push_next: no pane_map")
             return
@@ -2713,30 +3688,45 @@ def create_app(
         if task_type is None:
             logger.warning(f"_try_push_next: role {role} not in _ROLE_TO_TYPE")
             return
-        if q().has_in_progress(task_type):
-            logger.debug(f"_try_push_next: task_type {task_type} already in progress")
-            return  # agent busy; will get pushed when current task completes
-        task = q().dequeue(role=role)
-        if task is None:
-            logger.debug(f"_try_push_next: no pending task for role {role}")
-            return  # nothing pending
-
-        # Check if task has an agent_override in context
-        _target_agent = _DISPATCH_ROLE_TO_AGENT.get(role, "")
-        task_context = task.context if isinstance(task.context, dict) else {}
-        logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
-        if "agent_override" in task_context:
-            agent_override = task_context["agent_override"]
-            override_pane_id = pane_map.get(agent_override)
-            if override_pane_id:
-                logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
-                pane_id = override_pane_id
-                # #292 review: the context measurement follows the pane, so it
-                # has to follow the override too.
-                _target_agent = agent_override
-            else:
-                logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
+        # ⛔예전에는 여기서 `q().has_in_progress(task_type)` 로 막았다 — **전역
+        #   task_type 잠금**이라, 다른 pane 이 전부 비어 있어도 같은 task_type 이면
+        #   두 번째 task 가 스케줄되지 않았다(2026-09-23 실측: pane 3개 중 실효 1개).
+        #   잠금 키를 실행 자원(pane)으로 옮긴다 — 어느 pane 으로 갈지는 override 를
+        #   해석해야 알 수 있으므로 **dequeue 뒤에** 판정하고, 충돌이면 되돌린다.
+        skipped: set[str] = set()
+        while True:
+            task = q().dequeue(role=role, claimed_via="tmux_push", skip_deferred=True, skip_task_ids=skipped)
+            if task is None:
+                logger.debug(f"_try_push_next: no eligible pending task for role {role}")
                 return
+            pane_id = pane_map[role]
+            _target_agent = _DISPATCH_ROLE_TO_AGENT.get(role, "")
+            task_context = task.context if isinstance(task.context, dict) else {}
+            logger.debug(f"_try_push_next: task_id={task.task_id}, context={task_context}")
+            if "agent_override" in task_context:
+                agent_override = task_context["agent_override"]
+                override_pane_id = pane_map.get(agent_override)
+                if override_pane_id:
+                    logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
+                    pane_id = override_pane_id
+                    # #292: context measurement follows the resolved pane.
+                    _target_agent = agent_override
+                else:
+                    logger.warning(f"_try_push_next: agent_override {agent_override} not found in pane_map")
+                    q().requeue(task.task_id)
+                    skipped.add(task.task_id)
+                    continue
+
+            # A busy queue head must not hide a later task for a free pane.
+            if pane_id in _panes_with_in_progress(exclude_task_id=task.task_id):
+                logger.debug(
+                    f"_try_push_next: pane {pane_id} is busy — requeueing {task.task_id} "
+                    f"(role={role}, task_type={task.task_type})"
+                )
+                q().requeue(task.task_id)
+                skipped.add(task.task_id)
+                continue
+            break
 
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
@@ -2752,7 +3742,10 @@ def create_app(
                     # see which commit it was given can say so in its result,
                     # and a reviewer that cannot has no way to notice the head
                     # moved under it.
-                    _record_prepared_base(task, role, _reviewed_sha, "_try_push_next")
+                    if not _record_prepared_base(task, role, _reviewed_sha, "_try_push_next"):
+                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                        status="needs_human")
+                        return
                     logger.info(
                         f"_try_push_next: worktree prepared for {role} "
                         f"task_id={task.task_id} branch={task.branch or '(none)'}"
@@ -2782,6 +3775,16 @@ def create_app(
                         f"_try_push_next: worktree prep failed for {role} "
                         f"task_id={task.task_id} — continuing with dispatch"
                     )
+
+        # SEV-0 §11 ONE-TASK tokenomics canary — the last gate before the
+        # provider is spent. Placed AFTER worktree prep because the commit the
+        # reviewer would read is only known once it is prepared, and BEFORE the
+        # protocol/pane work because everything past this point costs provider
+        # tokens. Prep itself costs none.
+        if task.task_type == "review" and _tokenomics_canary_gate(
+            task, (task.context or {}).get("reviewed_sha") or ""
+        ):
+            return
 
         _push_worktree = worktree_map.get(role) if worktree_map else ""
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
@@ -2901,7 +3904,19 @@ def create_app(
         # or deleted task block to an otherwise healthy owned pane.
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        # ⛔DISPATCH answers before the block is built, not after it was sent.
+        #   The nonce only exists once the gate said PROCEED, and a worker that
+        #   already has the block cannot be un-handed it — so a refused dispatch
+        #   must be refused here, while there is still a decision to make.
+        try:
+            _nonce = q().record_dispatch(
+                task.task_id, channel="tmux_pane", agent=_target_agent or None,
+                target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
+        except AdmissionRefused as exc:
+            logger.warning("_try_push_next: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        push_fn(guarded_pane_id, _format_task_message(
+            task, port, nonce=_nonce, project=_server_identity()["project"]))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
@@ -2950,7 +3965,7 @@ def create_app(
         if q().has_discuss_in_progress_for_agent(agent):
             logger.debug(f"_try_push_discuss: discuss task in progress for agent {agent}")
             return
-        task = q().dequeue_discuss_for_agent(agent)
+        task = q().dequeue_discuss_for_agent(agent, claimed_via="tmux_push", skip_deferred=True)
         if task is None:
             logger.debug(f"_try_push_discuss: no pending discuss task for agent {agent}")
             return
@@ -2997,7 +4012,15 @@ def create_app(
             )
         if not _guard_task_existence(task.task_id, guarded_pane_id):
             return
-        push_fn(guarded_pane_id, _format_task_message(task, port))
+        try:
+            _nonce = q().record_dispatch(task.task_id, channel="tmux_pane", agent=agent,
+                                         target=guarded_pane_id,
+                                         lease_owner=f"pane:{guarded_pane_id}")
+        except AdmissionRefused as exc:
+            logger.warning("_try_push_discuss: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        push_fn(guarded_pane_id, _format_task_message(
+            task, port, nonce=_nonce, project=_server_identity()["project"]))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
@@ -3026,6 +4049,18 @@ def create_app(
         - ``timed_out`` — task_ids that we auto-failed
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        # #499 r0 HIGH: claude_cloud dispatches have no pane and are
+        # otherwise invisible to this pane-oriented watchdog (every check
+        # below resolves a pane per row and skips rows with none) — without
+        # this, a cloud dispatch never completes and permanently occupies a
+        # concurrency slot. Reconciled here, on the SAME periodic trigger
+        # this watchdog already runs on, rather than a new scheduler.
+        # Independent of pane_map so a cloud-only deployment (no tmux panes
+        # configured at all) still reconciles.
+        try:
+            _claude_cloud.reconcile_all_cloud_tasks(q())
+        except Exception:
+            logger.exception("watchdog: claude_cloud reconciliation failed")
         if not pane_map:
             return actions
 
@@ -3043,7 +4078,7 @@ def create_app(
             # Every watchdog tmux interaction, including permission dismissal
             # and timeout Ctrl+C, must use the same live ownership boundary as
             # task delivery. Never inspect or interrupt a foreign pane.
-            guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+            guarded_pane_id = _guard_tmx_push(task_id, pane_id, require_agent=False)
             if not guarded_pane_id:
                 continue
             pane_id = guarded_pane_id
@@ -3053,6 +4088,7 @@ def create_app(
                 _pane_dismiss_permission_prompt(pane_id)
                 if pane_busy_fn(pane_id):
                     q().bump_activity(task_id, ts=now)
+                    q().record_heartbeat(task_id, source="pane_busy", ts=now)
                     actions["bumped"].append(task_id)
                     # Busy pane resets the reminder cycle — agent is alive.
                     reminded_task_ids.discard(task_id)
@@ -3171,7 +4207,7 @@ def create_app(
                                     f"watchdog: failed to push next task for role {role}"
                                 )
             elif idle_for >= reminder_seconds and task_id not in reminded_task_ids:
-                guarded_pane_id = _guard_tmx_push(task_id, pane_id)
+                guarded_pane_id = _guard_tmx_push(task_id, pane_id, require_agent=False)
                 if not guarded_pane_id:
                     continue
                 pane_id = guarded_pane_id
@@ -3190,9 +4226,15 @@ def create_app(
                         )
                     except Exception:
                         logger.warning(f"watchdog: failed to send Ctrl+C to {pane_id}")
+                elif not _guard_agent_process(task_id, pane_id, pane_id, requeue=False):
+                    # G_DT: the reminder is a push too, but this task is
+                    # already running; refuse the text, leave the task alone.
+                    continue
                 else:
                     try:
-                        push_fn(pane_id, _format_reminder_message(task_id, port, idle_for, mcp_mode=not _push_enabled))
+                        push_fn(pane_id, _format_reminder_message(
+                            task_id, port, idle_for, project=_server_identity()["project"],
+                            mcp_mode=not _push_enabled))
                     except Exception:
                         logger.exception(
                             f"watchdog: failed to push reminder for {task_id}"
@@ -3333,7 +4375,8 @@ def create_app(
     # instead of just inferrable (#202 acceptance criterion).
     _seen_context_keys_this_process: set[str] = set()
 
-    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed") -> None:
+    def _fail_if_active(task_id: str, reason: str, *, status: str = "failed",
+                        details: Optional[dict] = None) -> bool:
         """End a task only when it is still in_progress (agent may have submitted first).
 
         `status` distinguishes two things the dispatcher used to conflate (#265):
@@ -3350,16 +4393,23 @@ def create_app(
         tasks = q().list_tasks(status="in_progress")
         if any(t.task_id == task_id for t in tasks):
             try:
+                summary = reason
+                if details and "last_output_age_s" in details:
+                    summary += f" (last output {details['last_output_age_s']:.1f}s ago)"
                 q().submit_result(
                     task_id,
-                    TaskResult(task_id=task_id, status=status, summary=reason,
-                               error_info={"reason": reason, "final": status == "failed"}),
+                    TaskResult(task_id=task_id, status=status, summary=summary,
+                               error_info={"reason": reason, "final": status == "failed",
+                                           **(details or {})}),
+                    dispatcher_failed=status == "failed",
                 )
+                capture_result_best_effort(db_path, task_id, TaskResult(
+                    task_id=task_id, status=status, summary=summary))
                 _attr = q().get_attribution(task_id)
                 record_context_event(
                     _context_events_path,
                     "task_failed" if status == "failed" else "task_timed_out",
-                    task_id=task_id, reason=reason,
+                    task_id=task_id, reason=reason, **(details or {}),
                     project=(_attr or {}).get("project"),
                     role=(_attr or {}).get("role"),
                     agent=(_attr or {}).get("agent"),
@@ -3370,8 +4420,10 @@ def create_app(
                 # can see this task actually failed.
                 if _attr:
                     append_attribution_jsonl(_attr_jsonl_path, _attr)
+                return q().get_task_status(task_id) == status
             except Exception:
                 logger.exception(f"_fail_if_active: could not fail task {task_id}")
+        return False
 
     def _resolve_dispatch_target(task: TaskRequest, role: str) -> tuple[str, Optional[str]]:
         """Resolve the (agent, worktree_path) a task will actually dispatch
@@ -3526,6 +4578,7 @@ def create_app(
         _ctx_over = False
         _ctx_cap_info = {}
         _codex_planned = ""      # the session a codex resume would use, if any
+        _renew_previous_session = ""
         if agent == "gemini":
             _ctx_over, _ctx_cap_info = agy_context_exceeds_cap(wt)
         elif agent == "codex":
@@ -3544,8 +4597,14 @@ def create_app(
                 _project, agent, wt) or "").strip()
             if not _codex_planned:
                 _codex_planned = codex_session_for_cwd(wt)
+            if (_codex_mode == "renew_rehydrate"
+                    and task.task_type == "implement"
+                    and not (_ctx.get("fix_round") or str(task.task_id).startswith("fix-"))
+                    and not _force_context_reset and _codex_planned):
+                _renew_previous_session = _codex_planned
+                _force_context_reset = True
             _ctx_over, _ctx_cap_info = codex_context_exceeds_cap(
-                wt, session_id=_codex_planned)
+                wt, max_mb=_codex_cap_mb, session_id=_codex_planned)
         elif agent == "claude":
             # #260: the same defect on the other provider. `--continue` was
             # unconditional here, so the session never rotated — one file per
@@ -3699,7 +4758,11 @@ def create_app(
                 # unknown, before prompt construction.  A prep failure still
                 # dispatches, but can no longer masquerade as an unrecorded
                 # stale base later in the task lineage.
-                _record_prepared_base(task, role, _reviewed_sha, "dispatcher")
+                if not _record_prepared_base(task, role, _reviewed_sha, "dispatcher"):
+                    _lock_stack.close()
+                    _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                    status="needs_human")
+                    return
                 logger.info(
                     f"dispatcher: worktree prepared for {role} "
                     f"task_id={task.task_id} branch={task.branch or '(none)'} "
@@ -3723,6 +4786,17 @@ def create_app(
                 logger.exception(
                     f"dispatcher: worktree prep failed for {role} task_id={task.task_id} — continuing"
                 )
+
+        # SEV-0 §11 ONE-TASK tokenomics canary — the last gate before the
+        # provider is spent. Placed AFTER worktree prep because the commit the
+        # reviewer would read is only known once it is prepared, and BEFORE the
+        # protocol/pane work because everything past this point costs provider
+        # tokens. Prep itself costs none.
+        if task.task_type == "review" and _tokenomics_canary_gate(
+            task, (task.context or {}).get("reviewed_sha") or ""
+        ):
+            _lock_stack.close()
+            return
 
         if not _ensure_role_protocol(
             role, wt, _project, os.path.join(os.path.dirname(db_path), "port"), agent=agent, port=port,
@@ -3811,9 +4885,34 @@ def create_app(
                 # operator-configured full-suite override. The cascade stores
                 # this decision on the task so replay/restart cannot infer it
                 # from a provider or project name.
-                if isinstance(task.context, dict) and task.context.get("test_scope") == "targeted":
+                # ⛔This reads the decision the cascade already STORED; it does
+                #   not make one. It used to re-ask the risk-tier module
+                #   whether tiering applied, which meant the same question was
+                #   answered twice — once when the cascade created this task and
+                #   again here, against config that may have changed in between.
+                #   The ADR removes that module as a decision (§11.1 row 13,
+                #   O10) and gives the review/test contract to the policy
+                #   snapshot's J7 `review_test_matrix`, read once at admission.
+                #   What survives at dispatch is honouring a reduction the
+                #   task's ADMISSION RECEIPT carries, and naming where it came
+                #   from.
+                # ⛔Not `task.context["test_scope"]`. The context is whatever the
+                #   request supplied, so honouring it let any ingress lower the
+                #   test gate — invariant 7, §7.2 (codex [0] at c18e092). A
+                #   request-side reduction is logged and ignored; with no J7
+                #   field on the receipt the task keeps its full scope.
+                _admitted = q().cea_admitted_test_scope(task.task_id)
+                if _admitted is not None:
                     _scope = {**_scope, "full_suite": False,
-                              "source": "risk_tier", "source_kind": "risk_tier"}
+                              "source": _admitted["source_kind"],
+                              "source_kind": _admitted["source_kind"]}
+                elif (isinstance(task.context, dict)
+                        and task.context.get("test_scope") not in (None, "")):
+                    logger.warning(
+                        "dispatcher: ingress test_scope ignored (§7.2) task_id=%s "
+                        "requested=%r source=%r", task.task_id,
+                        task.context.get("test_scope"),
+                        task.context.get("test_scope_source"))
                 _scope_name = _effective_scope(_scope)
                 _scope_hash = _scope_fingerprint(_scope)
                 q().record_test_economics(
@@ -3853,7 +4952,72 @@ def create_app(
             logger.exception(f"dispatcher: attribution record failed for task={task.task_id}")
 
 
-        message = _format_task_message(task, port)
+        # ⛔DISPATCH decides here, before the prompt exists, because the nonce it
+        #   mints must be *inside* that prompt — a subprocess cannot be handed
+        #   one afterwards. The pid is bound once the process exists
+        #   (`bind_dispatch_target`); binding a target is telemetry, deciding a
+        #   dispatch is not.
+        # ⛔The reservation goes in BEFORE the dispatch commits — see
+        #   `_reserve_dispatch_slot`. From here on every exit path must release
+        #   it: the refusal below does so explicitly, everything after the spawn
+        #   is covered by the `finally` that pops the registry.
+        # Resolved once (main's per-task `dispatch_timeout_s`): the lease and
+        # the wall-clock kill below must agree on the same budget.
+        timeout_secs = _dispatch_timeout_for_role(role, _ctx)
+        _slot = _reserve_dispatch_slot(task.task_id)
+        try:
+            _dispatch_nonce = q().record_dispatch(
+                task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
+                agent=agent, target=f"{agent}:pending",
+                lease_owner=f"{agent}:pending",
+                lease_seconds=timeout_secs)
+        except AdmissionRefused as exc:
+            logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
+            _release_dispatch_slot(task.task_id, _slot)
+            return
+        message = _format_task_message(
+            task, port, nonce=_dispatch_nonce, project=_server_identity()["project"])
+        if _renew_previous_session:
+            _summary = codex_latest_compaction_summary(_renew_previous_session)
+            _seed = "summary_and_checkpoint" if _summary else "checkpoint_only"
+            _previous_context = (q().get_task_context(_ctx_info["previous_task_id"])
+                                 if _ctx_info.get("previous_task_id") else {})
+            _chain_root = (_ctx.get("chain_root") or _ctx.get("prev_task_id")
+                           or task.task_id)
+            _checkpoint = {
+                "task_id": task.task_id, "branch": task.branch,
+                "pr_number": _ctx.get("pr_number") or _previous_context.get("pr_number"),
+                "previous_task_id": _ctx_info.get("previous_task_id"),
+                "chain_root": _chain_root,
+            }
+            # The existing ADR-001 store supplies verified owner statements.
+            # Only already provisioned project-local memory is read; a missing
+            # store is an explicit empty authority set, never an invented fact.
+            _owner_facts = []
+            try:
+                from agent_crew.memory_runtime import effective_owner_statements
+                _storage = getattr(_memory_provider, "storage", None)
+                if _storage is not None:
+                    _owner_facts = [
+                        {"source_ref": record.value.get("source_ref"),
+                         "text": record.value.get("text")}
+                        for record in effective_owner_statements(_storage, _project)
+                    ]
+            except Exception:
+                logger.exception("dispatcher: owner memory read failed for %s", task.task_id)
+            _checkpoint["owner_authority_facts"] = _owner_facts
+            _renew_block = (
+                "ADR-001 7.7 renewal checkpoint (verify current sources):\n"
+                + json.dumps(_checkpoint, ensure_ascii=False)
+                + ("\nPrevious Codex rollout compaction summary:\n" + _summary
+                   if _summary else "")
+            )
+            message = _renew_block + "\n\n" + message
+            q().patch_context(task.task_id, {
+                "context_renewal": {"mode": _codex_mode, "seed": _seed,
+                                    "previous_session_id": _renew_previous_session,
+                                    "chain_root": _chain_root},
+            })
         # #239: assemble a bounded, provenance-linked Context Pack from durable
         # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
         # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
@@ -3945,6 +5109,88 @@ def create_app(
             except Exception:
                 logger.exception(
                     f"dispatcher: context pack telemetry failed for {task.task_id}")
+        elif (agent == "claude" and _cpack.inject_gate_enabled() and _ctx_over
+              and _ctx_cap_info.get("tripped_by") == "tokens"
+              and _ctx_info["context_policy"] == "fresh"):
+            # The token cap already chose a fresh session. The gate only
+            # describes missing context; it cannot change that decision.
+            try:
+                _gate_pack = _cpack.build_pack_for_task(
+                    _ctx if isinstance(_ctx, dict) else {},
+                    task_id=task.task_id, task_type=task.task_type, role=role,
+                    repo_path=wt, branch=task.branch,
+                    episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
+                    procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
+                    shadow_path=os.path.join(_state_dir, "procedure_shadow.jsonl"),
+                )
+                _gate = _cpack.is_sufficient(
+                    _gate_pack, task_type=task.task_type,
+                    retry_of=str(_retry_of or _ctx.get("retry_of") or "") if isinstance(_ctx, dict) else "",
+                )
+                _block = _gate_pack.to_prompt_block(inject_gate=_gate)
+                _identity = {
+                    "task_id": task.task_id, "project": _project, "role": role,
+                    "agent": agent, "context_id": _ctx_info["context_id"],
+                    "context_generation": _ctx_info["context_generation"],
+                }
+                if _block:
+                    record_context_event(
+                        _context_events_path, "inject_gate",
+                        **{**_gate_pack.telemetry(), **_identity,
+                           "ok": _gate.ok, "missing_signals": _gate.missing_signals,
+                           "pack_tokens": _cpack.estimate_tokens(_block),
+                           "fresh_reason": "token_cap"},
+                    )
+                    message = _block + "\n\n" + message
+            except Exception:
+                logger.exception("dispatcher: context pack inject gate failed for %s", task.task_id)
+        elif _cpack.shadow_enabled():
+            # Observe the whole pack without changing the signed task row or
+            # the bytes sent to the provider. Shadow failures cannot gate dispatch.
+            try:
+                _shadow_pack = _cpack.build_pack_for_task(
+                    _ctx if isinstance(_ctx, dict) else {},
+                    task_id=task.task_id, task_type=task.task_type, role=role,
+                    repo_path=wt, branch=task.branch,
+                    episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
+                    procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
+                    shadow_path=os.path.join(_state_dir, "procedure_shadow.jsonl"),
+                )
+                _identity = {
+                    "task_id": task.task_id,
+                    "project": _project,
+                    "role": role,
+                    "agent": agent,
+                    "context_id": _ctx_info["context_id"],
+                    "context_generation": _ctx_info["context_generation"],
+                }
+                _telemetry = _shadow_pack.telemetry()
+                _shadowed = (set(_telemetry) & set(_identity)) - {"role"}
+                if _shadowed:
+                    logger.warning(
+                        "dispatcher: context pack telemetry carries dispatch "
+                        "identity keys %s for task=%s; the dispatcher's values "
+                        "win and the pack's are dropped (#258)",
+                        sorted(_shadowed), task.task_id,
+                    )
+                _item_types = {item.artifact_type for item in _shadow_pack.items}
+                record_context_event(
+                    _context_events_path, "context_pack_built",
+                    **{
+                        **_telemetry, **_identity,
+                        "shadow": True,
+                        "advisory": True,
+                        "pack_tokens": _cpack.estimate_tokens(_shadow_pack.to_prompt_block()),
+                        "warm_context_tokens": _ctx_cap_info.get("context_tokens"),
+                        "context_policy": _ctx_info["context_policy"],
+                        "has_issue": _cpack.TYPE_ISSUE in _item_types,
+                        "has_acceptance_criteria": _cpack.TYPE_AC in _item_types,
+                        "has_linked_review": _cpack.TYPE_REVIEW in _item_types,
+                    },
+                )
+            except Exception:
+                logger.exception(
+                    "dispatcher: context pack shadow failed for %s", task.task_id)
 
         # #322: Shadow-only optional durable-memory observation.  This sits
         # after the baseline message (including any Context Pack) is complete,
@@ -3957,6 +5203,7 @@ def create_app(
                     _memory_provider, MemoryRequest(
                         project=_project,
                         task_id=task.task_id,
+                        issue=str(_ctx.get("issue", "")) if isinstance(_ctx, dict) else "",
                         context_id=_ctx_info["context_id"],
                         agent_identity=agent,
                         context_generation=_ctx_info["context_generation"],
@@ -4054,7 +5301,6 @@ def create_app(
                 cmd = ["codex", "exec",
                        "--dangerously-bypass-approvals-and-sandbox", "--json", message]
 
-        timeout_secs = _dispatch_timeout_for_role(role, _ctx)
         logger.info(f"dispatcher: {agent} task={task.task_id} role={role} wt={wt} timeout={timeout_secs}s")
         # Only pop the retry counter on a terminal outcome. Flipped to False
         # right before the early `return` on a successful requeue — that
@@ -4084,22 +5330,40 @@ def create_app(
                 # Strip PYTHONPATH/PYTHONHOME so codex/gemini python wrappers
                 # don't load the server's 3.10 stdlib under a 3.12 interpreter
                 # (causes "SRE module mismatch" crash on subprocess startup).
-                _dispatch_env = {**os.environ, "TELEGRAM_STATE_DIR": os.path.join(wt, ".telegram")}
-                _dispatch_env.pop("PYTHONPATH", None)
-                _dispatch_env.pop("PYTHONHOME", None)
+                _dispatch_env = worker_environment(os.environ, wt)
                 # start_new_session=True puts proc in its own process group so
                 # we can kill the whole tree on timeout — agent CLIs (gemini,
                 # agy, codex) spawn helper children that survive a plain
                 # proc.kill() and reparent to PID 1 as orphans (#191).
+                #
+                # ⛔The spawn MUST stay inside this `with`. `log_f` is passed
+                #   as the child's stdout/stderr, and the spawn reads its
+                #   `.fileno()` to dup it into the child — outside the block the
+                #   handle is closed and every dispatch dies with
+                #   "I/O operation on closed file" (review of 720ac76). The
+                #   child keeps its own dup, so closing ours on exit is safe.
                 proc = await asyncio.create_subprocess_exec(
                     *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
                     start_new_session=True,
                 )
-            _timed_out = False
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=timeout_secs)
-            except asyncio.TimeoutError:
-                _timed_out = True
+            # ⛔I-B: publish the child into its reservation and decide, under the
+            #   same lock, whether a cancel has already landed. A cancel that
+            #   committed in the handoff window is not allowed to end with the
+            #   dispatcher awaiting the child it just authorized away.
+            if await _claim_spawned_child(task.task_id, _slot, proc):
+                return
+            # G12: the lease is the kill timeout enforced just below. The
+            # dispatch itself was decided before the prompt was built.
+            q().bind_dispatch_target(task.task_id, target=f"pid:{proc.pid}",
+                                     lease_owner=f"{agent}:pid:{proc.pid}")
+            _idle_timeout_secs = _dispatch_idle_timeout()
+            _timeout_reason, _last_output_age = await _wait_for_dispatch_activity(
+                proc, log_path, _task_log_start_offset,
+                hard_timeout_s=timeout_secs, idle_timeout_s=_idle_timeout_secs,
+                on_progress=lambda: q().record_heartbeat(
+                    task.task_id, source="output_progress"),
+            )
+            if _timeout_reason:
                 # Kill the entire process group, not just the direct child.
                 try:
                     os.killpg(proc.pid, signal.SIGKILL)
@@ -4109,7 +5373,8 @@ def create_app(
                     proc.kill()
                 except ProcessLookupError:
                     pass
-                logger.error(f"dispatcher: timeout {timeout_secs}s task={task.task_id}")
+                logger.error("dispatcher: %s task=%s last_output_age=%.1fs",
+                             _timeout_reason, task.task_id, _last_output_age)
             # Inspect the dispatch log tail for upstream errors — applies to
             # both clean exit AND timeout (#190). Claude can return rc=0 with
             # api_error_status:429; gemini-cli often hangs on retry loops past
@@ -4158,12 +5423,27 @@ def create_app(
                     # cheap to find, and once recorded the next resume needs no
                     # search at all. Without this a fresh codex task would never
                     # acquire a binding and every dispatch would start over.
-                    _codex_after = codex_session_for_cwd(wt)
+                    _codex_after = ((codex_thread_id_from_output(_task_log_tail)
+                                     if _renew_previous_session else "")
+                                    or codex_session_for_cwd(wt))
                     if _codex_after and _codex_after != _ctx_info.get("provider_session_id"):
                         q().update_context_provider_session_id(_context_key, _codex_after)
                         logger.info(
                             "dispatcher: recorded codex session %s for %s (#262)",
                             _codex_after[:8], wt)
+                    if _renew_previous_session:
+                        if _codex_after and _codex_after != _renew_previous_session:
+                            q().update_attribution_provider_session_id(task.task_id, _codex_after)
+                        _renew_fields = {
+                            "mode": _codex_mode, "seed": _seed,
+                            "previous_session_id": _renew_previous_session,
+                            "new_session_id": (_codex_after if _codex_after != _renew_previous_session else ""),
+                            "task_id": task.task_id, "chain_root": _chain_root,
+                        }
+                        q().patch_context(task.task_id, {"context_renewal": _renew_fields})
+                        record_context_event(_context_events_path, "context_renewed",
+                                             project=_project, agent=agent, role=role,
+                                             **_renew_fields)
                 if detect_context_compaction(_task_log_tail):
                     record_context_event(
                         _context_events_path, "context_compacted",
@@ -4173,14 +5453,20 @@ def create_app(
             except Exception:
                 logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
             try:
-                q().record_task_telemetry(
-                    task.task_id, response_log_telemetry(agent, _task_log_tail))
+                _record_exit_response_telemetry(q(), task.task_id, agent, _task_log_tail)
                 _telemetry_attr = q().get_attribution(task.task_id)
                 if _telemetry_attr:
                     append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
             except Exception:
                 logger.exception("dispatcher: terminal telemetry enrichment failed for task=%s", task.task_id)
-            if _transient in _TRANSIENT_RETRIABLE_TAGS:
+            if _timeout_reason:
+                # The task receipt, error_info, and event all carry the fired
+                # limit and output age for post-mortem inspection.
+                _fail_if_active(task.task_id, _timeout_reason, status="timed_out",
+                                details={"last_output_age_s": round(_last_output_age, 3),
+                                         "timeout_limit_s": (timeout_secs if _timeout_reason == "dispatcher_timeout"
+                                                             else _idle_timeout_secs)})
+            elif _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
                 if _n <= _MAX_TRANSIENT_RETRY:
@@ -4213,15 +5499,6 @@ def create_app(
                     "failing without retry (quota reset / migration required)"
                 )
                 _fail_if_active(task.task_id, _transient)
-            elif _timed_out:
-                # #265: NOT `failed`. The dispatcher stopped waiting; the worker
-                # may still be running and may still POST — measured on
-                # alpha_engine, six tasks in one day were marked failed and later
-                # turned completed, with their commits already pushed. A consumer
-                # reading status at notification time saw a false failure and
-                # would have re-issued work that was already done (including one
-                # task that had already opened a PR).
-                _fail_if_active(task.task_id, "dispatcher_timeout", status="timed_out")
             elif proc.returncode != 0:
                 _fail_if_active(task.task_id, f"exit_{proc.returncode}")
             else:
@@ -4233,6 +5510,11 @@ def create_app(
             logger.exception(f"dispatcher: error task={task.task_id}")
             _fail_if_active(task.task_id, "dispatcher_exception")
         finally:
+            with _active_dispatch_lock:
+                _active_dispatch_processes.pop(task.task_id, None)
+            # The process is reaped; a cancel's pending SIGKILL now has no
+            # legitimate target and must not outlive it (review of 720ac76).
+            _cancel_pending_kill(task.task_id)
             # #272: release the test-stage lock before anything else in the
             # teardown can raise — a leaked flock would block every later test
             # on this worktree until the process exits.
@@ -4262,23 +5544,48 @@ def create_app(
             # project's committed version). Both paths break the implementer's review
             # delegation flow (issue #187). After the reset we re-write all role
             # protocol files so the next dispatch finds them intact.
+            #
+            # #482: a task that did not complete may have left finished but
+            # uncommitted work (codex hit its limit right before `git commit`).
+            # Stash it first, named after the task; completed tasks are reset
+            # exactly as before.
+            _reset_safe = False
             try:
-                subprocess.run(
-                    ["git", "-C", wt, "checkout", "."],
-                    capture_output=True,
-                )
-                subprocess.run(
-                    [
-                        "git", "-C", wt, "clean", "-fd",
-                        "-e", ".claude/CLAUDE.md",
-                        "-e", "AGENTS.md",
-                        "-e", "GEMINI.md",
-                    ],
-                    capture_output=True,
-                )
-                logger.debug(f"dispatcher: worktree reset after task={task.task_id} role={role}")
+                if wt and q().get_task_status(task.task_id) != "completed":
+                    _wip = _stash_dirty_worktree(wt, task.task_id)
+                    if _wip is None:
+                        logger.error("dispatcher: stash failed for %s task=%s in %s; "
+                                     "manual recovery required; refusing reset", role,
+                                     task.task_id, wt)
+                        q().annotate_error_info(task.task_id, {
+                            "wip_stash_error": "manual_recovery_required", "wip_worktree": wt})
+                    else:
+                        _reset_safe = True
+                    if _wip:
+                        q().annotate_error_info(task.task_id, {
+                            "wip_stash": _wip, "wip_worktree": wt})
+                else:
+                    _reset_safe = True
             except Exception:
-                logger.exception(f"dispatcher: worktree reset failed for {role} task={task.task_id}")
+                logger.exception(f"dispatcher: wip stash failed for {role} task={task.task_id}")
+            if _reset_safe:
+                try:
+                    subprocess.run(
+                        ["git", "-C", wt, "checkout", "."],
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        [
+                            "git", "-C", wt, "clean", "-fd",
+                            "-e", ".claude/CLAUDE.md",
+                            "-e", "AGENTS.md",
+                            "-e", "GEMINI.md",
+                        ],
+                        capture_output=True,
+                    )
+                    logger.debug(f"dispatcher: worktree reset after task={task.task_id} role={role}")
+                except Exception:
+                    logger.exception(f"dispatcher: worktree reset failed for {role} task={task.task_id}")
             # Re-apply agent_crew protocol files for every role we host. Idempotent —
             # implementer's .claude/CLAUDE.md is overwritten; AGENTS.md/GEMINI.md get
             # the marker block re-merged onto the project's content.
@@ -4304,119 +5611,183 @@ def create_app(
                 )
 
     async def _dispatcher_loop() -> None:
-        """Poll DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn headless
-        agent subprocesses.  One concurrent task per role (same --continue session
-        cannot be shared across parallel invocations) — AND, since #202
-        review of PR #203 (finding 1), one concurrent task per *resolved*
-        worktree, since agent_override can route two different roles into
-        the same underlying agent/worktree/provider conversation. Role-slot
-        exclusivity alone doesn't see that — e.g. tester's normal gemini
-        task and a reviewer task with agent_override=gemini both occupy
-        different role slots but resolve to the same gemini worktree, and
-        running both `--continue` processes concurrently there would
-        corrupt that conversation. See _resolve_dispatch_target.
-        """
-        active_roles: set[str] = set()
-        active_worktrees: set[str] = set()
-        active_tasks: dict[str, asyncio.Task] = {}  # task_id → asyncio.Task
-        task_roles: dict[str, str] = {}  # task_id → role
+        """Poll the DB every AGENT_CREW_DISPATCH_INTERVAL seconds and spawn
+        headless agent subprocesses.
 
-        # Inverse of _DISPATCH_ROLE_TO_AGENT: agent → role (for worktree lookup).
-        # When the same agent maps to multiple roles (e.g. claude on both
-        # implementer and reviewer), prefer implementer for discuss dispatch
-        # since discuss tasks are exploratory rather than review-specific.
-        _AGENT_TO_ROLE: dict[str, str] = {}
+        ⭐**동시성 키는 실행 자원이다 — `task_type` 이 아니다.**
+
+        2026-09-23 실측(alpha_engine `:8101`): pane 세 개가 전부 비어 있는데도
+        `implement` 두 건이 직렬로 돌았다. 루프가 `for role in (...)` 로 **역할
+        슬롯**을 잠갔고 `agent_override` 는 그 뒤 실행 대상을 고를 때만 읽혔기
+        때문이다 — override 로 다른 worker 에 보낸 두 번째 implement 가
+        **스케줄 단계에서** 막혔다. 실효 병렬도가 3이 아니라 1이었다.
+
+        이제 잠그는 것은 두 가지뿐이다:
+
+        - **execution slot(`worker_id`)** — 같은 worker 에 동시에 두 task 금지.
+          한 provider 의 `--continue` 세션을 둘이 나눠 쓸 수 없다.
+        - **worktree lease** — 같은 worktree 에 동시 writer 금지(#202 / PR #203
+          finding 1). 서로 다른 worker 라도 override 로 같은 worktree 에 겹칠 수 있다.
+
+        ⛔`task_type`·`role` 은 잠금 키가 아니다. 서로 다른 worker + 서로 다른
+        worktree 면 같은 task_type 도 병렬로 돈다.
+
+        ⛔slot 은 **pane 이 아니라 `worker_id`** 다. pane 은 전달 계층의 관심사이고
+        여기서는 쓰지 않는다 — tmux 가 아닌 worker backend(컨테이너·원격 러너)가
+        추가돼도 이 스케줄러를 다시 뜯지 않게 하기 위해서다.
+        """
+        active_workers: set[str] = set()      # execution slot lease: worker_id
+        active_worktrees: set[str] = set()    # worktree lease: 해석된 worktree 경로
+        active_tasks: dict[str, asyncio.Task] = {}   # task_id → asyncio.Task
+        task_slots: dict[str, str] = {}       # task_id → worker_id
+
+        # Keep every configured role for an agent; the execution slot still
+        # serializes that agent's tasks across those roles.
+        _AGENT_TO_ROLES: dict[str, list[str]] = {}
         _ROLE_PRIORITY = {"implementer": 0, "reviewer": 1, "tester": 2}
         for _role, _agent in _DISPATCH_ROLE_TO_AGENT.items():
-            current = _AGENT_TO_ROLE.get(_agent)
-            if current is None or _ROLE_PRIORITY.get(_role, 99) < _ROLE_PRIORITY.get(current, 99):
-                _AGENT_TO_ROLE[_agent] = _role
+            _AGENT_TO_ROLES.setdefault(_agent, []).append(_role)
+        for _roles in _AGENT_TO_ROLES.values():
+            _roles.sort(key=lambda r: _ROLE_PRIORITY.get(r, 99))
+
+        # worker 순회 순서 — 역할 우선순위를 따르되 같은 worker 는 한 번만.
+        _workers: list[str] = []
+        for _role, _agent in sorted(
+            _DISPATCH_ROLE_TO_AGENT.items(),
+            key=lambda kv: _ROLE_PRIORITY.get(kv[0], 99),
+        ):
+            if _agent and _agent not in _workers:
+                _workers.append(_agent)
+        # discuss 는 role 매핑에 없는 agent 로도 올 수 있다.
+        _discuss_workers = list(dict.fromkeys(_workers + ["claude", "codex", "gemini"]))
+
+        # ⭐dispatcher 가 **실제로 들고 있는 lease**. orphan 판정의 권위다 —
+        #   `in_progress` 인데 여기 없으면 주인이 사라진 task 다(GET /tasks/orphans).
+        app.state.dispatcher_active_tasks = active_tasks
+        app.state.dispatcher_active_workers = active_workers
+        app.state.dispatcher_active_worktrees = active_worktrees
 
         interval = float(os.getenv("AGENT_CREW_DISPATCH_INTERVAL", "2"))
         try:
             while True:
                 await asyncio.sleep(interval)
                 try:
-                    logger.debug(f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} active_roles={active_roles}")
+                    logger.debug(
+                        f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} "
+                        f"active_workers={sorted(active_workers)} "
+                        f"active_worktrees={len(active_worktrees)}"
+                    )
                     # Reap completed dispatches, freeing their slots.
                     done = [tid for tid, t in list(active_tasks.items()) if t.done()]
                     for tid in done:
                         active_tasks.pop(tid, None)
-                        role = task_roles.pop(tid, None)
-                        if role:
-                            active_roles.discard(role)
+                        slot = task_slots.pop(tid, None)
+                        if slot:
+                            active_workers.discard(slot)
 
-                    for role in ("implementer", "reviewer", "tester"):
-                        if role in active_roles:
+                    for worker in _workers:
+                        if worker in active_workers:
                             continue
-                        task = q().dequeue(role=role)
+                        _worker_roles = _AGENT_TO_ROLES.get(worker, [])
+                        _default_role = _worker_roles[0] if _worker_roles else ""
+                        task = None
+                        for _candidate_role in _worker_roles:
+                            # Stage 1 checks overrides independent of task type;
+                            # Stage 2 checks each role this worker owns.
+                            task = q().dequeue(agent=worker, role=_candidate_role, claimed_via="dispatcher",
+                                               claim_source="dispatcher")
+                            if task is not None:
+                                break
                         if task is None:
                             continue
+                        # 프로토콜·결과 처리는 task_type 이 정한다.
+                        # override 는 **실행 자원만** 바꾼다(역할을 바꾸지 않는다).
+                        role = _TYPE_TO_ROLE.get(
+                            task.task_type, _default_role or "implementer")
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        _slot = _target_agent or worker
+                        if _slot in active_workers:
+                            # override 가 이미 바쁜 worker 를 가리켰다.
+                            logger.info(
+                                f"dispatcher: deferring task={task.task_id} — execution slot "
+                                f"{_slot} is held (task_type={task.task_type})"
+                            )
+                            q().requeue(task.task_id)
+                            continue
                         if _target_wt and _target_wt in active_worktrees:
-                            # Same worktree/provider conversation already in
-                            # flight under a different role slot — put the
-                            # task back and try again next tick, rather than
-                            # running two `--continue` processes against one
-                            # conversation concurrently.
+                            # 같은 worktree 에 두 writer 를 붙이지 않는다.
                             logger.info(
                                 f"dispatcher: deferring task={task.task_id} role={role} "
-                                f"agent={_target_agent} — target worktree {_target_wt} "
-                                "already active under another role this tick"
+                                f"agent={_target_agent} — worktree lease {_target_wt} is held"
                             )
                             q().requeue(task.task_id)
                             continue
-                        active_roles.add(role)
+                        active_workers.add(_slot)
                         if _target_wt:
                             active_worktrees.add(_target_wt)
-                        task_roles[task.task_id] = role
+                        task_slots[task.task_id] = _slot
 
-                        async def _run(t: TaskRequest = task, r: str = role, w: Optional[str] = _target_wt) -> None:
-                            try:
-                                await _dispatch_task(t, r)
-                            finally:
-                                active_roles.discard(r)
-                                if w:
-                                    active_worktrees.discard(w)
-                                active_tasks.pop(t.task_id, None)
-                                task_roles.pop(t.task_id, None)
-
-                        active_tasks[task.task_id] = asyncio.create_task(_run())
-
-                    # Discuss tasks are per-agent (not per-role); dispatch concurrently.
-                    for agent in ("claude", "codex", "gemini"):
-                        slot_key = f"discuss_{agent}"
-                        if slot_key in active_roles:
-                            continue
-                        task = q().dequeue_discuss_for_agent(agent)
-                        if task is None:
-                            continue
-                        role = _AGENT_TO_ROLE.get(agent, "implementer")
-                        _target_agent, _target_wt = _resolve_dispatch_target(task, role)
-                        if _target_wt and _target_wt in active_worktrees:
-                            logger.info(
-                                f"dispatcher: deferring discuss task={task.task_id} agent={agent} "
-                                f"— target worktree {_target_wt} already active this tick"
-                            )
-                            q().requeue(task.task_id)
-                            continue
-                        active_roles.add(slot_key)
-                        if _target_wt:
-                            active_worktrees.add(_target_wt)
-                        task_roles[task.task_id] = slot_key
-
-                        async def _run_discuss(
-                            t: TaskRequest = task, r: str = role, s: str = slot_key,
+                        async def _run(
+                            t: TaskRequest = task, r: str = role, s: str = _slot,
                             w: Optional[str] = _target_wt,
                         ) -> None:
                             try:
                                 await _dispatch_task(t, r)
                             finally:
-                                active_roles.discard(s)
+                                _drop_unspawned_reservation(t.task_id)
+                                active_workers.discard(s)
                                 if w:
                                     active_worktrees.discard(w)
                                 active_tasks.pop(t.task_id, None)
-                                task_roles.pop(t.task_id, None)
+                                task_slots.pop(t.task_id, None)
+
+                        active_tasks[task.task_id] = asyncio.create_task(_run())
+
+                    # discuss 도 **같은 execution slot 네임스페이스**를 쓴다.
+                    # ⛔예전에는 `discuss_<agent>` 라는 별도 키였다 — 같은 provider 에
+                    #   일반 task 와 discuss 가 동시에 붙을 수 있었다(같은 결함의 변종).
+                    for agent in _discuss_workers:
+                        if agent in active_workers:
+                            continue
+                        task = q().dequeue_discuss_for_agent(agent, claimed_via="dispatcher",
+                                                              claim_source="dispatcher")
+                        if task is None:
+                            continue
+                        role = _AGENT_TO_ROLES.get(agent, ["implementer"])[0]
+                        _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        _slot = _target_agent or agent
+                        if _slot in active_workers:
+                            logger.info(
+                                f"dispatcher: deferring discuss task={task.task_id} "
+                                f"— execution slot {_slot} is held"
+                            )
+                            q().requeue(task.task_id)
+                            continue
+                        if _target_wt and _target_wt in active_worktrees:
+                            logger.info(
+                                f"dispatcher: deferring discuss task={task.task_id} agent={agent} "
+                                f"— worktree lease {_target_wt} is held"
+                            )
+                            q().requeue(task.task_id)
+                            continue
+                        active_workers.add(_slot)
+                        if _target_wt:
+                            active_worktrees.add(_target_wt)
+                        task_slots[task.task_id] = _slot
+
+                        async def _run_discuss(
+                            t: TaskRequest = task, r: str = role, s: str = _slot,
+                            w: Optional[str] = _target_wt,
+                        ) -> None:
+                            try:
+                                await _dispatch_task(t, r)
+                            finally:
+                                _drop_unspawned_reservation(t.task_id)
+                                active_workers.discard(s)
+                                if w:
+                                    active_worktrees.discard(w)
+                                active_tasks.pop(t.task_id, None)
+                                task_slots.pop(t.task_id, None)
 
                         active_tasks[task.task_id] = asyncio.create_task(_run_discuss())
                 except Exception:
@@ -4436,6 +5807,18 @@ def create_app(
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
+    app.state.active_dispatch_processes = _active_dispatch_processes
+    # Exposed so a test can assert no kill is left armed after it finishes —
+    # and defuse one in teardown if it is.
+    app.state.cancel_kill_timers = _cancel_kill_timers
+    app.state.terminate_worker = _terminate_worker
+    # The cancel/spawn handoff (#51 I-B): the reservation helpers and the lock
+    # they share, so a test can drive a real interleaving instead of asserting
+    # against its own copy of the ordering.
+    app.state.active_dispatch_lock = _active_dispatch_lock
+    app.state.reserve_dispatch_slot = _reserve_dispatch_slot
+    app.state.claim_spawned_child = _claim_spawned_child
+    app.state.stop_worker_for_ended_task = _stop_worker_for_ended_task
     # Same rationale (#248, #265): expose the terminal-marking helper so a test
     # can drive the real timeout path instead of asserting against a
     # reimplementation of it.
@@ -4476,6 +5859,7 @@ def create_app(
             q(),
             review_task_id,
             pane_map=pane_map,
+            server_project=project,
             repo=repo,
             repo_cwd=_any_worktree_path(),
         )
@@ -4500,6 +5884,27 @@ def create_app(
             pass
         return ""
 
+    def _successor_project_for(parent_task_id: str, ctx: Optional[dict] = None) -> str:
+        """The project a server-internal successor is admitted under (§7.1, s4j).
+
+        In precedence order: the parent row's own project, the project its
+        context named, then this dispatcher's identity — which is
+        `_server_identity()`'s, i.e. the `create_app` argument or the state
+        directory the DB sits in (#248). `""` only when none of the three
+        answer, and an empty project is then refused with a receipt rather
+        than crashing the caller.
+        """
+        row_project = ""
+        try:
+            for t in q().list_tasks():
+                if t.task_id == parent_task_id:
+                    row_project = str(getattr(t, "project", "") or "").strip()
+                    break
+        except Exception:  # noqa: BLE001 — provenance, never a reason to drop the successor
+            row_project = ""
+        ctx_project = str((ctx or {}).get("project") or "").strip()
+        return row_project or ctx_project or str(_server_identity()["project"] or "").strip()
+
     def _requeue_review_at_head(review_task_id: str, pr_number, head: str, ctx) -> None:
         """Enqueue one head-anchored review for a PR whose head moved (#304).
 
@@ -4513,7 +5918,8 @@ def create_app(
         base = ctx if isinstance(ctx, dict) else {}
         context = {k: v for k, v in base.items()
                    if k in ("pr_number", "repo", "project", "no_tester",
-                            "coordinator_managed", "checklist_layers")}
+                            "coordinator_managed", "checklist_layers",
+                            "findings_only")}
         context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
                         "expected_head_sha": head})
         try:
@@ -4525,7 +5931,14 @@ def create_app(
                 branch=base.get("branch") or "main",
                 priority=3,
                 context=context,
-            ))
+                # s4j: a re-dispatched review is the same project as the review
+                # it supersedes. Naming none admitted project-less and the
+                # engine raised the frozen-contract violation inside the
+                # watchdog. `_server_identity` is the same fallback /health
+                # already reports this dispatcher under (#248).
+                project=_successor_project_for(review_task_id, base),
+            ),
+                        ingress="watchdog.stale_review")
             logger.info(
                 f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
                 f"{head[:12]}, superseding {review_task_id} (#304)")
@@ -4592,6 +6005,20 @@ def create_app(
             if not tasks:
                 return
             original_task = tasks[0]
+            # Opt-in for projects where repeating an agent-reported implement
+            # failure has proved wasteful. Read per call so the default retry
+            # behavior remains unchanged when the flag is unset.
+            error_info = original_task.error_info
+            if (
+                os.getenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "1") == "0"
+                and task_type == "implement"
+                and not (isinstance(error_info, dict) and error_info.get("reason"))
+            ):
+                logger.info(
+                    "_auto_retry_failed_task: skipping retry for %s: agent-reported implement failure; retry would repeat the same work",
+                    task_id,
+                )
+                return
 
             # #167: use the DB context retry_attempt, not result.retry_count.
             # Agents always submit retry_count=0 (they don't track it); the DB
@@ -4639,7 +6066,7 @@ def create_app(
                         return
 
             # Create retry task with incremented retry count
-            retry_context = dict(original_task.context) if isinstance(original_task.context, dict) else {}
+            retry_context = _successor_context(original_task.context)
             retry_context.pop(RESULT_BRANCH_CONTEXT_KEY, None)
             retry_context.pop(RESULT_COMMIT_CONTEXT_KEY, None)
             retry_context["retry_attempt"] = db_retry_attempt + 1
@@ -4653,10 +6080,15 @@ def create_app(
                 branch=original_task.branch,
                 priority=original_task.priority + 1,  # Bump priority for retries
                 context=retry_context,
+                # s4j: a retry is the same work, so the same project. The row is
+                # right here — `original_task` — so prefer it over the lookup.
+                project=(str(getattr(original_task, "project", "") or "").strip()
+                         or _successor_project_for(task_id, retry_context)),
             )
             from agent_crew.queue import TaskAlreadyExistsError as _TAE
             try:
-                q().enqueue(retry_req)
+                q().enqueue(retry_req, ingress="retry.failed_task",
+                            _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             except _TAE:
                 logger.info(f"_auto_retry_failed_task: {retry_req.task_id} 이미 존재 — 멱등 skip")
             logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")
@@ -4685,7 +6117,8 @@ def create_app(
         # IMMEDIATE 트랜잭션에서 runtime_stop을 확인해 unpaused일 때만 admit+reserve → STOP이
         # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
         # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
-        from agent_crew.github import get_repo, merge_pr, pr_state
+        from agent_crew.github import (get_repo, independent_review_succeeded,
+                                       merge_pr, pr_state)
         _merge_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         op_key = f"merge:pr:{pr_number}"
         resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
@@ -4725,6 +6158,19 @@ def create_app(
             q().external_op_mark(op_key, "failed",
                                  last_error="PR 상태 불명(gh 실패) — 다음 재확인 대기", inc_attempt=True)
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
+            return
+        # The HTTP cascade is allowed to run for every admitted task. Its
+        # test result alone is not authority to merge: crew run and external
+        # coordinators also submit test results and own their own merge policy.
+        # Require the independent review status on the current PR head for
+        # every server-side merge, regardless of caller-controlled context.
+        if not independent_review_succeeded(int(pr_number), _merge_repo):
+            q().external_op_mark(
+                op_key, "failed",
+                last_error="crew/independent-review success missing on PR head",
+                inc_attempt=True)
+            logger.warning(f"_auto_merge_pr: PR #{pr_number} lacks successful "
+                           "crew/independent-review status — merge refused")
             return
         # st == 'open' → merge 시도
         ok = merge_pr(int(pr_number), merge_method="squash", repo=_merge_repo)
@@ -4785,6 +6231,20 @@ def create_app(
         return {"project": name, "db_path": db_path, "port": port or 0,
                 "state_path": state_path or ""}
 
+    def _require_project_identity(client_project: Optional[str]) -> None:
+        if not identity_required:
+            return
+        server_project = _server_identity()["project"]
+        if client_project and client_project == server_project:
+            return
+        logger.error("#362 project identity rejected task transport: expected project=%r, server project=%r",
+                     client_project, server_project)
+        if not client_project:
+            raise HTTPException(status_code=428, detail="X-Agent-Crew-Project is required")
+        raise HTTPException(status_code=409, detail=(
+            f"project identity mismatch: expected project={client_project!r}, "
+            f"server project={server_project!r}"))
+
     @app.get("/health")
     def health():
         """Liveness plus the build this process is actually running (#248).
@@ -4806,11 +6266,47 @@ def create_app(
                          "incident": _stop.get("incident")}
         except Exception:
             _stop_out = {"epoch": None, "paused": True, "incident": None, "error": "read_failed"}
+        # P6 (ADR E11 @6cbce565): "/health.runtime_state exposes it." A state that
+        # is not in the runtime row does not exist — CX-4j is a runtime that was
+        # "quarantined" by record while its own row said otherwise, so the row is
+        # what this endpoint reports. `effective_state` folds in the tighten-only
+        # pause.json signal; `state` is the stored row.
+        try:
+            _rs = q().get_runtime_state()
+            _runtime_state_out = {
+                "state": _rs.get("state"),
+                "effective_state": _rs.get("effective_state"),
+                "epoch": _rs.get("epoch"),
+                "reason": _rs.get("reason"),
+                "decision_id": _rs.get("decision_id"),
+                "incident": _rs.get("incident"),
+                "pause_json_tightening": _rs.get("pause_json_tightening"),
+                "read_failed": bool(_rs.get("read_failed")),
+            }
+        except Exception:
+            _runtime_state_out = {"state": "STOPPED", "effective_state": "STOPPED", "epoch": None,
+                                  "reason": "runtime_state_unreadable", "decision_id": None,
+                                  "incident": None, "pause_json_tightening": None,
+                                  "read_failed": True}
+        # s4i item 2: how many rows are still in the queue with no receipt at
+        # all. Under `shadow` they claim and dispatch and are REPORTed; under
+        # `enforce` claim refuses them. "Is this project ready for enforce?" is
+        # that number reaching zero, so it rides on the endpoint an operator
+        # already polls rather than living only in a log nobody greps.
+        try:
+            _cea_out = {"legacy_rows": q().cea_legacy_rows()}
+        except Exception as exc:
+            _cea_out = {"legacy_rows": {"error": f"{type(exc).__name__}: {exc}"}}
         return {
             "status": "ok",
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,
+            "runtime_state": _runtime_state_out,
+            "cea": _cea_out,
+            # G_DT: pushes refused because the target pane runs no agent CLI.
+            "delivery_guard": {"delivery": _delivery_raw,
+                               "refusals": dict(delivery_guard_refusals)},
             "build": {
                 "commit": snap["commit"],
                 "commit_short": snap["commit_short"],
@@ -4892,7 +6388,8 @@ def create_app(
         return {"status": "ok", "pane_map": pane_map}
 
     @app.post("/tasks", status_code=201)
-    def post_task(task: TaskRequest):
+    def post_task(task: TaskRequest,
+                  x_agent_crew_project: Optional[str] = Header(default=None)):
         """Enqueue a task.
 
         ``201`` → ``{"task_id": "..."}``.
@@ -4912,28 +6409,23 @@ def create_app(
         one endpoint's error shape unique — and
         ``tests/unit/test_issue_273_duplicate_task_id.py`` asserts the whole
         body so the description cannot drift from it again.
+
+        ⛔No ``in_flight_for_issue``. #294's lexical in-flight advisory — match
+        the issue number, log a warning, return the colliding ids — was a
+        *second* duplicate matcher living beside admission, and the ADR removes
+        it (§11.1 row 14, fixture CXC-1). Matching on an issue number is
+        matching on a label: two tasks that mean the same thing under different
+        issue numbers were never flagged, and four tasks that legitimately share
+        one issue were. Duplicate suppression belongs to the engine's
+        ``intent_hash`` (Π P4), which is computed from what the task *is*, and
+        it decides rather than advises. Until that index lands, admission does
+        not pretend to answer the question at all — an advisory nobody can act
+        on is worse than a stated gap.
         """
+        _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
-        # #294: gathered BEFORE the enqueue, so the task being created can
-        # never appear in its own collision list.
-        # ⛔Resolved the same way `enqueue` will resolve it moments later.
-        #   Reading `context.issue` alone here meant a direct enqueue whose
-        #   issue lives only in its description reported no collision and was
-        #   then stored under that very issue (review of PR #295).
-        _issue_number = task_issue_number(task)
-        _in_flight: list = []
-        if isinstance(_issue_number, int) and not isinstance(_issue_number, bool):
-            try:
-                _in_flight = active_tasks_for_issue(
-                    q(), _issue_number, task_type=task.task_type)
-            except Exception:
-                # The whole feature is advisory; it must never cost a task.
-                logger.exception(
-                    f"POST /tasks: in-flight lookup failed for issue "
-                    f"#{_issue_number} — enqueueing anyway")
-                _in_flight = []
         try:
-            task_id = q().enqueue(task)
+            task_id = q().enqueue(task, ingress="http.tasks")
         except TaskAlreadyExistsError as e:
             raise HTTPException(
                 status_code=409,
@@ -4943,19 +6435,12 @@ def create_app(
                     "status": e.status,
                 },
             )
-        logger.info(f"POST /tasks: enqueued task_id={task_id}")
-        if _in_flight:
-            # ⛔Advisory, never a gate. Several tasks legitimately share one
-            #   issue — implement, its review, its fix rounds, its test — so
-            #   refusing by issue would break the cascade. What was missing is
-            #   only that nobody was TOLD: #294 measured a direct enqueue
-            #   duplicating a watch task that was still in flight, 15 minutes
-            #   before the first one's PR existed.
-            logger.warning(
-                f"POST /tasks: {task_id} is a second {task.task_type!r} task for "
-                f"issue #{_issue_number} while {_in_flight} is still in flight. "
-                f"Enqueued anyway — this is a heads-up, not a block (#294)."
+        except DuplicateReviewError as e:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": e.code, "existing_task_id": e.existing_task_id},
             )
+        logger.info(f"POST /tasks: enqueued task_id={task_id}")
         if not _push_enabled:
             logger.warning(
                 f"POST /tasks: AGENT_CREW_DELIVERY={_delivery_raw!r} — task {task_id} enqueued "
@@ -4973,12 +6458,12 @@ def create_app(
                 _try_push_next(role)
             else:
                 logger.warning(f"POST /tasks: no role found for task_type={task.task_type}")
-        # Always a list, never absent: a consumer should not have to tell "no
-        # collision" from "this server does not report collisions".
-        return {"task_id": task_id, "in_flight_for_issue": _in_flight}
+        return {"task_id": task_id}
 
     @app.get("/tasks/next")
-    def get_next_task(role: str = "", agent: str = ""):
+    def get_next_task(role: str = "", agent: str = "",
+                      x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         # #172: in MCP-only mode the LLM must use the get_next_task MCP tool,
         # not curl-poll this HTTP endpoint — block to prevent idle token burn.
         if not _push_enabled:
@@ -4989,25 +6474,133 @@ def create_app(
                     "Use the MCP get_next_task tool instead of curl-polling this endpoint."
                 ),
             )
-        task = q().dequeue(agent=agent, role=role)
+        task = q().dequeue(agent=agent, role=role, claimed_via="http_poll")
         if task is None:
             return None
-        return task
+        try:
+            nonce = q().record_dispatch(task.task_id, channel="api", agent=agent or None,
+                                        target=f"http_poll:{agent or 'anonymous'}")
+        except AdmissionRefused as exc:
+            # The claim already committed; the dispatch did not. Say so rather
+            # than hand out a task the gate refused.
+            raise HTTPException(status_code=409, detail=str(exc))
+        # ⛔Additive: every field a poller already reads is unchanged. The nonce
+        #   is presented back at `/tasks/{id}/start` and with the result under
+        #   `executor_binding`; `None` means none was minted and the two later
+        #   call sites have nothing to check (P2).
+        return {**dataclasses.asdict(task), "dispatch_nonce": nonce}
 
     @app.get("/tasks")
-    def list_tasks(status: str = ""):
+    def list_tasks(status: str = "", x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         return q().list_tasks(status=status)
 
+    def _dispatcher_lease_view() -> tuple[Optional[set], Optional[set]]:
+        """dispatcher 가 지금 들고 있는 (task_id lease, worker slot) 을 돌려준다.
+
+        ⛔dispatcher 가 안 돌고 있으면 `(None, None)` 이다 — 그때 "lease 가 없다"
+          를 "주인이 사라졌다" 로 읽으면 **살아 있는 task 를 orphan 으로 오인**한다.
+          그래서 호출부는 `lease_tracking` 을 함께 보고해야 한다.
+        """
+        _tasks = getattr(app.state, "dispatcher_active_tasks", None)
+        _workers = getattr(app.state, "dispatcher_active_workers", None)
+        if _tasks is None:
+            return None, None
+        return set(_tasks.keys()), set(_workers or ())
+
+    @app.get("/tasks/orphans")
+    def list_orphan_tasks(older_than: float = 0.0):
+        """`in_progress` 인데 **주인(dispatcher lease)이 없는** task 를 보여준다.
+
+        ⭐2026-09-23 실측: worker 프로세스가 사라졌는데 task 3건이 78분 동안
+          `in_progress` 로 남아 레인을 잡았다. 그때 쓸 수 있던 API 는 **전역
+          `expire-stale`** 뿐이라, 한 건을 치우려다 라이브 3건이 같이 취소됐다.
+          이 조회는 아무것도 바꾸지 않는다 — 스윕 전에 대상과 건수를 먼저 본다.
+
+        ⛔`lease_tracking=false` 면 이 목록은 orphan 판정이 아니라 **단순
+          in_progress 목록**이다(dispatcher 미가동). 그 상태에서 recover 를
+          돌리면 살아 있는 task 를 되돌릴 수 있다.
+        """
+        _leased, _ = _dispatcher_lease_view()
+        _now = time.time()
+        rows = q().list_in_progress_activity()
+        out = []
+        for r in rows:
+            _ts = r["last_activity_at"] or r["created_at"]
+            _age = max(0.0, _now - _ts) if _ts else None
+            _orphan = (
+                _leased is not None
+                and r["claim_source"] == "dispatcher"
+                and r["task_id"] not in _leased
+            )
+            if _age is not None and _age < older_than:
+                continue
+            _ctx = r.get("context") or {}
+            out.append({
+                "task_id": r["task_id"],
+                "task_type": r["task_type"],
+                "idle_s": round(_age, 1) if _age is not None else None,
+                "agent_override": (_ctx.get("agent_override") or None),
+                "claim_source": r["claim_source"] or "unknown",
+                "has_dispatcher_lease": (None if _leased is None
+                                         else r["task_id"] in _leased),
+                "orphan": _orphan,
+            })
+        return {
+            "lease_tracking": _leased is not None,
+            "in_progress": len(rows),
+            "listed": len(out),
+            "orphans": sum(1 for r in out if r["orphan"]),
+            "older_than": older_than,
+            "tasks": out,
+        }
+
     @app.get("/tasks/{task_id}")
-    def get_task(task_id: str):
+    def get_task(task_id: str, x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         tasks = q().list_tasks()
         for t in tasks:
             if t.task_id == task_id:
-                return t
+                # G12 / D6: additive — every field a client already reads is
+                # unchanged; `execution` is the claim/dispatch/lease record.
+                return {**dataclasses.asdict(t), "execution": q().get_exec_state(task_id)}
         raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
 
+    @app.post("/tasks/{task_id}/start", status_code=200)
+    def start_task(task_id: str, body: dict = Body(default_factory=dict),
+                   x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
+        """P2 EXECUTE_START — the pane's one-shot go/no-go before it starts work.
+
+        ``{"nonce": "<the dispatch nonce from the task block>"}`` →
+        ``{"go": true|false, "reason": ...}``. The nonce is single-use: the
+        first caller spends it, and a second caller presenting the same one is
+        told no. A worker that gets ``go: false`` must not start.
+
+        ⛔This endpoint is the check, not the enforcement. Nothing stops a pane
+          from skipping the call; what step 2b adds is the task block that makes
+          calling it the only way to learn what to do. Answering honestly here
+          first is what lets that change be about the protocol rather than about
+          the decision.
+        """
+        nonce = body.get("nonce") if isinstance(body, dict) else None
+        presenter = body.get("presenter") if isinstance(body, dict) else None
+        try:
+            return q().start_execution(task_id, nonce if isinstance(nonce, str) else None,
+                                       presenter=presenter if isinstance(presenter, str) else None)
+        except Exception as exc:
+            logger.exception(f"POST /tasks/{task_id}/start failed")
+            raise HTTPException(status_code=500, detail=str(exc))
+
     @app.post("/tasks/{task_id}/result", status_code=200)
-    def submit_result(task_id: str, result: TaskResult):
+    def submit_result(task_id: str, result: TaskResult,
+                      x_agent_crew_project: Optional[str] = Header(default=None)):
+        """Accept active results; keep rejected late payloads as exec events.
+
+        System-ended rows return HTTP 409. A late original whose fallback
+        owns the lineage returns an acknowledged, ignored result instead.
+        """
+        _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks/{task_id}/result: status={result.status}")
         # Capture context before marking done — we need the agent name for
         # discuss-task follow-up pushes.
@@ -5015,28 +6608,55 @@ def create_app(
         _artifact_held = None
         _task = next((item for item in q().list_tasks() if item.task_id == task_id), None)
         try:
-            _runtime_paused = bool(q().get_stop_epoch().get("paused")) or q()._pausejson_active()
+            _runtime_paused = q().get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
             # STOP state is safety authority.  Do not rewrite an in-flight
             # result while its state cannot be read; submit_result will retain
             # its established fail-closed cascade handling (#313).
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
+        _artifact_verified = None
+        # T5, ADR §11.1 row 10 / fixture CXC-6a: "dispatch base absent" is a
+        # FAIL, never a pass. An implement task that completes with no declared
+        # artifact contract and no `worktree_base_sha`/`reviewed_sha` gives the
+        # gate nothing to check the completion against — so the honest answer is
+        # that the artifact is unproven, not that the rule did not apply. Logging
+        # "not applied" and accepting `completed` made an *absent input* read as
+        # a passing check, which is the one thing P7 forbids a gate to do.
+        #
+        # ⛔Held under the project's rollout mode, not unconditionally: under
+        #   `shadow`/`off` this is recorded and the result stands, because the
+        #   whole point of shadow is to measure how many live tasks this would
+        #   have caught before it catches any.
         if (not _runtime_paused and not _REPLAYING.get() and _task is not None
                 and _task.task_type == "implement" and result.status == "completed"
+                and declared_artifact_kind(_task) is None
                 and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
                          or "rebase_onto" in _artifact_context)):
-            logger.info("POST /tasks/%s/result: artifact gate not applied — dispatch base absent", task_id)
+            _no_base = ("dispatch base absent: this implement task declares no "
+                        "artifact contract and carries no worktree_base_sha or "
+                        "reviewed_sha, so its completion cannot be verified")
+            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
+                logger.warning("POST /tasks/%s/result: artifact gate FAILED — %s",
+                               task_id, _no_base)
+                _artifact_held = _no_base
+                result = no_artifact_result(result, _no_base)
+            else:
+                logger.info("POST /tasks/%s/result: artifact gate would FAIL under "
+                            "enforce — %s (shadow: result stands)", task_id, _no_base)
+        # #374: the check follows the task's declared contract; undeclared
+        # tasks keep #353's commit rule exactly (artifact_gate_applies).
         if (not _runtime_paused and not _REPLAYING.get()
-                and bool(_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
-                         or "rebase_onto" in _artifact_context)
-                and _task is not None
-                and _task.task_type == "implement" and result.status == "completed"):
-            _ok, _detail = verify_implement_artifact(
-                _task, result, repo_cwd=_any_worktree_path())
+                and artifact_gate_applies(_task, result)):
+            _ok, _detail = verify_task_artifact(
+                _task, result, repo_cwd=_any_worktree_path(),
+                commit_verifier=verify_implement_artifact)
             if not _ok:
                 _artifact_held = _detail
                 result = no_artifact_result(result, _detail)
+            else:
+                _artifact_verified = {"kind": declared_artifact_kind(_task) if declared_artifact_kind(_task) is not None else "commit",
+                                      "detail": _detail}
         # #268: does this result even claim to be about the PR we dispatched
         # it for? Must happen before the row is written, so what lands in the
         # DB is the held form — a human reading the row later sees the
@@ -5044,15 +6664,46 @@ def create_app(
         # target. Both numbers survive: `requested` in the context, `reported`
         # on the row.
         result, _pr_mismatch = hold_mismatched_pr_result(task_id, result, ctx)
-        # #265: a result can arrive for a task the dispatcher already ended —
-        # it stopped waiting, the worker kept going, and the row silently flips
-        # from `timed_out` (previously `failed`) to `completed`. A consumer that
-        # read the status when the notification fired sees only the first value
-        # and never learns it was revised. Capture the prior status so the
-        # revision can be announced.
+        # #265: worker-reported failures can still be revised by that worker.
+        # Queue admission now refuses a timeout, cancel or dispatcher failure
+        # under the write lock, so those statuses never reach revision logging.
         _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
+        _adopted_fallback_id = None
+        if (_task is not None and _task.task_type == "implement"
+                and _prior in ("failed", "timed_out") and result.status == "completed"):
+            _fallbacks = [
+                t for t in q().list_tasks()
+                if t.task_id.startswith("fallback-")
+                and isinstance(t.context, dict)
+                and t.context.get("original_task_id") == task_id
+            ]
+            # Only an unfinished, unique fallback may be withdrawn. The queue
+            # checks the same lineage under its result write lock; if this
+            # snapshot is stale, the fallback still wins and the late result
+            # is retained as evidence only.
+            if len(_fallbacks) == 1 and _fallbacks[0].status in ("pending", "in_progress"):
+                _fallback_id = _fallbacks[0].task_id
+                try:
+                    _cancelled = cancel_task(_fallback_id)
+                    if isinstance(_cancelled, dict) and _cancelled.get("status") == "cancelled":
+                        _adopted_fallback_id = _fallback_id
+                        logger.info("POST /tasks/%s/result: adopted late original; "
+                                    "cancelled fallback %s", task_id, _fallback_id)
+                except Exception:
+                    logger.exception("POST /tasks/%s/result: fallback cancellation failed",
+                                     task_id)
+        # §2.2 / P2 RESULT. Popped, not read: the nonce is a spent credential
+        # and must not reach `result_json`. `presenter` defaults to the task's
+        # dispatch agent only when the worker did not name itself — an asserted
+        # identity either way under P2a, and the receipt records that it is.
+        _nonce, _presenter = result.take_executor_binding()
         try:
-            task_type = q().submit_result(task_id, result)
+            task_type = q().submit_result(task_id, result, nonce=_nonce,
+                                          presenter=_presenter,
+                                          allow_review_replay=_REPLAYING.get(),
+                                          validate_review=not _REPLAYING.get(),
+                                          adopted_fallback_task_id=_adopted_fallback_id)
+            capture_result_best_effort(db_path, task_id, result)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
             # outside submit_result's STOP-atomic transaction: a telemetry-like
@@ -5062,6 +6713,7 @@ def create_app(
                 key: value for key, value in (
                     (RESULT_BRANCH_CONTEXT_KEY, result.branch),
                     (RESULT_COMMIT_CONTEXT_KEY, result.commit),
+                    ("result_artifact", _artifact_verified),
                 ) if value
             }
             if _result_ref:
@@ -5093,11 +6745,36 @@ def create_app(
                 except Exception:
                     logger.exception(
                         f"POST /tasks/{task_id}/result: late-result event failed")
+        except AdmissionRefused as exc:
+            # P2 RESULT refused under enforce — nothing was written. 409, with
+            # the validator's own reason: a worker that presented an unspent
+            # nonce (never asked /start for its go/no-go) must learn that, not
+            # read a 500 and retry the same bypass.
+            logger.warning(f"POST /tasks/{task_id}/result: refused — {exc}")
+            raise HTTPException(status_code=409, detail=str(exc))
+        except LateResultRejected as exc:
+            # The queue decided this under its write lock and committed only a
+            # late_result evidence event. No attribution or cascade may follow.
+            from fastapi.responses import JSONResponse
+            logger.warning("POST /tasks/%s/result: %s", task_id, exc)
+            if exc.fallback_task_id:
+                return {"status": "ignored_late_result",
+                        "fallback_task_id": exc.fallback_task_id}
+            return JSONResponse(status_code=409, content={
+                "late_result": True, "accepted": False,
+                "task_id": task_id, "prior_status": exc.status,
+                "reason": str(exc),
+            })
+        except CompletedReviewRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc))
+        except DuplicateReviewResult:
+            return {"status": "ok", "duplicate": True}
+        except InvalidReviewResult as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
         except ValueError as e:
             msg = str(e)
             logger.error(f"POST /tasks/{task_id}/result: error: {msg}")
-            status_code = (409 if msg.startswith("LATE_RESULT_REJECTED:")
-                           else 404 if "not found" in msg.lower() else 400)
+            status_code = 404 if "not found" in msg.lower() else 400
             raise HTTPException(status_code=status_code, detail=msg)
         # #202: lifecycle event for the agent-self-reported terminal outcome
         # (the internal dispatcher-detected failure paths emit their own
@@ -5203,16 +6880,12 @@ def create_app(
             # Auto-transition: impl task completed → auto-enqueue review task.
             # Pass through the PR number from the impl result so the reviewer
             # task description nails down which PR head to diff (#86).
-            # Skip when coordinator_managed=True — `crew run` drives transitions itself
-            # to avoid duplicate tasks and _wait() blocking on the wrong task_id.
+            #
             _task_ctx = ctx if isinstance(ctx, dict) else {}
             if task_type == "implement" and result.status == "completed":
-                if _task_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto review enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
-                    _auto_enqueue_review(task_id, pr_number=result.pr_number,
-                                         result=result)
+                logger.info(f"POST /tasks/{task_id}/result: impl task completed, auto-enqueueing review")
+                _auto_enqueue_review(task_id, pr_number=result.pr_number,
+                                     result=result)
             # Auto-transition: review approved → auto-enqueue test task. Use
             # the defensive verdict resolver so a clean `verdict=null`+`[]`
             # review counts as approved (#100). Skip when the review task was
@@ -5369,10 +7042,8 @@ def create_app(
                 if review_ctx.get("no_tester"):
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
                     # #171: no tester stage → merge immediately on review approval
-                    if pr_number and not review_ctx.get("coordinator_managed"):
+                    if pr_number:
                         _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt)
-                elif review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto test enqueue")
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id, repo=_review_repo)
@@ -5383,20 +7054,15 @@ def create_app(
             # cascade, so a reviewer that keeps rejecting cannot spin the loop.
             elif (task_type == "review" and _resolve_verdict(result) == "request_changes"
                     and _review_result_is_actionable(result)):
-                review_ctx = ctx if isinstance(ctx, dict) else {}
-                if review_ctx.get("coordinator_managed"):
-                    logger.info(f"POST /tasks/{task_id}/result: coordinator_managed — skipping auto fix enqueue")
-                else:
-                    logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
-                    _auto_enqueue_fix(task_id, repo=_review_repo)
+                logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
+                _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
             if task_type == "test" and result.status == "completed":
-                if not _task_ctx.get("coordinator_managed"):
-                    test_pr = result.pr_number or _task_ctx.get("pr_number")
-                    if test_pr:
-                        _test_wt = _any_worktree_path()
-                        _test_repo = _task_ctx.get("repo") or ""
-                        _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
+                test_pr = result.pr_number or _task_ctx.get("pr_number")
+                if test_pr:
+                    _test_wt = _any_worktree_path()
+                    _test_repo = _task_ctx.get("repo") or ""
+                    _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")
@@ -5447,13 +7113,96 @@ def create_app(
 
     @app.delete("/tasks/{task_id}", status_code=200)
     def cancel_task(task_id: str):
+        """G12 I-A then I-B, in that order.
+
+        The authoritative cancel — status ``cancelled``, receipt ``REVOKED``,
+        outstanding nonces spent — commits in one transaction BEFORE the worker
+        is signalled.  720ac76 had it the other way round, which left two bad
+        windows: a killed worker that was still authorized, and (if the commit
+        then raised) a permanently dead attempt that the queue still believed
+        was running.  On commit failure we return 5xx and kill nothing, so the
+        caller can retry against an unchanged world.
+
+        Only an *active* row can be cancelled. A row already decided (completed,
+        failed, cancelled, timed_out, blocked) answers 409 ``NOT_ACTIVE`` and
+        nothing happens at all — no revocation, no nonce spent, no worker
+        signal. Before this, DELETE on a completed task returned 200 and
+        persisted ``cancelled``, retroactively revoking a finished attempt and
+        orphaning the successors it had legitimately spawned (r4 review of
+        c8ce45f). An unknown id stays the tolerated no-op it was.
+
+        #336 (PR #382) rides on the same commit: once cancelled, the pane the
+        server recorded at dispatch is interrupted (``cancel_task_with_signal``)
+        and the dispatcher subprocess, if any, is stopped (I-B).
+        """
+        from fastapi.responses import JSONResponse as _JSONResponse
         try:
-            return cancel_task_with_signal(
+            outcome = cancel_task_with_signal(
                 q(), task_id, state_path=state_path, pane_map=pane_map,
-                events_path=_context_events_path,
+                events_path=_context_events_path, reason=_CANCEL_REASON_ATTEMPT,
             )
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError:
+            return {"status": "unknown", "reason": "NO_SUCH_TASK",
+                    "worker_termination": "skipped"}
+        except Exception:
+            logger.exception("cancel: authoritative cancel failed task=%s", task_id)
+            raise HTTPException(
+                status_code=500,
+                detail=f"cancel of {task_id!r} did not commit; worker left running",
+            )
+        if not outcome["cancelled"]:
+            # A refusal wrote nothing, and the status that caused it is terminal
+            # — it cannot have moved again.
+            current = outcome["status"]
+            # ⛔No worker termination either: the attempt this DELETE names has
+            #   already ended, and any process still running under that id would
+            #   belong to a later attempt we were not asked to touch.
+            return _JSONResponse(
+                status_code=409,
+                content={"status": current, "reason": "NOT_ACTIVE",
+                         "task_id": task_id},
+            )
+        outcome.pop("cancelled", None)
+        outcome["worker_termination"] = _stop_worker_for_ended_task(
+            task_id, reason=_CANCEL_REASON_ATTEMPT)
+        return outcome
+
+    @app.post("/tasks/{task_id}/recover", status_code=200)
+    def recover_orphan_task(task_id: str, force: bool = False):
+        """**단건** orphan 을 pending 으로 되돌린다(취소가 아니라 재큐).
+
+        ⭐전역 `expire-stale` 없이 한 건만 안전하게 회수하기 위한 경로다.
+        ⛔dispatcher lease 가 살아 있으면 거부한다 — 돌고 있는 task 를 되돌리면
+          같은 worker 에 두 번째 프로세스가 붙는다. `force=true` 로만 넘어간다.
+        """
+        _leased, _ = _dispatcher_lease_view()
+        _status = q().get_task_status(task_id)
+        if _status is None:
+            raise HTTPException(status_code=404, detail=f"unknown task {task_id}")
+        if _status != "in_progress":
+            return {"task_id": task_id, "recovered": False,
+                    "reason": f"status={_status} (in_progress 가 아님)"}
+        if _leased is None and not force:
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "dispatcher lease 를 못 읽었다 — lease_tracking=false. "
+                              "살아 있는 task 를 되돌릴 수 있으므로 거부한다(force 로 강제)"}
+        if _leased is not None and task_id in _leased and not force:
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "dispatcher 가 이 task 의 lease 를 들고 있다(실행 중)"}
+        if not force and not q().requeue_dispatcher_claim(task_id):
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "dispatcher claim provenance absent or changed"}
+        if force:
+            q().requeue(task_id)
+        if q().get_task_status(task_id) != "pending":
+            return {"task_id": task_id, "recovered": False,
+                    "reason": "CEA requeue refused or task state changed"}
+        logger.info(
+            f"recover_orphan_task: {task_id} in_progress -> pending "
+            f"(lease_tracking={_leased is not None}, force={force})"
+        )
+        return {"task_id": task_id, "recovered": True, "new_status": "pending",
+                "lease_tracking": _leased is not None, "force": force}
 
     @app.post("/tasks/expire-stale", status_code=200)
     def expire_stale_tasks(
@@ -5461,88 +7210,65 @@ def create_app(
         task_id: Optional[str] = None,
         dry_run: bool = True,
     ):
-        """Cancel in_progress tasks idle longer than ``older_than`` seconds.
+        """Preview stale work by default; cancel only a scoped or explicit sweep.
 
-        ⛔**This sweep is global and it used to run on the first call.** A
-        coordinator invoked it on 2026-09-23 meaning to clear one stuck review;
-        it cancelled three, two of which were live lanes the owner had just
-        asked to keep running. Nothing in the request said "all", and nothing in
-        the response said what would be lost before it was lost.
-
-        So the scope is now explicit and the default is a preview:
-
-        - ``task_id`` — cancel exactly that task if it qualifies. Scoped, safe.
-        - ``dry_run`` (default **True**) — report what *would* be cancelled and
-          change nothing. A global sweep must be seen before it is taken.
-        - ``dry_run=false`` without ``task_id`` — the real global sweep, and the
-          caller has now said so in the request.
-
-        Returns ``{"cancelled": [...], "dry_run": bool, "scope": ...}``;
-        on a preview the ids are under ``"would_cancel"`` instead, so a caller
-        cannot mistake a preview for a completed action. A scoped cancellation
-        also reports ``cancel_signal_outcome`` for its bound worker; a global
-        sweep reports the outcome for each selected id.
+        A confirmed expiry uses the same authoritative cancel transaction and
+        worker termination as the per-task cancel route. The preview returns
+        candidate IDs without mutation; the caller must opt in with
+        ``dry_run=false`` before any cancellation occurs.
         """
         candidates = q().expire_stale(older_than_seconds=older_than, dry_run=True) \
             if _expire_stale_supports_dry_run(q()) else None
         if candidates is None:
-            # ⛔A backend without a preview mode cannot tell us what the sweep
-            #   would take. Guessing (every in_progress task, ignoring
-            #   ``older_than``) over-reports the preview and lets a scoped call
-            #   cancel a live task — fail closed instead.
             raise HTTPException(
                 status_code=501,
                 detail="queue backend has no expire_stale(dry_run=...) — "
                        "refusing to guess the stale set",
             )
         if task_id is not None:
-            candidates = [t for t in candidates if t == task_id]
+            candidates = [candidate for candidate in candidates if candidate == task_id]
             if not candidates:
                 return {"cancelled": [], "dry_run": dry_run, "scope": task_id,
                         "reason": "task_id not among the stale in_progress tasks"}
         if dry_run:
-            logger.info(
-                f"POST /tasks/expire-stale: preview only — would cancel "
-                f"{len(candidates)} task(s): {candidates}"
-            )
+            logger.info("POST /tasks/expire-stale: preview would cancel %s", candidates)
             return {"would_cancel": candidates, "dry_run": True,
                     "scope": task_id or "global"}
-        if task_id is not None:
-            try:
-                signal = cancel_task_with_signal(
-                    q(), task_id, state_path=state_path, pane_map=pane_map,
-                    events_path=_context_events_path,
-                )
-            except ValueError:
-                return {"cancelled": [], "dry_run": False, "scope": task_id,
-                        "reason": "task disappeared after stale preview"}
-            logger.info(f"POST /tasks/expire-stale: cancelled scoped task {task_id}")
-            return {"cancelled": [task_id], "dry_run": False, "scope": task_id,
-                    "worker_reachable": signal["worker_reachable"],
-                    "cancel_signal_outcome": signal["cancel_signal_outcome"],
-                    "pane_exit_observed": signal["pane_exit_observed"]}
+
         cancelled = []
         signal_outcomes = {}
+        terminations = {}
         for candidate in candidates:
             try:
                 signal = cancel_task_with_signal(
                     q(), candidate, state_path=state_path, pane_map=pane_map,
                     events_path=_context_events_path,
+                    reason=_CANCEL_REASON_STALE_LEASE,
+                    expected_status="in_progress",
                 )
             except ValueError:
-                logger.warning(
-                    "POST /tasks/expire-stale: candidate %s disappeared after preview",
-                    candidate,
-                )
+                logger.warning("expire_stale: candidate disappeared: %s", candidate)
+                continue
+            if not signal["cancelled"]:
                 continue
             cancelled.append(candidate)
             signal_outcomes[candidate] = signal["cancel_signal_outcome"]
-        logger.warning(
-            f"POST /tasks/expire-stale: GLOBAL sweep cancelled {len(cancelled)} "
-            f"task(s): {cancelled}"
-        )
-        return {"cancelled": cancelled, "dry_run": False, "scope": "global",
-                "cancel_signal_outcomes": signal_outcomes}
+            terminations[candidate] = _stop_worker_for_ended_task(
+                candidate, reason=_CANCEL_REASON_STALE_LEASE)
+        if task_id is None:
+            logger.warning("POST /tasks/expire-stale: GLOBAL sweep cancelled %s", cancelled)
+            return {"cancelled": cancelled, "dry_run": False, "scope": "global",
+                    "cancel_signal_outcomes": signal_outcomes,
+                    "worker_termination": terminations}
+        response = {"cancelled": cancelled, "dry_run": False, "scope": task_id,
+                    "worker_termination": terminations}
+        if cancelled:
+            response.update({
+                "worker_reachable": signal["worker_reachable"],
+                "cancel_signal_outcome": signal["cancel_signal_outcome"],
+                "pane_exit_observed": signal["pane_exit_observed"],
+            })
+        return response
 
     @app.post("/gates", status_code=201)
     def post_gate(gate: GateRequest):
@@ -5550,7 +7276,8 @@ def create_app(
         return {"gate_id": gate_id}
 
     @app.get("/gates/pending")
-    def get_pending_gates():
+    def get_pending_gates(x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         return q().list_gates(status="pending")
 
     @app.get("/gates/{gate_id}")
@@ -5562,7 +7289,9 @@ def create_app(
         raise HTTPException(status_code=404, detail=f"Gate {gate_id!r} not found")
 
     @app.post("/gates/{gate_id}/resolve", status_code=200)
-    def resolve_gate(gate_id: str, body: ResolveBody):
+    def resolve_gate(gate_id: str, body: ResolveBody,
+                     x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         try:
             q().resolve_gate(gate_id, approved=body.status == "approved")
         except ValueError as e:
@@ -5573,7 +7302,7 @@ def create_app(
             # the exact held transition first; the helper is idempotent via
             # deterministic child IDs and recognizes review vs test gates.
             try:
-                _resume_tier3_gate(q(), gate_id)
+                _resume_tier3_gate(q(), gate_id, server_project=project)
             except Exception:
                 logger.exception(
                     "resolve_gate: failed to resume Tier 3 gate %r after approval", gate_id
@@ -5590,12 +7319,15 @@ def create_app(
         return {"status": "resolved"}
 
     @app.post("/tasks/{task_id}/checkpoint", status_code=201)
-    def save_checkpoint(task_id: str, checkpoint: dict):
+    def save_checkpoint(task_id: str, checkpoint: dict,
+                        x_agent_crew_project: Optional[str] = Header(default=None)):
         """Save a task checkpoint for fault recovery and time-travel debugging."""
+        _require_project_identity(x_agent_crew_project)
         checkpoint_num = checkpoint.get("checkpoint_num", 0)
         state = checkpoint.get("state", {})
         try:
             checkpoint_id = q().save_checkpoint(task_id, checkpoint_num, state)
+            q().record_heartbeat(task_id, source="worker_checkpoint")
             logger.info(f"POST /tasks/{task_id}/checkpoint: saved checkpoint {checkpoint_num}")
             return {"checkpoint_id": checkpoint_id}
         except Exception as e:
@@ -5603,8 +7335,10 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/tasks/{task_id}/checkpoints")
-    def list_task_checkpoints(task_id: str):
+    def list_task_checkpoints(task_id: str,
+                              x_agent_crew_project: Optional[str] = Header(default=None)):
         """List all checkpoints for a task."""
+        _require_project_identity(x_agent_crew_project)
         try:
             checkpoints = q().list_checkpoints(task_id)
             logger.info(f"GET /tasks/{task_id}/checkpoints: found {len(checkpoints)} checkpoints")
@@ -5613,24 +7347,11 @@ def create_app(
             logger.error(f"GET /tasks/{task_id}/checkpoints: error: {e}")
             raise HTTPException(status_code=400, detail=str(e))
 
-    @app.get("/tasks/{task_id}/checkpoint/{checkpoint_num}")
-    def get_task_checkpoint(task_id: str, checkpoint_num: int):
-        """Retrieve a specific checkpoint for time-travel debugging."""
-        try:
-            state = q().get_checkpoint(task_id, checkpoint_num)
-            if state is None:
-                raise HTTPException(status_code=404, detail=f"Checkpoint {checkpoint_num} not found for task {task_id}")
-            logger.info(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: retrieved")
-            return {"checkpoint_num": checkpoint_num, "state": state}
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: error: {e}")
-            raise HTTPException(status_code=400, detail=str(e))
-
     @app.get("/tasks/{task_id}/checkpoint/latest")
-    def get_latest_task_checkpoint(task_id: str):
+    def get_latest_task_checkpoint(task_id: str,
+                                   x_agent_crew_project: Optional[str] = Header(default=None)):
         """Retrieve the latest checkpoint for a task."""
+        _require_project_identity(x_agent_crew_project)
         try:
             result = q().get_latest_checkpoint(task_id)
             if result is None:
@@ -5642,6 +7363,23 @@ def create_app(
             raise
         except Exception as e:
             logger.error(f"GET /tasks/{task_id}/checkpoint/latest: error: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/tasks/{task_id}/checkpoint/{checkpoint_num}")
+    def get_task_checkpoint(task_id: str, checkpoint_num: int,
+                            x_agent_crew_project: Optional[str] = Header(default=None)):
+        """Retrieve a specific checkpoint for time-travel debugging."""
+        _require_project_identity(x_agent_crew_project)
+        try:
+            state = q().get_checkpoint(task_id, checkpoint_num)
+            if state is None:
+                raise HTTPException(status_code=404, detail=f"Checkpoint {checkpoint_num} not found for task {task_id}")
+            logger.info(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: retrieved")
+            return {"checkpoint_num": checkpoint_num, "state": state}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: error: {e}")
             raise HTTPException(status_code=400, detail=str(e))
 
     return app
@@ -5669,5 +7407,6 @@ app = create_app(
     db_path=os.path.expanduser(os.getenv("AGENT_CREW_DB", "~/.agent_crew/default.db")),
     pane_map=_load_pane_map(),
     port=int(os.getenv("AGENT_CREW_PORT", "0") or 0),
+    project=os.getenv("AGENT_CREW_PROJECT") or None,
     state_path=os.path.expanduser(os.getenv("AGENT_CREW_STATE", "")) or None,
 )

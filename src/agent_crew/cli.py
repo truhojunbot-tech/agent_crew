@@ -4,7 +4,6 @@ import os
 import shutil
 import signal
 import socket
-import urllib.parse
 import subprocess
 import sys
 import time
@@ -70,6 +69,25 @@ def _context_pack_launch_value(state: dict | None = None) -> tuple[str, str]:
     return ("1" if _context_pack_enabled(state) else "0"), "project_state"
 
 
+def _codex_context_cap_state(project: str, state: dict | None) -> dict:
+    """Seed the proven cap only for agent_crew; retain explicit project values."""
+    result = dict(state or {})
+    if project == "agent_crew":
+        result.setdefault("codex_context_max_mb", 8)
+    return result
+
+
+def _codex_context_cap_launch_value(state: dict | None = None) -> tuple[str, str]:
+    """Environment overrides durable project state, then the 64 MB default."""
+    override = os.environ.get("AGENT_CREW_CODEX_CONTEXT_MAX_MB")
+    if override is not None:
+        return override, "environment"
+    value = (state or {}).get("codex_context_max_mb")
+    if value is not None:
+        return str(value), "project_state"
+    return "64", "built_in_default"
+
+
 def _parse_interval(text: str) -> float:
     """Parse a '30s' / '5m' / '1h' duration into seconds (#224)."""
     import re as _re
@@ -98,6 +116,51 @@ def _read_state(base: str, project: str) -> dict | None:
     return state
 
 
+def _writable_queue(db: str, *, base: str = "", project: str = ""):
+    """Open a project DB only when its live server runs this CLI's build."""
+    import urllib.error
+    import urllib.request
+
+    state_path = (_state_path(base, project) if base and project else
+                  os.path.join(os.path.dirname(os.path.abspath(db)), "state.json"))
+    try:
+        with open(state_path) as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        state = None
+    if (isinstance(state, dict)
+            and os.path.realpath(str(state.get("db") or "")) == os.path.realpath(db)
+            and state.get("port")):
+        try:
+            port = setup_module.require_project_port(
+                state["port"], str(state.get("project") or ""))
+        except ValueError as exc:
+            logger.warning("Ignoring corrupt project port in %s: %s", state_path, exc)
+            port = None
+        if port is not None:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                    health = json.loads(response.read().decode())
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                # Unavailable or unreadable health keeps the legacy local CLI path.
+                logger.warning("Cannot read /health for %s: %s", state_path, exc)
+                health = None
+            if health is not None:
+                from agent_crew.provenance import build
+
+                server_commit = str((health.get("build") or {}).get("commit") or "") if isinstance(health, dict) else ""
+                cli_commit = str(build().get("commit") or "")
+                if not server_commit or not cli_commit or server_commit != cli_commit:
+                    raise click.ClickException(
+                        f"Refusing writable tasks.db access: server build {server_commit or 'unknown'} "
+                        f"differs from CLI build {cli_commit or 'unknown'}. "
+                        f"Use the server's HTTP API at http://127.0.0.1:{port} or run a matching CLI build."
+                    )
+    from agent_crew.queue import TaskQueue
+
+    return TaskQueue(db)
+
+
 def _write_state(base: str, project: str, state: dict) -> None:
     if "port" in state:
         setup_module.require_project_port(state["port"], project)
@@ -118,6 +181,18 @@ def _port_listening(port: int, timeout: float = 5.0) -> bool:
     return False
 
 
+def _verify_project_server(port: int, project: str) -> None:
+    """Refuse to attach to a recycled or unavailable project port (#362)."""
+    if not _port_listening(port, timeout=5.0):
+        raise click.ClickException(
+            f"Server at port {port} unreachable — check crew status or run crew recover")
+    from agent_crew.project_identity import ProjectIdentityError, verify_server_identity
+    try:
+        verify_server_identity(f"http://127.0.0.1:{port}", project)
+    except ProjectIdentityError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 _PANE_IDLE_PATTERNS = [
     "$",            # shell prompt (agent CLI exited)
     "❯",            # zsh prompt
@@ -126,34 +201,120 @@ _PANE_IDLE_PATTERNS = [
 ]
 
 
-def _auto_detect_project(base: str) -> str | None:
-    """Try to auto-detect active project from crew state directory.
-
-    Returns project name if found, else None.
-    Strategy: check ~/.agent_crew for state.json files and return most recently
-    modified project's name.
-    """
-    try:
-        proj_dir = os.path.expanduser(base)
-        if not os.path.isdir(proj_dir):
-            return None
-
-        # Find all projects with state.json
-        projects_with_state = []
-        for entry in os.listdir(proj_dir):
-            state_path = os.path.join(proj_dir, entry, "state.json")
-            if os.path.isfile(state_path):
-                mtime = os.path.getmtime(state_path)
-                projects_with_state.append((entry, mtime))
-
-        if not projects_with_state:
-            return None
-
-        # Return the most recently modified project
-        projects_with_state.sort(key=lambda x: x[1], reverse=True)
-        return projects_with_state[0][0]
-    except Exception:
+def _git_repo_identity(path: str) -> tuple[str, str] | None:
+    """Return real top-level and common Git directory for a repository path."""
+    if not os.path.isdir(path) or not setup_module.validate_git_repo(path):
         return None
+    try:
+        top = subprocess.run(["git", "-C", path, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, check=True).stdout.strip()
+        common = subprocess.run(["git", "-C", path, "rev-parse", "--git-common-dir"],
+                                capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return os.path.realpath(top), os.path.realpath(os.path.join(path, common))
+
+
+def _matching_projects(base: str) -> list[str]:
+    cwd_identity = _git_repo_identity(os.getcwd())
+    root = os.path.expanduser(base)
+    if cwd_identity is None or not os.path.isdir(root):
+        return []
+    cwd = os.path.realpath(os.getcwd())
+    top = cwd_identity[0]
+    # The nearest marker is authoritative, including when several crews share
+    # a Git repository. Never silently fall back from a broken marker.
+    directory = cwd
+    while True:
+        marker = os.path.join(directory, ".crew-project")
+        if os.path.exists(marker):
+            try:
+                with open(marker) as stream:
+                    lines = stream.read().splitlines()
+            except OSError as exc:
+                raise click.ClickException(f"Cannot read {marker}: {exc}") from exc
+            if (len(lines) != 1 or not lines[0] or lines[0] != lines[0].strip()
+                    or lines[0] in (".", "..") or os.sep in lines[0]):
+                raise click.ClickException(f"Invalid .crew-project marker at {marker}: expected one project name.")
+            project = lines[0]
+            if not os.path.isfile(_state_path(root, project)):
+                raise click.ClickException(f".crew-project marker at {marker} names {project!r}, which is not registered.")
+            return [project]
+        if directory == top:
+            break
+        directory = os.path.dirname(directory)
+    # A bot instance inherits its parent's Git identity but is not necessarily
+    # the parent's crew project. Require an explicit project in this subtree.
+    if "instances" in os.path.relpath(cwd, top).split(os.sep):
+        return []
+    exact_matches = []
+    common_matches = []
+    try:
+        entries = sorted(os.listdir(root))
+    except OSError:
+        return []
+    for entry in entries:
+        state_path = _state_path(root, entry)
+        if not os.path.isfile(state_path):
+            continue
+        try:
+            with open(state_path) as stream:
+                state = json.load(stream)
+            if not isinstance(state, dict):
+                continue
+            repo_path = state.get("repo_path")
+            paths = ([repo_path] if isinstance(repo_path, str) and repo_path else [])
+            worktrees = state.get("worktrees")
+            if isinstance(worktrees, dict):
+                paths.extend(path for path in worktrees.values() if isinstance(path, str))
+            identities = [identity for path in paths
+                          if (identity := _git_repo_identity(path)) is not None]
+            if any(identity[0] == cwd_identity[0] for identity in identities):
+                exact_matches.append(entry)
+            elif any(identity[1] == cwd_identity[1] for identity in identities):
+                common_matches.append(entry)
+        except (OSError, ValueError, TypeError) as exc:
+            logger.warning("Skipping invalid project state %s: %s", state_path, exc)
+    return exact_matches if exact_matches else common_matches
+
+
+def _auto_detect_project(base: str) -> str | None:
+    """Resolve cwd to exactly one registered crew project, never by mtime."""
+    matches = _matching_projects(base)
+    if len(matches) > 1:
+        raise click.ClickException(
+            f"Current repository matches multiple projects: {', '.join(matches)}. "
+            "Specify --project."
+        )
+    return matches[0] if matches else None
+
+
+def _select_project(base: str, project: str, allow_cross_project: bool) -> str:
+    matches = _matching_projects(base)
+    if not project:
+        if len(matches) != 1:
+            reason = ("matches multiple projects: " + ", ".join(matches)) if matches else "matches no registered project"
+            raise click.ClickException(f"Current repository {reason}; specify --project (or --db), or add a .crew-project marker.")
+        return matches[0]
+    if len(matches) == 1 and matches[0] != project:
+        if not allow_cross_project:
+            raise click.ClickException(
+                f"Current repository belongs to {matches[0]!r}, not {project!r}; "
+                "pass --allow-cross-project to proceed."
+            )
+        message = f"Cross-project operation: cwd project {matches[0]!r} -> {project!r}"
+        click.echo(message, err=True)
+        _crew_log(_proj_dir(os.path.expanduser(base), project), message)
+    elif len(matches) > 1 and project not in matches:
+        if not allow_cross_project:
+            raise click.ClickException(
+                f"Current repository matches multiple projects: {', '.join(matches)}; "
+                "pass --allow-cross-project to target another project."
+            )
+        message = f"Cross-project operation: cwd projects {', '.join(matches)} -> {project!r}"
+        click.echo(message, err=True)
+        _crew_log(_proj_dir(os.path.expanduser(base), project), message)
+    return project
 
 
 def _status_all_projects(base: str) -> None:
@@ -194,7 +355,7 @@ def _status_all_projects(base: str) -> None:
             if port and _port_listening(port, timeout=1.0):
                 alive = True
                 for api_status, disp in [("pending", "p"), ("in_progress", "ip"), ("completed", "c"), ("failed", "f")]:
-                    tasks = _fetch_tasks_by_status(port, api_status)
+                    tasks = _fetch_tasks_by_status(port, api_status, project=name)
                     if disp == "p":
                         pending = len(tasks)
                     elif disp == "ip":
@@ -587,16 +748,18 @@ def _validate_pane_map(session: str, pane_ids: list[str], worktrees: dict[str, s
     }
 
 
-def _verify_delivery(port: int, task_id: str, timeout: float = 15.0) -> bool:
+def _verify_delivery(port: int, task_id: str, timeout: float = 15.0,
+                     project: str = "") -> bool:
     """Poll task status until it transitions out of 'pending' (i.e. pane received it).
     Returns True if delivered, False if still pending after timeout."""
     import urllib.request
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/tasks/{task_id}", timeout=2
-            ) as resp:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/tasks/{task_id}",
+                headers={"X-Agent-Crew-Project": project} if project else {})
+            with urllib.request.urlopen(req, timeout=2) as resp:
                 task = json.loads(resp.read())
             if task.get("status") != "pending":
                 return True
@@ -618,12 +781,13 @@ _STATUS_ALIASES = (
 # Reverse map: DB status → display label (used in DB fallback)
 _DB_STATUS_TO_DISPLAY = {api: disp for disp, api in _STATUS_ALIASES}
 
-def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
+def _fetch_tasks_by_status(port: int, status: str, project: str = "") -> list[dict]:
     import urllib.request
 
-    with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/tasks?status={status}", timeout=2
-    ) as resp:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/tasks?status={status}",
+        headers={"X-Agent-Crew-Project": project} if project else {})
+    with urllib.request.urlopen(req, timeout=2) as resp:
         return json.loads(resp.read())
 
 
@@ -982,6 +1146,7 @@ def setup(project: str, agents: str, base: str):
         )
     state_to_write = {
         "project": project,
+        "repo_path": _git_repo_identity(cwd)[0],
         "port": port,
         "port_file": port_file,
         "session": session_name,
@@ -999,6 +1164,11 @@ def setup(project: str, agents: str, base: str):
         "tokenomics_policy_path": policy_path,
         "context_pack_enabled": context_pack_enabled,
     }
+    if existing_state and "codex_session_mode" in existing_state:
+        state_to_write["codex_session_mode"] = existing_state["codex_session_mode"]
+    state_to_write.update({key: value for key, value in
+                           _codex_context_cap_state(project, existing_state).items()
+                           if key == "codex_context_max_mb"})
     # #337's explicit mapping records the default for new projects. Existing
     # state keeps its current role configuration during setup/recovery.
     if existing_state is None:
@@ -1019,15 +1189,18 @@ def setup(project: str, agents: str, base: str):
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         context_pack_value, context_pack_source = _context_pack_launch_value(
             {"context_pack_enabled": context_pack_enabled})
+        codex_cap_value, _ = _codex_context_cap_launch_value(state_to_write)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
+            "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
@@ -1075,15 +1248,18 @@ def setup(project: str, agents: str, base: str):
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         context_pack_value, context_pack_source = _context_pack_launch_value(
             {"context_pack_enabled": context_pack_enabled})
+        codex_cap_value, _ = _codex_context_cap_launch_value(state_to_write)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
+            "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
@@ -1356,7 +1532,7 @@ def status(project: str, base: str, preview: int):
     task_groups = None
     try:
         task_groups = {
-            display_status: _fetch_tasks_by_status(port, api_status)
+            display_status: _fetch_tasks_by_status(port, api_status, project=project)
             for display_status, api_status in _STATUS_ALIASES
         }
     except Exception:
@@ -1524,10 +1700,9 @@ def pause(project: str, base: str, reason: str, source: str, incident: str, scop
     state_dir = os.path.join(base, project) if scope == "project" else ""
     db_epoch = None
     if scope == "project" and state_dir:
-        from agent_crew.queue import TaskQueue
         db_path = os.path.join(state_dir, "tasks.db")
         # (1) DB에서 epoch 먼저 할당·commit (권위)
-        db_epoch = TaskQueue(db_path).set_stop_epoch(
+        db_epoch = _writable_queue(db_path, base=base, project=project).set_stop_epoch(
             True, incident=(incident or None), note=f"pause via cli: {reason}")
     # (2) pause.json은 DB epoch를 미러링(generation=db_epoch). global은 기존 monotonic +1.
     rec = pausemod.set_pause(state_dir, True, scope=scope, reason=reason,
@@ -1544,8 +1719,11 @@ def pause(project: str, base: str, reason: str, source: str, incident: str, scop
 @click.option("--generation", type=int, required=True,
               help="Must be > current pause generation; stale resume is rejected")
 @click.option("--source", default="cli")
+@click.option("--decision-id", default="", metavar="T0-ID",
+              help="The owner (T0) decision authorising this resume. Required for project "
+                   "scope: P6 makes loosening owner-only and the requester does not self-attest.")
 @click.option("--scope", type=click.Choice(["project", "global"]), default="project", show_default=True)
-def resume(project: str, base: str, generation: int, source: str, scope: str):
+def resume(project: str, base: str, generation: int, source: str, decision_id: str, scope: str):
     """#311/#314 generation-aware resume. 오래된(stale) generation resume은 최신 STOP을 덮지 못한다.
 
     #314 §1: project scope는 **DB(runtime_stop) CAS가 권위**다 — `--generation`이 현재 DB epoch보다
@@ -1554,10 +1732,26 @@ def resume(project: str, base: str, generation: int, source: str, scope: str):
     from agent_crew import pause as pausemod
     state_dir = os.path.join(base, project) if scope == "project" else ""
     if scope == "project" and state_dir:
-        from agent_crew.queue import TaskQueue
+        from agent_crew.queue import RuntimeTransitionRefused
         db_path = os.path.join(state_dir, "tasks.db")
         # (1) DB CAS resume (권위). 거부되면 pause.json 미변경.
-        res = TaskQueue(db_path).resume_stop(generation=generation)
+        # P6: resume is a loosening — owner principal + T0 decision_id, or the queue
+        # refuses. `crew resume` is the owner's own terminal, so it presents
+        # `owner:<source>`; the decision id is what makes that claim auditable.
+        if not decision_id.strip():
+            click.echo(json.dumps(
+                {"resumed": False, "reason": "P6: resume requires --decision-id naming the "
+                                             "owner (T0) decision that authorises it"},
+                ensure_ascii=False))
+            raise SystemExit(1)
+        from agent_crew.cea.wiring import install_from_env
+        install_from_env(db_path=db_path, project=project)
+        try:
+            res = _writable_queue(db_path, base=base, project=project).resume_stop(
+                generation=generation, who=f"owner:{source}", decision_id=decision_id.strip())
+        except RuntimeTransitionRefused as exc:
+            click.echo(json.dumps({"resumed": False, "reason": str(exc)}, ensure_ascii=False))
+            raise SystemExit(1)
         if res.get("resumed"):
             # (2) pause.json 미러 — DB가 unpause를 승인한 epoch로만. #canary#1 fix: DB가 보존한
             # incident를 pause.json에도 명시적으로 mirror한다(None으로 만들지 않음). 그래야 부팅
@@ -1584,18 +1778,14 @@ def task_group():
 @task_group.command("cancel")
 @click.argument("task_id")
 @click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--db", default="", help="SQLite DB path (standalone)")
-def task_cancel(task_id: str, project: str, base: str, db: str):
+def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str, db: str):
     """Cancel TASK_ID and attempt to interrupt its bound worker pane."""
-    from agent_crew.queue import TaskQueue
     from agent_crew.server import cancel_task_with_signal
     if not db:
-        if not project:
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException("--db or --project is required")
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
@@ -1603,12 +1793,17 @@ def task_cancel(task_id: str, project: str, base: str, db: str):
     state_path = os.path.join(os.path.dirname(os.path.abspath(db)), "state.json")
     try:
         result = cancel_task_with_signal(
-            TaskQueue(db), task_id, state_path=state_path, pane_map=None,
+            _writable_queue(db, base=base, project=project), task_id,
+            state_path=state_path, pane_map=None,
             events_path=os.path.join(os.path.dirname(os.path.abspath(db)),
                                      "context_events.jsonl"),
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
+    if not result["cancelled"]:
+        # G12: a terminal row is refused as a no-op; nothing was signalled.
+        click.echo(f"Not cancelled: {task_id} is already {result['status']} (NOT_ACTIVE)")
+        return
     if result["cancel_signal_outcome"] in ("not_running", "pane_exited"):
         click.echo(f"Cancelled: {task_id} ({result['cancel_signal_outcome']})")
         return
@@ -1621,26 +1816,21 @@ def task_cancel(task_id: str, project: str, base: str, db: str):
 
 @task_group.command("expire-stale")
 @click.option("--project", default="", help="Project name")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--older-than", default=600, type=int, show_default=True,
               help="Cancel in_progress tasks idle longer than N seconds")
 @click.option("--dry-run", is_flag=True, help="Print which tasks would be cancelled, but don't cancel")
-def task_expire_stale(project: str, base: str, db: str, older_than: int, dry_run: bool):
+def task_expire_stale(project: str, allow_cross_project: bool, base: str, db: str, older_than: int, dry_run: bool):
     """Cancel stale in_progress tasks (idle > --older-than seconds)."""
     import time as _t
-    from agent_crew.queue import TaskQueue
     if not db:
-        if not project:
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException("--db or --project is required")
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
         db = state["db"]
-    q = TaskQueue(db)
     if dry_run:
         cutoff = _t.time() - older_than
         import sqlite3 as _sq
@@ -1657,9 +1847,19 @@ def task_expire_stale(project: str, base: str, db: str, older_than: int, dry_run
             idle = int(_t.time() - (r["last_activity_at"] or 0))
             click.echo(f"  would cancel: {r['task_id']} ({r['task_type']}, idle {idle}s)")
         return
+    q = _writable_queue(db, base=base, project=project)
+    # Out of process, so there is no dispatch registry here: the cancel is
+    # authoritative (status, receipt REVOKED, nonces spent, end event) but a
+    # dispatcher child cannot be signalled from the CLI. The server's
+    # POST /tasks/expire-stale does both halves; say so rather than letting an
+    # operator assume the worker died with the row.
     cancelled = q.expire_stale(older_than_seconds=float(older_than))
     if cancelled:
         click.echo(f"Cancelled {len(cancelled)} stale task(s): {', '.join(cancelled)}")
+        click.echo("Note: workers were not signalled from here — the dispatcher's "
+                   "own re-check stops a child it spawned. Use "
+                   "POST /tasks/expire-stale on the running server to terminate "
+                   "children as part of the expiry.")
     else:
         click.echo("No stale tasks found.")
 
@@ -1676,6 +1876,10 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
     state = _read_state(base, project)
     if state is None:
         raise click.ClickException(f"project {project!r} not found. Run setup first.")
+    durable_state = _codex_context_cap_state(project, state)
+    if durable_state != state:
+        _write_state(base, project, durable_state)
+        state = durable_state
 
     session_name = state["session"]
     port = state["port"]
@@ -1709,15 +1913,18 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         state_file = _state_path(base, project)
         policy_path = _tokenomics_policy_path(proj_dir, state)
         context_pack_value, context_pack_source = _context_pack_launch_value(state)
+        codex_cap_value, _ = _codex_context_cap_launch_value(state)
         server_env = {
             **os.environ,
             "AGENT_CREW_DB": db_file,
+            "AGENT_CREW_PROJECT": project,
             "AGENT_CREW_PANE_MAP": pane_map_file,
             "AGENT_CREW_STATE": state_file,
             "AGENT_CREW_PORT": str(port),
             "PYTHONPATH": pythonpath,
             "AGENT_CREW_TOKENOMICS_POLICY_PATH": policy_path,
             "AGENT_CREW_CONTEXT_PACK": context_pack_value,
+            "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
@@ -1915,9 +2122,9 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         click.echo("Nothing to recover: server and tmux already running.")
 
     if reset_stale:
-        from agent_crew.queue import TaskQueue
         # #155: reset to pending (not cancel) so tasks can be retried
-        reset = TaskQueue(db_file).reset_stale_to_pending(older_than_seconds=float(stale_seconds))
+        reset = _writable_queue(db_file, base=base, project=project).reset_stale_to_pending(
+            older_than_seconds=float(stale_seconds))
         if reset:
             click.echo(f"Reset stale: {len(reset)} task(s) → pending: {', '.join(reset)}")
         else:
@@ -2061,6 +2268,7 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.argument("task")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--max-iter", default=0, type=int, help="Max review iterations (0 = default)")
 @click.option("--no-tester", is_flag=True, help="Skip test phase after approval")
@@ -2072,7 +2280,7 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.option("--implementer", default="", help="Agent for implementation (claude/codex/gemini)")
 @click.option("--reviewer", default="", help="Agent for review (claude/codex/gemini)")
 @click.option("--auto-merge", is_flag=True, help="Auto-merge PR via gh when loop completes successfully")
-def run_cmd(task: str, db: str, project: str, base: str,
+def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: str,
             max_iter: int, no_tester: bool, branch: str, timeout: int,
             create_issue: bool, create_pr: bool, repo: str,
             implementer: str, reviewer: str, auto_merge: bool):
@@ -2081,17 +2289,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         raise click.UsageError("task must not be empty")
 
     if not db:
-        if not project:
-            # Try to auto-detect project
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException(
-                    "Error: --db or --project is required.\n"
-                    f"Usage: crew run \"task\" --project <name>\n"
-                    f"Or:    crew run \"task\" --db <path>/tasks.db\n"
-                    f"List projects: ls {os.path.expanduser(base)}/"
-                )
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
@@ -2113,6 +2311,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
     from agent_crew.loop import (
         DEFAULT_MAX_ITER,
+        _adapter_project,
         build_feedback,
         enqueue_implement,
         enqueue_review,
@@ -2122,14 +2321,21 @@ def run_cmd(task: str, db: str, project: str, base: str,
         REVIEW_RETRY_MAX,
         handle_test_result,
     )
-    from agent_crew.queue import TaskQueue
     from agent_crew import github
     import time
 
     if max_iter <= 0:
         max_iter = DEFAULT_MAX_ITER
 
-    queue = TaskQueue(db)
+    # A live port can have been recycled for another project. Verify before
+    # opening the queue or enqueuing work into the wrong server (#362).
+    if project:
+        _identity_state = _read_state(base, project)
+        _identity_port = (_identity_state or {}).get("port")
+        if _identity_port:
+            _verify_project_server(_identity_port, project)
+
+    queue = _writable_queue(db, base=base, project=project)
 
     wait_timeout = float(timeout)
 
@@ -2162,7 +2368,7 @@ def run_cmd(task: str, db: str, project: str, base: str,
         req = _urllib_req.Request(
             f"http://127.0.0.1:{_run_port}/tasks/{task_id}/result",
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-Agent-Crew-Project": project},
             method="POST",
         )
         try:
@@ -2279,6 +2485,38 @@ def run_cmd(task: str, db: str, project: str, base: str,
             )
             raise click.exceptions.Exit(0)
 
+        # The dispatcher owns a running task and enforces its own hard and
+        # output-idle limits. A pane-less provider has no tmux activity for
+        # this wrapper to inspect, so its deadline cannot decide failure.
+        if task_status_now == "in_progress":
+            click.echo(
+                f"  Wrapper deadline reached for {task_id!r}; server still running. "
+                "Waiting for its result or terminal status."
+            )
+            last_progress_print = time.time()
+            while True:
+                result = queue.get_result(task_id)
+                if result is not None:
+                    return result
+                task_status_now = queue.get_task_status(task_id)
+                if task_status_now != "in_progress":
+                    # A timeout or cancellation may have no TaskResult row.
+                    result = queue.get_result(task_id)
+                    if result is not None:
+                        return result
+                    raise click.ClickException(
+                        f"task {task_id!r} ended {task_status_now or 'unknown'} "
+                        "without a result; server owns the terminal state."
+                    )
+                now = time.time()
+                if now - last_progress_print >= 60:
+                    click.echo(
+                        f"  Waiting for server-owned task {task_id!r} "
+                        f"({int(now - start_time)}s elapsed; still in_progress)."
+                    )
+                    last_progress_print = now
+                time.sleep(2)
+
         # Wrapper deadline hit before the agent posted a result. Don't blanket-
         # auto-fail (#92): if the pane shows the agent is still actively working,
         # extend the deadline rather than killing legitimate long tasks. Cap the
@@ -2333,9 +2571,10 @@ def run_cmd(task: str, db: str, project: str, base: str,
         """Resolve any pending gates via HTTP. Returns count of resolved gates."""
         resolved = 0
         try:
-            with _urllib_req.urlopen(
-                f"http://127.0.0.1:{port}/gates/pending", timeout=2
-            ) as resp:
+            req = _urllib_req.Request(
+                f"http://127.0.0.1:{port}/gates/pending",
+                headers={"X-Agent-Crew-Project": project})
+            with _urllib_req.urlopen(req, timeout=2) as resp:
                 gates = json.loads(resp.read())
             for gate in gates:
                 gate_id = gate.get("id") or gate.get("gate_id")
@@ -2345,7 +2584,8 @@ def run_cmd(task: str, db: str, project: str, base: str,
                 req = _urllib_req.Request(
                     f"http://127.0.0.1:{port}/gates/{gate_id}/resolve",
                     data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json",
+                             "X-Agent-Crew-Project": project},
                     method="POST",
                 )
                 try:
@@ -2446,15 +2686,38 @@ def run_cmd(task: str, db: str, project: str, base: str,
         else:
             raise click.ClickException("Failed to create GitHub issue")
 
-    # coordinator_managed tells the server to skip auto-transitions (impl→review,
-    # review→test). Without this flag the server and coordinator both enqueue the
-    # next phase independently, creating duplicate tasks and causing _wait() to
-    # block on the coordinator's copy while the agent completes the server's copy.
+    # coordinator_managed is provenance only (§7.2). The loop adopts the
+    # server's persisted successors below; this flag never decides a transition.
+    # A rerun may find the first implement task still queued or executing.
+    # Adopt before syncing worktrees: an in-progress worker's checkout must
+    # stay intact, while a pending worker still needs the fresh base sync.
+    _adopted_impl_id = None
+    _adopted_impl_status = None
+    if hasattr(queue, "list_tasks"):
+        _run_project = _adapter_project(queue, project)
+        _matches = [
+            existing for existing in queue.list_tasks()
+            if existing.task_type == "implement"
+            and (existing.project or "") == _run_project
+            and existing.status in ("pending", "in_progress")
+            and existing.description == task and existing.branch == branch
+            and not (isinstance(existing.context, dict)
+                     and existing.context.get("prev_task_id"))
+        ]
+        if len(_matches) > 1:
+            click.echo("Multiple in-flight implement tasks match; stopping without "
+                       "enqueue: " + ", ".join(t.task_id for t in _matches))
+            return
+        if _matches:
+            _adopted_impl_id = _matches[0].task_id
+            _adopted_impl_status = _matches[0].status
+            click.echo(f"(task already in flight, adopted {_adopted_impl_id})")
+
     # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the
     # implementer always branches off the most recent merged state.
     _sync_landed_bases: dict = {}
-    if _run_worktrees:
+    if _run_worktrees and _adopted_impl_status != "in_progress":
         click.echo(f"Syncing worktrees to origin/{branch}...")
         _sync_landed_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=branch)
 
@@ -2469,9 +2732,11 @@ def run_cmd(task: str, db: str, project: str, base: str,
     if no_tester:
         impl_context["no_tester"] = True
 
-    impl_id = enqueue_implement(queue, task, branch, context=impl_context, port=_run_port)
+    impl_id = _adopted_impl_id or enqueue_implement(
+        queue, task, branch, context=impl_context, port=_run_port)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
-    if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0):
+    if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0,
+                                          project=project):
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
 
     _loop_pr_number: int | None = None  # first PR number seen across all results
@@ -2482,6 +2747,12 @@ def run_cmd(task: str, db: str, project: str, base: str,
         impl_start = time.time()
         impl_result = _wait(impl_id)
         impl_elapsed = int(time.time() - impl_start)
+        if impl_result.status != "completed":
+            click.echo(
+                f"[{iteration}/{max_iter}] Implement task {impl_id} ended {impl_result.status}; "
+                "server owns retry/fallback/cascade. Stopping loop."
+            )
+            return
         _loop_pr_number = _loop_pr_number or getattr(impl_result, "pr_number", None)
         reported_branch = getattr(impl_result, "branch", "") or ""
         if run_branch_context["crew_run_branch"] and reported_branch and reported_branch != branch:
@@ -2518,8 +2789,10 @@ def run_cmd(task: str, db: str, project: str, base: str,
         # from spinning the same loop with review tasks.
         _review_attempts = 0
         while True:
-            review_id = enqueue_review(queue, task, impl_branch or branch,
-                                       prev_task_id=impl_id, context=review_context, port=_run_port)
+            review_id = enqueue_review(
+                queue, task, impl_branch or branch,
+                prev_task_id=impl_id, context=review_context, port=_run_port,
+            )
             click.echo(f"[{iteration}/{max_iter}] Reviewing... ({review_id})")
             review_start = time.time()
             review_result = _wait(review_id)
@@ -2618,13 +2891,37 @@ def run_cmd(task: str, db: str, project: str, base: str,
 
         # request_changes: re-implement with feedback
         click.echo(f"[{iteration}/{max_iter}] 🔄 Changes requested ({review_elapsed}s). Re-implementing.")
-        feedback = build_feedback(review_result)
-        retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
-        retry_context = {**_CM, **run_branch_context, "feedback": feedback, "sync_landed_bases": retry_bases}
-        if implementer:
-            retry_context["agent_override"] = implementer
-        impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                    context=retry_context, port=_run_port)
+        # The result POST has completed the server cascade before _wait returns.
+        # Reuse its fix by lineage, including when it has already started. In
+        # standalone DB mode the same bounded cascade creates it here. Never
+        # mint an unrelated implement id for the same review verdict.
+        if not hasattr(queue, "list_tasks"):
+            # Legacy in-memory queue adapters used by the CLI loop tests have
+            # no persisted lineage to adopt. The production TaskQueue does.
+            feedback = build_feedback(review_result)
+            retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
+            retry_context = {**_CM, **run_branch_context, "feedback": feedback,
+                             "sync_landed_bases": retry_bases}
+            if implementer:
+                retry_context["agent_override"] = implementer
+            impl_id = enqueue_implement(queue, task, impl_branch or branch,
+                                        context=retry_context, port=_run_port)
+            continue
+        from agent_crew.pipeline import auto_enqueue_fix
+        fixes = [t for t in queue.list_tasks()
+                 if t.task_type == "implement"
+                 and isinstance(t.context, dict)
+                 and t.context.get("prev_task_id") == review_id]
+        if not fixes:
+            auto_enqueue_fix(queue, review_id)
+            fixes = [t for t in queue.list_tasks()
+                     if t.task_type == "implement"
+                     and isinstance(t.context, dict)
+                     and t.context.get("prev_task_id") == review_id]
+        if len(fixes) != 1:
+            click.echo(f"[{iteration}/{max_iter}] ❌ Expected one actionable fix for {review_id}; found {len(fixes)}. Stopping.")
+            return
+        impl_id = fixes[0].task_id
 
     click.echo(f"❌ Max iterations ({max_iter}) reached without approval.")
 
@@ -2686,6 +2983,7 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
 @click.option("--then-run", is_flag=True, help="Trigger code-review loop after synthesis")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--project", default="", help="Project name (reads DB from state)")
+@click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--output", default="synthesis.md", show_default=True, help="Path to write synthesis")
 @click.option("--branch", default="main", show_default=True)
@@ -2701,7 +2999,7 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
                    "number once the discussion completes (#219). No effect with "
                    "--nowait, since there's no synthesis yet when that returns.")
 def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: bool,
-            db: str, project: str, base: str, output: str, branch: str,
+            db: str, project: str, allow_cross_project: bool, base: str, output: str, branch: str,
             timeout: int, nowait: bool, github_discussion: str, post_to: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
@@ -2709,17 +3007,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
 
     project_state = None
     if not db:
-        if not project:
-            # Try to auto-detect project
-            detected = _auto_detect_project(base)
-            if not detected:
-                raise click.ClickException(
-                    "Error: --db or --project is required.\n"
-                    f"Usage: crew discuss \"topic\" --project <name>\n"
-                    f"Or:    crew discuss \"topic\" --db <path>/tasks.db\n"
-                    f"List projects: ls {os.path.expanduser(base)}/"
-                )
-            project = detected
+        project = _select_project(base, project, allow_cross_project)
         project_state = _read_state(base, project)
         if project_state is None:
             raise click.ClickException(f"project {project!r} not found in {os.path.expanduser(base)}/")
@@ -2729,7 +3017,6 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         DEFAULT_PERSPECTIVES, assign_perspectives, build_synthesis, enqueue_panel_tasks
     )
     from agent_crew.loop import enqueue_implement
-    from agent_crew.queue import TaskQueue
     import time
 
     # Agents default: project's installed agents (from state) in project mode,
@@ -2779,7 +3066,13 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         except Exception:
             pass
 
-    queue = TaskQueue(db)
+    if project:
+        _identity_state = project_state or _read_state(base, project)
+        _identity_port = (_identity_state or {}).get("port")
+        if _identity_port:
+            _verify_project_server(_identity_port, project)
+
+    queue = _writable_queue(db, base=base, project=project)
     perspectives_map = assign_perspectives(agent_list, perspectives=perspective_pool)
 
     _run_port = 0
@@ -2834,7 +3127,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
-            branch=branch,
+            branch=branch, project=project,
         )
         click.echo(f"Discussion queued ({len(task_ids)} tasks). Track via `crew status`:")
         for agent, tid in zip(agent_list, task_ids):
@@ -2874,7 +3167,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
-            branch=branch,
+            branch=branch, project=project,
         )
         results_map, missing, idle_status = _wait_all(task_ids)
 
@@ -3080,7 +3373,6 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
         db = state["db"]
 
     from agent_crew import triage as triage_module
-    from agent_crew.queue import TaskQueue
 
     # Validate --repo matches the project's git origin to prevent cross-project enqueue.
     if project:
@@ -3093,7 +3385,7 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
             if not ok:
                 raise click.ClickException(err_msg)
 
-    queue = TaskQueue(db)
+    queue = _writable_queue(db, base=base, project=project)
 
     if watch:
         # #224: unattended manager mode. Distinct from the LLM-pick path below —
@@ -3286,9 +3578,8 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
     seconds = value * {"s": 1, "m": 60, "h": 3600}[unit]
 
     from agent_crew import triage as triage_module
-    from agent_crew.queue import TaskQueue
 
-    queue = TaskQueue(db)
+    queue = _writable_queue(db, base=base, project=project)
 
     def _agent_fn(prompt: str) -> str:
         import re
@@ -3380,10 +3671,13 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
     }
 
     if port:
+        if project:
+            _verify_project_server(port, project)
         req = _urllib_req.Request(
             f"http://127.0.0.1:{port}/tasks",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     "X-Agent-Crew-Project": project},
             method="POST",
         )
         try:
@@ -3395,7 +3689,8 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
         except Exception as exc:
             raise click.ClickException(f"POST /tasks failed: {exc}") from exc
     else:
-        from agent_crew.queue import TaskQueue, TaskRequest
-        TaskQueue(db).enqueue(TaskRequest(**payload))
+        from agent_crew.queue import TaskRequest
+        _writable_queue(db, base=base, project=project).enqueue(
+            TaskRequest(**payload), ingress="cli.enqueue")
 
     click.echo(task_id)

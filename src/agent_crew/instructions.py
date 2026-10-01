@@ -127,6 +127,23 @@ available.
 
 ## Polling Loop (session start)
 
+## Server identity check (#362)
+
+Before receiving a task or submitting a result, check that this port still
+serves this project. Stop if `/health` is unavailable or reports another project:
+
+```bash
+EXPECTED_PROJECT="<project>"
+ACTUAL_PROJECT=$(curl -fsS http://127.0.0.1:<port>/health 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("project", ""))' 2>/dev/null)
+if [ "$ACTUAL_PROJECT" != "$EXPECTED_PROJECT" ]; then
+  echo "agent_crew identity verification failed: expected project=$EXPECTED_PROJECT, server project=${ACTUAL_PROJECT:-unavailable}. Do not receive a task or submit a result." >&2
+  exit 1
+fi
+```
+
+Include `X-Agent-Crew-Project: <project>` on every worker HTTP poll, start,
+result, checkpoint, and task-enqueue request.
+
 At session start and after each task completes, poll every 30 seconds for the
 next task so no task is missed even if a push is delayed:
 
@@ -135,7 +152,7 @@ next task so no task is missed even if a push is delayed:
 get_next_task(agent="<your-agent-name>")
 
 # Or via HTTP fallback:
-curl -s http://127.0.0.1:<port>/tasks/next?role=<role>
+curl -s -H "X-Agent-Crew-Project: <project>" http://127.0.0.1:<port>/tasks/next?role=<role>
 ```
 
 If the response is `null` / empty, wait 30 seconds and try again.
@@ -187,7 +204,7 @@ time a result is skipped — there is no fallback.
 | `branch` | string | code tasks | The pushed branch; report it as a field, not only in prose. |
 | `commit` | string | code tasks | Full pushed commit SHA; report it as a field, not only in prose. |
 | `verdict` | enum\\|null | reviewers only | `approve` \\| `request_changes` \\| `null` |
-| `findings` | string[] | reviewers only | Actionable issues. Empty array for non-reviewers. |
+| `findings` | string[] or finding objects[] | reviewers only | Actionable issues. Objects require severity, file, line, title, detail. Empty array for non-reviewers. |
 | `pr_number` | int\\|null | if opened | GitHub PR number, otherwise `null`. |
 
 ### Canonical POST template
@@ -281,10 +298,10 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks/<task_id>/checkpoint \\
   }'
 
 # Retrieve latest checkpoint if resuming from failure
-curl -sS http://127.0.0.1:<port>/tasks/<task_id>/checkpoint/latest | jq '.state'
+curl -sS -H "X-Agent-Crew-Project: <project>" http://127.0.0.1:<port>/tasks/<task_id>/checkpoint/latest | jq '.state'
 
 # List all checkpoints for time-travel debugging
-curl -sS http://127.0.0.1:<port>/tasks/<task_id>/checkpoints | jq '.'
+curl -sS -H "X-Agent-Crew-Project: <project>" http://127.0.0.1:<port>/tasks/<task_id>/checkpoints | jq '.'
 ```
 
 Benefits:
@@ -388,6 +405,25 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 | `verdict` | reviewers only | `approve` \\| `request_changes` \\| `null` |
 | `findings` | reviewers only | Actionable issues. Empty list for non-reviewers. |
 | `pr_number` | if opened | GitHub PR number, otherwise `null`. |
+| `executor_binding` | if your task block had a `dispatch_nonce` | `{"nonce": "<it>", "presenter": "<your agent name>"}` |
+
+### The dispatch nonce (ADR P2, §2.2)
+
+If your task block carries a `dispatch_nonce:` line, it is a **single-use**
+proof that this task was dispatched to you, and it is checked twice:
+
+1. **Before you start**, present it once for a go/no-go. The block gives you the
+   exact call (`POST /tasks/<id>/start`, or pass it to the equivalent MCP tool).
+   It answers `{"go": true|false}`. Decide ONLY on the `go` field: `go: true`
+   means start the work, even when `outcome` or `reason` shows `BLOCK` with
+   `enforced: false` (a shadow observation). **On `go: false`, stop** — somebody
+   else is already running this attempt, or the authorisation no longer holds.
+2. **With your result**, as `executor_binding={"nonce": ..., "presenter": ...}`.
+
+⛔Do not invent one, and do not reuse another task's. A block with no
+  `dispatch_nonce` line means none was minted for you: submit the result without
+  the field rather than making one up. A fabricated nonce is refused, and a
+  result refused at the gate is a result nobody reads.
 
 **Never skip `submit_result`.** POST `status: failed` or `status: needs_human`
 with an honest summary rather than staying silent.
@@ -447,6 +483,19 @@ Before you POST the result, verify:
 - [ ] `status` is `completed` (or `failed`/`needs_human` with honest reason)
 - [ ] `verdict: null`, `findings: []` (implementers don't fill these)
 
+### Declared artifact contract (`context.artifact_kind`, #374)
+
+If the task context declares `artifact_kind`, the server checks that contract
+instead of the default commit rule. A result that does not satisfy it is
+stored as `failed` with `reason: no_artifact`.
+- `commit` (also the rule when nothing is declared): a new commit on top of the dispatch base, pushed.
+- `rebase`: push the rebased branch; its commit must descend from `origin/<context.rebase_onto>`
+  and carry the same change you were dispatched with (patch-equivalent commits, or one squash
+  of them). If the rebase needed conflict resolution, report `needs_human` instead.
+- `report`: do not commit. Send `"artifact": {"body": "<report>", "sha256": "<sha256 of body>"}`.
+  If the report is committed, send `"path"` plus `commit` instead of `"body"`.
+- `review`: `verdict` plus the reviewed `pr_number`; `request_changes` needs findings.
+
 ### ⛔ Delegating review / test to the next role — DO NOT use `crew run`
 
 When you need the reviewer (claude) or tester (gemini) to take over after your
@@ -491,6 +540,12 @@ you set `verdict: "approve"`:
 
 Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
 `findings`.
+Each finding may be a descriptive string (at least 10 characters), or an object
+with `severity`, `file`, `line`, `title`, and `detail`; objects are stored as
+`SEVERITY file:line - title: detail`. A final review summary must be at least
+40 characters. Short diagnostic payloads are rejected and leave the task active.
+After a review completes, further results for that task receive a conflict;
+start a new review task to revise the verdict.
 
 ### ⛔ Review the commit you were given — do not re-fetch
 
@@ -801,6 +856,10 @@ def generate(role: str, project: str, port: int, agent: str = "",
             "<test_scope>",
             render_scope(load_scope(worktree_path, project)))
     content = body.replace("<project>", project).replace("<port>", str(port))
+    content = content.replace(
+        '-H "Content-Type: application/json"',
+        f'-H "X-Agent-Crew-Project: {project}" \\\n  -H "Content-Type: application/json"',
+    )
     return content
 
 

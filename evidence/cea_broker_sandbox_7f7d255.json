@@ -1,0 +1,21 @@
+{
+  "build_sha": "7f7d25557e862fdcd2b1250379c53793265f6f85",
+  "temp_home": "/tmp/cea-broker-sandbox-l1l2wuga",
+  "server_port": 39357,
+  "server_health_status": 200,
+  "launcher_check": {
+    "exit_code": 0,
+    "stdout": "euid=1000 service_user=crew-authz service_uid=998\nptrace_scope=1\nsock_dir=/tmp/cea-broker-sandbox-l1l2wuga/sock perms=absent\npythonpath=/home/truhojun/.agent_crew/worktrees/agent_crew/codex/src readable=yes\ndowngrade_reason=BROKER_TREE_USER_WRITABLE path=/home/truhojun/.agent_crew/worktrees/agent_crew/codex/scripts/cea/broker-launch.sh\nNOTE: not running as crew-authz (only --degraded would start)\n"
+  },
+  "degraded_broker_started": true,
+  "decision_test": {
+    "exit_code": 0,
+    "output": ".                                                                        [100%]\n=============================== warnings summary ===============================\n../../../../.local/lib/python3.10/site-packages/fastapi/testclient.py:1\n  /home/truhojun/.local/lib/python3.10/site-packages/fastapi/testclient.py:1: StarletteDeprecationWarning: Using `httpx` with `starlette.testclient` is deprecated; install `httpx2` instead.\n    from starlette.testclient import TestClient as TestClient  # noqa\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n1 passed, 1 warning in 0.60s\n"
+  },
+  "cases": {
+    "RUNTIME_STATE_FORBIDS": "BLOCK",
+    "review_allowed": "ALLOW",
+    "BUDGET_EXHAUSTED": "advisory"
+  },
+  "scope": "decision cases use a separate isolated broker with injected test providers; server health and launcher are smoke checks"
+}

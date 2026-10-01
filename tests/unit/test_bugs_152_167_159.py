@@ -40,7 +40,7 @@ def _post_task(client, task_id="t1", task_type="implement", priority=3, ctx=None
     })
 
 
-def _post_result(client, task_id, status="completed", summary="done"):
+def _post_result(client, task_id, status="completed", summary="done", error_info=None):
     return client.post(f"/tasks/{task_id}/result", json={
         "task_id": task_id,
         "status": status,
@@ -48,6 +48,7 @@ def _post_result(client, task_id, status="completed", summary="done"):
         "verdict": None,
         "findings": [],
         "pr_number": None,
+        "error_info": error_info,
     })
 
 
@@ -57,6 +58,49 @@ class _RecordingPush:
 
     def __call__(self, pane_id, text):
         self.calls.append((pane_id, text))
+
+
+@pytest.mark.parametrize(
+    ("task_type", "error_info", "retry_flag", "expected_retry"),
+    [
+        ("implement", None, None, True),
+        ("implement", None, "1", True),
+        ("implement", None, "0", False),
+        ("implement", {"reason": "infrastructure_failure"}, "0", True),
+        ("review", None, "0", True),
+        ("test", None, "0", True),
+    ],
+)
+def test_auto_retry_skips_agent_reported_implement_failure(
+    tmp_db, monkeypatch, task_type, error_info, retry_flag, expected_retry,
+):
+    if retry_flag is None:
+        monkeypatch.delenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", retry_flag)
+    app = create_app(
+        db_path=tmp_db, pane_map={"implementer": "%100"}, port=8100,
+        push_fn=_RecordingPush(), watchdog_disabled=True, fallback_disabled=True,
+    )
+    with TestClient(app) as client:
+        assert _post_task(
+            client, "self-report-probe", task_type=task_type,
+            ctx={"pr_number": 123} if task_type == "review" else None,
+        ).status_code == 201
+        response = client.post("/tasks/self-report-probe/result", json={
+            "task_id": "self-report-probe", "status": "failed",
+            "summary": "agent failed", "error_info": error_info,
+        })
+        assert response.status_code == 200
+
+    tasks = TaskQueue(tmp_db).list_tasks()
+    retry = [task for task in tasks if task.task_id == "retry-self-report-probe-a1"]
+    assert len(retry) == int(expected_retry)
+    original = next(task for task in tasks if task.task_id == "self-report-probe")
+    assert original.context.get("retry_attempt", 0) == 0
+    assert original.error_info == error_info
+    if expected_retry:
+        assert retry[0].context["retry_attempt"] == 1
 
 
 class _PaneState:
@@ -393,12 +437,13 @@ class TestFallbackCancellation:
         """When fallback_chain_depth >= MAX, the original_task_id task must be
         marked 'cancelled' — not just have an escalation gate opened."""
         from agent_crew.pipeline import auto_fallback_failed_task
+        from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 
         q = TaskQueue(tmp_db)
-        # Seed the root original task as already failed.
+        # A failed row is terminal under G12 and cannot be retroactively
+        # cancelled; keep the root active to test the loop's cancel handoff.
         q.enqueue(_task("orig-root"))
         q.dequeue(role="implementer")
-        q.force_fail("orig-root", "first failure")
 
         # Simulate a fallback at depth=3 that traces back to orig-root.
         q.enqueue(_task("fb3", ctx={
@@ -406,7 +451,7 @@ class TestFallbackCancellation:
             "agent_override": "gemini",
             "fallback_excluded": ["claude", "codex", "gemini"],
             "original_task_id": "orig-root",
-        }))
+        }), _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         q.dequeue(role="implementer")
         result = TaskResult(
             task_id="fb3",

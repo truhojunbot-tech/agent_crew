@@ -63,7 +63,7 @@ def test_prepare_implementer_checks_out_owned_task_branch():
 
     def fake_run(cmd, **_kw):
         cmds.append(cmd)
-        return MagicMock(returncode=0, stderr="")
+        return MagicMock(returncode=0, stderr="", stdout="a" * 40 + "\n")
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
         _prepare_worktree_for_task(
@@ -75,10 +75,10 @@ def test_prepare_implementer_checks_out_owned_task_branch():
     assert any("stash" in " ".join(c) for c in git)
     # fetch
     assert any("fetch" in " ".join(c) for c in git)
-    # checkout -B agent/0123456789ab origin/main
+    # checkout -B agent/0123456789ab at the resolved origin/main SHA
     checkout = [c for c in git if "checkout" in c]
     assert checkout, "no checkout call"
-    assert [c[-3:] for c in checkout] == [["-B", "agent/0123456789ab", "origin/main"]]
+    assert [c[-3:] for c in checkout] == [["-B", "agent/0123456789ab", "a" * 40]]
 
 
 def test_prepare_implementer_detaches_for_unowned_agent_branch():
@@ -89,7 +89,7 @@ def test_prepare_implementer_detaches_for_unowned_agent_branch():
         cmds.append(cmd)
         if "rev-parse" in cmd:
             return MagicMock(returncode=0, stderr="", stdout="a" * 40 + "\n")
-        return MagicMock(returncode=0, stderr="", stdout="")
+        return MagicMock(returncode=0, stderr="", stdout="a" * 40 + "\n")
 
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
         _prepare_worktree_for_task(
@@ -99,7 +99,7 @@ def test_prepare_implementer_detaches_for_unowned_agent_branch():
     checkout = [c for c in _git_calls(cmds) if "checkout" in c]
     assert checkout == [[
         "git", "-C", "/wt/claude", "checkout", "--detach",
-        "origin/agent/my-local-experiment",
+        "a" * 40,
     ]]
 
 
@@ -109,7 +109,7 @@ def test_prepare_implementer_derives_branch_from_task_id_when_empty():
 
     def fake_run(cmd, **_kw):
         cmds.append(cmd)
-        return MagicMock(returncode=0, stderr="")
+        return MagicMock(returncode=0, stderr="", stdout="a" * 40 + "\n")
 
     # task_id without hyphen prefix so first 12 chars are predictable
     with patch("agent_crew.server.subprocess.run", side_effect=fake_run):
@@ -235,7 +235,7 @@ def _calls_with_kwargs(monkeypatch):
 
     def fake_run(cmd, **kw):
         calls.append((cmd, kw))
-        return MagicMock(returncode=0, stderr="")
+        return MagicMock(returncode=0, stderr="", stdout="a" * 40 + "\n")
 
     monkeypatch.setattr("agent_crew.server.subprocess.run", fake_run)
     return calls

@@ -27,7 +27,7 @@ PIPELINE_STAGES = (
 
 @dataclass(frozen=True)
 class MemoryRequest:
-    """A project-local request for non-authoritative historical evidence."""
+    """A scoped request for non-authoritative historical evidence."""
 
     project: str
     task_id: str = ""
@@ -44,6 +44,7 @@ class MemoryRequest:
     pipeline: tuple[str, ...] = PIPELINE_STAGES
     retrieval_query: str = ""
     query_source: str = ""
+    issue: str = ""
 
 
 @dataclass(frozen=True)
@@ -73,10 +74,16 @@ class MemoryResult:
     items: tuple[MemoryItem, ...] = ()
     latency_ms: float = 0.0
     error_type: str = ""
+    dropped_cross_project: int = 0
+
+
+def same_memory_project(request_project: str, item_project: str) -> bool:
+    """A memory record crosses this boundary only for its exact project."""
+    return bool(request_project) and item_project == request_project
 
 
 class MemoryProvider(Protocol):
-    """Backend-neutral retrieval contract. Implementations must be project-local."""
+    """Backend-neutral retrieval contract for project and fleet evidence."""
 
     name: str
     backend: str
@@ -131,16 +138,16 @@ class FakeMemoryProvider:
 def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryResult:
     """Fail-soft wrapper used solely for telemetry at the dispatch seam.
 
-    It also filters a provider's response by the mandatory request project.
-    This is defense in depth: a future backend cannot cause a cross-project
-    result merely by failing to enforce the contract itself.
+    Only exact project matches cross this boundary, including for fleet-scoped
+    storage records returned by a provider.
     """
     started = perf_counter()
     name = getattr(provider, "name", provider.__class__.__name__)
     backend = getattr(provider, "backend", "")
     try:
         result = provider.retrieve(request)
-        scoped = tuple(item for item in result.items if item.project == request.project)
+        scoped = tuple(item for item in result.items
+                       if same_memory_project(request.project, item.project))
         state = result.state
         if state == "results" and not scoped:
             state = "empty"
@@ -151,6 +158,8 @@ def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryR
             items=scoped,
             latency_ms=(perf_counter() - started) * 1000,
             error_type=result.error_type,
+            dropped_cross_project=(result.dropped_cross_project
+                                   + len(result.items) - len(scoped)),
         )
     except TimeoutError as exc:
         return MemoryResult(
@@ -206,6 +215,7 @@ def shadow_telemetry(result: MemoryResult, request: MemoryRequest | None = None)
         "provider": result.provider,
         "backend": result.backend,
         "state": result.state,
+        "dropped_cross_project": result.dropped_cross_project,
         "latency_ms": round(result.latency_ms, 3),
         "error_type": result.error_type or None,
         "result_ids": [item.item_id for item in result.items],

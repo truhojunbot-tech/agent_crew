@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
 from click.testing import CliRunner
 
 from agent_crew.cli import crew
@@ -149,10 +150,13 @@ class _LoopQueue:
         return next(self.results)
 
 
-def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main"):
+def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main", existing_tasks=None,
+              queue_override=None, timeout=None, project=""):
     import agent_crew.loop as loop
 
-    queue = _LoopQueue(results)
+    queue = queue_override or _LoopQueue(results)
+    if existing_tasks is not None:
+        queue.list_tasks = lambda: existing_tasks
     dispatched = []
 
     def enqueue_implement(queue, task, branch, context=None, port=0):
@@ -160,6 +164,11 @@ def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main"):
         return f"impl-{len([x for x in dispatched if x[0] == 'implement'])}"
 
     def enqueue_review(queue, task, branch, prev_task_id=None, context=None, port=0):
+        for existing in existing_tasks or []:
+            if (existing.task_type == "review"
+                    and existing.context.get("prev_task_id") == prev_task_id
+                    and existing.status not in {"failed", "timed_out", "blocked"}):
+                return existing.task_id
         dispatched.append(("review", branch, context or {}))
         return f"review-{len([x for x in dispatched if x[0] == 'review'])}"
 
@@ -167,11 +176,279 @@ def _run_loop(monkeypatch, tmp_path, results, max_iter=2, branch="main"):
     monkeypatch.setattr(loop, "enqueue_implement", enqueue_implement)
     monkeypatch.setattr(loop, "enqueue_review", enqueue_review)
     runner = CliRunner()
-    invocation = runner.invoke(crew, [
+    args = [
         "run", "implement persistence", "--db", str(tmp_path / "tasks.db"),
         "--branch", branch, "--no-tester", "--max-iter", str(max_iter),
-    ])
+    ]
+    if timeout is not None:
+        args += ["--timeout", str(timeout)]
+    if project:
+        args += ["--project", project]
+    invocation = runner.invoke(crew, args)
     return invocation, dispatched
+
+
+def test_run_loop_stops_after_failed_implement_without_review(tmp_path, monkeypatch):
+    results = [TaskResult(task_id="impl-1", status="failed", summary="no artifact")]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "ended failed" in invocation.output
+    assert "server owns retry/fallback/cascade" in invocation.output
+
+
+def _inflight_impl(task_id="impl-existing", *, status="pending", branch="main",
+                   project="", context=None):
+    return TaskRequest(task_id=task_id, task_type="implement",
+                       description="implement persistence", branch=branch,
+                       project=project, status=status, context=context or {})
+
+
+@pytest.mark.parametrize("status", ["pending", "in_progress"])
+def test_run_adopts_identical_first_implement(tmp_path, monkeypatch, status):
+    results = [
+        TaskResult(task_id="impl-existing", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, results, existing_tasks=[_inflight_impl(status=status)])
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["review"]
+    assert "(task already in flight, adopted impl-existing)" in invocation.output
+
+
+@pytest.mark.parametrize("existing", [
+    _inflight_impl(branch="other"),
+    _inflight_impl(status="completed"),
+    _inflight_impl(status="failed"),
+    _inflight_impl(project="other"),
+    _inflight_impl(context={"prev_task_id": "review-parent"}),
+])
+def test_run_enqueues_when_existing_implement_is_not_a_match(
+        tmp_path, monkeypatch, existing):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, results, existing_tasks=[existing])
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+
+
+def test_run_refuses_ambiguous_inflight_implements(tmp_path, monkeypatch):
+    existing = [_inflight_impl("impl-one"),
+                _inflight_impl("impl-two", status="in_progress")]
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, [], existing_tasks=existing)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert dispatched == []
+    assert "impl-one" in invocation.output and "impl-two" in invocation.output
+
+
+def test_run_does_not_sync_worktree_when_adopting_running_task(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_crew.cli._read_state", lambda *args: {
+        "port": 0, "pane_ids": [], "worktrees": {"codex": "/unused/worktree"}})
+    sync_calls = []
+    monkeypatch.setattr("agent_crew.cli._sync_worktrees_to_main",
+                        lambda *args, **kwargs: sync_calls.append((args, kwargs)) or {})
+    results = [
+        TaskResult(task_id="impl-existing", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    class AssertNoEarlySync(_LoopQueue):
+        def get_result(self, task_id):
+            if task_id == "impl-existing":
+                assert sync_calls == [], "must not reset an active worktree before result"
+            return super().get_result(task_id)
+
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, results, project="sandbox",
+        queue_override=AssertNoEarlySync(results),
+        existing_tasks=[_inflight_impl(status="in_progress", project="sandbox")])
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["review"]
+    assert len(sync_calls) == 1  # normal post-completion sync remains
+
+
+def test_run_syncs_worktree_before_waiting_for_adopted_pending_task(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_crew.cli._read_state", lambda *args: {
+        "port": 0, "pane_ids": [], "worktrees": {"codex": "/unused/worktree"}})
+    sync_calls = []
+    monkeypatch.setattr("agent_crew.cli._sync_worktrees_to_main",
+                        lambda *args, **kwargs: sync_calls.append((args, kwargs)) or {})
+    results = [
+        TaskResult(task_id="impl-existing", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+
+    class AssertPendingSynced(_LoopQueue):
+        def get_result(self, task_id):
+            if task_id == "impl-existing":
+                assert len(sync_calls) == 1, "pending worktree needs pre-run sync"
+            return super().get_result(task_id)
+
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, results, project="sandbox",
+        queue_override=AssertPendingSynced(results),
+        existing_tasks=[_inflight_impl(status="pending", project="sandbox")])
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["review"]
+    assert len(sync_calls) == 2  # pre-run sync plus normal post-completion sync
+
+
+class _WaitClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+
+class _WaitQueue:
+    def __init__(self, clock, finish_at=None, status="in_progress"):
+        self.clock = clock
+        self.finish_at = finish_at
+        self.status = status
+
+    def get_result(self, task_id):
+        if task_id == "impl-1" and self.finish_at is not None and self.clock.now >= self.finish_at:
+            return TaskResult(task_id="impl-1", status="completed", summary="done")
+        if task_id == "review-1":
+            return TaskResult(task_id="review-1", status="completed", summary="approved",
+                              verdict="approve", findings=[])
+        return None
+
+    def get_task_status(self, task_id):
+        return self.status
+
+
+def test_run_waits_for_server_running_without_pane_after_wrapper_deadline(tmp_path, monkeypatch):
+    import time
+    import urllib.request
+
+    clock = _WaitClock()
+    queue = _WaitQueue(clock, finish_at=5.0)
+    monkeypatch.setattr(time, "time", clock.time)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    monkeypatch.setattr("agent_crew.cli._read_state", lambda *args: {
+        "port": 18001, "pane_ids": [], "worktrees": {}})
+    monkeypatch.setattr("agent_crew.cli._port_listening", lambda *args, **kwargs: True)
+    monkeypatch.setattr("agent_crew.cli._verify_delivery", lambda *args, **kwargs: True)
+    posts = []
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: posts.append(args))
+
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, [], queue_override=queue,
+                                       timeout=1, project="sandbox")
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert "server still running" in invocation.output
+    assert not [args for args in posts if getattr(args[0], "full_url", "").endswith(
+        "/tasks/impl-1/result")]
+
+
+def test_run_pending_at_wrapper_deadline_still_exits(tmp_path, monkeypatch):
+    import time
+
+    clock = _WaitClock()
+    monkeypatch.setattr(time, "time", clock.time)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, [], queue_override=_WaitQueue(clock, status="pending"), timeout=1)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "Task queued" in invocation.output
+
+
+def test_run_nonrunning_without_result_keeps_wrapper_failure(tmp_path, monkeypatch):
+    import time
+
+    clock = _WaitClock()
+    monkeypatch.setattr(time, "time", clock.time)
+    monkeypatch.setattr(time, "sleep", clock.sleep)
+    invocation, dispatched = _run_loop(
+        monkeypatch, tmp_path, [], queue_override=_WaitQueue(clock, status="failed"), timeout=1)
+
+    assert invocation.exit_code != 0
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "auto-failed for queue cleanup" in invocation.output
+
+
+def test_run_loop_adopts_persisted_server_review(tmp_path, monkeypatch):
+    review_id = "review-impl-1-r0"
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id=review_id, status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    existing = [TaskRequest(task_id=review_id, task_type="review", description="review",
+                            branch="main", context={"prev_task_id": "impl-1"})]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=existing)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert f"Reviewing... ({review_id})" in invocation.output
+
+
+def test_run_loop_enqueues_review_when_no_persisted_successor(tmp_path, monkeypatch):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=[])
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+
+
+def test_run_loop_ignores_dead_persisted_review(tmp_path, monkeypatch):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    existing = [TaskRequest(task_id="review-dead", task_type="review", description="review",
+                            branch="main", context={"prev_task_id": "impl-1"}, status="failed")]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=existing)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement", "review"]
+    assert "Reviewing... (review-1)" in invocation.output
+
+
+def test_run_loop_adopts_live_review_among_dead_reviews(tmp_path, monkeypatch):
+    results = [
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-live", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ]
+    existing = [
+        TaskRequest(task_id="review-dead", task_type="review", description="review",
+                    branch="main", context={"prev_task_id": "impl-1"}, status="timed_out"),
+        TaskRequest(task_id="review-live", task_type="review", description="review",
+                    branch="main", context={"prev_task_id": "impl-1"}, status="pending"),
+    ]
+    invocation, dispatched = _run_loop(monkeypatch, tmp_path, results, existing_tasks=existing)
+
+    assert invocation.exit_code == 0, invocation.output
+    assert [kind for kind, *_ in dispatched] == ["implement"]
+    assert "Reviewing... (review-live)" in invocation.output
 
 
 def test_run_loop_reviews_and_reimplements_on_reported_ref(tmp_path, monkeypatch):

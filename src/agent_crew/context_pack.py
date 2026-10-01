@@ -36,6 +36,8 @@ import os
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -209,6 +211,7 @@ class ContextPack:
             "role": self.role,
             "candidate_count": self.candidate_count,
             "selected_count": self.selected_count,
+            "forge_items": sum(a.artifact_id.startswith("forge:") for a in self.items),
             "total_tokens": self.total_tokens,
             "tokens_by_category": self.tokens_by_category(),
             "stale_count": self.stale_count,
@@ -219,17 +222,20 @@ class ContextPack:
             "budget": dict(self.budget or {}),
         }
 
-    def to_prompt_block(self) -> str:
+    def to_prompt_block(self, inject_gate: Optional["InjectGate"] = None) -> str:
         """Render the pack for the task prompt.
 
         Every item states its type, provenance and revision so the agent can
         weigh it — and conflicts are printed as conflicts rather than being
         silently resolved in favour of whichever scored higher.
         """
-        if not self.items and not self.degraded:
+        if not self.items and not self.degraded and inject_gate is None:
             return ""
         lines = [f"=== CONTEXT PACK {self.pack_id} (mode={self.mode}, "
                  f"{self.selected_count} items, ~{self.total_tokens} tok) ==="]
+        if inject_gate is not None and not inject_gate.ok:
+            lines.append("⚠️ INJECT WARNING (ok=False):")
+            lines.extend(f"  - {signal}" for signal in inject_gate.missing_signals)
         if self.degraded:
             lines.append(
                 f"!! DEGRADED: {self.degraded_reason} — this pack is incomplete. "
@@ -250,6 +256,33 @@ class ContextPack:
                 lines.append(f"  - {c}")
         lines.append("=== END CONTEXT PACK ===")
         return "\n".join(lines)
+
+
+@dataclass
+class InjectGate:
+    ok: bool
+    missing_signals: list = field(default_factory=list)
+
+
+def is_sufficient(pack: ContextPack, *, task_type: str = "", retry_of: str = "") -> InjectGate:
+    """Describe missing context for a fresh session; never block injection."""
+    signals = []
+    types = {item.artifact_type for item in pack.items}
+    if TYPE_ISSUE not in types:
+        signals.append("issue artifact missing — agent cannot identify what it is fixing")
+    no_ac = any(item.artifact_type == TYPE_ISSUE and
+                "no_ac=true" in (item.provenance or "") for item in pack.items)
+    if TYPE_AC not in types and not no_ac:
+        signals.append("AC artifact missing — acceptance bar unknown; "
+                       "annotate no_ac=true in IssueProvider if issue has none")
+    if ("fix" in (task_type or "").lower() or pack.task_id.startswith("fix-")) and TYPE_REVIEW not in types:
+        signals.append("fix round requires linked_review — prior findings unknown; "
+                       "reviewer may re-raise same issues")
+    if retry_of and not any(item.artifact_type == TYPE_EPISODE and
+                            retry_of in item.artifact_id for item in pack.items):
+        signals.append(f"retry of {retry_of} but no episodic record — "
+                       "prior failure reason unknown")
+    return InjectGate(ok=not signals, missing_signals=signals)
 
 
 # ── retrieval providers ───────────────────────────────────────────────
@@ -419,6 +452,60 @@ class LexicalRepoProvider(RetrievalProvider):
             return ""
 
 
+class ForgeProvider(RetrievalProvider):
+    """Optional crew-domain retrieval; a failed request only degrades the pack."""
+
+    name = "forge_crew"
+    version = 1
+    mode = MODE_HYBRID
+
+    def __init__(self, forge_url: str = "http://127.0.0.1:9002", timeout_s: float = 5.0):
+        self._url = forge_url.rstrip("/")
+        self._timeout = timeout_s
+        self.last_error = ""
+
+    def retrieve(self, query: RetrievalQuery) -> list:
+        self.last_error = ""
+        payload = {
+            "query": f"{query.issue_title} {' '.join(query.keywords[:4])}".strip(),
+            "situation": {
+                "project": query.repo.split("/")[-1] if query.repo else "*",
+                "task_type": query.task_type or "implement",
+                "fix_round": query.task_id.startswith("fix-"),
+            },
+        }
+        try:
+            request = urllib.request.Request(
+                self._url + "/get_context", data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                items = json.load(response).get("context_items", [])
+            return [self._to_artifact(item) for item in items]
+        except Exception as exc:  # noqa: BLE001 — retrieval must not block dispatch
+            self.last_error = str(exc)
+            logger.warning("context_pack: Forge retrieval failed: %s", exc)
+            return []
+
+    @staticmethod
+    def _to_artifact(item: dict) -> Artifact:
+        source = str(item.get("source_file") or "")
+        labels = " ".join(str(v) for v in (
+            item.get("reliability_label", ""), item.get("tags", ""),
+            item.get("metadata", "")))
+        reliability = float(item.get("source_reliability") or 0)
+        return Artifact(
+            artifact_id=f"forge:{item['chunk_id']}", uri=source,
+            artifact_type=TYPE_ADR if "adr" in (source + " " + labels).lower() else TYPE_SPEC,
+            revision=str((item.get("metadata") or {}).get("revision", "")),
+            score=float(item.get("score") or 0) * (1 + reliability),
+            score_components={"forge_score": float(item.get("score") or 0),
+                              "forge_reliability": reliability},
+            provenance=(f"Forge crew domain ({item.get('reliability_label', '')}; "
+                        f"{item.get('match_type', '')})"),
+            freshness=FRESH, excerpt=str(item.get("content") or "")[:800],
+        )
+
+
 class EpisodicProvider(RetrievalProvider):
     """Prior attempts on this issue, from durable terminal task evidence.
 
@@ -582,13 +669,25 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
     pack = ContextPack(task_id=query.task_id, role=query.role, mode=mode,
                        budget=budget or budget_for(query.role))
     candidates: list = []
+    lexical_paths: set = set()
     for p in providers:
         if time.time() - started > timeout_s:
             pack.degraded = True
             pack.degraded_reason = f"retrieval timeout after {timeout_s:.0f}s"
             break
         try:
-            candidates.extend(p.retrieve(query) or [])
+            retrieved = p.retrieve(query) or []
+            if isinstance(p, LexicalRepoProvider):
+                for artifact in retrieved:
+                    lexical_paths.update(_artifact_path_keys(artifact.uri, query.repo_path))
+            elif isinstance(p, ForgeProvider):
+                retrieved = [a for a in retrieved if not any(
+                    key in lexical_paths for key in _artifact_path_keys(a.uri, query.repo_path))]
+                if p.last_error:
+                    pack.degraded = True
+                    pack.provider_errors.append(f"{p.name}: {p.last_error}")
+                    pack.degraded_reason = "; ".join(pack.provider_errors)
+            candidates.extend(retrieved)
         except Exception as exc:  # noqa: BLE001
             pack.degraded = True
             pack.provider_errors.append(f"{getattr(p, 'name', '?')}: {exc}")
@@ -630,6 +729,14 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
     return pack
 
 
+def _artifact_path_keys(uri: str, repo_path: str) -> set:
+    """Match a Forge source to a lexical repo file, including absolute paths."""
+    path = os.path.normpath(str(uri or ""))
+    if repo_path and path.startswith(os.path.normpath(repo_path) + os.sep):
+        path = os.path.relpath(path, repo_path)
+    return {path, os.path.basename(path)} if path else set()
+
+
 def keywords_from(query_title: str, body: str = "", extra: Optional[list] = None,
                   limit: int = 8) -> list:
     """Deterministic keyword extraction for the lexical baseline.
@@ -661,6 +768,18 @@ def keywords_from(query_title: str, body: str = "", extra: Optional[list] = None
 #: measured baseline, not an assumed improvement).
 def enabled() -> bool:
     return os.getenv("AGENT_CREW_CONTEXT_PACK", "").lower() in ("1", "true", "yes", "on")
+
+
+def shadow_enabled() -> bool:
+    return os.getenv("AGENT_CREW_CONTEXT_PACK_SHADOW", "").lower() in ("1", "true", "yes", "on")
+
+
+def inject_gate_enabled() -> bool:
+    return os.getenv("AGENT_CREW_CONTEXT_PACK_INJECT_GATE", "").lower() in ("1", "true", "yes", "on")
+
+
+def forge_enabled() -> bool:
+    return os.getenv("AGENT_CREW_FORGE_PROVIDER", "").lower() in ("1", "true", "yes", "on")
 
 
 #: Bounded `gh` lookup for an issue body the ingest path did not persist.
@@ -963,6 +1082,8 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
         retry_of=str(ctx.get("retry_of") or ""),
     )
     providers = [IssueProvider(), LexicalRepoProvider()]
+    if forge_enabled():
+        providers.append(ForgeProvider(os.getenv("AGENT_CREW_FORGE_URL", "http://127.0.0.1:9002")))
     episodes = load_episodes(episodes_path) if episodes_path else []
     if episodes_path:
         providers.append(EpisodicProvider(episodes))
@@ -985,7 +1106,8 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
     providers.extend(extra_providers or [])
     try:
         pack = plan_pack(query, providers,
-                         budget=budget or budget_for(role), mode=mode,
+                         budget=budget or budget_for(role),
+                         mode=MODE_HYBRID if forge_enabled() else mode,
                          timeout_s=timeout_s)
         # ⛔The acceptance criteria are the one thing #239 promises never to
         #   drop. If this task HAS an issue but we could not read its body, the
@@ -1017,6 +1139,10 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
             # issues have none — so it is stated, not flagged as degraded.
             logger.info("context_pack: issue #%s has no acceptance-criteria "
                         "section", issue)
+            if not IssueProvider.extract_ac(body) and not body_is_truncated(ctx, body):
+                for artifact in pack.items:
+                    if artifact.artifact_type == TYPE_ISSUE:
+                        artifact.provenance += "; no_ac=true"
         if matched and shadow_path:
             _record_shadow(shadow_path, matched, task_id)
         return pack

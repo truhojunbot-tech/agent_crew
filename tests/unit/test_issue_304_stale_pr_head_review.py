@@ -257,8 +257,8 @@ def _submit_review(tmp_db, monkeypatch, head, *, unused_tcp_port):
     with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         response = client.post("/tasks/review-stale/result", json={
             "task_id": "review-stale", "status": "completed",
-            "summary": "blocker", "verdict": "request_changes",
-            "findings": ["code_quality: x"],
+            "summary": "Review found a blocker in the current PR changes", "verdict": "request_changes",
+            "findings": ["code_quality: fix the blocking code path"],
             "pr_number": 5652})
         assert response.status_code == 200, response.text
     return posted, TaskQueue(tmp_db)
@@ -349,7 +349,7 @@ def _submit_approve(tmp_db, monkeypatch, head, *, no_tester=False, unused_tcp_po
     with TestClient(app) as client:
         response = client.post("/tasks/review-approve/result", json={
             "task_id": "review-approve", "status": "completed",
-            "summary": "looks good", "verdict": "approve", "pr_number": 5652})
+            "summary": "Reviewed the current PR head and approved the changes", "verdict": "approve", "pr_number": 5652})
         assert response.status_code == 200, response.text
     tests.extend(t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "test")
     return posted, tests, merged

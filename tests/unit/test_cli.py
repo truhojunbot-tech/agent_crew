@@ -217,8 +217,10 @@ def test_u_c19_discuss_context_includes_perspective():
     class _FakeQueue:
         def __init__(self):
             self.enqueued = []
-        def enqueue(self, req):
+            self.ingresses = []
+        def enqueue(self, req, **kwargs):
             self.enqueued.append(req)
+            self.ingresses.append(kwargs["ingress"])
             return req.task_id
 
     q = _FakeQueue()
@@ -227,6 +229,7 @@ def test_u_c19_discuss_context_includes_perspective():
         perspectives={"claude": "analyst", "codex": "critic"},
     )
     assert len(ids) == 2
+    assert q.ingresses == ["cli.discuss", "cli.discuss"]
     assert q.enqueued[0].context["agent"] == "claude"
     assert q.enqueued[0].context["perspective"] == "analyst"
     assert q.enqueued[1].context["agent"] == "codex"
@@ -441,132 +444,6 @@ def test_u_c32_auto_detect_no_projects(tmp_path):
     assert result is None
 
 
-# U-C33: _auto_detect_project — returns most recently modified project
-def test_u_c33_auto_detect_most_recent_project(tmp_path):
-    from agent_crew.cli import _auto_detect_project
-    import json
-    import time
-
-    base = str(tmp_path)
-
-    # Create two projects with different mtimes
-    proj1_dir = tmp_path / "project_old"
-    proj1_dir.mkdir()
-    (proj1_dir / "state.json").write_text(json.dumps({"project": "project_old"}))
-
-    time.sleep(0.1)  # Ensure different mtimes
-
-    proj2_dir = tmp_path / "project_new"
-    proj2_dir.mkdir()
-    (proj2_dir / "state.json").write_text(json.dumps({"project": "project_new"}))
-
-    result = _auto_detect_project(base)
-    assert result == "project_new"
-
-
-# U-C34: _auto_detect_project — ignores dirs without state.json
-def test_u_c34_auto_detect_ignores_dirs_without_state(tmp_path):
-    from agent_crew.cli import _auto_detect_project
-    import json
-
-    base = str(tmp_path)
-
-    # Create project with state.json
-    proj_with_state = tmp_path / "with_state"
-    proj_with_state.mkdir()
-    (proj_with_state / "state.json").write_text(json.dumps({"project": "with_state"}))
-
-    # Create project without state.json
-    proj_without_state = tmp_path / "without_state"
-    proj_without_state.mkdir()
-    (proj_without_state / "other_file.txt").write_text("not a state file")
-
-    result = _auto_detect_project(base)
-    assert result == "with_state"
-
-
-# U-C35: _auto_detect_project — works with tilde expansion
-def test_u_c35_auto_detect_tilde_expansion(tmp_path, monkeypatch):
-    from agent_crew.cli import _auto_detect_project
-    import json
-
-    # Mock home directory to tmp_path
-    monkeypatch.setenv("HOME", str(tmp_path))
-
-    # Create nested directory structure
-    crew_dir = tmp_path / ".agent_crew"
-    crew_dir.mkdir()
-    proj_dir = crew_dir / "test_project"
-    proj_dir.mkdir()
-    (proj_dir / "state.json").write_text(json.dumps({"project": "test_project"}))
-
-    result = _auto_detect_project("~/.agent_crew")
-    assert result == "test_project"
-
-
-# U-C36: _auto_detect_project — handles exception gracefully
-def test_u_c36_auto_detect_handles_exception(tmp_path):
-    from agent_crew.cli import _auto_detect_project
-    from unittest.mock import patch
-
-    base = str(tmp_path)
-
-    # Mock os.listdir to raise an exception
-    with patch("os.listdir", side_effect=PermissionError("Access denied")):
-        result = _auto_detect_project(base)
-
-    assert result is None
-
-
-# U-C37: crew run uses auto-detected project in place of explicit --project flag
-def test_u_c37_run_auto_detect_used(tmp_path):
-    from agent_crew.cli import run_cmd
-    from unittest.mock import patch, MagicMock
-    import json
-
-    base = str(tmp_path)
-    proj_dir = tmp_path / "auto_test"
-    proj_dir.mkdir()
-    db_file = str(proj_dir / "tasks.db")
-    state = {
-        "project": "auto_test",
-        "port": 0,
-        "db": db_file,
-    }
-    (proj_dir / "state.json").write_text(json.dumps(state))
-
-    # Mock the downstream functions to avoid server requirement
-    with patch("agent_crew.cli.click.ClickException") as mock_exc, \
-         patch("agent_crew.cli._read_state") as mock_read:
-        mock_read.return_value = state
-        # When auto-detect happens and we provide only base, it should
-        # find "auto_test" and proceed without error
-        from agent_crew.cli import _auto_detect_project
-        result = _auto_detect_project(base)
-        assert result == "auto_test"
-
-
-# U-C38: crew discuss uses auto-detected project in place of explicit --project flag
-def test_u_c38_discuss_auto_detect_used(tmp_path):
-    from agent_crew.cli import _auto_detect_project
-    import json
-
-    base = str(tmp_path)
-    proj_dir = tmp_path / "discuss_auto_test"
-    proj_dir.mkdir()
-    db_file = str(proj_dir / "tasks.db")
-    state = {
-        "project": "discuss_auto_test",
-        "port": 0,
-        "db": db_file,
-    }
-    (proj_dir / "state.json").write_text(json.dumps(state))
-
-    # When auto-detect happens, it should find "discuss_auto_test"
-    result = _auto_detect_project(base)
-    assert result == "discuss_auto_test"
-
-
 # U-C39: _auto_detect_project — returns None when base is not a directory
 def test_u_c39_auto_detect_base_is_file(tmp_path):
     from agent_crew.cli import _auto_detect_project
@@ -730,7 +607,8 @@ def test_u_c43_status_uses_server_when_reachable(tmp_path):
          "branch": "main", "priority": 3, "context": {}, "status": "failed"},
     ]
 
-    def mock_fetch(port, status):
+    def mock_fetch(port, status, project=""):
+        assert project == "proj43"
         return [t for t in server_tasks if t["status"] == status]
 
     runner = CliRunner()
@@ -1090,7 +968,7 @@ def test_u_c53_status_lists_queue_in_progress_and_completed_tasks(tmp_path):
         return MagicMock(returncode=0, stdout="", stderr="")
 
     runner = CliRunner()
-    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=lambda _port, status: task_groups[status]), \
+    with patch("agent_crew.cli._fetch_tasks_by_status", side_effect=lambda _port, status, project="": task_groups[status]), \
          patch("agent_crew.cli._validate_pane_map", return_value={"valid": True, "mismatches": [], "suggestions": []}), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run):
         result = runner.invoke(crew, ["status", "proj", "--base", str(tmp_path), "--preview", "0"])

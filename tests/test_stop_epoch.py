@@ -46,7 +46,7 @@ class TestEpochBasics(Base):
     def test_set_stop_epoch_monotonic(self):
         q = TaskQueue(self.db)
         e1 = q.set_stop_epoch(True, incident="alfred#39")
-        e2 = q.set_stop_epoch(False)
+        e2 = q.set_stop_epoch(False, who="owner:test", decision_id="D-51-9")
         e3 = q.set_stop_epoch(True, incident="alfred#39")
         self.assertEqual([e1, e2, e3], [1, 2, 3])
         self.assertTrue(q.get_stop_epoch()["paused"])
@@ -131,8 +131,8 @@ class TestBootReconcile(Base):
         q = TaskQueue(self.db)
         # db를 epoch3 unpaused로 만든다
         q.set_stop_epoch(True)          # 1
-        q.set_stop_epoch(False)         # 2 unpaused
-        q.set_stop_epoch(False)         # 3 unpaused
+        q.set_stop_epoch(False, who="owner:test", decision_id="D-51-9")   # 2 unpaused
+        q.set_stop_epoch(False, who="owner:test", decision_id="D-51-9")   # 3 unpaused
         # pause.json을 같은 epoch3 paused로
         pausemod.set_pause(self.dir, True, scope="project", incident="alfred#39", generation=3)
         q2 = TaskQueue(self.db)
@@ -148,7 +148,7 @@ class TestReconcileIncidentFix(Base):
     def test_unpaused_incident_mismatch_no_conflict(self):
         q = TaskQueue(self.db)
         q.set_stop_epoch(True, incident="alfred#39")   # epoch1 paused
-        q.resume_stop(generation=2)                    # epoch2 unpaused, incident 보존(alfred#39)
+        q.resume_stop(generation=2, who="owner:test", decision_id="D-51-9")  # epoch2 unpaused, incident 보존(alfred#39)
         # pause.json: unpaused gen2 incident=None (버그 재현 형상)
         pausemod.set_pause(self.dir, False, scope="project", generation=2, incident=None)
         st = TaskQueue(self.db).get_stop_epoch()        # 재부팅 reconcile
@@ -172,7 +172,8 @@ class TestReconcileIncidentFix(Base):
         e = q.set_stop_epoch(True, incident="alfred#39")           # DB epoch1 paused inc alfred#39
         pausemod.set_pause(sd, True, scope="project", generation=e, incident="alfred#39")  # pause.json mirror
         # 실제 CLI resume(project scope) — cli.py의 mirror 경로를 구동
-        r = CliRunner().invoke(crew_cli, ["resume", proj, "--generation", "2", "--base", base])
+        r = CliRunner().invoke(crew_cli, ["resume", proj, "--generation", "2", "--base", base,
+                                          "--decision-id", "D-51-9"])
         self.assertEqual(r.exit_code, 0, r.output)
         # DB: unpaused, 새 epoch, incident 보존
         st = q.get_stop_epoch()
@@ -183,10 +184,29 @@ class TestReconcileIncidentFix(Base):
         pj = pausemod.pause_state(sd)["project"]
         self.assertFalse(pj["paused"])
         self.assertEqual(int(pj["generation"]), 2)
+
         self.assertEqual(pj.get("incident"), "alfred#39",
                          "CLI resume이 DB incident를 pause.json에 mirror해야(None化 금지)")
         # fresh TaskQueue 재구성 후에도 unpaused(재-pause 없음 — canary가 잡은 무한 re-pause 방지 확인)
         self.assertFalse(TaskQueue(db).get_stop_epoch()["paused"])
+
+    def test_cli_resume_without_a_t0_decision_is_refused(self):
+        """P6: `crew resume` may not loosen the runtime on its own say-so, and a
+        refused resume leaves pause.json untouched (fail-closed)."""
+        from click.testing import CliRunner
+        from agent_crew.cli import crew as crew_cli
+        base = tempfile.mkdtemp()
+        proj = "refuseproj"
+        sd = os.path.join(base, proj)
+        os.makedirs(sd)
+        q = TaskQueue(os.path.join(sd, "tasks.db"))
+        e = q.set_stop_epoch(True, incident="alfred#39")
+        pausemod.set_pause(sd, True, scope="project", generation=e, incident="alfred#39")
+        r = CliRunner().invoke(crew_cli, ["resume", proj, "--generation", "2", "--base", base])
+        self.assertEqual(r.exit_code, 1, r.output)
+        self.assertIn("decision-id", r.output)
+        self.assertTrue(q.get_stop_epoch()["paused"])
+        self.assertTrue(pausemod.pause_state(sd)["project"]["paused"])
 
     def test_paused_state_mismatch_failclosed(self):
         q = TaskQueue(self.db)
@@ -210,14 +230,14 @@ class TestResumeCAS(Base):
         q = TaskQueue(self.db)
         e = q.set_stop_epoch(True, incident="alfred#39")   # epoch1 paused
         # stale: generation <= 현재 epoch → 거부
-        res = q.resume_stop(generation=e)
+        res = q.resume_stop(generation=e, who="owner:test", decision_id="D-51-9")
         self.assertFalse(res["resumed"])
         self.assertTrue(q.get_stop_epoch()["paused"])
 
     def test_resume_newer_generation_succeeds(self):
         q = TaskQueue(self.db)
         e = q.set_stop_epoch(True, incident="alfred#39")   # epoch1
-        res = q.resume_stop(generation=e + 1)
+        res = q.resume_stop(generation=e + 1, who="owner:test", decision_id="D-51-9")
         self.assertTrue(res["resumed"])
         self.assertEqual(res["epoch"], e + 1)
         self.assertFalse(q.get_stop_epoch()["paused"])
@@ -230,7 +250,7 @@ class TestResumeCAS(Base):
         q.set_stop_epoch(True, incident="alfred#39")       # epoch1
         # 관측자는 epoch1을 보고 resume gen2를 시도하려는데, 그 사이 새 STOP이 epoch2로 올라감
         q.set_stop_epoch(True, incident="alfred#39")       # epoch2 (newer STOP)
-        res = q.resume_stop(generation=2)                  # gen2 <= 현재 epoch2 → 거부
+        res = q.resume_stop(generation=2, who="owner:test", decision_id="D-51-9")  # gen2 <= 현재 epoch2 → 거부
         self.assertFalse(res["resumed"])
         self.assertTrue(q.get_stop_epoch()["paused"])
 
@@ -423,7 +443,7 @@ class TestExternalOpReceipt(Base):
     def test_reserve_records_admitted_epoch(self):
         q = TaskQueue(self.db)
         q.set_stop_epoch(True)          # epoch1 paused
-        q.set_stop_epoch(False)         # epoch2 unpaused
+        q.set_stop_epoch(False, who="owner:test", decision_id="D-51-9")   # epoch2 unpaused
         r = q.external_op_reserve("merge:pr:2", pr_number=2)
         self.assertTrue(r["admitted"])
         self.assertEqual(q.external_op_get("merge:pr:2")["admitted_epoch"], 2,

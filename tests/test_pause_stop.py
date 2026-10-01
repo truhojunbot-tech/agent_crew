@@ -86,17 +86,54 @@ class TestResume(Base):
         self.assertIsNone(self.q.dequeue(role="implementer"))
 
     def test_current_generation_resume_continues_lineage(self):
+        """A resume through the DB authority continues the existing lineage.
+
+        The pause.json mirror is written the way `crew resume` writes it, but the
+        thing that actually loosens the runtime is `resume_stop`, with an owner
+        principal and a T0 decision record — see
+        `test_pause_json_alone_cannot_resume_a_stopped_runtime` for what happens
+        without it.
+        """
         self._enqueue(2)
         rec = pause.set_pause(self.state_dir, True, source="test")
         self.assertIsNone(self.q.dequeue(role="implementer"))
-        res = pause.resume(self.state_dir, generation=rec["generation"] + 1, source="test")
+        gen = rec["generation"] + 1
+        res = self.q.resume_stop(generation=max(gen, int(self.q.get_stop_epoch()["epoch"]) + 1),
+                                 who="owner:test", decision_id="D-51-9")
         self.assertTrue(res["resumed"])
+        pause.resume(self.state_dir, generation=res["epoch"], source="test")   # mirror
         # resume 후 기존 lineage 그대로 dequeue(중복 task 생성 없음)
         t = self.q.dequeue(role="implementer")
         self.assertIsNotNone(t)
         # 총 task 수는 enqueue한 2개 그대로(resume이 복제하지 않음)
         allt = self.q.list_tasks()
         self.assertEqual(len([x for x in allt]), 2)
+
+    def test_pause_json_alone_cannot_resume_a_stopped_runtime(self):
+        """P6 pause.json is tighten-only — including at boot reconciliation.
+
+        Repro from the s1-fix re-review (P1 #1, second half): a higher-generation
+        unpaused pause.json turned a STOPPED row into ACTIVE with
+        `decision_id=None` and no principal, around the authority check the
+        loosening APIs had just been given.
+        """
+        self._enqueue(1)
+        rec = pause.set_pause(self.state_dir, True, source="test")
+        self.assertIsNone(self.q.dequeue(role="implementer"))
+        self.assertEqual(self.q.get_runtime_state()["state"], "STOPPED")
+
+        # a higher-generation, unpaused pause.json + a restart: boot reconciliation
+        # is where the promotion used to happen.
+        pause.resume(self.state_dir, generation=rec["generation"] + 5, source="attacker")
+        q2 = TaskQueue(self.db)
+
+        state = q2.get_runtime_state()
+        self.assertEqual(state["state"], "STOPPED", "pause.json may not loosen (P6)")
+        self.assertIsNone(q2.dequeue(role="implementer"))
+
+        events = q2.runtime_state_events(limit=5)
+        self.assertTrue(any("REFUSED" in (e.get("reason") or "") for e in events),
+                        f"the refusal must be recorded, got {events!r}")
 
 
 class TestFailClosed(Base):

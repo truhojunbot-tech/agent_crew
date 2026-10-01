@@ -614,7 +614,12 @@ def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypat
     wt.mkdir(exist_ok=True)
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {"codex": str(wt)}}))
+    state.write_text(json.dumps({"project": "p", "worktrees": {"codex": str(wt)},
+                                 "role_agents": {"implementer": "codex", "reviewer": "codex",
+                                                 "tester": "codex"},
+                                 "roles": [{"role": "reviewer", "agent": "codex",
+                                            "worktree": str(wt)}],
+                                 "codex_context_max_mb": 2}))
     db = str(tmp_path / "t.db")
     home = tmp_path / "codexhome"
 
@@ -627,7 +632,9 @@ def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypat
 
     def cap(cwd, *a, **kw):
         measured["session_id"] = kw.get("session_id")
-        return real_cap(cwd, max_mb=2, home=home, session_id=kw.get("session_id", ""))
+        measured["max_mb"] = kw.get("max_mb")
+        return real_cap(cwd, max_mb=kw.get("max_mb"), home=home,
+                        session_id=kw.get("session_id", ""))
 
     async def _fake_exec(*cmd, **kwargs):
         measured["cmd"] = list(cmd)
@@ -685,4 +692,5 @@ def test_dispatch_measures_the_stored_session_not_the_newest(tmp_path, monkeypat
         f"the cap measured {measured.get('session_id')!r}, not the session the "
         f"resume would replay"
     )
+    assert measured["max_mb"] == 2
     assert "resume" not in measured["cmd"], "an oversized stored session was resumed"

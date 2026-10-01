@@ -87,6 +87,23 @@ def pr_repo(tmp_path):
 
 
 @pytest.mark.parametrize("role", ["reviewer", "tester"])
+def test_review_roles_land_on_pr_content_not_implementer_base(pr_repo, role):
+    """#404: the #397 implementer base rule must not apply to review roles."""
+    clone, wt, pr_head, _advance = pr_repo
+    main_head = _sha(clone, "origin/main")
+    assert pr_head != main_head
+    assert (wt / "a.txt").read_text() == "base\n"
+
+    prepared = _prepare_worktree_for_task(str(wt), "review-404", PR_BRANCH, role,
+                                          {"base_branch": "main"})
+
+    assert prepared == pr_head
+    assert _sha(wt) == pr_head
+    assert _sha(wt) != main_head
+    assert (wt / "a.txt").read_text() == "commit A\n"
+
+
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
 def test_the_prepared_head_does_not_follow_a_moving_pr(pr_repo, role):
     """★★The race from the issue, executed.
 

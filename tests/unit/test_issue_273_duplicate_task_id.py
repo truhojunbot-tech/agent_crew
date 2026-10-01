@@ -34,7 +34,28 @@ from agent_crew.server import create_app
 
 #: Every NOT NULL column `enqueue` writes from caller-supplied data. Each one
 #: could raise IntegrityError without a single duplicate being involved.
-NOT_NULL_FIELDS = ["task_type", "description", "branch", "project"]
+#:
+#: ⛔`project` left the list in s4k (SEV-0 CEA) and that is a fix, not a gap:
+#:   `TaskQueue.enqueue` now resolves an absent project from the queue's own
+#:   identity before the INSERT, so a caller can no longer drive this column to
+#:   NULL at all. The property under test — "some *other* constraint is not a
+#:   duplicate task_id" — is unchanged and still exercised by the three columns
+#:   a caller can still empty.
+NOT_NULL_FIELDS = ["task_type", "description", "branch"]
+
+
+def test_project_can_no_longer_reach_the_insert_as_null(tmp_db):
+    """The column dropped from the list above, pinned rather than forgotten.
+
+    s4k: an absent project is filled from the queue's identity at admission, so
+    this is now a successful enqueue instead of an IntegrityError. If that ever
+    regresses, the row appears with a NULL project and this goes red — which is
+    the evidence the shortened list needs."""
+    q = TaskQueue(tmp_db)
+    q.enqueue(_task("no-project", project=None))
+    rows = [t for t in q.list_tasks() if t.task_id == "no-project"]
+    assert len(rows) == 1
+    assert rows[0].project == q.queue_project != ""
 
 
 def _task(task_id="t-1", **kw):

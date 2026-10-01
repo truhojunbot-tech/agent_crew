@@ -212,11 +212,32 @@ class TestSubmitResult:
             "submit_result",
             task_id="t-rev",
             status="completed",
-            summary="reviewed",
+            summary="Reviewed this change and found an off-by-one error.",
             verdict="request_changes",
             findings=["[bug] off-by-one in step 2"],
         )
         assert ack["acknowledged"] is True
+
+    def test_review_on_remote_default_branch_does_not_enqueue_fix(self, tmp_db, monkeypatch):
+        """MCP has a repo identity but no checkout from which to read origin/HEAD."""
+        monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+        monkeypatch.setattr("agent_crew.pipeline._repo_default_branch", lambda repo: "trunk")
+        q = TaskQueue(tmp_db)
+        review = _make_task("review-trunk-probe", task_type="review")
+        review.branch = "trunk"
+        review.context = {"repo": "owner/repo"}
+        q.enqueue(review)
+        mcp = build_mcp_server(tmp_db)
+        _call_tool(mcp, "get_next_task", role="reviewer")
+
+        ack = _call_tool(
+            mcp, "submit_result", task_id=review.task_id, status="completed",
+            summary="Reviewed this change and found a blocking issue on trunk.",
+            verdict="request_changes", findings=["HIGH file.py:1 - blocking issue"],
+        )
+
+        assert ack["acknowledged"] is True
+        assert [t for t in q.list_tasks() if t.task_type == "implement"] == []
 
 
 # ---------------------------------------------------------------------------

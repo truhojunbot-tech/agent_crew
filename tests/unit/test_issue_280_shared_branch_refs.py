@@ -95,8 +95,8 @@ def test_a_callers_branch_is_checked_out_detached_instead():
     git = _run_prepare(CALLER_BRANCH, "implementer")
     detach = [c for c in git if "checkout" in c and "--detach" in c]
     assert detach, f"no detached checkout; calls were {[' '.join(c[2:]) for c in git]}"
-    assert f"origin/{CALLER_BRANCH}" in " ".join(detach[0]), \
-        "detached somewhere other than that branch's own remote tip"
+    assert "origin/main" in " ".join(detach[0]), \
+        "implementer must start at the declared base without moving the caller's ref"
 
 
 def test_main_is_never_force_moved(  ):
@@ -107,12 +107,11 @@ def test_main_is_never_force_moved(  ):
 
 
 def test_the_detach_falls_back_to_main_when_the_branch_has_no_remote(  ):
-    """A brand-new branch name has no `origin/<name>` yet. Falling back keeps
-    the task runnable without inventing a ref."""
+    """A new output branch still starts from the declared base."""
     git = _run_prepare("brand-new-thing", "implementer", rc=1)   # every git call fails
     detach = [c for c in git if "checkout" in c and "--detach" in c]
-    assert len(detach) == 2, "expected a retry at origin/main after the first detach failed"
-    assert "origin/main" in " ".join(detach[-1])
+    assert len(detach) == 1
+    assert "origin/main" in " ".join(detach[0])
 
 
 # ── 3. what must NOT change ───────────────────────────────────────────
@@ -209,14 +208,12 @@ def test_the_callers_ref_does_not_move(shared_clone):
     assert after == before, f"the caller's branch ref moved {where}"
 
 
-def test_the_worktree_still_lands_on_that_branchs_content(shared_clone):
-    """⛔Not moving the ref is only half of it. The task still has to see the
-    code it was dispatched for, or the fix trades a data hazard for a
-    correctness one."""
+def test_the_worktree_lands_on_the_implement_task_base(shared_clone):
+    """The output branch is preserved while the next task starts at main."""
     clone, wt = shared_clone
     _prepare_worktree_for_task(str(wt), "task-abc123", CALLER_BRANCH, "implementer")
-    assert _sha(wt, "HEAD") == _sha(clone, f"origin/{CALLER_BRANCH}")
-    assert (wt / "a.txt").read_text() == "two\n"
+    assert _sha(wt, "HEAD") == _sha(clone, "origin/main")
+    assert (wt / "a.txt").read_text() == "one\n"
 
 
 def test_the_worktree_head_is_detached_not_owning_the_branch(shared_clone):

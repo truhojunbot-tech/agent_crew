@@ -87,7 +87,7 @@ class TaskResult:
     status: Literal["completed", "failed", "needs_human", "timed_out", "blocked"]
     summary: str
     verdict: Optional[Literal["approve", "request_changes"]] = None
-    findings: list[str] = field(default_factory=list)
+    findings: list[Union[str, dict]] = field(default_factory=list)
     #: ⛔Accepts a `str` on the way IN and is always `int | None` on the way OUT
     #: — see `__post_init__`. Typed `Optional[int]`, FastAPI rejected `"#268"`
     #: with a 422 before any normalisation could run (review of PR #270), so
@@ -118,6 +118,32 @@ class TaskResult:
     commit: str = ""
     retry_count: int = 0  # Track number of retry attempts
     error_info: Optional[dict] = None  # Structured error payload for debugging (#167)
+    #: #374: the non-commit artifact a declared contract hands back — for a
+    #: `report`, ``{"sha256": ..., "body": ...}`` or ``{"sha256": ..., "path": ...}``.
+    #: Optional and ignored unless the task declared `context.artifact_kind`.
+    artifact: Optional[dict] = None
+    #: ADR §2.2 / P2 RESULT — ``{"nonce": ..., "presenter": ...}``, the
+    #: single-use dispatch nonce the worker was handed in its task block.
+    #:
+    #: ⛔Transport only, and stripped by the endpoint before the row is
+    #:   written. It is the one field here that is a *credential* rather than a
+    #:   report: persisting it in ``result_json`` would leave a spent proof
+    #:   lying in a column every consumer of the row can read. The field exists
+    #:   on the model because both transports must accept the same body — a
+    #:   guard on one transport is a guard an agent walks around by changing
+    #:   how it reports (#123) — and because without it pydantic silently
+    #:   dropped the nonce, which is how RESULT came to be a gate nobody could
+    #:   pass (codex cross-repo review of 8993bdb, P1 #2).
+    executor_binding: Optional[dict] = None
+
+    def take_executor_binding(self) -> tuple[Optional[str], Optional[str]]:
+        """Pop ``(nonce, presenter)`` off the result, leaving nothing behind."""
+        binding = self.executor_binding if isinstance(self.executor_binding, dict) else {}
+        self.executor_binding = None
+        nonce = binding.get("nonce")
+        presenter = binding.get("presenter")
+        return (nonce if isinstance(nonce, str) and nonce else None,
+                presenter if isinstance(presenter, str) and presenter else None)
 
     def __post_init__(self):
         # #305: keep the SPELLING honest without ever throwing the result away.
@@ -128,6 +154,26 @@ class TaskResult:
         self.branch = (self.branch or "").strip() if isinstance(self.branch, str) else ""
         _commit = (self.commit or "").strip() if isinstance(self.commit, str) else ""
         self.commit = _commit if _OBJECT_ID_RE.match(_commit) else ""
+        normalized_findings = []
+        for index, finding in enumerate(self.findings or []):
+            if isinstance(finding, str):
+                normalized_findings.append(finding)
+            elif isinstance(finding, dict):
+                required = ("severity", "file", "line", "title", "detail")
+                if any(key not in finding or finding[key] in (None, "") for key in required):
+                    # Existing internal result producers carry provenance and
+                    # legacy finding objects. The review intake validator below
+                    # rejects malformed worker findings; keep internal payloads
+                    # intact so suppression and feedback retain that metadata.
+                    normalized_findings.append(finding)
+                    continue
+                normalized_findings.append(
+                    f"{finding['severity']} {finding['file']}:{finding['line']} - "
+                    f"{finding['title']}: {finding['detail']}")
+            else:
+                raise ValueError(f"findings[{index}] must be a string or an object with "
+                                 "severity, file, line, title, detail")
+        self.findings = normalized_findings
         if self.status not in _VALID_RESULT_STATUSES:
             raise ValueError(f"Invalid status: {self.status!r}. Must be one of {_VALID_RESULT_STATUSES}")
         if self.retry_count < 0:
@@ -159,6 +205,21 @@ class TaskResult:
                         f"Invalid pr_number: {self.pr_number!r}. Must name a PR "
                         f'(268, "268" or "#268") or be omitted.')
                 self.pr_number = normalized
+
+
+def validate_review_result(result: TaskResult) -> Optional[str]:
+    """Reject diagnostic review payloads before they become final verdicts."""
+    if result.status != "completed" or result.verdict not in ("approve", "request_changes"):
+        return None
+    if len(result.summary.strip()) < 40:
+        return "review summary must be at least 40 characters for a final verdict"
+    for index, finding in enumerate(result.findings):
+        if not isinstance(finding, str):
+            return (f"findings[{index}] must be a string or an object with "
+                    "severity, file, line, title, detail")
+        if len(finding.strip()) < 10:
+            return f"findings[{index}] must be at least 10 characters for a final verdict"
+    return None
 
 
 @dataclass

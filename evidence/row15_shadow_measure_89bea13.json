@@ -1,0 +1,611 @@
+{
+  "build_prefix": "a138976",
+  "capture_completeness": {
+    "captured_episodic": 10,
+    "complete_tasks": 10,
+    "missing": [],
+    "scope_fill": {
+      "context_generation": {
+        "denominator": 10,
+        "filled": 10
+      },
+      "issue": {
+        "denominator": 10,
+        "filled": 8
+      },
+      "provider_session": {
+        "denominator": 10,
+        "filled": 10
+      },
+      "task_id": {
+        "denominator": 10,
+        "filled": 10
+      },
+      "worktree": {
+        "denominator": 10,
+        "filled": 10
+      }
+    },
+    "terminal_tasks": 10
+  },
+  "live_db_open_mode": "ro",
+  "memory_rows_snapshot": 1918,
+  "project_terminal_counts": {
+    "agent_crew": 8,
+    "alfred": 0,
+    "quota-ops": 2
+  },
+  "provenance": "claim_build_commit",
+  "retrieval": {
+    "sample_count": 10,
+    "samples": [
+      {
+        "issue": "427",
+        "project": "agent_crew",
+        "task_id": "review-impl-427-cea-broker-oop-r0",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 2,
+            "hits_by_layer": {
+              "decision": 4,
+              "episodic": 4
+            },
+            "latency_ms": 170.35,
+            "result_ids": [
+              "task:impl-427-cea-broker-oop:decision",
+              "task:impl-427-cea-broker-oop:episodic",
+              "episode:review-fix-408-already-completed-fail-closed-r1b-r0:decision",
+              "episode:review-fix-408-already-completed-fail-closed-r1b-r0:episodic",
+              "episode:review-fix-review-sev0-tokenomics-canary-one-r2-atomic-suppression-r0-r1-r1:decision",
+              "episode:review-fix-review-sev0-tokenomics-canary-one-r2-atomic-suppression-r0-r1-r1:episodic",
+              "episode:review-impl-408-already-completed-consumed-r0:decision",
+              "episode:review-impl-408-already-completed-consumed-r0:episodic"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 8,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 4,
+              "failure_pattern": 1
+            },
+            "latency_ms": 12.309,
+            "result_ids": [
+              "task:review-impl-427-cea-broker-oop-r0:failure_pattern",
+              "task:review-impl-427-cea-broker-oop-r0:decision",
+              "task:review-impl-427-cea-broker-oop-r0:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "430",
+        "project": "agent_crew",
+        "task_id": "impl-430-test-shadow-isolation-b",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 6,
+            "hits_by_layer": {
+              "decision": 2,
+              "episodic": 2
+            },
+            "latency_ms": 310.309,
+            "result_ids": [
+              "episode:review-e202e60c:decision",
+              "episode:review-e202e60c:episodic",
+              "episode:review-p01-canary-378-impl-r0:decision",
+              "episode:review-p01-canary-378-impl-r0:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 4,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 5
+            },
+            "latency_ms": 13.19,
+            "result_ids": [
+              "task:impl-430-test-shadow-isolation-b:decision",
+              "task:impl-430-test-shadow-isolation-b:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "431",
+        "project": "agent_crew",
+        "task_id": "impl-431-row15-measure",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 6,
+            "hits_by_layer": {
+              "decision": 2,
+              "episodic": 2
+            },
+            "latency_ms": 198.802,
+            "result_ids": [
+              "episode:review-371-narrow:decision",
+              "episode:review-371-narrow:episodic",
+              "episode:review-impl-418-memory-project-boundary-r0:decision",
+              "episode:review-impl-418-memory-project-boundary-r0:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 4,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 4,
+              "failure_pattern": 1
+            },
+            "latency_ms": 9.285,
+            "result_ids": [
+              "task:impl-431-row15-measure:failure_pattern",
+              "task:impl-431-row15-measure:decision",
+              "task:impl-431-row15-measure:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "430",
+        "project": "agent_crew",
+        "task_id": "impl-430-test-shadow-isolation",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 6,
+            "hits_by_layer": {
+              "decision": 2,
+              "episodic": 2
+            },
+            "latency_ms": 159.105,
+            "result_ids": [
+              "episode:review-e202e60c:decision",
+              "episode:review-e202e60c:episodic",
+              "episode:review-p01-canary-378-impl-r0:decision",
+              "episode:review-p01-canary-378-impl-r0:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 4,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 4,
+              "failure_pattern": 1
+            },
+            "latency_ms": 9.627,
+            "result_ids": [
+              "task:impl-430-test-shadow-isolation:failure_pattern",
+              "task:impl-430-test-shadow-isolation:decision",
+              "task:impl-430-test-shadow-isolation:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "427",
+        "project": "agent_crew",
+        "task_id": "impl-427-cea-broker-oop",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 4,
+            "hits_by_layer": {
+              "decision": 3,
+              "episodic": 3
+            },
+            "latency_ms": 343.384,
+            "result_ids": [
+              "episode:review-impl-398-replay-corrected-rules-r0:decision",
+              "episode:review-impl-398-replay-corrected-rules-r0:episodic",
+              "episode:review-impl-runtime-swap-script-r0:decision",
+              "episode:review-impl-runtime-swap-script-r0:episodic",
+              "episode:review-359-packflag:decision",
+              "episode:review-359-packflag:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 6,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 5
+            },
+            "latency_ms": 6.504,
+            "result_ids": [
+              "task:impl-427-cea-broker-oop:decision",
+              "task:impl-427-cea-broker-oop:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "428",
+        "project": "agent_crew",
+        "task_id": "review-impl-428-chaos-qouta-containment-r0",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 5,
+            "hits_by_layer": {
+              "decision": 3,
+              "episodic": 2
+            },
+            "latency_ms": 97.266,
+            "result_ids": [
+              "task:impl-428-chaos-qouta-containment:decision",
+              "task:impl-428-chaos-qouta-containment:episodic",
+              "task:review-impl-428-chaos-qouta-containment-r0:decision",
+              "task:review-impl-428-chaos-qouta-containment-r0:episodic",
+              "episode:impl-e3366965:decision"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 5,
+            "same_task_best_rank": 3,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 5
+            },
+            "latency_ms": 10.748,
+            "result_ids": [
+              "task:review-impl-428-chaos-qouta-containment-r0:decision",
+              "task:review-impl-428-chaos-qouta-containment-r0:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "425",
+        "project": "agent_crew",
+        "task_id": "review-fix-review-impl-425-result-intake-guard-r0-r1",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 5
+            },
+            "latency_ms": 222.726,
+            "result_ids": [
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "episode:impl-watch-b2f5a4a8:decision",
+              "episode:impl-watch-b2f5a4a8:episodic",
+              "episode:review-fix-review-p01-336-cancel-terminates-worker-r2-r0-r1-r1:decision",
+              "episode:review-fix-review-p01-336-cancel-terminates-worker-r2-r0-r1-r1:episodic",
+              "episode:implement-103968a6:decision",
+              "episode:implement-103968a6:episodic",
+              "episode:p01-review-pr376:decision",
+              "episode:p01-review-pr376:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 10,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 4,
+              "failure_pattern": 1
+            },
+            "latency_ms": 8.382,
+            "result_ids": [
+              "task:review-fix-review-impl-425-result-intake-guard-r0-r1:failure_pattern",
+              "task:review-fix-review-impl-425-result-intake-guard-r0-r1:decision",
+              "task:review-fix-review-impl-425-result-intake-guard-r0-r1:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "428",
+        "project": "agent_crew",
+        "task_id": "impl-428-chaos-qouta-containment",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 5
+            },
+            "latency_ms": 211.35,
+            "result_ids": [
+              "episode:implement-eca8602d:decision",
+              "episode:implement-eca8602d:episodic",
+              "episode:review-368-protocol-filenames-r2:decision",
+              "episode:review-368-protocol-filenames-r2:episodic",
+              "episode:p01-review-pr376:decision",
+              "episode:p01-review-pr376:episodic",
+              "episode:review-3501d562:decision",
+              "episode:review-3501d562:episodic",
+              "episode:review-362-dispatch-guards-fix2:decision",
+              "episode:review-362-dispatch-guards-fix2:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 10,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 5
+            },
+            "latency_ms": 10.747,
+            "result_ids": [
+              "task:impl-428-chaos-qouta-containment:decision",
+              "task:impl-428-chaos-qouta-containment:episodic",
+              "task:review-impl-425-result-intake-guard-r0:decision",
+              "task:review-impl-425-result-intake-guard-r0:episodic",
+              "task:impl-425-result-intake-guard:decision",
+              "task:impl-425-result-intake-guard:episodic",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:test-review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:decision",
+              "task:review-fix-review-impl-423-shadow-scope-r0-r1-r1:episodic"
+            ],
+            "same_issue_best_rank": 1,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "",
+        "project": "quota-ops",
+        "task_id": "retry-deploy-qo63-f01e28e-a1",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 4,
+            "hits_by_layer": {
+              "decision": 3,
+              "episodic": 3
+            },
+            "latency_ms": 810.923,
+            "result_ids": [
+              "task:review-fix-review-fix-adr-row-1-3-r0-r1-r1:decision",
+              "task:review-fix-review-fix-adr-row-1-3-r0-r1-r1:episodic",
+              "episode:claude-a523ba92:decision",
+              "episode:claude-a523ba92:episodic",
+              "episode:claude-662f70e7:decision",
+              "episode:claude-662f70e7:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 6,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 4,
+              "failure_pattern": 1
+            },
+            "latency_ms": 6.416,
+            "result_ids": [
+              "task:retry-deploy-qo63-f01e28e-a1:failure_pattern",
+              "task:retry-deploy-qo63-f01e28e-a1:decision",
+              "task:retry-deploy-qo63-f01e28e-a1:episodic",
+              "task:test-review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:decision",
+              "task:test-review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:episodic",
+              "task:review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:decision",
+              "task:review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:episodic",
+              "task:fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b:decision",
+              "task:fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b:episodic",
+              "task:review-fix-review-fix-adr-row-1-3-r0-r1-r1:decision"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      },
+      {
+        "issue": "",
+        "project": "quota-ops",
+        "task_id": "deploy-qo63-f01e28e",
+        "variants": {
+          "k4_lexical": {
+            "cross_project": 0,
+            "dropped_cross_project": 4,
+            "hits_by_layer": {
+              "decision": 3,
+              "episodic": 3
+            },
+            "latency_ms": 1194.658,
+            "result_ids": [
+              "task:review-fix-review-fix-adr-row-1-3-r0-r1-r1:decision",
+              "task:review-fix-review-fix-adr-row-1-3-r0-r1-r1:episodic",
+              "episode:claude-a523ba92:decision",
+              "episode:claude-a523ba92:episodic",
+              "episode:claude-662f70e7:decision",
+              "episode:claude-662f70e7:episodic"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 6,
+            "same_task_best_rank": null,
+            "state": "results"
+          },
+          "runtime": {
+            "cross_project": 0,
+            "dropped_cross_project": 0,
+            "hits_by_layer": {
+              "decision": 5,
+              "episodic": 4,
+              "failure_pattern": 1
+            },
+            "latency_ms": 5.017,
+            "result_ids": [
+              "task:deploy-qo63-f01e28e:failure_pattern",
+              "task:deploy-qo63-f01e28e:decision",
+              "task:deploy-qo63-f01e28e:episodic",
+              "task:test-review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:decision",
+              "task:test-review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:episodic",
+              "task:review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:decision",
+              "task:review-fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b-r2:episodic",
+              "task:fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b:decision",
+              "task:fix-review-fix-review-fix-adr-row-1-3-r0-r1-r1-r2b:episodic",
+              "task:review-fix-review-fix-adr-row-1-3-r0-r1-r1:decision"
+            ],
+            "same_issue_best_rank": null,
+            "same_project": 10,
+            "same_task_best_rank": 1,
+            "state": "results"
+          }
+        }
+      }
+    ]
+  },
+  "rollback": {
+    "free_port_used_for_app_config_only": true,
+    "pass": true,
+    "stages": [
+      {
+        "capture_rows": 2,
+        "elapsed_ms": 1291.965,
+        "enabled": true,
+        "http_status": 200,
+        "task_status": "completed"
+      },
+      {
+        "capture_rows": 0,
+        "elapsed_ms": 689.427,
+        "enabled": false,
+        "http_status": 200,
+        "task_status": "completed"
+      },
+      {
+        "capture_rows": 2,
+        "elapsed_ms": 672.319,
+        "enabled": true,
+        "http_status": 200,
+        "task_status": "completed"
+      }
+    ],
+    "temp_home": true
+  }
+}

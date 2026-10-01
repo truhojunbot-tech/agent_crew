@@ -1,6 +1,6 @@
 import uuid
 
-from agent_crew.loop import _post_task_http
+from agent_crew.loop import _adapter_project, _post_task_http
 from agent_crew.protocol import TaskRequest
 
 DEFAULT_PERSPECTIVES: list[str] = ["analyst", "critic", "advocate", "risk"]
@@ -10,6 +10,7 @@ def enqueue_panel_tasks(
     queue, agents: list[str], topic: str, context: dict, port: int = 0,
     perspectives: dict[str, str] | None = None,
     branch: str = "",
+    project: str = "",
 ) -> list[str]:
     """Enqueue one discuss task per agent.
 
@@ -21,8 +22,12 @@ def enqueue_panel_tasks(
     Callers should pass a pre-computed `perspectives` dict from
     `assign_perspectives(agents)` so both sides of the equation agree.
     Pass `branch` so the server worktree syncs the right branch before dispatching.
+    Pass `project` to name the project these tasks are admitted under; it
+    otherwise comes from the queue's own identity (§7.1 step 2, s4j). Before
+    s4j this adapter named none, and admission raised out of it.
     """
     perspective_map = perspectives or assign_perspectives(agents)
+    panel_project = _adapter_project(queue, project)
     task_ids = []
     for agent in agents:
         ctx = {**context, "agent": agent, "perspective": perspective_map.get(agent, "")}
@@ -32,8 +37,9 @@ def enqueue_panel_tasks(
             description=f"Discuss: {topic}",
             branch=branch,
             context=ctx,
+            project=panel_project,
         )
-        task_id = _post_task_http(port, req) if port else queue.enqueue(req)
+        task_id = _post_task_http(port, req) if port else queue.enqueue(req, ingress="cli.discuss")
         task_ids.append(task_id)
     return task_ids
 

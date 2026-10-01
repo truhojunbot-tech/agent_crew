@@ -10,6 +10,8 @@ The server's contract:
 from fastapi.testclient import TestClient
 
 from agent_crew.server import create_app
+from agent_crew.queue import TaskQueue
+from agent_crew.protocol import TaskRequest
 
 
 def _task_payload(task_id="t1", task_type="implement", description="do work", priority=3, project=""):
@@ -41,6 +43,31 @@ class RecordingPush:
 
     def __call__(self, pane_id, text):
         self.calls.append((pane_id, text))
+
+
+def test_busy_queue_head_does_not_block_free_override_pane(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(**_task_payload("busy_claude")))
+    assert queue.dequeue(role="implementer").task_id == "busy_claude"
+    push = RecordingPush()
+    app = create_app(
+        db_path=tmp_db,
+        pane_map={
+            "implementer": "%100", "reviewer": "%101", "tester": "%102",
+            "claude": "%100", "codex": "%101", "gemini": "%102",
+        },
+        worktree_map={}, port=8100, push_fn=push,
+        watchdog_disabled=True, anomaly_disabled=True,
+    )
+    with TestClient(app) as client:
+        assert client.post("/tasks", json=_task_payload("older_default")).status_code == 201
+        override = _task_payload("younger_override")
+        override["context"] = {"agent_override": "codex"}
+        assert client.post("/tasks", json=override).status_code == 201
+        assert client.get("/tasks/younger_override").json()["status"] == "in_progress"
+    assert len(push.calls) == 1
+    assert push.calls[0][0] == "%101"
 
 
 # U-SP01: POST /tasks on idle role → push fires to the role's pane

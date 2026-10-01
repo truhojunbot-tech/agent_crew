@@ -146,7 +146,7 @@ def test_project_is_inherited(q):
 
 
 def test_an_approved_review_enqueues_no_fix(q):
-    review_id = _review(q, verdict="approve", findings=[], summary="lgtm")
+    review_id = _review(q, verdict="approve", findings=[], summary="Reviewed the changes and approved the implementation.")
 
     assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
 
@@ -172,11 +172,11 @@ def test_request_changes_with_nothing_actionable_enqueues_nothing(q):
     assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
 
 
-def test_coordinator_managed_review_is_skipped(q):
-    """`crew run` drives its own loop; a second enqueue here races it."""
+def test_coordinator_managed_review_still_enqueues_fix(q):
+    """alfred#51 §7.2 / CX-4b: provenance cannot suppress an actionable fix."""
     review_id = _review(q, context={"coordinator_managed": True})
 
-    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is None
+    assert auto_enqueue_fix(q, review_id, pr_state_fn=_open) is not None
 
 
 def test_cross_project_review_is_skipped(q):
@@ -354,7 +354,7 @@ class _RecordingPush:
 
 def _post_review_result(client, review_id, **kw):
     payload = {"task_id": review_id, "status": "completed",
-               "summary": "request_changes: the cap drops the AC",
+               "summary": "Request changes because the cap drops the acceptance criteria.",
                "verdict": "request_changes", "findings": [FINDING],
                "pr_number": None}
     payload.update(kw)
@@ -389,7 +389,8 @@ def test_http_request_changes_result_enqueues_and_pushes_a_fix(tmp_db):
                for pane, text in push.calls)
 
 
-def test_http_coordinator_managed_review_enqueues_no_fix(tmp_db):
+def test_http_coordinator_managed_review_enqueues_fix(tmp_db):
+    """alfred#51 §7.2 / CX-4b applies to the HTTP result cascade too."""
     from fastapi.testclient import TestClient
 
     push = _RecordingPush()
@@ -397,8 +398,8 @@ def test_http_coordinator_managed_review_enqueues_no_fix(tmp_db):
         _enqueue_review(client, "review-http-2", {"coordinator_managed": True})
         assert _post_review_result(client, "review-http-2").status_code == 200
 
-    assert not [t for t in TaskQueue(tmp_db).list_tasks()
-                if t.task_type == "implement"]
+    assert len([t for t in TaskQueue(tmp_db).list_tasks()
+                if t.task_type == "implement"]) == 1
 
 
 def test_http_approved_review_still_goes_to_test_not_fix(tmp_db):
@@ -409,7 +410,7 @@ def test_http_approved_review_still_goes_to_test_not_fix(tmp_db):
     with TestClient(_server(tmp_db, push)) as client:
         _enqueue_review(client, "review-http-3")
         assert _post_review_result(client, "review-http-3", verdict="approve",
-                                   findings=[], summary="lgtm").status_code == 200
+                                   findings=[], summary="Reviewed the changes and approved the implementation.").status_code == 200
 
     types = [t.task_type for t in TaskQueue(tmp_db).list_tasks()]
     assert "test" in types
@@ -433,11 +434,9 @@ def test_http_result_submission_survives_a_broken_cascade(tmp_db, monkeypatch):
 
 # ── 7. idempotency: a replayed result must not fork the work ──────────
 #
-# `submit_result` has no "already done" guard, so a retried or duplicated
-# result POST re-runs the whole cascade. With a random fix task id every
-# replay minted a NEW task: two implementers, same branch, same findings,
-# concurrently — and both recorded as round 1, so the round cap could not
-# even see them as separate rounds (review of PR #245).
+# A retried or duplicated result must not fork a second fix task. The intake
+# guard acknowledges an identical review POST without running the cascade.
+# The cascade itself remains idempotent for recovery and replay paths.
 
 
 def test_a_replayed_review_result_does_not_fork_a_second_fix(q):
@@ -584,8 +583,7 @@ def test_concurrent_submissions_produce_exactly_one_fix(q, tmp_db):
 def test_http_duplicate_result_post_enqueues_one_fix(tmp_db):
     """★★End to end: the same POST twice, as the reporter described it.
 
-    `submit_result` has no already-done guard, so the second POST really does
-    re-run the cascade — the idempotency has to live below it.
+    The second identical POST is acknowledged without re-running the cascade.
     """
     from fastapi.testclient import TestClient
 
