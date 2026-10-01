@@ -90,6 +90,9 @@ def test_latest_fix_requires_its_own_post_result_decision(
     assert reason == expected_reason
     assert cap == (1 if produced_after_result else 3)
     assert (citation or {}).get("cited_task_id") == (latest if decision_for_latest else ROOT)
+    if not produced_after_result:
+        assert _run(q, review) is not None
+        assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
 
 
 def test_kill_switch_off_preserves_fix_and_shadow_receipt(q, tmp_path, monkeypatch):
