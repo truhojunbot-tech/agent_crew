@@ -6,10 +6,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent_crew.pipeline import _canary_round_cap, auto_enqueue_fix, auto_enqueue_test
-from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.pipeline import (_canary_round_cap, auto_enqueue_fix,
+                                 auto_enqueue_test, resume_tier3_gate)
+from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from agent_crew.server import create_app
 from agent_crew.tokenomics_canary import CANARY_ENV, ROUNDS_CAP_ENV
+from fastapi.testclient import TestClient
 
 ROOT = "impl-canary-rounds"
 
@@ -167,6 +170,40 @@ def test_project_pin_uses_server_project_for_legacy_approved_review(q, tmp_path,
     assert test_id is not None
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
     assert next(task for task in q.list_tasks() if task.task_id == test_id).project == "agent_crew"
+
+
+def test_tier3_resume_uses_server_project_for_legacy_approved_review(q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(q, fix_round=0, verdict="approve")
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (review,))
+    gate_id = f"risk-tier3-test-{review}"
+    q.create_gate(GateRequest(gate_id, "approval", "approve test"))
+    monkeypatch.setattr("agent_crew.pipeline.pr_is_actionable",
+                        lambda *args, **kwargs: (True, "open"))
+    with TestClient(create_app(q._db_path, project="agent_crew",
+                               watchdog_disabled=True, anomaly_disabled=True)) as client:
+        response = client.post(f"/gates/{gate_id}/resolve", json={"status": "approved"})
+    assert response.status_code == 200
+    test_id = f"test-{review}"
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
+    assert next(task for task in q.list_tasks() if task.task_id == test_id).project == "agent_crew"
+
+
+def test_tier3_resume_passes_server_project_to_review_successor(q):
+    q.submit_result(ROOT, TaskResult(task_id=ROOT, status="completed", summary="done"))
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (ROOT,))
+    gate_id = f"risk-tier3-{ROOT}"
+    q.create_gate(GateRequest(gate_id, "approval", "approve review"))
+    q.resolve_gate(gate_id, approved=True)
+
+    review_id = resume_tier3_gate(q, gate_id, server_project="agent_crew",
+                                  pr_state_fn=lambda _: "open")
+    assert review_id is not None
+    assert next(task for task in q.list_tasks() if task.task_id == review_id).project == "agent_crew"
 
 
 @pytest.mark.parametrize("produced,age,mtime_age,expected_reason", [

@@ -2038,7 +2038,8 @@ def auto_enqueue_test(
         return None
 
 
-def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Optional[str]:
+def resume_tier3_gate(queue: TaskQueue, gate_id: str, *,
+                      server_project: Optional[str] = None, pr_state_fn=None) -> Optional[str]:
     """Resume the exact Tier 3 successor held by an approved approval gate."""
     gate = next((item for item in queue.list_gates() if item.id == gate_id), None)
     if gate is None or gate.status != "approved":
@@ -2049,11 +2050,13 @@ def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Op
     if gate_id.startswith("risk-tier3-test-"):
         review_task_id = gate_id[len("risk-tier3-test-"):]
         queue.patch_context(review_task_id, {"tier3_gate_approved": True})
-        return auto_enqueue_test(queue, review_task_id, pr_state_fn=pr_state_fn)
+        return auto_enqueue_test(queue, review_task_id, server_project=server_project,
+                                 pr_state_fn=pr_state_fn)
     if gate_id.startswith("risk-tier3-"):
         impl_task_id = gate_id[len("risk-tier3-"):]
         queue.patch_context(impl_task_id, {"tier3_gate_approved": True})
-        return auto_enqueue_review(queue, impl_task_id, pr_state_fn=pr_state_fn)
+        return auto_enqueue_review(queue, impl_task_id, server_project=server_project,
+                                   pr_state_fn=pr_state_fn)
     return None
 
 

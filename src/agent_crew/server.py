@@ -7186,7 +7186,7 @@ def create_app(
             # the exact held transition first; the helper is idempotent via
             # deterministic child IDs and recognizes review vs test gates.
             try:
-                _resume_tier3_gate(q(), gate_id)
+                _resume_tier3_gate(q(), gate_id, server_project=project)
             except Exception:
                 logger.exception(
                     "resolve_gate: failed to resume Tier 3 gate %r after approval", gate_id
