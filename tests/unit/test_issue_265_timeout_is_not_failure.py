@@ -43,7 +43,8 @@ def _in_progress(q, task_id="t-1", task_type="implement"):
 
 
 def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port,
-                      context=None, captured_timeout=None, return_db=False):
+                      context=None, captured_timeout=None, return_db=False,
+                      codex_rollout_size=None):
     """Drive the REAL dispatch path and return the task row it ends with.
 
     ⛔Goes through `_dispatch_task`, not through the terminal-marking helper.
@@ -59,12 +60,31 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port,
     from agent_crew import server as sv
     from agent_crew.server import create_app
 
-    wt = tmp_path / "claude"
+    agent = "codex" if codex_rollout_size is not None else "claude"
+    wt = tmp_path / agent
     wt.mkdir(exist_ok=True)
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"role_agents": {"implementer": "claude", "reviewer": "codex", "tester": "gemini"}, "worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({
+        "role_agents": {"implementer": agent,
+                        "reviewer": "claude" if agent == "codex" else "codex",
+                        "tester": "gemini"},
+        "worktrees": {agent: str(wt)},
+    }))
     db = str(tmp_path / "t.db")
+    codex_session_id = "session-364"
+    if codex_rollout_size is not None:
+        home = tmp_path / "codex-home"
+        rollout_dir = home / "sessions" / "2026" / "09" / "04"
+        rollout_dir.mkdir(parents=True)
+        rollout = rollout_dir / f"rollout-2026-09-04T10-00-00-{codex_session_id}.jsonl"
+        rollout.write_text(json.dumps({
+            "type": "session_meta",
+            "payload": {"id": codex_session_id, "cwd": str(wt), "originator": "codex-exec"},
+        }) + "\n")
+        with rollout.open("ab") as fh:
+            fh.write(b"x" * codex_rollout_size)
+        monkeypatch.setattr(sv, "_codex_home", lambda home=None: tmp_path / "codex-home")
 
     async def _fake_exec(*cmd, **kwargs):
         if behaviour == "exception":
@@ -112,8 +132,12 @@ def _dispatch_outcome(tmp_path, monkeypatch, *, behaviour, unused_tcp_port,
                      project="p", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         q = TaskQueue(db)
+        if codex_rollout_size is not None:
+            identity = q.get_or_create_context("p", "codex", str(wt), task_id="seed")
+            q.update_context_provider_session_id(identity["context_key"], codex_session_id)
         q.enqueue(TaskRequest(task_id="t-1", task_type="implement",
-                              description="do it", branch="main", context=context or {}))
+                              description="do it", branch="main", context=context or {},
+                              project="p" if codex_rollout_size is not None else ""))
         task = q.dequeue(role="implementer")
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))
@@ -170,6 +194,24 @@ def test_a_clean_exit_without_a_result_is_also_timed_out(tmp_path, monkeypatch, 
 
     assert task.status == "timed_out"
     assert task.error_info["reason"] == "no_result_submitted"
+
+
+@pytest.mark.parametrize("behaviour,reason", [
+    ("clean", "no_result_submitted"),
+    ("hang", "dispatcher_timeout"),
+])
+def test_codex_no_result_records_resumed_rollout_size_and_session(
+    tmp_path, monkeypatch, *, unused_tcp_port, behaviour, reason,
+):
+    task = _dispatch_outcome(
+        tmp_path, monkeypatch, behaviour=behaviour,
+        codex_rollout_size=2 * 1024 * 1024, unused_tcp_port=unused_tcp_port,
+    )
+    rollout = next((tmp_path / "codex-home" / "sessions").rglob("*.jsonl"))
+    assert task.status == "timed_out"
+    assert task.error_info["reason"] == reason
+    assert task.error_info["provider_session_id"] == "session-364"
+    assert task.error_info["codex_rollout_bytes"] == rollout.stat().st_size
 
 
 def test_a_real_failure_is_still_failed(tmp_path, monkeypatch, *, unused_tcp_port):
