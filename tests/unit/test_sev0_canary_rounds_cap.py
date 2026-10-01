@@ -1,14 +1,18 @@
 """D-11832: only a fresh quota-core decision may narrow one pinned lineage."""
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_test
-from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.pipeline import (_canary_round_cap, auto_enqueue_fix,
+                                 auto_enqueue_test, resume_tier3_gate)
+from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from agent_crew.server import create_app
 from agent_crew.tokenomics_canary import CANARY_ENV, ROUNDS_CAP_ENV
+from fastapi.testclient import TestClient
 
 ROOT = "impl-canary-rounds"
 
@@ -21,14 +25,19 @@ def q(tmp_db):
     return queue
 
 
-def _contract(tmp_path, monkeypatch, recommended=1, *, age=0):
+def _contract(tmp_path, monkeypatch, recommended=1, *, age=0, produced=True, mtime_age=0):
     path = tmp_path / "policy.json"
-    path.write_text(json.dumps({
+    contract = {
         "contract_version": "1.0", "mode": "shadow",
-        "produced_at": (datetime.now(timezone.utc) - timedelta(days=age)).isoformat(),
         "decisions": [{"task_id": ROOT,
                        "recommended_max_review_fix_rounds": recommended}],
-    }))
+    }
+    if produced:
+        contract["produced_at"] = (datetime.now(timezone.utc) - timedelta(days=age)).isoformat()
+    path.write_text(json.dumps(contract))
+    if mtime_age:
+        timestamp = (datetime.now(timezone.utc) - timedelta(days=mtime_age)).timestamp()
+        os.utime(path, (timestamp, timestamp))
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(path))
 
 
@@ -93,6 +102,124 @@ def test_narrow_cap_holds_fix_with_cea_receipt(q, tmp_path, monkeypatch):
         assert conn.execute(
             "SELECT count(*) FROM authorization_receipts WHERE receipt_id=?",
             (row["canary_cea_receipt_id"],)).fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("project,expected_reason", [
+    ("agent_crew", "cap_not_reached"),
+    ("other_project", "not_pinned"),
+])
+def test_project_pin_matches_only_its_lineage(tmp_path, monkeypatch, project, expected_reason):
+    (tmp_path / project).mkdir()
+    queue = TaskQueue(str(tmp_path / project / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
+                              description="root", branch="canary-branch"))
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1)
+    review = _review(queue, fix_round=0)
+    tasks_by_id = {task.task_id: task for task in queue.list_tasks()}
+    _, _, reason = _canary_round_cap(tasks_by_id, tasks_by_id[review], 3, queue)
+    assert reason == expected_reason
+    assert _run(queue, review) is not None
+    if project == "agent_crew":
+        assert queue.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
+
+
+def test_project_pin_applies_narrow_fresh_cap(tmp_path, monkeypatch):
+    (tmp_path / "agent_crew").mkdir()
+    queue = TaskQueue(str(tmp_path / "agent_crew" / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
+                              description="root", branch="canary-branch"))
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(queue)
+    assert _run(queue, review) is None
+    assert queue.get_tokenomics_shadow_receipt(ROOT)["canary_applied"] == 1
+
+
+def test_project_pin_uses_server_project_for_legacy_review(q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(q, fix_round=0)
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (review,))
+    task = next(task for task in q.list_tasks() if task.task_id == review)
+    from agent_crew.pipeline import _successor_project
+    assert _successor_project(q, task) != "agent_crew"
+    assert _successor_project(q, task, "agent_crew") == "agent_crew"
+
+    assert auto_enqueue_fix(q, review, server_project="agent_crew",
+                            pr_state_fn=lambda _: "open",
+                            already_announced_fn=lambda *a, **kw: False,
+                            repo="owner/repo") is not None
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
+
+
+def test_project_pin_uses_server_project_for_legacy_approved_review(q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(q, fix_round=0, verdict="approve")
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (review,))
+
+    test_id = auto_enqueue_test(q, review, server_project="agent_crew",
+                                pr_state_fn=lambda _: "open")
+    assert test_id is not None
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
+    assert next(task for task in q.list_tasks() if task.task_id == test_id).project == "agent_crew"
+
+
+def test_tier3_resume_uses_server_project_for_legacy_approved_review(q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(q, fix_round=0, verdict="approve")
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (review,))
+    gate_id = f"risk-tier3-test-{review}"
+    q.create_gate(GateRequest(gate_id, "approval", "approve test"))
+    monkeypatch.setattr("agent_crew.pipeline.pr_is_actionable",
+                        lambda *args, **kwargs: (True, "open"))
+    with TestClient(create_app(q._db_path, project="agent_crew",
+                               watchdog_disabled=True, anomaly_disabled=True)) as client:
+        response = client.post(f"/gates/{gate_id}/resolve", json={"status": "approved"})
+    assert response.status_code == 200
+    test_id = f"test-{review}"
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
+    assert next(task for task in q.list_tasks() if task.task_id == test_id).project == "agent_crew"
+
+
+def test_tier3_resume_passes_server_project_to_review_successor(q):
+    q.submit_result(ROOT, TaskResult(task_id=ROOT, status="completed", summary="done"))
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (ROOT,))
+    gate_id = f"risk-tier3-{ROOT}"
+    q.create_gate(GateRequest(gate_id, "approval", "approve review"))
+    q.resolve_gate(gate_id, approved=True)
+
+    review_id = resume_tier3_gate(q, gate_id, server_project="agent_crew",
+                                  pr_state_fn=lambda _: "open")
+    assert review_id is not None
+    assert next(task for task in q.list_tasks() if task.task_id == review_id).project == "agent_crew"
+
+
+@pytest.mark.parametrize("produced,age,mtime_age,expected_reason", [
+    (False, 0, 0, "cap_not_reached"),
+    (False, 0, 2, "contract_missing_or_stale"),
+    (True, 2, 0, "contract_missing_or_stale"),
+])
+def test_contract_mtime_only_when_produced_at_absent(q, tmp_path, monkeypatch,
+                                                      produced, age, mtime_age, expected_reason):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, age=age,
+              produced=produced, mtime_age=mtime_age)
+    review = _review(q, fix_round=0)
+    assert _run(q, review) is not None
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
 
 
 @pytest.mark.parametrize("recommended,age,expected_reason", [

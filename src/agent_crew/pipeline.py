@@ -945,6 +945,14 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
         current = tasks_by_id[prev]
 
 
+def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
+                      server_project: Optional[str] = None) -> bool:
+    return _tokenomics_canary._is_pinned(
+        review_task, _tokenomics_canary.canary_pin(),
+        project=_successor_project(queue, review_task, server_project),
+        lineage_root=_lineage_root_task_id(tasks_by_id, review_task))
+
+
 def _contract_time(value) -> Optional[datetime]:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -976,6 +984,12 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task,
         seen.add(current.task_id)
         shadow = shadow_recommendation_for_task_id(current.task_id)
         produced = _contract_time(shadow.get("produced_at"))
+        if shadow.get("produced_at") is None and shadow.get("contract_mtime") is not None:
+            try:
+                produced = datetime.fromtimestamp(shadow["contract_mtime"], timezone.utc)
+                shadow = {**shadow, "produced_at": produced.isoformat()}
+            except (TypeError, ValueError, OverflowError, OSError):
+                produced = None
         if (shadow.get("decision_source") == "quota_core_contract" and produced
                 and decision_at and produced <= decision_at):
             candidates.append((produced, current.task_id, shadow))
@@ -1030,11 +1044,12 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task,
 
 
 def _canary_round_cap(tasks_by_id: dict, review_task,
-                      baseline_cap: int, queue: TaskQueue) -> tuple[int, Optional[dict], str]:
+                      baseline_cap: int, queue: TaskQueue,
+                      server_project: Optional[str] = None) -> tuple[int, Optional[dict], str]:
     """Return the narrowed cap only for the pinned lineage and a fresh contract."""
     if not _tokenomics_canary.rounds_cap_enabled():
         return baseline_cap, None, "switch_off"
-    if _lineage_root_task_id(tasks_by_id, review_task) != _tokenomics_canary.canary_pin():
+    if not _round_cap_pinned(tasks_by_id, review_task, queue, server_project):
         return baseline_cap, None, "not_pinned"
     try:
         citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
@@ -1258,9 +1273,9 @@ def auto_enqueue_fix(
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
         max_rounds, canary_citation, canary_reason = _canary_round_cap(
-            tasks_by_id, review_task, baseline_cap, queue)
+            tasks_by_id, review_task, baseline_cap, queue, server_project)
         canary_pinned = (_tokenomics_canary.rounds_cap_enabled()
-                         and lineage_root_id == _tokenomics_canary.canary_pin())
+                         and _round_cap_pinned(tasks_by_id, review_task, queue, server_project))
         if canary_pinned:
             try:
                 queue.record_shadow_rounds_vs_cap(
@@ -1880,6 +1895,7 @@ def auto_enqueue_test(
     review_task_id: str,
     *,
     pane_map: Optional[dict] = None,
+    server_project: Optional[str] = None,
     pr_state_fn=None,
     repo: str = "",
     repo_cwd: str = "",
@@ -1910,12 +1926,11 @@ def auto_enqueue_test(
         contract = _cascade.stored(review_task)
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         if (_tokenomics_canary.rounds_cap_enabled()
-                and _lineage_root_task_id(tasks_by_id, review_task)
-                == _tokenomics_canary.canary_pin()):
+                and _round_cap_pinned(tasks_by_id, review_task, queue, server_project)):
             try:
                 _, citation, reason = _canary_round_cap(
                     tasks_by_id, review_task,
-                    contract.fix_round_cap(review_fix_max_rounds()), queue)
+                    contract.fix_round_cap(review_fix_max_rounds()), queue, server_project)
                 queue.record_tokenomics_canary_receipt(
                     _lineage_root_task_id(tasks_by_id, review_task),
                     decision_source=(citation or {}).get(
@@ -2002,7 +2017,7 @@ def auto_enqueue_test(
             description=compact_desc,
             branch=review_task.branch,
             context=test_context,
-            project=_successor_project(queue, review_task),
+            project=_successor_project(queue, review_task, server_project),
         )
         try:
             queue.enqueue(test_req, ingress="cascade.test")
@@ -2023,7 +2038,8 @@ def auto_enqueue_test(
         return None
 
 
-def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Optional[str]:
+def resume_tier3_gate(queue: TaskQueue, gate_id: str, *,
+                      server_project: Optional[str] = None, pr_state_fn=None) -> Optional[str]:
     """Resume the exact Tier 3 successor held by an approved approval gate."""
     gate = next((item for item in queue.list_gates() if item.id == gate_id), None)
     if gate is None or gate.status != "approved":
@@ -2034,11 +2050,13 @@ def resume_tier3_gate(queue: TaskQueue, gate_id: str, *, pr_state_fn=None) -> Op
     if gate_id.startswith("risk-tier3-test-"):
         review_task_id = gate_id[len("risk-tier3-test-"):]
         queue.patch_context(review_task_id, {"tier3_gate_approved": True})
-        return auto_enqueue_test(queue, review_task_id, pr_state_fn=pr_state_fn)
+        return auto_enqueue_test(queue, review_task_id, server_project=server_project,
+                                 pr_state_fn=pr_state_fn)
     if gate_id.startswith("risk-tier3-"):
         impl_task_id = gate_id[len("risk-tier3-"):]
         queue.patch_context(impl_task_id, {"tier3_gate_approved": True})
-        return auto_enqueue_review(queue, impl_task_id, pr_state_fn=pr_state_fn)
+        return auto_enqueue_review(queue, impl_task_id, server_project=server_project,
+                                   pr_state_fn=pr_state_fn)
     return None
 
 
