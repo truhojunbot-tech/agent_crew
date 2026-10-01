@@ -2,6 +2,7 @@
 
 import json
 import os
+import site
 import subprocess
 import sys
 from pathlib import Path
@@ -45,7 +46,8 @@ def test_project_resume_checks_signed_t0_in_fresh_cli_process(
     for key in ("AGENT_CREW_CEA_SNAPSHOT_PATH", "AGENT_CREW_CEA_POLICY_SNAPSHOT",
                 "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"):
         env.pop(key, None)
-    env.update(HOME=str(home), TMUX_TMPDIR=str(tmux))
+    env.update(HOME=str(home), TMUX_TMPDIR=str(tmux),
+               PYTHONUSERBASE=site.getuserbase())
     if snapshot_configured:
         running_build = provenance.build()["commit"]
         assert running_build
@@ -58,6 +60,7 @@ def test_project_resume_checks_signed_t0_in_fresh_cli_process(
                "--generation", str(stopped_epoch + 1), "--source", source,
                "--decision-id", decision_id]
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30)
+    assert result.stdout, f"fresh CLI produced no stdout; stderr={result.stderr!r}"
     payload = json.loads(result.stdout)
     assert payload["resumed"] is allowed, result.stdout + result.stderr
     assert result.returncode == (0 if allowed else 1), result.stdout + result.stderr
