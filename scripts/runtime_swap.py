@@ -9,10 +9,12 @@ after a failed relaunch, see docs/runtime_swap.md. No SIGKILL.
 from __future__ import annotations
 
 import argparse
+import grp
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -109,6 +111,28 @@ def listener_pid(port: int) -> int:
     raise RuntimeError(f"no listener for 127.0.0.1:{port}")
 
 
+def enter_client_group(broker_socket: str, argv: list[str], cea_file: Path) -> None:
+    """Run preflight/go with the same socket group as spawn_from_env."""
+    if not broker_socket:
+        return
+    gid = os.stat(Path(broker_socket).parent).st_gid
+    if os.getegid() == gid:
+        return
+    group = grp.getgrgid(gid).gr_name
+    command = ["env", f"HOME={Path.home()}",
+               f"AGENT_CREW_SWAP_CEA_ENV_FILE={cea_file}",
+               sys.executable, str(Path(__file__).resolve()), *argv]
+    os.execvp("sg", ["sg", group, "-c", shlex.join(command)])
+    raise RuntimeError("client-group relaunch returned unexpectedly")
+
+
+def complete_environ(raw: bytes) -> bytes:
+    """Never proceed to relaunch with an empty or truncated environment dump."""
+    if not raw or not raw.endswith(b"\0"):
+        raise RuntimeError("captured environment missing or incomplete")
+    return raw
+
+
 def counts(db_path: Path) -> list[tuple[str, int]]:
     with sqlite3.connect(db_path) as db:
         return db.execute("SELECT status, count(*) FROM tasks GROUP BY status ORDER BY status").fetchall()
@@ -150,18 +174,32 @@ def main(argv=None) -> int:
     cea_file = Path(os.environ.get("AGENT_CREW_SWAP_CEA_ENV_FILE", str(directory / "cea.env")))
     if not cea_file.is_file():
         raise RuntimeError(f"CEA env file missing: {cea_file}")
-    parse_env_file(cea_file)
+    cea_env = parse_env_file(cea_file)
+    if args.step in ("preflight", "go"):
+        enter_client_group(cea_env.get("AGENT_CREW_CEA_BROKER_SOCKET", ""),
+                           list(sys.argv[1:] if argv is None else argv), cea_file)
     prepare_checkout(checkout, args.sha)
     health = api(port, "/health")
     paused(db_path, health)
     require_no_running_work(api(port, "/tasks"))
-    pid = listener_pid(port)
+    try:
+        pid = listener_pid(port)
+    except RuntimeError:
+        # /health on this exact port proves a listener even when ss hides its
+        # PID across the sg group boundary. Only post can use this proof: go
+        # still needs a verified PID to signal and preflight to read /proc.
+        if args.step != "post":
+            raise
+        if health.get("build", {}).get("commit") != args.sha:
+            raise RuntimeError(f"build SHA differs: {health.get('build', {}).get('commit')} != {args.sha}")
+        pid = None
     evidence.parent.mkdir(parents=True, exist_ok=True)
     evidence.parent.chmod(0o700)
     evidence.mkdir(exist_ok=True)
     evidence.chmod(0o700)
     if args.step == "preflight":
-        (evidence / "env.pre.nul").write_bytes((Path("/proc") / str(pid) / "environ").read_bytes())
+        (evidence / "env.pre.nul").write_bytes(
+            complete_environ((Path("/proc") / str(pid) / "environ").read_bytes()))
         (evidence / "env.pre.nul").chmod(0o600)
         subprocess.run([sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"), "--probe-broker",
                         str(evidence / "env.pre.nul"), str(cea_file), str(checkout / "src")], check=True)
@@ -181,6 +219,7 @@ def main(argv=None) -> int:
             raise RuntimeError("listener changed since preflight")
         if not (evidence / "env.pre.nul").is_file():
             raise RuntimeError("captured environment missing")
+        complete_environ((evidence / "env.pre.nul").read_bytes())
         # Recheck immediately before the process boundary; permissions may have changed.
         subprocess.run([sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"), "--probe-broker",
                         str(evidence / "env.pre.nul"), str(cea_file), str(checkout / "src")], check=True)
