@@ -154,6 +154,21 @@ def test_project_pin_uses_server_project_for_legacy_review(q, tmp_path, monkeypa
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
 
 
+def test_project_pin_uses_server_project_for_legacy_approved_review(q, tmp_path, monkeypatch):
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(q, fix_round=0, verdict="approve")
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute("UPDATE tasks SET project='' WHERE task_id=?", (review,))
+
+    test_id = auto_enqueue_test(q, review, server_project="agent_crew",
+                                pr_state_fn=lambda _: "open")
+    assert test_id is not None
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
+    assert next(task for task in q.list_tasks() if task.task_id == test_id).project == "agent_crew"
+
+
 @pytest.mark.parametrize("produced,age,mtime_age,expected_reason", [
     (False, 0, 0, "cap_not_reached"),
     (False, 0, 2, "contract_missing_or_stale"),

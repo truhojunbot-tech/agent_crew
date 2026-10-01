@@ -5828,6 +5828,7 @@ def create_app(
             q(),
             review_task_id,
             pane_map=pane_map,
+            server_project=project,
             repo=repo,
             repo_cwd=_any_worktree_path(),
         )

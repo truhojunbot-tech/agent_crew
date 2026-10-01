@@ -1895,6 +1895,7 @@ def auto_enqueue_test(
     review_task_id: str,
     *,
     pane_map: Optional[dict] = None,
+    server_project: Optional[str] = None,
     pr_state_fn=None,
     repo: str = "",
     repo_cwd: str = "",
@@ -1925,11 +1926,11 @@ def auto_enqueue_test(
         contract = _cascade.stored(review_task)
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         if (_tokenomics_canary.rounds_cap_enabled()
-                and _round_cap_pinned(tasks_by_id, review_task, queue)):
+                and _round_cap_pinned(tasks_by_id, review_task, queue, server_project)):
             try:
                 _, citation, reason = _canary_round_cap(
                     tasks_by_id, review_task,
-                    contract.fix_round_cap(review_fix_max_rounds()), queue)
+                    contract.fix_round_cap(review_fix_max_rounds()), queue, server_project)
                 queue.record_tokenomics_canary_receipt(
                     _lineage_root_task_id(tasks_by_id, review_task),
                     decision_source=(citation or {}).get(
@@ -2016,7 +2017,7 @@ def auto_enqueue_test(
             description=compact_desc,
             branch=review_task.branch,
             context=test_context,
-            project=_successor_project(queue, review_task),
+            project=_successor_project(queue, review_task, server_project),
         )
         try:
             queue.enqueue(test_req, ingress="cascade.test")
