@@ -35,6 +35,7 @@ def shadow_recommendation_for_task_id(task_id: str) -> dict[str, Any]:
     try:
         with open(path, "rb") as handle:
             raw_contract = handle.read()
+            contract_mtime = os.fstat(handle.fileno()).st_mtime
         contract_sha = hashlib.sha256(raw_contract).hexdigest()
         contract = json.loads(raw_contract)
         if not isinstance(contract, dict):
@@ -57,6 +58,7 @@ def shadow_recommendation_for_task_id(task_id: str) -> dict[str, Any]:
             return {"decision_source": "quota_core_contract",
                     "policy_version": contract["contract_version"],
                     "produced_at": contract.get("produced_at"),
+                    "contract_mtime": contract_mtime,
                     "recommendation": recommendation,
                     "reason": "shadow_only", "contract_sha": contract_sha}
         if "contract_version" in contract:

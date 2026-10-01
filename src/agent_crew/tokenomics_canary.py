@@ -40,7 +40,8 @@ ROUNDS_CAP_ENV = "AGENT_CREW_TOKENOMICS_CANARY_ROUNDS_CAP"
 def rounds_cap_enabled(env: Optional[dict] = None) -> bool:
     source = os.environ if env is None else env
     pin = canary_pin(source)
-    return source.get(ROUNDS_CAP_ENV) == "1" and bool(pin) and not pin.startswith("project:")
+    return (source.get(ROUNDS_CAP_ENV) == "1" and bool(pin)
+            and (not pin.startswith("project:") or pin_project(pin) is not None))
 
 #: The one recommendation kind the matched evidence supports.
 RECOMMENDATION_KIND = "suppress_identical_sha_rereview"
@@ -177,7 +178,8 @@ def _target_of(task) -> tuple[str, Optional[int], str]:
     return ("", None, "")
 
 
-def _is_pinned(task, pin: str, project: Optional[str] = None) -> bool:
+def _is_pinned(task, pin: str, project: Optional[str] = None,
+               *, lineage_root: Optional[str] = None) -> bool:
     """Does the pin name this review's lineage?
 
     A task-id pin names ``context.prev_task_id``; a project pin names the
@@ -187,7 +189,7 @@ def _is_pinned(task, pin: str, project: Optional[str] = None) -> bool:
         pinned_project = pin_project(pin)
         return pinned_project is not None and project == pinned_project
     ctx = task.context if isinstance(getattr(task, "context", None), dict) else {}
-    parent = (ctx.get("prev_task_id") or "").strip()
+    parent = lineage_root if lineage_root is not None else (ctx.get("prev_task_id") or "").strip()
     return pin == parent and bool(pin)
 
 

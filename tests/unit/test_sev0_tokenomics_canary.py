@@ -129,10 +129,10 @@ def test_task_id_pin_still_matches_parent_regardless_of_project(monkeypatch):
     assert decision.applied is True
 
 
-def test_project_pin_never_enables_round_cap_and_unset_rolls_back(monkeypatch):
+def test_project_pin_enables_round_cap_and_unset_rolls_back(monkeypatch):
     monkeypatch.setenv(canary.CANARY_ENV, "project:alfred")
     monkeypatch.setenv(canary.ROUNDS_CAP_ENV, "1")
-    assert canary.rounds_cap_enabled() is False
+    assert canary.rounds_cap_enabled() is True
     monkeypatch.delenv(canary.CANARY_ENV)
     assert canary.rounds_cap_enabled() is False
     decision = canary.evaluate_review_dispatch(

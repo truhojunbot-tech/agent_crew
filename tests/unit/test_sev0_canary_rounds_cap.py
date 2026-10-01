@@ -1,11 +1,12 @@
 """D-11832: only a fresh quota-core decision may narrow one pinned lineage."""
 import json
+import os
 import sqlite3
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_test
+from agent_crew.pipeline import _canary_round_cap, auto_enqueue_fix, auto_enqueue_test
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.tokenomics_canary import CANARY_ENV, ROUNDS_CAP_ENV
@@ -21,14 +22,19 @@ def q(tmp_db):
     return queue
 
 
-def _contract(tmp_path, monkeypatch, recommended=1, *, age=0):
+def _contract(tmp_path, monkeypatch, recommended=1, *, age=0, produced=True, mtime_age=0):
     path = tmp_path / "policy.json"
-    path.write_text(json.dumps({
+    contract = {
         "contract_version": "1.0", "mode": "shadow",
-        "produced_at": (datetime.now(timezone.utc) - timedelta(days=age)).isoformat(),
         "decisions": [{"task_id": ROOT,
                        "recommended_max_review_fix_rounds": recommended}],
-    }))
+    }
+    if produced:
+        contract["produced_at"] = (datetime.now(timezone.utc) - timedelta(days=age)).isoformat()
+    path.write_text(json.dumps(contract))
+    if mtime_age:
+        timestamp = (datetime.now(timezone.utc) - timedelta(days=mtime_age)).timestamp()
+        os.utime(path, (timestamp, timestamp))
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(path))
 
 
@@ -93,6 +99,56 @@ def test_narrow_cap_holds_fix_with_cea_receipt(q, tmp_path, monkeypatch):
         assert conn.execute(
             "SELECT count(*) FROM authorization_receipts WHERE receipt_id=?",
             (row["canary_cea_receipt_id"],)).fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("project,expected_reason", [
+    ("agent_crew", "cap_not_reached"),
+    ("other_project", "not_pinned"),
+])
+def test_project_pin_matches_only_its_lineage(tmp_path, monkeypatch, project, expected_reason):
+    (tmp_path / project).mkdir()
+    queue = TaskQueue(str(tmp_path / project / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
+                              description="root", branch="canary-branch"))
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1)
+    review = _review(queue, fix_round=0)
+    tasks_by_id = {task.task_id: task for task in queue.list_tasks()}
+    _, _, reason = _canary_round_cap(tasks_by_id, tasks_by_id[review], 3, queue)
+    assert reason == expected_reason
+    assert _run(queue, review) is not None
+    if project == "agent_crew":
+        assert queue.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
+
+
+def test_project_pin_applies_narrow_fresh_cap(tmp_path, monkeypatch):
+    (tmp_path / "agent_crew").mkdir()
+    queue = TaskQueue(str(tmp_path / "agent_crew" / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
+                              description="root", branch="canary-branch"))
+    monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, produced=False)
+    review = _review(queue)
+    assert _run(queue, review) is None
+    assert queue.get_tokenomics_shadow_receipt(ROOT)["canary_applied"] == 1
+
+
+@pytest.mark.parametrize("produced,age,mtime_age,expected_reason", [
+    (False, 0, 0, "cap_not_reached"),
+    (False, 0, 2, "contract_missing_or_stale"),
+    (True, 2, 0, "contract_missing_or_stale"),
+])
+def test_contract_mtime_only_when_produced_at_absent(q, tmp_path, monkeypatch,
+                                                      produced, age, mtime_age, expected_reason):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch, recommended=1, age=age,
+              produced=produced, mtime_age=mtime_age)
+    review = _review(q, fix_round=0)
+    assert _run(q, review) is not None
+    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
 
 
 @pytest.mark.parametrize("recommended,age,expected_reason", [

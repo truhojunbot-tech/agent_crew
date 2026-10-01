@@ -945,6 +945,13 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
         current = tasks_by_id[prev]
 
 
+def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue) -> bool:
+    return _tokenomics_canary._is_pinned(
+        review_task, _tokenomics_canary.canary_pin(),
+        project=_successor_project(queue, review_task),
+        lineage_root=_lineage_root_task_id(tasks_by_id, review_task))
+
+
 def _contract_time(value) -> Optional[datetime]:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
@@ -976,6 +983,12 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task,
         seen.add(current.task_id)
         shadow = shadow_recommendation_for_task_id(current.task_id)
         produced = _contract_time(shadow.get("produced_at"))
+        if shadow.get("produced_at") is None and shadow.get("contract_mtime") is not None:
+            try:
+                produced = datetime.fromtimestamp(shadow["contract_mtime"], timezone.utc)
+                shadow = {**shadow, "produced_at": produced.isoformat()}
+            except (TypeError, ValueError, OverflowError, OSError):
+                produced = None
         if (shadow.get("decision_source") == "quota_core_contract" and produced
                 and decision_at and produced <= decision_at):
             candidates.append((produced, current.task_id, shadow))
@@ -1034,7 +1047,7 @@ def _canary_round_cap(tasks_by_id: dict, review_task,
     """Return the narrowed cap only for the pinned lineage and a fresh contract."""
     if not _tokenomics_canary.rounds_cap_enabled():
         return baseline_cap, None, "switch_off"
-    if _lineage_root_task_id(tasks_by_id, review_task) != _tokenomics_canary.canary_pin():
+    if not _round_cap_pinned(tasks_by_id, review_task, queue):
         return baseline_cap, None, "not_pinned"
     try:
         citation = _shadow_rounds_citation(tasks_by_id, review_task, queue)
@@ -1260,7 +1273,7 @@ def auto_enqueue_fix(
         max_rounds, canary_citation, canary_reason = _canary_round_cap(
             tasks_by_id, review_task, baseline_cap, queue)
         canary_pinned = (_tokenomics_canary.rounds_cap_enabled()
-                         and lineage_root_id == _tokenomics_canary.canary_pin())
+                         and _round_cap_pinned(tasks_by_id, review_task, queue))
         if canary_pinned:
             try:
                 queue.record_shadow_rounds_vs_cap(
@@ -1910,8 +1923,7 @@ def auto_enqueue_test(
         contract = _cascade.stored(review_task)
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         if (_tokenomics_canary.rounds_cap_enabled()
-                and _lineage_root_task_id(tasks_by_id, review_task)
-                == _tokenomics_canary.canary_pin()):
+                and _round_cap_pinned(tasks_by_id, review_task, queue)):
             try:
                 _, citation, reason = _canary_round_cap(
                     tasks_by_id, review_task,
