@@ -22,14 +22,17 @@ def q(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
                               description="root", branch="canary-branch"))
+    # A cap may cite only a decision published after the latest implement result.
+    queue.submit_result(ROOT, TaskResult(ROOT, "completed", "root completed"))
     return queue
 
 
-def _contract(tmp_path, monkeypatch, recommended=1, *, age=0, produced=True, mtime_age=0):
+def _contract(tmp_path, monkeypatch, recommended=1, *, age=0, produced=True,
+              mtime_age=0, task_id=ROOT):
     path = tmp_path / "policy.json"
     contract = {
         "contract_version": "1.0", "mode": "shadow",
-        "decisions": [{"task_id": ROOT,
+        "decisions": [{"task_id": task_id,
                        "recommended_max_review_fix_rounds": recommended}],
     }
     if produced:
@@ -49,7 +52,8 @@ def _review(q, task_id="review-canary-rounds", *, root=ROOT, fix_round=1,
                                    "pr_number": 51}))
     q.submit_result(task_id, TaskResult(
         task_id=task_id, status="completed", summary="fix it", verdict=verdict,
-        findings=["Fix the review finding"], pr_number=51))
+        findings=["Fix the review finding"] if verdict == "request_changes" else [],
+        pr_number=51))
     return task_id
 
 
@@ -59,6 +63,36 @@ def _run(q, review_id, comments=None):
                                                           if comments is not None else None),
                             already_announced_fn=lambda *a, **kw: False,
                             repo="owner/repo")
+
+
+@pytest.mark.parametrize("decision_for_latest,produced_after_result,expected_reason", [
+    (False, False, "contract_predates_latest_fix"),
+    (True, False, "contract_predates_latest_fix"),
+    (True, True, "cap_not_reached"),
+])
+def test_latest_fix_requires_its_own_post_result_decision(
+        q, tmp_path, monkeypatch, decision_for_latest,
+        produced_after_result, expected_reason):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    latest = "fix-latest"
+    q.enqueue(TaskRequest(task_id=latest, task_type="implement",
+                          description="fix the review", branch="canary-branch",
+                          context={"prev_task_id": ROOT, "fix_round": 1}))
+    if not produced_after_result:
+        _contract(tmp_path, monkeypatch, task_id=latest if decision_for_latest else ROOT)
+    q.submit_result(latest, TaskResult(latest, "completed", "fix completed"))
+    if produced_after_result:
+        _contract(tmp_path, monkeypatch, task_id=latest)
+    review = _review(q, root=latest)
+    tasks = {task.task_id: task for task in q.list_tasks()}
+    cap, citation, reason = _canary_round_cap(tasks, tasks[review], 3, q)
+    assert reason == expected_reason
+    assert cap == (1 if produced_after_result else 3)
+    assert (citation or {}).get("cited_task_id") == (latest if decision_for_latest else ROOT)
+    if not produced_after_result:
+        assert _run(q, review) is not None
+        assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
 
 
 def test_kill_switch_off_preserves_fix_and_shadow_receipt(q, tmp_path, monkeypatch):
@@ -113,6 +147,7 @@ def test_project_pin_matches_only_its_lineage(tmp_path, monkeypatch, project, ex
     queue = TaskQueue(str(tmp_path / project / "tasks.db"))
     queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
                               description="root", branch="canary-branch"))
+    queue.submit_result(ROOT, TaskResult(ROOT, "completed", "root completed"))
     monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
     monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
     _contract(tmp_path, monkeypatch, recommended=1)
@@ -130,6 +165,7 @@ def test_project_pin_applies_narrow_fresh_cap(tmp_path, monkeypatch):
     queue = TaskQueue(str(tmp_path / "agent_crew" / "tasks.db"))
     queue.enqueue(TaskRequest(task_id=ROOT, task_type="implement",
                               description="root", branch="canary-branch"))
+    queue.submit_result(ROOT, TaskResult(ROOT, "completed", "root completed"))
     monkeypatch.setenv(CANARY_ENV, "project:agent_crew")
     monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
     _contract(tmp_path, monkeypatch, recommended=1, produced=False)
@@ -307,6 +343,8 @@ def test_latest_valid_lineage_receipt_wins_over_future_contract(
     monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
     review = _review(q)
     decision_at = q.get_exec_state(review)["events"][-1]["at"]
+    result_at = q.get_exec_state(ROOT)["result_posted_at"]
+    produced_at = (result_at + decision_at) / 2
     with sqlite3.connect(q._db_path) as conn:
         conn.execute(
             """UPDATE tokenomics_shadow_receipts
@@ -315,9 +353,9 @@ def test_latest_valid_lineage_receipt_wins_over_future_contract(
                    shadow_contract_sha='earlier-contract'
                WHERE task_id=?""",
             (json.dumps({"produced_at": datetime.fromtimestamp(
-                decision_at - 10, timezone.utc).isoformat(),
+                produced_at, timezone.utc).isoformat(),
                 "recommendation": {"recommended_max_review_fix_rounds": 1}}),
-             decision_at - 10, ROOT))
+             produced_at, ROOT))
     path = tmp_path / "future.json"
     path.write_text(json.dumps({
         "contract_version": "1.0", "mode": "shadow",
@@ -332,7 +370,7 @@ def test_latest_valid_lineage_receipt_wins_over_future_contract(
     assert cited["contract_sha"] == "earlier-contract"
     assert cited["recommended_max_review_fix_rounds"] == 1
     assert cited["produced_at"] == datetime.fromtimestamp(
-        decision_at - 10, timezone.utc).isoformat()
+        produced_at, timezone.utc).isoformat()
 
 
 def test_real_mtime_receipt_cited_when_live_contract_is_from_future(
@@ -341,9 +379,10 @@ def test_real_mtime_receipt_cited_when_live_contract_is_from_future(
     monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
     _contract(tmp_path, monkeypatch, recommended=1, produced=False)
     path = tmp_path / "policy.json"
-    observed_mtime = (datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp()
+    # Model a post-result contract re-emit captured in the durable receipt.
+    observed_mtime = datetime.now(timezone.utc).timestamp()
     os.utime(path, (observed_mtime, observed_mtime))
-    q.submit_result(ROOT, TaskResult(task_id=ROOT, status="completed", summary="done"))
+    q._refresh_shadow_after_commit(ROOT)
     stored = q.get_tokenomics_shadow_receipt(ROOT)
     assert json.loads(stored["shadow_recommendation_json"])["produced_at"] == (
         datetime.fromtimestamp(observed_mtime, timezone.utc).isoformat())

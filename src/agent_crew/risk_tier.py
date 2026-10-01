@@ -148,8 +148,10 @@ def risk_declaration(description: str, context: Mapping | None = None) -> dict:
             stronger = {}
             if tier == TIER_3:
                 stronger = {"safety_or_live_change": True, "human_gate_required": True}
-            elif tier == TIER_2:
-                stronger = {"broad_architecture_change": True}
+            # A cascade fix embeds the review's prose and file paths in its
+            # description. Words such as "server.py" describe the finding,
+            # not a new broad-architecture declaration by this successor.
+            # Keep the root's explicit fact; still escalate live/safety work.
             if any(explicit[field] is not True for field in stronger):
                 return {**explicit, **stronger,
                         "declaration_source": "heuristic", "confidence": "low"}

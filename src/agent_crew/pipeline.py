@@ -945,6 +945,22 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
         current = tasks_by_id[prev]
 
 
+def _latest_lineage_implement(tasks_by_id: dict, task):
+    """Return the most recent implement/fix ancestor of a review."""
+    current = task
+    seen = set()
+    while current.task_id not in seen:
+        seen.add(current.task_id)
+        if current.task_type == "implement":
+            return current
+        ctx = current.context if isinstance(current.context, dict) else {}
+        previous = ctx.get("prev_task_id")
+        if not isinstance(previous, str) or previous not in tasks_by_id:
+            break
+        current = tasks_by_id[previous]
+    return None
+
+
 def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
     """Copy only a declared lineage risk; admission still classifies the child."""
     if context.get("risk_declaration") is not None:
@@ -1088,6 +1104,16 @@ def _canary_round_cap(tasks_by_id: dict, review_task,
         current = False
     if citation["decision_source"] != "quota_core_contract" or not current:
         reason = "contract_missing_or_stale"
+    elif (latest := _latest_lineage_implement(tasks_by_id, review_task)) is None:
+        reason = "contract_predates_latest_fix"
+    elif citation["cited_task_id"] != latest.task_id:
+        reason = "contract_predates_latest_fix"
+    elif not (latest_state := queue.get_exec_state(latest.task_id)):
+        reason = "contract_predates_latest_fix"
+    elif not isinstance(latest_state.get("result_posted_at"), (int, float)):
+        reason = "contract_predates_latest_fix"
+    elif produced.timestamp() <= latest_state["result_posted_at"]:
+        reason = "contract_predates_latest_fix"
     elif recommended is None or recommended < 1:
         reason = "invalid_recommendation"
     elif recommended >= baseline_cap:
