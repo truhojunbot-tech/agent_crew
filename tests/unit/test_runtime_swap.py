@@ -7,7 +7,8 @@ import threading
 
 import pytest
 
-from scripts.runtime_swap import parse_args, parse_env_file, check_checkout, require_no_running_work
+from scripts.runtime_swap import (parse_args, parse_env_file, check_checkout,
+                                  complete_environ, require_no_running_work)
 
 
 def test_argument_parsing_rejects_short_sha_and_unknown_step():
@@ -135,6 +136,72 @@ def test_main_preflight_and_post_count_mismatch(tmp_path, monkeypatch):
         swap.main(['demo', 'a' * 40, 'post'])
 
 
+def test_post_accepts_hidden_pid_only_with_matching_health(tmp_path, monkeypatch):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    assert swap.main(['demo', 'a' * 40, 'preflight']) == 0
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    (evidence / 'counts.pre.json').write_text('[ ["completed", 1] ]')
+    (evidence / 'pending.pre.json').write_text('[]')
+    monkeypatch.setattr(swap, 'listener_pid',
+                        lambda port: (_ for _ in ()).throw(RuntimeError('no listener')))
+
+    assert swap.main(['demo', 'a' * 40, 'post']) == 0
+
+
+def test_post_hidden_pid_refuses_wrong_or_unreachable_health(tmp_path, monkeypatch):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    assert swap.main(['demo', 'a' * 40, 'preflight']) == 0
+    monkeypatch.setattr(swap, 'listener_pid',
+                        lambda port: (_ for _ in ()).throw(RuntimeError('no listener')))
+    monkeypatch.setattr(swap, 'api', lambda port, path: {
+        'stop': {'paused': True}, 'build': {'commit': 'b' * 40}} if path == '/health' else [])
+    with pytest.raises(RuntimeError, match='build SHA differs'):
+        swap.main(['demo', 'a' * 40, 'post'])
+
+    monkeypatch.setattr(swap, 'api',
+                        lambda port, path: (_ for _ in ()).throw(OSError('health down')))
+    with pytest.raises(OSError, match='health down'):
+        swap.main(['demo', 'a' * 40, 'post'])
+
+
+def test_preflight_hands_off_to_socket_group_before_proc_capture(tmp_path, monkeypatch):
+    swap, directory, _ = _swap_fixture(tmp_path, monkeypatch)
+    sock_dir = tmp_path / 'sock'
+    sock_dir.mkdir()
+    (directory / 'cea.env').write_text(
+        f'AGENT_CREW_CEA_MODE=shadow\nAGENT_CREW_CEA_BROKER_SOCKET={sock_dir / "broker.sock"}\n')
+    monkeypatch.setattr(swap.os, 'getegid', lambda: os.stat(sock_dir).st_gid + 1)
+    commands = []
+
+    def execvp(program, command):
+        commands.append((program, command))
+        raise RuntimeError('group handoff')
+
+    monkeypatch.setattr(swap.os, 'execvp', execvp)
+    with pytest.raises(RuntimeError, match='group handoff'):
+        swap.main(['demo', 'a' * 40, 'preflight'])
+    assert commands and commands[0][0] == 'sg'
+    assert 'preflight' in commands[0][1][-1]
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    assert not (evidence / 'env.pre.nul').exists()
+
+
+def test_preflight_unreadable_environ_never_records_partial_capture(tmp_path, monkeypatch):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    original = type(tmp_path).read_bytes
+
+    def read_bytes(path):
+        if str(path).endswith('/environ'):
+            raise PermissionError('environ unreadable')
+        return original(path)
+
+    monkeypatch.setattr(type(tmp_path), 'read_bytes', read_bytes)
+    with pytest.raises(PermissionError, match='environ unreadable'):
+        swap.main(['demo', 'a' * 40, 'preflight'])
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    assert not (evidence / 'preflight.json').exists()
+
+
 def test_pending_only_preflight_and_post_requires_same_ids(tmp_path, monkeypatch):
     import sqlite3
     swap, _, db = _swap_fixture(tmp_path, monkeypatch)
@@ -162,6 +229,28 @@ def test_main_refuses_mismatched_preflight(tmp_path, monkeypatch):
     (evidence / 'preflight.json').write_text(json.dumps({'sha': 'b' * 40, 'project': 'demo', 'port': 8765}))
     with pytest.raises(RuntimeError, match='does not match'):
         swap.main(['demo', 'a' * 40, 'go'])
+
+
+@pytest.mark.parametrize('captured', [b'', b'X=Y'])
+def test_go_refuses_incomplete_captured_env_before_signalling(tmp_path, monkeypatch, captured):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    evidence.mkdir(parents=True)
+    (evidence / 'preflight.json').write_text(json.dumps({
+        'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid(),
+    }))
+    (evidence / 'env.pre.nul').write_bytes(captured)
+    signalled = []
+    monkeypatch.setattr(swap.os, 'kill', lambda *args: signalled.append(args))
+
+    with pytest.raises(RuntimeError, match='captured environment missing or incomplete'):
+        swap.main(['demo', 'a' * 40, 'go'])
+    assert signalled == []
+    assert not (evidence / 'tasks.db.pre').exists()
+
+
+def test_complete_environ_preserves_valid_capture():
+    assert complete_environ(b'X=Y\0') == b'X=Y\0'
 
 
 def test_spawn_captured_env_preserves_spaces_and_drops_old_agent_source(tmp_path, monkeypatch):
