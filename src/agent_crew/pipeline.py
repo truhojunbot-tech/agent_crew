@@ -945,6 +945,25 @@ def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
         current = tasks_by_id[prev]
 
 
+def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
+    """Copy only a declared lineage risk; admission still classifies the child."""
+    if context.get("risk_declaration") is not None:
+        return
+    root_id = _lineage_root_task_id(tasks_by_id, parent_task)
+    root = tasks_by_id.get(root_id)
+    root_context = root.context if root and isinstance(root.context, dict) else {}
+    declaration = root_context.get("risk_declaration")
+    if (isinstance(declaration, dict)
+            and declaration.get("declaration_source") in {"explicit", "inherited"}
+            and any(isinstance(declaration.get(field), bool) for field in (
+                "safety_or_live_change", "broad_architecture_change",
+                "bounded_routine_fix", "human_gate_required"))):
+        context["risk_declaration"] = {
+            **declaration,
+            "inherited_from": declaration.get("inherited_from") or root_id,
+        }
+
+
 def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
                       server_project: Optional[str] = None) -> bool:
     return _tokenomics_canary._is_pinned(
@@ -1398,6 +1417,7 @@ def auto_enqueue_fix(
             "fix_round": fix_round,
             "review_findings": list(review_result.findings or []),
         }
+        _inherit_root_risk(tasks_by_id, review_task, fix_context)
         if pr_number is not None:
             # #186: lets the dispatcher check out the PR head for this task.
             fix_context["pr_number"] = pr_number
@@ -1818,6 +1838,8 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
+        _inherit_root_risk({t.task_id: t for t in queue.list_tasks()},
+                           impl_task, review_context)
         if enforce_risk_tier:
             review_context.update(risk)
         if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
@@ -1972,6 +1994,7 @@ def auto_enqueue_test(
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
         test_context: dict = {"prev_task_id": review_task_id}
+        _inherit_root_risk(tasks_by_id, review_task, test_context)
         # Test the exact revision approved by the reviewer. This is also the
         # artifact component of the test's CEA intent identity.
         if review_ctx.get("reviewed_sha"):
@@ -2093,6 +2116,13 @@ def auto_fallback_failed_task(
             return False
         original = tasks[0]
         ctx = successor_context(original.context)
+        copied_risk = ctx.get("risk_declaration")
+        if (isinstance(copied_risk, dict)
+                and copied_risk.get("declaration_source") in {"explicit", "inherited"}):
+            ctx["risk_declaration"] = {
+                **copied_risk,
+                "inherited_from": copied_risk.get("inherited_from") or task_id,
+            }
         ctx.pop(RESULT_BRANCH_CONTEXT_KEY, None)
         ctx.pop(RESULT_COMMIT_CONTEXT_KEY, None)
 

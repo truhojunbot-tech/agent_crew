@@ -505,9 +505,12 @@ def _normalize_risk_declaration(value: object) -> dict:
     source = value.get("declaration_source")
     confidence = value.get("confidence")
     normalized["declaration_source"] = (
-        source if source in {"explicit", "heuristic", "unknown"} else "unknown"
+        source if source in {"explicit", "inherited", "heuristic", "unknown"} else "unknown"
     )
     normalized["confidence"] = confidence if confidence in {"high", "medium", "low"} else None
+    inherited_from = value.get("inherited_from")
+    if isinstance(inherited_from, str) and inherited_from:
+        normalized["inherited_from"] = inherited_from
     return normalized
 
 
