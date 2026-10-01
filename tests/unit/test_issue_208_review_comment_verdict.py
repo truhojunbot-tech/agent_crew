@@ -130,10 +130,13 @@ def test_u208_explicit_request_changes_verdict_passed_through(tmp_db, monkeypatc
     app = _make_app(tmp_db, push_calls)
     with TestClient(app) as client:
         client.post("/tasks", json=_review_payload("review-208c", pr_number=99))
-        client.post(
+        response = client.post(
             "/tasks/review-208c/result",
-            json=_result_payload("review-208c", verdict="request_changes", findings=["x"]),
+            json=_result_payload("review-208c", verdict="request_changes",
+                                 findings=["src/x.py:1 — actionable issue"],
+                                 summary="Reviewed PR #99 and found an actionable issue in src/x.py"),
         )
 
+    assert response.status_code == 200, response.text
     assert len(calls) == 1
     assert calls[0]["verdict"] == "request_changes"

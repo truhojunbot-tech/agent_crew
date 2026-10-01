@@ -5,6 +5,7 @@
 요청에도 '전부' 라는 말이 없었고 응답도 무엇을 잃는지 **잃기 전에** 말해주지 않았다.
 """
 import subprocess
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -179,3 +180,49 @@ def test_scoped_call_on_a_fresh_task_refuses(client):
                        params={"older_than": 3600, "task_id": "fresh-one", "dry_run": "false"}).json()
     assert body["cancelled"] == [] and "reason" in body
     assert client.get("/tasks/fresh-one").json()["status"] == "in_progress"
+
+
+def test_global_sweep_continues_when_one_candidate_cancel_raises(client, monkeypatch):
+    _seed_in_progress(client, "stale-bad", "implement", idle_s=7200)
+    _seed_in_progress(client, "stale-good", "review", idle_s=7200)
+    from agent_crew import server
+
+    real_cancel = server.cancel_task_with_signal
+
+    def flaky_cancel(queue, task_id, **kwargs):
+        if task_id == "stale-bad":
+            raise RuntimeError("injected cancel failure")
+        return real_cancel(queue, task_id, **kwargs)
+
+    monkeypatch.setattr(server, "cancel_task_with_signal", flaky_cancel)
+    response = client.post("/tasks/expire-stale", params={
+        "older_than": 3600, "dry_run": "false",
+    })
+
+    assert response.status_code == 200, response.text
+    assert response.json()["cancelled"] == ["stale-good"]
+    assert client.get("/tasks/stale-bad").json()["status"] == "in_progress"
+    assert client.get("/tasks/stale-good").json()["status"] == "cancelled"
+
+
+def test_global_sweep_records_stop_error_and_continues(client, monkeypatch):
+    _seed_in_progress(client, "stale-stop", "implement", idle_s=7200)
+    _seed_in_progress(client, "stale-good", "review", idle_s=7200)
+    client.app.state.active_dispatch_processes["stale-stop"] = SimpleNamespace(
+        pid=4242, returncode=None)
+
+    def fail_stop(_pid, _signal):
+        raise RuntimeError("injected worker stop failure")
+
+    monkeypatch.setattr("agent_crew.server.os.killpg", fail_stop)
+    response = client.post("/tasks/expire-stale", params={
+        "older_than": 3600, "dry_run": "false",
+    })
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert set(body["cancelled"]) == {"stale-stop", "stale-good"}
+    assert body["worker_termination"]["stale-stop"] == "stop_error"
+    assert body["worker_termination"]["stale-good"] == "pane_worker_not_killable"
+    assert client.get("/tasks/stale-stop").json()["status"] == "cancelled"
+    assert client.get("/tasks/stale-good").json()["status"] == "cancelled"
