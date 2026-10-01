@@ -6,6 +6,7 @@ import pytest
 
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
+from agent_crew.telemetry import TaskTelemetry
 from agent_crew.telemetry_response import response_log_telemetry, response_telemetry
 
 
@@ -97,3 +98,88 @@ def test_claude_terminal_result_usage_overrides_message_output_only():
     assert telemetry.output_tokens == 11657
     assert (telemetry.uncached_input_tokens, telemetry.cache_write_tokens,
             telemetry.cache_read_tokens, telemetry.context_window_tokens) == (2, 3, 5, 10)
+
+
+def _codex_task(queue, task_id, session, index, **usage):
+    queue.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="d"))
+    queue.record_attribution(task_id, agent="codex", provider_session_id=session,
+                             session_task_index=index, status="in_progress")
+    queue.record_task_telemetry(task_id, TaskTelemetry(**usage))
+    row = queue.get_attribution(task_id)
+    return row, json.loads(queue.get_tokenomics_shadow_receipt(task_id)["economics_json"])
+
+
+def test_codex_resumed_thread_receipt_uses_per_task_delta_and_keeps_cumulative(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    first, _ = _codex_task(queue, "first", "thread-a", 1,
+                           uncached_input_tokens=100, cache_read_tokens=200,
+                           output_tokens=30, reasoning_tokens=10, context_window_tokens=300)
+    second, economics = _codex_task(queue, "second", "thread-a", 2,
+                                    uncached_input_tokens=115, cache_read_tokens=250,
+                                    output_tokens=38, reasoning_tokens=13,
+                                    context_window_tokens=365)
+    assert first["output_tokens"] == 30
+    for field, expected in {"uncached_input_tokens": 15, "cache_read_tokens": 50,
+                            "output_tokens": 8, "reasoning_tokens": 3,
+                            "context_window_tokens": 65}.items():
+        assert second[field] == economics[field] == expected
+    cumulative = {"uncached_input_tokens": 115, "cache_read_tokens": 250,
+                  "cache_write_tokens": None,
+                  "output_tokens": 38, "reasoning_tokens": 13,
+                  "context_window_tokens": 365}
+    assert json.loads(second["codex_thread_cumulative"]) == cumulative
+    assert economics["codex_thread_cumulative"] == cumulative
+
+
+def test_codex_first_task_and_changed_session_do_not_subtract(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    first, _ = _codex_task(queue, "first", "thread-a", 1, output_tokens=30)
+    renewed, economics = _codex_task(queue, "renewed", "thread-b", 2, output_tokens=7)
+    assert first["output_tokens"] == 30
+    assert renewed["output_tokens"] == economics["output_tokens"] == 7
+
+
+def test_codex_negative_or_unknown_previous_field_is_null(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _codex_task(queue, "first", "thread-a", 1, output_tokens=30)
+    second, economics = _codex_task(queue, "second", "thread-a", 2,
+                                    output_tokens=20, reasoning_tokens=4)
+    assert second["output_tokens"] is economics["output_tokens"] is None
+    assert second["reasoning_tokens"] is economics["reasoning_tokens"] is None
+    assert json.loads(second["codex_thread_cumulative"])["output_tokens"] == 20
+
+
+def test_codex_previous_task_without_usage_keeps_delta_unknown(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="first", task_type="implement", description="d"))
+    queue.record_attribution("first", agent="codex", provider_session_id="thread-a",
+                             session_task_index=1)
+    second, _ = _codex_task(queue, "second", "thread-a", 2, output_tokens=20)
+    assert second["output_tokens"] is None
+
+
+@pytest.mark.parametrize("provider", ["claude", "gemini"])
+def test_other_provider_receipts_do_not_use_codex_delta(tmp_path, provider):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _codex_task(queue, "first", "shared-id", 1, output_tokens=30)
+    queue.enqueue(TaskRequest(task_id="other", task_type="implement", description="d"))
+    queue.record_attribution("other", agent=provider, provider_session_id="shared-id",
+                             session_task_index=2)
+    queue.record_task_telemetry("other", TaskTelemetry(output_tokens=7))
+    row = queue.get_attribution("other")
+    economics = json.loads(queue.get_tokenomics_shadow_receipt("other")["economics_json"])
+    assert row["output_tokens"] == economics["output_tokens"] == 7
+    assert row["codex_thread_cumulative"] is None
+    assert "codex_thread_cumulative" not in economics
+
+
+def test_codex_log_uses_latest_cumulative_turn_not_sum():
+    records = [
+        {"type": "turn.completed", "usage": {"input_tokens": 100, "cached_input_tokens": 60,
+                                              "output_tokens": 10}},
+        {"type": "turn.completed", "usage": {"input_tokens": 140, "cached_input_tokens": 80,
+                                              "output_tokens": 15}},
+    ]
+    telemetry = response_log_telemetry("codex", "\n".join(map(json.dumps, records)))
+    assert (telemetry.uncached_input_tokens, telemetry.cache_read_tokens,
+            telemetry.output_tokens) == (60, 80, 15)

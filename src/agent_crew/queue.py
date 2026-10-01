@@ -809,6 +809,7 @@ _DDL_MIGRATE_ATTR_CACHE_READ = "ALTER TABLE task_attribution ADD COLUMN cache_re
 _DDL_MIGRATE_ATTR_OUTPUT = "ALTER TABLE task_attribution ADD COLUMN output_tokens INTEGER DEFAULT NULL"
 _DDL_MIGRATE_ATTR_REASONING = "ALTER TABLE task_attribution ADD COLUMN reasoning_tokens INTEGER DEFAULT NULL"
 _DDL_MIGRATE_ATTR_CONTEXT_WINDOW = "ALTER TABLE task_attribution ADD COLUMN context_window_tokens INTEGER DEFAULT NULL"
+_DDL_MIGRATE_ATTR_CODEX_CUMULATIVE = "ALTER TABLE task_attribution ADD COLUMN codex_thread_cumulative TEXT DEFAULT NULL"
 _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH = "ALTER TABLE task_attribution ADD COLUMN stable_prefix_hash TEXT DEFAULT NULL"
 _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH = "ALTER TABLE task_attribution ADD COLUMN context_pack_hash TEXT DEFAULT NULL"
 _DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED = (
@@ -857,6 +858,7 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_OUTPUT,
     _DDL_MIGRATE_ATTR_REASONING,
     _DDL_MIGRATE_ATTR_CONTEXT_WINDOW,
+    _DDL_MIGRATE_ATTR_CODEX_CUMULATIVE,
     _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH,
     _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH,
     _DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED,
@@ -4192,8 +4194,16 @@ class TaskQueue:
         economics = conn.execute(
             """SELECT uncached_input_tokens, cache_write_tokens, cache_read_tokens,
                       output_tokens, reasoning_tokens, context_window_tokens,
-                      outcome, retry_of, fallback_of, required_context_recalled
+                      outcome, retry_of, fallback_of, required_context_recalled,
+                      codex_thread_cumulative
                FROM task_attribution WHERE task_id=?""", (task_id,)).fetchone()
+        economics_json = None
+        if economics is not None:
+            economics_values = dict(economics)
+            codex_cumulative = economics_values.pop("codex_thread_cumulative")
+            if codex_cumulative:
+                economics_values["codex_thread_cumulative"] = json.loads(codex_cumulative)
+            economics_json = json.dumps(economics_values)
         token_observations = {
             key: (economics[key] if economics is not None else None)
             for key in ("uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
@@ -4225,7 +4235,7 @@ class TaskQueue:
         conn.execute(
             """UPDATE tokenomics_shadow_receipts
                SET outcome=COALESCE(?, outcome), economics_json=?, evidence_json=?, updated_at=? WHERE task_id=?""",
-            (outcome, json.dumps(dict(economics)) if economics is not None else None,
+            (outcome, economics_json,
              json.dumps(_quality_evidence_envelope(
                  evidence,
                  task_context.get("risk_declaration") if isinstance(task_context, dict) else None,
@@ -4304,7 +4314,49 @@ class TaskQueue:
             "stable_prefix_hash",
         )
         values = [getattr(telemetry, field) for field in fields]
-        observed = [(field, value) for field, value in zip(fields, values) if value is not None]
+        attribution = conn.execute(
+            "SELECT agent, project, provider_session_id, session_task_index "
+            "FROM task_attribution WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if attribution is not None and attribution["agent"] == "codex":
+            usage_fields = fields[:6]
+            cumulative = {field: getattr(telemetry, field) for field in usage_fields}
+            session = telemetry.provider_session_id or attribution["provider_session_id"]
+            previous = None
+            session_unknown = not session or session == "unknown"
+            if not session_unknown and attribution["session_task_index"] > 1:
+                previous = conn.execute(
+                    """SELECT codex_thread_cumulative FROM task_attribution
+                       WHERE agent='codex' AND project=? AND provider_session_id=?
+                         AND session_task_index < ? AND task_id != ?
+                       ORDER BY session_task_index DESC, created_at DESC LIMIT 1""",
+                    (attribution["project"], session, attribution["session_task_index"], task_id),
+                ).fetchone()
+            previous_values = None
+            if previous is not None and previous["codex_thread_cumulative"]:
+                try:
+                    previous_values = json.loads(previous["codex_thread_cumulative"])
+                except (TypeError, ValueError):
+                    previous_values = {}
+            if previous is not None and not isinstance(previous_values, dict):
+                previous_values = {}
+            observed = []
+            for field in usage_fields:
+                current = cumulative[field]
+                if previous is None and not (session_unknown and attribution["session_task_index"] > 1):
+                    delta = current
+                elif previous is None:
+                    delta = None
+                else:
+                    prior = previous_values.get(field) if previous_values is not None else None
+                    delta = (current - prior if isinstance(current, int) and
+                             isinstance(prior, int) and current >= prior else None)
+                observed.append((field, delta))
+            observed.append(("codex_thread_cumulative", json.dumps(cumulative)))
+            observed.extend((field, value) for field, value in zip(fields[6:], values[6:])
+                            if value is not None)
+        else:
+            observed = [(field, value) for field, value in zip(fields, values) if value is not None]
         if context_pack_hash is not None:
             observed.append(("context_pack_hash", context_pack_hash))
         assignments = [f"{field}=?" for field, _ in observed]
