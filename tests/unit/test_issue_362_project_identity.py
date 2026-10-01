@@ -1,7 +1,8 @@
 """A recycled local port must not attach workers from another crew (#362)."""
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from io import BytesIO
 
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
@@ -11,6 +12,7 @@ from agent_crew.instructions import generate
 from agent_crew.project_identity import ProjectIdentityError, verify_server_identity
 from agent_crew.server import _format_task_message, create_app
 from agent_crew.queue import TaskRequest
+from agent_crew.loop import _post_task_http
 
 
 def test_health_keeps_existing_project_identity(tmp_path):
@@ -25,7 +27,8 @@ def test_worker_transport_refuses_missing_and_foreign_identity_before_claim(tmp_
                                anomaly_disabled=True)) as client:
         payload = {"task_id": "impl-identity", "task_type": "implement",
                    "description": "work", "project": "alpha"}
-        assert client.post("/tasks", json=payload).status_code == 201
+        assert client.post("/tasks", json=payload, headers={
+            "X-Agent-Crew-Project": "alpha"}).status_code == 201
         result = {"task_id": "impl-identity", "status": "completed", "summary": "done"}
         assert client.get("/tasks/next?role=implementer").status_code == 428
         assert client.get("/tasks/next?role=implementer", headers={
@@ -41,6 +44,71 @@ def test_worker_transport_refuses_missing_and_foreign_identity_before_claim(tmp_
             "X-Agent-Crew-Project": "alpha"})
         assert claimed.status_code == 200
         assert claimed.json()["task_id"] == "impl-identity"
+
+
+def test_http_enqueue_requires_matching_project_before_insert(tmp_path):
+    with TestClient(create_app(str(tmp_path / "tasks.db"), project="alpha",
+                               identity_required=True, watchdog_disabled=True,
+                               anomaly_disabled=True)) as client:
+        task = {"task_id": "impl-http", "task_type": "implement",
+                "description": "work", "project": "alpha"}
+        assert client.post("/tasks", json=task).status_code == 428
+        assert client.post("/tasks", json=task, headers={
+            "X-Agent-Crew-Project": "beta"}).status_code == 409
+        assert client.get("/tasks/impl-http").status_code == 404
+        assert client.post("/tasks", json=task, headers={
+            "X-Agent-Crew-Project": "alpha"}).status_code == 201
+
+
+def test_loop_http_enqueue_asserts_project():
+    class Response(BytesIO):
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            self.close()
+    with patch("agent_crew.loop.urllib.request.urlopen", return_value=Response(
+            b'{"task_id":"impl-http"}')) as urlopen:
+        assert _post_task_http(8102, TaskRequest(
+            task_id="impl-http", task_type="implement", description="work",
+            project="alpha")) == "impl-http"
+    assert urlopen.call_args.args[0].get_header("X-agent-crew-project") == "alpha"
+
+
+def test_discuss_verifies_project_before_opening_queue(tmp_path):
+    state_dir = tmp_path / "alpha"
+    state_dir.mkdir()
+    db = state_dir / "tasks.db"
+    (state_dir / "state.json").write_text(json.dumps({
+        "project": "alpha", "port": 8102, "db": str(db),
+        "agents": ["claude"], "pane_map": {"claude": "%1"},
+    }))
+    with patch("agent_crew.cli._port_listening", return_value=True), \
+         patch("agent_crew.project_identity.verify_server_identity",
+               side_effect=ProjectIdentityError("foreign server")) as verify, \
+         patch("agent_crew.cli._writable_queue") as queue:
+        result = CliRunner().invoke(crew, ["discuss", "topic", "--project", "alpha",
+                                           "--base", str(tmp_path), "--nowait"])
+    assert result.exit_code != 0
+    assert "foreign server" in result.output
+    verify.assert_called_once()
+    queue.assert_not_called()
+
+
+def test_cli_enqueue_verifies_project_and_sends_header(tmp_path):
+    state_dir = tmp_path / "alpha"
+    state_dir.mkdir()
+    (state_dir / "state.json").write_text(json.dumps({
+        "project": "alpha", "port": 8102, "db": str(state_dir / "tasks.db"),
+    }))
+    response = MagicMock(status=201)
+    response.__enter__.return_value = response
+    with patch("agent_crew.cli._verify_project_server") as verify, \
+         patch("urllib.request.urlopen", return_value=response) as urlopen:
+        result = CliRunner().invoke(crew, ["enqueue", "implement", "work",
+                                           "--project", "alpha", "--base", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    verify.assert_called_once_with(8102, "alpha")
+    assert urlopen.call_args.args[0].get_header("X-agent-crew-project") == "alpha"
 
 
 def test_generated_protocol_and_pushed_result_assert_project():

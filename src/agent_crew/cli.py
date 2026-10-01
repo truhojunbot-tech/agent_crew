@@ -181,6 +181,18 @@ def _port_listening(port: int, timeout: float = 5.0) -> bool:
     return False
 
 
+def _verify_project_server(port: int, project: str) -> None:
+    """Refuse to attach to a recycled or unavailable project port (#362)."""
+    if not _port_listening(port, timeout=5.0):
+        raise click.ClickException(
+            f"Server at port {port} unreachable — check crew status or run crew recover")
+    from agent_crew.project_identity import ProjectIdentityError, verify_server_identity
+    try:
+        verify_server_identity(f"http://127.0.0.1:{port}", project)
+    except ProjectIdentityError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 _PANE_IDLE_PATTERNS = [
     "$",            # shell prompt (agent CLI exited)
     "❯",            # zsh prompt
@@ -2318,15 +2330,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         _identity_state = _read_state(base, project)
         _identity_port = (_identity_state or {}).get("port")
         if _identity_port:
-            if not _port_listening(_identity_port, timeout=5.0):
-                raise click.ClickException(
-                    f"Server at port {_identity_port} unreachable — "
-                    "check crew status or run crew recover")
-            from agent_crew.project_identity import ProjectIdentityError, verify_server_identity
-            try:
-                verify_server_identity(f"http://127.0.0.1:{_identity_port}", project)
-            except ProjectIdentityError as exc:
-                raise click.ClickException(str(exc)) from exc
+            _verify_project_server(_identity_port, project)
 
     queue = _writable_queue(db, base=base, project=project)
 
@@ -3056,6 +3060,12 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         except Exception:
             pass
 
+    if project:
+        _identity_state = project_state or _read_state(base, project)
+        _identity_port = (_identity_state or {}).get("port")
+        if _identity_port:
+            _verify_project_server(_identity_port, project)
+
     queue = _writable_queue(db, base=base, project=project)
     perspectives_map = assign_perspectives(agent_list, perspectives=perspective_pool)
 
@@ -3111,7 +3121,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
-            branch=branch,
+            branch=branch, project=project,
         )
         click.echo(f"Discussion queued ({len(task_ids)} tasks). Track via `crew status`:")
         for agent, tid in zip(agent_list, task_ids):
@@ -3151,7 +3161,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         task_ids = enqueue_panel_tasks(
             queue, agent_list, topic, context,
             port=_run_port, perspectives=perspectives_map,
-            branch=branch,
+            branch=branch, project=project,
         )
         results_map, missing, idle_status = _wait_all(task_ids)
 
@@ -3655,10 +3665,13 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
     }
 
     if port:
+        if project:
+            _verify_project_server(port, project)
         req = _urllib_req.Request(
             f"http://127.0.0.1:{port}/tasks",
             data=json.dumps(payload).encode(),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json",
+                     "X-Agent-Crew-Project": project},
             method="POST",
         )
         try:

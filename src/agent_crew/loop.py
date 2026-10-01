@@ -30,7 +30,8 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
     http_req = urllib.request.Request(
         f"http://127.0.0.1:{port}/tasks",
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json",
+                 "X-Agent-Crew-Project": req.project},
         method="POST",
     )
     with urllib.request.urlopen(http_req, timeout=5) as resp:

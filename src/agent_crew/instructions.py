@@ -142,7 +142,7 @@ fi
 ```
 
 Include `X-Agent-Crew-Project: <project>` on every worker HTTP poll, start,
-and result POST.
+result, and task-enqueue POST.
 
 At session start and after each task completes, poll every 30 seconds for the
 next task so no task is missed even if a push is delayed:

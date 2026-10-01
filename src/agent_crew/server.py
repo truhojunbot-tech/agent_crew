@@ -6373,7 +6373,8 @@ def create_app(
         return {"status": "ok", "pane_map": pane_map}
 
     @app.post("/tasks", status_code=201)
-    def post_task(task: TaskRequest):
+    def post_task(task: TaskRequest,
+                  x_agent_crew_project: Optional[str] = Header(default=None)):
         """Enqueue a task.
 
         ``201`` → ``{"task_id": "..."}``.
@@ -6406,6 +6407,7 @@ def create_app(
         not pretend to answer the question at all — an advisory nobody can act
         on is worse than a stated gap.
         """
+        _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
             task_id = q().enqueue(task, ingress="http.tasks")
