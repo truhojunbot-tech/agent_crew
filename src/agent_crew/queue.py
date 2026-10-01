@@ -2741,6 +2741,18 @@ class TaskQueue:
         if not gate.proceed:
             raise AdmissionRefused(gate)
         receipt_id = receipt.get("receipt_id")
+        # A coordinator can enqueue a review before it has a reviewed_sha.
+        # Resolve outside the SQLite write lock; the dispatch-time check still
+        # pins and verifies the head if it moves after this lookup.
+        resolved_review_sha = ""
+        unknown_review_head = False
+        if task.task_type in ("review", "test") and not any(
+            isinstance(context.get(key), str)
+            and _CEA_COMMIT_RE.fullmatch(context[key].strip())
+            for key in ("reviewed_sha", "expected_head_sha", "head_sha")
+        ):
+            resolved_review_sha = self._resolve_review_head(task, context)
+            unknown_review_head = not resolved_review_sha
         conn = self._connect()
         try:
             # #313/#314 P0-1: 실행생성 mutation(INSERT) 자체를 pause와 원자적으로 admission.
@@ -2757,7 +2769,7 @@ class TaskQueue:
             expired_reservations: list = []
             duplicate_id = self._duplicate_review_in_txn(
                 conn, task, context, now=admit_at, ttl=reservation_ttl,
-                expired=expired_reservations)
+                expired=expired_reservations, resolved_sha=resolved_review_sha)
             if duplicate_id:
                 if context.get("allow_duplicate_review") is True:
                     self._append_exec_event_on(
@@ -2772,6 +2784,12 @@ class TaskQueue:
                         existing_task_id=duplicate_id, code=DuplicateReviewError.code)
                     conn.commit()
                     raise DuplicateReviewError(duplicate_id)
+            if unknown_review_head:
+                self._append_exec_event_on(
+                    conn, task.task_id, "duplicate_check_skipped_unknown_head",
+                    admit_at, branch=task.branch,
+                    pr_number=_normalize_pr_number(context.get("pr_number"))
+                    or _normalize_pr_number(task.pr_number))
             # #415: written in the admission transaction, so the event exists
             # iff the stale reservation actually let this task in.
             for stale_id, since in expired_reservations:
@@ -2909,12 +2927,33 @@ class TaskQueue:
         return (value if math.isfinite(value) and value > 0
                 else cls.REVIEW_RESERVATION_TTL)
 
+    def _resolve_review_head(self, task: TaskRequest, context: dict) -> str:
+        """Resolve an unpinned review against this queue's repository identity."""
+        from agent_crew.github import branch_head_sha, pr_head_sha
+
+        repos = self._project_repos
+        repo = (repos[0] if len(repos) == 1 else
+                str(context.get("repo") or task.project or "").strip())
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+            return ""
+        pr = _normalize_pr_number(context.get("pr_number"))
+        if pr is None:
+            pr = _normalize_pr_number(task.pr_number)
+        try:
+            sha = (pr_head_sha(pr, repo=repo, timeout=5.0) if pr is not None
+                   else branch_head_sha(task.branch, repo=repo))
+        except Exception:
+            logger.exception("duplicate review head lookup failed for %s", task.task_id)
+            return ""
+        return sha.strip().lower() if isinstance(sha, str) and _CEA_COMMIT_RE.fullmatch(sha.strip()) else ""
+
     @staticmethod
     def _duplicate_review_in_txn(conn, task: TaskRequest, context: dict, *,
                                  dispatch: bool = False,
                                  now: Optional[float] = None,
                                  ttl: Optional[float] = None,
-                                 expired: Optional[list] = None) -> Optional[str]:
+                                 expired: Optional[list] = None,
+                                 resolved_sha: str = "") -> Optional[str]:
         """Find a standing review/test of this target under the write lock.
 
         Pending reviews without a pin will use the current head at dispatch, so
@@ -2933,8 +2972,8 @@ class TaskQueue:
         if task.task_type not in ("review", "test"):
             return None
         sha = (context.get("reviewed_sha") if dispatch else
-               context.get("reviewed_sha") or context.get("expected_head_sha")
-               or context.get("head_sha"))
+               resolved_sha or context.get("reviewed_sha")
+               or context.get("expected_head_sha") or context.get("head_sha"))
         sha = (sha.strip().lower() if isinstance(sha, str)
                and _CEA_COMMIT_RE.fullmatch(sha.strip()) else None)
         pr = _normalize_pr_number(context.get("pr_number"))
