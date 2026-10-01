@@ -277,6 +277,19 @@ ENFORCEABLE_REASON_CODES = frozenset({
     "SNAPSHOT_STALE", "SNAPSHOT_ROLLBACK", "STALE_RECEIPT", "TASK_ID_MISMATCH",
 })
 
+# #398 audit verdicts. Codes absent from this map have not been audited;
+# the supported RUNTIME_STATE_FORBIDS result is a 4/4 census.
+ENFORCEMENT_AUDIT_STATUS = {
+    "RUNTIME_STATE_FORBIDS": "supported",
+    "ALREADY_COMPLETED": "rejected",       # 0/5
+    "BUDGET_EXHAUSTED": "rejected",        # 0/2
+    "BUDGET_UNVERIFIED": "rejected",       # 0/9
+    "DECISION_HUMAN_GATE": "not_applicable",
+    "HUMAN_GATE_DENIED": "not_applicable",
+    "HUMAN_GATE_PENDING": "not_applicable",
+    "HUMAN_GATE_REVOKED": "not_applicable",
+}
+
 
 def resolve_enforce_codes(env: dict, project: Optional[str] = None) -> Optional[frozenset[str]]:
     """Per-project code allowlist, then process-wide; ``None`` means unrestricted."""
@@ -296,6 +309,11 @@ def resolve_enforce_codes(env: dict, project: Optional[str] = None) -> Optional[
                 codes.add(code)
             else:
                 logger.warning("Ignoring unrecognised CEA enforcement code %r in %s", code, name)
+        for code in sorted(codes):
+            status = ENFORCEMENT_AUDIT_STATUS.get(code, "unaudited")
+            if status != "supported":
+                logger.warning("CEA enforcement audit: %s is %s; allowlist still applies",
+                               code, status)
         return frozenset(codes)
     return None
 

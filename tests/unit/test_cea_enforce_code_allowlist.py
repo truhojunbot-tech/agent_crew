@@ -64,6 +64,40 @@ def test_per_project_precedence_and_unknown_code_warning(caplog):
     assert resolve_enforce_codes({}, "alfred") is None
 
 
+def test_rejected_audit_code_warns_but_remains_enforceable(caplog):
+    env = {"AGENT_CREW_CEA_MODE": "enforce",
+           "AGENT_CREW_CEA_ENFORCE_CODES": "ALREADY_COMPLETED, BUDGET_EXHAUSTED"}
+    with caplog.at_level(logging.WARNING):
+        config = EngineConfig.from_env(env)
+    assert [r.message for r in caplog.records if "CEA enforcement audit" in r.message] == [
+        "CEA enforcement audit: ALREADY_COMPLETED is rejected; allowlist still applies",
+        "CEA enforcement audit: BUDGET_EXHAUSTED is rejected; allowlist still applies",
+    ]
+    gate = _verdict("ALREADY_COMPLETED", ValidationOutcome.BLOCK, config)
+    assert gate.proceed is False and gate.enforced is True
+
+
+def test_supported_code_has_no_audit_warning(caplog):
+    with caplog.at_level(logging.WARNING):
+        config = EngineConfig.from_env({
+            "AGENT_CREW_CEA_MODE": "enforce",
+            "AGENT_CREW_CEA_ENFORCE_CODES": "RUNTIME_STATE_FORBIDS"})
+    assert config.enforce_codes == frozenset({"RUNTIME_STATE_FORBIDS"})
+    assert not any("CEA enforcement audit" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("code,status", [
+    ("OWNER_CONFLICT", "unaudited"),
+    ("HUMAN_GATE_PENDING", "not_applicable"),
+])
+def test_other_audit_status_is_named_in_warning(caplog, code, status):
+    with caplog.at_level(logging.WARNING):
+        config = EngineConfig.from_env({"AGENT_CREW_CEA_ENFORCE_CODES": code})
+    assert config.enforce_codes == frozenset({code})
+    assert [r.message for r in caplog.records if "CEA enforcement audit" in r.message] == [
+        f"CEA enforcement audit: {code} is {status}; allowlist still applies"]
+
+
 def test_advisory_start_response_says_go_and_keeps_real_outcome(tmp_path):
     config = EngineConfig(mode="test", enforce_codes=frozenset({"RUNTIME_STATE_FORBIDS"}))
     q = TaskQueue(str(tmp_path / "tasks.db"), cea_config=config, cea_providers=dict(WIRED))
@@ -79,4 +113,3 @@ def test_advisory_start_response_says_go_and_keeps_real_outcome(tmp_path):
     # #409: the reason prose is labelled, so it cannot be read as a refusal.
     assert answer["reason"].startswith("advisory (not enforced): ")
     assert "shadow" not in answer["reason"]
-
