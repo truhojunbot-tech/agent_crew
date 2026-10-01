@@ -2251,6 +2251,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
 
     from agent_crew.loop import (
         DEFAULT_MAX_ITER,
+        _adapter_project,
         build_feedback,
         enqueue_implement,
         enqueue_review,
@@ -2618,11 +2619,36 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
 
     # coordinator_managed is provenance only (§7.2). The loop adopts the
     # server's persisted successors below; this flag never decides a transition.
+    # A rerun may find the first implement task still queued or executing.
+    # Adopt before syncing worktrees: an in-progress worker's checkout must
+    # stay intact, while a pending worker still needs the fresh base sync.
+    _adopted_impl_id = None
+    _adopted_impl_status = None
+    if hasattr(queue, "list_tasks"):
+        _run_project = _adapter_project(queue, project)
+        _matches = [
+            existing for existing in queue.list_tasks()
+            if existing.task_type == "implement"
+            and (existing.project or "") == _run_project
+            and existing.status in ("pending", "in_progress")
+            and existing.description == task and existing.branch == branch
+            and not (isinstance(existing.context, dict)
+                     and existing.context.get("prev_task_id"))
+        ]
+        if len(_matches) > 1:
+            click.echo("Multiple in-flight implement tasks match; stopping without "
+                       "enqueue: " + ", ".join(t.task_id for t in _matches))
+            return
+        if _matches:
+            _adopted_impl_id = _matches[0].task_id
+            _adopted_impl_status = _matches[0].status
+            click.echo(f"(task already in flight, adopted {_adopted_impl_id})")
+
     # Sync all worktrees to the task's actual base before starting (#175, #176).
     # Agents may be on stale branches from the previous run; reset them so the
     # implementer always branches off the most recent merged state.
     _sync_landed_bases: dict = {}
-    if _run_worktrees:
+    if _run_worktrees and _adopted_impl_status != "in_progress":
         click.echo(f"Syncing worktrees to origin/{branch}...")
         _sync_landed_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=branch)
 
@@ -2637,7 +2663,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     if no_tester:
         impl_context["no_tester"] = True
 
-    impl_id = enqueue_implement(queue, task, branch, context=impl_context, port=_run_port)
+    impl_id = _adopted_impl_id or enqueue_implement(
+        queue, task, branch, context=impl_context, port=_run_port)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
     if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0):
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
