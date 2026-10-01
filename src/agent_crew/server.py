@@ -33,6 +33,7 @@ from agent_crew.memory import (
     shadow_telemetry,
 )
 from agent_crew.memory_capture import capture_result_best_effort
+from agent_crew.memory_runtime import SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
 from agent_crew.context_identity import (
     append_attribution_jsonl,
     detect_context_compaction,
@@ -2894,9 +2895,10 @@ def create_app(
     if shadow_memory_timeout_seconds is None:
         try:
             shadow_memory_timeout_seconds = float(
-                os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.05"))
+                os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS",
+                          str(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS)))
         except ValueError:
-            shadow_memory_timeout_seconds = 0.05
+            shadow_memory_timeout_seconds = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
 
     if worktree_map is None:
         worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
