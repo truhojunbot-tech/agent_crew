@@ -204,7 +204,7 @@ time a result is skipped — there is no fallback.
 | `branch` | string | code tasks | The pushed branch; report it as a field, not only in prose. |
 | `commit` | string | code tasks | Full pushed commit SHA; report it as a field, not only in prose. |
 | `verdict` | enum\\|null | reviewers only | `approve` \\| `request_changes` \\| `null` |
-| `findings` | string[] or finding objects[] | reviewers only | Actionable issues. Objects require severity, file, line, title, detail. Empty array for non-reviewers. |
+| `findings` | string[] or finding objects[] | reviewers only | `approve` requires `[]`; `request_changes` lists only changes required to approve. Put non-blocking notes in the summary or GitHub PR comment. Objects require severity, file, line, title, detail. Empty array for non-reviewers. |
 | `pr_number` | int\\|null | if opened | GitHub PR number, otherwise `null`. |
 
 ### Canonical POST template
@@ -403,7 +403,7 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 | `branch` | code tasks | Pushed branch, supplied as a structured field. |
 | `commit` | code tasks | Full pushed commit SHA, supplied as a structured field. |
 | `verdict` | reviewers only | `approve` \\| `request_changes` \\| `null` |
-| `findings` | reviewers only | Actionable issues. Empty list for non-reviewers. |
+| `findings` | reviewers only | `approve` requires `[]`; `request_changes` lists only changes required to approve. Put non-blocking notes in the summary or GitHub PR comment. Empty list for non-reviewers. |
 | `pr_number` | if opened | GitHub PR number, otherwise `null`. |
 | `executor_binding` | if your task block had a `dispatch_nonce` | `{"nonce": "<it>", "presenter": "<your agent name>"}` |
 
@@ -494,7 +494,7 @@ stored as `failed` with `reason: no_artifact`.
   of them). If the rebase needed conflict resolution, report `needs_human` instead.
 - `report`: do not commit. Send `"artifact": {"body": "<report>", "sha256": "<sha256 of body>"}`.
   If the report is committed, send `"path"` plus `commit` instead of `"body"`.
-- `review`: `verdict` plus the reviewed `pr_number`; `request_changes` needs findings.
+- `review`: `verdict` plus the reviewed `pr_number`; `approve` requires `findings: []`, while `request_changes` needs only changes required to approve.
 
 ### ⛔ Delegating review / test to the next role — DO NOT use `crew run`
 
@@ -530,6 +530,12 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks \\
     "reviewer": """\
 ## Role: reviewer
 
+### Review result contract
+
+`approve` requires `findings: []`. Non-blocking notes, nits, and coverage gaps
+go in the summary or the GitHub PR comment. `request_changes` findings list only
+changes required to approve.
+
 <bounded_pytest>
 
 You review the coder's PR across three layers — all three must pass before
@@ -540,8 +546,8 @@ you set `verdict: "approve"`:
 2. **Code quality** — architecture, readability, naming, coupling.
 3. **Business logic gaps** — side effects, security, performance, missing requirements.
 
-Set `verdict` to `"approve"` or `"request_changes"`. Put actionable issues in
-`findings`.
+Set `verdict` to `"approve"` or `"request_changes"`. Put only required changes
+in `findings` for `request_changes`.
 Each finding may be a descriptive string (at least 10 characters), or an object
 with `severity`, `file`, `line`, `title`, and `detail`; objects are stored as
 `SEVERITY file:line - title: detail`. A final review summary must be at least
@@ -603,8 +609,8 @@ Before you POST the result, verify:
 - [ ] GitHub PR comment posted (see above)
 - [ ] `status: completed` (the review itself completed, regardless of verdict)
 - [ ] `verdict` is `approve` or `request_changes` — never `null`
-- [ ] `findings` lists concrete, actionable items when verdict is
-  `request_changes`; may be empty on `approve`
+- [ ] `findings: []` when verdict is `approve`; when verdict is
+  `request_changes`, `findings` lists only changes required to approve
 - [ ] `summary` names the PR reviewed and the headline judgement
 
 ### ⛔ Delegating test to the next role — DO NOT use `crew run`
