@@ -15,14 +15,9 @@ The contamination that allows:
 
 which is exactly the resume-vs-fresh benchmark the consumer is building.
 
-⛔The treatment is corrected with the mechanism that already means this, not a
-  new parallel concept: `task.context["context_reset"]` is what an operator
-  sets to force a fresh context, and after a real `/clear` that is simply true.
-  The next context resolution bumps the generation and records `fresh`, so a
-  cohort keyed on the recorded policy cannot pick the task up as a resume.
-
 ⛔`send-keys` returning 0 proves the keystrokes were delivered, not that the
-  provider cleared. Recorded as `attempted`, never `completed`.
+  provider cleared. An unconfirmed send remains `attempted` and does not set
+  `context_reset`; a measured drop after the send confirms the reset.
 """
 
 import json
@@ -70,20 +65,26 @@ def _cleared_events(db_path):
             if e.get("event_type") == "provider_context_cleared"]
 
 
-def _run(tmp_path, monkeypatch, *, tokens=BIG, task_type="implement",
+def _run(tmp_path, monkeypatch, *, tokens=BIG, post_clear_tokens=None, task_type="implement",
          context=None, agent_key="claude", pane="%91", unused_tcp_port):
     """Push one task through the real path; return (db, sent_keys, task_ctx)."""
     wt = tmp_path / "worktrees" / "demo" / agent_key
     wt.mkdir(parents=True, exist_ok=True)
     _session(tmp_path / "claudehome", str(wt), tokens)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {agent_key: str(wt)}}))
+    state.write_text(json.dumps({"port": 0, "roles": [
+        {"role": "implementer", "agent": agent_key, "worktree": str(wt)},
+        {"role": "reviewer", "agent": "codex", "worktree": str(wt.parent / "codex")},
+        {"role": "tester", "agent": "gemini", "worktree": str(wt.parent / "gemini")},
+    ]}))
 
     sent = []
 
     def fake_run(cmd, **kw):
         if isinstance(cmd, list) and "send-keys" in cmd:
             sent.append(cmd)
+            if "/clear" in cmd and post_clear_tokens is not None:
+                _session(tmp_path / "claudehome", str(wt), post_clear_tokens)
         return _pane()
 
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
@@ -181,20 +182,28 @@ def test_no_clear_means_no_event(tmp_path, monkeypatch, *, unused_tcp_port):
 # ── 2. the treatment is corrected, not just described ─────────────────
 
 
-def test_the_cleared_task_is_marked_for_a_fresh_context(tmp_path, monkeypatch, *, unused_tcp_port):
-    """★★The integration bug. `context_reset` is what an operator sets to force
-    a fresh context, and after a real `/clear` it is simply true — so the next
-    resolution bumps the generation and records `fresh` instead of `resume`."""
+def test_an_unconfirmed_clear_attempt_does_not_force_fresh(tmp_path, monkeypatch, *, unused_tcp_port):
+    """Keystroke delivery is not provider confirmation."""
     _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert ctx["context_reset"] is True
+    assert "context_reset" not in ctx
+    assert ctx["auto_clear_outcome"] == "attempted"
+    assert "auto_cleared_before_push" not in ctx
 
 
-def test_a_task_that_was_already_a_resume_is_still_corrected(tmp_path, monkeypatch, *, unused_tcp_port):
-    """★★Acceptance 4's case: a pre-existing resume whose pane is over
-    threshold. This is precisely the row that would otherwise enter a
-    resume cohort having actually run fresh."""
+def test_an_unconfirmed_attempt_preserves_resume(tmp_path, monkeypatch, *, unused_tcp_port):
     _, _, ctx = _run(tmp_path, monkeypatch, context={"context_policy": "resume"}, unused_tcp_port=unused_tcp_port)
+    assert ctx["context_policy"] == "resume"
+    assert "context_reset" not in ctx
+    assert ctx["auto_clear_outcome"] == "attempted"
+
+
+def test_a_measured_post_clear_drop_confirms_fresh(tmp_path, monkeypatch, *, unused_tcp_port):
+    db, _, ctx = _run(tmp_path, monkeypatch, post_clear_tokens=100,
+                      context={"context_policy": "resume"}, unused_tcp_port=unused_tcp_port)
     assert ctx["context_reset"] is True
+    assert ctx["auto_cleared_before_push"] is True
+    assert ctx["auto_clear_outcome"] == "confirmed"
+    assert _cleared_events(db)[0]["outcome"] == "confirmed"
 
 
 def test_the_intervention_is_joinable_on_its_own(tmp_path, monkeypatch, *, unused_tcp_port):
@@ -202,9 +211,10 @@ def test_the_intervention_is_joinable_on_its_own(tmp_path, monkeypatch, *, unuse
     stratify auto-cleared rows specifically, not merely see `fresh` and wonder
     which of several reasons produced it."""
     _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert ctx["auto_cleared_before_push"] is True
+    assert ctx["auto_clear_outcome"] == "attempted"
     assert ctx["auto_clear_context_tokens"] == BIG
     assert ctx["auto_clear_token_source"] == "transcript"
+    assert ctx["auto_clear_threshold_tokens"] == sv._TOKEN_CLEAR_THRESHOLD
 
 
 def test_an_uncleared_task_carries_no_intervention_marks(tmp_path, monkeypatch, *, unused_tcp_port):
@@ -238,7 +248,8 @@ def test_the_discuss_path_is_attributed_too(tmp_path, monkeypatch, *, unused_tcp
 def test_the_discuss_task_is_also_marked(tmp_path, monkeypatch, *, unused_tcp_port):
     _, _, ctx = _run(tmp_path, monkeypatch, task_type="discuss",
                      context={"agent": "claude"}, unused_tcp_port=unused_tcp_port)
-    assert ctx["context_reset"] is True and ctx["auto_cleared_before_push"] is True
+    assert "context_reset" not in ctx
+    assert ctx["auto_clear_outcome"] == "attempted"
 
 
 # ── 4. identity, where the push path can know it ──────────────────────
@@ -250,11 +261,30 @@ def test_a_known_context_identity_is_attached(tmp_path, monkeypatch):
     `task_id` is the join key either way; this is the audit detail."""
     db = str(tmp_path / "peek.db")
     q = TaskQueue(db)
-    q.get_or_create_context(project="demo", agent="claude",
-                            worktree_path="/w/claude", task_id="seed")
+    created = q.get_or_create_context(project="demo", agent="claude",
+                                      worktree_path="/w/claude", task_id="seed")
     identity = q.peek_context_identity("demo", "claude", "/w/claude")
     assert identity["context_id"]
     assert identity["context_generation"] >= 1
+    q.update_context_provider_session_id(created["context_key"], "session-before-clear")
+
+    monkeypatch.setattr(sv.subprocess, "run", lambda *_a, **_kw: _pane())
+    monkeypatch.setattr(sv.time, "sleep", lambda *_a: None)
+    monkeypatch.setattr(sv, "_context_token_count", lambda *_a, **_kw: (100, "transcript"))
+    events_path = str(tmp_path / "events.jsonl")
+    outcome = sv._pane_clear_context(
+        "%91", task_id="next", project="demo", role="implementer",
+        agent="claude", worktree_path="/w/claude", context_tokens=BIG,
+        token_source="transcript", threshold=sv._TOKEN_CLEAR_THRESHOLD,
+        events_path=events_path, queue=q)
+    event = json.loads((tmp_path / "events.jsonl").read_text().splitlines()[0])
+    assert outcome == event["outcome"] == "confirmed"
+    assert event["context_id"] == identity["context_id"]
+    assert event["context_generation"] == identity["context_generation"]
+    assert event["provider_session_id"] == "session-before-clear"
+    assert event["context_tokens"] == BIG
+    assert event["cap_tokens"] == sv._TOKEN_CLEAR_THRESHOLD
+    assert event["post_clear_tokens"] == 100
 
 
 def test_an_unknown_context_identity_is_absent_not_invented(tmp_path):
@@ -283,7 +313,11 @@ def _failing_send(tmp_path, monkeypatch, *, task_type="implement", context=None,
     wt.mkdir(parents=True, exist_ok=True)
     _session(tmp_path / "claudehome", str(wt), BIG)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"port": 0, "roles": [
+        {"role": "implementer", "agent": "claude", "worktree": str(wt)},
+        {"role": "reviewer", "agent": "codex", "worktree": str(wt.parent / "codex")},
+        {"role": "tester", "agent": "gemini", "worktree": str(wt.parent / "gemini")},
+    ]}))
 
     def fake_run(cmd, **kw):
         if isinstance(cmd, list) and "send-keys" in cmd and "/clear" in cmd:
@@ -342,10 +376,10 @@ def test_a_failed_send_is_still_recorded(tmp_path, monkeypatch, *, unused_tcp_po
     assert events[0]["outcome"] == "send_failed"
 
 
-def test_a_successful_send_is_still_marked(tmp_path, monkeypatch, *, unused_tcp_port):
-    """⛔The control, so the fix is not simply "never mark"."""
+def test_a_successful_send_is_still_recorded_as_attempted(tmp_path, monkeypatch, *, unused_tcp_port):
     _, _, ctx = _run(tmp_path, monkeypatch, unused_tcp_port=unused_tcp_port)
-    assert ctx["context_reset"] is True and ctx["auto_cleared_before_push"] is True
+    assert ctx["auto_clear_outcome"] == "attempted"
+    assert "context_reset" not in ctx
 
 
 # ── 6. the event's role comes from the live map ───────────────────────
@@ -405,7 +439,7 @@ def test_an_ambiguous_agent_emits_no_role_rather_than_a_guess():
 
 
 def test_the_role_lookup_falls_back_to_the_static_default():
-    assert sv._agent_role("codex", None) == "reviewer"
+    assert sv._agent_role("codex", None) == "implementer"
 
 
 def test_an_unknown_agent_has_no_role():
