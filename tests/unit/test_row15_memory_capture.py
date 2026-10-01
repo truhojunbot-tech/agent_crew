@@ -17,6 +17,7 @@ from agent_crew.memory_capture import (
 from agent_crew.memory_runtime import (
     MemoryScope, SQLiteMemoryStorage, RuntimeMemoryProvider, MemoryRecord,
     capture_owner_statement, effective_owner_statements, reconstruct_context,
+    shadow_sqlite_timeout_seconds,
 )
 from agent_crew.memory import MemoryRequest, shadow_retrieve
 from scripts.migrate_memory_project_keys import migrate
@@ -91,6 +92,47 @@ def test_scope_enrichment_preserves_version_lineage(tmp_path):
         versions = db.execute("SELECT version FROM adr001_memory WHERE key LIKE 'task:scope-task:%'").fetchall()
     assert len(versions) == 3
     assert {row[0] for row in versions} == {3}
+
+
+def test_shadow_prune_deletes_one_batch_per_call_then_converges(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    scope = json.dumps({"project": "agent_crew"})
+    with sqlite3.connect(storage.path) as db:
+        db.executemany("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)", (
+            ("episodic", f"task:seed-{index}", "{}", scope, 1, float(index))
+            for index in range(1020)))
+    record = MemoryRecord("episodic", "task:new", {}, MemoryScope(project="agent_crew"))
+    def count():
+        with sqlite3.connect(storage.path) as db:
+            return db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
+
+    storage.put_many_shadow([record])
+    assert count() == 971  # 1021 rows before prune; only one 50-row batch deleted.
+    for _ in range(3):
+        storage.put_many_shadow([record])
+    assert count() == 900
+
+
+def test_shadow_prune_keeps_table_at_or_below_retention_size(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    scope = json.dumps({"project": "agent_crew"})
+    with sqlite3.connect(storage.path) as db:
+        db.executemany("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)", (
+            ("episodic", f"task:seed-{index}", "{}", scope, 1, float(index))
+            for index in range(898)))
+    storage.put_many_shadow([
+        MemoryRecord("episodic", "task:new", {}, MemoryScope(project="agent_crew"))])
+    with sqlite3.connect(storage.path) as db:
+        assert db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0] == 899
+
+
+def test_shadow_sqlite_wait_is_bounded_by_capture_timeout(monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", raising=False)
+    assert shadow_sqlite_timeout_seconds() == 0.05
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.01")
+    assert shadow_sqlite_timeout_seconds() == 0.01
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.2")
+    assert shadow_sqlite_timeout_seconds() == 0.05
 
 
 def test_result_capture_without_attribution_table_and_bad_issue(tmp_path, monkeypatch):

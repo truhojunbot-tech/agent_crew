@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from agent_crew.memory_runtime import (
     MemoryRecord, MemoryScope, SQLiteMemoryStorage, ingest_blackboard_entry,
+    shadow_sqlite_timeout_seconds,
 )
 from agent_crew.context_identity import record_context_event
 
@@ -144,8 +145,9 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
         path = Path(shadow_db).expanduser()
         if not path.is_file():
             raise FileNotFoundError(path)
+        timeout_seconds = shadow_sqlite_timeout_seconds()
         with closing(sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True,
-                                     timeout=0.05)) as db:
+                                     timeout=timeout_seconds)) as db:
             row = db.execute("SELECT project,context FROM tasks WHERE task_id=?",
                              (task_id,)).fetchone()
             try:
@@ -172,7 +174,7 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
                              task_id=task_id, outcome="stored",
                              layers=[record.layer for record in records],
                              latency_ms=round((perf_counter() - started) * 1000, 3),
-                             over_budget=(perf_counter() - started) > 0.05)
+                             over_budget=(perf_counter() - started) > timeout_seconds)
     except Exception as exc:
         unknown = isinstance(exc, ValueError) and "unknown or ambiguous memory project" in str(exc)
         warning_key = row[0] if unknown and "row" in locals() and row else ""

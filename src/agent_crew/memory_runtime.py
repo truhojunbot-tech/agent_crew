@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import sqlite3
 import time
@@ -13,6 +14,22 @@ from typing import Optional, Protocol
 
 LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
                     "decision", "failure_pattern"})
+SHADOW_RETENTION_ROWS_PER_PROJECT = 900
+SHADOW_PRUNE_BATCH_ROWS = 50
+SHADOW_RETRIEVAL_MAX_ROWS = 50
+SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS = 0.05
+
+
+def shadow_sqlite_timeout_seconds() -> float:
+    """Keep shadow DB waits within both the capture and configured time budgets."""
+    try:
+        configured = float(os.getenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS",
+                                     str(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS)))
+    except ValueError:
+        configured = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
+    if not math.isfinite(configured) or configured <= 0:
+        configured = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
+    return min(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS, configured)
 
 
 @dataclass(frozen=True)
@@ -161,7 +178,7 @@ class SQLiteMemoryStorage:
                 (record.layer, record.key, json.dumps(record.value), _canonical_scope_json(record.scope), record.version, time.time())); db.commit()
 
     def put_many_shadow(self, records: list[MemoryRecord], *, retire_keys: tuple[str, ...] = (),
-                        max_rows_per_project: int = 900) -> None:
+                        max_rows_per_project: int = SHADOW_RETENTION_ROWS_PER_PROJECT) -> None:
         """Batch derived evidence in one bounded transaction, pruning old captures."""
         if not records:
             return
@@ -169,7 +186,7 @@ class SQLiteMemoryStorage:
         if not project or any(r.scope.project != project or r.layer not in {
                 "episodic", "decision", "failure_pattern"} for r in records):
             raise ValueError("shadow batch requires one project and derived layers")
-        with closing(sqlite3.connect(self.path, timeout=0.05)) as db:
+        with closing(sqlite3.connect(self.path, timeout=shadow_sqlite_timeout_seconds())) as db:
             db.execute("BEGIN IMMEDIATE")
             for record in records:
                 scope = _canonical_scope_json(record.scope)
@@ -201,8 +218,8 @@ class SQLiteMemoryStorage:
                 WHERE layer IN ('episodic','decision','failure_pattern')
                   AND json_extract(scope, '$.project')=?
                   AND (key GLOB 'task:*' OR key GLOB 'episode:*')
-                ORDER BY created DESC,rowid DESC LIMIT -1 OFFSET ?)""",
-                (project, max_rows_per_project))
+                ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
+                (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
             db.commit()
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
         fields = asdict(scope)
@@ -269,13 +286,13 @@ class SQLiteMemoryStorage:
                 + " AND json_extract(value,'$.superseded_at') IS NULL"
                 + " AND COALESCE(json_extract(value,'$.superseded'),0)=0")
         args = [*sorted(layers), *params]
-        with closing(sqlite3.connect(self.path, timeout=0.05)) as db:
+        with closing(sqlite3.connect(self.path, timeout=shadow_sqlite_timeout_seconds())) as db:
             dropped = db.execute("SELECT count(*) FROM adr001_memory WHERE " + base +
                 " AND COALESCE(json_extract(scope,'$.project'),'')=''", args).fetchone()[0]
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
                 + base + " AND json_extract(scope,'$.project')=? "
                 "ORDER BY created DESC,rowid DESC LIMIT ?",
-                [*args, scope.project, min(limit, 50)]).fetchall()
+                [*args, scope.project, min(limit, SHADOW_RETRIEVAL_MAX_ROWS)]).fetchall()
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
         return [r for r in records if _scope_applies(r.scope, scope, strict=False)], dropped
