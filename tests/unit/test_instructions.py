@@ -10,6 +10,8 @@ def test_review_and_test_pytest_runs_are_bounded(role, delivery):
     assert 'timeout -k 10 "$N" python -m pytest' in content
     assert "remaining dispatch budget" in content
     assert "600" in content
+    assert "900-second" in content
+    assert "1200-second" not in content
     assert "124" in content and "137" in content
     assert "files changed by the PR" in content
     assert "full suite was not completed" in content

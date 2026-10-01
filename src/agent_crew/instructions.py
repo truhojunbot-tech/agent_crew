@@ -828,8 +828,9 @@ _BOUNDED_PYTEST = """\
 Bound **every** pytest invocation, including a fallback run. At task receipt,
 note the start time. Before each run, set `N` to the smaller of 600 seconds and
 half the remaining dispatch budget in whole seconds. Use
-`context.dispatch_timeout_s` from the task block; if absent, use a 1200-second
-budget, giving a 600-second default. Subtract elapsed time since task receipt
+`context.dispatch_timeout_s` from the task block; if absent, use a conservative
+900-second budget (the tester default), giving at most 450 seconds. Subtract
+elapsed time since task receipt
 before halving. If no time remains, do not start pytest.
 
 ```bash
