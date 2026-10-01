@@ -355,7 +355,7 @@ def _status_all_projects(base: str) -> None:
             if port and _port_listening(port, timeout=1.0):
                 alive = True
                 for api_status, disp in [("pending", "p"), ("in_progress", "ip"), ("completed", "c"), ("failed", "f")]:
-                    tasks = _fetch_tasks_by_status(port, api_status)
+                    tasks = _fetch_tasks_by_status(port, api_status, project=name)
                     if disp == "p":
                         pending = len(tasks)
                     elif disp == "ip":
@@ -748,16 +748,18 @@ def _validate_pane_map(session: str, pane_ids: list[str], worktrees: dict[str, s
     }
 
 
-def _verify_delivery(port: int, task_id: str, timeout: float = 15.0) -> bool:
+def _verify_delivery(port: int, task_id: str, timeout: float = 15.0,
+                     project: str = "") -> bool:
     """Poll task status until it transitions out of 'pending' (i.e. pane received it).
     Returns True if delivered, False if still pending after timeout."""
     import urllib.request
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/tasks/{task_id}", timeout=2
-            ) as resp:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/tasks/{task_id}",
+                headers={"X-Agent-Crew-Project": project} if project else {})
+            with urllib.request.urlopen(req, timeout=2) as resp:
                 task = json.loads(resp.read())
             if task.get("status") != "pending":
                 return True
@@ -779,12 +781,13 @@ _STATUS_ALIASES = (
 # Reverse map: DB status → display label (used in DB fallback)
 _DB_STATUS_TO_DISPLAY = {api: disp for disp, api in _STATUS_ALIASES}
 
-def _fetch_tasks_by_status(port: int, status: str) -> list[dict]:
+def _fetch_tasks_by_status(port: int, status: str, project: str = "") -> list[dict]:
     import urllib.request
 
-    with urllib.request.urlopen(
-        f"http://127.0.0.1:{port}/tasks?status={status}", timeout=2
-    ) as resp:
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/tasks?status={status}",
+        headers={"X-Agent-Crew-Project": project} if project else {})
+    with urllib.request.urlopen(req, timeout=2) as resp:
         return json.loads(resp.read())
 
 
@@ -1529,7 +1532,7 @@ def status(project: str, base: str, preview: int):
     task_groups = None
     try:
         task_groups = {
-            display_status: _fetch_tasks_by_status(port, api_status)
+            display_status: _fetch_tasks_by_status(port, api_status, project=project)
             for display_status, api_status in _STATUS_ALIASES
         }
     except Exception:
@@ -2568,9 +2571,10 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         """Resolve any pending gates via HTTP. Returns count of resolved gates."""
         resolved = 0
         try:
-            with _urllib_req.urlopen(
-                f"http://127.0.0.1:{port}/gates/pending", timeout=2
-            ) as resp:
+            req = _urllib_req.Request(
+                f"http://127.0.0.1:{port}/gates/pending",
+                headers={"X-Agent-Crew-Project": project})
+            with _urllib_req.urlopen(req, timeout=2) as resp:
                 gates = json.loads(resp.read())
             for gate in gates:
                 gate_id = gate.get("id") or gate.get("gate_id")
@@ -2580,7 +2584,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                 req = _urllib_req.Request(
                     f"http://127.0.0.1:{port}/gates/{gate_id}/resolve",
                     data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers={"Content-Type": "application/json",
+                             "X-Agent-Crew-Project": project},
                     method="POST",
                 )
                 try:
@@ -2730,7 +2735,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     impl_id = _adopted_impl_id or enqueue_implement(
         queue, task, branch, context=impl_context, port=_run_port)
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
-    if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0):
+    if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0,
+                                          project=project):
         click.echo(f"Warning: task {impl_id!r} still pending after 15s — agent pane may not have received it.")
 
     _loop_pr_number: int | None = None  # first PR number seen across all results

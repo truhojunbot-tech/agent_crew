@@ -2,18 +2,80 @@
 
 import json
 import subprocess
-from unittest.mock import MagicMock, patch
 from io import BytesIO
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-from agent_crew.cli import crew
+from agent_crew.cli import _fetch_tasks_by_status, _verify_delivery, crew
 from agent_crew.instructions import generate
 from agent_crew.project_identity import ProjectIdentityError, verify_server_identity
 from agent_crew.server import _format_task_message, create_app
 from agent_crew.queue import TaskRequest
 from agent_crew.loop import _post_task_http
+
+
+# Routes used by worker instructions or by the crew run/CLI HTTP transport.
+_WORKER_HTTP_ROUTES = [
+    ("post", "/tasks", {"task_id": "impl-route", "task_type": "implement",
+                        "description": "work", "project": "alpha"}),
+    ("get", "/tasks/next?role=implementer", None),
+    ("get", "/tasks", None),
+    ("get", "/tasks/impl-route", None),
+    ("post", "/tasks/impl-route/start", {"nonce": "x"}),
+    ("post", "/tasks/impl-route/result", {"task_id": "impl-route",
+                                           "status": "failed", "summary": "work failed"}),
+    ("get", "/gates/pending", None),
+    ("post", "/gates/unknown/resolve", {"status": "rejected"}),
+    ("post", "/tasks/impl-route/checkpoint", {"checkpoint_num": 1, "state": {}}),
+    ("get", "/tasks/impl-route/checkpoints", None),
+    ("get", "/tasks/impl-route/checkpoint/latest", None),
+    ("get", "/tasks/impl-route/checkpoint/1", None),
+]
+
+
+@pytest.mark.parametrize("method,path,body", _WORKER_HTTP_ROUTES)
+def test_worker_http_routes_require_matching_project(tmp_path, method, path, body):
+    with TestClient(create_app(str(tmp_path / "tasks.db"), project="alpha",
+                               identity_required=True, watchdog_disabled=True,
+                               anomaly_disabled=True)) as client:
+        request = getattr(client, method)
+        kwargs = {"json": body} if body is not None else {}
+        assert request(path, **kwargs).status_code == 428
+        assert request(path, headers={"X-Agent-Crew-Project": "beta"},
+                       **kwargs).status_code == 409
+
+
+def test_checkpoint_latest_routes_before_number_and_accepts_matching_project(tmp_path):
+    with TestClient(create_app(str(tmp_path / "tasks.db"), project="alpha",
+                               identity_required=True, watchdog_disabled=True,
+                               anomaly_disabled=True)) as client:
+        headers = {"X-Agent-Crew-Project": "alpha"}
+        saved = client.post("/tasks/impl-route/checkpoint", headers=headers,
+                            json={"checkpoint_num": 1, "state": {"step": "done"}})
+        assert saved.status_code == 201
+        latest = client.get("/tasks/impl-route/checkpoint/latest", headers=headers)
+        assert latest.status_code == 200
+        assert latest.json() == {"checkpoint_num": 1, "state": {"step": "done"}}
+
+
+def test_cli_task_reads_send_project_header():
+    class Response(BytesIO):
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            self.close()
+
+    with patch("urllib.request.urlopen", return_value=Response(
+            b'{"status":"completed"}')) as urlopen:
+        assert _verify_delivery(8102, "impl-route", project="alpha")
+    assert urlopen.call_args.args[0].get_header("X-agent-crew-project") == "alpha"
+    with patch("urllib.request.urlopen", return_value=Response(b'[]')) as urlopen:
+        assert _fetch_tasks_by_status(8102, "pending", project="alpha") == []
+    assert urlopen.call_args.args[0].get_header("X-agent-crew-project") == "alpha"
 
 
 def test_health_keeps_existing_project_identity(tmp_path):
@@ -40,7 +102,8 @@ def test_worker_transport_refuses_missing_and_foreign_identity_before_claim(tmp_
         assert client.post("/tasks/impl-identity/start", json={"nonce": "x"}).status_code == 428
         assert client.post("/tasks/impl-identity/start", json={"nonce": "x"}, headers={
             "X-Agent-Crew-Project": "beta"}).status_code == 409
-        assert client.get("/tasks/impl-identity").json()["status"] == "pending"
+        assert client.get("/tasks/impl-identity", headers={
+            "X-Agent-Crew-Project": "alpha"}).json()["status"] == "pending"
         claimed = client.get("/tasks/next?role=implementer", headers={
             "X-Agent-Crew-Project": "alpha"})
         assert claimed.status_code == 200
@@ -56,7 +119,8 @@ def test_http_enqueue_requires_matching_project_before_insert(tmp_path):
         assert client.post("/tasks", json=task).status_code == 428
         assert client.post("/tasks", json=task, headers={
             "X-Agent-Crew-Project": "beta"}).status_code == 409
-        assert client.get("/tasks/impl-http").status_code == 404
+        assert client.get("/tasks/impl-http", headers={
+            "X-Agent-Crew-Project": "alpha"}).status_code == 404
         assert client.post("/tasks", json=task, headers={
             "X-Agent-Crew-Project": "alpha"}).status_code == 201
 
@@ -117,6 +181,8 @@ def test_generated_protocol_and_pushed_result_assert_project():
     assert "/health" in text
     assert "Do not receive a task or submit a result" in text
     assert "X-Agent-Crew-Project: alpha" in text
+    assert 'curl -sS -H "X-Agent-Crew-Project: alpha" http://127.0.0.1:8102/tasks/<task_id>/checkpoint/latest' in text
+    assert 'curl -sS -H "X-Agent-Crew-Project: alpha" http://127.0.0.1:8102/tasks/<task_id>/checkpoints' in text
     start = text.index("curl -sS -X POST http://127.0.0.1:8102/tasks/<task_id>/result")
     command = text[start:text.index("\n```", start)].replace("<task_id>", "task-1")
     # Execute with a shell function in place of curl: this checks the real

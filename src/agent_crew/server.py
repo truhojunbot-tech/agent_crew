@@ -6476,7 +6476,8 @@ def create_app(
         return {**dataclasses.asdict(task), "dispatch_nonce": nonce}
 
     @app.get("/tasks")
-    def list_tasks(status: str = ""):
+    def list_tasks(status: str = "", x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         return q().list_tasks(status=status)
 
     def _dispatcher_lease_view() -> tuple[Optional[set], Optional[set]]:
@@ -6540,7 +6541,8 @@ def create_app(
         }
 
     @app.get("/tasks/{task_id}")
-    def get_task(task_id: str):
+    def get_task(task_id: str, x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         tasks = q().list_tasks()
         for t in tasks:
             if t.task_id == task_id:
@@ -7201,7 +7203,8 @@ def create_app(
         return {"gate_id": gate_id}
 
     @app.get("/gates/pending")
-    def get_pending_gates():
+    def get_pending_gates(x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         return q().list_gates(status="pending")
 
     @app.get("/gates/{gate_id}")
@@ -7213,7 +7216,9 @@ def create_app(
         raise HTTPException(status_code=404, detail=f"Gate {gate_id!r} not found")
 
     @app.post("/gates/{gate_id}/resolve", status_code=200)
-    def resolve_gate(gate_id: str, body: ResolveBody):
+    def resolve_gate(gate_id: str, body: ResolveBody,
+                     x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
         try:
             q().resolve_gate(gate_id, approved=body.status == "approved")
         except ValueError as e:
@@ -7241,8 +7246,10 @@ def create_app(
         return {"status": "resolved"}
 
     @app.post("/tasks/{task_id}/checkpoint", status_code=201)
-    def save_checkpoint(task_id: str, checkpoint: dict):
+    def save_checkpoint(task_id: str, checkpoint: dict,
+                        x_agent_crew_project: Optional[str] = Header(default=None)):
         """Save a task checkpoint for fault recovery and time-travel debugging."""
+        _require_project_identity(x_agent_crew_project)
         checkpoint_num = checkpoint.get("checkpoint_num", 0)
         state = checkpoint.get("state", {})
         try:
@@ -7255,8 +7262,10 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(e))
 
     @app.get("/tasks/{task_id}/checkpoints")
-    def list_task_checkpoints(task_id: str):
+    def list_task_checkpoints(task_id: str,
+                              x_agent_crew_project: Optional[str] = Header(default=None)):
         """List all checkpoints for a task."""
+        _require_project_identity(x_agent_crew_project)
         try:
             checkpoints = q().list_checkpoints(task_id)
             logger.info(f"GET /tasks/{task_id}/checkpoints: found {len(checkpoints)} checkpoints")
@@ -7265,24 +7274,11 @@ def create_app(
             logger.error(f"GET /tasks/{task_id}/checkpoints: error: {e}")
             raise HTTPException(status_code=400, detail=str(e))
 
-    @app.get("/tasks/{task_id}/checkpoint/{checkpoint_num}")
-    def get_task_checkpoint(task_id: str, checkpoint_num: int):
-        """Retrieve a specific checkpoint for time-travel debugging."""
-        try:
-            state = q().get_checkpoint(task_id, checkpoint_num)
-            if state is None:
-                raise HTTPException(status_code=404, detail=f"Checkpoint {checkpoint_num} not found for task {task_id}")
-            logger.info(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: retrieved")
-            return {"checkpoint_num": checkpoint_num, "state": state}
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: error: {e}")
-            raise HTTPException(status_code=400, detail=str(e))
-
     @app.get("/tasks/{task_id}/checkpoint/latest")
-    def get_latest_task_checkpoint(task_id: str):
+    def get_latest_task_checkpoint(task_id: str,
+                                   x_agent_crew_project: Optional[str] = Header(default=None)):
         """Retrieve the latest checkpoint for a task."""
+        _require_project_identity(x_agent_crew_project)
         try:
             result = q().get_latest_checkpoint(task_id)
             if result is None:
@@ -7294,6 +7290,23 @@ def create_app(
             raise
         except Exception as e:
             logger.error(f"GET /tasks/{task_id}/checkpoint/latest: error: {e}")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    @app.get("/tasks/{task_id}/checkpoint/{checkpoint_num}")
+    def get_task_checkpoint(task_id: str, checkpoint_num: int,
+                            x_agent_crew_project: Optional[str] = Header(default=None)):
+        """Retrieve a specific checkpoint for time-travel debugging."""
+        _require_project_identity(x_agent_crew_project)
+        try:
+            state = q().get_checkpoint(task_id, checkpoint_num)
+            if state is None:
+                raise HTTPException(status_code=404, detail=f"Checkpoint {checkpoint_num} not found for task {task_id}")
+            logger.info(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: retrieved")
+            return {"checkpoint_num": checkpoint_num, "state": state}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"GET /tasks/{task_id}/checkpoint/{checkpoint_num}: error: {e}")
             raise HTTPException(status_code=400, detail=str(e))
 
     return app

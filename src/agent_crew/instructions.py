@@ -142,7 +142,7 @@ fi
 ```
 
 Include `X-Agent-Crew-Project: <project>` on every worker HTTP poll, start,
-result, and task-enqueue POST.
+result, checkpoint, and task-enqueue request.
 
 At session start and after each task completes, poll every 30 seconds for the
 next task so no task is missed even if a push is delayed:
@@ -298,10 +298,10 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks/<task_id>/checkpoint \\
   }'
 
 # Retrieve latest checkpoint if resuming from failure
-curl -sS http://127.0.0.1:<port>/tasks/<task_id>/checkpoint/latest | jq '.state'
+curl -sS -H "X-Agent-Crew-Project: <project>" http://127.0.0.1:<port>/tasks/<task_id>/checkpoint/latest | jq '.state'
 
 # List all checkpoints for time-travel debugging
-curl -sS http://127.0.0.1:<port>/tasks/<task_id>/checkpoints | jq '.'
+curl -sS -H "X-Agent-Crew-Project: <project>" http://127.0.0.1:<port>/tasks/<task_id>/checkpoints | jq '.'
 ```
 
 Benefits:
