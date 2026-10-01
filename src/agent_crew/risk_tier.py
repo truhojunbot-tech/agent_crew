@@ -104,7 +104,7 @@ def _explicit_risk_declaration(context: Mapping | None) -> dict | None:
         if any(field in raw and isinstance(raw.get(field), bool) for field in RISK_DECLARATION_FIELDS):
             inherited_from = raw.get("inherited_from")
             if isinstance(inherited_from, str) and inherited_from:
-                return {**values, "declaration_source": "inherited", "confidence": "high",
+                return {**values, "declaration_source": "explicit", "confidence": "high",
                         "inherited_from": inherited_from}
             return {**values, "declaration_source": "explicit", "confidence": "high"}
 
@@ -143,7 +143,7 @@ def risk_declaration(description: str, context: Mapping | None = None) -> dict:
     """
     explicit = _explicit_risk_declaration(context)
     if explicit is not None:
-        if explicit["declaration_source"] == "inherited":
+        if explicit.get("inherited_from"):
             tier = classify_task(description, context)
             stronger = {}
             if tier == TIER_3:

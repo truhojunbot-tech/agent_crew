@@ -954,7 +954,7 @@ def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
     root_context = root.context if root and isinstance(root.context, dict) else {}
     declaration = root_context.get("risk_declaration")
     if (isinstance(declaration, dict)
-            and declaration.get("declaration_source") in {"explicit", "inherited"}
+            and declaration.get("declaration_source") == "explicit"
             and any(isinstance(declaration.get(field), bool) for field in (
                 "safety_or_live_change", "broad_architecture_change",
                 "bounded_routine_fix", "human_gate_required"))):
@@ -2118,7 +2118,7 @@ def auto_fallback_failed_task(
         ctx = successor_context(original.context)
         copied_risk = ctx.get("risk_declaration")
         if (isinstance(copied_risk, dict)
-                and copied_risk.get("declaration_source") in {"explicit", "inherited"}):
+                and copied_risk.get("declaration_source") == "explicit"):
             ctx["risk_declaration"] = {
                 **copied_risk,
                 "inherited_from": copied_risk.get("inherited_from") or task_id,

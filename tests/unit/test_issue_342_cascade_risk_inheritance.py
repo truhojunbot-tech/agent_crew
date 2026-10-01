@@ -40,7 +40,8 @@ def test_review_and_fix_inherit_explicit_root_declaration(tmp_db):
     _root(queue)
     review_id = _review(queue)
     review = _attribution(queue, review_id)
-    assert review["risk_declaration_source"] == "inherited"
+    assert review["risk_declaration_source"] == "explicit"
+    assert review["risk_declaration_confidence"] == "high"
     assert review["bounded_routine_fix"] == 1
     assert review["safety_or_live_change"] == 0
     assert queue.get_task_context(review_id)["risk_declaration"]["inherited_from"] == "risk-root"
@@ -52,7 +53,8 @@ def test_review_and_fix_inherit_explicit_root_declaration(tmp_db):
                               repo="owner/repo")
     assert fix_id
     fix = _attribution(queue, fix_id)
-    assert fix["risk_declaration_source"] == "inherited"
+    assert fix["risk_declaration_source"] == "explicit"
+    assert fix["risk_declaration_confidence"] == "high"
     assert fix["bounded_routine_fix"] == 1
     assert queue.get_task_context(fix_id)["risk_declaration"]["inherited_from"] == "risk-root"
 
@@ -66,8 +68,10 @@ def test_test_task_inherits_explicit_root_declaration(tmp_db):
     test_id = auto_enqueue_test(queue, review_id, pr_state_fn=lambda _: "open")
     assert test_id
     attribution = _attribution(queue, test_id)
-    assert attribution["risk_declaration_source"] == "inherited"
+    assert attribution["risk_declaration_source"] == "explicit"
+    assert attribution["risk_declaration_confidence"] == "high"
     assert attribution["bounded_routine_fix"] == 1
+    assert queue.get_task_context(test_id)["risk_declaration"]["inherited_from"] == "risk-root"
 
 
 def test_root_without_explicit_declaration_does_not_inherit(tmp_db):
@@ -108,5 +112,6 @@ def test_fallback_successor_context_marks_root_declaration_inherited(tmp_db):
     assert handled
     fallback = next(t for t in queue.list_tasks() if t.task_id.startswith("fallback-"))
     attribution = _attribution(queue, fallback.task_id)
-    assert attribution["risk_declaration_source"] == "inherited"
+    assert attribution["risk_declaration_source"] == "explicit"
+    assert attribution["risk_declaration_confidence"] == "high"
     assert queue.get_task_context(fallback.task_id)["risk_declaration"]["inherited_from"] == "risk-root"
