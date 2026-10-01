@@ -284,10 +284,10 @@ ENFORCEMENT_AUDIT_STATUS = {
     "ALREADY_COMPLETED": "rejected",       # 0/5
     "BUDGET_EXHAUSTED": "rejected",        # 0/2
     "BUDGET_UNVERIFIED": "rejected",       # 0/9
+    # Generic validator placeholders are replaced by the receipt's reason
+    # before the allowlist check. Named gate outcomes are real, unaudited codes.
+    "DECISION_BLOCK": "not_applicable",
     "DECISION_HUMAN_GATE": "not_applicable",
-    "HUMAN_GATE_DENIED": "not_applicable",
-    "HUMAN_GATE_PENDING": "not_applicable",
-    "HUMAN_GATE_REVOKED": "not_applicable",
 }
 
 

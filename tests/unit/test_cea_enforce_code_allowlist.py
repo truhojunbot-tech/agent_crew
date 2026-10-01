@@ -88,7 +88,11 @@ def test_supported_code_has_no_audit_warning(caplog):
 
 @pytest.mark.parametrize("code,status", [
     ("OWNER_CONFLICT", "unaudited"),
-    ("HUMAN_GATE_PENDING", "not_applicable"),
+    ("HUMAN_GATE_DENIED", "unaudited"),
+    ("HUMAN_GATE_PENDING", "unaudited"),
+    ("HUMAN_GATE_REVOKED", "unaudited"),
+    ("DECISION_BLOCK", "not_applicable"),
+    ("DECISION_HUMAN_GATE", "not_applicable"),
 ])
 def test_other_audit_status_is_named_in_warning(caplog, code, status):
     with caplog.at_level(logging.WARNING):
@@ -96,6 +100,17 @@ def test_other_audit_status_is_named_in_warning(caplog, code, status):
     assert config.enforce_codes == frozenset({code})
     assert [r.message for r in caplog.records if "CEA enforcement audit" in r.message] == [
         f"CEA enforcement audit: {code} is {status}; allowlist still applies"]
+
+
+@pytest.mark.parametrize("code,outcome", [
+    ("HUMAN_GATE_DENIED", ValidationOutcome.BLOCK),
+    ("HUMAN_GATE_PENDING", ValidationOutcome.HUMAN_GATE),
+    ("HUMAN_GATE_REVOKED", ValidationOutcome.BLOCK),
+])
+def test_named_human_gate_code_can_enforce_when_allowlisted(code, outcome):
+    config = EngineConfig(mode="enforce", enforce_codes=frozenset({code}))
+    gate = _verdict(code, outcome, config)
+    assert gate.enforced is True and gate.proceed is False
 
 
 def test_advisory_start_response_says_go_and_keeps_real_outcome(tmp_path):
