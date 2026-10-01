@@ -194,6 +194,56 @@ def test_shadow_scope_restricts_explicit_dimensions_and_fleet(tmp_path):
                             worktree="/tmp/one", provider_session="session-one"))
 
 
+def _query_storage(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "query-memory.db"))
+    scope = MemoryScope(project="agent_crew")
+    for key, value, created in (
+        ("task:matched", {"text": "solar battery"}, 1),
+        ("task:partial", {"text": "solar"}, 2),
+        ("task:unrelated", {"text": "notes"}, 3),
+    ):
+        storage.put(MemoryRecord("episodic", key, value, scope))
+        with sqlite3.connect(storage.path) as db:
+            db.execute("UPDATE adr001_memory SET created=? WHERE key=?", (created, key))
+    return storage
+
+
+def test_shadow_query_uses_same_ranker_as_regular_provider_branch(tmp_path):
+    storage = _query_storage(tmp_path)
+
+    class OtherStorage:
+        def retrieve(self, scope, query="", exact_key=""):
+            return storage.retrieve(scope, query=query, exact_key=exact_key)
+
+    request = MemoryRequest(project="agent_crew", memory_types=("episodic",),
+                            limit=2, retrieval_query="solar battery")
+    regular = RuntimeMemoryProvider(OtherStorage()).retrieve(request)
+    shadow = RuntimeMemoryProvider(storage).retrieve(request)
+    assert [item.item_id for item in regular.items] == ["task:matched", "task:partial"]
+    assert [item.item_id for item in shadow.items] == [item.item_id for item in regular.items]
+
+
+def test_shadow_empty_query_retains_recent_first_order(tmp_path):
+    storage = _query_storage(tmp_path)
+    request = MemoryRequest(project="agent_crew", memory_types=("episodic",), limit=2)
+    result = RuntimeMemoryProvider(storage).retrieve(request)
+    assert [item.item_id for item in result.items] == ["task:unrelated", "task:partial"]
+
+
+def test_shadow_query_does_not_return_foreign_or_projectless_rows(tmp_path):
+    storage = _query_storage(tmp_path)
+    storage.put(MemoryRecord("episodic", "task:foreign", {"text": "solar battery"},
+                             MemoryScope(project="halla")))
+    storage.put(MemoryRecord("episodic", "task:unscoped", {"text": "solar battery"},
+                             MemoryScope()))
+    request = MemoryRequest(project="agent_crew", memory_types=("episodic",),
+                            limit=5, retrieval_query="solar battery")
+    result = RuntimeMemoryProvider(storage).retrieve(request)
+    assert [item.item_id for item in result.items] == [
+        "task:matched", "task:partial", "task:unrelated"]
+    assert result.dropped_cross_project == 1
+
+
 def test_result_and_episode_missing_scope_fields_stay_empty(tmp_path, monkeypatch):
     memory_db = tmp_path / "memory.db"
     storage = SQLiteMemoryStorage(str(memory_db))

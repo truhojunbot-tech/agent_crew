@@ -65,6 +65,13 @@ def _scope_specificity(scope: MemoryScope) -> int:
     return sum(value not in ("", None) for value in asdict(scope).values())
 
 
+def _retrieval_rank(record: MemoryRecord, terms: set[str]) -> tuple[int, int, str]:
+    """Shared relevance and scope order for both storage retrieval paths."""
+    text = (record.key + ' ' + json.dumps(record.value)).lower().replace('-', ' ')
+    relevance = len(terms.intersection(text.split()))
+    return (-relevance, -_scope_specificity(record.scope), record.key)
+
+
 def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
                    *, strict: bool = True) -> bool:
     """Return whether a stored scope applies to a query under ADR-001 order."""
@@ -253,14 +260,10 @@ class SQLiteMemoryStorage:
                   and not record.value.get("superseded_at")
                   and not record.value.get("superseded")]
         terms = set(query.lower().replace('-', ' ').split())
-        def rank(record):
-            text = (record.key + ' ' + json.dumps(record.value)).lower().replace('-', ' ')
-            relevance = len(terms.intersection(text.split()))
-            specificity = _scope_specificity(record.scope)
-            return (-relevance, -specificity, record.key)
-        return sorted(result, key=rank)
+        return sorted(result, key=lambda record: _retrieval_rank(record, terms))
 
-    def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int
+    def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int,
+                        query: str = ""
                         ) -> tuple[list[MemoryRecord], int]:
         """Bound parsing to recent candidates and count project-less drops."""
         if not scope.project or not layers or limit <= 0:
@@ -298,10 +301,15 @@ class SQLiteMemoryStorage:
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
                 + base + " AND json_extract(scope,'$.project')=? "
                 "ORDER BY created DESC,rowid DESC LIMIT ?",
-                [*args, scope.project, min(limit, SHADOW_RETRIEVAL_MAX_ROWS)]).fetchall()
+                [*args, scope.project, (SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
+                                        else min(limit, SHADOW_RETRIEVAL_MAX_ROWS))]).fetchall()
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
-        return [r for r in records if _scope_applies(r.scope, scope, strict=False)], dropped
+        scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
+        if query.strip():
+            terms = set(query.lower().replace('-', ' ').split())
+            scoped.sort(key=lambda record: _retrieval_rank(record, terms))
+        return scoped[:min(limit, SHADOW_RETRIEVAL_MAX_ROWS)], dropped
 
 
 def owner_statement_key(project: str, channel: str, chat_id: str,
@@ -449,7 +457,8 @@ class RuntimeMemoryProvider:
             "procedural", "episodic", "decision", "failure_pattern"}
         allowed &= {"procedural", "episodic", "decision", "failure_pattern"}
         if isinstance(self.storage, SQLiteMemoryStorage):
-            scoped, dropped = self.storage.retrieve_shadow(scope, allowed, request.limit)
+            scoped, dropped = self.storage.retrieve_shadow(
+                scope, allowed, request.limit, query=request.retrieval_query)
         else:
             records = [record for record in self.storage.retrieve(scope,
                 query=request.retrieval_query) if record.layer in allowed]
