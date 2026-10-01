@@ -4,7 +4,6 @@ import os
 import shutil
 import signal
 import socket
-import urllib.parse
 import subprocess
 import sys
 import time
@@ -115,6 +114,51 @@ def _read_state(base: str, project: str) -> dict | None:
         logger.warning("Ignoring corrupt state for project %r: %s", project, exc)
         return None
     return state
+
+
+def _writable_queue(db: str, *, base: str = "", project: str = ""):
+    """Open a project DB only when its live server runs this CLI's build."""
+    import urllib.error
+    import urllib.request
+
+    state_path = (_state_path(base, project) if base and project else
+                  os.path.join(os.path.dirname(os.path.abspath(db)), "state.json"))
+    try:
+        with open(state_path) as stream:
+            state = json.load(stream)
+    except (OSError, ValueError):
+        state = None
+    if (isinstance(state, dict)
+            and os.path.realpath(str(state.get("db") or "")) == os.path.realpath(db)
+            and state.get("port")):
+        try:
+            port = setup_module.require_project_port(
+                state["port"], str(state.get("project") or ""))
+        except ValueError as exc:
+            logger.warning("Ignoring corrupt project port in %s: %s", state_path, exc)
+            port = None
+        if port is not None:
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:
+                    health = json.loads(response.read().decode())
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+                # Unavailable or unreadable health keeps the legacy local CLI path.
+                logger.warning("Cannot read /health for %s: %s", state_path, exc)
+                health = None
+            if health is not None:
+                from agent_crew.provenance import build
+
+                server_commit = str((health.get("build") or {}).get("commit") or "") if isinstance(health, dict) else ""
+                cli_commit = str(build().get("commit") or "")
+                if not server_commit or not cli_commit or server_commit != cli_commit:
+                    raise click.ClickException(
+                        f"Refusing writable tasks.db access: server build {server_commit or 'unknown'} "
+                        f"differs from CLI build {cli_commit or 'unknown'}. "
+                        f"Use the server's HTTP API at http://127.0.0.1:{port} or run a matching CLI build."
+                    )
+    from agent_crew.queue import TaskQueue
+
+    return TaskQueue(db)
 
 
 def _write_state(base: str, project: str, state: dict) -> None:
@@ -1639,10 +1683,9 @@ def pause(project: str, base: str, reason: str, source: str, incident: str, scop
     state_dir = os.path.join(base, project) if scope == "project" else ""
     db_epoch = None
     if scope == "project" and state_dir:
-        from agent_crew.queue import TaskQueue
         db_path = os.path.join(state_dir, "tasks.db")
         # (1) DB에서 epoch 먼저 할당·commit (권위)
-        db_epoch = TaskQueue(db_path).set_stop_epoch(
+        db_epoch = _writable_queue(db_path, base=base, project=project).set_stop_epoch(
             True, incident=(incident or None), note=f"pause via cli: {reason}")
     # (2) pause.json은 DB epoch를 미러링(generation=db_epoch). global은 기존 monotonic +1.
     rec = pausemod.set_pause(state_dir, True, scope=scope, reason=reason,
@@ -1672,7 +1715,7 @@ def resume(project: str, base: str, generation: int, source: str, decision_id: s
     from agent_crew import pause as pausemod
     state_dir = os.path.join(base, project) if scope == "project" else ""
     if scope == "project" and state_dir:
-        from agent_crew.queue import TaskQueue, RuntimeTransitionRefused
+        from agent_crew.queue import RuntimeTransitionRefused
         db_path = os.path.join(state_dir, "tasks.db")
         # (1) DB CAS resume (권위). 거부되면 pause.json 미변경.
         # P6: resume is a loosening — owner principal + T0 decision_id, or the queue
@@ -1687,7 +1730,7 @@ def resume(project: str, base: str, generation: int, source: str, decision_id: s
         from agent_crew.cea.wiring import install_from_env
         install_from_env(db_path=db_path, project=project)
         try:
-            res = TaskQueue(db_path).resume_stop(
+            res = _writable_queue(db_path, base=base, project=project).resume_stop(
                 generation=generation, who=f"owner:{source}", decision_id=decision_id.strip())
         except RuntimeTransitionRefused as exc:
             click.echo(json.dumps({"resumed": False, "reason": str(exc)}, ensure_ascii=False))
@@ -1723,7 +1766,6 @@ def task_group():
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str, db: str):
     """Cancel TASK_ID and attempt to interrupt its bound worker pane."""
-    from agent_crew.queue import TaskQueue
     from agent_crew.server import cancel_task_with_signal
     if not db:
         project = _select_project(base, project, allow_cross_project)
@@ -1734,7 +1776,8 @@ def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str
     state_path = os.path.join(os.path.dirname(os.path.abspath(db)), "state.json")
     try:
         result = cancel_task_with_signal(
-            TaskQueue(db), task_id, state_path=state_path, pane_map=None,
+            _writable_queue(db, base=base, project=project), task_id,
+            state_path=state_path, pane_map=None,
             events_path=os.path.join(os.path.dirname(os.path.abspath(db)),
                                      "context_events.jsonl"),
         )
@@ -1765,14 +1808,12 @@ def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str
 def task_expire_stale(project: str, allow_cross_project: bool, base: str, db: str, older_than: int, dry_run: bool):
     """Cancel stale in_progress tasks (idle > --older-than seconds)."""
     import time as _t
-    from agent_crew.queue import TaskQueue
     if not db:
         project = _select_project(base, project, allow_cross_project)
         state = _read_state(base, project)
         if state is None:
             raise click.ClickException(f"project {project!r} not found")
         db = state["db"]
-    q = TaskQueue(db)
     if dry_run:
         cutoff = _t.time() - older_than
         import sqlite3 as _sq
@@ -1789,6 +1830,7 @@ def task_expire_stale(project: str, allow_cross_project: bool, base: str, db: st
             idle = int(_t.time() - (r["last_activity_at"] or 0))
             click.echo(f"  would cancel: {r['task_id']} ({r['task_type']}, idle {idle}s)")
         return
+    q = _writable_queue(db, base=base, project=project)
     # Out of process, so there is no dispatch registry here: the cancel is
     # authoritative (status, receipt REVOKED, nonces spent, end event) but a
     # dispatcher child cannot be signalled from the CLI. The server's
@@ -2062,9 +2104,9 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
         click.echo("Nothing to recover: server and tmux already running.")
 
     if reset_stale:
-        from agent_crew.queue import TaskQueue
         # #155: reset to pending (not cancel) so tasks can be retried
-        reset = TaskQueue(db_file).reset_stale_to_pending(older_than_seconds=float(stale_seconds))
+        reset = _writable_queue(db_file, base=base, project=project).reset_stale_to_pending(
+            older_than_seconds=float(stale_seconds))
         if reset:
             click.echo(f"Reset stale: {len(reset)} task(s) → pending: {', '.join(reset)}")
         else:
@@ -2261,14 +2303,13 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         REVIEW_RETRY_MAX,
         handle_test_result,
     )
-    from agent_crew.queue import TaskQueue
     from agent_crew import github
     import time
 
     if max_iter <= 0:
         max_iter = DEFAULT_MAX_ITER
 
-    queue = TaskQueue(db)
+    queue = _writable_queue(db, base=base, project=project)
 
     wait_timeout = float(timeout)
 
@@ -2947,7 +2988,6 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         DEFAULT_PERSPECTIVES, assign_perspectives, build_synthesis, enqueue_panel_tasks
     )
     from agent_crew.loop import enqueue_implement
-    from agent_crew.queue import TaskQueue
     import time
 
     # Agents default: project's installed agents (from state) in project mode,
@@ -2997,7 +3037,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         except Exception:
             pass
 
-    queue = TaskQueue(db)
+    queue = _writable_queue(db, base=base, project=project)
     perspectives_map = assign_perspectives(agent_list, perspectives=perspective_pool)
 
     _run_port = 0
@@ -3298,7 +3338,6 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
         db = state["db"]
 
     from agent_crew import triage as triage_module
-    from agent_crew.queue import TaskQueue
 
     # Validate --repo matches the project's git origin to prevent cross-project enqueue.
     if project:
@@ -3311,7 +3350,7 @@ def triage(repo: str, db: str, project: str, base: str, branch: str,
             if not ok:
                 raise click.ClickException(err_msg)
 
-    queue = TaskQueue(db)
+    queue = _writable_queue(db, base=base, project=project)
 
     if watch:
         # #224: unattended manager mode. Distinct from the LLM-pick path below —
@@ -3504,9 +3543,8 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
     seconds = value * {"s": 1, "m": 60, "h": 3600}[unit]
 
     from agent_crew import triage as triage_module
-    from agent_crew.queue import TaskQueue
 
-    queue = TaskQueue(db)
+    queue = _writable_queue(db, base=base, project=project)
 
     def _agent_fn(prompt: str) -> str:
         import re
@@ -3613,7 +3651,8 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
         except Exception as exc:
             raise click.ClickException(f"POST /tasks failed: {exc}") from exc
     else:
-        from agent_crew.queue import TaskQueue, TaskRequest
-        TaskQueue(db).enqueue(TaskRequest(**payload), ingress="cli.enqueue")
+        from agent_crew.queue import TaskRequest
+        _writable_queue(db, base=base, project=project).enqueue(
+            TaskRequest(**payload), ingress="cli.enqueue")
 
     click.echo(task_id)
