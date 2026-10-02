@@ -29,12 +29,6 @@ PRIVATE_LITERAL_ALLOWLIST = {
         "Optional CEA policy snapshot default; environment configurable.",
     ("cea/wiring.py", 71, "/home/truhojun"):
         "Optional CEA memory command default; environment configurable.",
-    ("github.py", 40, "~/alfred"):
-        "Docstring example of the wrong repository; no runtime path.",
-    ("setup.py", 287, "~/alfred"):
-        "Docstring describing the legacy project-discovery search.",
-    ("setup.py", 294, "~/alfred"):
-        "Legacy project-discovery candidate; no change in this audit slice.",
 }
 
 

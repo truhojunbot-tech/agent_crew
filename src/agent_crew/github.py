@@ -42,8 +42,8 @@ def get_repo(cwd: Optional[str] = None) -> Optional[str]:
     ⛔Pass `cwd` whenever the caller knows which checkout it means. Without it
       this reads the SERVER process's working directory, which is the instance
       directory — and that is not merely empty, it is a DIFFERENT repository:
-      from `~/alfred/instances/agent_crew` this returns
-      `truhojunbot-tech/alfred`. A caller that then asks about "PR 251" is
+      from a different instance checkout this returns that checkout's repo.
+      A caller that then asks about a PR number is
       asking the wrong repo, which answers nothing, or worse answers about an
       unrelated PR of the same number (review of PR #255).
     """

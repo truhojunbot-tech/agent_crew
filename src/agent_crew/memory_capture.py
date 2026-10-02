@@ -32,6 +32,49 @@ _ALIASES = {"agent-crew": "agent_crew", "agent crew": "agent_crew",
             "alpha-engine": "alpha_engine", "alpha engine": "alpha_engine",
             "quota_ops": "quota-ops", "quota ops": "quota-ops",
             "quota_core": "quota-core", "quota core": "quota-core"}
+_REPO_DISAMBIGUATION = {"quota": frozenset({"quota-ops", "quota-core"})}
+
+
+def _project_catalog() -> tuple[frozenset[str], dict[str, str], dict[str, frozenset[str]]]:
+    """Read an optional complete project catalog; preserve fleet defaults if unset/invalid.
+
+    AGENT_CREW_MEMORY_PROJECTS_JSON accepts an object with ``projects`` (list),
+    ``aliases`` (name-to-project object), and ``repo_disambiguation``
+    (name-to-list-of-projects object). A configured catalog replaces the defaults.
+    """
+    raw = (os.environ.get("AGENT_CREW_MEMORY_PROJECTS_JSON") or "").strip()
+    defaults = (CANONICAL_PROJECTS, _ALIASES, _REPO_DISAMBIGUATION)
+    if not raw:
+        return defaults
+    try:
+        config = json.loads(raw)
+        if not isinstance(config, dict):
+            raise ValueError("catalog must be an object")
+        names = config["projects"]
+        aliases = config["aliases"]
+        disambiguation = config["repo_disambiguation"]
+        if (not isinstance(names, list) or not names or
+                not all(isinstance(name, str) and name.strip() for name in names) or
+                not isinstance(aliases, dict) or not isinstance(disambiguation, dict)):
+            raise ValueError("invalid projects, aliases, or repo_disambiguation")
+        projects = frozenset(name.strip().lower() for name in names)
+        if not all(isinstance(key, str) and key.strip() and isinstance(value, str)
+                   and value.strip().lower() in projects for key, value in aliases.items()):
+            raise ValueError("alias target is not a configured project")
+        mapped = {key.strip().lower(): value.strip().lower()
+                  for key, value in aliases.items()}
+        choices = {}
+        for key, values in disambiguation.items():
+            if (not isinstance(key, str) or not key.strip() or not isinstance(values, list)
+                    or not values or not all(isinstance(value, str) and value.strip().lower()
+                                              in projects for value in values)):
+                raise ValueError("invalid repository disambiguation")
+            choices[key.strip().lower()] = frozenset(value.strip().lower()
+                                                       for value in values)
+        return projects, mapped, choices
+    except (KeyError, TypeError, ValueError) as exc:
+        logger.warning("invalid AGENT_CREW_MEMORY_PROJECTS_JSON; using defaults: %s", exc)
+        return defaults
 
 
 def _optional_generation(value) -> int | None:
@@ -53,14 +96,15 @@ def _optional_issue(value) -> str:
 def canonical_project(name: str, *, repo: str = "") -> str:
     """Resolve one owner/bot name; ambiguous Quota requires a repository."""
     token = str(name or "").strip().lower()
-    if token in CANONICAL_PROJECTS:
+    projects, aliases, disambiguation = _project_catalog()
+    if token in projects:
         return token
-    if token in _ALIASES:
-        return _ALIASES[token]
-    if token == "quota":
+    if token in aliases:
+        return aliases[token]
+    if token in disambiguation:
         parts = [part.lower().removesuffix(".git")
                  for part in urlparse(str(repo or "")).path.split("/") if part]
-        matches = {part for part in parts if part in {"quota-ops", "quota-core"}}
+        matches = {part for part in parts if part in disambiguation[token]}
         if len(matches) == 1:
             return matches.pop()
     raise ValueError(f"unknown or ambiguous memory project: {name!r} (repo={repo!r})")

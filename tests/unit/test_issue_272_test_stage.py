@@ -134,12 +134,10 @@ def test_the_tester_must_say_which_scope_it_used():
 
 
 def test_no_project_name_is_hardcoded_into_the_prompt():
-    """⛔The issue asked for this explicitly. alpha_engine may be cited as the
-    measurement, but it must not be the condition."""
+    """The tester prompt stays project-neutral; historical evidence lives in docs."""
     text = tp.render_scope(tp.DEFAULT_SCOPE)
-    assert "alpha_engine#5541" in text, "the measurement should stay cited"
-    assert "if alpha_engine" not in text.lower()
-    for other in ("quota-core", "quota-ops", "halla"):
+    assert "CI runs the full suite" in text
+    for other in ("alpha_engine", "quota-core", "quota-ops", "halla"):
         assert other not in text
 
 

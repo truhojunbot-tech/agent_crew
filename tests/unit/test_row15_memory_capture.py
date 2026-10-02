@@ -450,6 +450,29 @@ def test_additional_known_projects_are_canonical():
     assert canonical_project("ht-8004") == "ht-8004"
 
 
+def test_memory_project_catalog_can_replace_fleet_defaults(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_MEMORY_PROJECTS_JSON", json.dumps({
+        "projects": ["demo", "worker"],
+        "aliases": {"my demo": "demo"},
+        "repo_disambiguation": {"team": ["demo", "worker"]},
+    }))
+    assert canonical_project("my demo") == "demo"
+    assert canonical_project("team", repo="https://github.com/example/worker.git") == "worker"
+    with pytest.raises(ValueError):
+        canonical_project("alpha_engine")
+
+
+def test_memory_project_catalog_unset_keeps_fleet_defaults(monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_MEMORY_PROJECTS_JSON", raising=False)
+    assert canonical_project("alpha-engine") == "alpha_engine"
+    assert canonical_project("Quota", repo="https://github.com/example/quota-core.git") == "quota-core"
+
+
+def test_memory_project_catalog_invalid_config_keeps_fleet_defaults(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_MEMORY_PROJECTS_JSON", "not-json")
+    assert canonical_project("alpha-engine") == "alpha_engine"
+
+
 def test_migration_dry_run_apply_creates_backup_and_no_duplicate(tmp_path):
     path = tmp_path / "memory.db"
     SQLiteMemoryStorage(str(path))
