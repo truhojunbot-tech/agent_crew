@@ -85,3 +85,20 @@ def test_lexical_path_wins_over_forge(monkeypatch):
     assert pack.telemetry()["forge_items"] == 1
     assert "forge:crew-adr-17" not in {a.artifact_id for a in pack.items}
     assert "forge:crew-spec-9" in {a.artifact_id for a in pack.items}
+
+
+def test_same_basename_different_paths_survive_but_exact_duplicates_do_not(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
+        cp.Artifact("repo:docs/README.md", "docs/README.md", cp.TYPE_SPEC)
+    ])
+    monkeypatch.setattr(cp.ForgeProvider, "retrieve", lambda self, query: [
+        cp.Artifact("forge:src-readme", "src/README.md", cp.TYPE_SPEC),
+        cp.Artifact("forge:docs-readme", "docs/README.md", cp.TYPE_SPEC),
+        cp.Artifact("forge:src-readme", "src/README.md", cp.TYPE_SPEC),
+    ])
+
+    ids = [a.artifact_id for a in _build().items]
+    assert ids.count("repo:docs/README.md") == 1
+    assert ids.count("forge:src-readme") == 1
+    assert "forge:docs-readme" not in ids
