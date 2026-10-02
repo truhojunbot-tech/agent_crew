@@ -170,12 +170,17 @@ def test_the_push_path_clears_on_a_saturated_transcript(tmp_path, monkeypatch, *
     wt.mkdir(parents=True)
     _session(tmp_path / "claudehome", str(wt), {"cache_read_input_tokens": 900_000})
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"port": unused_tcp_port,
+                                 "worktrees": {"claude": str(wt)}, "pane_ids": ["%91"],
+                                 "role_agents": {"implementer": "claude", "reviewer": "codex",
+                                                 "tester": "gemini"}}))
 
     cleared = []
     monkeypatch.setattr(sv, "_claude_home", lambda home=None: tmp_path / "claudehome")
     monkeypatch.setattr(sv, "_pane_clear_context", lambda pane, **_kw: cleared.append(pane))
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_resolve_tmux_pane_target", lambda pane: pane)
+    monkeypatch.setattr(sv, "_pane_process_kind", lambda pane: ("agent", "claude"))
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda pane: False)
     monkeypatch.setattr(sv, "_pane_dismiss_permission_prompt", lambda pane: None)
     monkeypatch.setattr(sv.subprocess, "run", _pane(NO_HINT))
@@ -291,7 +296,7 @@ def test_the_worktree_follows_the_agent_not_the_role():
     """The map is keyed by role in one mode and by agent in the other; either
     way the answer must be the worktree that AGENT works in."""
     by_agent = {"claude": "/w/claude", "codex": "/w/codex"}
-    by_role = {"implementer": "/w/claude", "reviewer": "/w/codex"}
+    by_role = {"implementer": "/w/codex", "reviewer": "/w/claude"}
     assert sv._agent_worktree(by_agent, "codex", "implementer") == "/w/codex"
     assert sv._agent_worktree(by_role, "codex", "implementer") == "/w/codex"
     assert sv._agent_worktree(by_role, "claude", "reviewer") == "/w/claude"
@@ -515,7 +520,7 @@ def test_an_agent_keyed_map_is_unaffected():
 
 def test_the_static_default_is_still_the_fallback():
     """Legacy setups with no roles list keep working."""
-    assert sv._agent_worktree(ROLE_MAP, "claude", "") == "/w/impl"
+    assert sv._agent_worktree(ROLE_MAP, "claude", "") == "/w/rev"
 
 
 def test_an_agent_in_no_role_resolves_to_nothing():

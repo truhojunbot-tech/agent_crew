@@ -116,7 +116,9 @@ def _dispatch(tmp_path, monkeypatch, *, agent="claude", cap_info=None, over=Fals
     wt = tmp_path / "worktrees" / "demo" / agent
     wt.mkdir(parents=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {agent: str(wt)}}))
+    state.write_text(json.dumps({"port": 0, "worktrees": {agent: str(wt)},
+                                 "role_agents": {"implementer": "claude", "reviewer": "codex",
+                                                 "tester": "gemini"}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
