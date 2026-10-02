@@ -1297,7 +1297,8 @@ def test_u_c59_recover_dead_session_uses_log_viewers_in_dispatcher_mode(tmp_path
         return MagicMock(returncode=0, stdout="", stderr="")
 
     runner = CliRunner()
-    with patch("agent_crew.cli._read_state", return_value=state), \
+    with patch.dict("os.environ", {"TMUX_PANE": "%400"}), \
+         patch("agent_crew.cli._read_state", return_value=state), \
          patch("agent_crew.cli._port_listening", return_value=True), \
          patch("agent_crew.cli.subprocess.run", side_effect=_fake_run), \
          patch("agent_crew.cli.subprocess.Popen"), \

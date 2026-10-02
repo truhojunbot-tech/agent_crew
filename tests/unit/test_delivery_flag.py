@@ -157,7 +157,7 @@ def _approved_result(task_id):
     return {
         "task_id": task_id,
         "status": "completed",
-        "summary": "lgtm",
+        "summary": "Reviewed the changes and approve this result for the next stage.",
         "verdict": "approve",
         "findings": [],
         "pr_number": None,

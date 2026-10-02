@@ -18,18 +18,18 @@ from agent_crew import instructions, setup as crew_setup
 
 
 class TestGenerateEmbedsTaskLoop:
-    def test_implementer_default_agent_is_claude(self):
+    def test_implementer_default_agent_is_codex(self):
         out = instructions.generate("implementer", "myproj", 8100)
         # The full task-loop prompt's signature line — pinned to make sure
         # the prompt actually got prepended.
-        assert "You are claude" in out
+        assert "You are codex" in out
         assert "get_next_task" in out
         # Existing _COMMON / role section content still present.
         assert "Agent Crew — myproj" in out
 
-    def test_reviewer_default_agent_is_codex(self):
+    def test_reviewer_default_agent_is_claude(self):
         out = instructions.generate("reviewer", "myproj", 8100)
-        assert "You are codex" in out
+        assert "You are claude" in out
         assert "review" in out
 
     def test_tester_default_agent_is_gemini(self):

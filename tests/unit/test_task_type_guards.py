@@ -121,9 +121,9 @@ class TestMcpPathGuard:
         tool = mcp._tool_manager._tools["get_next_task"]
         func = tool.fn
         if asyncio.iscoroutinefunction(func):
-            result = asyncio.run(func(agent="codex"))
+            result = asyncio.run(func(agent="claude"))
         else:
-            result = func(agent="codex")
+            result = func(agent="claude")
         assert result is not None
         assert result["description"].startswith("[REVIEW ONLY")
         assert "review PR #99" in result["description"]
@@ -159,8 +159,8 @@ class TestMcpPathGuard:
         tool = mcp._tool_manager._tools["get_next_task"]
         func = tool.fn
         if asyncio.iscoroutinefunction(func):
-            result = asyncio.run(func(agent="claude"))
+            result = asyncio.run(func(agent="codex"))
         else:
-            result = func(agent="claude")
+            result = func(agent="codex")
         assert result is not None
         assert result["description"] == "impl feature Y"

@@ -37,8 +37,8 @@ def _impl_payload(task_id="t1", description="do work"):
 
 def _make_app(tmp_db, *, push_calls=None, panes=None, **kwargs):
     panes = panes or {
-        "implementer": "%C", "claude": "%C",
-        "reviewer": "%X", "codex": "%X",
+        "implementer": "%C", "codex": "%C",
+        "reviewer": "%X", "claude": "%X",
         "tester": "%G", "gemini": "%G",
     }
     if push_calls is None:
@@ -119,19 +119,20 @@ class TestGetTasksStatusField:
 class TestUsageLimitOnFallbackAgentPaneReroutes:
     def test_usage_limit_on_fallback_agent_triggers_chain_again(self, tmp_db):
         """
-        Scenario: original task fails (claude rate-limited) → fallback creates
-        task with agent_override='codex'. When that task is dequeued for push,
-        codex pane also shows a usage-limit → server must force-fail the fallback
-        task and create a new one targeting gemini.
+        A Codex usage limit holds implementation for Codex; it never substitutes
+        Gemini into the implementer role (#308).
         """
         app, push_calls = _make_app(tmp_db)
 
-        # Mark codex pane (%X) as usage-limited
+        # Mark Codex's implementer pane as usage-limited.
         def pane_has_usage_limit(pane_id: str) -> bool:
-            return pane_id == "%X"
+            return pane_id == "%C"
 
         with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_usage_limit", pane_has_usage_limit):
+             patch("agent_crew.server._pane_has_usage_limit", pane_has_usage_limit), \
+             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
+             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
+             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
             # Enqueue the fallback task (claude already excluded)
             fallback_payload = _impl_payload("fb-t1")
             fallback_payload["context"] = {
@@ -140,31 +141,32 @@ class TestUsageLimitOnFallbackAgentPaneReroutes:
             }
             client.post("/tasks", json=fallback_payload)
 
-        # The fallback task targeting codex should have been force-failed
+        # The same-role task stays pending for Codex after the limit clears.
         rows = TaskQueue(tmp_db).list_all_with_status()
         fb_task = next((r for r in rows if r["task_id"] == "fb-t1"), None)
         assert fb_task is not None
-        assert fb_task["status"] == "failed", (
-            "fallback task should have been force-failed when codex pane is usage-limited"
+        assert fb_task["status"] == "pending", (
+            "Codex work should be held when its pane is usage-limited"
         )
 
-        # A new fallback task for gemini should have been created
+        # No cross-provider implementer substitution is permitted.
         gemini_tasks = [
             r for r in rows
             if isinstance(r.get("context"), dict)
             and r["context"].get("agent_override") == "gemini"
         ]
-        assert len(gemini_tasks) >= 1, (
-            "expected a new fallback task with agent_override='gemini' after codex usage-limit"
-        )
-        assert "codex" in gemini_tasks[0]["context"]["fallback_excluded"]
+        assert gemini_tasks == []
+        assert push_calls == []
 
     def test_codex_push_proceeds_when_pane_healthy(self, tmp_db):
         """Regression: when codex pane is healthy, fallback task is pushed normally."""
         app, push_calls = _make_app(tmp_db)
 
         with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_usage_limit", return_value=False):
+             patch("agent_crew.server._pane_has_usage_limit", return_value=False), \
+             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
+             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
+             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
             fallback_payload = _impl_payload("fb-t2")
             fallback_payload["context"] = {
                 "agent_override": "codex",
@@ -172,8 +174,8 @@ class TestUsageLimitOnFallbackAgentPaneReroutes:
             }
             client.post("/tasks", json=fallback_payload)
 
-        # Task should have been pushed to codex pane (%X)
-        assert any(pane == "%X" for pane, _ in push_calls), (
+        # Task should have been pushed to Codex's implementer pane.
+        assert any(pane == "%C" for pane, _ in push_calls), (
             "healthy codex pane should receive the fallback task push"
         )
 
@@ -280,7 +282,10 @@ class TestBashPromptDetectionOnDispatch:
             return pane_id == "%C"
 
         with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_bash_prompt", pane_has_bash_prompt):
+             patch("agent_crew.server._pane_has_bash_prompt", pane_has_bash_prompt), \
+             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
+             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
+             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
             client.post("/tasks", json=_impl_payload("bp1"))
 
         # Push should NOT have gone to %C
@@ -301,7 +306,10 @@ class TestBashPromptDetectionOnDispatch:
         app, push_calls = _make_app(tmp_db)
 
         with TestClient(app) as client, \
-             patch("agent_crew.server._pane_has_bash_prompt", return_value=False):
+             patch("agent_crew.server._pane_has_bash_prompt", return_value=False), \
+             patch("agent_crew.server._resolve_tmux_pane_target", side_effect=lambda pane: pane), \
+             patch("agent_crew.server._pane_alive_for_push", return_value=True), \
+             patch("agent_crew.server._pane_process_kind", return_value=("agent", "codex")):
             client.post("/tasks", json=_impl_payload("bp2"))
 
         assert any(pane == "%C" for pane, _ in push_calls), (
@@ -336,7 +344,7 @@ class TestCrewRunTimeoutPendingTask:
         q.dequeue(role="implementer")
         assert q.get_task_status("gs2") == "in_progress"
 
-    def test_wait_exits_gracefully_when_task_still_pending(self, tmp_db, tmp_path):
+    def test_wait_exits_gracefully_when_task_still_pending(self, tmp_db, tmp_path, unused_tcp_port):
         """
         When crew run --timeout N expires and the task is still pending
         (no agent picked it up), the tool must exit WITHOUT auto-failing the
@@ -351,7 +359,7 @@ class TestCrewRunTimeoutPendingTask:
         proj_dir.mkdir()
         state = {
             "project": "myproj",
-            "port": 0,
+            "port": unused_tcp_port,
             "port_file": str(proj_dir / "port"),
             "session": "test",
             "window": "0",
@@ -374,7 +382,8 @@ class TestCrewRunTimeoutPendingTask:
         ))
 
         runner = CliRunner()
-        with patch("agent_crew.cli._port_listening", return_value=False), \
+        with patch("agent_crew.cli._port_listening", return_value=True), \
+             patch("agent_crew.cli._verify_project_server"), \
              patch("agent_crew.cli._pane_alive", return_value=True), \
              patch("agent_crew.cli._verify_delivery", return_value=False), \
              patch("agent_crew.loop.enqueue_implement", return_value="run-pending-1"), \

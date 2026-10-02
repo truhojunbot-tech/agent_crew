@@ -316,6 +316,7 @@ def test_mcp_a_mismatched_result_is_held_on_this_transport_too(tmp_db, monkeypat
 def test_mcp_an_agreeing_result_still_cascades(tmp_db, monkeypatch):
     """⛔The MCP control."""
     monkeypatch.setattr("agent_crew.github.pr_state", lambda pr, *a, **k: "open")
+    monkeypatch.setattr("agent_crew.pipeline._repo_default_branch", lambda repo: "main")
     q = TaskQueue(tmp_db)
     # canonical-repo-identity remediation: see test_http_an_agreeing_review_still_cascades.
     q.enqueue(TaskRequest(task_id="review-mcp-ok", task_type="review", description="review",
