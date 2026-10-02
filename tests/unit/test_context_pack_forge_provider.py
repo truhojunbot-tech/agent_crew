@@ -161,6 +161,37 @@ def test_lexical_path_wins_over_forge(monkeypatch):
     assert "forge:crew-spec-9" in {a.artifact_id for a in pack.items}
 
 
+def test_forge_adr_label_has_no_authority_rank(monkeypatch):
+    lexical_adr = cp.Artifact(
+        "repo:docs/adr/local.md", "docs/adr/local.md", cp.TYPE_ADR,
+        score=0.1,
+    )
+    lexical_code = cp.Artifact(
+        "repo:src/local.py", "src/local.py", cp.TYPE_CODE,
+        score=0.9,
+    )
+    forge_adr = cp.ForgeProvider._to_artifact({
+        "chunk_id": "remote-adr", "source_file": "docs/adr/remote.md",
+        "content": "remote decision", "score": 1.0,
+        "reliability_label": "ADR", "source_reliability": 1.0,
+    })
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
+        lexical_adr, lexical_code,
+    ])
+    monkeypatch.setattr(cp.ForgeProvider, "retrieve", lambda self, query: [forge_adr])
+    query = cp.RetrievalQuery(task_id="fix-1", role="implementer")
+    providers = [cp.LexicalRepoProvider(), cp.ForgeProvider()]
+
+    ordered = cp.plan_pack(query, providers, mode=cp.MODE_HYBRID,
+                           budget={"max_tokens": 1000, "max_items": 3}).items
+    assert [item.artifact_id for item in ordered] == [
+        lexical_adr.artifact_id, lexical_code.artifact_id, forge_adr.artifact_id,
+    ]
+    selected = cp.plan_pack(query, providers, mode=cp.MODE_HYBRID,
+                            budget={"max_tokens": 1000, "max_items": 1}).items
+    assert [item.artifact_id for item in selected] == [lexical_adr.artifact_id]
+
+
 def test_same_basename_different_paths_survive_but_exact_duplicates_do_not(monkeypatch):
     monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
     monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
