@@ -688,7 +688,10 @@ def budget_for(role: str, overrides: Optional[dict] = None) -> dict:
 def _sort_key(a: Artifact):
     # Deterministic total order: mandatory, then type rank, then score desc,
     # then id — so the same candidates always produce the same pack.
-    return (0 if a.mandatory else 1, _TYPE_RANK.get(a.artifact_type, 99),
+    # Forge labels describe remote content; they do not confer local ADR/spec authority.
+    type_rank = (_TYPE_RANK[TYPE_EVIDENCE] if a.artifact_id.startswith("forge:")
+                 else _TYPE_RANK.get(a.artifact_type, 99))
+    return (0 if a.mandatory else 1, type_rank,
             -a.score, a.artifact_id)
 
 
