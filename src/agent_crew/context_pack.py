@@ -35,6 +35,7 @@ import logging
 import os
 import re
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -42,6 +43,11 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+# A timed-out synchronous Forge call may still be stuck in DNS or a response
+# read. Keep at most one such daemon worker alive instead of accumulating one
+# per dispatch while the optional provider is unhealthy.
+_FORGE_HTTP_SLOT = threading.BoundedSemaphore(1)
 
 #: Bump only for breaking changes to the pack/artifact field contract.
 CONTEXT_PACK_SCHEMA_VERSION = 1
@@ -474,17 +480,51 @@ class ForgeProvider(RetrievalProvider):
                 "fix_round": query.task_id.startswith("fix-"),
             },
         }
-        try:
-            request = urllib.request.Request(
-                self._url + "/get_context", data=json.dumps(payload).encode(),
-                headers={"Content-Type": "application/json"}, method="POST")
-            with urllib.request.urlopen(request, timeout=self._timeout) as response:
-                items = json.load(response).get("context_items", [])
-            return [self._to_artifact(item) for item in items]
-        except Exception as exc:  # noqa: BLE001 — retrieval must not block dispatch
-            self.last_error = str(exc)
-            logger.warning("context_pack: Forge retrieval failed: %s", exc)
+        if not _FORGE_HTTP_SLOT.acquire(blocking=False):
+            self.last_error = "previous Forge request still in progress"
+            logger.warning("context_pack: %s", self.last_error)
             return []
+
+        done = threading.Event()
+        result: dict = {}
+
+        def fetch() -> None:
+            try:
+                request = urllib.request.Request(
+                    self._url + "/get_context", data=json.dumps(payload).encode(),
+                    headers={"Content-Type": "application/json"}, method="POST")
+                with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                    body = json.load(response)
+                if not isinstance(body, dict) or not isinstance(body.get("context_items"), list):
+                    raise ValueError("Forge response has no context_items list")
+                items = body["context_items"]
+                if any(not isinstance(item, dict) or
+                       not isinstance(item.get("chunk_id"), str) or not item["chunk_id"] or
+                       not isinstance(item.get("source_file"), str) or not item["source_file"] or
+                       not isinstance(item.get("content"), str) or "score" not in item
+                       for item in items):
+                    raise ValueError("Forge response contains an incomplete context item")
+                result["items"] = [self._to_artifact(item) for item in items]
+            except Exception as exc:  # noqa: BLE001 — optional provider degrades
+                result["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                _FORGE_HTTP_SLOT.release()
+                done.set()
+
+        try:
+            threading.Thread(target=fetch, name="forge-context-fetch", daemon=True).start()
+        except Exception as exc:  # noqa: BLE001 — failed spawn also degrades
+            _FORGE_HTTP_SLOT.release()
+            result["error"] = f"{type(exc).__name__}: {exc}"
+            done.set()
+        if not done.wait(self._timeout):
+            self.last_error = f"Forge request timeout after {self._timeout}s"
+        else:
+            self.last_error = result.get("error", "")
+        if self.last_error:
+            logger.warning("context_pack: Forge retrieval failed: %s", self.last_error)
+            return []
+        return result.get("items", [])
 
     @staticmethod
     def _to_artifact(item: dict) -> Artifact:
