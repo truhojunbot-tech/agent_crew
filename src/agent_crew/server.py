@@ -645,6 +645,7 @@ def _prepare_worktree_for_task(
     task_branch: str,
     role: str,
     task_context: Optional[dict] = None,
+    task_type: str = "",
 ) -> str:
     """Sync worktree to origin and checkout the right branch before task dispatch.
 
@@ -665,7 +666,7 @@ def _prepare_worktree_for_task(
     try:
         return _prepare_worktree_for_task_inner(
             worktree_path, task_id, task_branch, role,
-            task_context=task_context or {}) or ""
+            task_context=task_context or {}, task_type=task_type) or ""
     except WorktreePrepRefused:
         # ⛔Not swallowed. Every other prep failure is survivable — a stash
         #   conflict, a slow fetch — and dispatch continues on a worktree that
@@ -754,6 +755,7 @@ def _prepare_worktree_for_task_inner(
     task_branch: str,
     role: str,
     task_context: Optional[dict] = None,
+    task_type: str = "",
 ) -> None:
     """Inner (may raise). Wrapped by _prepare_worktree_for_task."""
     if task_context is None:
@@ -1047,7 +1049,11 @@ def _prepare_worktree_for_task_inner(
         #   that cannot find its target must stop, not review something else.
         #   A resolved pin still wins (#286) — it IS the target, already known.
         _main_ref = f"origin/{main_branch}"
-        if _resolved and _resolved_from == _main_ref and target_ref != _main_ref:
+        # A discuss panel may name the caller's local branch. Use it when it
+        # resolves, but allow the already-probed default base when it does not.
+        # Review/test tasks still require their named target (#301/#289).
+        if (_resolved and _resolved_from == _main_ref and target_ref != _main_ref
+                and task_type != "discuss"):
             raise WorktreeTargetUnresolved(
                 f"{role} {task_id} names branch {target_ref!r}, which does not "
                 f"resolve in this repository. Refusing to fall back to "
@@ -4755,6 +4761,7 @@ def create_app(
                 _reviewed_sha = _prepare_worktree_for_task(
                     wt, task.task_id, task.branch or "", role,
                     task_context=task.context if isinstance(task.context, dict) else {},
+                    task_type=task.task_type,
                 )
                 # #253/#358: record the exact prepared commit, or explicit
                 # unknown, before prompt construction.  A prep failure still

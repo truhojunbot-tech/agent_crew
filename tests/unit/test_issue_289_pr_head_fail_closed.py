@@ -135,6 +135,67 @@ def test_a_task_with_no_pr_number_still_uses_its_branch(pr_repo, monkeypatch):
         str(wt), "task-289", PR_BRANCH, "reviewer", task_context={}) == sha_a
 
 
+@pytest.mark.parametrize("branch,expected_ref", [
+    ("wt-main", "main"),
+    (PR_BRANCH, "feature"),
+])
+def test_discuss_branch_uses_origin_when_available_or_main_when_missing(
+    pr_repo, tmp_path, monkeypatch, unused_tcp_port, branch, expected_ref,
+):
+    """A panel uses a real branch; a caller-local branch falls back to main."""
+    from fastapi.testclient import TestClient
+
+    from agent_crew.server import create_app
+
+    _, wt, feature_tip, main_tip = pr_repo
+    spawned = []
+
+    async def fake_exec(*cmd, **kwargs):
+        spawned.append(cmd)
+
+        class Process:
+            returncode, pid = 0, 1
+
+            async def wait(self):
+                return 0
+
+        return Process()
+
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"roles": [
+        {"role": "reviewer", "agent": "claude", "worktree": str(wt)},
+    ]}))
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
+    monkeypatch.setenv("AGENT_CREW_BASE", str(tmp_path / "lockbase"))
+    monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", fake_exec)
+
+    db = str(tmp_path / "discuss.db")
+    app = create_app(db_path=db, pane_map={}, port=unused_tcp_port,
+                     state_path=str(state), project="demo", watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app):
+        queue = TaskQueue(db)
+        queue.enqueue(TaskRequest(task_id="discuss-289", task_type="discuss",
+                                  description="Discuss the issue", branch=branch,
+                                  project="demo", context={"agent": "claude"}))
+        task = queue.dequeue_discuss_for_agent("claude")
+        assert task is not None
+        asyncio.run(app.state.dispatch_task(task, "reviewer"))
+        row = {item.task_id: item for item in queue.list_tasks()}["discuss-289"]
+
+    assert spawned, "the discuss worker was not dispatched"
+    assert row.status != "needs_human"
+    assert _sha(wt) == (feature_tip if expected_ref == "feature" else main_tip)
+
+
+def test_review_still_refuses_missing_branch_with_task_type(pr_repo):
+    _, wt, _, _ = pr_repo
+    with pytest.raises(sv.WorktreeTargetUnresolved):
+        sv._prepare_worktree_for_task(str(wt), "review-289", "wt-main",
+                                      "reviewer", task_type="review")
+
+
 def test_the_implementer_is_unaffected(pr_repo, monkeypatch):
     """The implementer starts from main by design (#140); it is not reviewing an
     artifact, so there is nothing to fail closed about."""
