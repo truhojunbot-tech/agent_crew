@@ -279,7 +279,8 @@ def _dispatch(tmp_path, monkeypatch, task_type, *, lock_base, role="tester", unu
     # then holds the lock for exactly the path the implementer would use, so it
     # proves the gate is scoped to the task type and not to the worktree.
     state.write_text(json.dumps(
-        {"port": 0, "worktrees": {"gemini": str(wt), "claude": str(wt)}}))
+        {"port": 0, "worktrees": {"gemini": str(wt), "claude": str(wt),
+                                  "codex": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setenv("AGENT_CREW_BASE", lock_base)

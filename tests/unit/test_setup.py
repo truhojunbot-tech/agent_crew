@@ -368,6 +368,15 @@ def test_u_se22_start_agents_no_warn_when_cli_detected():
 
 
 # U-SE23: start_agents_in_panes sends a kickoff prompt after CLI boots
+def _kickoff_from_buffer(mock_run):
+    loads = [call for call in mock_run.call_args_list
+             if call.args[0] == ["tmux", "load-buffer", "-"]]
+    assert len(loads) == 1, "kickoff was not loaded into tmux"
+    assert any(call.args[0] == ["tmux", "paste-buffer", "-p", "-d", "-t", "crew:0.0"]
+               for call in mock_run.call_args_list), "kickoff was not pasted to the pane"
+    return loads[0].kwargs["input"]
+
+
 def test_u_se23_start_agents_sends_kickoff_prompt():
     """After the CLI boots, start_agents_in_panes must send a kickoff prompt
     telling the agent to start polling get_next_task every 30 seconds."""
@@ -378,18 +387,10 @@ def test_u_se23_start_agents_sends_kickoff_prompt():
          patch("agent_crew.setup.time.sleep"):
         start_agents_in_panes("crew", ["claude"])
 
-    # Collect all literal send-keys text
-    literal_texts = []
-    for call in mock_run.call_args_list:
-        args = call[0][0]
-        if "-l" in args:
-            literal_texts.append(args[-1])
-
     # Kickoff prompt must reference polling / get_next_task
-    kickoff_text = " ".join(literal_texts)
-    assert "get_next_task" in kickoff_text or "30" in kickoff_text, (
-        "kickoff prompt must mention get_next_task polling or 30-second interval"
-    )
+    kickoff_text = _kickoff_from_buffer(mock_run)
+    assert "get_next_task" in kickoff_text
+    assert "30 seconds" in kickoff_text
 
 
 # U-SE24: kickoff prompt explicitly mentions GET /tasks/next fallback polling
@@ -403,12 +404,6 @@ def test_u_se24_start_agents_kickoff_mentions_http_polling():
          patch("agent_crew.setup.time.sleep"):
         start_agents_in_panes("crew", ["claude"])
 
-    literal_texts = []
-    for call in mock_run.call_args_list:
-        args = call[0][0]
-        if "-l" in args:
-            literal_texts.append(args[-1])
-
-    kickoff_text = " ".join(literal_texts)
+    kickoff_text = _kickoff_from_buffer(mock_run)
     assert "/tasks/next" in kickoff_text
     assert "30 seconds" in kickoff_text
