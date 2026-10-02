@@ -217,6 +217,33 @@ def test_narrow_cap_holds_fix_with_cea_receipt(q, tmp_path, monkeypatch):
             (row["canary_cea_receipt_id"],)).fetchone()[0] == 2
 
 
+@pytest.mark.parametrize("drift", ["time", "contract_missing"])
+def test_held_fix_stays_held_on_replay_when_evidence_drifts(
+        q, tmp_path, monkeypatch, drift):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    review = _review(q)
+    _contract_after_verdict(q, review, tmp_path, monkeypatch)
+    assert _run(q, review) is None
+    held = q.get_tokenomics_shadow_receipt(ROOT)
+    assert held["canary_applied"] == 1
+    if drift == "time":
+        class FutureDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime.now(tz) + timedelta(hours=25)
+
+        monkeypatch.setattr("agent_crew.pipeline.datetime", FutureDateTime)
+    else:
+        monkeypatch.delenv("AGENT_CREW_TOKENOMICS_POLICY_PATH")
+    assert _run(q, review) is None
+    assert not any(t.task_id == f"fix-{review}-r2" for t in q.list_tasks())
+    replayed = q.get_tokenomics_shadow_receipt(ROOT)
+    assert replayed["canary_applied"] == 1
+    assert replayed["canary_cea_receipt_id"] == held["canary_cea_receipt_id"]
+    assert replayed["canary_reason"] == "round_cap_reached"
+
+
 @pytest.mark.parametrize("project,expected_reason", [
     ("agent_crew", "cap_not_reached"),
     ("other_project", "not_pinned"),

@@ -1328,6 +1328,18 @@ def auto_enqueue_fix(
         baseline_cap = contract.fix_round_cap(review_fix_max_rounds())
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         lineage_root_id = _lineage_root_task_id(tasks_by_id, review_task)
+        # A prior evaluation may already have held this lineage at the canary
+        # cap. That decision is durable: replay must not recompute against a
+        # newer clock or a changed/missing contract and enqueue the held fix.
+        held = queue.get_tokenomics_shadow_receipt(lineage_root_id)
+        if (held and held.get("canary_applied") == 1
+                and held.get("canary_reason") == "round_cap_reached"
+                and held.get("canary_cea_receipt_id")):
+            logger.info(
+                "auto_enqueue_fix: lineage %s already has held canary fix %s; "
+                "not re-evaluating review %s",
+                lineage_root_id, held["canary_cea_receipt_id"], review_task_id)
+            return None
         counterfactual_cap, canary_citation, canary_reason = _canary_round_cap(
             tasks_by_id, review_task, baseline_cap, queue, server_project)
         switch_enabled = _tokenomics_canary.rounds_cap_enabled()
