@@ -163,8 +163,12 @@ class TestReconcileIncidentFix(Base):
         fresh TaskQueue 생성 후에도 unpaused."""
         from click.testing import CliRunner
         from agent_crew.cli import crew as crew_cli
+        from agent_crew import provenance
+        from tests.unit.test_sev0_cea_s4e_wiring import DECISION_ID, write_key, write_snapshot
+        from pathlib import Path
+        from unittest.mock import patch
         base = tempfile.mkdtemp()
-        proj = "canaryproj"
+        proj = "agent_crew"
         sd = os.path.join(base, proj)
         os.makedirs(sd)
         db = os.path.join(sd, "tasks.db")
@@ -172,8 +176,13 @@ class TestReconcileIncidentFix(Base):
         e = q.set_stop_epoch(True, incident="alfred#39")           # DB epoch1 paused inc alfred#39
         pausemod.set_pause(sd, True, scope="project", generation=e, incident="alfred#39")  # pause.json mirror
         # 실제 CLI resume(project scope) — cli.py의 mirror 경로를 구동
-        r = CliRunner().invoke(crew_cli, ["resume", proj, "--generation", "2", "--base", base,
-                                          "--decision-id", "D-51-9"])
+        snapshot = write_snapshot(Path(base), build_commits=(provenance.build()["commit"],))
+        key = write_key(Path(base))
+        with patch.dict(os.environ, {"AGENT_CREW_CEA_SNAPSHOT_PATH": str(snapshot),
+                                    "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE": str(key)}):
+            r = CliRunner().invoke(crew_cli, ["resume", proj, "--generation", "2",
+                                              "--base", base, "--source", "hojun",
+                                              "--decision-id", DECISION_ID])
         self.assertEqual(r.exit_code, 0, r.output)
         # DB: unpaused, 새 epoch, incident 보존
         st = q.get_stop_epoch()
@@ -371,7 +380,7 @@ class TestFixBudgetReplaySkip(Base):
 
     def _seed_review_reqchanges(self, q, tid, pr):
         q.enqueue(TaskRequest(task_id=tid, task_type="review", description="r",
-                              branch="main", priority=3,
+                              branch="feat/fix-budget", priority=3,
                               context={"fix_round": 9, "pr_number": pr}, project="p"))
         q.dequeue(role="reviewer")
         q.submit_result(tid, TaskResult(task_id=tid, status="completed",

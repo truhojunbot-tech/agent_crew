@@ -167,11 +167,12 @@ def test_e_rc02_recover_server(monkeypatch, git_repo, base_dir, e2e_project):
 
 # ── E-RC03: SQLite persistence — task survives server kill ───────────────────
 
-def test_e_rc03_sqlite_persistence(tmp_path):
+def test_e_rc03_sqlite_persistence(tmp_path, e2e_project):
     port = _find_free_port()
     db_path = str(tmp_path / "tasks.db")
 
     base = str(tmp_path / "base")
+    e2e_project(base, "persistproj")
     proj_state_dir = os.path.join(base, "persistproj")
     os.makedirs(proj_state_dir, exist_ok=True)
 

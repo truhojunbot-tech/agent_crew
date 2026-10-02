@@ -9,6 +9,7 @@ E-TR04: poll --interval parsing — 10s / 2m / 1h parsed to correct seconds
 
 import json
 import subprocess
+import threading
 
 import pytest
 from click.testing import CliRunner
@@ -123,9 +124,16 @@ def test_e_tr04_poll_interval_parsing(monkeypatch, db_path, interval, expected_s
     slept: list[float] = []
 
     import time as _time_mod
+    original_sleep = _time_mod.sleep
+    test_thread = threading.get_ident()
 
     def _fake_sleep(secs: float):
-        slept.append(secs)
+        # Other e2e servers may still have background polling threads. Observe
+        # only this CLI invocation and leave their timing unchanged.
+        if threading.get_ident() == test_thread:
+            slept.append(secs)
+        else:
+            original_sleep(secs)
 
     monkeypatch.setattr(_time_mod, "sleep", _fake_sleep)
 

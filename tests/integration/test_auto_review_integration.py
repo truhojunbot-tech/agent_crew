@@ -44,7 +44,7 @@ def test_i_ar01_impl_completion_auto_enqueues_review(test_client):
     assert len(review_tasks) >= 1
 
     review = review_tasks[0]
-    assert review["description"] == "Implement feature X"
+    assert "impl-ar01" in review["description"]
     assert review["branch"] == "feat/x"
     assert "impl-ar01" in str(review.get("context", {}))
 
@@ -101,7 +101,8 @@ def test_i_ar03_auto_review_preserves_checklist(test_client):
 
     # Get auto-created review task
     tasks = test_client.get("/tasks").json()
-    review_tasks = [t for t in tasks if t["task_type"] == "review" and t.get("description") == "Implement feature Z"]
+    review_tasks = [t for t in tasks if t["task_type"] == "review"
+                    and t.get("context", {}).get("prev_task_id") == "impl-ar03"]
     assert len(review_tasks) == 1
 
     review = review_tasks[0]
@@ -137,5 +138,7 @@ def test_i_ar04_multiple_impl_tasks_create_reviews(test_client):
     # Verify 2 review tasks were created
     tasks = test_client.get("/tasks").json()
     review_tasks = [t for t in tasks if t["task_type"] == "review"]
-    feature_reviews = [t for t in review_tasks if "feature" in t.get("description", "").lower()]
+    feature_reviews = [t for t in review_tasks
+                       if t.get("context", {}).get("prev_task_id") in
+                       {"impl-ar04-0", "impl-ar04-1"}]
     assert len(feature_reviews) >= 2

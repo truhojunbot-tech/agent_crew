@@ -126,7 +126,8 @@ class TestDeterministicRace(Base):
         c = self._client()
         r = c.post(f"/tasks/{t.task_id}/result",
                    json={"task_id": t.task_id, "status": "completed", "verdict": "request_changes",
-                         "summary": "needs work", "findings": ["x"]})
+                         "summary": "The review found changes needed before this can be approved.",
+                         "findings": ["The implementation still needs a specific fix."]})
         self.assertTrue(r.json().get("suppressed_by_pause"))
         self.assertEqual(len([x for x in self.q.list_tasks() if x.task_type == "implement"]), 0)
 
@@ -222,7 +223,8 @@ class TestReviewCommentReconciliation(Base):
             self.q.external_op_reserve("comment:review:rev-x", pr_number=77)
             r = c.post("/tasks/rev-x/result",
                        json={"task_id": "rev-x", "status": "completed", "verdict": "approve",
-                             "summary": "lgtm", "pr_number": 77})
+                             "summary": "Reviewed the proposed change and found no blocking issues.",
+                             "findings": [], "pr_number": 77})
             self.assertEqual(r.status_code, 200)
             self.assertEqual(len(posts), 0, "이미 있는 댓글 → 재게시 안 함(reconciliation)")
             self.assertEqual(self.q.external_op_get("comment:review:rev-x")["state"], "done",
@@ -248,7 +250,8 @@ class TestReviewCommentReconciliation(Base):
             self.q.external_op_reserve("comment:review:rev-y", pr_number=78)  # 기존 reserved
             r = c.post("/tasks/rev-y/result",
                        json={"task_id": "rev-y", "status": "completed", "verdict": "approve",
-                             "summary": "lgtm", "pr_number": 78})
+                             "summary": "Reviewed the proposed change and found no blocking issues.",
+                             "findings": [], "pr_number": 78})
             self.assertEqual(r.status_code, 200)
             self.assertEqual(len(posts), 0, "unknown → fail-closed 미게시")
             self.assertEqual(self.q.external_op_get("comment:review:rev-y")["state"], "reserved",
@@ -471,4 +474,3 @@ class TestMcpTransportParity(Base):
         self.assertTrue(ack.get("acknowledged"), ack)
         self.assertFalse(ack.get("suppressed_by_pause"))
         self.assertEqual(self._review_count(), 1, "the normal MCP cascade stopped working")
-
