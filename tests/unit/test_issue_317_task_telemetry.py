@@ -282,8 +282,10 @@ def test_claude_dispatch_persists_the_existing_transcript_byte_boundary(tmp_path
         context = queue.get_or_create_context("project", "claude", str(wt),
                                               role="implementer", task_id="prior")
         queue.update_context_provider_session_id(context["context_key"], path.stem)
+        # Claude is an explicit override; Codex is the current implementer default.
         queue.enqueue(TaskRequest(task_id="span-dispatch", task_type="implement",
-                                  description="d", project="project"))
+                                  description="d", project="project",
+                                  context={"agent_override": "claude"}))
         task = queue.dequeue(role="implementer")
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "implementer"))

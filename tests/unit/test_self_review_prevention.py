@@ -94,11 +94,16 @@ class TestAutoEnqueueReviewRecordsImplementer:
 
 class TestAutoEnqueueTestRecordsBothAgents:
     def test_full_pipeline_records_implementer_and_reviewer(self, tmp_db):
-        """impl(claude) → review(codex approve) → test must inherit
-        implementer_agent=claude and reviewer_agent=codex."""
+        """The test inherits both upstream agents after an accepted approval."""
         push = RecordingPush()
+        # Keep this pipeline check on the current default role assignment.
+        current_panes = {
+            "implementer": "%100", "codex": "%100",
+            "reviewer": "%200", "claude": "%200",
+            "tester": "%300", "gemini": "%300",
+        }
         app = create_app(
-            db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push
+            db_path=tmp_db, pane_map=current_panes, port=8100, push_fn=push
         )
         with TestClient(app) as client:
             client.post("/tasks", json=_task_payload("impl-003", "implement"))
@@ -107,16 +112,20 @@ class TestAutoEnqueueTestRecordsBothAgents:
             )
             tasks = client.get("/tasks").json()
             review = [t for t in tasks if t["task_type"] == "review"][0]
-            client.post(
+            review_response = client.post(
                 f"/tasks/{review['task_id']}/result",
-                json=_result_payload(review["task_id"], verdict="approve"),
+                json=_result_payload(
+                    review["task_id"], verdict="approve",
+                    summary="Reviewed the implementation and approved the full test handoff.",
+                ),
             )
+            assert review_response.status_code == 200
             tasks2 = client.get("/tasks").json()
             tests = [t for t in tasks2 if t["task_type"] == "test"]
             assert len(tests) == 1
             test_ctx = tests[0]["context"]
-            assert test_ctx.get("implementer_agent") == "claude"
-            assert test_ctx.get("reviewer_agent") == "codex"
+            assert test_ctx.get("implementer_agent") == "codex"
+            assert test_ctx.get("reviewer_agent") == "claude"
 
 
 # ---------------------------------------------------------------------------
