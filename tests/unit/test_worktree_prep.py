@@ -28,8 +28,8 @@ def test_load_worktree_map_derives_roles(tmp_path):
     state_file.write_text(json.dumps(state))
 
     wm = _load_worktree_map(str(state_file))
-    assert wm["implementer"] == "/wt/claude"
-    assert wm["reviewer"] == "/wt/codex"
+    assert wm["implementer"] == "/wt/codex"
+    assert wm["reviewer"] == "/wt/claude"
     assert wm["tester"] == "/wt/gemini"
 
 

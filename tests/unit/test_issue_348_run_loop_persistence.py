@@ -336,7 +336,8 @@ class _WaitQueue:
         return self.status
 
 
-def test_run_waits_for_server_running_without_pane_after_wrapper_deadline(tmp_path, monkeypatch):
+def test_run_waits_for_server_running_without_pane_after_wrapper_deadline(tmp_path, monkeypatch,
+                                                                          unused_tcp_port):
     import time
     import urllib.request
 
@@ -345,9 +346,12 @@ def test_run_waits_for_server_running_without_pane_after_wrapper_deadline(tmp_pa
     monkeypatch.setattr(time, "time", clock.time)
     monkeypatch.setattr(time, "sleep", clock.sleep)
     monkeypatch.setattr("agent_crew.cli._read_state", lambda *args: {
-        "port": 18001, "pane_ids": [], "worktrees": {}})
+        "port": unused_tcp_port, "pane_ids": [], "worktrees": {}})
     monkeypatch.setattr("agent_crew.cli._port_listening", lambda *args, **kwargs: True)
     monkeypatch.setattr("agent_crew.cli._verify_delivery", lambda *args, **kwargs: True)
+    # The test exercises wrapper waiting, not the separate live /health check.
+    monkeypatch.setattr("agent_crew.project_identity.verify_server_identity",
+                        lambda *args, **kwargs: {"project": "sandbox"})
     posts = []
     monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: posts.append(args))
 

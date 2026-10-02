@@ -142,7 +142,7 @@ def test_u_t09_validate_repo_origin_match(tmp_path):
 
 
 # U-T10: crew triage exits with repo mismatch error when --repo doesn't match project origin
-def test_u_t10_triage_cli_exits_on_repo_mismatch(tmp_path):
+def test_u_t10_triage_cli_exits_on_repo_mismatch(tmp_path, unused_tcp_port):
     """crew triage --project X --repo Y must fail immediately with a clear error
     when Y does not match X's git origin URL. This prevents enqueueing issues
     from a different repo into the wrong project queue."""
@@ -153,7 +153,7 @@ def test_u_t10_triage_cli_exits_on_repo_mismatch(tmp_path):
     TaskQueue(db_file)
     state = {
         "project": "proj_t10",
-        "port": 0,
+        "port": unused_tcp_port,
         "db": db_file,
         "session": "crew_proj_t10",
         "agents": ["claude"],
@@ -164,7 +164,8 @@ def test_u_t10_triage_cli_exits_on_repo_mismatch(tmp_path):
 
     runner = CliRunner()
     # validate_repo_origin returns mismatch
-    with patch("agent_crew.triage.validate_repo_origin",
+    with patch("agent_crew.cli.setup_module.resolve_project_path", return_value=str(tmp_path)), \
+         patch("agent_crew.triage.validate_repo_origin",
                return_value=(False, "repo mismatch: --repo org/wrong but project proj_t10 origin is org/actual")):
         result = runner.invoke(crew, [
             "triage",

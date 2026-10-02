@@ -81,14 +81,14 @@ def test_u213_get_task_http_endpoint_returns_result_fields(tmp_db, github_writes
         })
         client.post("/tasks/review-213d/result", json={
             "task_id": "review-213d", "status": "completed",
-            "summary": "Approved — no blocking issues.",
+            "summary": "Approved after reviewing the change; no blocking issues remain.",
             "verdict": "approve", "findings": [], "pr_number": 99,
         })
 
         resp = client.get("/tasks/review-213d")
         assert resp.status_code == 200
         body = resp.json()
-        assert body["summary"] == "Approved — no blocking issues."
+        assert body["summary"] == "Approved after reviewing the change; no blocking issues remain."
         assert body["verdict"] == "approve"
         assert body["pr_number"] == 99
         assert body["status"] == "completed"

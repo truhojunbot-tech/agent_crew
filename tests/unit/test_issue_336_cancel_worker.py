@@ -129,7 +129,7 @@ def test_cli_cancel_signals_bound_worker_and_reports_unconfirmed_stop(
     assert outcome in result.output
 
 
-def test_cli_project_cancel_signals_its_bound_worker(tmp_path):
+def test_cli_project_cancel_signals_its_bound_worker(tmp_path, unused_tcp_port):
     project_dir = tmp_path / "demo"
     project_dir.mkdir()
     db = str(project_dir / "tasks.db")
@@ -139,9 +139,10 @@ def test_cli_project_cancel_signals_its_bound_worker(tmp_path):
     queue.dequeue(role="implementer")
     queue.set_push_at("project-running", pane_id="%101")
     (project_dir / "state.json").write_text(json.dumps({
-        "db": db, "port": 8100, "pane_ids": ["%101"],
+        "db": db, "port": unused_tcp_port, "pane_ids": ["%101"],
     }))
-    with patch("agent_crew.server.subprocess.run") as run:
+    with patch("agent_crew.server._pane_alive_for_push", return_value=True), \
+         patch("agent_crew.server.subprocess.run") as run:
         run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
         result = CliRunner().invoke(crew, ["task", "cancel", "project-running",
                                              "--project", "demo", "--base", str(tmp_path)])

@@ -111,9 +111,10 @@ def test_the_duplicate_check_names_the_column_not_just_the_constraint_kind(tmp_d
     conn.commit()
     conn.close()
 
-    q.enqueue(_task("first", branch="unique-branch"))
+    # Implement tasks are not subject to the separate standing-review guard.
+    q.enqueue(_task("first", task_type="implement", branch="unique-branch"))
     with pytest.raises(sqlite3.IntegrityError) as exc:
-        q.enqueue(_task("second", branch="unique-branch"))
+        q.enqueue(_task("second", task_type="implement", branch="unique-branch"))
     assert "UNIQUE" in str(exc.value)
 
 
