@@ -91,7 +91,9 @@ class QuotaBudgetProvider:
             return None
         with open(self.cooldown_file, "r", encoding="utf-8") as fh:
             doc = json.load(fh)
-        v = (doc or {}).get(provider)
+        if not isinstance(doc, dict):
+            raise ValueError("cooldown file must contain a provider mapping")
+        v = doc.get(provider)
         if isinstance(v, dict):
             v = v.get("until")
         return float(v) if isinstance(v, (int, float)) else None

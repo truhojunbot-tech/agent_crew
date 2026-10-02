@@ -89,11 +89,30 @@ def test_cooldown_only_clears_on_file_clear_or_until(tmp_path):
     assert reader.active_cooldown_until("codex") is None
 
 
-def test_malformed_configured_cooldown_is_not_treated_as_clear(tmp_path):
+@pytest.mark.parametrize("body", ["{", "[1,2,3]", "42", '"codex"', "true", "null"])
+def test_malformed_configured_cooldown_is_not_treated_as_clear(tmp_path, body):
     path = tmp_path / "cooldown.json"
-    path.write_text("{")
+    path.write_text(body)
     reader = QuotaBudgetProvider(cooldown_file=str(path), clock=lambda: 100)
     assert reader.active_cooldown_until("codex") == float("inf")
+
+
+def test_task_post_with_wrong_shape_cooldown_holds_without_500(
+        tmp_db, cooldown, monkeypatch):
+    cooldown_file = cooldown("codex", time.time() + 3600)
+    cooldown_file.write_text("[1,2,3]")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    app = create_app(tmp_db, pane_map={"implementer": "%100"},
+                     push_fn=lambda *_: None, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "task_id": "wrong-shape", "task_type": "implement",
+            "description": "work", "branch": "topic", "priority": 3,
+            "context": {}, "project": "",
+        })
+    assert response.status_code == 201
+    assert TaskQueue(tmp_db).get_task_status("wrong-shape") == "pending"
 
 
 def test_rate_limit_cannot_substitute_provider(tmp_db):
