@@ -42,9 +42,13 @@ def submit_result(task_id):
     result = {
         "task_id": task_id,
         "status": STATUS,
-        "summary": f"stub {ROLE} done",
+        "summary": (
+            f"Stub {ROLE} completed the assigned task and checked its result."
+            if ROLE == "reviewer" else f"stub {ROLE} done"
+        ),
         "verdict": VERDICT,
-        "findings": [],
+        "findings": (["The implementation needs changes before approval."]
+                     if ROLE == "reviewer" and VERDICT == "request_changes" else []),
     }
     body = json.dumps(result).encode()
     url = f"{BASE_URL}/tasks/{task_id}/result"

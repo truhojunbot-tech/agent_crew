@@ -117,7 +117,9 @@ def test_e_lo01_basic_approve(live_server):
 def test_e_lo02_request_changes_then_approve(live_server):
     port, db_path = live_server
 
-    cli_t, holder = _start_cli(["run", "feat Y", "--db", db_path, "--branch", "main"])
+    # Automated fixes cannot target the default branch (#457).
+    cli_t, holder = _start_cli(["run", "feat Y", "--db", db_path,
+                                "--branch", "feat/review-loop"])
 
     # iteration 1: coder done, reviewer rejects
     assert _stub(port, "coder").returncode == 0
@@ -140,7 +142,8 @@ def test_e_lo03_escalation_gate(live_server):
     port, db_path = live_server
 
     cli_t, holder = _start_cli(
-        ["run", "feat Z", "--db", db_path, "--branch", "main", "--max-iter", "2"]
+        ["run", "feat Z", "--db", db_path, "--branch", "feat/review-loop",
+         "--max-iter", "2"]
     )
 
     # iteration 1: coder done, reviewer rejects
