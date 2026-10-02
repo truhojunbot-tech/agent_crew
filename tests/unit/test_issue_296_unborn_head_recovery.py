@@ -268,7 +268,7 @@ def test_the_dispatcher_does_not_launch_into_a_broken_worktree(tmp_path, monkeyp
 
     wt = _unhealable(repo)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"port": 0, "worktrees": {"codex": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
@@ -402,7 +402,7 @@ def test_an_unhealthy_worktree_is_not_reported_as_a_pr_problem(tmp_path,
         return _P()
 
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"port": 0, "worktrees": {"codex": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)

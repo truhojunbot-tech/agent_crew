@@ -17,9 +17,19 @@ changed whether the write happened. A boundary that depends on each test
 remembering is not a boundary.
 """
 
+import os
+import sys
+
 import pytest
 
 from tests.conftest import GITHUB_WRITE_FUNCTIONS, GitHubWriteFromTest
+
+
+def _pytest_subprocess_env(env=None):
+    """Keep installed test dependencies visible when a fixture isolates HOME."""
+    result = dict(os.environ if env is None else env)
+    result["PYTHONPATH"] = os.pathsep.join(path for path in sys.path if path)
+    return result
 
 
 def test_every_mutating_github_function_is_covered():
@@ -93,7 +103,8 @@ def test_a_swallowed_write_attempt_still_fails_the_test(testdir_factory=None):
     tmp.write_text(body)
     try:
         r = subprocess.run([sys.executable, "-m", "pytest", str(tmp), "-q"],
-                           capture_output=True, text=True, timeout=180)
+                           capture_output=True, text=True, timeout=180,
+                           env=_pytest_subprocess_env())
         assert r.returncode != 0, (
             "a test that swallowed a blocked GitHub write still passed — the "
             "attempt has to fail the test, not just be blocked"
@@ -199,7 +210,8 @@ def test_an_unapproved_live_github_test_is_skipped_and_still_blocked(tmp_path):
            if k not in (LIVE_GITHUB_ENV, LIVE_GITHUB_REPO_ENV)}
     try:
         r = subprocess.run([sys.executable, "-m", "pytest", str(probe), "-q", "-rs"],
-                           capture_output=True, text=True, timeout=180, env=env)
+                           capture_output=True, text=True, timeout=180,
+                           env=_pytest_subprocess_env(env))
         assert r.returncode == 0, r.stdout + r.stderr      # skipped, not failed
         combined = r.stdout + r.stderr
         assert "skipped" in combined
@@ -282,7 +294,8 @@ def _run_probe(tmp_path, body, *, approved=True, target=APPROVED_TARGET):
         env.pop(LIVE_GITHUB_REPO_ENV, None)
     try:
         return subprocess.run([sys.executable, "-m", "pytest", str(probe), "-q"],
-                              capture_output=True, text=True, timeout=180, env=env)
+                              capture_output=True, text=True, timeout=180,
+                              env=_pytest_subprocess_env(env))
     finally:
         probe.unlink(missing_ok=True)
 
