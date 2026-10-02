@@ -12,19 +12,21 @@ import pytest
 
 @pytest.mark.skipif(os.environ.get("RUN_CEA_BROKER_SANDBOX") != "1",
                     reason="set RUN_CEA_BROKER_SANDBOX=1 for subprocess sandbox")
-def test_broker_sandbox():
+def test_broker_sandbox(tmp_path):
     script = Path(__file__).resolve().parents[2] / "scripts/cea/broker_sandbox.py"
     subprocess.run([sys.executable, str(script)], check=True, timeout=90,
-                   env={**os.environ, "PYTHONUSERBASE": site.getuserbase()})
+                   env={**os.environ, "PYTHONUSERBASE": site.getuserbase(),
+                        "CEA_BROKER_SANDBOX_EVIDENCE_DIR": str(tmp_path)})
 
 
 @pytest.mark.skipif(importlib.util.find_spec("uvicorn") is None,
                     reason="uvicorn unavailable")
-def test_broker_sandbox_e2e():
+def test_broker_sandbox_e2e(tmp_path):
     script = Path(__file__).resolve().parents[2] / "scripts/cea/broker_sandbox.py"
     result = subprocess.run([sys.executable, str(script), "--e2e"],
                             capture_output=True, text=True, timeout=120,
-                            env={**os.environ, "PYTHONUSERBASE": site.getuserbase()})
+                            env={**os.environ, "PYTHONUSERBASE": site.getuserbase(),
+                                 "CEA_BROKER_SANDBOX_EVIDENCE_DIR": str(tmp_path)})
     assert result.returncode == 0, result.stdout + result.stderr
     evidence = json.loads(Path(result.stdout.strip().splitlines()[-1]).read_text())
     assert evidence["pass"] is True

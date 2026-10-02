@@ -287,13 +287,14 @@ def test_provenance_endpoint_grades_against_an_expected_ref(tmp_db):
 
     assert snap["project"] == "agent_crew" and snap["port"] == 8105
     assert stale["expected"]["status"] == prov.UNKNOWN
-    # ⛔Keyed off the REAL process, which during development is usually dirty.
-    #   #256 made that unconfirmable on purpose: a working tree with
-    #   uncommitted edits is not the commit it names, and asserting CURRENT
-    #   unconditionally here would re-assert exactly the thing that was wrong.
+    # A dirty checkout is confirmable only if its loaded files match the
+    # expected commit's tree. Edits to loaded code remain unconfirmable (#256).
     if snap["dirty"]:
-        assert graded["expected"]["status"] == prov.UNKNOWN
-        assert "dirty" in graded["expected"]["reason"]
+        if graded["expected"]["status"] == prov.CURRENT:
+            assert "loaded files match its tree" in graded["expected"]["reason"]
+        else:
+            assert graded["expected"]["status"] == prov.UNKNOWN
+            assert "dirty" in graded["expected"]["reason"]
     else:
         assert graded["expected"]["status"] == prov.CURRENT
 

@@ -28,6 +28,12 @@ LAUNCHER = ROOT / "scripts/cea/broker-launch.sh"
 TEST = ROOT / "tests/unit/test_cea_broker_oop.py"
 
 
+def evidence_path(name: str) -> Path:
+    """Keep operator evidence in the repo unless a caller selects another dir."""
+    directory = os.environ.get("CEA_BROKER_SANDBOX_EVIDENCE_DIR")
+    return (Path(directory) if directory else ROOT / "evidence") / name
+
+
 def free_port():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -37,7 +43,7 @@ def free_port():
 def run_e2e():
     """Exercise HTTP admission through the degraded broker in disposable state."""
     build = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-    out = ROOT / "evidence" / f"cea_broker_e2e_{build[:7]}.json"
+    out = evidence_path(f"cea_broker_e2e_{build[:7]}.json")
     with tempfile.TemporaryDirectory(prefix="cea-broker-e2e-") as tmp:
         home = Path(tmp)
         project_dir = home / "alfred"
@@ -321,7 +327,7 @@ def run():
                                   "review_allowed": "ALLOW",
                                   "BUDGET_EXHAUSTED": "advisory"} if test.returncode == 0 else {},
                         "scope": "decision cases use a separate isolated broker with injected test providers; server health and launcher are smoke checks"}
-            out = ROOT / "evidence" / f"cea_broker_sandbox_{build[:7]}.json"
+            out = evidence_path(f"cea_broker_sandbox_{build[:7]}.json")
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(json.dumps(evidence, indent=2) + "\n")
             print(out)
