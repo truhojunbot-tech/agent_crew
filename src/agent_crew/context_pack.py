@@ -734,7 +734,7 @@ def _artifact_path_keys(uri: str, repo_path: str) -> set:
     path = os.path.normpath(str(uri or ""))
     if repo_path and path.startswith(os.path.normpath(repo_path) + os.sep):
         path = os.path.relpath(path, repo_path)
-    return {path, os.path.basename(path)} if path else set()
+    return {path} if path else set()
 
 
 def keywords_from(query_title: str, body: str = "", extra: Optional[list] = None,
