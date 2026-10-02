@@ -181,7 +181,9 @@ def test_a_poisoned_pythonpath_fails_the_whole_process(tmp_path):
 def test_the_healthy_subprocess_still_emits_parseable_json(tmp_path):
     """⛔Control for the above, so the assertion cannot pass by the script being
     broken outright."""
-    env = dict(os.environ, PYTHONPATH=os.path.join(REPO, "src"),
+    # The isolated test HOME hides user-site dependencies from the child process.
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join(
+        [os.path.join(REPO, "src"), *(path for path in sys.path if path)]),
                AGENT_CREW_BASE=str(tmp_path))
     proc = subprocess.run([sys.executable, SCRIPT, "--json"], env=env,
                           capture_output=True, text=True, timeout=120)

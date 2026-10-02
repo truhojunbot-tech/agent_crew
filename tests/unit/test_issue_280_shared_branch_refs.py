@@ -239,7 +239,8 @@ def test_the_cli_worktree_sync_does_not_force_move_main():
     source = inspect.getsource(cli)
     assert '"checkout", "-B", main_branch' not in source, \
         "worktree sync still force-moves the shared main ref"
-    assert '"checkout", "--detach", f"origin/{main_branch}"' in source
+    assert '"checkout", "--detach", requested_ref' in source
+    assert 'requested_ref = f"origin/{main_branch}"' in source
 
 
 def test_a_detached_worktree_still_reports_which_branch_the_work_is_about(
@@ -271,7 +272,7 @@ def test_a_detached_worktree_still_reports_which_branch_the_work_is_about(
         return _P()
 
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    state.write_text(json.dumps({"port": 0, "worktrees": {"codex": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)

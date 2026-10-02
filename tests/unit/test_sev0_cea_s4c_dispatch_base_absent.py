@@ -52,6 +52,7 @@ def hermetic_admission(monkeypatch):
       BLOCK receipt is not.
     """
     from agent_crew.cea import wiring as cea_wiring
+    from agent_crew.cea import signed_receipt
 
     original = TaskQueue.__init__
 
@@ -62,6 +63,10 @@ def hermetic_admission(monkeypatch):
     monkeypatch.setattr(TaskQueue, "__init__", patched)
     monkeypatch.setattr(cea_wiring, "install_from_env", lambda *a, **k: types.SimpleNamespace(
         providers=dict(WIRED), authority=None, mode="shadow", statuses=()))
+    # This suite isolates T5. Treat the fixture receipts as valid grants at P2;
+    # signature validation itself is covered by test_cea_signed_receipt.py.
+    monkeypatch.setattr(signed_receipt, "load_public", lambda *_: object())
+    monkeypatch.setattr(signed_receipt, "verify", lambda *_a, task_id, **_k: (True, task_id))
 
 
 def _run_to_result(client, task_id, body):
@@ -74,9 +79,12 @@ def _run_to_result(client, task_id, body):
       would test the wrong rule. Driving the lifecycle is what isolates the
       artifact gate now that the lineage is enforced consistently.
     """
-    handed = client.get("/tasks/next",
-                        params={"role": "implementer", "agent": "claude"}).json()
-    assert handed.get("task_id") == task_id, handed
+    claim = client.get("/tasks/next",
+                       params={"role": "implementer", "agent": "claude"})
+    handed = claim.json()
+    assert isinstance(handed, dict) and handed.get("task_id") == task_id, (
+        claim.status_code, handed
+    )
     nonce = handed.get("dispatch_nonce")
     assert nonce, handed
     go = client.post(f"/tasks/{task_id}/start",

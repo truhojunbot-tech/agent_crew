@@ -19,7 +19,7 @@ PUBLIC_IMPORT_ROOTS = {
 PRIVATE_LITERAL_ALLOWLIST = {
     ("cea/input_providers/admission_inputs.py", 28, "/home/truhojun"):
         "Optional CEA subprocess default; an environment path can replace it.",
-    ("cea/input_providers/budget.py", 35, "/home/truhojun"):
+    ("cea/input_providers/budget.py", 36, "/home/truhojun"):
         "Optional CEA quota cache default; an environment path can replace it.",
     ("cea/input_providers/snapshot.py", 45, "/home/truhojun"):
         "Optional CEA snapshot default; an environment path can replace it.",
