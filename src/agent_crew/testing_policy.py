@@ -196,9 +196,8 @@ def render_scope(scope: dict) -> str:
 
     lines = ["### Test scope: TARGETED — do NOT run the full suite\n",
              "CI runs the full suite on this PR. Running it again here is a second",
-             "copy of the same work on a shared host: alpha_engine#5541 measured",
-             "load 30.29 on 16 cores with 1 GB free and a dev job queued 45+ minutes",
-             "behind it (#272). Your job is the part CI cannot do — checking that",
+             "copy of the same work on a shared host and can delay other jobs.",
+             "Your job is the part CI cannot do — checking that",
              "the diff is covered — not re-running what CI already ran.\n",
              "1. Get the diff: `git diff --name-only origin/main...HEAD`.",
              "2. Run the tests that cover those files."]

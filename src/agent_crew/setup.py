@@ -286,12 +286,16 @@ def validate_git_repo(path: str) -> bool:
 def resolve_project_path(project: str) -> str:
     """Auto-detect project path from project name.
 
-    Searches common locations: ~/alfred/projects/<project>, ~/work/<project>, etc.
+    Searches AGENT_CREW_PROJECT_ROOTS (os.pathsep-separated), then common home
+    locations. With no override, the legacy project root is searched first.
     Falls back to current directory if it's a git repo. Raises RuntimeError if not found.
     """
     # Priority order for project discovery
-    candidates = [
-        os.path.expanduser(f"~/alfred/projects/{project}"),
+    roots = (os.environ.get("AGENT_CREW_PROJECT_ROOTS") or "").split(os.pathsep)
+    roots = [os.path.expanduser(root.strip()) for root in roots if root.strip()]
+    if not roots:
+        roots = [os.path.join(os.path.expanduser("~"), "alfred", "projects")]
+    candidates = [os.path.join(root, project) for root in roots] + [
         os.path.expanduser(f"~/projects/{project}"),
         os.path.expanduser(f"~/work/{project}"),
         os.path.expanduser(f"~/{project}"),

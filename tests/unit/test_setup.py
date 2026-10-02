@@ -1,4 +1,7 @@
 from unittest.mock import MagicMock, patch
+import os
+
+from agent_crew import setup as setup_api
 
 from agent_crew.setup import (
     _CLI_READY_MARKERS,
@@ -15,6 +18,23 @@ from agent_crew.setup import (
     write_sessions_json,
     _get_agent_cmd,
 )
+
+
+def test_project_roots_default_preserves_legacy_search(monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_PROJECT_ROOTS", raising=False)
+    legacy = os.path.join(os.path.expanduser("~"), "alfred", "projects", "demo")
+    monkeypatch.setattr(setup_api.os.path, "isdir", lambda path: path == legacy)
+    monkeypatch.setattr(setup_api, "validate_git_repo", lambda path: path == legacy)
+    assert setup_api.resolve_project_path("demo") == legacy
+
+
+def test_project_roots_env_replaces_legacy_search(monkeypatch, tmp_path):
+    roots = [tmp_path / "first", tmp_path / "second"]
+    selected = str(roots[1] / "demo")
+    monkeypatch.setenv("AGENT_CREW_PROJECT_ROOTS", os.pathsep.join(map(str, roots)))
+    monkeypatch.setattr(setup_api.os.path, "isdir", lambda path: path == selected)
+    monkeypatch.setattr(setup_api, "validate_git_repo", lambda path: path == selected)
+    assert setup_api.resolve_project_path("demo") == selected
 
 
 # U-SE01: validate_git_repo — git repo 경로 → True (mock subprocess)
