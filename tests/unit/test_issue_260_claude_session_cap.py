@@ -115,7 +115,9 @@ def _dispatch_cmd(tmp_path, monkeypatch, agent, *, policy="resume", over=False, 
     wt.mkdir(exist_ok=True)      # the same tmp_path is reused across calls
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"worktrees": {agent: str(wt)}}))
+    state.write_text(json.dumps({"worktrees": {agent: str(wt)},
+                                 "role_agents": {"implementer": "claude", "reviewer": "codex",
+                                                 "tester": "gemini"}}))
     db = str(tmp_path / "t.db")
     spawned = {}
 
@@ -240,7 +242,9 @@ def _capped_event(tmp_path, monkeypatch, agent, cap_info, *, unused_tcp_port):
     wt.mkdir(exist_ok=True)
     (wt / ".git").mkdir(exist_ok=True)
     state = tmp_path / "state.json"
-    state.write_text(_json.dumps({"worktrees": {agent: str(wt)}}))
+    state.write_text(_json.dumps({"worktrees": {agent: str(wt)},
+                                  "role_agents": {"implementer": "claude", "reviewer": "codex",
+                                                  "tester": "gemini"}}))
     db = str(tmp_path / "t.db")
 
     async def _fake_exec(*cmd, **kwargs):

@@ -257,12 +257,26 @@ def test_the_window_is_reported_even_when_no_token_cap_is_set(tmp_path):
     assert info["context_tokens"] == 601_674, "the measurement was dropped"
 
 
-def test_the_default_token_cap_is_off(tmp_path):
-    """⛔Deliberate. On the measured fleet a 400k default would reset three of
-    seven worktrees on their next dispatch, and alpha_engine reached 363k
-    shortly after a rotation — so a low cap would thrash. Picking that number
-    is provider-economics policy, which this layer does not own."""
-    assert sv.CLAUDE_CONTEXT_MAX_TOKENS == 0
+def test_the_default_token_cap_is_off():
+    """An unset cap is off, independent of the host's configured cap."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    env = os.environ.copy()
+    env.pop("AGENT_CREW_CLAUDE_CONTEXT_MAX_TOKENS", None)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(Path(__file__).resolve().parents[2] / "src"),
+         *(path for path in sys.path if path)]
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", "from agent_crew.server import CLAUDE_CONTEXT_MAX_TOKENS; "
+         "print(CLAUDE_CONTEXT_MAX_TOKENS)"],
+        capture_output=True, text=True, env=env, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "0"
 
 
 @pytest.mark.parametrize("tokens, cap, expected", [
@@ -318,7 +332,9 @@ def test_the_cap_event_carries_the_window_and_the_cause(tmp_path, monkeypatch, *
     wt = tmp_path / "worktrees" / "demo" / "claude"
     wt.mkdir(parents=True)
     state = tmp_path / "state.json"
-    state.write_text(_json.dumps({"port": 0, "worktrees": {"claude": str(wt)}}))
+    state.write_text(_json.dumps({"port": 0, "worktrees": {"claude": str(wt)},
+                                  "role_agents": {"implementer": "claude", "reviewer": "codex",
+                                                  "tester": "gemini"}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)

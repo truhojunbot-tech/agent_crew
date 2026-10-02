@@ -36,8 +36,9 @@ def test_shadow_telemetry_without_request_retains_its_existing_shape():
 
     assert set(telemetry) == {
         "provider", "backend", "state", "latency_ms", "error_type", "result_ids", "ranks",
-        "scores", "source_refs", "freshness", "superseded",
+        "scores", "source_refs", "freshness", "superseded", "dropped_cross_project",
     }
+    assert telemetry["dropped_cross_project"] == 0
     assert "query_hash" not in telemetry
     assert "query_source" not in telemetry
 

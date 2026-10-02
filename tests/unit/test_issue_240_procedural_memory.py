@@ -743,7 +743,9 @@ def test_enabled_dispatcher_puts_a_persisted_procedure_into_the_prompt(
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)}}))
+    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)},
+                                      "role_agents": {"implementer": "claude", "reviewer": "codex",
+                                                      "tester": "gemini"}}))
     db = str(tmp_path / "t.db")
     _persist(tmp_path / "procedures.jsonl", trigger={},
              scope=Scope(repos=["org/repo"]))
@@ -1047,7 +1049,9 @@ def test_enabled_dispatcher_respects_module_scope(tmp_path, monkeypatch, *, unus
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)}}))
+    state_file.write_text(_json.dumps({"worktrees": {"claude": str(wt)},
+                                      "role_agents": {"implementer": "claude", "reviewer": "codex",
+                                                      "tester": "gemini"}}))
     db = str(tmp_path / "t.db")
     _persist(tmp_path / "procedures.jsonl", trigger={},
              scope=Scope(modules=["agent_crew.watch"]))
