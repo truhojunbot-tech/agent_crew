@@ -135,14 +135,19 @@ def test_a_task_with_no_pr_number_still_uses_its_branch(pr_repo, monkeypatch):
         str(wt), "task-289", PR_BRANCH, "reviewer", task_context={}) == sha_a
 
 
-def test_discuss_with_local_branch_dispatches_from_main(pr_repo, tmp_path, monkeypatch,
-                                                        unused_tcp_port):
-    """A panel has no review target even when its caller names a local branch."""
+@pytest.mark.parametrize("branch,expected_ref", [
+    ("wt-main", "main"),
+    (PR_BRANCH, "feature"),
+])
+def test_discuss_branch_uses_origin_when_available_or_main_when_missing(
+    pr_repo, tmp_path, monkeypatch, unused_tcp_port, branch, expected_ref,
+):
+    """A panel uses a real branch; a caller-local branch falls back to main."""
     from fastapi.testclient import TestClient
 
     from agent_crew.server import create_app
 
-    _, wt, _, main_tip = pr_repo
+    _, wt, feature_tip, main_tip = pr_repo
     spawned = []
 
     async def fake_exec(*cmd, **kwargs):
@@ -172,7 +177,7 @@ def test_discuss_with_local_branch_dispatches_from_main(pr_repo, tmp_path, monke
     with TestClient(app):
         queue = TaskQueue(db)
         queue.enqueue(TaskRequest(task_id="discuss-289", task_type="discuss",
-                                  description="Discuss the issue", branch="wt-main",
+                                  description="Discuss the issue", branch=branch,
                                   project="demo", context={"agent": "claude"}))
         task = queue.dequeue_discuss_for_agent("claude")
         assert task is not None
@@ -181,7 +186,14 @@ def test_discuss_with_local_branch_dispatches_from_main(pr_repo, tmp_path, monke
 
     assert spawned, "the discuss worker was not dispatched"
     assert row.status != "needs_human"
-    assert _sha(wt) == main_tip
+    assert _sha(wt) == (feature_tip if expected_ref == "feature" else main_tip)
+
+
+def test_review_still_refuses_missing_branch_with_task_type(pr_repo):
+    _, wt, _, _ = pr_repo
+    with pytest.raises(sv.WorktreeTargetUnresolved):
+        sv._prepare_worktree_for_task(str(wt), "review-289", "wt-main",
+                                      "reviewer", task_type="review")
 
 
 def test_the_implementer_is_unaffected(pr_repo, monkeypatch):
