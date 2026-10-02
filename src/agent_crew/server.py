@@ -21,6 +21,7 @@ from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
+from agent_crew.cea.input_providers.budget import QuotaBudgetProvider
 from agent_crew.port_validation import require_project_port
 from agent_crew import claude_transcript as _claude_transcript
 from agent_crew.anomaly import check_wrong_repo
@@ -40,7 +41,7 @@ from agent_crew.context_identity import (
     extract_claude_session_id,
     record_context_event,
 )
-from agent_crew.fallback import is_rate_limit_error
+from agent_crew.fallback import has_rate_limit_signal, is_rate_limit_error
 from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo
 from agent_crew.loop import _resolve_verdict
@@ -3315,6 +3316,42 @@ def create_app(
     def q() -> TaskQueue:
         return state["queue"]
 
+    def _hold_or_skip_provider_limit(task: TaskRequest, agent: str,
+                                     until: Optional[float]) -> None:
+        note = f"{agent} tester stage not run (provider limit)"
+        recorded_until = until if until is None or math.isfinite(until) else "unknown"
+        if task.task_type == "test":
+            fields = {"reason": note, "provider": agent,
+                      "cooldown_until": recorded_until}
+            q().requeue(task.task_id, reason="provider_cooldown")
+            q().patch_context(task.task_id, {
+                "test_stage_skip": fields, "post_recovery_verification": True,
+            })
+            parent = (task.context or {}).get("prev_task_id")
+            if parent:
+                q().patch_context(parent, {"test_stage_skip": fields})
+            if not (task.context or {}).get("post_recovery_verification"):
+                pr_number = (task.context or {}).get("pr_number")
+                if isinstance(pr_number, int):
+                    _auto_merge_pr(pr_number, repo=(task.context or {}).get("repo") or "")
+            action = "held" if (task.context or {}).get("post_recovery_verification") else "skipped"
+        else:
+            q().requeue(task.task_id, reason="provider_cooldown")
+            action = "held"
+        logger.warning(
+            "provider cooldown: provider=%s since=unknown until=%s task=%s "
+            "tasks_%s=1", agent, recorded_until, task.task_id, action)
+
+    def _honor_provider_cooldown(task: TaskRequest, agent: str) -> bool:
+        """Hold work or skip a tester before spending this provider's slot."""
+        if task.task_type not in ("implement", "review", "test"):
+            return False
+        until = QuotaBudgetProvider().active_cooldown_until(agent)
+        if until is None:
+            return False
+        _hold_or_skip_provider_limit(task, agent, until)
+        return True
+
     def _guard_task_existence(task_id: str, target: str) -> bool:
         """Refuse a task block whose DB row is missing or terminal."""
         task_status = q().get_task_status(task_id)
@@ -3726,6 +3763,10 @@ def create_app(
                     skipped.add(task.task_id)
                     continue
 
+            if _honor_provider_cooldown(task, _target_agent):
+                skipped.add(task.task_id)
+                continue
+
             # A busy queue head must not hide a later task for a free pane.
             if pane_id in _panes_with_in_progress(exclude_task_id=task.task_id):
                 logger.debug(
@@ -3810,39 +3851,10 @@ def create_app(
         if not guarded_pane_id:
             return
 
-        # #151: if target pane shows a usage-limit message, immediately reroute
-        # via fallback rather than pushing into a blocked agent.
+        # #308: a pane usage-limit signal follows the same role policy as a
+        # cooldown; never substitute another provider into this role.
         if _pane_has_usage_limit(guarded_pane_id):
-            blocked_agent = next(
-                (k for k, v in (pane_map or {}).items() if v == pane_id and k in ("claude", "codex", "gemini")),
-                None,
-            )
-            logger.warning(
-                f"_try_push_next: pane {pane_id} shows usage-limit — "
-                f"skipping push, routing task {task.task_id} to fallback "
-                f"(blocked_agent={blocked_agent})"
-            )
-            usage_limit_summary = (
-                f"usage limit detected on pane {pane_id}"
-                + (f" (agent={blocked_agent})" if blocked_agent else "")
-            )
-            task_type_for_fb = _ROLE_TO_TYPE.get(role)
-            if task_type_for_fb:
-                fb_result = TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    summary=usage_limit_summary,
-                    verdict=None,
-                    findings=[],
-                    pr_number=None,
-                )
-                q().force_fail(task.task_id, usage_limit_summary)
-                try:
-                    _auto_fallback_failed_task(task.task_id, fb_result, task_type_for_fb)
-                except Exception:
-                    logger.exception(f"_try_push_next: fallback failed for usage-limited task {task.task_id}")
-            else:
-                q().requeue(task.task_id)
+            _hold_or_skip_provider_limit(task, _target_agent, None)
             return
 
         # #158: if pane shows a bare shell prompt (agent CLI crashed), requeue
@@ -4272,6 +4284,10 @@ def create_app(
                 tid = sp.get("task_id")
                 if not tid:
                     continue
+                if (sp.get("context") or {}).get("post_recovery_verification"):
+                    # This task is intentionally pending until the provider
+                    # recovers. An absent MCP client is not a test failure.
+                    continue
                 summary = (
                     f"watchdog: AGENT_CREW_DELIVERY=mcp — no MCP client dequeued "
                     f"task {tid} within {stale_pending_seconds:.0f}s"
@@ -4468,6 +4484,8 @@ def create_app(
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         agent, wt = _resolve_dispatch_target(task, role)
+        if _honor_provider_cooldown(task, agent):
+            return
         if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
             if agent == _override:
                 logger.info(
@@ -5887,6 +5905,13 @@ def create_app(
         )
         if test_id:
             _try_push_next("tester")
+        else:
+            review_ctx = q().get_task_context(review_task_id) or {}
+            skipped = review_ctx.get("test_stage_skip") or {}
+            if skipped.get("reason") == "gemini tester stage not run (provider limit)":
+                pr_number = review_ctx.get("pr_number")
+                if isinstance(pr_number, int):
+                    _auto_merge_pr(pr_number, repo=repo or review_ctx.get("repo") or "")
 
     def _any_worktree_path() -> str:
         """A worktree that is a checkout of THIS project's repository.
@@ -6056,6 +6081,24 @@ def create_app(
                     f"Task {task_id} failed (status={result.status}), "
                     f"but DB retry_attempt={db_retry_attempt} >= MAX_RETRIES={MAX_RETRIES}"
                 )
+                if has_rate_limit_signal(result.summary, result.findings):
+                    # No cross-provider fallback (#308). Preserve the old
+                    # fallback chain's durable exhaustion signal instead of
+                    # letting the last same-role retry disappear into a log.
+                    gate_id = f"escalation-{task_id}-provider-limit"
+                    message = (
+                        f"Provider limit after {MAX_RETRIES} same-role retries; "
+                        f"task_id: {task_id}; task_type: {task_type}; "
+                        f"last summary: {(result.summary or '')[:200]}"
+                    )
+                    try:
+                        q().create_gate(GateRequest(
+                            id=gate_id, type="escalation", message=message,
+                        ))
+                    except sqlite3.IntegrityError:
+                        pass  # Same failed result replayed; reuse its gate.
+                    q().patch_context(task_id, {"provider_limit_escalation": gate_id})
+                    logger.warning("provider limit exhausted: task=%s gate=%s", task_id, gate_id)
                 return
 
             # #161: review tasks with no branch AND no pr_number have no way to
@@ -6089,6 +6132,13 @@ def create_app(
 
             # Create retry task with incremented retry count
             retry_context = _successor_context(original_task.context)
+            retry_risk = retry_context.get("risk_declaration")
+            if (isinstance(retry_risk, dict)
+                    and retry_risk.get("declaration_source", "explicit") == "explicit"):
+                retry_context["risk_declaration"] = {
+                    **retry_risk,
+                    "inherited_from": retry_risk.get("inherited_from") or task_id,
+                }
             retry_context.pop(RESULT_BRANCH_CONTEXT_KEY, None)
             retry_context.pop(RESULT_COMMIT_CONTEXT_KEY, None)
             retry_context["retry_attempt"] = db_retry_attempt + 1
@@ -6888,6 +6938,24 @@ def create_app(
             logger.warning("POST /tasks/%s/result: no artifact — %s", task_id, _artifact_held)
             return {"status": "ok", "task_id": task_id, "held": "no_artifact",
                     "reason": "no_artifact", "detail": _artifact_held}
+        if task_type == "test" and isinstance(ctx, dict) and ctx.get("post_recovery_verification"):
+            outcome = "PASS" if result.status == "completed" else "FAIL"
+            q().patch_context(task_id, {"post_recovery_verification_result": outcome})
+            pr_number = ctx.get("pr_number")
+            repo = ctx.get("repo") or ""
+            if isinstance(pr_number, int) and repo:
+                from agent_crew.github import post_pr_comment, pr_has_comment_containing
+                marker = f"[agent_crew post-recovery verification] task: {task_id}"
+                already_posted = pr_has_comment_containing(pr_number, marker, repo=repo)
+                if already_posted is False:
+                    body = (f"{marker}\nresult: {outcome}\n"
+                            f"summary: {(result.summary or '')[:500]}")
+                    if not post_pr_comment(pr_number, body, repo=repo):
+                        logger.warning("post-recovery verification comment failed: task=%s PR=%s",
+                                       task_id, pr_number)
+                elif already_posted is None:
+                    logger.warning("post-recovery verification comment deferred: task=%s PR=%s; "
+                                   "existing comments could not be checked", task_id, pr_number)
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
@@ -7079,7 +7147,8 @@ def create_app(
                 logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
                 _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
-            if task_type == "test" and result.status == "completed":
+            if (task_type == "test" and result.status == "completed"
+                    and not _task_ctx.get("post_recovery_verification")):
                 test_pr = result.pr_number or _task_ctx.get("pr_number")
                 if test_pr:
                     _test_wt = _any_worktree_path()

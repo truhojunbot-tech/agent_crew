@@ -224,7 +224,7 @@ class TestPushAt:
 # ---------------------------------------------------------------------------
 
 class TestFallbackLoop:
-    """Bug #167: force_fail must record error_info; fallback chain must not loop forever."""
+    """Bug #167 error recording and retired fallback behavior under #308."""
 
     # U-167-01: force_fail stores structured error_info in the DB.
     def test_u_167_01_force_fail_records_error_info(self, tmp_db):
@@ -241,9 +241,9 @@ class TestFallbackLoop:
         assert stored["reason"] == "watchdog_timeout"
         assert stored["idle_seconds"] == 300
 
-    # U-167-02: fallback_chain_depth increments on each new fallback task.
-    def test_u_167_02_fallback_chain_depth_tracked(self, tmp_db):
-        """auto_fallback_failed_task increments fallback_chain_depth in the new task's context."""
+    # #308 retired the provider fallback chain; no new depth is minted.
+    def test_u_167_02_rate_limit_does_not_create_fallback_depth(self, tmp_db):
+        """A provider limit never creates a cross-provider successor."""
         from agent_crew.pipeline import auto_fallback_failed_task
 
         q = TaskQueue(tmp_db)
@@ -257,14 +257,12 @@ class TestFallbackLoop:
             verdict=None,
             findings=[],
         )
-        auto_fallback_failed_task(
+        handled = auto_fallback_failed_task(
             q, "orig", result, "implement",
             pane_map={"implementer": "%91", "claude": "%91", "codex": "%92", "gemini": "%93"},
         )
-        pending = q.list_tasks(status="pending")
-        assert len(pending) == 1, "one fallback task should be created"
-        fb_ctx = pending[0].context
-        assert fb_ctx.get("fallback_chain_depth", 0) == 1, "depth should be 1 after first fallback"
+        assert handled is False
+        assert not any(t.task_id.startswith("fallback-") for t in q.list_tasks())
 
     # U-167-03: fallback loop cancelled once chain depth reaches 3.
     def test_u_167_03_fallback_loop_cancelled_at_max_depth(self, tmp_db):
@@ -429,13 +427,11 @@ class TestErrorInfoWiring:
 
 
 class TestFallbackCancellation:
-    """Review feedback: fallback loop guard must cancel the original task,
-    not just open a gate; auto_retry must use DB retry count."""
+    """Retired fallback behavior and the active retry's DB counter."""
 
-    # U-167-07: fallback chain loop cancels the original_task_id task.
-    def test_u_167_07_fallback_chain_cancels_original_on_loop(self, tmp_db):
-        """When fallback_chain_depth >= MAX, the original_task_id task must be
-        marked 'cancelled' — not just have an escalation gate opened."""
+    # #308 also disables legacy fallback rows from cancelling their root.
+    def test_u_167_07_legacy_fallback_depth_does_not_cancel_root(self, tmp_db):
+        """An old fallback row cannot revive cross-provider loop handling."""
         from agent_crew.pipeline import auto_fallback_failed_task
         from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 
@@ -460,17 +456,18 @@ class TestFallbackCancellation:
             verdict=None,
             findings=[],
         )
-        auto_fallback_failed_task(
+        handled = auto_fallback_failed_task(
             q, "fb3", result, "implement",
             pane_map={"implementer": "%91", "claude": "%91", "codex": "%92", "gemini": "%93"},
         )
+        assert handled is False
 
         pending = q.list_tasks(status="pending")
         assert len(pending) == 0, "No new pending task on loop detection"
 
         orig_tasks = [t for t in q.list_tasks() if t.task_id == "orig-root"]
-        assert orig_tasks[0].status == "cancelled", (
-            "original_task_id must be cancelled when fallback loop is detected"
+        assert orig_tasks[0].status == "in_progress", (
+            "retired fallback handling must not cancel the root"
         )
 
     # U-167-08: auto_retry reads retry count from DB context, not result.retry_count.

@@ -5,10 +5,8 @@ Three behaviours pinned here:
 1. The watchdog reminder message instructs the agent on three options
    (complete / failed / keep working), the second of which is the explicit
    stream-timeout recovery path.
-2. The fallback rate-limit detector recognises watchdog auto-fail summaries
-   so a stuck pane reroutes to the next agent in the chain.
-3. End-to-end: a watchdog timeout produces a `fallback-*` task assigned to
-   the next agent in the chain (not a same-role retry).
+2. The legacy rate-limit detector still recognises watchdog summaries.
+3. End-to-end: a watchdog timeout never substitutes another provider (#308).
 """
 from fastapi.testclient import TestClient
 
@@ -107,9 +105,8 @@ class _Push:
         self.calls.append((pane_id, text))
 
 
-def test_watchdog_timeout_routes_to_next_agent_via_fallback(tmp_db):
-    """Stuck task auto-failed by the watchdog must produce a `fallback-*`
-    task assigned to the next agent in the chain, not a same-role retry."""
+def test_watchdog_timeout_does_not_substitute_provider(tmp_db):
+    """A watchdog failure must not resurrect the retired provider chain."""
     push = _Push()
     panes = {
         # Canonical tmux pane IDs are numeric.  These fixtures exercise the
@@ -139,13 +136,6 @@ def test_watchdog_timeout_routes_to_next_agent_via_fallback(tmp_db):
 
     assert result["timed_out"] == ["impl-stream"]
 
-    # A fallback task should now exist routed to codex (the next agent in
-    # the default implement chain).
     tasks = TaskQueue(tmp_db).list_tasks()
-    fallback = [t for t in tasks if t.task_id.startswith("fallback-impl-stream-")]
-    assert len(fallback) == 1
-    assert fallback[0].context["agent_override"] == "codex"
-    assert fallback[0].context["fallback_excluded"] == ["claude"]
-    # And no same-role retry was enqueued (the watchdog path doesn't go
-    # through `_auto_retry_failed_task` once the fallback handler returns True).
-    assert [t for t in tasks if t.task_id.startswith("retry-impl-stream-")] == []
+    assert next(t for t in tasks if t.task_id == "impl-stream").status == "failed"
+    assert not any(t.task_id.startswith("fallback-") for t in tasks)

@@ -62,7 +62,7 @@ def _make_app(tmp_db, *, push_calls, panes=None, **kwargs):
 
 @pytest.mark.parametrize("summary, successor_prefix", [
     ("worker failed", "retry-receipt-parent-"),
-    ("rate limit reached", "fallback-receipt-parent-"),
+    ("rate limit reached", "retry-receipt-parent-"),
 ])
 def test_successor_cea_blocks_belong_to_own_receipt(tmp_db, summary, successor_prefix):
     app = _make_app(tmp_db, push_calls=[])
@@ -100,8 +100,8 @@ def test_successor_cea_blocks_belong_to_own_receipt(tmp_db, summary, successor_p
             assert block["receipt_id"] == child_receipt, key
 
 
-# U-FB01: rate-limit hit on implementer (claude) reroutes the same task to codex.
-def test_u_fb01_rate_limit_reroutes_implement_to_next_agent(tmp_db):
+# #308: a rate limit may retry the same role but cannot substitute a provider.
+def test_u_fb01_rate_limit_never_substitutes_implementer(tmp_db):
     push_calls: list = []
     app = _make_app(tmp_db, push_calls=push_calls)
 
@@ -113,87 +113,72 @@ def test_u_fb01_rate_limit_reroutes_implement_to_next_agent(tmp_db):
         # Implementer reports rate-limit failure.
         client.post("/tasks/impl-1/result", json=_result("impl-1"))
 
-    # Fallback should have enqueued a new implement task (or it may be pushed already).
+    # Same-role retry is allowed; no alternate provider receives this role.
     rows = TaskQueue(tmp_db).list_all_with_status()
     fallback = [r for r in rows if r["task_id"].startswith("fallback-impl-1-")]
-    assert len(fallback) == 1
-    fallback_task = TaskQueue(tmp_db).list_tasks()
-    fb_task = next(t for t in fallback_task if t.task_id.startswith("fallback-impl-1-"))
-    assert fb_task.context["agent_override"] == "codex"
-    assert fb_task.context["fallback_excluded"] == ["claude"]
-    # The fallback push went to codex pane (%X).
-    fallback_push = [c for c in push_calls if c[0] == "%X"]
-    assert len(fallback_push) == 1
+    assert fallback == []
+    retries = [t for t in TaskQueue(tmp_db).list_tasks()
+               if t.task_id.startswith("retry-impl-1-")]
+    assert len(retries) == 1
+    assert "agent_override" not in retries[0].context
+    assert not any(pane == "%X" for pane, _ in push_calls)
 
 
-# U-FB02: rate-limit on the fallback agent (codex) cascades to gemini.
-def test_u_fb02_rate_limit_chain_progresses(tmp_db):
+# #308: repeated rate limits still cannot create a cross-provider chain.
+def test_u_fb02_repeated_rate_limit_has_no_fallback_chain(tmp_db):
     push_calls: list = []
     app = _make_app(tmp_db, push_calls=push_calls)
 
     with TestClient(app) as client:
         client.post("/tasks", json=_task_payload("impl-2"))
         client.post("/tasks/impl-2/result", json=_result("impl-2", summary="usage limit"))
-        # Find the fallback task id and fail it too.
-        fb_task = next(
+        retry_task = next(
             t for t in TaskQueue(tmp_db).list_tasks()
-            if t.task_id.startswith("fallback-impl-2-")
+            if t.task_id.startswith("retry-impl-2-")
         )
-        client.post(f"/tasks/{fb_task.task_id}/result", json=_result(fb_task.task_id, summary="quota exceeded"))
+        client.post(f"/tasks/{retry_task.task_id}/result",
+                    json=_result(retry_task.task_id, summary="quota exceeded"))
 
-    # Second fallback should target gemini, with both claude and codex excluded.
-    cascading = [
-        t for t in TaskQueue(tmp_db).list_tasks()
-        if t.task_id.startswith("fallback-")
-    ]
-    # Two fallback tasks exist: claude→codex, then codex→gemini.
-    assert len(cascading) == 2
-    second = next(t for t in cascading if t.context.get("agent_override") == "gemini")
-    assert sorted(second.context["fallback_excluded"]) == ["claude", "codex"]
+    assert not any(t.task_id.startswith("fallback-")
+                   for t in TaskQueue(tmp_db).list_tasks())
 
 
-# U-FB03: chain exhaustion creates an escalation gate; no further fallback enqueued.
-def test_u_fb03_chain_exhaustion_creates_escalation_gate(tmp_db):
+# #308: an exhausted provider cannot create a cross-provider escalation chain.
+def test_u_fb03_rate_limit_does_not_create_fallback_escalation(tmp_db):
     push_calls: list = []
-    notify_calls: list = []
+    app = _make_app(tmp_db, push_calls=push_calls)
+    with TestClient(app) as client:
+        client.post("/tasks", json=_task_payload("impl-3"))
+        client.post("/tasks/impl-3/result", json=_result("impl-3", summary="rate limit"))
 
-    # Patch notify_telegram to capture the call without going to the network.
-    # The escalation hook moved into agent_crew.pipeline as part of #123;
-    # patch that module's symbol so the lambda actually intercepts the call.
-    import agent_crew.pipeline as pipeline_mod
-    original_notify = pipeline_mod.notify_telegram
-    pipeline_mod.notify_telegram = lambda msg, **kw: (notify_calls.append(msg), True)[1]
-    try:
-        app = _make_app(tmp_db, push_calls=push_calls)
-        with TestClient(app) as client:
-            client.post("/tasks", json=_task_payload("impl-3"))
-            client.post("/tasks/impl-3/result", json=_result("impl-3", summary="rate limit"))
-            fb1 = next(
-                t for t in TaskQueue(tmp_db).list_tasks()
-                if t.task_id.startswith("fallback-impl-3-")
-            )
-            client.post(f"/tasks/{fb1.task_id}/result", json=_result(fb1.task_id, summary="quota exceeded"))
-            fb2 = next(
-                t for t in TaskQueue(tmp_db).list_tasks()
-                if t.task_id.startswith("fallback-") and t.task_id != fb1.task_id
-            )
-            client.post(f"/tasks/{fb2.task_id}/result", json=_result(fb2.task_id, summary="usage limit"))
-    finally:
-        pipeline_mod.notify_telegram = original_notify
-
-    # No 4th fallback enqueued.
     fallback_tasks = [
         t for t in TaskQueue(tmp_db).list_tasks()
         if t.task_id.startswith("fallback-")
     ]
-    assert len(fallback_tasks) == 2
-    # Escalation gate created.
+    assert fallback_tasks == []
     gates = TaskQueue(tmp_db).list_gates()
     escalations = [g for g in gates if g.type == "escalation"]
+    assert escalations == []
+
+
+def test_rate_limit_retry_exhaustion_records_one_escalation(tmp_db):
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    task_id = "impl-limited"
+    with TestClient(app) as client:
+        assert client.post("/tasks", json=_task_payload(task_id)).status_code == 201
+        for attempt in range(3):
+            response = client.post(f"/tasks/{task_id}/result",
+                                   json=_result(task_id, summary="rate limit reached"))
+            assert response.status_code == 200, (attempt, task_id, response.text)
+            if attempt < 2:
+                task_id = f"retry-{task_id}-a{attempt + 1}"
+
+    queue = TaskQueue(tmp_db)
+    escalations = [g for g in queue.list_gates() if g.type == "escalation"]
     assert len(escalations) == 1
-    assert "impl-3" in escalations[0].message or "rate-limit" in escalations[0].message
-    # Notify helper was called.
-    assert notify_calls and "rate-limit" in notify_calls[0].lower()
+    assert escalations[0].id == f"escalation-{task_id}-provider-limit"
+    assert queue.get_task_context(task_id)["provider_limit_escalation"] == escalations[0].id
 
 
 # U-FB04: non-rate-limit failure falls through to the auto-retry path
@@ -250,9 +235,8 @@ def test_u_fb05_disabled_via_env(tmp_db, monkeypatch):
     assert len(retry_tasks) == 1
 
 
-# U-FB06: per-project chain override (~/.agent_crew/<project>/fallback_chains.json)
-# changes the next-agent decision.
-def test_u_fb06_chain_override_respected(tmp_db, tmp_path):
+# #308: legacy chain configuration cannot revive provider substitution.
+def test_u_fb06_chain_override_cannot_substitute(tmp_db, tmp_path):
     state_path = tmp_path / "state.json"
     state_path.write_text("{}")
     override = tmp_path / "fallback_chains.json"
@@ -265,9 +249,5 @@ def test_u_fb06_chain_override_respected(tmp_db, tmp_path):
         client.post("/tasks", json=_task_payload("impl-6"))
         client.post("/tasks/impl-6/result", json=_result("impl-6", summary="rate limit"))
 
-    # Override chain: claude → gemini (not codex).
-    fb_task = next(
-        t for t in TaskQueue(tmp_db).list_tasks()
-        if t.task_id.startswith("fallback-impl-6-")
-    )
-    assert fb_task.context["agent_override"] == "gemini"
+    assert not any(t.task_id.startswith("fallback-")
+                   for t in TaskQueue(tmp_db).list_tasks())

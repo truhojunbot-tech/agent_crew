@@ -1,17 +1,4 @@
-"""Self-review/self-test prevention in rate-limit fallback (Issue #117).
-
-When `_auto_fallback_failed_task` reroutes a review or test task because
-the assigned agent hit a rate-limit, the successor must skip any agent
-that already participated upstream in the pipeline:
-
-  - review fallback must skip the impl task's implementer
-  - test fallback must skip both the implementer and the reviewer
-
-To make that decision, `_auto_enqueue_review` and `_auto_enqueue_test`
-record the upstream agent identities into the new task's context
-(`implementer_agent`, `reviewer_agent`). The fallback handler then
-unions those names into the `excluded` list before walking the chain.
-"""
+"""Upstream agent identity propagation and no cross-provider retry (#117/#308)."""
 from fastapi.testclient import TestClient
 
 from agent_crew.server import create_app
@@ -133,14 +120,13 @@ class TestAutoEnqueueTestRecordsBothAgents:
 
 
 # ---------------------------------------------------------------------------
-# Fallback skips upstream agents
+# Provider exhaustion never substitutes an upstream agent
 # ---------------------------------------------------------------------------
 
 
-class TestReviewFallbackSkipsImplementer:
-    def test_codex_review_fails_claude_skipped_picks_gemini(self, tmp_db):
-        """Review chain ['codex','claude','gemini']. codex (current) hits
-        rate-limit and claude is the implementer → fallback must pick gemini."""
+class TestReviewNoProviderSubstitution:
+    def test_review_limit_does_not_substitute_an_upstream_agent(self, tmp_db):
+        """A rate-limited review must not move to another provider (#308)."""
         push = RecordingPush()
         app = create_app(
             db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push
@@ -158,31 +144,16 @@ class TestReviewFallbackSkipsImplementer:
                 ),
             )
             tasks = client.get("/tasks").json()
-            fb = [
-                t for t in tasks
-                if t["task_id"].startswith("fallback-rev-001")
-            ]
-            assert len(fb) == 1, (
-                "expected exactly one fallback task; got "
-                f"{[t['task_id'] for t in fb]}"
-            )
-            new_ctx = fb[0]["context"]
-            assert new_ctx["agent_override"] == "gemini"
-            excluded = new_ctx.get("fallback_excluded", [])
-            assert "codex" in excluded
-            assert "claude" in excluded
-            # implementer_agent must propagate so subsequent fallbacks still
-            # know who not to route back to.
-            assert new_ctx.get("implementer_agent") == "claude"
+            assert not any(t["task_id"].startswith("fallback-") for t in tasks)
+            assert not any(t["context"].get("agent_override") == "gemini"
+                           for t in tasks if t["task_id"] != "rev-001")
 
 
-class TestTestFallbackSkipsImplementerAndReviewer:
-    def test_gemini_test_fails_implementer_and_reviewer_excluded_escalates(
+class TestTestNoProviderSubstitution:
+    def test_gemini_failure_does_not_substitute_implementer_or_reviewer(
         self, tmp_db
     ):
-        """Test chain ['gemini','codex','claude']. gemini (current) hits
-        rate-limit; codex was the reviewer; claude was the implementer →
-        chain exhausted → no fallback task, escalation gate created."""
+        """A failed Gemini test cannot reroute to either upstream provider."""
         push = RecordingPush()
         app = create_app(
             db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push
@@ -214,6 +185,5 @@ class TestTestFallbackSkipsImplementerAndReviewer:
                 "expected zero fallback tasks (chain exhausted); got "
                 f"{[t['task_id'] for t in fb]}"
             )
-            gates = client.get("/gates/pending").json()
-            esc = [g for g in gates if g.get("type") == "escalation"]
-            assert len(esc) >= 1
+            assert not any(t["context"].get("agent_override") in {"codex", "claude"}
+                           for t in tasks if t["task_id"] != "test-001")
