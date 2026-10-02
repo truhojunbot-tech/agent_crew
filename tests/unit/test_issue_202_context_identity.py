@@ -292,8 +292,8 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, u
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
-                    # review role's default agent is codex; override to gemini
-                    # is a provider_fallback relative to that default.
+                    # An explicit Gemini override differs from the review role's
+                    # current Claude default; preserve the event/lineage check.
                     resp = client.post("/tasks", json=_task_payload(
                         "review-1", task_type="review", context={"agent_override": "gemini"},
                     ))
@@ -306,22 +306,22 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, u
     events = _read_jsonl(os.path.join(tmp_path.__str__(), "context_events.jsonl"))
     fallback_events = [e for e in events if e["event_type"] == "provider_fallback" and e.get("task_id") == "review-1"]
     assert fallback_events, f"expected a provider_fallback event, got {[e['event_type'] for e in events]}"
-    assert fallback_events[0]["from_agent"] == "codex"
+    assert fallback_events[0]["from_agent"] == "claude"
     assert fallback_events[0]["to_agent"] == "gemini"
 
-    # retry_of / fallback_of lineage: submitted directly against attribution
-    # since it's populated from task.context at dispatch time regardless of
-    # how the follow-up task was created.
+    # retry_of / fallback_of lineage: these model in-process successors. The
+    # admission boundary strips lineage supplied by an untrusted caller.
     q = TaskQueue(tmp_db)
+    from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE
     from agent_crew.protocol import TaskRequest
     q.enqueue(TaskRequest(
         task_id="retry-review-1-ab12", task_type="review", description="retry",
         context={"retry_attempt": 1, "original_task_id": "review-1"},
-    ))
+    ), _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     q.enqueue(TaskRequest(
         task_id="fallback-review-1-cd34", task_type="review", description="fallback",
         context={"fallback_from_task_id": "review-1", "original_task_id": "review-1"},
-    ))
+    ), _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     with patch.dict(os.environ, {
         "AGENT_CREW_DISPATCHER": "1",
         "AGENT_CREW_DISPATCH_INTERVAL": "0.05",
