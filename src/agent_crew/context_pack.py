@@ -766,6 +766,11 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
         per_type[a.artifact_type] = per_type.get(a.artifact_type, 0) + 1
 
     pack.items = selected
+    # Hybrid attribution describes what reached the pack, not which optional
+    # provider was queried. Keep failed Forge attempts in degraded telemetry.
+    if (mode == MODE_HYBRID and any(isinstance(p, ForgeProvider) for p in providers)
+            and not any(a.artifact_id.startswith("forge:") for a in selected)):
+        pack.mode = MODE_LEXICAL
     pack.stale_count = sum(1 for a in selected if a.freshness == STALE)
     pack.conflicts = detect_conflicts(selected)
     pack.latency_ms = (time.time() - started) * 1000.0

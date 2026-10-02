@@ -75,6 +75,7 @@ def test_failure_degrades_but_builds(monkeypatch, error):
     pack = _build()
     assert pack.degraded
     assert pack.telemetry()["forge_items"] == 0
+    assert pack.mode == cp.MODE_LEXICAL
     assert "repo:src/worker.py" in {item.artifact_id for item in pack.items}
     assert any("forge_crew" in e for e in pack.provider_errors)
 
@@ -105,7 +106,7 @@ def test_malformed_forge_response_keeps_lexical_results(monkeypatch, body):
 
     monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **kw: Response())
     pack = _build()
-    assert pack.mode == cp.MODE_HYBRID
+    assert pack.mode == cp.MODE_LEXICAL
     assert pack.degraded and pack.provider_errors
     assert pack.telemetry()["forge_items"] == 0
     assert "repo:src/worker.py" in {item.artifact_id for item in pack.items}
@@ -207,3 +208,48 @@ def test_same_basename_different_paths_survive_but_exact_duplicates_do_not(monke
     assert ids.count("repo:docs/README.md") == 1
     assert ids.count("forge:src-readme") == 1
     assert "forge:docs-readme" not in ids
+
+
+@pytest.mark.parametrize("forge_path,max_items", [
+    ("docs/adr/local.md", 2),  # the lexical copy wins deduplication
+    ("docs/adr/remote.md", 1),  # the budget excludes Forge
+])
+def test_hybrid_mode_requires_selected_forge_item(monkeypatch, forge_path, max_items):
+    lexical = cp.Artifact("repo:local", "docs/adr/local.md", cp.TYPE_ADR)
+    forge = cp.ForgeProvider._to_artifact({
+        "chunk_id": "remote", "source_file": forge_path,
+        "content": "remote decision", "score": 1.0,
+    })
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve",
+                        lambda self, query: [lexical])
+    monkeypatch.setattr(cp.ForgeProvider, "retrieve", lambda self, query: [forge])
+    pack = cp.plan_pack(
+        cp.RetrievalQuery(task_id="fix-1", role="implementer"),
+        [cp.LexicalRepoProvider(), cp.ForgeProvider()],
+        budget={"max_tokens": 1000, "max_items": max_items}, mode=cp.MODE_HYBRID,
+    )
+    assert [item.artifact_id for item in pack.items] == [lexical.artifact_id]
+    assert pack.mode == pack.telemetry()["mode"] == cp.MODE_LEXICAL
+    assert pack.telemetry()["forge_items"] == 0
+
+
+def test_hybrid_mode_counts_selected_forge_items(monkeypatch):
+    lexical = cp.Artifact("repo:local", "docs/adr/local.md", cp.TYPE_ADR)
+    forge_items = [cp.ForgeProvider._to_artifact({
+        "chunk_id": f"remote-{index}", "source_file": f"docs/adr/remote-{index}.md",
+        "content": "remote decision", "score": 1.0,
+    }) for index in range(2)]
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve",
+                        lambda self, query: [lexical])
+    monkeypatch.setattr(cp.ForgeProvider, "retrieve",
+                        lambda self, query: forge_items)
+    pack = cp.plan_pack(
+        cp.RetrievalQuery(task_id="fix-1", role="implementer"),
+        [cp.LexicalRepoProvider(), cp.ForgeProvider()],
+        budget={"max_tokens": 1000, "max_items": 2}, mode=cp.MODE_HYBRID,
+    )
+    assert [item.artifact_id for item in pack.items] == [
+        lexical.artifact_id, forge_items[0].artifact_id,
+    ]
+    assert pack.mode == pack.telemetry()["mode"] == cp.MODE_HYBRID
+    assert pack.telemetry()["forge_items"] == 1
