@@ -1,6 +1,8 @@
 """Forge retrieval stays optional and cannot block context pack construction."""
 
 import json
+import threading
+import time
 from pathlib import Path
 from urllib.error import URLError
 
@@ -66,11 +68,83 @@ def test_real_shape_maps_artifacts_and_request(monkeypatch):
 @pytest.mark.parametrize("error", [URLError("refused"), TimeoutError("timeout")])
 def test_failure_degrades_but_builds(monkeypatch, error):
     monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
+        cp.Artifact("repo:src/worker.py", "src/worker.py", cp.TYPE_CODE)
+    ])
     monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **kw: (_ for _ in ()).throw(error))
     pack = _build()
     assert pack.degraded
     assert pack.telemetry()["forge_items"] == 0
+    assert "repo:src/worker.py" in {item.artifact_id for item in pack.items}
     assert any("forge_crew" in e for e in pack.provider_errors)
+
+
+@pytest.mark.parametrize("body", [
+    b"not-json",
+    b"[]",
+    b"{}",
+    b'{"context_items": {}}',
+    b'{"context_items": [{"chunk_id": "missing-source"}]}',
+    b'{"context_items": [{"chunk_id": "missing-score", "source_file": "src/x.py", "content": "x"}]}',
+])
+def test_malformed_forge_response_keeps_lexical_results(monkeypatch, body):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
+        cp.Artifact("repo:src/worker.py", "src/worker.py", cp.TYPE_CODE)
+    ])
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def read(self, *_):
+            return body
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **kw: Response())
+    pack = _build()
+    assert pack.mode == cp.MODE_HYBRID
+    assert pack.degraded and pack.provider_errors
+    assert pack.telemetry()["forge_items"] == 0
+    assert "repo:src/worker.py" in {item.artifact_id for item in pack.items}
+
+
+def test_stalled_forge_read_is_bounded_and_keeps_lexical_results(monkeypatch):
+    release = threading.Event()
+    exited = threading.Event()
+    calls = []
+
+    def stalled_urlopen(*args, **kwargs):
+        calls.append(1)
+        try:
+            release.wait(1)
+            raise TimeoutError("stalled response")
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", stalled_urlopen)
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
+        cp.Artifact("repo:src/worker.py", "src/worker.py", cp.TYPE_CODE)
+    ])
+    started = time.monotonic()
+    try:
+        pack = cp.plan_pack(
+            cp.RetrievalQuery(task_id="fix-1", role="implementer"),
+            [cp.LexicalRepoProvider(), cp.ForgeProvider(timeout_s=0.05)],
+            mode=cp.MODE_HYBRID,
+        )
+        another = cp.ForgeProvider(timeout_s=0.05)
+        assert another.retrieve(cp.RetrievalQuery(task_id="fix-2")) == []
+        assert "still in progress" in another.last_error
+    finally:
+        release.set()
+        exited.wait(1)
+    assert time.monotonic() - started < 0.5
+    assert pack.degraded and "timeout" in pack.degraded_reason
+    assert "repo:src/worker.py" in {item.artifact_id for item in pack.items}
+    assert calls == [1], "a stalled Forge call spawned another HTTP worker"
 
 
 def test_lexical_path_wins_over_forge(monkeypatch):
