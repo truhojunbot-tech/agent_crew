@@ -6132,6 +6132,13 @@ def create_app(
 
             # Create retry task with incremented retry count
             retry_context = _successor_context(original_task.context)
+            retry_risk = retry_context.get("risk_declaration")
+            if (isinstance(retry_risk, dict)
+                    and retry_risk.get("declaration_source", "explicit") == "explicit"):
+                retry_context["risk_declaration"] = {
+                    **retry_risk,
+                    "inherited_from": retry_risk.get("inherited_from") or task_id,
+                }
             retry_context.pop(RESULT_BRANCH_CONTEXT_KEY, None)
             retry_context.pop(RESULT_COMMIT_CONTEXT_KEY, None)
             retry_context["retry_attempt"] = db_retry_attempt + 1

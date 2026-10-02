@@ -14,7 +14,7 @@ Two halves, because either alone proves nothing:
   not registered fails here; a registered ingress nothing calls fails here.
 * **dynamic equivalence** — ``N`` generated ``(intent, authority state)``
   fixtures are pushed through **every** registered adapter (``queue.enqueue``
-  with that adapter's ``ingress`` id — the one admission entry all fourteen
+  with that adapter's ``ingress`` id — the one admission entry all active
   share, §7.1) under ``mode=test`` (enforcing, embedded permitted), each in a
   fresh DB, and ``(decision, reason, intent_hash)`` plus admitted/refused must be
   identical across adapters. ``caller_*``, ``receipt_id``, ``issued_at`` are the
@@ -68,6 +68,9 @@ DOCUMENTED = {
     "cascade.review", "cascade.test", "cascade.fix", "cascade.fallback",
     "retry.failed_task", "watchdog.stale_review", "cron.watch", "cron.triage",
 }
+# The adapter remains registered for historical receipts, but #308 removed
+# its only production enqueue call site when provider substitution was retired.
+RETIRED_INGRESSES = {"cascade.fallback"}
 
 
 def _ingress_call_sites() -> dict[str, list[str]]:
@@ -97,9 +100,10 @@ def test_registry_equals_the_documented_adapter_list():
 
 def test_every_ingress_call_site_in_the_code_is_a_registered_adapter_and_vice_versa():
     sites = _ingress_call_sites()
-    assert set(sites) == set(adapters.BY_ID), (
+    active = set(adapters.BY_ID) - RETIRED_INGRESSES
+    assert set(sites) == active, (
         f"code-only: {sorted(set(sites) - set(adapters.BY_ID))}; "
-        f"registered-but-uncalled: {sorted(set(adapters.BY_ID) - set(sites))}; sites={sites}")
+        f"active-but-uncalled: {sorted(active - set(sites))}; sites={sites}")
 
 
 def test_the_swept_modules_carry_every_adapter_and_mcp_protocol_carry_none():
@@ -257,12 +261,12 @@ DOCUMENTED_MCP_TOOLS = {"get_next_task", "get_next_discuss_task", "submit_result
 TRANSPORTS = {"http.tasks": "http", "cli.enqueue": "cli", "loop.implement": "loop",
               "cli.discuss": "discussion", "cascade.review": "cascade_review",
               "cron.watch": "cron_watch",
-              # 4d-r3: the eight the s4d-r2 result listed as remaining
+              # 4d-r3: the active successors from the s4d-r2 census
               "cascade.test": "cascade_test", "cascade.fix": "cascade_fix",
-              "cascade.fallback": "cascade_fallback", "cron.triage": "cron_triage",
+              "cron.triage": "cron_triage",
               "loop.review": "loop_review", "loop.test": "loop_test",
               "retry.failed_task": "retry_http", "watchdog.stale_review": "stale_review_http"}
-NOT_YET_TRANSPORT_DRIVEN = sorted(set(DOCUMENTED) - set(TRANSPORTS))
+NOT_YET_TRANSPORT_DRIVEN = sorted(set(DOCUMENTED) - set(TRANSPORTS) - RETIRED_INGRESSES)
 
 
 def _app(db):
@@ -317,9 +321,11 @@ def test_every_registered_adapter_is_transport_driven_or_listed_as_remaining():
     assert set(TRANSPORTS) <= set(adapters.BY_ID)
     # the remaining ids are reported in the step result; this pins the list so it
     # can only shrink knowingly.
-    # 4d-r3: every documented ingress is now driven through its real entry point.
+    # Every active ingress is driven; the retired fallback adapter remains in
+    # the registry only for historical receipts.
     assert NOT_YET_TRANSPORT_DRIVEN == []
-    assert set(TRANSPORTS) == DOCUMENTED == set(adapters.BY_ID)
+    assert set(TRANSPORTS) == DOCUMENTED - RETIRED_INGRESSES
+    assert DOCUMENTED == set(adapters.BY_ID)
 
 
 def _via_http(tmp_path, req, name):
@@ -404,15 +410,6 @@ def _drive_r3(kind, db, live, monkeypatch):
                              verdict="request_changes", findings=["P1: flag is ignored"])
         auto_enqueue_fix(TaskQueue(db), "rev-p", pr_state_fn=lambda *a, **k: "OPEN",
                          comment_fn=lambda *a, **k: None, suppress_side_effects=True)
-    elif kind == "cascade_fallback":
-        from agent_crew.pipeline import auto_fallback_failed_task
-        from agent_crew.protocol import TaskResult
-        seed_finished_parent(db, live, task("impl-f", context={"agent_override": "claude"}),
-                             status="failed", summary="rate limit exceeded (429)")
-        auto_fallback_failed_task(
-            TaskQueue(db), "impl-f",
-            TaskResult(task_id="impl-f", status="failed", summary="rate limit exceeded (429)"),
-            "implement", state_path=str(db) + ".state.json", suppress_side_effects=True)
     elif kind == "cron_triage":
         from agent_crew.triage import enqueue_task
         try:
@@ -475,7 +472,7 @@ TRANSPORT_STATES = (AuthorityState("active"),
 #: Transports whose adapter built its TaskRequest with **no** ``project``.
 #:
 #: s4j emptied this set. Through s4i it held nine — ``loop``, ``discussion``,
-#: ``cascade_test``, ``cascade_fallback``, ``cron_triage``, ``loop_review``,
+#: ``cascade_test``, historical ``cascade_fallback``, ``cron_triage``, ``loop_review``,
 #: ``loop_test``, ``retry_http``, ``stale_review_http`` — each of which reached
 #: admission with ``project=""`` and got ``EngineError($.project non-empty)``
 #: out of ``_record``: an unhandled exception inside the adapter, with nothing
@@ -501,7 +498,7 @@ def test_every_transport_reaches_admission_as_its_own_ingress(tmp_path, monkeypa
     """Not xfailed for any transport: the driver is real, whatever admission then does.
 
     Separates "the entry point reaches the one admission entry under its own
-    ingress id" (asserted for all fourteen) from "and the decision equals HTTP".
+    ingress id" (asserted for every active transport) from "and the decision equals HTTP".
 
     s4j: it also asserts that **every** adapter names a project. That used to be
     the other way round — nine kinds were listed as project-less and this test
@@ -528,12 +525,12 @@ def test_every_transport_reaches_admission_as_its_own_ingress(tmp_path, monkeypa
                            f"every §7 adapter names its project (s4j)")
 
 
-def test_s4j_retry_and_fallback_now_collide_with_their_parent_lineage(tmp_path, monkeypatch):
-    """A declared fallback re-admits its parent's lineage through P4's retry path."""
+def test_s4j_retry_collides_with_its_parent_lineage(tmp_path, monkeypatch):
+    """The active same-role retry re-admits its parent's lineage through P4."""
     live = LiveState(AuthorityState("active"))
     inject_cea(monkeypatch, live)
     db = str(tmp_path / "collide.db")
-    _drive_r3("cascade_fallback", db, live, monkeypatch)
+    _drive_r3("retry_http", db, live, monkeypatch)
     conn = sqlite3.connect(db)
     conn.row_factory = sqlite3.Row
     try:
@@ -542,8 +539,8 @@ def test_s4j_retry_and_fallback_now_collide_with_their_parent_lineage(tmp_path, 
                                       "ORDER BY rowid")]
     finally:
         conn.close()
-    parent = [r for r in rows if r["task_id"] == "impl-f"]
-    child = [r for r in rows if r["task_id"].startswith("fallback-")]
+    parent = [r for r in rows if r["task_id"] == "impl-r"]
+    child = [r for r in rows if r["task_id"].startswith("retry-")]
     assert parent and child, [r["task_id"] for r in rows]
     # the s4j half: the successor names the parent's project rather than ""
     assert child[-1]["project"] == parent[-1]["project"] == "agent_crew"
@@ -583,17 +580,7 @@ def test_i1_transport_persisted_decision_equals_http(tmp_path, monkeypatch, kind
         assert not validate_receipt(got), validate_receipt(got)
         assert got["caller_identity_status"] == "UNVERIFIED"
         n = len(spy.calls)
-        if kind == "cascade_fallback":
-            from agent_crew.queue import (AdmissionRefused, TaskQueue,
-                                          _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
-            try:
-                TaskQueue(str(tmp_path / f"base-{kind}-{req.task_id}.db")).enqueue(
-                    req, ingress="cascade.fallback",
-                    _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
-            except AdmissionRefused:
-                pass
-        else:
-            _via_http(tmp_path, req, f"base-{kind}-{req.task_id}.db")
+        _via_http(tmp_path, req, f"base-{kind}-{req.task_id}.db")
         _, _, b_adm, b_rid, b_db = spy.calls[n]
         base = persisted_receipt(b_db, b_rid)
         assert _view(admitted, got) == _view(b_adm, base), (

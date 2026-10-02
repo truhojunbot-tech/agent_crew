@@ -1,10 +1,13 @@
 """#342: cascade attribution keeps the root's declared risk without hiding escalation."""
 
+from fastapi.testclient import TestClient
+
 from agent_crew.pipeline import (auto_enqueue_fix, auto_enqueue_review,
                                  auto_enqueue_test, auto_fallback_failed_task,
                                  successor_context)
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from agent_crew.server import create_app
 
 
 ROUTINE = {
@@ -128,6 +131,29 @@ def test_retry_successor_preserves_root_explicit_declaration(tmp_db):
     assert retry["bounded_routine_fix"] == 1
 
 
+def test_server_same_role_retry_marks_root_declaration_inherited(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", "1")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(
+        "risk-root", "implement", "implement the task", branch="feature/risk",
+        context={"risk_declaration": ROUTINE},
+    ))
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks/risk-root/result", json={
+            "task_id": "risk-root", "status": "failed", "summary": "usage limit hit",
+            "findings": [],
+        })
+    assert response.status_code == 200, response.text
+    retry_id = "retry-risk-root-a1"
+    assert queue.get_task_status(retry_id) == "pending"
+    assert queue.get_task_context(retry_id)["risk_declaration"]["inherited_from"] == "risk-root"
+    retry = _attribution(queue, retry_id)
+    assert retry["risk_declaration_source"] == "explicit"
+    assert retry["risk_declaration_confidence"] == "high"
+
+
 def test_risky_descendant_heuristic_overrides_inherited_routine(tmp_db):
     queue = TaskQueue(tmp_db)
     _root(queue)
@@ -144,7 +170,7 @@ def test_risky_descendant_heuristic_overrides_inherited_routine(tmp_db):
     assert attribution["risk_declaration_source"] == "heuristic"
 
 
-def test_fallback_successor_context_marks_root_declaration_inherited(tmp_db):
+def test_rate_limit_does_not_create_cross_provider_successor(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
         "risk-root", "implement", "implement the task", branch="feature/risk",
@@ -154,9 +180,7 @@ def test_fallback_successor_context_marks_root_declaration_inherited(tmp_db):
         queue, "risk-root", TaskResult("risk-root", "failed", "usage limit hit"),
         "implement", pane_map={"implementer": "%91", "claude": "%91",
                                 "codex": "%92", "gemini": "%93"})
-    assert handled
-    fallback = next(t for t in queue.list_tasks() if t.task_id.startswith("fallback-"))
-    attribution = _attribution(queue, fallback.task_id)
-    assert attribution["risk_declaration_source"] == "explicit"
-    assert attribution["risk_declaration_confidence"] == "high"
-    assert queue.get_task_context(fallback.task_id)["risk_declaration"]["inherited_from"] == "risk-root"
+    # #308 holds the implementer on provider exhaustion. The review/fix tests
+    # above still pin inherited_from on successor paths that remain active.
+    assert handled is False
+    assert not any(t.task_id.startswith("fallback-") for t in queue.list_tasks())
