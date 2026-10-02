@@ -2054,22 +2054,24 @@ def auto_enqueue_test(
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
         # #308: a provider cooldown skips this optional tester stage. Keep the
-        # reason on the durable review task so a missing test row is explicit.
+        # reason on the durable review task and retain a deferred verification
+        # task, queued before the PR can merge, for when Gemini recovers.
         test_id = f"test-{review_task_id}"
-        if any(task.task_id == test_id for task in tasks_by_id.values()):
+        existing_test = tasks_by_id.get(test_id)
+        if existing_test:
+            existing_ctx = existing_test.context or {}
+            if existing_ctx.get("post_recovery_verification"):
+                skip_note = existing_ctx.get("test_stage_skip")
+                if isinstance(skip_note, dict):
+                    queue.patch_context(review_task_id, {"test_stage_skip": skip_note})
+                return None  # Replay the skipped-stage merge, never a second test.
             return test_id
         until = QuotaBudgetProvider().active_cooldown_until("gemini")
+        skip_note = None
         if until is not None:
-            note = "gemini tester stage not run (provider limit)"
-            recorded_until = until if math.isfinite(until) else "unknown"
-            queue.patch_context(review_task_id, {
-                "test_stage_skip": {"reason": note, "provider": "gemini",
-                                    "cooldown_until": recorded_until},
-            })
-            logger.warning(
-                "auto_enqueue_test: %s; provider=gemini since=unknown until=%s "
-                "tasks_skipped=1 review=%s", note, recorded_until, review_task_id)
-            return None
+            skip_note = {"reason": "gemini tester stage not run (provider limit)",
+                         "provider": "gemini",
+                         "cooldown_until": until if math.isfinite(until) else "unknown"}
         test_context: dict = {"prev_task_id": review_task_id}
         _inherit_root_risk(tasks_by_id, review_task, test_context)
         # Test the exact revision approved by the reviewer. This is also the
@@ -2099,6 +2101,9 @@ def auto_enqueue_test(
             test_context["implementer_agent"] = implementer_agent
         if reviewer_agent:
             test_context["reviewer_agent"] = reviewer_agent
+        if skip_note:
+            test_context["post_recovery_verification"] = True
+            test_context["test_stage_skip"] = skip_note
 
         # #164: compact test description — reviewer can fetch full spec via
         # get_task(prev_task_id) chain if needed.
@@ -2108,6 +2113,8 @@ def auto_enqueue_test(
             compact_desc = (
                 f"Test branch {review_task.branch!r} for reviewed task {review_task_id}."
             )
+        if skip_note:
+            compact_desc += " Post-recovery verification; report PASS or FAIL."
 
         # #314 §4 P0-1: 결정론 successor id — review당 test 1개(review id는 이미 round별 결정론).
         test_req = TaskRequest(
@@ -2124,6 +2131,13 @@ def auto_enqueue_test(
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
         except DuplicateReviewError as exc:
             return exc.existing_task_id
+        if skip_note:
+            queue.patch_context(review_task_id, {"test_stage_skip": skip_note})
+            logger.warning(
+                "auto_enqueue_test: %s; provider=gemini since=unknown until=%s "
+                "tasks_skipped=1 deferred_test=%s",
+                skip_note["reason"], skip_note["cooldown_until"], test_id)
+            return None  # Continue the reviewed PR; verify after recovery.
         return test_id
     except PausedError:
         # #314 §4 P0-2: STOP race — 부모(review) outbox reopen + 전파.

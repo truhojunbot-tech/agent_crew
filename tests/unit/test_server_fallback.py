@@ -161,6 +161,26 @@ def test_u_fb03_rate_limit_does_not_create_fallback_escalation(tmp_db):
     assert escalations == []
 
 
+def test_rate_limit_retry_exhaustion_records_one_escalation(tmp_db):
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True)
+    task_id = "impl-limited"
+    with TestClient(app) as client:
+        assert client.post("/tasks", json=_task_payload(task_id)).status_code == 201
+        for attempt in range(3):
+            response = client.post(f"/tasks/{task_id}/result",
+                                   json=_result(task_id, summary="rate limit reached"))
+            assert response.status_code == 200, (attempt, task_id, response.text)
+            if attempt < 2:
+                task_id = f"retry-{task_id}-a{attempt + 1}"
+
+    queue = TaskQueue(tmp_db)
+    escalations = [g for g in queue.list_gates() if g.type == "escalation"]
+    assert len(escalations) == 1
+    assert escalations[0].id == f"escalation-{task_id}-provider-limit"
+    assert queue.get_task_context(task_id)["provider_limit_escalation"] == escalations[0].id
+
+
 # U-FB04: non-rate-limit failure falls through to the auto-retry path
 # (not the fallback path) — fallback must NOT trigger.
 def test_u_fb04_non_rate_limit_failure_skips_fallback(tmp_db):

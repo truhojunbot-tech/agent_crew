@@ -49,7 +49,7 @@ def test_dispatch_holds_role_task_pending_during_cooldown(
 
 
 def test_gemini_cooldown_skips_test_with_note(tmp_db, cooldown, monkeypatch):
-    cooldown("gemini", time.time() + 3600)
+    cooldown_file = cooldown("gemini", time.time() + 3600)
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     queue = TaskQueue(tmp_db)
     review = "review-cooldown"
@@ -58,11 +58,55 @@ def test_gemini_cooldown_skips_test_with_note(tmp_db, cooldown, monkeypatch):
     queue.submit_result(review, TaskResult(review, "completed", "approved",
                                           verdict="approve", findings=[]))
     assert auto_enqueue_test(queue, review) is None
-    assert not any(t.task_type == "test" for t in queue.list_tasks())
+    deferred = f"test-{review}"
+    assert queue.get_task_status(deferred) == "pending"
+    assert queue.get_task_context(deferred)["post_recovery_verification"] is True
     assert queue.get_task_context(review)["test_stage_skip"]["reason"] == (
         "gemini tester stage not run (provider limit)")
+    assert auto_enqueue_test(queue, review) is None
+    assert len([task for task in queue.list_tasks() if task.task_type == "test"]) == 1
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        task = queue.dequeue(role="tester")
+        assert task is not None and task.task_id == deferred
+        asyncio.run(app.state.dispatch_task(task, "tester"))
+    assert queue.get_task_status(deferred) == "pending"
+    cooldown_file.write_text("{}")
+    assert QuotaBudgetProvider(cooldown_file=str(cooldown_file)).active_cooldown_until(
+        "gemini") is None
+    assert queue.dequeue(role="tester").task_id == deferred
 
-    # A test queued before cooldown began is also skipped before its worker runs.
+
+def test_skipped_pr_test_is_queued_before_merge_for_pinned_verification(
+        tmp_db, cooldown):
+    cooldown("gemini", time.time() + 3600)
+    queue = TaskQueue(tmp_db)
+    review = "review-pr-cooldown"
+    queue.enqueue(TaskRequest(
+        task_id=review, task_type="review", description="review PR",
+        branch="topic", context={"pr_number": 42, "repo": "owner/repo",
+                                 "reviewed_sha": "a" * 40}))
+    queue.submit_result(review, TaskResult(review, "completed", "approved",
+                                          verdict="approve", findings=[]))
+    assert auto_enqueue_test(queue, review, pr_state_fn=lambda _number: "open") is None
+    deferred = f"test-{review}"
+    assert queue.get_task_status(deferred) == "pending"
+    context = queue.get_task_context(deferred)
+    assert context["pr_number"] == 42
+    assert context["reviewed_sha"] == "a" * 40
+    assert context["post_recovery_verification"] is True
+    assert auto_enqueue_test(queue, review, pr_state_fn=lambda _number: "open") is None
+    assert len([task for task in queue.list_tasks() if task.task_type == "test"]) == 1
+
+
+def test_queued_test_becomes_deferred_verification(tmp_db, cooldown, monkeypatch):
+    cooldown("gemini", time.time() + 3600)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    queue = TaskQueue(tmp_db)
+    review = "review-preexisting"
+    queue.enqueue(TaskRequest(task_id=review, task_type="review",
+                              description="review", branch="topic"))
+    # A test queued before cooldown began is also deferred before its worker runs.
     queued = "test-preexisting"
     queue.enqueue(TaskRequest(task_id=queued, task_type="test",
                               description="test", branch="topic",
@@ -72,9 +116,38 @@ def test_gemini_cooldown_skips_test_with_note(tmp_db, cooldown, monkeypatch):
         task = queue.dequeue(role="tester")
         assert task is not None
         asyncio.run(app.state.dispatch_task(task, "tester"))
-    assert queue.get_task_status(queued) == "cancelled"
+    assert queue.get_task_status(queued) == "pending"
+    assert queue.get_task_context(queued)["post_recovery_verification"] is True
     assert queue.get_task_context(queued)["test_stage_skip"]["reason"] == (
         "gemini tester stage not run (provider limit)")
+
+
+@pytest.mark.parametrize("status,expected", [("completed", "PASS"), ("failed", "FAIL")])
+def test_post_recovery_test_reports_outcome_on_pr(
+        tmp_db, monkeypatch, status, expected):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    comments = []
+    monkeypatch.setattr("agent_crew.github.pr_has_comment_containing",
+                        lambda *_args, **_kwargs: False)
+    monkeypatch.setattr("agent_crew.github.post_pr_comment",
+                        lambda number, body, **_kwargs: comments.append((number, body)) or True)
+    queue = TaskQueue(tmp_db)
+    task_id = f"test-recovery-{status}"
+    queue.enqueue(TaskRequest(
+        task_id=task_id, task_type="test", description="verify after recovery",
+        branch="topic", context={"post_recovery_verification": True,
+                                 "pr_number": 42, "repo": "owner/repo"}))
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post(f"/tasks/{task_id}/result", json={
+            "task_id": task_id, "status": status, "summary": "verification finished",
+            "findings": [], "pr_number": 42,
+        })
+    assert response.status_code == 200, response.text
+    assert queue.get_task_context(task_id)["post_recovery_verification_result"] == expected
+    assert len(comments) == 1
+    assert comments[0][0] == 42
+    assert f"result: {expected}" in comments[0][1]
 
 
 def test_cooldown_only_clears_on_file_clear_or_until(tmp_path):

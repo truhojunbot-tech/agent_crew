@@ -41,7 +41,7 @@ from agent_crew.context_identity import (
     extract_claude_session_id,
     record_context_event,
 )
-from agent_crew.fallback import is_rate_limit_error
+from agent_crew.fallback import has_rate_limit_signal, is_rate_limit_error
 from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo
 from agent_crew.loop import _resolve_verdict
@@ -3321,17 +3321,20 @@ def create_app(
         note = f"{agent} tester stage not run (provider limit)"
         recorded_until = until if until is None or math.isfinite(until) else "unknown"
         if task.task_type == "test":
-            if q().cancel(task.task_id, reason=note, expected_status="in_progress"):
-                fields = {"reason": note, "provider": agent,
-                          "cooldown_until": recorded_until}
-                q().patch_context(task.task_id, {"test_stage_skip": fields})
-                parent = (task.context or {}).get("prev_task_id")
-                if parent:
-                    q().patch_context(parent, {"test_stage_skip": fields})
+            fields = {"reason": note, "provider": agent,
+                      "cooldown_until": recorded_until}
+            q().requeue(task.task_id, reason="provider_cooldown")
+            q().patch_context(task.task_id, {
+                "test_stage_skip": fields, "post_recovery_verification": True,
+            })
+            parent = (task.context or {}).get("prev_task_id")
+            if parent:
+                q().patch_context(parent, {"test_stage_skip": fields})
+            if not (task.context or {}).get("post_recovery_verification"):
                 pr_number = (task.context or {}).get("pr_number")
                 if isinstance(pr_number, int):
                     _auto_merge_pr(pr_number, repo=(task.context or {}).get("repo") or "")
-            action = "skipped"
+            action = "held" if (task.context or {}).get("post_recovery_verification") else "skipped"
         else:
             q().requeue(task.task_id, reason="provider_cooldown")
             action = "held"
@@ -4280,6 +4283,10 @@ def create_app(
             for sp in stale:
                 tid = sp.get("task_id")
                 if not tid:
+                    continue
+                if (sp.get("context") or {}).get("post_recovery_verification"):
+                    # This task is intentionally pending until the provider
+                    # recovers. An absent MCP client is not a test failure.
                     continue
                 summary = (
                     f"watchdog: AGENT_CREW_DELIVERY=mcp — no MCP client dequeued "
@@ -6074,6 +6081,24 @@ def create_app(
                     f"Task {task_id} failed (status={result.status}), "
                     f"but DB retry_attempt={db_retry_attempt} >= MAX_RETRIES={MAX_RETRIES}"
                 )
+                if has_rate_limit_signal(result.summary, result.findings):
+                    # No cross-provider fallback (#308). Preserve the old
+                    # fallback chain's durable exhaustion signal instead of
+                    # letting the last same-role retry disappear into a log.
+                    gate_id = f"escalation-{task_id}-provider-limit"
+                    message = (
+                        f"Provider limit after {MAX_RETRIES} same-role retries; "
+                        f"task_id: {task_id}; task_type: {task_type}; "
+                        f"last summary: {(result.summary or '')[:200]}"
+                    )
+                    try:
+                        q().create_gate(GateRequest(
+                            id=gate_id, type="escalation", message=message,
+                        ))
+                    except sqlite3.IntegrityError:
+                        pass  # Same failed result replayed; reuse its gate.
+                    q().patch_context(task_id, {"provider_limit_escalation": gate_id})
+                    logger.warning("provider limit exhausted: task=%s gate=%s", task_id, gate_id)
                 return
 
             # #161: review tasks with no branch AND no pr_number have no way to
@@ -6906,6 +6931,24 @@ def create_app(
             logger.warning("POST /tasks/%s/result: no artifact — %s", task_id, _artifact_held)
             return {"status": "ok", "task_id": task_id, "held": "no_artifact",
                     "reason": "no_artifact", "detail": _artifact_held}
+        if task_type == "test" and isinstance(ctx, dict) and ctx.get("post_recovery_verification"):
+            outcome = "PASS" if result.status == "completed" else "FAIL"
+            q().patch_context(task_id, {"post_recovery_verification_result": outcome})
+            pr_number = ctx.get("pr_number")
+            repo = ctx.get("repo") or ""
+            if isinstance(pr_number, int) and repo:
+                from agent_crew.github import post_pr_comment, pr_has_comment_containing
+                marker = f"[agent_crew post-recovery verification] task: {task_id}"
+                already_posted = pr_has_comment_containing(pr_number, marker, repo=repo)
+                if already_posted is False:
+                    body = (f"{marker}\nresult: {outcome}\n"
+                            f"summary: {(result.summary or '')[:500]}")
+                    if not post_pr_comment(pr_number, body, repo=repo):
+                        logger.warning("post-recovery verification comment failed: task=%s PR=%s",
+                                       task_id, pr_number)
+                elif already_posted is None:
+                    logger.warning("post-recovery verification comment deferred: task=%s PR=%s; "
+                                   "existing comments could not be checked", task_id, pr_number)
         if task_type == "discuss":
             agent = ctx.get("agent") if isinstance(ctx, dict) else None
             logger.info(f"POST /tasks/{task_id}/result: discuss task, pushing next discuss for agent={agent}")
@@ -7097,7 +7140,8 @@ def create_app(
                 logger.info(f"POST /tasks/{task_id}/result: review requested changes, auto-enqueueing fix")
                 _auto_enqueue_fix(task_id, repo=_review_repo)
             # #171: test passed → merge the PR. pr_number carried via test context.
-            if task_type == "test" and result.status == "completed":
+            if (task_type == "test" and result.status == "completed"
+                    and not _task_ctx.get("post_recovery_verification")):
                 test_pr = result.pr_number or _task_ctx.get("pr_number")
                 if test_pr:
                     _test_wt = _any_worktree_path()
