@@ -4752,9 +4752,15 @@ def create_app(
         #   about to not happen. Refusing early leaves no row to correct.
         if not _WORKTREE_SYNC_DISABLED:
             try:
+                # A discuss panel has no PR or branch target. Its branch is
+                # often the caller's local worktree name (e.g. wt-main), which
+                # must not enter the reviewer's #301 target-resolution guard.
+                _prep_branch = "" if task.task_type == "discuss" else task.branch or ""
+                _prep_context = ({} if task.task_type == "discuss" else
+                                 task.context if isinstance(task.context, dict) else {})
                 _reviewed_sha = _prepare_worktree_for_task(
-                    wt, task.task_id, task.branch or "", role,
-                    task_context=task.context if isinstance(task.context, dict) else {},
+                    wt, task.task_id, _prep_branch, role,
+                    task_context=_prep_context,
                 )
                 # #253/#358: record the exact prepared commit, or explicit
                 # unknown, before prompt construction.  A prep failure still
