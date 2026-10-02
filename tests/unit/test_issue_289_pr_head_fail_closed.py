@@ -346,7 +346,9 @@ def _push_fixture(tmp_path, monkeypatch, pr_repo, *, head=None):
 
     clone, wt, sha_a, main_tip = pr_repo
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 8105, "worktrees": {"codex": str(wt)}}))
+    state.write_text(json.dumps({"port": 8105, "roles": [
+        {"role": "reviewer", "agent": "claude", "worktree": str(wt)},
+    ]}))
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
     monkeypatch.setattr(sv, "_resolve_pr_head_branch", lambda *a, **k: head)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **k: False)
@@ -402,7 +404,9 @@ def test_an_ordinary_prep_failure_still_continues_on_the_push_path(tmp_path,
 
     clone, wt, sha_a, _ = pr_repo
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 8105, "worktrees": {"codex": str(wt)}}))
+    state.write_text(json.dumps({"port": 8105, "roles": [
+        {"role": "reviewer", "agent": "claude", "worktree": str(wt)},
+    ]}))
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
     monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **k: False)
     monkeypatch.setattr(sv, "_prepare_worktree_for_task",
