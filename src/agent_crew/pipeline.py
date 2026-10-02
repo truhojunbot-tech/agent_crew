@@ -5,7 +5,7 @@ When a task gets a result submitted, three follow-up flows may fire:
   1. ``auto_enqueue_review``           impl ✓  → enqueue a review task
   2. ``auto_enqueue_test``             review approve → enqueue a test task
   3. ``auto_enqueue_fix``              review request_changes → enqueue a fix
-  4. ``auto_fallback_failed_task``     rate-limit ✗ → reroute to next agent
+  4. ``auto_fallback_failed_task``     rate-limit ✗ → same-role retry
 
 Both transports — HTTP ``submit_result`` and MCP ``submit_result`` — must
 trigger these so the pipeline doesn't stall after the first stage when an
@@ -20,12 +20,12 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 import re
 import sqlite3
 import json
 import subprocess
-import uuid
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -33,20 +33,16 @@ from typing import Optional
 from agent_crew.fallback import (
     default_agent_for_role,
     has_rate_limit_signal,
-    load_fallback_chains,
-    next_agent,
 )
+from agent_crew.cea.input_providers.budget import QuotaBudgetProvider
 from agent_crew.loop import _resolve_verdict
-from agent_crew.notify import notify_telegram
 from agent_crew.protocol import (
     GateRequest,
     TaskRequest,
     TaskResult,
     normalize_pr_number,
-    RESULT_BRANCH_CONTEXT_KEY,
-    RESULT_COMMIT_CONTEXT_KEY,
 )
-from agent_crew.queue import (TaskQueue, _TYPE_TO_ROLE, PausedError, TaskAlreadyExistsError,
+from agent_crew.queue import (TaskQueue, PausedError, TaskAlreadyExistsError,
                               DuplicateReviewError,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
@@ -58,8 +54,6 @@ from agent_crew import tokenomics_canary as _tokenomics_canary
 from agent_crew.cea import cascade_contract as _cascade
 
 logger = logging.getLogger(__name__)
-
-MAX_FALLBACK_CHAIN_DEPTH = 3
 
 
 def successor_context(parent_context: object) -> dict:
@@ -2059,6 +2053,23 @@ def auto_enqueue_test(
         if _skip_terminal_pr("auto_enqueue_test", review_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
+        # #308: a provider cooldown skips this optional tester stage. Keep the
+        # reason on the durable review task so a missing test row is explicit.
+        test_id = f"test-{review_task_id}"
+        if any(task.task_id == test_id for task in tasks_by_id.values()):
+            return test_id
+        until = QuotaBudgetProvider().active_cooldown_until("gemini")
+        if until is not None:
+            note = "gemini tester stage not run (provider limit)"
+            recorded_until = until if math.isfinite(until) else "unknown"
+            queue.patch_context(review_task_id, {
+                "test_stage_skip": {"reason": note, "provider": "gemini",
+                                    "cooldown_until": recorded_until},
+            })
+            logger.warning(
+                "auto_enqueue_test: %s; provider=gemini since=unknown until=%s "
+                "tasks_skipped=1 review=%s", note, recorded_until, review_task_id)
+            return None
         test_context: dict = {"prev_task_id": review_task_id}
         _inherit_root_risk(tasks_by_id, review_task, test_context)
         # Test the exact revision approved by the reviewer. This is also the
@@ -2099,7 +2110,6 @@ def auto_enqueue_test(
             )
 
         # #314 §4 P0-1: 결정론 successor id — review당 test 1개(review id는 이미 round별 결정론).
-        test_id = f"test-{review_task_id}"
         test_req = TaskRequest(
             task_id=test_id,
             task_type="test",  # type: ignore[arg-type]
@@ -2160,183 +2170,13 @@ def auto_fallback_failed_task(
     fallback_disabled: bool = False,
     suppress_side_effects: bool = False,
 ) -> bool:
-    """Reroute a rate-limit-shaped failure to the next agent in the chain.
+    """Keep a failed task on its role; #308 forbids provider substitution.
 
-    #314 §4 P0: ``suppress_side_effects`` (replay 경로) 시 escalation gate 생성과 telegram
-    notification 같은 non-idempotent side effect를 skip한다. fallback successor enqueue(stable id)와
-    task cancel(idempotent)은 durable transition이므로 계속 수행된다.
-
-    Returns ``True`` when fallback handled the task — caller should skip
-    auto-retry. ``False`` means caller should fall through to its normal
-    retry path. On chain exhaustion, opens an ``escalation`` gate and
-    sends a Telegram alert (best-effort).
+    Returning False lets the existing same-role retry path run. Its pending
+    task is held by dispatch while the role's provider has an active cooldown.
+    The legacy signature remains for HTTP and MCP callers.
     """
-    if fallback_disabled:
-        return False
-    if not has_rate_limit_signal(result.summary, result.findings):
-        return False
-
-    try:
-        tasks = [t for t in queue.list_tasks() if t.task_id == task_id]
-        if not tasks:
-            return False
-        original = tasks[0]
-        ctx = successor_context(original.context)
-        copied_risk = ctx.get("risk_declaration")
-        if (isinstance(copied_risk, dict)
-                and copied_risk.get("declaration_source") == "explicit"):
-            ctx["risk_declaration"] = {
-                **copied_risk,
-                "inherited_from": copied_risk.get("inherited_from") or task_id,
-            }
-        ctx.pop(RESULT_BRANCH_CONTEXT_KEY, None)
-        ctx.pop(RESULT_COMMIT_CONTEXT_KEY, None)
-
-        # #167: stop infinite fallback loops — if the chain has already been
-        # retried MAX_FALLBACK_CHAIN_DEPTH times, cancel the original task and
-        # escalate without creating another fallback task.
-        if ctx.get("fallback_chain_depth", 0) >= MAX_FALLBACK_CHAIN_DEPTH:
-            logger.warning(
-                f"auto_fallback: fallback_chain_depth={ctx.get('fallback_chain_depth')} "
-                f">= MAX ({MAX_FALLBACK_CHAIN_DEPTH}) for {task_id} — cancelling chain."
-            )
-            # Cancel an active root; G12 keeps an already-failed root terminal.
-            original_task_id = ctx.get("original_task_id")
-            if original_task_id:
-                try:
-                    if queue.cancel(original_task_id):
-                        logger.info("auto_fallback: cancelled original task %s due to fallback loop",
-                                    original_task_id)
-                    else:
-                        logger.info("auto_fallback: original task %s already terminal; cancel refused",
-                                    original_task_id)
-                except Exception as e:
-                    logger.warning(
-                        f"auto_fallback: failed to cancel original task {original_task_id}: {e}"
-                    )
-            msg = (
-                f"agent_crew fallback loop detected\n"
-                f"task_id: {task_id}\n"
-                f"task_type: {task_type}\n"
-                f"chain_depth: {ctx.get('fallback_chain_depth')}\n"
-                f"original_task_id: {original_task_id or '(unknown)'}\n"
-                f"last summary: {(result.summary or '')[:200]}"
-            )
-            # #314 §4 P0: escalation gate 생성 + telegram notify는 non-idempotent side effect.
-            # replay(suppress_side_effects)에서는 skip해 중복 gate/notification을 막는다.
-            if not suppress_side_effects:
-                try:
-                    queue.create_gate(
-                        GateRequest(
-                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
-                            type="escalation",
-                            message=msg,
-                            status="pending",
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
-                try:
-                    notify_telegram(msg)
-                except Exception:
-                    pass
-            return True
-
-        role = _TYPE_TO_ROLE.get(task_type)
-        current_agent = (
-            ctx.get("agent_override")
-            or (default_agent_for_role(role, pane_map) if (role and pane_map) else None)
-        )
-        excluded = list(ctx.get("fallback_excluded") or [])
-        # Self-review/self-test prevention (#117): any upstream agent
-        # already in the lineage (impl→review→test) must be excluded so
-        # the chain doesn't loop the task back to a participant whose
-        # output is being judged.
-        for upstream_key in ("implementer_agent", "reviewer_agent"):
-            upstream = ctx.get(upstream_key)
-            if upstream and upstream not in excluded:
-                excluded.append(upstream)
-        if current_agent and current_agent not in excluded:
-            excluded.append(current_agent)
-
-        chains = load_fallback_chains(state_path)
-        successor = next_agent(task_type, current_agent, excluded, chains)
-
-        if successor is None:
-            logger.warning(
-                f"auto_fallback: chain exhausted for {task_id} "
-                f"(task_type={task_type}, excluded={excluded}). Escalating."
-            )
-            msg = (
-                f"agent_crew rate-limit fallback exhausted\n"
-                f"task_id: {task_id}\n"
-                f"task_type: {task_type}\n"
-                f"tried agents: {', '.join(excluded) or '(none)'}\n"
-                f"last summary: {(result.summary or '')[:200]}"
-            )
-            # #314 §4 P0: escalation gate 생성 + telegram notify는 non-idempotent side effect.
-            # replay(suppress_side_effects)에서는 skip해 중복 gate/notification을 막는다.
-            if not suppress_side_effects:
-                try:
-                    queue.create_gate(
-                        GateRequest(
-                            id=f"escalation-{task_id}-{uuid.uuid4().hex[:4]}",
-                            type="escalation",
-                            message=msg,
-                            status="pending",
-                        )
-                    )
-                except Exception as e:
-                    logger.warning(f"auto_fallback: failed to create escalation gate: {e}")
-                try:
-                    notify_telegram(msg)
-                except Exception:
-                    pass
-            return True
-
-        new_ctx = dict(ctx)
-        new_ctx["agent_override"] = successor
-        new_ctx["fallback_excluded"] = excluded
-        new_ctx["fallback_from_task_id"] = task_id
-        new_ctx["fallback_chain_depth"] = ctx.get("fallback_chain_depth", 0) + 1
-        # Carry the root task_id through the chain so loop detection can
-        # cancel the original task when the depth limit is reached (#167).
-        new_ctx["original_task_id"] = ctx.get("original_task_id") or task_id
-        try:
-            # #314 §4 P0-1: 결정론 successor id — chain depth로 구분(replay가 같은 depth→같은 id).
-            fallback_req = TaskRequest(
-                task_id=f"fallback-{task_id}-d{int(new_ctx['fallback_chain_depth'])}",
-                task_type=task_type,  # type: ignore[arg-type]
-                description=original.description,
-                branch=original.branch,
-                priority=original.priority,
-                context=new_ctx,
-                # s4j: a fallback is the same work on another provider, so it is
-                # the same project. Naming none admitted project-less.
-                project=_successor_project(queue, original),
-            )
-            try:
-                queue.enqueue(fallback_req, ingress="cascade.fallback",
-                              _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
-            except TaskAlreadyExistsError:
-                logger.info(f"auto_fallback: {fallback_req.task_id} 이미 존재 — 멱등 skip")
-            logger.info(
-                f"auto_fallback: rerouted {task_id} -> {successor} "
-                f"(excluded={excluded})"
-            )
-            return True
-        except PausedError:
-            raise   # 아래 outer에서 reopen+전파
-        except Exception as e:
-            logger.warning(f"auto_fallback: enqueue failed for {task_id}: {e}")
-            return False
-    except PausedError:
-        # #314 §4 P0-2: STOP race — 부모(failed task) outbox reopen + 전파.
-        try:
-            queue.outbox_reopen(task_id)
-        except Exception:
-            logger.exception(f"auto_fallback: outbox_reopen({task_id}) 실패")
-        raise
-    except Exception as e:
-        logger.warning(f"auto_fallback: unexpected error for {task_id}: {e}")
-        return False
+    if has_rate_limit_signal(result.summary, result.findings):
+        logger.info("auto_fallback: provider substitution disabled for %s (%s)",
+                    task_id, task_type)
+    return False

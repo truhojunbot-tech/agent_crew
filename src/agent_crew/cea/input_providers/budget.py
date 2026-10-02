@@ -28,6 +28,7 @@ import time
 import base64
 import binascii
 import hashlib
+import math
 from typing import Optional
 
 from agent_crew.cea.receipt import BudgetClass, ProviderBudget, ProviderBudgetState
@@ -94,6 +95,20 @@ class QuotaBudgetProvider:
         if isinstance(v, dict):
             v = v.get("until")
         return float(v) if isinstance(v, (int, float)) else None
+
+    def active_cooldown_until(self, provider: str) -> Optional[float]:
+        """Read the authoritative cooldown at dispatch time, without quota-cache lag.
+
+        A malformed configured file cannot prove that a previous cooldown was
+        cleared. Hold until the operator repairs or clears that file.
+        """
+        if not self.cooldown_file:
+            return None
+        try:
+            until = self._cooldown_until(provider)
+        except (OSError, ValueError, TypeError):
+            return math.inf
+        return until if until is not None and until > self._clock() else None
 
     def budget(self, provider: str) -> ProviderBudget:
         now = self._clock()

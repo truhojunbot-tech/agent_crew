@@ -21,6 +21,7 @@ from fastapi import Body, FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 from agent_crew import instructions
+from agent_crew.cea.input_providers.budget import QuotaBudgetProvider
 from agent_crew.port_validation import require_project_port
 from agent_crew import claude_transcript as _claude_transcript
 from agent_crew.anomaly import check_wrong_repo
@@ -3315,6 +3316,39 @@ def create_app(
     def q() -> TaskQueue:
         return state["queue"]
 
+    def _hold_or_skip_provider_limit(task: TaskRequest, agent: str,
+                                     until: Optional[float]) -> None:
+        note = f"{agent} tester stage not run (provider limit)"
+        recorded_until = until if until is None or math.isfinite(until) else "unknown"
+        if task.task_type == "test":
+            if q().cancel(task.task_id, reason=note, expected_status="in_progress"):
+                fields = {"reason": note, "provider": agent,
+                          "cooldown_until": recorded_until}
+                q().patch_context(task.task_id, {"test_stage_skip": fields})
+                parent = (task.context or {}).get("prev_task_id")
+                if parent:
+                    q().patch_context(parent, {"test_stage_skip": fields})
+                pr_number = (task.context or {}).get("pr_number")
+                if isinstance(pr_number, int):
+                    _auto_merge_pr(pr_number, repo=(task.context or {}).get("repo") or "")
+            action = "skipped"
+        else:
+            q().requeue(task.task_id, reason="provider_cooldown")
+            action = "held"
+        logger.warning(
+            "provider cooldown: provider=%s since=unknown until=%s task=%s "
+            "tasks_%s=1", agent, recorded_until, task.task_id, action)
+
+    def _honor_provider_cooldown(task: TaskRequest, agent: str) -> bool:
+        """Hold work or skip a tester before spending this provider's slot."""
+        if task.task_type not in ("implement", "review", "test"):
+            return False
+        until = QuotaBudgetProvider().active_cooldown_until(agent)
+        if until is None:
+            return False
+        _hold_or_skip_provider_limit(task, agent, until)
+        return True
+
     def _guard_task_existence(task_id: str, target: str) -> bool:
         """Refuse a task block whose DB row is missing or terminal."""
         task_status = q().get_task_status(task_id)
@@ -3726,6 +3760,10 @@ def create_app(
                     skipped.add(task.task_id)
                     continue
 
+            if _honor_provider_cooldown(task, _target_agent):
+                skipped.add(task.task_id)
+                continue
+
             # A busy queue head must not hide a later task for a free pane.
             if pane_id in _panes_with_in_progress(exclude_task_id=task.task_id):
                 logger.debug(
@@ -3810,39 +3848,10 @@ def create_app(
         if not guarded_pane_id:
             return
 
-        # #151: if target pane shows a usage-limit message, immediately reroute
-        # via fallback rather than pushing into a blocked agent.
+        # #308: a pane usage-limit signal follows the same role policy as a
+        # cooldown; never substitute another provider into this role.
         if _pane_has_usage_limit(guarded_pane_id):
-            blocked_agent = next(
-                (k for k, v in (pane_map or {}).items() if v == pane_id and k in ("claude", "codex", "gemini")),
-                None,
-            )
-            logger.warning(
-                f"_try_push_next: pane {pane_id} shows usage-limit — "
-                f"skipping push, routing task {task.task_id} to fallback "
-                f"(blocked_agent={blocked_agent})"
-            )
-            usage_limit_summary = (
-                f"usage limit detected on pane {pane_id}"
-                + (f" (agent={blocked_agent})" if blocked_agent else "")
-            )
-            task_type_for_fb = _ROLE_TO_TYPE.get(role)
-            if task_type_for_fb:
-                fb_result = TaskResult(
-                    task_id=task.task_id,
-                    status="failed",
-                    summary=usage_limit_summary,
-                    verdict=None,
-                    findings=[],
-                    pr_number=None,
-                )
-                q().force_fail(task.task_id, usage_limit_summary)
-                try:
-                    _auto_fallback_failed_task(task.task_id, fb_result, task_type_for_fb)
-                except Exception:
-                    logger.exception(f"_try_push_next: fallback failed for usage-limited task {task.task_id}")
-            else:
-                q().requeue(task.task_id)
+            _hold_or_skip_provider_limit(task, _target_agent, None)
             return
 
         # #158: if pane shows a bare shell prompt (agent CLI crashed), requeue
@@ -4468,6 +4477,8 @@ def create_app(
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         agent, wt = _resolve_dispatch_target(task, role)
+        if _honor_provider_cooldown(task, agent):
+            return
         if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
             if agent == _override:
                 logger.info(
@@ -5887,6 +5898,13 @@ def create_app(
         )
         if test_id:
             _try_push_next("tester")
+        else:
+            review_ctx = q().get_task_context(review_task_id) or {}
+            skipped = review_ctx.get("test_stage_skip") or {}
+            if skipped.get("reason") == "gemini tester stage not run (provider limit)":
+                pr_number = review_ctx.get("pr_number")
+                if isinstance(pr_number, int):
+                    _auto_merge_pr(pr_number, repo=repo or review_ctx.get("repo") or "")
 
     def _any_worktree_path() -> str:
         """A worktree that is a checkout of THIS project's repository.
