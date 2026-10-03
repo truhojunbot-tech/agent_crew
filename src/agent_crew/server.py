@@ -5944,10 +5944,9 @@ def create_app(
         """
         row_project = ""
         try:
-            for t in q().list_tasks():
-                if t.task_id == parent_task_id:
-                    row_project = str(getattr(t, "project", "") or "").strip()
-                    break
+            parent = q().get_task(parent_task_id)
+            if parent is not None:
+                row_project = str(getattr(parent, "project", "") or "").strip()
         except Exception:  # noqa: BLE001 — provenance, never a reason to drop the successor
             row_project = ""
         ctx_project = str((ctx or {}).get("project") or "").strip()
@@ -6049,10 +6048,9 @@ def create_app(
         MAX_RETRIES = 2
         try:
             # Get the original task to extract description, branch, and context
-            tasks = [t for t in q().list_tasks() if t.task_id == task_id]
-            if not tasks:
+            original_task = q().get_task(task_id)
+            if original_task is None:
                 return
-            original_task = tasks[0]
             # Opt-in for projects where repeating an agent-reported implement
             # failure has proved wasteful. Read per call so the default retry
             # behavior remains unchanged when the flag is unset.
@@ -6631,13 +6629,12 @@ def create_app(
     @app.get("/tasks/{task_id}")
     def get_task(task_id: str, x_agent_crew_project: Optional[str] = Header(default=None)):
         _require_project_identity(x_agent_crew_project)
-        tasks = q().list_tasks()
-        for t in tasks:
-            if t.task_id == task_id:
-                # G12 / D6: additive — every field a client already reads is
-                # unchanged; `execution` is the claim/dispatch/lease record.
-                return {**dataclasses.asdict(t), "execution": q().get_exec_state(task_id)}
-        raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        task = q().get_task(task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"Task {task_id!r} not found")
+        # G12 / D6: additive — every field a client already reads is
+        # unchanged; `execution` is the claim/dispatch/lease record.
+        return {**dataclasses.asdict(task), "execution": q().get_exec_state(task_id)}
 
     @app.post("/tasks/{task_id}/start", status_code=200)
     def start_task(task_id: str, body: dict = Body(default_factory=dict),
@@ -6679,7 +6676,7 @@ def create_app(
         # discuss-task follow-up pushes.
         ctx = q().get_task_context(task_id)
         _artifact_held = None
-        _task = next((item for item in q().list_tasks() if item.task_id == task_id), None)
+        _task = q().get_task(task_id)
         try:
             _runtime_paused = q().get_runtime_state().get("effective_state") != "ACTIVE"
         except Exception:
@@ -6740,16 +6737,12 @@ def create_app(
         # #265: worker-reported failures can still be revised by that worker.
         # Queue admission now refuses a timeout, cancel or dispatcher failure
         # under the write lock, so those statuses never reach revision logging.
-        _prior = next((t.status for t in q().list_tasks() if t.task_id == task_id), "")
+        _prior = q().get_task(task_id)
+        _prior = _prior.status if _prior is not None else ""
         _adopted_fallback_id = None
         if (_task is not None and _task.task_type == "implement"
                 and _prior in ("failed", "timed_out") and result.status == "completed"):
-            _fallbacks = [
-                t for t in q().list_tasks()
-                if t.task_id.startswith("fallback-")
-                and isinstance(t.context, dict)
-                and t.context.get("original_task_id") == task_id
-            ]
+            _fallbacks = q().list_fallback_tasks_for_original(task_id)
             # Only an unfinished, unique fallback may be withdrawn. The queue
             # checks the same lineage under its result write lock; if this
             # snapshot is stale, the fallback still wins and the late result

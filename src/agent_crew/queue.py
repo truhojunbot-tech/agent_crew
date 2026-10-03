@@ -5559,6 +5559,51 @@ class TaskQueue:
         finally:
             conn.close()
 
+    @staticmethod
+    def _task_from_row(r: sqlite3.Row) -> TaskRequest:
+        """Use one mapping for list and primary-key task reads."""
+        return TaskRequest(
+            task_id=r["task_id"],
+            task_type=r["task_type"],
+            description=r["description"],
+            branch=r["branch"],
+            priority=r["priority"],
+            context=json.loads(r["context"]),
+            project=r["project"] if r["project"] else "",
+            status=r["status"],
+            # #213: result fields are part of both list and single-task reads.
+            summary=r["summary"] or "",
+            verdict=r["verdict"],
+            findings=json.loads(r["findings"]) if r["findings"] else [],
+            pr_number=r["pr_number"],
+            error_info=json.loads(r["error_info"]) if r["error_info"] else None,
+            status_changed_at=(r["status_changed_at"]
+                               if "status_changed_at" in r.keys() else 0.0),
+        )
+
+    def get_task(self, task_id: str) -> Optional[TaskRequest]:
+        """Read one task by primary key, with the same fields as list_tasks."""
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+            return self._task_from_row(row) if row is not None else None
+        finally:
+            conn.close()
+
+    def list_fallback_tasks_for_original(self, task_id: str) -> List[TaskRequest]:
+        """Read fallback candidates for one original without decoding every task."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM tasks WHERE task_id LIKE 'fallback-%' "
+                "AND json_extract(context, '$.original_task_id') = ? "
+                "ORDER BY priority ASC, created_at ASC",
+                (task_id,),
+            ).fetchall()
+            return [self._task_from_row(row) for row in rows]
+        finally:
+            conn.close()
+
     def list_tasks(self, status: str = "") -> List[TaskRequest]:
         conn = self._connect()
         try:
@@ -5571,29 +5616,7 @@ class TaskQueue:
                 rows = conn.execute(
                     "SELECT * FROM tasks ORDER BY priority ASC, created_at ASC"
                 ).fetchall()
-            return [
-                TaskRequest(
-                    task_id=r["task_id"],
-                    task_type=r["task_type"],
-                    description=r["description"],
-                    branch=r["branch"],
-                    priority=r["priority"],
-                    context=json.loads(r["context"]),
-                    project=r["project"] if r["project"] else "",
-                    status=r["status"],
-                    # #213: these columns are already in `r` (SELECT *) —
-                    # only actually meaningful once the task has a result,
-                    # but harmless/empty-default otherwise.
-                    summary=r["summary"] or "",
-                    verdict=r["verdict"],
-                    findings=json.loads(r["findings"]) if r["findings"] else [],
-                    pr_number=r["pr_number"],
-                    error_info=json.loads(r["error_info"]) if r["error_info"] else None,
-                    status_changed_at=(r["status_changed_at"]
-                                       if "status_changed_at" in r.keys() else 0.0),
-                )
-                for r in rows
-            ]
+            return [self._task_from_row(r) for r in rows]
         finally:
             conn.close()
 
