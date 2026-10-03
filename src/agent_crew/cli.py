@@ -2302,6 +2302,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             )
         risk_tier = int(raw_tier)
     risk_context = {"risk_tier": risk_tier} if risk_tier is not None else {}
+    artifact_context = {"artifact_kind": artifact_kind} if artifact_kind is not None else {}
 
     if not db:
         project = _select_project(base, project, allow_cross_project)
@@ -2742,10 +2743,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
     run_branch_context = {"base_branch": declared_base,
                           "crew_run_branch": branch != declared_base}
-    impl_context = {**_CM, **run_branch_context, **risk_context,
+    impl_context = {**_CM, **run_branch_context, **risk_context, **artifact_context,
                     "sync_landed_bases": _sync_landed_bases}
-    if artifact_kind is not None:
-        impl_context["artifact_kind"] = artifact_kind
     if implementer:
         impl_context["agent_override"] = implementer
     if no_tester:
@@ -2901,6 +2900,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                     retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
                                                context={**_CM, **run_branch_context, **risk_context,
+                                                        **artifact_context,
                                                         "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
@@ -2927,7 +2927,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             # no persisted lineage to adopt. The production TaskQueue does.
             feedback = build_feedback(review_result)
             retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
-            retry_context = {**_CM, **run_branch_context, **risk_context,
+            retry_context = {**_CM, **run_branch_context, **risk_context, **artifact_context,
                              "feedback": feedback,
                              "sync_landed_bases": retry_bases}
             if implementer:

@@ -136,3 +136,44 @@ def test_help_explains_report_contract_and_cascade():
     assert "--artifact-kind" in run_help.output
     assert "post-verification cascade" in run_help.output
     assert "--artifact-kind" in enqueue_help.output
+
+
+@pytest.mark.parametrize("retry_path", ["failed_test", "review_feedback"])
+def test_run_retry_keeps_artifact_kind(monkeypatch, tmp_path, retry_path):
+    """A declared report contract must follow each CLI-created implement retry."""
+    import agent_crew.loop as loop
+
+    results = iter([
+        TaskResult(task_id="impl-1", status="completed", summary="report complete"),
+        TaskResult(
+            task_id="review-1", status="completed", summary="review complete",
+            verdict="approve" if retry_path == "failed_test" else "request_changes",
+            findings=[] if retry_path == "failed_test" else ["Report needs a source link"],
+        ),
+        *([TaskResult(task_id="test-1", status="failed", summary="test failed")]
+          if retry_path == "failed_test" else []),
+        TaskResult(task_id="impl-2", status="failed", summary="stop after retry"),
+    ])
+
+    class Queue:
+        def get_result(self, _task_id):
+            return next(results)
+
+    contexts = []
+
+    def enqueue_implement(_queue, _task, _branch, context=None, port=0):
+        contexts.append(context)
+        return f"impl-{len(contexts)}"
+
+    monkeypatch.setattr("agent_crew.cli._writable_queue", lambda *_a, **_kw: Queue())
+    monkeypatch.setattr(loop, "enqueue_implement", enqueue_implement)
+    monkeypatch.setattr(loop, "enqueue_review", lambda *_a, **_kw: "review-1")
+    monkeypatch.setattr(loop, "enqueue_test", lambda *_a, **_kw: "test-1")
+    result = CliRunner().invoke(crew, [
+        "run", "read-only report", "--db", str(tmp_path / "tasks.db"),
+        "--branch", "fix/report", "--max-iter", "2", "--artifact-kind", "report",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert len(contexts) == 2, result.output
+    assert [context.get("artifact_kind") for context in contexts] == ["report", "report"]
