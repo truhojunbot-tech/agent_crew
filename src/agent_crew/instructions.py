@@ -474,6 +474,12 @@ everyone, which is the bug this avoids.
 
 ### Result checklist (implementer)
 
+For a completed implement result, the structured `branch`, full pushed `commit`
+SHA, and `pr_number` are **REQUIRED**. A PR number mentioned only in `summary`
+does not identify the artifact. If POST /result replies `held: no_artifact`,
+resend the result for the same task with those fields and the same executor
+binding/nonce.
+
 Before you POST the result, verify:
 - [ ] Tests pass locally
 - [ ] `git commit` done — you have a real commit hash
