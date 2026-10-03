@@ -29,6 +29,7 @@ from unittest.mock import MagicMock, patch
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
+from agent_crew.protocol import TaskRequest
 from agent_crew.server import create_app
 
 RUN_S = 0.35
@@ -63,7 +64,8 @@ def _agent_of(cmd0: str) -> str:
     return "claude"
 
 
-def _run_dispatcher(tmp_db, tmp_path, payloads, settle_s: float = 1.6):
+def _run_dispatcher(tmp_db, tmp_path, payloads, settle_s: float = 1.6,
+                    preenqueue: bool = False):
     """태스크를 넣고 디스패처를 돌린 뒤, worker 별 (시작, 끝) 구간을 돌려준다."""
     spans: list[tuple[str, float, float]] = []
 
@@ -83,6 +85,12 @@ def _run_dispatcher(tmp_db, tmp_path, payloads, settle_s: float = 1.6):
         return proc
 
     state_file = _state(tmp_path)
+    if preenqueue:
+        # Both workers must see pending work at startup. Sequential HTTP POSTs
+        # can arrive after the first fast worker finishes, masking concurrency.
+        queue = TaskQueue(tmp_db)
+        for payload in payloads:
+            queue.enqueue(TaskRequest(**payload))
     # 프로토콜 재생성이 port file 을 요구한다(_ensure_role_protocol). 없으면
     # dispatch 가 그 자리에서 끊겨 subprocess 가 아예 안 뜬다.
     port_file = os.path.join(os.path.dirname(tmp_db), "port")
@@ -101,8 +109,9 @@ def _run_dispatcher(tmp_db, tmp_path, payloads, settle_s: float = 1.6):
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app) as client:
-                    for p in payloads:
-                        assert client.post("/tasks", json=p).status_code == 201
+                    if not preenqueue:
+                        for p in payloads:
+                            assert client.post("/tasks", json=p).status_code == 201
                     time.sleep(settle_s)
     return spans
 
@@ -139,7 +148,7 @@ def test_two_implements_on_different_workers_overlap_in_time(tmp_db, tmp_path):
     spans = _run_dispatcher(tmp_db, tmp_path, [
         _payload("impl_default"),
         _payload("impl_override", override="claude"),
-    ])
+    ], preenqueue=True)
     agents = sorted(s[0] for s in spans)
     assert agents == ["claude", "codex"], f"두 worker 로 안 갈렸다: {spans}"
     a, b = spans[0], spans[1]
