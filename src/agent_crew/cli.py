@@ -11,6 +11,7 @@ import time
 import click
 
 from agent_crew import setup as setup_module
+from agent_crew.pipeline import ARTIFACT_KINDS
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT,
     effective_role_mapping,
@@ -2275,6 +2276,8 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.option("--branch", default="main", show_default=True)
 @click.option("--risk-tier", type=click.IntRange(0, 3), default=None,
               help="Explicit risk tier 0-3 (default: AGENT_CREW_DEFAULT_RISK_TIER if set)")
+@click.option("--artifact-kind", type=click.Choice(ARTIFACT_KINDS), default=None,
+              help="Declare artifact contract; report keeps the server's existing post-verification cascade.")
 @click.option("--timeout", default=600, type=int, show_default=True, help="Task wait timeout in seconds")
 @click.option("--create-issue", is_flag=True, help="Create GitHub issue for task")
 @click.option("--create-pr", is_flag=True, help="Create GitHub PR after implementation")
@@ -2284,7 +2287,7 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.option("--auto-merge", is_flag=True, help="Auto-merge PR via gh when loop completes successfully")
 def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: str,
             max_iter: int, no_tester: bool, branch: str, risk_tier: int | None,
-            timeout: int,
+            artifact_kind: str | None, timeout: int,
             create_issue: bool, create_pr: bool, repo: str,
             implementer: str, reviewer: str, auto_merge: bool):
     """Run TASK through the code-review loop."""
@@ -2299,6 +2302,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             )
         risk_tier = int(raw_tier)
     risk_context = {"risk_tier": risk_tier} if risk_tier is not None else {}
+    artifact_context = {"artifact_kind": artifact_kind} if artifact_kind is not None else {}
 
     if not db:
         project = _select_project(base, project, allow_cross_project)
@@ -2739,7 +2743,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
     run_branch_context = {"base_branch": declared_base,
                           "crew_run_branch": branch != declared_base}
-    impl_context = {**_CM, **run_branch_context, **risk_context,
+    impl_context = {**_CM, **run_branch_context, **risk_context, **artifact_context,
                     "sync_landed_bases": _sync_landed_bases}
     if implementer:
         impl_context["agent_override"] = implementer
@@ -2896,6 +2900,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                     retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
                                                context={**_CM, **run_branch_context, **risk_context,
+                                                        **artifact_context,
                                                         "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
@@ -2922,7 +2927,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             # no persisted lineage to adopt. The production TaskQueue does.
             feedback = build_feedback(review_result)
             retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
-            retry_context = {**_CM, **run_branch_context, **risk_context,
+            retry_context = {**_CM, **run_branch_context, **risk_context, **artifact_context,
                              "feedback": feedback,
                              "sync_landed_bases": retry_bases}
             if implementer:
@@ -3643,6 +3648,8 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
               help="Git branch the task targets")
 @click.option("--pr", "pr_number", default=0, type=int,
               help="PR number to attach to context (for review/test tasks)")
+@click.option("--artifact-kind", type=click.Choice(ARTIFACT_KINDS), default=None,
+              help="Declare the task's completion artifact contract (for example, report).")
 @click.option("--prev-task-id", default="",
               help="Task id this one depends on (typically the impl task id "
                    "for review, or the review id for test).")
@@ -3650,7 +3657,8 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
 @click.option("--task-id", default="",
               help="Override task_id (default: <type>-<random8hex>)")
 def enqueue(task_type: str, description: str, project: str, db: str, base: str,
-            branch: str, pr_number: int, prev_task_id: str, priority: int,
+            branch: str, pr_number: int, artifact_kind: str | None,
+            prev_task_id: str, priority: int,
             task_id: str):
     """Enqueue a single TASK_TYPE task without entering the loop.
 
@@ -3690,6 +3698,8 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
         context["prev_task_id"] = prev_task_id
     if pr_number:
         context["pr_number"] = pr_number
+    if artifact_kind is not None:
+        context["artifact_kind"] = artifact_kind
 
     payload = {
         "task_id": task_id,
