@@ -17,7 +17,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
-from fastapi import Body, FastAPI, Header, HTTPException
+from fastapi import Body, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel
 
 from agent_crew import instructions
@@ -71,7 +71,8 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               DuplicateReviewResult, InvalidReviewResult, LateResultRejected,
                               TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
-                              _ROLE_TO_TYPE, _TYPE_TO_ROLE)
+                              _ROLE_TO_TYPE, _TYPE_TO_ROLE,
+                              RequestSqliteTiming, request_sqlite_timing)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
 from agent_crew import claude_cloud as _claude_cloud
@@ -3268,6 +3269,36 @@ def create_app(
                     await task
 
     app = FastAPI(lifespan=lifespan)
+
+    try:
+        slow_request_ms = max(0.0, float(os.getenv("AGENT_CREW_SLOW_REQUEST_MS", "2000")))
+    except ValueError:
+        slow_request_ms = 2000.0
+
+    @app.middleware("http")
+    async def log_slow_request(request: Request, call_next):
+        if slow_request_ms == 0:
+            return await call_next(request)
+        timing = RequestSqliteTiming()
+        token = request_sqlite_timing.set(timing)
+        started = time.perf_counter()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            total_ms = (time.perf_counter() - started) * 1000
+            request_sqlite_timing.reset(token)
+            if total_ms >= slow_request_ms:
+                route = request.scope.get("route")
+                path_template = getattr(route, "path", "<unmatched>")
+                logger.warning(
+                    "slow request method=%s path=%s status=%s total_ms=%.1f "
+                    "lock_wait_ms=%.1f lock_hold_ms=%.1f",
+                    request.method, path_template, status, total_ms,
+                    timing.lock_wait_seconds * 1000, timing.lock_hold_seconds * 1000,
+                )
 
     # #314 §3/§4: 라이브 cascade 도중 successor enqueue 시점에 STOP이 authoritative가 돼 enqueue가
     # PausedError로 원자 거부되면 — 부모 result는 이미 cascade_outbox에 result_json과 함께 원자

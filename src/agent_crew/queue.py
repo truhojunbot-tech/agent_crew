@@ -1,5 +1,6 @@
 import json
 import contextlib
+import contextvars
 import copy
 import fcntl
 import hashlib
@@ -11,7 +12,7 @@ import sqlite3
 import threading
 import time
 import uuid
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field as dataclass_field, replace
 from datetime import datetime, timezone
 from typing import Callable, List, Optional
 
@@ -42,6 +43,67 @@ from agent_crew.telemetry import TaskTelemetry, TaskTelemetryAdapter, default_te
 from agent_crew.tokenomics_canary import SUPPRESSED_REASON as _CANARY_SUPPRESSED_REASON
 from agent_crew.tokenomics_shadow import shadow_recommendation, shadow_recommendation_for_task_id
 from agent_crew.risk_tier import RISK_DECLARATION_FIELDS, risk_declaration
+
+
+@dataclass
+class RequestSqliteTiming:
+    """Mutable timing shared with FastAPI's copied threadpool context."""
+
+    lock_wait_seconds: float = 0.0
+    lock_hold_seconds: float = 0.0
+    _lock: threading.Lock = dataclass_field(default_factory=threading.Lock, repr=False)
+
+    def add(self, *, wait: float = 0.0, hold: float = 0.0) -> None:
+        with self._lock:
+            self.lock_wait_seconds += wait
+            self.lock_hold_seconds += hold
+
+
+request_sqlite_timing: contextvars.ContextVar[RequestSqliteTiming | None] = (
+    contextvars.ContextVar("request_sqlite_timing", default=None)
+)
+
+
+class _TimedConnection(sqlite3.Connection):
+    """Time the queue's existing BEGIN IMMEDIATE transactions, without changing them."""
+
+    def _finish_write_lock(self) -> None:
+        started = getattr(self, "_write_lock_started", None)
+        if started is not None:
+            self._write_lock_timing.add(hold=time.perf_counter() - started)
+            self._write_lock_started = None
+
+    def execute(self, sql, parameters=(), /):
+        statement = sql.lstrip().upper()
+        if statement.startswith("BEGIN IMMEDIATE"):
+            timing = request_sqlite_timing.get()
+            if timing is not None:
+                started = time.perf_counter()
+                try:
+                    return super().execute(sql, parameters)
+                finally:
+                    timing.add(wait=time.perf_counter() - started)
+                    if self.in_transaction:
+                        self._write_lock_timing = timing
+                        self._write_lock_started = time.perf_counter()
+        result = super().execute(sql, parameters)
+        if statement in ("COMMIT", "ROLLBACK"):
+            self._finish_write_lock()
+        return result
+
+    def commit(self):
+        result = super().commit()
+        self._finish_write_lock()
+        return result
+
+    def rollback(self):
+        result = super().rollback()
+        self._finish_write_lock()
+        return result
+
+    def close(self):
+        self._finish_write_lock()
+        return super().close()
 
 
 #: Why a task was cancelled, as written into the ``task_exec`` end event and the
@@ -1449,7 +1511,9 @@ class TaskQueue:
         self._reconcile_stop_on_boot()
 
     def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self._db_path, timeout=10, check_same_thread=False)
+        conn = sqlite3.connect(self._db_path, timeout=10, check_same_thread=False,
+                               factory=(_TimedConnection if request_sqlite_timing.get() is not None
+                                        else sqlite3.Connection))
         conn.row_factory = sqlite3.Row
         return conn
 
