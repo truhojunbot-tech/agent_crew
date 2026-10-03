@@ -98,6 +98,16 @@ def _read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
+def _wait_for_dispatch(predicate, *, timeout=10):
+    """Wait for a durable dispatch effect, not an assumed number of ticks."""
+    deadline = time.monotonic() + timeout
+    while not predicate():
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.02)
+    return True
+
+
 # ---------------------------------------------------------------------------
 # DB-level: TaskQueue.get_or_create_context
 # ---------------------------------------------------------------------------
@@ -298,7 +308,13 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, u
                         "review-1", task_type="review", context={"agent_override": "gemini"},
                     ))
                     assert resp.status_code == 201
-                    time.sleep(0.5)
+                    events_path = str(tmp_path / "context_events.jsonl")
+                    observed = _wait_for_dispatch(lambda: (
+                        _attribution_row(tmp_db, "review-1") is not None
+                        and any(event.get("event_type") == "provider_fallback"
+                                and event.get("task_id") == "review-1"
+                                for event in _read_jsonl(events_path))))
+                    assert observed, "review dispatch did not persist attribution and fallback event"
 
     row = _attribution_row(tmp_db, "review-1")
     assert row["agent"] == "gemini"
@@ -335,7 +351,10 @@ def test_u_i202_provider_fallback_event_and_retry_lineage(tmp_db, tmp_path, *, u
                     watchdog_disabled=True, anomaly_disabled=True,
                 )
                 with TestClient(app2):
-                    time.sleep(0.6)
+                    observed = _wait_for_dispatch(lambda: (
+                        _attribution_row(tmp_db, "retry-review-1-ab12") is not None
+                        and _attribution_row(tmp_db, "fallback-review-1-cd34") is not None))
+                    assert observed, "retry and fallback dispatches did not persist attribution"
 
     retry_row = _attribution_row(tmp_db, "retry-review-1-ab12")
     fallback_row = _attribution_row(tmp_db, "fallback-review-1-cd34")

@@ -103,8 +103,13 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path, unused_
                         resp = client.post("/tasks", json=_discuss_payload(f"t_{agent}", agent))
                         assert resp.status_code == 201
 
-                    # Let dispatcher loop run a few cycles
-                    time.sleep(0.4)
+                    # Worktree preparation runs in a worker thread, so a fixed
+                    # tick count does not guarantee all three agents spawned.
+                    deadline = time.monotonic() + 10
+                    while set(dispatched_agents) != {"claude", "codex", "gemini"}:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.02)
 
     # Verify all 3 agents were dispatched
     assert "claude" in dispatched_agents, f"claude discuss task not dispatched; got {dispatched_agents}"
