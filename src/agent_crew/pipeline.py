@@ -110,6 +110,11 @@ def verify_implement_artifact(
     rebase_target = str(context.get("rebase_onto") or "").strip()
     named_no_ref = not (result.commit or result.branch or result.pr_number)
     branch = (result.branch or task.branch or "").strip()
+    base_branch = str(context.get("base_branch") or os.getenv("AGENT_CREW_MAIN_BRANCH") or "main").strip()
+    unnamed_base_branch = (named_no_ref and not context.get("crew_run_branch")
+                           and branch == base_branch)
+    unnamed_base_detail = (f"{MISSING_IMPLEMENT_REF_DETAIL}; task branch "
+                           f"{branch!r} is the dispatch base branch")
     commit = (result.commit or "").strip()
     if not repo_cwd:
         return False, "artifact repository unavailable"
@@ -148,6 +153,8 @@ def verify_implement_artifact(
         derived_commit = False
         if not commit:
             if fetch.returncode != 0:
+                if unnamed_base_branch:
+                    return False, unnamed_base_detail
                 return False, "origin branch unavailable for commit derivation"
             origin_head = subprocess.run(
                 ["git", "-C", repo_cwd, "rev-parse", "--verify",
@@ -156,7 +163,16 @@ def verify_implement_artifact(
             )
             commit = origin_head.stdout.strip()
             if origin_head.returncode != 0 or not commit:
+                if unnamed_base_branch:
+                    return False, unnamed_base_detail
                 return False, "origin branch head is not resolvable for commit derivation"
+            if unnamed_base_branch:
+                # origin/main may have moved because someone else's PR merged.
+                # Its head proves no artifact for a result that named no ref.
+                if commit == base:
+                    return False, (f"{MISSING_IMPLEMENT_REF_DETAIL}; task branch "
+                                   f"{branch!r} is still at the dispatch base")
+                return False, unnamed_base_detail
             # Persist the independently-derived full SHA so the accepted
             # handoff remains auditable through the normal result path.
             result.commit = commit

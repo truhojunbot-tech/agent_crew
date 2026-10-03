@@ -13,6 +13,7 @@ from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED, admitted
 
 BASE = "a" * 40
 NEW = "b" * 40
+ADVANCED = "c" * 40
 DETAIL = "result named no commit, branch or pr_number; task branch 'main' is still at the dispatch base"
 
 
@@ -32,6 +33,72 @@ def test_missing_refs_have_distinct_detail(monkeypatch):
     ok, detail = verify_implement_artifact(
         task, TaskResult("impl-missing", "completed", "done"), repo_cwd="/repo")
     assert (ok, detail) == (False, DETAIL)
+
+
+def test_advanced_base_branch_without_reported_refs_is_held(monkeypatch):
+    from agent_crew.pipeline import verify_implement_artifact
+
+    calls = []
+
+    def advanced_main(argv, **kwargs):
+        calls.append(argv)
+        if argv[3] == "rev-parse":
+            return MagicMock(returncode=0, stdout=ADVANCED + "\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", advanced_main)
+    task = TaskRequest("impl-advanced", "implement", "change", branch="main",
+                       context={"worktree_base_sha": BASE, "base_branch": "main",
+                                "crew_run_branch": False})
+    result = TaskResult("impl-advanced", "completed", "work on another PR")
+    ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
+
+    assert ok is False
+    assert detail.startswith("result named no commit, branch or pr_number")
+    assert "main" in detail
+    assert result.commit == "", "the unrelated origin/main head must not become artifact evidence"
+    assert not any(call[3] == "merge-base" for call in calls)
+
+
+def test_unavailable_base_branch_without_reported_refs_still_asks_for_refs(monkeypatch):
+    from agent_crew.pipeline import verify_implement_artifact
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run",
+                        lambda *_a, **_k: MagicMock(returncode=1, stdout="", stderr="offline"))
+    task = TaskRequest("impl-offline", "implement", "change", branch="main",
+                       context={"worktree_base_sha": BASE, "base_branch": "main"})
+    ok, detail = verify_implement_artifact(
+        task, TaskResult("impl-offline", "completed", "done"), repo_cwd="/repo")
+    assert ok is False
+    assert detail.startswith("result named no commit, branch or pr_number")
+
+
+@pytest.mark.parametrize("context", [
+    {"worktree_base_sha": BASE, "base_branch": "main", "crew_run_branch": True},
+    {"worktree_base_sha": BASE, "base_branch": "main", "crew_run_branch": False},
+])
+def test_non_base_task_branch_can_still_derive_origin_head(monkeypatch, context):
+    from agent_crew.pipeline import verify_implement_artifact
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", _git)
+    task = TaskRequest("impl-feature", "implement", "change", branch="feature",
+                       context=context)
+    result = TaskResult("impl-feature", "completed", "done")
+    ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
+    assert ok is True, detail
+    assert result.commit == NEW
+
+
+def test_explicit_pr_branch_and_commit_still_pass(monkeypatch):
+    from agent_crew.pipeline import verify_implement_artifact
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", _git)
+    task = TaskRequest("impl-reported", "implement", "change", branch="main",
+                       context={"worktree_base_sha": BASE, "base_branch": "main"})
+    result = TaskResult("impl-reported", "completed", "done",
+                        branch="feature", commit=NEW, pr_number=5810)
+    ok, detail = verify_implement_artifact(task, result, repo_cwd="/repo")
+    assert ok is True, detail
 
 
 def test_explicit_base_commit_keeps_existing_detail(monkeypatch):
@@ -64,11 +131,17 @@ def hermetic_cea(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["shadow", "enforce"])
+@pytest.mark.parametrize("advanced_base", [False, True])
 def test_held_missing_ref_can_be_corrected_by_same_worker(
-        tmp_path, monkeypatch, hermetic_cea, mode):
+        tmp_path, monkeypatch, hermetic_cea, mode, advanced_base):
     from agent_crew.server import create_app
 
-    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", _git)
+    def git_head(argv, **kwargs):
+        if advanced_base and argv[3] == "rev-parse" and argv[-1] == "origin/main^{commit}":
+            return MagicMock(returncode=0, stdout=ADVANCED + "\n", stderr="")
+        return _git(argv, **kwargs)
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", git_head)
     monkeypatch.setattr("agent_crew.pipeline.pr_is_actionable",
                         lambda *_a, **_k: (True, "open"))
     worktree = tmp_path / "worktree"
@@ -76,7 +149,9 @@ def test_held_missing_ref_can_be_corrected_by_same_worker(
     db = str(tmp_path / "tasks.db")
     queue = TaskQueue(db)
     queue.enqueue(TaskRequest("impl-missing", "implement", "change", branch="main",
-                              project="demo", context=admitted({"worktree_base_sha": BASE})))
+                              project="demo", context=admitted({
+                                  "worktree_base_sha": BASE, "base_branch": "main",
+                                  "crew_run_branch": False})))
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", mode)
     app = create_app(db, pane_map={"reviewer": "%crew-test-reviewer"},
                      worktree_map={"implementer": str(worktree)},
@@ -93,9 +168,12 @@ def test_held_missing_ref_can_be_corrected_by_same_worker(
                 "executor_binding": {"nonce": nonce, "presenter": "claude"}}
         held = client.post("/tasks/impl-missing/result", json=body)
         assert held.status_code == 200, held.text
+        held_detail = (DETAIL if not advanced_base else
+                       "result named no commit, branch or pr_number; "
+                       "task branch 'main' is the dispatch base branch")
         assert held.json() == {
             "status": "ok", "task_id": "impl-missing", "held": "no_artifact",
-            "reason": "no_artifact", "detail": DETAIL,
+            "reason": "no_artifact", "detail": held_detail,
             "missing": ["branch", "commit", "pr_number"],
             "resend": "POST the result again with branch, full commit SHA and pr_number",
         }
@@ -116,6 +194,7 @@ def test_held_missing_ref_can_be_corrected_by_same_worker(
     if mode == "shadow":
         assert len(reviews) == 1
         assert reviews[0].branch == "feature"
+        assert reviews[0].context["reviewed_sha"] == NEW
     else:
         # This fixture's CEA snapshot cannot admit a new review intent; the
         # corrected implement result itself must still be accepted in enforce.

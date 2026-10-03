@@ -314,7 +314,28 @@ def test_the_mcp_transport_applies_the_same_commit_guard(tmp_db, monkeypatch):
     assert reviews[0].context.get("reviewed_sha") != "HEAD"
 
 
-def test_an_mcp_submission_reporting_nothing_routes_as_before(tmp_db):
-    """⛔The compatibility control, same as the HTTP path's."""
-    _, reviews = _mcp_submit(tmp_db)
-    assert reviews[0].branch == "main"
+def test_an_mcp_submission_reporting_nothing_is_held_for_missing_refs(tmp_db, monkeypatch):
+    """#548 / impl-21d42d92: an empty MCP result must not claim origin/main.
+
+    The old review-on-main expectation depended on this host's origin/main
+    advancing past the task base and accepted someone else's commit as proof.
+    """
+    from subprocess import CompletedProcess
+
+    from agent_crew.queue import TaskQueue
+
+    # Model an independently advanced main, regardless of this host's refs.
+    def advanced_main(argv, **_kwargs):
+        return CompletedProcess(argv, 0, stdout="a" * 40 + "\n", stderr="")
+
+    monkeypatch.setattr("agent_crew.pipeline.subprocess.run", advanced_main)
+
+    ack, reviews = _mcp_submit(tmp_db)
+    assert ack["held"] == "no_artifact"
+    assert ack["reason"] == "no_artifact"
+    assert "result named no commit, branch or pr_number" in ack["detail"]
+    assert "task branch 'main' is the dispatch base branch" in ack["detail"]
+    assert reviews == []
+    task = next(t for t in TaskQueue(tmp_db).list_tasks() if t.task_id == "impl-watch-mcp")
+    assert task.status == "failed"
+    assert task.error_info["reason"] == "no_artifact"
