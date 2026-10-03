@@ -2273,6 +2273,8 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.option("--max-iter", default=0, type=int, help="Max review iterations (0 = default)")
 @click.option("--no-tester", is_flag=True, help="Skip test phase after approval")
 @click.option("--branch", default="main", show_default=True)
+@click.option("--risk-tier", type=click.IntRange(0, 3), default=None,
+              help="Explicit risk tier 0-3 (default: AGENT_CREW_DEFAULT_RISK_TIER if set)")
 @click.option("--timeout", default=600, type=int, show_default=True, help="Task wait timeout in seconds")
 @click.option("--create-issue", is_flag=True, help="Create GitHub issue for task")
 @click.option("--create-pr", is_flag=True, help="Create GitHub PR after implementation")
@@ -2281,12 +2283,22 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
 @click.option("--reviewer", default="", help="Agent for review (claude/codex/gemini)")
 @click.option("--auto-merge", is_flag=True, help="Auto-merge PR via gh when loop completes successfully")
 def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: str,
-            max_iter: int, no_tester: bool, branch: str, timeout: int,
+            max_iter: int, no_tester: bool, branch: str, risk_tier: int | None,
+            timeout: int,
             create_issue: bool, create_pr: bool, repo: str,
             implementer: str, reviewer: str, auto_merge: bool):
     """Run TASK through the code-review loop."""
     if not task.strip():
         raise click.UsageError("task must not be empty")
+
+    if risk_tier is None and "AGENT_CREW_DEFAULT_RISK_TIER" in os.environ:
+        raw_tier = os.environ["AGENT_CREW_DEFAULT_RISK_TIER"].strip()
+        if raw_tier not in {"0", "1", "2", "3"}:
+            raise click.UsageError(
+                "AGENT_CREW_DEFAULT_RISK_TIER must be an integer from 0 to 3"
+            )
+        risk_tier = int(raw_tier)
+    risk_context = {"risk_tier": risk_tier} if risk_tier is not None else {}
 
     if not db:
         project = _select_project(base, project, allow_cross_project)
@@ -2727,7 +2739,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
     run_branch_context = {"base_branch": declared_base,
                           "crew_run_branch": branch != declared_base}
-    impl_context = {**_CM, **run_branch_context, "sync_landed_bases": _sync_landed_bases}
+    impl_context = {**_CM, **run_branch_context, **risk_context,
+                    "sync_landed_bases": _sync_landed_bases}
     if implementer:
         impl_context["agent_override"] = implementer
     if no_tester:
@@ -2882,7 +2895,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
                     retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                               context={**_CM, **run_branch_context, "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
+                                               context={**_CM, **run_branch_context, **risk_context,
+                                                        "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
                 if _run_port:
@@ -2908,7 +2922,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             # no persisted lineage to adopt. The production TaskQueue does.
             feedback = build_feedback(review_result)
             retry_bases = _sync_worktrees_to_main(_run_worktrees, base_branch=impl_branch or branch) if _run_worktrees else {}
-            retry_context = {**_CM, **run_branch_context, "feedback": feedback,
+            retry_context = {**_CM, **run_branch_context, **risk_context,
+                             "feedback": feedback,
                              "sync_landed_bases": retry_bases}
             if implementer:
                 retry_context["agent_override"] = implementer
