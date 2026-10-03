@@ -4808,7 +4808,8 @@ def create_app(
         #   about to not happen. Refusing early leaves no row to correct.
         if not _WORKTREE_SYNC_DISABLED:
             try:
-                _reviewed_sha = _prepare_worktree_for_task(
+                _reviewed_sha = await asyncio.to_thread(
+                    _prepare_worktree_for_task,
                     wt, task.task_id, task.branch or "", role,
                     task_context=task.context if isinstance(task.context, dict) else {},
                     task_type=task.task_type,
@@ -4867,14 +4868,14 @@ def create_app(
         # Record durable attribution before dispatch so quota systems can map
         # token usage back to the project even after worktrees are torn down (#174).
         try:
-            _repo_url = subprocess.run(
+            _repo_url = (await asyncio.to_thread(subprocess.run,
                 ["git", "-C", wt, "remote", "get-url", "origin"],
                 capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
-            _git_branch = subprocess.run(
+            )).stdout.strip()
+            _git_branch = (await asyncio.to_thread(subprocess.run,
                 ["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"],
                 capture_output=True, text=True, timeout=5,
-            ).stdout.strip()
+            )).stdout.strip()
             if _git_branch == "HEAD":
                 # #280: a detached worktree reports the literal string "HEAD",
                 # which is not a branch and joins to nothing downstream. Record
@@ -5624,7 +5625,7 @@ def create_app(
             _reset_safe = False
             try:
                 if wt and q().get_task_status(task.task_id) != "completed":
-                    _wip = _stash_dirty_worktree(wt, task.task_id)
+                    _wip = await asyncio.to_thread(_stash_dirty_worktree, wt, task.task_id)
                     if _wip is None:
                         logger.error("dispatcher: stash failed for %s task=%s in %s; "
                                      "manual recovery required; refusing reset", role,
@@ -5642,11 +5643,11 @@ def create_app(
                 logger.exception(f"dispatcher: wip stash failed for {role} task={task.task_id}")
             if _reset_safe:
                 try:
-                    subprocess.run(
+                    await asyncio.to_thread(subprocess.run,
                         ["git", "-C", wt, "checkout", "."],
                         capture_output=True,
                     )
-                    subprocess.run(
+                    await asyncio.to_thread(subprocess.run,
                         [
                             "git", "-C", wt, "clean", "-fd",
                             "-e", ".claude/CLAUDE.md",
