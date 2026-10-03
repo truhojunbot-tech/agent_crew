@@ -49,6 +49,7 @@ from agent_crew.pipeline import (
     auto_enqueue_fix as _pipeline_auto_enqueue_fix,
     auto_enqueue_review as _pipeline_auto_enqueue_review,
     auto_enqueue_test as _pipeline_auto_enqueue_test,
+    reresolve_pending_rounds_caps as _pipeline_reresolve_pending_rounds_caps,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     successor_context as _successor_context,
     hold_mismatched_pr_result,
@@ -5744,6 +5745,12 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    # Shadow-only receipt refresh; a slow contract read must not
+                    # delay dispatch or HTTP responses.
+                    try:
+                        await asyncio.to_thread(_pipeline_reresolve_pending_rounds_caps, q())
+                    except Exception:
+                        logger.exception("rounds-cap shadow re-resolution failed — continuing dispatch")
                     logger.debug(
                         f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} "
                         f"active_workers={sorted(active_workers)} "

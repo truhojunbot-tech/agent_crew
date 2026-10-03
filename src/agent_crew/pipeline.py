@@ -75,6 +75,7 @@ def successor_context(parent_context: object) -> dict:
 #: and says so on the PR, because the next move is a human's.
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
 CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
+ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS = 60
 #: Bounds on how much review text is copied into the fix task description.
 MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
@@ -1149,6 +1150,66 @@ def _lineage_tasks(tasks_by_id: dict, task):
         task = tasks_by_id[previous]
 
 
+def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = None) -> int:
+    """Settle switch-off shadows against the first post-verdict contract.
+
+    This only updates receipts. It never replays a cascade or changes a live cap.
+    """
+    now = datetime.now(timezone.utc).timestamp() if now is None else now
+    settled = 0
+    for row in queue.pending_rounds_cap_reresolutions():
+        raw = row["canary_counterfactual"]
+        try:
+            counterfactual = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(counterfactual, dict):
+            continue
+        verdict_at = counterfactual.get("verdict_at")
+        review_id = counterfactual.get("review_task_id")
+        if not isinstance(verdict_at, (int, float)) or not isinstance(review_id, str):
+            continue
+        expired = now > verdict_at + ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS
+        citation = None
+        reason = counterfactual.get("stale_reason", "contract_predates_latest_result")
+        cap = counterfactual["baseline_cap"]
+        if not expired:
+            tasks_by_id = {}
+            current = queue.get_task(review_id)
+            while current and current.task_id not in tasks_by_id:
+                tasks_by_id[current.task_id] = current
+                previous = (current.context or {}).get("prev_task_id")
+                current = queue.get_task(previous) if isinstance(previous, str) else None
+            review = tasks_by_id.get(review_id)
+            if review:
+                cap, citation, reason = _canary_round_cap(
+                    tasks_by_id, review, counterfactual["baseline_cap"], queue,
+                    counterfactual.get("server_project"))
+        produced = _contract_time((citation or {}).get("produced_at"))
+        fresh = (not expired and produced is not None
+                 and verdict_at < produced.timestamp() <= verdict_at + ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS
+                 and (citation or {}).get("decision_source") == "quota_core_contract"
+                 and reason not in ("contract_predates_latest_result", "contract_predates_latest_fix",
+                                    "contract_missing_or_stale"))
+        if not fresh and not expired:
+            continue
+        counterfactual.update({
+            "pending_reresolve": False,
+            "counterfactual_cap": cap if fresh else counterfactual["baseline_cap"],
+            "would_fire": bool(fresh and cap < counterfactual["baseline_cap"]
+                               and counterfactual["round"] > cap
+                               and counterfactual["round"] <= counterfactual["baseline_cap"]),
+        })
+        if queue.resolve_pending_rounds_cap(
+            row["task_id"], expected_counterfactual=raw,
+            decision_source=(citation or {}).get("decision_source", "baseline") if fresh else "baseline",
+            recommendation=(citation or {}) if fresh else {}, counterfactual=counterfactual,
+            reason="switch_off:fresh_reresolved" if fresh else f"switch_off:{counterfactual['stale_reason']}",
+        ):
+            settled += 1
+    return settled
+
+
 def fix_task_id(review_task_id: str, fix_round: int) -> str:
     """The task id a given review round's fix MUST have.
 
@@ -1355,6 +1416,14 @@ def auto_enqueue_fix(
                 "not re-evaluating review %s",
                 lineage_root_id, held["canary_cea_receipt_id"], review_task_id)
             return None
+        try:
+            prior_counterfactual = json.loads((held or {}).get("canary_counterfactual") or "null")
+        except (TypeError, ValueError):
+            prior_counterfactual = None
+        same_review_observation = (
+            isinstance(prior_counterfactual, dict)
+            and "pending_reresolve" in prior_counterfactual
+            and prior_counterfactual.get("review_task_id") == review_task_id)
         counterfactual_cap, canary_citation, canary_reason = _canary_round_cap(
             tasks_by_id, review_task, baseline_cap, queue, server_project)
         switch_enabled = _tokenomics_canary.rounds_cap_enabled()
@@ -1376,18 +1445,32 @@ def auto_enqueue_fix(
         fix_round = int(review_ctx.get("fix_round") or 0) + 1
         would_fire = (canary_pinned and counterfactual_cap < baseline_cap
                       and fix_round > counterfactual_cap and fix_round <= baseline_cap)
-        if canary_pinned and not switch_enabled:
+        if canary_pinned and not switch_enabled and not same_review_observation:
             try:
+                pending = canary_reason in (
+                    "contract_predates_latest_result", "contract_predates_latest_fix")
+                verdict_state = queue.get_exec_state(review_task_id) if pending else None
+                verdict_at = (verdict_state or {}).get("result_posted_at")
+                pending = pending and isinstance(verdict_at, (int, float))
+                shadow_counterfactual = {
+                    "baseline_cap": baseline_cap,
+                    "counterfactual_cap": counterfactual_cap,
+                    "round": fix_round, "would_fire": would_fire,
+                }
+                if pending:
+                    shadow_counterfactual.update({
+                        "pending_reresolve": True, "verdict_at": verdict_at,
+                        "review_task_id": review_task_id,
+                        "stale_reason": canary_reason,
+                        "server_project": server_project,
+                    })
                 queue.record_tokenomics_canary_receipt(
                     lineage_root_id,
                     decision_source=(canary_citation or {}).get("decision_source") or "baseline",
                     recommendation=canary_citation or {}, applied=False,
-                    counterfactual=json.dumps({
-                        "baseline_cap": baseline_cap,
-                        "counterfactual_cap": counterfactual_cap,
-                        "round": fix_round, "would_fire": would_fire,
-                    }),
-                    reason=f"switch_off:{canary_reason}", preserve_applied=True)
+                    counterfactual=json.dumps(shadow_counterfactual),
+                    reason="switch_off:pending_reresolve" if pending
+                    else f"switch_off:{canary_reason}", preserve_applied=True)
             except Exception:
                 logger.exception("auto_enqueue_fix: switch-off shadow receipt failed for %s", lineage_root_id)
         canary_fired = (switch_enabled and canary_pinned and max_rounds < baseline_cap

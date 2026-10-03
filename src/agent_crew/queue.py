@@ -6502,6 +6502,43 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def pending_rounds_cap_reresolutions(self) -> list[dict]:
+        """Return only switch-off observations awaiting a fresh contract."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, canary_counterfactual FROM tokenomics_shadow_receipts "
+                "WHERE canary_reason='switch_off:pending_reresolve' AND canary_applied=0"
+            ).fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
+    def resolve_pending_rounds_cap(
+        self, task_id: str, *, expected_counterfactual: str,
+        decision_source: str, recommendation: dict, counterfactual: dict,
+        reason: str,
+    ) -> bool:
+        """Settle a pending shadow receipt once, without touching an applied cap."""
+        conn = self._connect()
+        try:
+            now = time.time()
+            changed = conn.execute(
+                """UPDATE tokenomics_shadow_receipts
+                   SET canary_decision_source=?, canary_recommendation_json=?,
+                       canary_counterfactual=?, canary_reason=?,
+                       canary_resolved_at=?, updated_at=?
+                   WHERE task_id=? AND canary_applied=0
+                     AND canary_reason='switch_off:pending_reresolve'
+                     AND canary_counterfactual=?""",
+                (decision_source, json.dumps(recommendation), json.dumps(counterfactual),
+                 reason, now, now, task_id, expected_counterfactual),
+            ).rowcount
+            conn.commit()
+            return changed == 1
+        finally:
+            conn.close()
+
     def hold_tokenomics_canary_fix(
         self, review_task: TaskRequest, *, receipt_task_id: str, fix_round: int,
         recommendation: dict, counterfactual: dict,
