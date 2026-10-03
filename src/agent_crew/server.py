@@ -52,6 +52,7 @@ from agent_crew.pipeline import (
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     successor_context as _successor_context,
     hold_mismatched_pr_result,
+    MISSING_IMPLEMENT_REF_DETAIL,
     artifact_gate_applies,
     declared_artifact_kind,
     no_artifact_result,
@@ -6772,6 +6773,16 @@ def create_app(
         try:
             task_type = q().submit_result(task_id, result, nonce=_nonce,
                                           presenter=_presenter,
+                                          # This one held result is an invitation
+                                          # to correct the same execution's refs.
+                                          # Keep its RUNNING receipt so P2 can
+                                          # validate the same spent start nonce
+                                          # on the corrected POST. Other terminal
+                                          # results still consume their receipt.
+                                          consume_receipt=not (
+                                              _artifact_held is not None and
+                                              _artifact_held.startswith(MISSING_IMPLEMENT_REF_DETAIL)
+                                          ),
                                           allow_review_replay=_REPLAYING.get(),
                                           validate_review=not _REPLAYING.get(),
                                           adopted_fallback_task_id=_adopted_fallback_id)
@@ -6936,8 +6947,12 @@ def create_app(
                     "pause_generation": _pepoch, "cascade_suppressed": True}
         if _artifact_held is not None:
             logger.warning("POST /tasks/%s/result: no artifact — %s", task_id, _artifact_held)
-            return {"status": "ok", "task_id": task_id, "held": "no_artifact",
+            held = {"status": "ok", "task_id": task_id, "held": "no_artifact",
                     "reason": "no_artifact", "detail": _artifact_held}
+            if _artifact_held.startswith(MISSING_IMPLEMENT_REF_DETAIL):
+                held.update(missing=["branch", "commit", "pr_number"],
+                            resend="POST the result again with branch, full commit SHA and pr_number")
+            return held
         if task_type == "test" and isinstance(ctx, dict) and ctx.get("post_recovery_verification"):
             outcome = "PASS" if result.status == "completed" else "FAIL"
             q().patch_context(task_id, {"post_recovery_verification_result": outcome})

@@ -90,6 +90,7 @@ FIX_EXHAUSTED_KIND = "fix_exhausted"
 #: one its task was dispatched for (#268). Grep-able on purpose: it is the only
 #: trace a human has that the reviewer answered a different question.
 PR_MISMATCH_MARKER = "[agent_crew] PR MISMATCH"
+MISSING_IMPLEMENT_REF_DETAIL = "result named no commit, branch or pr_number"
 
 
 def verify_implement_artifact(
@@ -107,6 +108,7 @@ def verify_implement_artifact(
     base = str(context.get("worktree_base_sha") or context.get("reviewed_sha") or "").strip()
     has_rebase_target = "rebase_onto" in context
     rebase_target = str(context.get("rebase_onto") or "").strip()
+    named_no_ref = not (result.commit or result.branch or result.pr_number)
     branch = (result.branch or task.branch or "").strip()
     commit = (result.commit or "").strip()
     if not repo_cwd:
@@ -163,6 +165,9 @@ def verify_implement_artifact(
         if commit == ancestor:
             if has_rebase_target:
                 return False, "reported commit is the rebase_onto target (no new artifact)"
+            if named_no_ref and derived_commit and commit == base:
+                return False, (f"{MISSING_IMPLEMENT_REF_DETAIL}; task branch "
+                               f"{branch!r} is still at the dispatch base")
             return False, "reported commit is the dispatch base (no new artifact)"
         local_commit = subprocess.run(
             ["git", "-C", repo_cwd, "rev-parse", "--verify", f"{commit}^{{commit}}"],
