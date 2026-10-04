@@ -1,4 +1,6 @@
 import json
+import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -108,36 +110,60 @@ def next_review_action(outcome: str, attempts: int,
     return "retry" if attempts < max_attempts else "give_up"
 
 
+def _existing_successor_id(queue, task_type: str, prev_task_id: str,
+                           context: dict | None = None) -> str | None:
+    """Find the server's successor using the same lineage match as the CLI."""
+    if task_type == "test" and not prev_task_id:
+        return None
+    try:
+        for task in queue.list_tasks():
+            if task.task_type != task_type:
+                continue
+            task_ctx = task.context if isinstance(task.context, dict) else {}
+            if task_ctx.get("prev_task_id") != prev_task_id:
+                continue
+            if task_type == "review":
+                # A failed review cannot satisfy a retry (#302).
+                try:
+                    if queue.get_task_status(task.task_id) in _DEAD_REVIEW_STATUSES:
+                        continue
+                except Exception:
+                    pass
+                if context:
+                    try:
+                        queue.patch_context(task.task_id, context)
+                    except Exception:
+                        pass
+            return task.task_id
+    except Exception:
+        pass  # The HTTP path may still create or reveal the successor.
+    return None
+
+
+def _successor_after_conflict(queue, task_type: str, prev_task_id: str,
+                              context: dict | None = None) -> str | None:
+    """Give a competing server cascade about five seconds to become visible."""
+    deadline = time.monotonic() + 5
+    for attempt in range(6):
+        existing = _existing_successor_id(queue, task_type, prev_task_id, context)
+        if existing:
+            return existing
+        if attempt == 5:
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1, remaining))
+    return None
+
+
 def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, context: dict = {},
                    port: int = 0, project: str = "") -> str:
     # Check if a review task already exists for this impl task (auto-transition case).
     # This makes enqueue_review idempotent when the server has auto-created a review.
-    try:
-        all_tasks = queue.list_tasks()
-        for task in all_tasks:
-            if task.task_type == "review":
-                task_ctx = task.context if isinstance(task.context, dict) else {}
-                if task_ctx.get("prev_task_id") == prev_task_id:
-                    # ⛔A review that already FAILED is not a review in flight,
-                    #   and reusing it hands the retry the same dead task id
-                    #   forever — so #302's retry would be a silent no-op. This
-                    #   idempotence exists so the server's auto-created review
-                    #   is not duplicated; that argument covers a pending, live
-                    #   or completed review, not one that died.
-                    try:
-                        if queue.get_task_status(task.task_id) in _DEAD_REVIEW_STATUSES:
-                            continue
-                    except Exception:
-                        pass
-                    # Merge caller context (e.g. no_tester) onto the existing task.
-                    if context:
-                        try:
-                            queue.patch_context(task.task_id, context)
-                        except Exception:
-                            pass
-                    return task.task_id
-    except Exception:
-        pass  # If we can't query, just create a new one
+    existing = _existing_successor_id(queue, "review", prev_task_id, context)
+    if existing:
+        return existing
 
     req = TaskRequest(
         task_id=f"review-{uuid.uuid4().hex[:8]}",
@@ -148,7 +174,14 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
         project=_adapter_project(queue, project),
     )
     if port:
-        return _post_task_http(port, req)
+        try:
+            return _post_task_http(port, req)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                existing = _successor_after_conflict(queue, "review", prev_task_id, context)
+                if existing:
+                    return existing
+            raise
     return queue.enqueue(req, ingress="loop.review")
 
 
@@ -156,15 +189,9 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
                  port: int = 0, project: str = "") -> str:
     # Check if a test task already exists for this review task (auto-transition case).
     # This makes enqueue_test idempotent when the server has auto-created a test.
-    if prev_task_id:
-        try:
-            for task in queue.list_tasks():
-                if task.task_type == "test":
-                    task_ctx = task.context if isinstance(task.context, dict) else {}
-                    if task_ctx.get("prev_task_id") == prev_task_id:
-                        return task.task_id
-        except Exception:
-            pass  # If we can't query, just create a new one
+    existing = _existing_successor_id(queue, "test", prev_task_id)
+    if existing:
+        return existing
 
     merged_context = {"prev_task_id": prev_task_id, **context} if prev_task_id else context
     req = TaskRequest(
@@ -176,7 +203,14 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
         project=_adapter_project(queue, project),
     )
     if port:
-        return _post_task_http(port, req)
+        try:
+            return _post_task_http(port, req)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 409:
+                existing = _successor_after_conflict(queue, "test", prev_task_id)
+                if existing:
+                    return existing
+            raise
     return queue.enqueue(req, ingress="loop.test")
 
 
