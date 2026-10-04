@@ -21,6 +21,12 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import _stash_dirty_worktree
 
 
+@pytest.fixture(autouse=True)
+def _declared_base_branch(monkeypatch):
+    """These #482 tests exercise WIP preservation without a remote."""
+    monkeypatch.setenv("AGENT_CREW_MAIN_BRANCH", "main")
+
+
 def _git(wt, *args) -> str:
     return subprocess.run(["git", "-C", str(wt), *args], check=True,
                           capture_output=True, text=True).stdout

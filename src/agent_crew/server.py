@@ -242,7 +242,7 @@ def _reset_pane_busy_cache() -> None:
 _WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").lower() in (
     "1", "true", "yes",
 )
-_WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
+_WORKTREE_DEFAULT_BRANCHES: dict[str, str] = {}
 
 
 def _ensure_role_protocol(
@@ -480,6 +480,53 @@ class WorktreeTargetUnresolved(WorktreePrepRefused):
     """
 
     reason = "pr_head_unresolved"
+
+    def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        if reason is not None:
+            self.reason = reason
+
+
+def _remote_default_branch(worktree_path: str) -> str:
+    """Resolve and cache this worktree's origin default branch (#555)."""
+    key = os.path.realpath(worktree_path)
+    cached = _WORKTREE_DEFAULT_BRANCHES.get(key)
+    if cached:
+        return cached
+
+    head = subprocess.run(
+        ["git", "-C", worktree_path, "symbolic-ref", "--quiet",
+         "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True, timeout=30,
+    )
+    prefix = "refs/remotes/origin/"
+    target = head.stdout.strip()
+    if head.returncode == 0 and target.startswith(prefix):
+        branch = target[len(prefix):]
+        if branch and branch != "HEAD" and _branch_ref(worktree_path, target):
+            _WORKTREE_DEFAULT_BRANCHES[key] = branch
+            return branch
+
+    for branch in ("main", "master"):
+        if _branch_ref(worktree_path, f"{prefix}{branch}"):
+            _WORKTREE_DEFAULT_BRANCHES[key] = branch
+            return branch
+
+    # Best-effort prep has always tolerated paths that are not Git worktrees.
+    # A real worktree with no resolvable origin base must still refuse (#555).
+    is_worktree = subprocess.run(
+        ["git", "-C", worktree_path, "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if is_worktree.returncode != 0 or is_worktree.stdout.strip() != "true":
+        return "main"
+
+    raise WorktreeTargetUnresolved(
+        f"worktree {worktree_path}: no resolvable remote default branch; "
+        "origin/HEAD is not a resolvable symbolic ref, and neither "
+        "origin/main nor origin/master resolves (#555)",
+        reason="worktree_base_unresolved",
+    )
 
 
 def _unborn_head_ref(worktree_path: str) -> str:
@@ -764,19 +811,25 @@ def _prepare_worktree_for_task_inner(
     """Inner (may raise). Wrapped by _prepare_worktree_for_task."""
     if task_context is None:
         task_context = {}
-    # `main` is only a default.  A project can run on a long-lived integration
-    # branch; dispatching its worker from origin/main silently makes it edit a
-    # stale, different tree (#353).  The explicit context is produced by the
-    # CLI and survives queue/restart. Without one, use the configured default;
-    # task.branch names the output branch for implementers.
-    main_branch = str(task_context.get("base_branch") or _WORKTREE_MAIN_BRANCH).strip()
-    # #296: is this worktree even usable? Asked BEFORE any other git call,
+    # Keep the historical provisional base through HEAD recovery and fetch.
+    # Discover the remote default only if the selected path actually needs a
+    # base; review PR-head and pinned paths must keep their own error order.
+    main_branch = str(task_context.get("base_branch") or "").strip()
+    if not main_branch:
+        main_branch = os.getenv("AGENT_CREW_MAIN_BRANCH", "").strip()
+    discover_default = not main_branch
+    main_branch = main_branch or "main"
+    # #296: is this worktree even usable? Asked before any mutating git call,
     # because an interrupted ref update can leave HEAD pointing at a branch that
     # was never created, and `stash`/`fetch`/`checkout` all behave differently
     # against an unborn HEAD. Reported live: three role worktrees in that state
     # with 4,000+ files staged each, and nothing detected it.
     _unborn = _unborn_head_ref(worktree_path)
     if _unborn:
+        # Healing creates the missing branch ref, so its starting commit must
+        # use the resolved base even when a later checkout needs no base.
+        if discover_default:
+            main_branch = _remote_default_branch(worktree_path)
         _what = f"_prepare_worktree_for_task: {role} {task_id}"
         if not _heal_unborn_head(worktree_path, main_branch, _unborn, what=_what):
             raise WorktreeUnhealthy(
@@ -830,6 +883,18 @@ def _prepare_worktree_for_task_inner(
         # Once prepared, the recorded SHA pins a second preparation of the same
         # task even if origin/main advances between push and dispatch.
         pinned_base = _object_id_or_empty(task_context.get("worktree_base_sha"))
+        branch_start = ""
+        if task_context.get("crew_run_branch"):
+            # The caller's existing branch supplies its own content. Only a
+            # new branch needs the default base (#555).
+            local = _branch_ref(worktree_path, f"refs/heads/{branch}")
+            remote = _branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
+            if local and remote and not _is_ancestor(worktree_path, local, remote):
+                branch_start = local
+            else:
+                branch_start = remote or local
+        if discover_default and not pinned_base and not branch_start:
+            main_branch = _remote_default_branch(worktree_path)
         base_ref = pinned_base or f"origin/{main_branch}"
         base_sha = _branch_ref(worktree_path, base_ref)
         checkout_base = base_sha or base_ref
@@ -839,12 +904,7 @@ def _prepare_worktree_for_task_inner(
             # remote tip. A new branch starts at the declared base. Only our
             # generated branch names may be checked out with -B (#280); a
             # caller-supplied context flag never grants shared-ref ownership.
-            local = _branch_ref(worktree_path, f"refs/heads/{branch}")
-            remote = _branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
-            if local and remote and not _is_ancestor(worktree_path, local, remote):
-                start = local
-            else:
-                start = remote or local
+            start = branch_start
             if not start:
                 start = base_sha or _branch_ref(worktree_path, f"origin/{main_branch}")
             if not start:
@@ -972,6 +1032,8 @@ def _prepare_worktree_for_task_inner(
                     f"for a PR task is the base branch (#289)."
                 )
 
+        if discover_default and not pr_branch and not _pinned_sha:
+            main_branch = _remote_default_branch(worktree_path)
         target_ref = f"origin/{pr_branch}" if pr_branch else f"origin/{main_branch}"
         # #286: resolve to an exact object FIRST, then detach at it. Two
         # reasons, and the second is the one #286 is about:
