@@ -2794,13 +2794,18 @@ def _format_task_message(task: TaskRequest, port: int,
     ctx = json.dumps(task.context, ensure_ascii=False)
     identity_header = f"-H 'X-Agent-Crew-Project: {project}' " if project else ""
     description = _guard_description(task)
+    commit_contract = (
+        task.task_type == "implement"
+        and (task.context or {}).get("artifact_kind") in (None, "", "commit")
+    )
     result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
-                   f"\"summary\":\"...\",\"findings\":[]}}")
+                   f"\"summary\":\"...\",\"findings\":[]")
+    if commit_contract:
+        result_body += (',"branch":"<branch-name>",'
+                        '"commit":"<full-commit-sha>","pr_number":null')
     start_step = ""
     if nonce:
-        result_body = (f"{{\"task_id\":\"{task.task_id}\",\"status\":\"completed\","
-                       f"\"summary\":\"...\",\"findings\":[],"
-                       f"\"executor_binding\":{{\"nonce\":\"{nonce}\"}}}}")
+        result_body += f',"executor_binding":{{"nonce":"{nonce}"}}'
         start_step = (
             f"FIRST, before any work, ask for the go/no-go — the nonce is single-use "
             f"and this call spends it:\n"
@@ -2812,6 +2817,14 @@ def _format_task_message(task: TaskRequest, port: int,
             f"go:true means start the work, even if outcome/reason show BLOCK with "
             f"enforced:false (shadow observation). On go:false, STOP.\n"
         )
+    result_body += "}"
+    result_instruction = (
+        "Do the work described above, then POST result:\n"
+        "implement results without branch+commit (or pr_number) are held as "
+        "no_artifact; resend with them\n"
+        if commit_contract else
+        "Do the work described above, then POST result: "
+    )
     return (
         f"=== AGENT_CREW TASK ===\n"
         f"task_id: {task.task_id}\n"
@@ -2823,8 +2836,8 @@ def _format_task_message(task: TaskRequest, port: int,
         f"description: {description}\n"
         f"=== END TASK ===\n"
         + start_step
-        + f"Do the work described above, then POST result: "
-        f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
+        + result_instruction
+        + f"curl -s -X POST http://127.0.0.1:{port}/tasks/{task.task_id}/result "
         f"{identity_header}"
         f"-H 'Content-Type: application/json' "
         f"-d '{result_body}'"
