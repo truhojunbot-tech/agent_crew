@@ -826,6 +826,10 @@ def _prepare_worktree_for_task_inner(
     # with 4,000+ files staged each, and nothing detected it.
     _unborn = _unborn_head_ref(worktree_path)
     if _unborn:
+        # Healing creates the missing branch ref, so its starting commit must
+        # use the resolved base even when a later checkout needs no base.
+        if discover_default:
+            main_branch = _remote_default_branch(worktree_path)
         _what = f"_prepare_worktree_for_task: {role} {task_id}"
         if not _heal_unborn_head(worktree_path, main_branch, _unborn, what=_what):
             raise WorktreeUnhealthy(

@@ -95,3 +95,14 @@ def test_existing_crew_run_branch_needs_no_default_base(tmp_path, monkeypatch):
         str(worker), "impl-555", "trunk", "implementer",
         {"crew_run_branch": True},
     ) == commits["trunk"]
+
+
+def test_unborn_head_heals_from_remote_default_not_provisional_main(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    worker, commits = _worktree(tmp_path, default="trunk", extra=("main",))
+    _git("-C", worker, "symbolic-ref", "HEAD", "refs/heads/fix/output")
+
+    assert _prepare_worktree_for_task(
+        str(worker), "impl-555", "fix/output", "implementer",
+    ) == commits["trunk"]
+    assert _git("-C", worker, "rev-parse", "refs/heads/fix/output") == commits["trunk"]
