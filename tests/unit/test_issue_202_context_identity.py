@@ -98,7 +98,7 @@ def _read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
-def _wait_for_dispatch(predicate, *, timeout=10):
+def _wait_for_dispatch(predicate, *, timeout=30):
     """Wait for a durable dispatch effect, not an assumed number of ticks."""
     deadline = time.monotonic() + timeout
     while not predicate():
@@ -227,10 +227,14 @@ def test_u_i202_two_sequential_tasks_share_context_and_increment_index(tmp_db, t
                 with TestClient(app) as client:
                     resp = client.post("/tasks", json=_task_payload("test-1"))
                     assert resp.status_code == 201
-                    time.sleep(0.5)
+                    assert _wait_for_dispatch(lambda: (
+                        (row := _attribution_row(tmp_db, "test-1")) is not None
+                        and row["status"] == "failed")), "first task did not finish dispatch"
                     resp = client.post("/tasks", json=_task_payload("test-2"))
                     assert resp.status_code == 201
-                    time.sleep(0.5)
+                    assert _wait_for_dispatch(lambda: (
+                        (row := _attribution_row(tmp_db, "test-2")) is not None
+                        and row["status"] == "failed")), "second task did not finish dispatch"
 
     row1 = _attribution_row(tmp_db, "test-1")
     row2 = _attribution_row(tmp_db, "test-2")
@@ -464,6 +468,10 @@ def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, t
     intervals = []  # (cwd, start, end)
     lock = threading.Lock()
 
+    def both_gemini_dispatches_finished():
+        with lock:
+            return sum(cwd == gemini_wt for cwd, _, _ in intervals) == 2
+
     async def fake_subprocess(*args, **kwargs):
         cwd = kwargs.get("cwd")
         start = time.time()
@@ -501,9 +509,12 @@ def test_u_i202_concurrent_dispatch_into_shared_worktree_is_serialized(tmp_db, t
                     client.post("/tasks", json=_task_payload(
                         "review-1", task_type="review", context={"agent_override": "gemini"},
                     ))
-                    time.sleep(1.5)
+                    assert _wait_for_dispatch(both_gemini_dispatches_finished), (
+                        f"both tasks did not finish dispatch into {gemini_wt}; got {intervals}"
+                    )
 
-    gemini_intervals = [iv for iv in intervals if iv[0] == gemini_wt]
+    with lock:
+        gemini_intervals = [iv for iv in intervals if iv[0] == gemini_wt]
     assert len(gemini_intervals) == 2, (
         f"expected both tasks to eventually dispatch into {gemini_wt}, got {intervals}"
     )
@@ -596,7 +607,14 @@ def test_u_i202_attribution_terminal_state_on_internal_dispatcher_failure(tmp_db
                 with TestClient(app) as client:
                     resp = client.post("/tasks", json=_task_payload("fail-internal-1"))
                     assert resp.status_code == 201
-                    time.sleep(0.6)
+                    task_id = "fail-internal-1"
+                    attr_jsonl = os.path.join(str(tmp_path), "attribution.jsonl")
+                    assert _wait_for_dispatch(lambda: (
+                        (row := _attribution_row(tmp_db, task_id)) is not None
+                        and row["status"] == "failed"
+                        and any(line.get("task_id") == task_id and line.get("status") == "failed"
+                                for line in _read_jsonl(attr_jsonl))
+                    )), "internal failure did not persist terminal attribution"
 
     task_id = "fail-internal-1"
 
