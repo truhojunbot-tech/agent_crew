@@ -84,3 +84,14 @@ def test_context_base_branch_keeps_priority_over_env(tmp_path, monkeypatch):
         str(worker), "impl-555", "fix/output", "implementer",
         {"base_branch": "main"},
     ) == commits["main"]
+
+
+def test_existing_crew_run_branch_needs_no_default_base(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    worker, commits = _worktree(tmp_path, default="trunk")
+    _git("-C", worker, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+
+    assert _prepare_worktree_for_task(
+        str(worker), "impl-555", "trunk", "implementer",
+        {"crew_run_branch": True},
+    ) == commits["trunk"]
