@@ -5668,10 +5668,25 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def list_tasks(self, status: str = "") -> List[TaskRequest]:
+    def list_tasks(self, status: str = "", limit: Optional[int] = None) -> List[TaskRequest]:
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be positive")
         conn = self._connect()
         try:
-            if status:
+            if limit is not None and status:
+                rows = conn.execute(
+                    "SELECT * FROM (SELECT * FROM tasks WHERE status = ? "
+                    "ORDER BY rowid DESC LIMIT ?) "
+                    "ORDER BY priority ASC, created_at ASC",
+                    (status, limit),
+                ).fetchall()
+            elif limit is not None:
+                rows = conn.execute(
+                    "SELECT * FROM (SELECT * FROM tasks ORDER BY rowid DESC LIMIT ?) "
+                    "ORDER BY priority ASC, created_at ASC",
+                    (limit,),
+                ).fetchall()
+            elif status:
                 rows = conn.execute(
                     "SELECT * FROM tasks WHERE status = ? ORDER BY priority ASC, created_at ASC",
                     (status,),

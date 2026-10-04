@@ -17,7 +17,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Callable, Literal, Optional
 
-from fastapi import Body, FastAPI, Header, HTTPException, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from pydantic import BaseModel
 
 from agent_crew import instructions
@@ -6614,9 +6614,10 @@ def create_app(
         return {**dataclasses.asdict(task), "dispatch_nonce": nonce}
 
     @app.get("/tasks")
-    def list_tasks(status: str = "", x_agent_crew_project: Optional[str] = Header(default=None)):
+    def list_tasks(status: str = "", limit: Optional[int] = Query(default=None, ge=1),
+                   x_agent_crew_project: Optional[str] = Header(default=None)):
         _require_project_identity(x_agent_crew_project)
-        return q().list_tasks(status=status)
+        return q().list_tasks(status=status, limit=limit)
 
     def _dispatcher_lease_view() -> tuple[Optional[set], Optional[set]]:
         """dispatcher 가 지금 들고 있는 (task_id lease, worker slot) 을 돌려준다.
