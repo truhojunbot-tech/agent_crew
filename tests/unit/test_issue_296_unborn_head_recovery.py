@@ -26,6 +26,12 @@ import pytest
 from agent_crew import server as sv
 
 
+@pytest.fixture(autouse=True)
+def _declared_base_branch(monkeypatch):
+    """These #296 tests exercise HEAD recovery, not #555 default discovery."""
+    monkeypatch.setenv("AGENT_CREW_MAIN_BRANCH", "main")
+
+
 def _git(*args, cwd):
     return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
                           text=True, timeout=60)

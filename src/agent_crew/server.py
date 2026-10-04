@@ -242,7 +242,7 @@ def _reset_pane_busy_cache() -> None:
 _WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").lower() in (
     "1", "true", "yes",
 )
-_WORKTREE_MAIN_BRANCH = os.getenv("AGENT_CREW_MAIN_BRANCH", "main")
+_WORKTREE_DEFAULT_BRANCHES: dict[str, str] = {}
 
 
 def _ensure_role_protocol(
@@ -480,6 +480,44 @@ class WorktreeTargetUnresolved(WorktreePrepRefused):
     """
 
     reason = "pr_head_unresolved"
+
+    def __init__(self, message: str, *, reason: Optional[str] = None) -> None:
+        super().__init__(message)
+        if reason is not None:
+            self.reason = reason
+
+
+def _remote_default_branch(worktree_path: str) -> str:
+    """Resolve and cache this worktree's origin default branch (#555)."""
+    key = os.path.realpath(worktree_path)
+    cached = _WORKTREE_DEFAULT_BRANCHES.get(key)
+    if cached:
+        return cached
+
+    head = subprocess.run(
+        ["git", "-C", worktree_path, "symbolic-ref", "--quiet",
+         "refs/remotes/origin/HEAD"],
+        capture_output=True, text=True, timeout=30,
+    )
+    prefix = "refs/remotes/origin/"
+    target = head.stdout.strip()
+    if head.returncode == 0 and target.startswith(prefix):
+        branch = target[len(prefix):]
+        if branch and branch != "HEAD" and _branch_ref(worktree_path, target):
+            _WORKTREE_DEFAULT_BRANCHES[key] = branch
+            return branch
+
+    for branch in ("main", "master"):
+        if _branch_ref(worktree_path, f"{prefix}{branch}"):
+            _WORKTREE_DEFAULT_BRANCHES[key] = branch
+            return branch
+
+    raise WorktreeTargetUnresolved(
+        f"worktree {worktree_path}: no resolvable remote default branch; "
+        "origin/HEAD is not a resolvable symbolic ref, and neither "
+        "origin/main nor origin/master resolves (#555)",
+        reason="worktree_base_unresolved",
+    )
 
 
 def _unborn_head_ref(worktree_path: str) -> str:
@@ -764,13 +802,15 @@ def _prepare_worktree_for_task_inner(
     """Inner (may raise). Wrapped by _prepare_worktree_for_task."""
     if task_context is None:
         task_context = {}
-    # `main` is only a default.  A project can run on a long-lived integration
-    # branch; dispatching its worker from origin/main silently makes it edit a
-    # stale, different tree (#353).  The explicit context is produced by the
-    # CLI and survives queue/restart. Without one, use the configured default;
+    # The explicit context survives queue/restart and outranks the configured
+    # default (#353). Without either, use this worktree's origin default (#555).
     # task.branch names the output branch for implementers.
-    main_branch = str(task_context.get("base_branch") or _WORKTREE_MAIN_BRANCH).strip()
-    # #296: is this worktree even usable? Asked BEFORE any other git call,
+    main_branch = str(task_context.get("base_branch") or "").strip()
+    if not main_branch:
+        main_branch = os.getenv("AGENT_CREW_MAIN_BRANCH", "").strip()
+    if not main_branch:
+        main_branch = _remote_default_branch(worktree_path)
+    # #296: is this worktree even usable? Asked before any mutating git call,
     # because an interrupted ref update can leave HEAD pointing at a branch that
     # was never created, and `stash`/`fetch`/`checkout` all behave differently
     # against an unborn HEAD. Reported live: three role worktrees in that state
