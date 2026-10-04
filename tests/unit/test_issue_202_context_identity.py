@@ -269,9 +269,13 @@ def test_u_i202_context_reset_flag_creates_new_generation(tmp_db, tmp_path, *, u
                 )
                 with TestClient(app) as client:
                     client.post("/tasks", json=_task_payload("test-a"))
-                    time.sleep(0.5)
+                    assert _wait_for_dispatch(lambda: (
+                        (row := _attribution_row(tmp_db, "test-a")) is not None
+                        and row["status"] == "failed")), "first task did not finish dispatch"
                     client.post("/tasks", json=_task_payload("test-b", context={"context_reset": True}))
-                    time.sleep(0.5)
+                    assert _wait_for_dispatch(lambda: (
+                        (row := _attribution_row(tmp_db, "test-b")) is not None
+                        and row["status"] == "failed")), "reset task did not finish dispatch"
 
     row_a = _attribution_row(tmp_db, "test-a")
     row_b = _attribution_row(tmp_db, "test-b")
@@ -390,7 +394,9 @@ def test_u_i202_context_survives_restart(tmp_db, tmp_path, *, unused_tcp_port):
                 )
                 with TestClient(app1) as client:
                     client.post("/tasks", json=_task_payload("before-restart"))
-                    time.sleep(0.5)
+                    assert _wait_for_dispatch(lambda: (
+                        (row := _attribution_row(tmp_db, "before-restart")) is not None
+                        and row["status"] == "failed")), "pre-restart task did not finish dispatch"
 
     # Simulate a server restart: brand new create_app() (fresh in-process
     # _seen_context_keys_this_process set), same db_path/state_path.
@@ -403,7 +409,9 @@ def test_u_i202_context_survives_restart(tmp_db, tmp_path, *, unused_tcp_port):
                 )
                 with TestClient(app2) as client:
                     client.post("/tasks", json=_task_payload("after-restart"))
-                    time.sleep(0.5)
+                    assert _wait_for_dispatch(lambda: (
+                        (row := _attribution_row(tmp_db, "after-restart")) is not None
+                        and row["status"] == "failed")), "post-restart task did not finish dispatch"
 
     row_before = _attribution_row(tmp_db, "before-restart")
     row_after = _attribution_row(tmp_db, "after-restart")
