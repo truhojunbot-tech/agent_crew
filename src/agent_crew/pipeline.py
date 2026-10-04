@@ -1171,8 +1171,8 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
             continue
         expired = now > verdict_at + ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS
         citation = None
-        reason = counterfactual.get("stale_reason", "contract_predates_latest_result")
         cap = counterfactual["baseline_cap"]
+        allowed_task_ids = set()
         if not expired:
             tasks_by_id = {}
             current = queue.get_task(review_id)
@@ -1181,18 +1181,32 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
                 previous = (current.context or {}).get("prev_task_id")
                 current = queue.get_task(previous) if isinstance(previous, str) else None
             review = tasks_by_id.get(review_id)
-            if review:
-                cap, citation, reason = _canary_round_cap(
-                    tasks_by_id, review, counterfactual["baseline_cap"], queue,
-                    counterfactual.get("server_project"))
+            if review and _round_cap_pinned(
+                    tasks_by_id, review, queue, counterfactual.get("server_project")):
+                allowed_task_ids = {task.task_id for task in _lineage_tasks(tasks_by_id, review)}
+                citation_task = review
+                fix_round = counterfactual.get("round")
+                if isinstance(fix_round, int) and not isinstance(fix_round, bool):
+                    fix = queue.get_task(fix_task_id(review_id, fix_round))
+                    fix_context = fix.context if fix and isinstance(fix.context, dict) else {}
+                    if (fix and fix.task_type == "implement"
+                            and fix_context.get("prev_task_id") == review_id):
+                        tasks_by_id[fix.task_id] = fix
+                        allowed_task_ids.add(fix.task_id)
+                        citation_task = fix
+                citation = _shadow_rounds_citation(tasks_by_id, citation_task, queue)
         produced = _contract_time((citation or {}).get("produced_at"))
         fresh = (not expired and produced is not None
-                 and verdict_at < produced.timestamp() <= verdict_at + ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS
+                 and verdict_at < produced.timestamp() <= min(
+                     now, verdict_at + ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS)
                  and (citation or {}).get("decision_source") == "quota_core_contract"
-                 and reason not in ("contract_predates_latest_result", "contract_predates_latest_fix",
-                                    "contract_missing_or_stale"))
+                 and (citation or {}).get("cited_task_id") in allowed_task_ids)
         if not fresh and not expired:
             continue
+        if fresh:
+            recommended = citation["recommended_max_review_fix_rounds"]
+            if isinstance(recommended, int) and 1 <= recommended < cap:
+                cap = recommended
         counterfactual.update({
             "pending_reresolve": False,
             "counterfactual_cap": cap if fresh else counterfactual["baseline_cap"],

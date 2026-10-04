@@ -3,6 +3,7 @@
 import json
 import time
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 import pytest
 
@@ -36,8 +37,10 @@ def pending(tmp_path, monkeypatch):
     verdict_at = queue.get_exec_state("review-reresolve")["result_posted_at"]
     root_at = queue.get_exec_state("impl-reresolve")["result_posted_at"]
     _write_contract(policy, (root_at + verdict_at) / 2)
-    fix = auto_enqueue_fix(queue, "review-reresolve", repo="owner/repo",
-                           pr_state_fn=lambda _: "open", comment_fn=lambda *_a: None)
+    # The fix is a consequence of the verdict, enqueued five seconds later.
+    with patch("time.time", return_value=verdict_at + 5):
+        fix = auto_enqueue_fix(queue, "review-reresolve", repo="owner/repo",
+                               pr_state_fn=lambda _: "open", comment_fn=lambda *_a: None)
     assert fix is not None  # the live cascade does not wait for a new contract
     row = queue.get_tokenomics_shadow_receipt("impl-reresolve")
     assert row["canary_reason"] == "switch_off:pending_reresolve"
@@ -47,11 +50,11 @@ def pending(tmp_path, monkeypatch):
     return queue, policy, verdict_at
 
 
-def _write_contract(path, produced_at):
+def _write_contract(path, produced_at, *, task_id="impl-reresolve"):
     path.write_text(json.dumps({
         "contract_version": "1.0", "mode": "shadow",
         "produced_at": datetime.fromtimestamp(produced_at, timezone.utc).isoformat(),
-        "decisions": [{"task_id": "impl-reresolve",
+        "decisions": [{"task_id": task_id,
                        "recommended_max_review_fix_rounds": 1}],
     }))
 
@@ -89,6 +92,56 @@ def test_fresh_contract_reresolves_once_with_sha_and_would_fire(pending, monkeyp
     replayed = queue.get_tokenomics_shadow_receipt("impl-reresolve")
     assert replayed["canary_reason"] == "switch_off:fresh_reresolved"
     assert replayed["canary_counterfactual"] == before_replay
+
+
+def test_fresh_contract_citing_spawned_fix_reresolves(pending, monkeypatch):
+    queue, policy, verdict_at = pending
+    fix_id = pipeline.fix_task_id("review-reresolve", 2)
+    fix = queue.get_task(fix_id)
+    assert fix is not None
+    assert fix.context["prev_task_id"] == "review-reresolve"
+    _write_contract(policy, verdict_at + 20, task_id=fix_id)
+    _clock(monkeypatch, verdict_at + 21)
+
+    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 21) == 1
+    row = queue.get_tokenomics_shadow_receipt("impl-reresolve")
+    citation = json.loads(row["canary_recommendation_json"])
+    counterfactual = json.loads(row["canary_counterfactual"])
+    assert row["canary_reason"] == "switch_off:fresh_reresolved"
+    assert citation["cited_task_id"] == fix_id
+    assert citation["produced_at"] == datetime.fromtimestamp(
+        verdict_at + 20, timezone.utc).isoformat()
+    assert citation["contract_sha"]
+    assert counterfactual["counterfactual_cap"] == 1
+    assert counterfactual["would_fire"] is True
+    assert row["canary_applied"] == 0
+
+
+def test_spawned_fix_contract_after_window_stays_stale(pending, monkeypatch):
+    queue, policy, verdict_at = pending
+    _write_contract(policy, verdict_at + 70,
+                    task_id=pipeline.fix_task_id("review-reresolve", 2))
+    _clock(monkeypatch, verdict_at + 71)
+
+    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 71) == 1
+    row = queue.get_tokenomics_shadow_receipt("impl-reresolve")
+    assert row["canary_reason"] == "switch_off:contract_predates_latest_result"
+    assert json.loads(row["canary_counterfactual"])["counterfactual_cap"] == 3
+    assert row["canary_applied"] == 0
+
+
+def test_unrelated_contract_does_not_reresolve(pending, monkeypatch):
+    queue, policy, verdict_at = pending
+    _write_contract(policy, verdict_at + 20, task_id="unrelated-task")
+    _clock(monkeypatch, verdict_at + 21)
+
+    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 21) == 0
+    assert queue.get_tokenomics_shadow_receipt("impl-reresolve")[
+        "canary_reason"] == "switch_off:pending_reresolve"
+    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 61) == 1
+    row = queue.get_tokenomics_shadow_receipt("impl-reresolve")
+    assert row["canary_reason"] == "switch_off:contract_predates_latest_result"
+    assert json.loads(row["canary_counterfactual"])["counterfactual_cap"] == 3
 
 
 @pytest.mark.parametrize("offset", [-1, 90])
