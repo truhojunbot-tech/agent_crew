@@ -130,6 +130,9 @@ class SQLiteMemoryStorage:
             db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))")
             db.execute("CREATE INDEX IF NOT EXISTS idx_adr001_shadow_project_created "
                        "ON adr001_memory(COALESCE(json_extract(scope,'$.project'),''), created DESC)")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_adr001_shadow_project_pr "
+                       "ON adr001_memory(COALESCE(json_extract(scope,'$.project'),''), "
+                       "json_extract(value,'$.pr_number'), created DESC)")
             self._migrate_legacy_generation_zero(db)
             db.commit()
 
@@ -266,7 +269,8 @@ class SQLiteMemoryStorage:
         return sorted(result, key=lambda record: _retrieval_rank(record, terms))
 
     def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int,
-                        query: str = "", predecessor_task_ids: tuple[str, ...] = ()
+                        query: str = "", predecessor_task_ids: tuple[str, ...] = (),
+                        pr_number: Optional[int] = None
                         ) -> tuple[list[MemoryRecord], int]:
         """Bound parsing to recent candidates and count project-less drops."""
         if not scope.project or not layers or limit <= 0:
@@ -316,6 +320,15 @@ class SQLiteMemoryStorage:
                 + ") AND COALESCE(json_extract(scope,'$.project'),'')=?",
                 [*predecessor_keys, scope.project],
             ).fetchall() if predecessor_keys else []
+            pr_rows = db.execute(
+                "SELECT layer,key,value,scope,version FROM adr001_memory "
+                "WHERE layer='decision' "
+                "AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                "AND json_extract(value,'$.pr_number')=? "
+                "AND json_extract(value,'$.task_id')<>? "
+                "ORDER BY created DESC LIMIT ?",
+                (scope.project, pr_number, scope.task_id, SHADOW_RETRIEVAL_MAX_ROWS),
+            ).fetchall() if pr_number and "decision" in layers else []
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
@@ -330,8 +343,17 @@ class SQLiteMemoryStorage:
                   and not lineage[key].value.get("invalidated_at")
                   and not lineage[key].value.get("superseded_at")
                   and not lineage[key].value.get("superseded")]
+        same_pr = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+                                version) for layer, key, value, record_scope, version in pr_rows]
+        same_pr = [record for record in same_pr
+                   if record.scope.fleet in ("", scope.fleet)
+                   and not record.value.get("invalidated_at")
+                   and not record.value.get("superseded_at")
+                   and not record.value.get("superseded")]
         pinned_keys = {record.key for record in pinned}
-        return (pinned + [record for record in scoped if record.key not in pinned_keys])[
+        selected = pinned + [record for record in same_pr if record.key not in pinned_keys]
+        selected_keys = {record.key for record in selected}
+        return (selected + [record for record in scoped if record.key not in selected_keys])[
             :min(limit, SHADOW_RETRIEVAL_MAX_ROWS)], dropped
 
 
@@ -482,7 +504,8 @@ class RuntimeMemoryProvider:
         if isinstance(self.storage, SQLiteMemoryStorage):
             scoped, dropped = self.storage.retrieve_shadow(
                 scope, allowed, request.limit, query=request.retrieval_query,
-                predecessor_task_ids=request.predecessor_task_ids)
+                predecessor_task_ids=request.predecessor_task_ids,
+                pr_number=request.pr_number)
         else:
             records = [record for record in self.storage.retrieve(scope,
                 query=request.retrieval_query) if record.layer in allowed]

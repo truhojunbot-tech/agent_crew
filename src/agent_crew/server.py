@@ -5327,12 +5327,13 @@ def create_app(
         if shadow_memory_enabled:
             try:
                 try:
-                    _predecessors, _ = await asyncio.to_thread(
+                    _predecessors, _lineage_pr = await asyncio.to_thread(
                         task_lineage, db_path, task.task_id)
                 except Exception:
                     logger.exception("dispatcher: lineage lookup failed for %s", task.task_id)
                     _parent = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
                     _predecessors = (_parent,) if isinstance(_parent, str) and _parent else ()
+                    _lineage_pr = task.pr_number or (_ctx.get("pr_number") if isinstance(_ctx, dict) else None)
                 _shadow_result = shadow_retrieve_bounded(
                     _memory_provider, MemoryRequest(
                         project=_project,
@@ -5349,6 +5350,7 @@ def create_app(
                         memory_types=(
                             "procedural", "episodic", "decision", "failure_pattern", "evidence"),
                         predecessor_task_ids=_predecessors,
+                        pr_number=_lineage_pr,
                         limit=min(SHADOW_RETRIEVAL_MAX_ROWS, max(10, len(_predecessors))),
                     ), shadow_memory_timeout_seconds,
                 )

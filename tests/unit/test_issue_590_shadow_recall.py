@@ -5,7 +5,8 @@ import sqlite3
 
 from agent_crew.memory import (FakeMemoryProvider, MemoryItem, MemoryRequest,
                                shadow_retrieve_bounded)
-from agent_crew.memory_capture import capture_result_best_effort, task_lineage
+from agent_crew.memory_capture import (capture_result_best_effort, capture_task_outcome,
+                                       task_lineage)
 from agent_crew.memory_runtime import (MemoryRecord, MemoryScope, RuntimeMemoryProvider,
                                        SQLiteMemoryStorage)
 from agent_crew.protocol import TaskRequest, TaskResult
@@ -71,6 +72,20 @@ def test_keyed_lineage_read_keeps_project_boundary(tmp_path):
         project="agent_crew", task_id="current", predecessor_task_ids=("prior",)))
     assert result.items == ()
     assert _lineage_recall_observation(result, ("prior",)) is False
+
+
+def test_shared_store_recalls_same_pr_without_local_task_row(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    capture_task_outcome(storage, project="agent_crew", repo="agent_crew",
+                         task_id="other-instance", status="completed",
+                         summary="prior result", pr_number=590)
+    capture_task_outcome(storage, project="halla", repo="halla",
+                         task_id="foreign", status="completed",
+                         summary="foreign result", pr_number=590)
+    result = RuntimeMemoryProvider(storage).retrieve(MemoryRequest(
+        project="agent_crew", task_id="current", pr_number=590))
+    assert "task:other-instance:decision" in {item.item_id for item in result.items}
+    assert "task:foreign:decision" not in {item.item_id for item in result.items}
 
 
 def test_required_context_recalled_is_one_zero_or_null(tmp_path):
