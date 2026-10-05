@@ -44,7 +44,10 @@ def pr_repo(tmp_path):
     return worker, pr_head, main_head
 
 
-@pytest.mark.parametrize("context", [{"pr_number": 595}, {}])
+@pytest.mark.parametrize("context", [
+    {"pr_number": 595},
+    {"prev_task_id": "review-fix-r1", "fix_round": 2},
+])
 def test_fix_commit_descending_from_existing_pr_head_is_accepted(pr_repo, context):
     worker, pr_head, main_head = pr_repo
     prepared = _prepare_worktree_for_task(
@@ -64,6 +67,17 @@ def test_fix_commit_descending_from_existing_pr_head_is_accepted(pr_repo, contex
     result = TaskResult("fix-review-r2", "completed", "done",
                         branch="fix/existing-pr", commit=commit)
     assert verify_implement_artifact(task, result, repo_cwd=str(worker))[0]
+
+
+@pytest.mark.parametrize("context", [{}, {"prev_task_id": "other-task"}, {"fix_round": 1}])
+def test_fresh_implement_task_starts_from_main_even_when_output_branch_exists(pr_repo, context):
+    worker, pr_head, main_head = pr_repo
+    prepared = _prepare_worktree_for_task(
+        str(worker), "fresh-implement", "fix/existing-pr", "implementer",
+        context, task_type="implement")
+    assert prepared == main_head
+    assert _git(worker, "rev-parse", "HEAD") == main_head
+    assert prepared != pr_head
 
 
 def test_commit_not_descending_from_pr_head_is_refused(pr_repo):

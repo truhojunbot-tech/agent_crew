@@ -865,12 +865,14 @@ def _prepare_worktree_for_task_inner(
         # Once prepared, the recorded SHA pins a second preparation of the same
         # task even if origin/main advances between push and dispatch.
         pinned_base = _object_id_or_empty(task_context.get("worktree_base_sha"))
-        # #595: a fix on an existing PR branch must compare its result with
-        # that branch's head at dispatch, not with a newer default-branch tip.
-        # Resolve after fetch, and keep the pinned SHA authoritative on a
-        # second preparation of the same task.
+        # #595: a continuing PR/fix task compares its result with the branch
+        # head at dispatch. Fresh implement tasks still start at their declared
+        # base even if somebody already pushed their output branch (#280).
+        # The cascade sets both lineage fields when it creates a fix task.
+        continuing_branch = bool(task_context.get("pr_number")) or bool(
+            task_context.get("prev_task_id") and task_context.get("fix_round"))
         remote_branch = (_branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
-                         if task_type in ("", "implement") else "")
+                         if task_type in ("", "implement") and continuing_branch else "")
         branch_start = ""
         if task_context.get("crew_run_branch"):
             # The caller's existing branch supplies its own content. Only a
