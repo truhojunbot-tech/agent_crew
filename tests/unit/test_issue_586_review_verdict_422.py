@@ -1,7 +1,9 @@
 """#586: a review result without a verdict is refused (422), not marked done."""
 
+import pytest
 from fastapi.testclient import TestClient
 
+from agent_crew.mcp_server import build_mcp_server
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
@@ -67,3 +69,19 @@ def test_pending_review_without_verdict_is_422_and_stays_pending(tmp_db):
     assert response.status_code == 422
     assert "verdict" in response.json()["detail"]
     assert _task(queue, "review-586").status == "pending"
+
+
+@pytest.mark.parametrize("claimed", [False, True])
+def test_mcp_review_without_verdict_is_rejected_and_stays_live(tmp_db, claimed):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="review-586", task_type="review",
+                              description="Review PR #586", context={"pr_number": 586}))
+    if claimed:
+        assert queue.dequeue(role="reviewer").task_id == "review-586"
+    mcp = build_mcp_server(tmp_db)
+    submit = mcp._tool_manager._tools["submit_result"].fn
+    response = submit(task_id="review-586", status="completed", summary=SUMMARY,
+                      findings=[FINDING], pr_number=586)
+    assert response["acknowledged"] is False
+    assert "verdict" in response["error"]
+    assert _task(queue, "review-586").status == ("in_progress" if claimed else "pending")

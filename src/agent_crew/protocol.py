@@ -209,8 +209,12 @@ class TaskResult:
 
 def validate_review_result(result: TaskResult) -> Optional[str]:
     """Reject diagnostic review payloads before they become final verdicts."""
-    if result.status != "completed" or result.verdict not in ("approve", "request_changes"):
+    if result.status != "completed":
         return None
+    if (result.verdict not in ("approve", "request_changes")
+            or (result.verdict == "approve" and result.findings)
+            or (result.verdict == "request_changes" and not result.findings)):
+        return "review result requires a verdict: approve with no findings or request_changes with findings"
     if len(result.summary.strip()) < 40:
         return "review summary must be at least 40 characters for a final verdict"
     for index, finding in enumerate(result.findings):
