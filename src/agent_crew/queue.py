@@ -547,6 +547,10 @@ def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None,
 
 logger = logging.getLogger(__name__)
 
+#: #581 waste reason for a provider capacity refusal (codex "Selected model is
+#: at capacity"). Infra waste, not a task outcome.
+PROVIDER_CAPACITY = "provider_capacity"
+
 
 def _unknown_risk_declaration() -> dict:
     return {
@@ -5089,6 +5093,72 @@ class TaskQueue:
                          (json.dumps(ctx), status, task_id))
             conn.execute("COMMIT")
             return count
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
+    def defer_provider_capacity(self, task_id: str, *, delay_s: float, blocked_after_s: float,
+                                provider_tag: str = "codex_capacity") -> Optional[dict]:
+        """Requeue a task its provider refused for capacity, not before ``delay_s`` (#581).
+
+        Capacity is an external outage, not a task failure: there is no
+        attempt cap here and the task never ends from capacity alone. In one
+        transaction it sets ``push_not_before`` with ``push_refusal_reason =
+        provider_tag`` (honoured by every dequeue), counts the streak in the
+        context, requeues through the §8 gate, and records the end as
+        ``requeued`` with ``waste_reason='provider_capacity'`` (infra waste —
+        tokenomics consumers exclude it from the #80 cohort). Once the streak
+        has lasted ``blocked_after_s`` it appends ``provider_capacity_blocked``
+        once, for the coordinator. Returns the streak state, or None if the
+        task was not in_progress or the gate kept it.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, context FROM tasks WHERE task_id = ?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.execute("ROLLBACK")
+                return None
+            now = time.time()
+            ctx = json.loads(row["context"] or "{}")
+            count = int(ctx.get("provider_capacity_count") or 0) + 1
+            since = float(ctx.get("provider_capacity_since") or now)
+            blocked = (now - since >= blocked_after_s
+                       and not ctx.get("provider_capacity_blocked_at"))
+            requeued, _gate = self.requeue_through_gate(
+                conn, task_id, path="queue.defer_provider_capacity",
+                reason=f"{PROVIDER_CAPACITY}: {provider_tag}")
+            if not requeued:
+                conn.execute("COMMIT")   # keep the refusal's runtime event
+                return None
+            # ⛔Re-read: requeue_through_gate patched the context (§8 answer).
+            ctx = json.loads(conn.execute("SELECT context FROM tasks WHERE task_id = ?",
+                                          (task_id,)).fetchone()["context"] or "{}")
+            ctx.update({"push_not_before": now + delay_s,
+                        "push_refusal_reason": provider_tag,
+                        "provider_capacity_count": count,
+                        "provider_capacity_since": since})
+            if blocked:
+                ctx["provider_capacity_blocked_at"] = now
+            conn.execute(
+                "UPDATE tasks SET context = ?, status = 'pending', claim_source = '' "
+                "WHERE task_id = ? AND status = 'in_progress'",
+                (json.dumps(ctx), task_id))
+            waste = {"waste_reason": PROVIDER_CAPACITY, "waste_class": "infra",
+                     "provider_tag": provider_tag, "capacity_refusals": count,
+                     "capacity_since": since}
+            self._record_end_on(conn, task_id, now, "requeued", posted=False,
+                                not_before=now + delay_s, **waste)
+            if blocked:
+                self._append_exec_event_on(conn, task_id, "provider_capacity_blocked", now,
+                                           blocked_for_s=round(now - since, 1), **waste)
+            conn.execute("COMMIT")
+            return {"count": count, "since": since, "not_before": now + delay_s,
+                    "blocked": blocked}
         except Exception:
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK")

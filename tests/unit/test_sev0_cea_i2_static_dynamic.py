@@ -340,7 +340,8 @@ from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
 #: with "pending") so it is matched by name, not by literal.
 PENDING_WRITERS = {
     "queue.py": {"enqueue (INSERT)", "requeue", "requeue_dispatcher_claim",
-                 "reset_stale_to_pending", "defer_push_delivery"},
+                 "reset_stale_to_pending", "defer_push_delivery",
+                 "defer_provider_capacity"},
 }
 #: callers of those writers that are themselves "paths back" (server/cli).
 REQUEUE_CALLERS = {"server.py": {"_requeue_orphans", "requeue"}, "cli.py": {"recover"}}
@@ -362,9 +363,10 @@ def test_static_every_literal_pending_write_is_inventoried():
     INSERT. The three literal writers are ``requeue``, ``requeue_dispatcher_claim``
     (queue.py:4486, receipt via ``requeue_through_gate`` before the write), and
     ``reset_stale_to_pending`` (queue.py:4723, same gate per row before UPDATE).
-    ``defer_push_delivery`` is the bound-parameter writer."""
+    ``defer_push_delivery`` is the bound-parameter writer. #581 added
+    ``defer_provider_capacity`` (same gate before its UPDATE)."""
     writes = _pending_writes()
-    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 3, writes
+    assert set(writes) == {"queue.py"} and len(writes["queue.py"]) == 4, writes
 
 
 def test_dispatcher_claim_requeue_moves_receipt_before_pending(tmp_path):
@@ -394,7 +396,8 @@ def test_static_requeue_callers_are_inventoried():
     calls = {}
     for p, body in _sources().items():
         rel = p.relative_to(SRC).as_posix()
-        n = len(re.findall(r"\.(requeue|reset_stale_to_pending|defer_push_delivery)\(", body))
+        n = len(re.findall(r"\.(requeue|reset_stale_to_pending|defer_push_delivery"
+                           r"|defer_provider_capacity)\(", body))
         if n and rel != "queue.py":
             calls[rel] = n
     assert set(calls) == {"server.py", "cli.py"}, calls
@@ -413,6 +416,8 @@ def _back_to_pending(q, how):
         q.requeue("t1")
     elif how == "defer_push_delivery":
         assert q.defer_push_delivery("t1", "%1", "pane refused", max_refusals=5, backoff_s=0) == 1
+    elif how == "defer_provider_capacity":
+        assert q.defer_provider_capacity("t1", delay_s=0, blocked_after_s=3600)["count"] == 1
     elif how in ("reset_stale_to_pending", "recover"):
         # ``crew recover --reset-stale`` is exactly this call (cli.py recover)
         c = sqlite3.connect(q._db_path)
@@ -431,7 +436,7 @@ def _back_to_pending(q, how):
         c.close()
 
 
-REQUEUE_PATHS = ("requeue", "defer_push_delivery", "reset_stale_to_pending",
+REQUEUE_PATHS = ("requeue", "defer_push_delivery", "defer_provider_capacity", "reset_stale_to_pending",
                  "_requeue_orphans", "recover")
 
 

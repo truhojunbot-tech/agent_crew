@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import signal
 import sqlite3
@@ -1224,10 +1225,34 @@ _TRANSIENT_RETRIABLE_TAGS = frozenset({
     "claude_throttle",
     "gemini_capacity",
     "gemini_resource_exhausted",
-    "codex_capacity",
     "agy_timeout",
     "agy_subscriber_lag",
 })
+# #581: provider capacity refusals, classified `provider_capacity`. Requeued
+# with a cooldown that never runs out and never spends the transient budget.
+_PROVIDER_CAPACITY_TAGS = frozenset({
+    "codex_capacity",
+})
+
+
+def _capacity_cooldown_s(refusal: int) -> float:
+    """Cooldown before the ``refusal``-th capacity requeue (1-based) (#581).
+
+    ``base * 2**(n-1)`` — 2 → 4 → 8 min — with ±jitter so a fleet of refused
+    tasks does not stampede back together, capped at 15 min.
+    """
+    def _f(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, default))
+        except ValueError:
+            return default
+    base = _f("AGENT_CREW_CAPACITY_BACKOFF_S", 120.0)
+    cap = _f("AGENT_CREW_CAPACITY_BACKOFF_CAP_S", 900.0)
+    jitter = _f("AGENT_CREW_CAPACITY_JITTER", 0.2)
+    raw = min(cap, base * (2 ** min(max(refusal, 1) - 1, 30)))
+    return max(0.0, min(cap, raw * random.uniform(1 - jitter, 1 + jitter)))
+
+
 # Tags that mean "exhausted for hours+; retry is futile". Surface as a
 # clear-reason failure instead.
 _TRANSIENT_NONRETRIABLE_TAGS = frozenset({
@@ -4473,18 +4498,12 @@ def create_app(
         _MAX_TRANSIENT_RETRY = int(os.getenv("AGENT_CREW_TRANSIENT_RETRY_MAX", "3"))
     except ValueError:
         _MAX_TRANSIENT_RETRY = 3
-    # #581: codex "Selected model is at capacity" outlasts an immediate retry —
-    # three back-to-back requeues burned out in ~4 min. Capacity alone backs
-    # off via `push_not_before`: base * 2**(n-1) = 2/4/8/16 min (~30 min),
-    # then fails as before. No implementer fallback (owner policy: HOLD).
+    # #581: after this long of continuous capacity refusals the task gets a
+    # `provider_capacity_blocked` exec event (a coordinator watches for it).
     try:
-        _CAPACITY_BACKOFF_S = float(os.getenv("AGENT_CREW_CAPACITY_BACKOFF_S", "120"))
+        _CAPACITY_BLOCKED_AFTER_S = float(os.getenv("AGENT_CREW_CAPACITY_BLOCKED_AFTER_S", "3600"))
     except ValueError:
-        _CAPACITY_BACKOFF_S = 120.0
-    try:
-        _MAX_CAPACITY_RETRY = int(os.getenv("AGENT_CREW_CAPACITY_RETRY_MAX", "4"))
-    except ValueError:
-        _MAX_CAPACITY_RETRY = 4
+        _CAPACITY_BLOCKED_AFTER_S = 3600.0
 
     # #202: append-only context lifecycle event stream, separate from
     # attribution.jsonl (see context_identity.record_context_event).
@@ -5606,25 +5625,41 @@ def create_app(
                                          "timeout_limit_s": (timeout_secs if _timeout_reason == "dispatcher_timeout"
                                                              else _idle_timeout_secs),
                                          **_codex_no_result_details})
+            elif _transient in _PROVIDER_CAPACITY_TAGS:
+                # #581: an external outage, not a task failure. Cool down and
+                # requeue, forever; never the transient budget, never another
+                # provider or model (owner policy: codex exhaustion is HOLD).
+                try:
+                    _cap_n = int(q().get_task_context(task.task_id)
+                                 .get("provider_capacity_count") or 0) + 1
+                    _delay = _capacity_cooldown_s(_cap_n)
+                    _cap = q().defer_provider_capacity(
+                        task.task_id, delay_s=_delay,
+                        blocked_after_s=_CAPACITY_BLOCKED_AFTER_S, provider_tag=_transient)
+                    if _cap is not None:
+                        _blocked_for = time.time() - _cap["since"]
+                        (logger.error if _blocked_for >= _CAPACITY_BLOCKED_AFTER_S
+                         else logger.warning)(
+                            "dispatcher: provider_capacity (%s) on task=%s — requeued, "
+                            "not before +%.0fs (refusal %d, blocked %.0fs)%s",
+                            _transient, task.task_id, _delay, _cap["count"], _blocked_for,
+                            " — provider_capacity_blocked" if _cap["blocked"] else "")
+                    _terminal = False
+                    return
+                except Exception:
+                    logger.exception(
+                        f"dispatcher: capacity requeue failed for task={task.task_id}")
+                _fail_if_active(task.task_id, "provider_capacity_requeue_failed")
             elif _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
-                _capacity = _transient == "codex_capacity"
-                _max_retry = _MAX_CAPACITY_RETRY if _capacity else _MAX_TRANSIENT_RETRY
-                if _n <= _max_retry:
+                if _n <= _MAX_TRANSIENT_RETRY:
                     try:
-                        if _capacity:
-                            # Before the requeue, so no dequeue sees it undelayed.
-                            _delay = _CAPACITY_BACKOFF_S * (2 ** (_n - 1))
-                            q().patch_context(task.task_id, {
-                                "push_not_before": time.time() + _delay,
-                                "push_refusal_reason": _transient})
                         q().requeue(task.task_id)
                         logger.warning(
                             f"dispatcher: transient {_transient} on "
                             f"task={task.task_id} — requeued "
-                            f"(attempt {_n}/{_max_retry})"
-                            + (f", not before +{_delay:.0f}s" if _capacity else "")
+                            f"(attempt {_n}/{_MAX_TRANSIENT_RETRY})"
                         )
                         _terminal = False
                         return
@@ -5636,7 +5671,7 @@ def create_app(
                     logger.error(
                         f"dispatcher: transient {_transient} on "
                         f"task={task.task_id} — giving up after "
-                        f"{_max_retry} retries"
+                        f"{_MAX_TRANSIENT_RETRY} retries"
                     )
                 _fail_if_active(task.task_id, f"transient_{_transient}_max_retries")
             elif _transient in _TRANSIENT_NONRETRIABLE_TAGS:
