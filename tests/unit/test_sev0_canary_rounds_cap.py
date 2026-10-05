@@ -105,10 +105,11 @@ def test_contract_between_fix_and_review_verdict_keeps_baseline(
     contract["produced_at"] = datetime.fromtimestamp(
         (fix_at + verdict_at) / 2, timezone.utc).isoformat()
     path.write_text(json.dumps(contract))
-    assert _run(q, review) is not None
+    assert _run(q, review) is None
     row = q.get_tokenomics_shadow_receipt(ROOT)
     assert row["canary_applied"] == 0
-    assert row["canary_reason"] == "contract_predates_latest_result"
+    assert row["canary_reason"] == "switch_on:pending_reresolve"
+    assert json.loads(row["canary_counterfactual"])["stale_reason"] == "contract_predates_latest_result"
 
 
 def test_contract_after_review_verdict_narrows(q, tmp_path, monkeypatch):
@@ -170,8 +171,10 @@ def test_latest_fix_requires_its_own_post_result_decision(
     assert cap == (1 if produced_after_result else 3)
     assert (citation or {}).get("cited_task_id") == (latest if decision_for_latest else ROOT)
     if not produced_after_result:
-        assert _run(q, review) is not None
-        assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
+        assert _run(q, review) is None
+        row = q.get_tokenomics_shadow_receipt(ROOT)
+        assert row["canary_reason"] == "switch_on:pending_reresolve"
+        assert json.loads(row["canary_counterfactual"])["stale_reason"] == expected_reason
 
 
 def test_kill_switch_off_preserves_fix_and_shadow_receipt(q, tmp_path, monkeypatch):
@@ -469,9 +472,10 @@ def test_pre_verdict_lineage_receipt_cannot_narrow_with_future_contract(
         "decisions": [{"task_id": review, "recommended_max_review_fix_rounds": 2}],
     }))
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(path))
-    assert _run(q, review) is not None
+    assert _run(q, review) is None
     row = q.get_tokenomics_shadow_receipt(ROOT)
-    assert row["canary_reason"] == "contract_predates_latest_result"
+    assert row["canary_reason"] == "switch_on:pending_reresolve"
+    assert json.loads(row["canary_counterfactual"])["stale_reason"] == "contract_predates_latest_result"
     cited = json.loads(row["canary_recommendation_json"])
     assert cited["cited_task_id"] == ROOT
     assert cited["contract_sha"] == "earlier-contract"
@@ -500,9 +504,10 @@ def test_pre_verdict_mtime_receipt_cannot_narrow_with_future_contract(
     # be used; only the already-stored implementation receipt is eligible.
     future_mtime = decision_at + 60
     os.utime(path, (future_mtime, future_mtime))
-    assert _run(q, review) is not None
+    assert _run(q, review) is None
     row = q.get_tokenomics_shadow_receipt(ROOT)
-    assert row["canary_reason"] == "contract_predates_latest_result"
+    assert row["canary_reason"] == "switch_on:pending_reresolve"
+    assert json.loads(row["canary_counterfactual"])["stale_reason"] == "contract_predates_latest_result"
     citation = json.loads(row["canary_recommendation_json"])
     assert citation["decision_source"] == "quota_core_contract"
     assert citation["cited_task_id"] == ROOT
