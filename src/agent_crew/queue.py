@@ -3812,7 +3812,7 @@ class TaskQueue:
     def dequeue(
         self, agent: str = "", role: str = "", *, claimed_via: str = "",
         claim_source: str = "", skip_task_ids: Optional[set[str]] = None,
-        skip_deferred: bool = False, skip_capacity_deferred: bool = False,
+        skip_deferred: bool = False,
     ) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -3835,16 +3835,17 @@ class TaskQueue:
         winning the ORDER BY and starving the tasks behind it. Other consumers
         (dispatcher, MCP) leave it False — the backoff is about a pane, not
         the task.
-        ``skip_capacity_deferred`` (#581): the dispatcher passes True so it
-        honours only the provider-capacity backoff (`push_refusal_reason ==
-        'codex_capacity'`), not a pane refusal it can still deliver past.
+        Provider-capacity backoff (`push_refusal_reason == 'codex_capacity'`)
+        applies to every claimant, including MCP and HTTP polling (#581).
+        Pane refusals remain specific to push delivery.
         ``claim_source`` is server-owned provenance for recovery. Skipped IDs
         let push delivery pass a busy queue head during this scheduling pass.
         """
         _now = time.time()
-        _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "
-                      + repr(_now)) if skip_deferred else ""
-        if skip_capacity_deferred and not skip_deferred:
+        if skip_deferred:
+            _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "
+                          + repr(_now))
+        else:
             _defer_sql = (" AND NOT (COALESCE(json_extract(context, '$.push_refusal_reason'), '')"
                           " = 'codex_capacity' AND COALESCE(json_extract(context,"
                           " '$.push_not_before'), 0) > " + repr(_now) + ")")

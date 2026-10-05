@@ -5852,7 +5852,7 @@ def create_app(
                             # Stage 1 checks overrides independent of task type;
                             # Stage 2 checks each role this worker owns.
                             task = q().dequeue(agent=worker, role=_candidate_role, claimed_via="dispatcher",
-                                               claim_source="dispatcher", skip_capacity_deferred=True)
+                                               claim_source="dispatcher")
                             if task is not None:
                                 break
                         if task is None:

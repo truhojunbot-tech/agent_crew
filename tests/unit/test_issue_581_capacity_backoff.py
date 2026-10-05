@@ -114,7 +114,25 @@ def test_u_581_dispatcher_dequeue_honours_only_capacity_backoff(tmp_db):
     q.enqueue(TaskRequest(task_id="pane", task_type="test", description="d", branch="b-pane",
                           context={"push_not_before": future,
                                    "push_refusal_reason": "pane_not_agent_shell"}))
-    got = q.dequeue(role="tester", claimed_via="dispatcher", skip_capacity_deferred=True)
+    got = q.dequeue(role="tester", claimed_via="dispatcher")
     # The pane-refusal backoff is not the dispatcher's concern; capacity is.
     assert got is not None and got.task_id == "pane"
-    assert q.dequeue(role="tester", claimed_via="dispatcher", skip_capacity_deferred=True) is None
+    assert q.dequeue(role="tester", claimed_via="dispatcher") is None
+
+
+def test_u_581_mcp_and_http_poll_cannot_claim_capacity_deferred_task(tmp_db):
+    q = TaskQueue(tmp_db)
+    future = time.time() + 600
+    q.enqueue(TaskRequest(task_id="cap", task_type="implement", description="d",
+                          branch="b-cap", context={
+                              "push_not_before": future,
+                              "push_refusal_reason": "codex_capacity"}))
+    q.enqueue(TaskRequest(task_id="pane", task_type="implement", description="d",
+                          branch="b-pane", context={
+                              "push_not_before": future,
+                              "push_refusal_reason": "pane_not_agent_shell"}))
+    # The pane's refusal is not a provider delay, so an independent consumer
+    # may take it. The capacity task remains unavailable to both poll paths.
+    got = q.dequeue(agent="codex", role="implementer", claimed_via="mcp")
+    assert got is not None and got.task_id == "pane"
+    assert q.dequeue(agent="codex", role="implementer", claimed_via="http_poll") is None
