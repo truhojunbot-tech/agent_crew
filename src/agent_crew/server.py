@@ -87,6 +87,7 @@ from agent_crew.testing_policy import (
     test_stage_lock,
 )
 from agent_crew.telemetry_response import response_log_telemetry
+from agent_crew.worktree_default_branch import remote_default_branch
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(
@@ -242,7 +243,6 @@ def _reset_pane_busy_cache() -> None:
 _WORKTREE_SYNC_DISABLED = os.getenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "").lower() in (
     "1", "true", "yes",
 )
-_WORKTREE_DEFAULT_BRANCHES: dict[str, str] = {}
 
 
 def _ensure_role_protocol(
@@ -488,29 +488,10 @@ class WorktreeTargetUnresolved(WorktreePrepRefused):
 
 
 def _remote_default_branch(worktree_path: str) -> str:
-    """Resolve and cache this worktree's origin default branch (#555)."""
-    key = os.path.realpath(worktree_path)
-    cached = _WORKTREE_DEFAULT_BRANCHES.get(key)
-    if cached:
-        return cached
-
-    head = subprocess.run(
-        ["git", "-C", worktree_path, "symbolic-ref", "--quiet",
-         "refs/remotes/origin/HEAD"],
-        capture_output=True, text=True, timeout=30,
-    )
-    prefix = "refs/remotes/origin/"
-    target = head.stdout.strip()
-    if head.returncode == 0 and target.startswith(prefix):
-        branch = target[len(prefix):]
-        if branch and branch != "HEAD" and _branch_ref(worktree_path, target):
-            _WORKTREE_DEFAULT_BRANCHES[key] = branch
-            return branch
-
-    for branch in ("main", "master"):
-        if _branch_ref(worktree_path, f"{prefix}{branch}"):
-            _WORKTREE_DEFAULT_BRANCHES[key] = branch
-            return branch
+    """Resolve this worktree's origin default, preserving prep refusal semantics."""
+    branch = remote_default_branch(worktree_path)
+    if branch:
+        return branch
 
     # Best-effort prep has always tolerated paths that are not Git worktrees.
     # A real worktree with no resolvable origin base must still refuse (#555).

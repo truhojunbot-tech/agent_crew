@@ -9,9 +9,11 @@ import sys
 import time
 
 import click
+from click.core import ParameterSource
 
 from agent_crew import setup as setup_module
 from agent_crew.pipeline import ARTIFACT_KINDS
+from agent_crew.worktree_default_branch import remote_default_branch
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT,
     effective_role_mapping,
@@ -2226,13 +2228,9 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "") -> dict[s
                 # A new task base is often not on origin yet.  Do not leave
                 # the prior (unknown/stale) checkout in place: resolve the
                 # remote's advertised default branch and land there instead.
-                default_ref = subprocess.run(
-                    ["git", "-C", wt_path, "symbolic-ref", "--quiet", "--short",
-                     "refs/remotes/origin/HEAD"],
-                    capture_output=True, text=True,
-                )
-                fallback = default_ref.stdout.strip() if default_ref.returncode == 0 else ""
-                fallback = fallback or f"origin/{os.environ.get('AGENT_CREW_MAIN_BRANCH', 'main')}"
+                default_branch = remote_default_branch(wt_path)
+                fallback = (f"origin/{default_branch}" if default_branch else
+                            f"origin/{os.environ.get('AGENT_CREW_MAIN_BRANCH', 'main')}")
                 actual_ref = fallback
                 status = "fallback"
                 fallback_checkout = subprocess.run(
@@ -2744,8 +2742,20 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     _CM: dict = {"coordinator_managed": True}
 
     declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    if "AGENT_CREW_MAIN_BRANCH" not in os.environ:
+        for wt_path in _run_worktrees.values():
+            if wt_path and os.path.isdir(wt_path):
+                try:
+                    resolved_base = remote_default_branch(wt_path)
+                except (OSError, subprocess.TimeoutExpired):
+                    resolved_base = ""
+                if resolved_base:
+                    declared_base = resolved_base
+                    break
+    implicit_main = ("AGENT_CREW_MAIN_BRANCH" not in os.environ and branch == "main" and
+                     click.get_current_context().get_parameter_source("branch") == ParameterSource.DEFAULT)
     run_branch_context = {"base_branch": declared_base,
-                          "crew_run_branch": branch != declared_base}
+                          "crew_run_branch": branch != declared_base and not implicit_main}
     impl_context = {**_CM, **run_branch_context, **risk_context, **issue_context,
                     **artifact_context,
                     "sync_landed_bases": _sync_landed_bases}
