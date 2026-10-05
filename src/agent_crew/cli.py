@@ -2315,6 +2315,33 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
     return landed_bases
 
 
+def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = "",
+                      timeout: float = 30.0, poll_interval: float = 1.0) -> list:
+    """Return the fix tasks whose ``prev_task_id`` is ``review_id`` (#582).
+
+    The server cascade enqueues the fix ~10 s after the review result lands,
+    so poll for it before falling back to a local ``auto_enqueue_fix``. The
+    fallback names the repo and a checkout of it; without them
+    ``pr_is_actionable`` resolves to unknown and no fix is created.
+    """
+    def _fixes():
+        return [t for t in queue.list_tasks()
+                if t.task_type == "implement"
+                and isinstance(t.context, dict)
+                and t.context.get("prev_task_id") == review_id]
+
+    deadline = time.time() + timeout
+    fixes = _fixes()
+    while not fixes and time.time() < deadline:
+        time.sleep(poll_interval)
+        fixes = _fixes()
+    if not fixes:
+        from agent_crew.pipeline import auto_enqueue_fix
+        auto_enqueue_fix(queue, review_id, repo=repo, repo_cwd=repo_cwd)
+        fixes = _fixes()
+    return fixes
+
+
 @crew.command("run")
 @click.argument("task")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
@@ -3019,17 +3046,10 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             impl_id = enqueue_implement(queue, task, impl_branch or branch,
                                         context=retry_context, port=_run_port)
             continue
-        from agent_crew.pipeline import auto_enqueue_fix
-        fixes = [t for t in queue.list_tasks()
-                 if t.task_type == "implement"
-                 and isinstance(t.context, dict)
-                 and t.context.get("prev_task_id") == review_id]
-        if not fixes:
-            auto_enqueue_fix(queue, review_id)
-            fixes = [t for t in queue.list_tasks()
-                     if t.task_type == "implement"
-                     and isinstance(t.context, dict)
-                     and t.context.get("prev_task_id") == review_id]
+        _impl_agent = implementer or _run_role_to_agent.get("implementer", "")
+        fixes = _await_review_fix(
+            queue, review_id, repo=repo,
+            repo_cwd=_run_worktrees.get(_impl_agent, "") if _run_worktrees else "")
         if len(fixes) != 1:
             click.echo(f"[{iteration}/{max_iter}] ❌ Expected one actionable fix for {review_id}; found {len(fixes)}. Stopping.")
             return
