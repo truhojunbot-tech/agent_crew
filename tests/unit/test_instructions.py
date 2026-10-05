@@ -30,6 +30,29 @@ def test_review_and_test_pytest_runs_are_bounded(role, delivery):
     assert "never report" in content.lower()
 
 
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
+@pytest.mark.parametrize("delivery", ["dispatcher", "mcp", "push", "both"])
+def test_review_and_test_claude_p_runs_commands_in_foreground(role, delivery):
+    content = generate(role, "myproject", 8123, delivery=delivery)
+    assert "run every command in the foreground" in content
+    assert "run_in_background" in content
+    assert "Monitor" in content
+    assert "POST the result before ending the turn" in content
+    assert "the session exits then" in content
+
+
+@pytest.mark.parametrize("role", ["reviewer", "tester"])
+@pytest.mark.parametrize("delivery", ["dispatcher", "mcp", "push", "both"])
+def test_review_and_test_bash_timeout_covers_pytest_bound(role, delivery):
+    content = generate(role, "myproject", 8123, delivery=delivery)
+    assert "585 seconds" in content
+    assert "Bash tool's `timeout` parameter" in content
+    assert "(N+15)*1000" in content
+    assert "600000" in content
+    assert "await it in the same turn" in content
+    assert "`status: failed`" in content
+
+
 def test_implementer_protocol_has_no_pytest_rule():
     content = generate("implementer", "myproject", 8123, delivery="dispatcher")
     assert "Bounded pytest runs" not in content
