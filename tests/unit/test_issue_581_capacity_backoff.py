@@ -136,3 +136,19 @@ def test_u_581_mcp_and_http_poll_cannot_claim_capacity_deferred_task(tmp_db):
     got = q.dequeue(agent="codex", role="implementer", claimed_via="mcp")
     assert got is not None and got.task_id == "pane"
     assert q.dequeue(agent="codex", role="implementer", claimed_via="http_poll") is None
+
+
+def test_u_581_discuss_claims_honor_capacity_but_not_pane_backoff(tmp_db):
+    q = TaskQueue(tmp_db)
+    future = time.time() + 600
+    q.enqueue(TaskRequest(task_id="discuss-cap", task_type="discuss", description="d",
+                          branch="b-cap", context={
+                              "agent": "codex", "push_not_before": future,
+                              "push_refusal_reason": "codex_capacity"}))
+    q.enqueue(TaskRequest(task_id="discuss-pane", task_type="discuss", description="d",
+                          branch="b-pane", context={
+                              "agent": "codex", "push_not_before": future,
+                              "push_refusal_reason": "pane_not_agent_shell"}))
+    got = q.dequeue_discuss_for_agent("codex", claimed_via="dispatcher")
+    assert got is not None and got.task_id == "discuss-pane"
+    assert q.dequeue_discuss_for_agent("codex", claimed_via="mcp") is None

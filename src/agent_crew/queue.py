@@ -5550,8 +5550,9 @@ class TaskQueue:
                     ctx = json.loads(row["context"]) if row["context"] else {}
                 except Exception:
                     continue
-                if skip_deferred and float(ctx.get("push_not_before") or 0) > time.time():
-                    continue            # G_DT backoff — see dequeue()
+                if ((skip_deferred or ctx.get("push_refusal_reason") == "codex_capacity")
+                        and float(ctx.get("push_not_before") or 0) > time.time()):
+                    continue            # Pane push or provider-capacity backoff — see dequeue()
                 if ctx.get("agent") == agent:
                     chosen = row
                     break
