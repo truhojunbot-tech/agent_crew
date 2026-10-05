@@ -44,7 +44,8 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import (TaskQueue, PausedError, TaskAlreadyExistsError,
                               DuplicateReviewError,
-                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              risk_declaration)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
 from agent_crew import tokenomics_canary as _tokenomics_canary
 # §11.2 #14: the review/test contract comes from admission, already decided.
@@ -996,6 +997,23 @@ def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
         }
 
 
+def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
+                                 tasks_by_id: dict, parent_task, *,
+                                 ingress: str, successor_provenance=None) -> None:
+    """Keep inherited risk out of the broker payload, then record it (#578)."""
+    inherited: dict = {}
+    _inherit_root_risk(tasks_by_id, parent_task, inherited)
+    queue.enqueue(task, ingress=ingress,
+                  _successor_provenance=successor_provenance)
+    if inherited:
+        try:
+            context = task.context if isinstance(task.context, dict) else {}
+            queue.patch_context(task.task_id, {"risk_declaration": risk_declaration(
+                task.description, {**context, **inherited})})
+        except Exception:
+            logger.exception("inherited risk telemetry failed for %s", task.task_id)
+
+
 def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
                       server_project: Optional[str] = None) -> bool:
     return _tokenomics_canary._is_pinned(
@@ -1595,7 +1613,6 @@ def auto_enqueue_fix(
             "fix_round": fix_round,
             "review_findings": list(review_result.findings or []),
         }
-        _inherit_root_risk(tasks_by_id, review_task, fix_context)
         if pr_number is not None:
             # #186: lets the dispatcher check out the PR head for this task.
             fix_context["pr_number"] = pr_number
@@ -1636,16 +1653,15 @@ def auto_enqueue_fix(
             )
             return None
         try:
-            queue.enqueue(TaskRequest(
+            _enqueue_with_inherited_risk(queue, TaskRequest(
                 task_id=fix_id,
                 task_type="implement",  # type: ignore[arg-type]
                 description="\n".join(parts),
                 branch=review_task.branch,
                 context=fix_context,
                 project=_successor_project(queue, review_task, server_project),
-            ),
-                          ingress="cascade.fix",
-                          _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+            ), tasks_by_id, review_task, ingress="cascade.fix",
+                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.
@@ -2016,8 +2032,6 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
-        _inherit_root_risk({t.task_id: t for t in queue.list_tasks()},
-                           impl_task, review_context)
         if enforce_risk_tier:
             review_context.update(risk)
         if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
@@ -2070,7 +2084,9 @@ def auto_enqueue_review(
             project=_successor_project(queue, impl_task, server_project),
         )
         try:
-            queue.enqueue(review_req, ingress="cascade.review")
+            _enqueue_with_inherited_risk(
+                queue, review_req, {t.task_id: t for t in queue.list_tasks()},
+                impl_task, ingress="cascade.review")
         except TaskAlreadyExistsError:
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
@@ -2191,7 +2207,6 @@ def auto_enqueue_test(
                          "provider": "gemini",
                          "cooldown_until": until if math.isfinite(until) else "unknown"}
         test_context: dict = {"prev_task_id": review_task_id}
-        _inherit_root_risk(tasks_by_id, review_task, test_context)
         # Test the exact revision approved by the reviewer. This is also the
         # artifact component of the test's CEA intent identity.
         if review_ctx.get("reviewed_sha"):
@@ -2244,7 +2259,9 @@ def auto_enqueue_test(
             project=_successor_project(queue, review_task, server_project),
         )
         try:
-            queue.enqueue(test_req, ingress="cascade.test")
+            _enqueue_with_inherited_risk(
+                queue, test_req, tasks_by_id, review_task,
+                ingress="cascade.test")
         except TaskAlreadyExistsError:
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
         except DuplicateReviewError as exc:
