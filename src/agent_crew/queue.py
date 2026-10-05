@@ -1243,6 +1243,7 @@ _DDL_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_type_status ON tasks(task_type, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority DESC, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_pr_context_valid ON tasks(project, COALESCE(pr_number, CASE WHEN json_valid(context) THEN json_extract(context,'$.pr_number') END));
 CREATE INDEX IF NOT EXISTS idx_checkpoints_task_num ON checkpoints(task_id, checkpoint_num DESC);
 CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status);
 """
@@ -1500,6 +1501,10 @@ class TaskQueue:
             except Exception:
                 pass  # column already exists
         # Create indexes for performance
+        # #590/#558: the earlier expression index called json_extract on every
+        # inserted context, including legacy malformed rows outside a limited
+        # /tasks listing. Replace it once; the versioned safe index persists.
+        conn.execute("DROP INDEX IF EXISTS idx_tasks_project_pr_context")
         for idx_stmt in _DDL_INDEXES.strip().split('\n'):
             if idx_stmt.strip():
                 conn.execute(idx_stmt)

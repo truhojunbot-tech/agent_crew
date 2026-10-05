@@ -33,8 +33,9 @@ from agent_crew.memory import (
     shadow_retrieve_bounded,
     shadow_telemetry,
 )
-from agent_crew.memory_capture import capture_result_best_effort
-from agent_crew.memory_runtime import SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
+from agent_crew.memory_capture import capture_result_best_effort, task_lineage
+from agent_crew.memory_runtime import (SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS,
+                                       SHADOW_RETRIEVAL_MAX_ROWS)
 from agent_crew.context_identity import (
     append_attribution_jsonl,
     detect_context_compaction,
@@ -291,6 +292,15 @@ def _required_context_recalled_observation(pack) -> Optional[bool]:
     if bool(pack.degraded):
         return False
     return True if getattr(pack, "items", ()) else None
+
+
+def _lineage_recall_observation(result, predecessor_task_ids: tuple[str, ...]) -> Optional[bool]:
+    """Shadow memory recalled every predecessor, or there was none to recall."""
+    if not predecessor_task_ids:
+        return None
+    result_ids = {item.item_id for item in result.items}
+    return all(f"task:{task_id}:decision" in result_ids
+               for task_id in predecessor_task_ids)
 
 
 def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Optional[str]:
@@ -5317,6 +5327,14 @@ def create_app(
         # converted to telemetry by `shadow_retrieve`, not an execution error.
         if shadow_memory_enabled:
             try:
+                try:
+                    _predecessors, _lineage_pr = await asyncio.to_thread(
+                        task_lineage, db_path, task.task_id)
+                except Exception:
+                    logger.exception("dispatcher: lineage lookup failed for %s", task.task_id)
+                    _parent = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
+                    _predecessors = (_parent,) if isinstance(_parent, str) and _parent else ()
+                    _lineage_pr = task.pr_number or (_ctx.get("pr_number") if isinstance(_ctx, dict) else None)
                 _shadow_result = shadow_retrieve_bounded(
                     _memory_provider, MemoryRequest(
                         project=_project,
@@ -5332,8 +5350,19 @@ def create_app(
                             _ctx.get("reviewed_sha", "") if isinstance(_ctx, dict) else ""),
                         memory_types=(
                             "procedural", "episodic", "decision", "failure_pattern", "evidence"),
+                        predecessor_task_ids=_predecessors,
+                        pr_number=_lineage_pr,
+                        limit=min(SHADOW_RETRIEVAL_MAX_ROWS, max(10, len(_predecessors))),
                     ), shadow_memory_timeout_seconds,
                 )
+                try:
+                    q().record_required_context_recalled(
+                        task.task_id,
+                        _lineage_recall_observation(_shadow_result, _predecessors),
+                    )
+                except Exception:
+                    logger.exception("dispatcher: lineage recall telemetry failed for %s",
+                                     task.task_id)
                 _shadow_event = {
                     **shadow_telemetry(_shadow_result),
                     "task_id": task.task_id,

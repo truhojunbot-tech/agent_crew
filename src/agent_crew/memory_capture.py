@@ -113,6 +113,7 @@ def canonical_project(name: str, *, repo: str = "") -> str:
 def capture_task_outcome(storage: SQLiteMemoryStorage, *, project: str, repo: str,
                          task_id: str, status: str, summary: str,
                          verdict: str = "", pr_number: int | None = None,
+                         predecessor_task_ids: tuple[str, ...] = (),
                          issue: str = "", worktree: str = "",
                          provider_session: str = "",
                          context_generation: int | None = None) -> list[MemoryRecord]:
@@ -122,6 +123,7 @@ def capture_task_outcome(storage: SQLiteMemoryStorage, *, project: str, repo: st
         raise ValueError("task outcome requires a terminal task id and status")
     value = {"task_id": task_id, "status": status, "summary": (summary or "")[:600],
              "verdict": verdict or "", "pr_number": pr_number,
+             "project": canonical, "predecessor_task_ids": list(predecessor_task_ids),
              "source_ref": f"crew-task:{canonical}:{task_id}"}
     layers = ["episodic", "decision"]
     if status in {"failed", "needs_human", "timed_out"}:
@@ -135,6 +137,62 @@ def capture_task_outcome(storage: SQLiteMemoryStorage, *, project: str, repo: st
     storage.put_many_shadow(records, retire_keys=(f"task:{task_id}:failure_pattern",)
                             if status == "completed" else ())
     return records
+
+
+def _task_context(raw: object) -> dict:
+    """Legacy task contexts may be malformed; shadow recall must stay optional."""
+    try:
+        context = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return context if isinstance(context, dict) else {}
+
+
+def task_lineage(db_path: str, task_id: str) -> tuple[tuple[str, ...], int | None]:
+    """Read this task's predecessor chain and earlier terminal tasks on its PR."""
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True, timeout=shadow_sqlite_timeout_seconds())) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT rowid, project, context, pr_number FROM tasks WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return (), None
+        context = _task_context(row["context"])
+        pr_number = row["pr_number"] or context.get("pr_number")
+        predecessors: list[str] = []
+        seen = {task_id}
+        parent = context.get("prev_task_id")
+        while isinstance(parent, str) and parent and parent not in seen:
+            seen.add(parent)
+            previous = db.execute(
+                "SELECT project, context FROM tasks WHERE task_id=?", (parent,),
+            ).fetchone()
+            if previous is None:
+                # A declared predecessor that has disappeared is still required
+                # context; recall must observe a miss instead of reporting NULL.
+                predecessors.append(parent)
+                break
+            if previous["project"] != row["project"]:
+                break
+            predecessors.append(parent)
+            parent = _task_context(previous["context"]).get("prev_task_id")
+        if pr_number:
+            # rowid is insertion order; it excludes this task and later work
+            # even when several tasks have the same created_at timestamp.
+            for previous in db.execute(
+                "SELECT task_id FROM tasks WHERE project=? "
+                "AND COALESCE(pr_number,CASE WHEN json_valid(context) "
+                "THEN json_extract(context,'$.pr_number') END)=? "
+                "AND rowid<? AND status IN ('completed','failed','needs_human','timed_out') "
+                "ORDER BY rowid DESC",
+                (row["project"], pr_number, row["rowid"]),
+            ):
+                if previous["task_id"] not in seen:
+                    seen.add(previous["task_id"])
+                    predecessors.append(previous["task_id"])
+        return tuple(predecessors), pr_number
 
 
 def capture_blackboard_result(storage: SQLiteMemoryStorage, frontmatter: dict) -> MemoryRecord:
@@ -192,7 +250,7 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
         timeout_seconds = shadow_sqlite_timeout_seconds(capture=True)
         with closing(sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True,
                                      timeout=timeout_seconds)) as db:
-            row = db.execute("SELECT project,context FROM tasks WHERE task_id=?",
+            row = db.execute("SELECT project,context,pr_number FROM tasks WHERE task_id=?",
                              (task_id,)).fetchone()
             try:
                 attribution = db.execute(
@@ -204,11 +262,14 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
         context = json.loads(row[1] or "{}") if row else {}
         if not isinstance(context, dict):
             context = {}
+        predecessors, lineage_pr_number = task_lineage(db_path, task_id)
         records = capture_task_outcome(
             SQLiteMemoryStorage.existing(str(path)), project=row[0] if row else "",
             repo=str(context.get("repo") or context.get("target_repo") or ""),
             task_id=task_id, status=result.status, summary=result.summary,
-            verdict=result.verdict or "", pr_number=result.pr_number,
+            verdict=result.verdict or "",
+            pr_number=result.pr_number or (row[2] if row else None) or lineage_pr_number,
+            predecessor_task_ids=predecessors,
             issue=context.get("issue") or "",
             worktree=attribution[0] if attribution else "",
             provider_session=attribution[1] if attribution else "",
