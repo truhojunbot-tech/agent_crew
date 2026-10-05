@@ -207,14 +207,21 @@ class TaskResult:
                 self.pr_number = normalized
 
 
-def validate_review_result(result: TaskResult) -> Optional[str]:
-    """Reject diagnostic review payloads before they become final verdicts."""
+def validate_review_result(result: TaskResult, *, require_verdict: bool = False) -> Optional[str]:
+    """Reject diagnostic review payloads before they become final verdicts.
+
+    ``require_verdict`` (#586) is set only for a live (pending/in_progress)
+    row: a revision of a worker-failed review keeps its old intake rules.
+    """
     if result.status != "completed":
         return None
-    if (result.verdict not in ("approve", "request_changes")
+    if require_verdict and (
+            result.verdict not in ("approve", "request_changes")
             or (result.verdict == "approve" and result.findings)
             or (result.verdict == "request_changes" and not result.findings)):
         return "review result requires a verdict: approve with no findings or request_changes with findings"
+    if result.verdict not in ("approve", "request_changes"):
+        return None
     if len(result.summary.strip()) < 40:
         return "review summary must be at least 40 characters for a final verdict"
     for index, finding in enumerate(result.findings):
