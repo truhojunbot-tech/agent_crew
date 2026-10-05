@@ -5,6 +5,8 @@ import json
 import subprocess
 from urllib.error import URLError
 
+import pytest
+
 from agent_crew import cli
 
 
@@ -94,3 +96,51 @@ def test_sync_preserves_existing_behavior_when_server_unreachable(tmp_path, monk
     assert _git(busy, "rev-parse", "HEAD") == base
     assert _git(idle, "rev-parse", "HEAD") == base
     assert {record["status"] for record in landed.values()} == {"known"}
+
+
+@pytest.mark.parametrize("context, expected_agent", [
+    ({}, "claude"),
+    ({"agent_override": "gemini"}, "gemini"),
+])
+def test_claimed_before_dispatch_is_busy(tmp_path, monkeypatch, context, expected_agent):
+    """The server pins a claimed task's worktree before dispatched_at exists."""
+    busy, idle, base, feature = _worktrees(tmp_path)
+    worktrees = {"claude": str(busy), "gemini": str(idle)}
+    target = busy if expected_agent == "claude" else idle
+    monkeypatch.setattr(cli, "_fetch_tasks_by_status",
+                        lambda *args, **kwargs: [{"task_id": "review-claimed"}])
+    monkeypatch.setattr("urllib.request.urlopen", lambda *_args, **_kwargs: _Response(
+        json.dumps({"task_id": "review-claimed", "task_type": "review",
+                    "status": "in_progress", "context": context,
+                    "execution": {"claimed_by_role": "reviewer", "dispatched_at": 0}}).encode()))
+
+    landed = cli._sync_worktrees_to_main(
+        worktrees, base_branch="main", port=8105, project="demo")
+
+    assert _git(target, "rev-parse", "HEAD") == feature
+    assert landed[expected_agent]["status"] == "skipped_busy"
+    other = "gemini" if expected_agent == "claude" else "claude"
+    assert landed[other]["sha"] == base
+
+
+@pytest.mark.parametrize("tasks,detail", [
+    ([{}], None),
+    ([{"task_id": "finished"}], {"status": "completed", "execution": {}}),
+    ([{"task_id": "unknown-agent"}], {"status": "in_progress",
+                                    "execution": {"dispatched_at": 1,
+                                                  "dispatch_agent": "other"}}),
+])
+def test_busy_lookup_filters_nonmatching_tasks(
+        tmp_path, monkeypatch, tasks, detail):
+    wt = tmp_path / "claude"
+    wt.mkdir()
+    monkeypatch.setattr(cli, "_fetch_tasks_by_status",
+                        lambda *args, **kwargs: tasks)
+
+    def task_detail(*_args, **_kwargs):
+        assert detail is not None
+        return _Response(json.dumps(detail).encode())
+
+    monkeypatch.setattr("urllib.request.urlopen", task_detail)
+    assert cli._busy_sync_worktrees(
+        {"claude": str(wt)}, port=8105, project="demo") == {}

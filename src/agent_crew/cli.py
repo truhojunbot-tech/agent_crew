@@ -13,6 +13,7 @@ from click.core import ParameterSource
 
 from agent_crew import setup as setup_module
 from agent_crew.pipeline import ARTIFACT_KINDS
+from agent_crew.queue import _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT,
@@ -2188,8 +2189,9 @@ def teardown(project: str, base: str):
     click.echo(f"Teardown complete: {project}")
 
 
-def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str) -> dict[str, str]:
-    """Map dispatched worktree paths to active task ids using the target server."""
+def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
+                         role_to_agent: dict | None = None) -> dict[str, str]:
+    """Map claimed worktree paths to active task ids using the target server."""
     import urllib.request
 
     if not port:
@@ -2210,9 +2212,13 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str) -> dict[st
             if detail.get("status") != "in_progress":
                 continue
             execution = detail.get("execution") or {}
-            if not execution.get("dispatched_at"):
-                continue
             agent = execution.get("dispatch_agent")
+            if not agent:
+                context = detail.get("context") or {}
+                agent = context.get("agent_override")
+            if not agent:
+                role = _TYPE_TO_ROLE.get(detail.get("task_type"))
+                agent = (role_to_agent or DEFAULT_ROLE_TO_AGENT).get(role)
             wt_path = worktrees.get(agent) if agent else None
             if wt_path:
                 busy[os.path.realpath(wt_path)] = task_id
@@ -2224,7 +2230,8 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str) -> dict[st
 
 
 def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
-                            port: int = 0, project: str = "") -> dict[str, dict]:
+                            port: int = 0, project: str = "",
+                            role_to_agent: dict | None = None) -> dict[str, dict]:
     """Reset all agent worktrees to their configured origin base branch.
 
     Used both before a crew run/discuss (so agents start from latest main)
@@ -2238,7 +2245,8 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
             continue
         requested_ref = f"origin/{main_branch}"
         # Recheck immediately before this worktree's first mutating git call.
-        busy = _busy_sync_worktrees({agent: wt_path}, port=port, project=project)
+        busy = _busy_sync_worktrees({agent: wt_path}, port=port, project=project,
+                                    role_to_agent=role_to_agent)
         task_id = busy.get(os.path.realpath(wt_path))
         if task_id:
             landed_bases[agent] = {"requested_ref": requested_ref, "actual_ref": None,
@@ -2716,11 +2724,13 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     # Determine port and worktrees (available when --project is set)
     _run_port = 0
     _run_worktrees: dict = {}
+    _run_role_to_agent = dict(DEFAULT_ROLE_TO_AGENT)
     if project:
         _pstate = _read_state(base, project)
         if _pstate:
             _run_port = _pstate.get("port", 0)
             _run_worktrees = _pstate.get("worktrees", {})
+            _run_role_to_agent, _ = effective_role_mapping(_pstate, project=project)
 
     # Fast server liveness check — avoid the 70+ second task-wait timeout when
     # the server is simply not running (crashed or not yet started).
@@ -2782,7 +2792,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
     if _run_worktrees and _adopted_impl_status != "in_progress":
         click.echo(f"Syncing worktrees to origin/{branch}...")
         _sync_landed_bases = _sync_worktrees_to_main(
-            _run_worktrees, base_branch=branch, port=_run_port, project=project)
+            _run_worktrees, base_branch=branch, port=_run_port, project=project,
+            role_to_agent=_run_role_to_agent)
 
     _CM: dict = {"coordinator_managed": True}
 
@@ -2954,13 +2965,15 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                     if _run_worktrees:
                         _sync_worktrees_to_main(
                             _run_worktrees, base_branch=branch,
-                            port=_run_port, project=project)  # #166
+                            port=_run_port, project=project,
+                            role_to_agent=_run_role_to_agent)  # #166
                     return
                 else:
                     click.echo(f"[{iteration}/{max_iter}] ❌ Tests {test_outcome} ({test_elapsed}s). Re-implementing.")
                     retry_bases = _sync_worktrees_to_main(
                         _run_worktrees, base_branch=impl_branch or branch,
-                        port=_run_port, project=project) if _run_worktrees else {}
+                        port=_run_port, project=project,
+                        role_to_agent=_run_role_to_agent) if _run_worktrees else {}
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
                                                context={**_CM, **run_branch_context, **risk_context,
                                                         **issue_context,
@@ -2979,7 +2992,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                 if _run_worktrees:
                     _sync_worktrees_to_main(
                         _run_worktrees, base_branch=branch,
-                        port=_run_port, project=project)  # #166
+                        port=_run_port, project=project,
+                        role_to_agent=_run_role_to_agent)  # #166
             return
 
         # request_changes: re-implement with feedback
@@ -2994,7 +3008,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             feedback = build_feedback(review_result)
             retry_bases = _sync_worktrees_to_main(
                 _run_worktrees, base_branch=impl_branch or branch,
-                port=_run_port, project=project) if _run_worktrees else {}
+                port=_run_port, project=project,
+                role_to_agent=_run_role_to_agent) if _run_worktrees else {}
             retry_context = {**_CM, **run_branch_context, **risk_context, **issue_context,
                              **artifact_context,
                              "feedback": feedback,
@@ -3248,7 +3263,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     if _discuss_worktrees:
         click.echo("Syncing worktrees to origin/main...")
         _discuss_sync_bases = _sync_worktrees_to_main(
-            _discuss_worktrees, port=_run_port, project=project)
+            _discuss_worktrees, port=_run_port, project=project,
+            role_to_agent=effective_role_mapping(project_state, project=project)[0])
 
     prior_synthesis = ""
     final_synthesis = ""
