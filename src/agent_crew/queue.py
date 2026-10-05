@@ -4341,14 +4341,25 @@ class TaskQueue:
             task_context = json.loads(task_row["context"] or "{}") if task_row is not None else {}
         except (TypeError, ValueError):
             task_context = {}
+        envelope = _quality_evidence_envelope(
+            evidence,
+            task_context.get("risk_declaration") if isinstance(task_context, dict) else None,
+        )
+        prior = conn.execute(
+            "SELECT evidence_json FROM tokenomics_shadow_receipts WHERE task_id=?", (task_id,)
+        ).fetchone()
+        if prior is not None:
+            try:
+                prior_evidence = json.loads(prior["evidence_json"] or "{}")
+            except (TypeError, ValueError):
+                prior_evidence = {}
+            if (isinstance(prior_evidence, dict)
+                    and isinstance(prior_evidence.get("canary_history"), list)):
+                envelope["canary_history"] = prior_evidence["canary_history"]
         conn.execute(
             """UPDATE tokenomics_shadow_receipts
                SET outcome=COALESCE(?, outcome), economics_json=?, evidence_json=?, updated_at=? WHERE task_id=?""",
-            (outcome, economics_json,
-             json.dumps(_quality_evidence_envelope(
-                 evidence,
-                 task_context.get("risk_declaration") if isinstance(task_context, dict) else None,
-             )), now, task_id),
+            (outcome, economics_json, json.dumps(envelope), now, task_id),
         )
 
     def record_required_context_recalled(self, task_id: str, observed: Optional[bool]) -> None:
@@ -6504,30 +6515,11 @@ class TaskQueue:
                    VALUES (?, 'baseline', NULL, NULL, ?, ?, ?)""",
                 (task_id, json.dumps({"cascade": "baseline", "task_type": "review"}), now, now),
             )
-            row = conn.execute(
-                "SELECT evidence_json FROM tokenomics_shadow_receipts WHERE task_id=?",
-                (task_id,),
-            ).fetchone()
-            try:
-                evidence = json.loads(row["evidence_json"] or "{}") if row else {}
-            except (TypeError, ValueError):
-                evidence = {}
-            if not isinstance(evidence, dict):
-                evidence = {}
-            history = evidence.get("canary_history")
-            history = list(history) if isinstance(history, list) else []
-            history.append({
-                "at": now, "decision_source": decision_source,
-                "recommendation": recommendation, "applied": bool(applied),
-                "counterfactual": counterfactual, "reason": reason,
-                "cea_receipt_id": cea_receipt_id,
-            })
-            evidence["canary_history"] = history
-            # This append is unconditional: preserve_applied only protects the
-            # latest columns, not the record of evaluations (#579).
-            conn.execute(
-                "UPDATE tokenomics_shadow_receipts SET evidence_json=?, updated_at=? "
-                "WHERE task_id=?", (json.dumps(evidence), now, task_id),
+            self._append_canary_history_in_txn(
+                conn, task_id, at=now, decision_source=decision_source,
+                recommendation=recommendation, applied=applied,
+                counterfactual=counterfactual, reason=reason,
+                cea_receipt_id=cea_receipt_id,
             )
             conn.execute(
                 """UPDATE tokenomics_shadow_receipts
@@ -6542,6 +6534,40 @@ class TaskQueue:
             conn.commit()
         finally:
             conn.close()
+
+    @staticmethod
+    def _append_canary_history_in_txn(
+        conn: sqlite3.Connection, task_id: str, *, at: float,
+        decision_source: str, recommendation: dict, applied: bool,
+        counterfactual: str | dict, reason: str,
+        cea_receipt_id: Optional[str],
+    ) -> None:
+        """Append one canary observation without leaving the caller's transaction."""
+        row = conn.execute(
+            "SELECT evidence_json FROM tokenomics_shadow_receipts WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        history = evidence.get("canary_history")
+        history = list(history) if isinstance(history, list) else []
+        history.append({
+            "at": at, "decision_source": decision_source,
+            "recommendation": recommendation, "applied": bool(applied),
+            "counterfactual": counterfactual, "reason": reason,
+            "cea_receipt_id": cea_receipt_id,
+        })
+        evidence["canary_history"] = history
+        conn.execute(
+            "UPDATE tokenomics_shadow_receipts SET evidence_json=?, updated_at=? "
+            "WHERE task_id=?", (json.dumps(evidence), at, task_id),
+        )
 
     def pending_rounds_cap_reresolutions(self) -> list[dict]:
         """Return only switch-off observations awaiting a fresh contract."""
@@ -6564,6 +6590,7 @@ class TaskQueue:
         conn = self._connect()
         try:
             now = time.time()
+            conn.execute("BEGIN IMMEDIATE")
             changed = conn.execute(
                 """UPDATE tokenomics_shadow_receipts
                    SET canary_decision_source=?, canary_recommendation_json=?,
@@ -6575,6 +6602,12 @@ class TaskQueue:
                 (decision_source, json.dumps(recommendation), json.dumps(counterfactual),
                  reason, now, now, task_id, expected_counterfactual),
             ).rowcount
+            if changed == 1:
+                self._append_canary_history_in_txn(
+                    conn, task_id, at=now, decision_source=decision_source,
+                    recommendation=recommendation, applied=False,
+                    counterfactual=counterfactual, reason=reason, cea_receipt_id=None,
+                )
             conn.commit()
             return changed == 1
         finally:
@@ -6640,6 +6673,12 @@ class TaskQueue:
                 (json.dumps(recommendation), json.dumps(counterfactual),
                  receipt_id, now, now, receipt_task_id),
             )
+            self._append_canary_history_in_txn(
+                conn, receipt_task_id, at=now, decision_source="quota_core_contract",
+                recommendation=recommendation, applied=True,
+                counterfactual=counterfactual, reason="round_cap_reached",
+                cea_receipt_id=receipt_id,
+            )
             conn.commit()
             return receipt_id
         except Exception:
@@ -6661,6 +6700,12 @@ class TaskQueue:
                WHERE task_id=?""",
             (decision_source, json.dumps(recommendation), counterfactual or None,
              reason, cea_receipt_id, now, now, task_id),
+        )
+        self._append_canary_history_in_txn(
+            conn, task_id, at=now, decision_source=decision_source,
+            recommendation=recommendation, applied=True,
+            counterfactual=counterfactual, reason=reason,
+            cea_receipt_id=cea_receipt_id,
         )
 
     def suppress_review_atomically(
