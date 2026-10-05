@@ -6801,6 +6801,7 @@ def create_app(
             _runtime_paused = True
         _artifact_context = _task.context if _task is not None and isinstance(_task.context, dict) else {}
         _artifact_verified = None
+        _inferred_artifact = None
         # T5, ADR §11.1 row 10 / fixture CXC-6a: "dispatch base absent" is a
         # FAIL, never a pass. An implement task that completes with no declared
         # artifact contract and no `worktree_base_sha`/`reviewed_sha` gives the
@@ -6837,10 +6838,11 @@ def create_app(
                 _task, result, repo_cwd=_any_worktree_path(),
                 commit_verifier=verify_implement_artifact)
             if (not _ok and _detail.startswith(MISSING_IMPLEMENT_REF_DETAIL)
-                    and _task is not None and _task.task_type == "implement"):
+                    and _task is not None and _task.task_type == "implement"
+                    and _task.status == "in_progress"):
                 # A result with no refs may still have a git-proven artifact
-                # in the exact worktree recorded for this dispatch (#573).
-                # Never infer one from the summary or from another role's tree.
+                # in the exact worktree recorded for this active dispatch (#573).
+                # A late revision must not adopt the next task's HEAD there.
                 try:
                     attribution = q().get_attribution(task_id) or {}
                     wt = str(attribution.get("worktree_path") or "")
@@ -6859,6 +6861,16 @@ def create_app(
                                 _task, candidate, repo_cwd=wt,
                                 commit_verifier=verify_implement_artifact)
                             result, _ok, _detail = candidate, candidate_ok, candidate_detail
+                            if candidate_ok:
+                                _inferred_artifact = {
+                                    "source": "worktree_head", "worktree_path": wt,
+                                    "commit": head, "branch": branch,
+                                }
+                                logger.info(
+                                    "POST /tasks/%s/result: inferred worktree artifact "
+                                    "worktree=%s commit=%s branch=%s",
+                                    task_id, wt, head, branch,
+                                )
                 except Exception:
                     logger.exception("POST /tasks/%s/result: worktree artifact probe failed",
                                      task_id)
@@ -6868,6 +6880,8 @@ def create_app(
             else:
                 _artifact_verified = {"kind": declared_artifact_kind(_task) if declared_artifact_kind(_task) is not None else "commit",
                                       "detail": _detail}
+                if _inferred_artifact is not None:
+                    _artifact_verified.update(_inferred_artifact)
         # #268: does this result even claim to be about the PR we dispatched
         # it for? Must happen before the row is written, so what lands in the
         # DB is the held form — a human reading the row later sees the

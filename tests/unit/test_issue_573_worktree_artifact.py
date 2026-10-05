@@ -1,5 +1,6 @@
 """A dispatched worktree can prove a missing implement result ref (#573)."""
 
+import logging
 import subprocess
 
 import pytest
@@ -52,7 +53,7 @@ def _worktree(tmp_path, head_state):
     "descendant", "base", "unrelated", "unpublished", "unknown_path",
 ])
 def test_missing_refs_use_only_descendant_dispatched_worktree_head(
-        tmp_path, monkeypatch, head_state):
+        tmp_path, monkeypatch, caplog, head_state):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "off")
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     worker, base, head = _worktree(tmp_path, head_state)
@@ -63,13 +64,14 @@ def test_missing_refs_use_only_descendant_dispatched_worktree_head(
         context={"worktree_base_sha": base, "base_branch": "main",
                  "crew_run_branch": False},
     ))
+    assert queue.dequeue(role="implementer").task_id == "impl-573"
     if head_state != "unknown_path":
         queue.record_attribution("impl-573", worktree_path=str(worker),
                                  role="implementer", agent="codex")
     app = create_app(db, worktree_map={"implementer": str(worker)},
                      pane_map={}, identity_required=False,
                      watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app) as client:
+    with caplog.at_level(logging.INFO), TestClient(app) as client:
         response = client.post("/tasks/impl-573/result", json={
             "task_id": "impl-573", "status": "completed", "summary": "work done",
         })
@@ -84,6 +86,11 @@ def test_missing_refs_use_only_descendant_dispatched_worktree_head(
         assert len(reviews) == 1
         assert reviews[0].branch == "feature"
         assert reviews[0].context["reviewed_sha"] == head
+        provenance = queue.get_task_context("impl-573")["result_artifact"]
+        assert provenance["source"] == "worktree_head"
+        assert provenance["worktree_path"] == str(worker)
+        assert any("inferred worktree artifact" in record.message
+                   for record in caplog.records)
     else:
         assert response.json()["held"] == "no_artifact"
         assert queue.get_task_status("impl-573") == "failed"
@@ -92,3 +99,50 @@ def test_missing_refs_use_only_descendant_dispatched_worktree_head(
             assert queue.get_result("impl-573").commit == head
         else:
             assert queue.get_result("impl-573").commit == ""
+
+
+def test_late_revision_cannot_adopt_another_tasks_worktree_head(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "off")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    worker, base, _ = _worktree(tmp_path, "base")
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest(
+        "impl-a", "implement", "first task", branch="main", project="demo",
+        context={"worktree_base_sha": base, "base_branch": "main",
+                 "crew_run_branch": False},
+    ))
+    assert queue.dequeue(role="implementer").task_id == "impl-a"
+    queue.record_attribution("impl-a", worktree_path=str(worker),
+                             role="implementer", agent="codex")
+    app = create_app(db, worktree_map={"implementer": str(worker)},
+                     pane_map={}, identity_required=False,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        failed = client.post("/tasks/impl-a/result", json={
+            "task_id": "impl-a", "status": "failed", "summary": "first task failed",
+        })
+        assert failed.status_code == 200, failed.text
+        assert queue.get_task_status("impl-a") == "failed"
+
+        queue.enqueue(TaskRequest("impl-b", "implement", "second task",
+                                  branch="main", project="demo"))
+        assert queue.dequeue(role="implementer").task_id == "impl-b"
+        queue.record_attribution("impl-b", worktree_path=str(worker),
+                                 role="implementer", agent="codex")
+        _git(worker, "checkout", "-b", "agent/other-task")
+        (worker / "other.txt").write_text("another task's work\n")
+        _git(worker, "add", "other.txt")
+        _git(worker, "commit", "-m", "other task")
+        _git(worker, "push", "origin", "agent/other-task")
+
+        late = client.post("/tasks/impl-a/result", json={
+            "task_id": "impl-a", "status": "completed", "summary": "late completion",
+        })
+
+    assert late.status_code == 200, late.text
+    assert late.json()["held"] == "no_artifact"
+    assert queue.get_task_status("impl-a") == "failed"
+    assert queue.get_result("impl-a").commit == ""
+    assert not [task for task in queue.list_tasks()
+                if task.task_type == "review" and task.context.get("prev_task_id") == "impl-a"]
