@@ -837,6 +837,9 @@ timeout (default 900s). An explicit POST with `status: failed` and a reason in
 _BOUNDED_PYTEST = """\
 ### Bounded pytest runs (#340)
 
+For `claude -p` reviewer/tester tasks, run every command in the foreground (no
+`run_in_background`, Monitor, or background waits) and POST the result before ending the turn; the session exits then.
+
 Bound **every** pytest invocation, including a fallback run. At task receipt,
 note the start time. Before each run, set `N` to the smaller of 600 seconds and
 half the remaining dispatch budget in whole seconds. Use
