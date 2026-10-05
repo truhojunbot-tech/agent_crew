@@ -841,12 +841,19 @@ For `claude -p` reviewer/tester tasks, run every command in the foreground (no
 `run_in_background`, Monitor, or background waits) and POST the result before ending the turn; the session exits then.
 
 Bound **every** pytest invocation, including a fallback run. At task receipt,
-note the start time. Before each run, set `N` to the smaller of 600 seconds and
+note the start time. Before each run, set `N` to the smaller of 585 seconds and
 half the remaining dispatch budget in whole seconds. Use
 `context.dispatch_timeout_s` from the task block; if absent, use a conservative
 900-second budget (the tester default), giving at most 450 seconds. Subtract
 elapsed time since task receipt
 before halving. If no time remains, do not start pytest.
+
+For `claude -p`, set the Bash tool's `timeout` parameter to at least
+`(N+15)*1000` milliseconds, capped at `600000` milliseconds. This covers the
+shell timeout and its 10-second kill grace period so the tool does not move a
+foreground pytest run to the background at its default 120-second timeout.
+If a command is backgrounded anyway, await it in the same turn or POST a
+`status: failed` result with the reason; never end the turn without a POST.
 
 ```bash
 timeout -k 10 "$N" python -m pytest <test paths and options>
