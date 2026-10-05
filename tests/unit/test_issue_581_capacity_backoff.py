@@ -319,3 +319,129 @@ def test_u_581_capacity_keys_do_not_change_the_receipt_payload_hash():
         "x": 1, "push_not_before": 1.0, "push_refusal_reason": "codex_capacity",
         "provider_capacity_count": 3, "provider_capacity_since": 1.0,
         "provider_capacity_blocked_at": 2.0})
+
+
+# ── CEA enforcement: re-dispatch after a spent receipt (codex r1 of 1210a4a) ──
+
+@pytest.fixture
+def enforcing_codex_queues(monkeypatch):
+    """s4b's ``enforcing_queues`` harness (every queue, the server's included,
+    runs ``mode=test`` on wired providers and reads no production input), with
+    codex as the bound implementer like this crew, and the default
+    one-attempt receipt budget."""
+    import types
+
+    from agent_crew.cea import wiring as cea_wiring
+    from agent_crew.cea.engine import DEFAULT_ROLE_AGENTS, EngineConfig
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED
+
+    original = TaskQueue.__init__
+    agents = {**DEFAULT_ROLE_AGENTS, "implementer": "codex"}
+
+    def patched(self, db_path, **kw):
+        kw["cea_config"] = EngineConfig(mode="test", role_agents=agents)
+        kw["cea_providers"] = dict(WIRED)
+        original(self, db_path, **kw)
+
+    monkeypatch.setattr(TaskQueue, "__init__", patched)
+    monkeypatch.setattr(cea_wiring, "install_from_env", lambda *a, **k: types.SimpleNamespace(
+        providers=dict(WIRED), authority=None, mode="test", statuses=()))
+
+
+def test_u_581_capacity_redispatches_under_cea_enforcement(tmp_path, enforcing_codex_queues):
+    """Under ``mode=test`` the default one-attempt receipt is spent by the
+    first capacity refusal and §8 supersedes it. The work must still come back
+    — through admission, as a successor with its own receipt — and complete
+    with every gate (claim, dispatch nonce, /start, result) verifying it."""
+    import sqlite3
+
+    from agent_crew.cea import store as receipt_store
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import admitted
+
+    db = str(tmp_path / "enf.db")
+    TaskQueue(db)
+    spawned: list[str] = []
+    started: list[dict] = []
+
+    def _in_flight():
+        conn = sqlite3.connect(db)
+        conn.row_factory = sqlite3.Row
+        try:
+            row = conn.execute("SELECT task_id, receipt_id FROM tasks "
+                               "WHERE status = 'in_progress'").fetchone()
+            nonce = conn.execute(
+                "SELECT nonce FROM dispatch_nonces WHERE receipt_id = ? AND used_at IS NULL "
+                "ORDER BY issued_at DESC LIMIT 1", (row["receipt_id"],)).fetchone()
+            return row["task_id"], nonce["nonce"]
+        finally:
+            conn.close()
+
+    async def fake_subprocess(*args, **kwargs):
+        task_id, nonce = _in_flight()
+        spawned.append(task_id)
+        proc = MagicMock(kill=MagicMock())
+        if len(spawned) < 3:
+            kwargs["stdout"].write(_CAPACITY_LOG)
+            kwargs["stdout"].flush()
+            proc.returncode = 1
+        else:
+            q = TaskQueue(db)
+            started.append(q.start_execution(task_id, nonce, presenter="codex"))
+            q.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
+                                                summary="done"),
+                            nonce=nonce, presenter="codex")
+            proc.returncode = 0
+        proc.wait = AsyncMock(return_value=proc.returncode)
+        return proc
+
+    with patch.dict(os.environ, {"AGENT_CREW_DISPATCHER": "1",
+                                 "AGENT_CREW_DISPATCH_INTERVAL": "0.05",
+                                 "AGENT_CREW_WORKTREE_SYNC_DISABLED": "1",
+                                 "AGENT_CREW_CAPACITY_BACKOFF_S": "0.1",
+                                 "AGENT_CREW_CAPACITY_JITTER": "0"}), \
+            patch("asyncio.create_subprocess_exec", side_effect=fake_subprocess), \
+            patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")):
+        app = create_app(db_path=db, pane_map={}, port=8106, state_path=_state(tmp_path),
+                         watchdog_disabled=True, anomaly_disabled=True)
+        with TestClient(app) as client:
+            r = client.post("/tasks", json={
+                "task_id": "t-enf", "task_type": "implement", "description": "add a --json flag",
+                "branch": "main", "priority": 3, "project": "agent_crew",
+                "context": admitted()})
+            assert r.status_code in (200, 201), r.text
+            deadline = time.time() + 15
+            while time.time() < deadline and not started:
+                time.sleep(0.05)
+            time.sleep(0.2)
+
+    q = TaskQueue(db)
+    assert spawned == ["t-enf", "retry-t-enf-a1", "retry-t-enf-a2"], spawned   # flat ids
+    assert started and started[0]["go"] is True, started
+    assert q.get_task_status("retry-t-enf-a2") == "completed"
+    # the spent rows are cancelled, never failed, and never re-claimed
+    assert q.get_task_status("t-enf") == "cancelled"
+    assert q.get_task_status("retry-t-enf-a1") == "cancelled"
+    conn = sqlite3.connect(db)
+    conn.row_factory = sqlite3.Row
+    try:
+        states = {}
+        for tid in spawned:
+            rid = conn.execute("SELECT receipt_id FROM tasks WHERE task_id = ?",
+                               (tid,)).fetchone()["receipt_id"]
+            states[tid] = receipt_store.current_receipt(conn, rid)["state"]
+    finally:
+        conn.close()
+    # one receipt per admission, none re-entered: SUPERSEDED, then CONSUMED
+    assert states == {"t-enf": "SUPERSEDED", "retry-t-enf-a1": "SUPERSEDED",
+                      "retry-t-enf-a2": "CONSUMED"}, states
+    # each spent row says why (infra waste), the streak carries across admissions
+    for tid, n in (("t-enf", 1), ("retry-t-enf-a1", 2)):
+        ev = _events(db, tid, "provider_capacity_readmit")
+        assert len(ev) == 1 and ev[0]["waste_reason"] == PROVIDER_CAPACITY
+        assert ev[0]["capacity_refusals"] == n
+    ctx = q.get_task_context("retry-t-enf-a2")
+    assert ctx["original_task_id"] == "retry-t-enf-a1" and "retry_attempt" not in ctx
+    assert ctx["provider_capacity_root"] == "t-enf"
+    # same work (P4): every admission in the streak anchors on the root
+    from agent_crew.queue import _cea_lineage_root_task_id
+    assert _cea_lineage_root_task_id("retry-t-enf-a2", ctx) == "t-enf"

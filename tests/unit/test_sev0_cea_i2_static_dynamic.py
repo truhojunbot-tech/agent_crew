@@ -455,7 +455,11 @@ def test_requeue_moves_the_receipt_back_through_the_lifecycle(tmp_path, how):
     ``test_requeue_reuses_the_receipt_while_an_attempt_remains`` below.
     """
     q = _claimed(tmp_path, f"{how}.db", "test")
-    assert _back_to_pending(q, how) == "pending"
+    # #581: a capacity requeue on a spent receipt does not leave a pending row
+    # on it (that row could never be claimed again); it stays in_progress for
+    # the server to re-admit as a successor (server._readmit_provider_capacity).
+    assert _back_to_pending(q, how) == ("in_progress" if how == "defer_provider_capacity"
+                                        else "pending")
     conn = sqlite3.connect(q._db_path)
     conn.row_factory = sqlite3.Row
     r = receipt_for_task(q, "t1")

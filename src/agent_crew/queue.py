@@ -5114,6 +5114,14 @@ class TaskQueue:
         has lasted ``blocked_after_s`` it appends ``provider_capacity_blocked``
         once, for the coordinator. Returns the streak state, or None if the
         task was not in_progress or the gate kept it.
+
+        ⛔When the gate answers ``RE_ADMIT`` under enforcement (the attempt
+          budget is spent, or B drifted), the receipt is SUPERSEDED and a
+          pending row on it could never be claimed again. The row is then NOT
+          put back to pending: it stays in_progress, the result carries
+          ``readmit=True``, and the caller re-admits the work as a successor
+          through admission (``server._readmit_provider_capacity``) and
+          cancels this row. Nothing here mints or repoints a receipt.
         """
         conn = self._connect()
         try:
@@ -5135,6 +5143,8 @@ class TaskQueue:
             if not requeued:
                 conn.execute("COMMIT")   # keep the refusal's runtime event
                 return None
+            readmit = bool(_gate is not None and _gate.outcome is _CeaOutcome.RE_ADMIT
+                           and _gate.enforced)
             # ⛔Re-read: requeue_through_gate patched the context (§8 answer).
             ctx = json.loads(conn.execute("SELECT context FROM tasks WHERE task_id = ?",
                                           (task_id,)).fetchone()["context"] or "{}")
@@ -5144,21 +5154,29 @@ class TaskQueue:
                         "provider_capacity_since": since})
             if blocked:
                 ctx["provider_capacity_blocked_at"] = now
-            conn.execute(
-                "UPDATE tasks SET context = ?, status = 'pending', claim_source = '' "
-                "WHERE task_id = ? AND status = 'in_progress'",
-                (json.dumps(ctx), task_id))
+            if readmit:     # stays in_progress until the caller cancels it
+                conn.execute("UPDATE tasks SET context = ? WHERE task_id = ?",
+                             (json.dumps(ctx), task_id))
+            else:
+                conn.execute(
+                    "UPDATE tasks SET context = ?, status = 'pending', claim_source = '' "
+                    "WHERE task_id = ? AND status = 'in_progress'",
+                    (json.dumps(ctx), task_id))
             waste = {"waste_reason": PROVIDER_CAPACITY, "waste_class": "infra",
                      "provider_tag": provider_tag, "capacity_refusals": count,
                      "capacity_since": since}
-            self._record_end_on(conn, task_id, now, "requeued", posted=False,
-                                not_before=now + delay_s, **waste)
+            if readmit:
+                self._append_exec_event_on(conn, task_id, "provider_capacity_readmit", now,
+                                           gate_reason=_gate.reason, **waste)
+            else:
+                self._record_end_on(conn, task_id, now, "requeued", posted=False,
+                                    not_before=now + delay_s, **waste)
             if blocked:
                 self._append_exec_event_on(conn, task_id, "provider_capacity_blocked", now,
                                            blocked_for_s=round(now - since, 1), **waste)
             conn.execute("COMMIT")
             return {"count": count, "since": since, "not_before": now + delay_s,
-                    "blocked": blocked}
+                    "blocked": blocked, "readmit": readmit}
         except Exception:
             with contextlib.suppress(Exception):
                 conn.execute("ROLLBACK")

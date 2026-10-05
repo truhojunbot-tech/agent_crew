@@ -5636,6 +5636,12 @@ def create_app(
                     _cap = q().defer_provider_capacity(
                         task.task_id, delay_s=_delay,
                         blocked_after_s=_CAPACITY_BLOCKED_AFTER_S, provider_tag=_transient)
+                    if _cap is not None and _cap["readmit"]:
+                        _succ = _readmit_provider_capacity(task.task_id, _cap, _delay, _transient)
+                        logger.warning(
+                            "dispatcher: provider_capacity (%s) on task=%s — receipt spent; "
+                            "re-admitted as %s, not before +%.0fs",
+                            _transient, task.task_id, _succ, _delay)
                     if _cap is not None:
                         _blocked_for = time.time() - _cap["since"]
                         (logger.error if _blocked_for >= _CAPACITY_BLOCKED_AFTER_S
@@ -6192,6 +6198,51 @@ def create_app(
                 f"_auto_enqueue_fix: cascade failed for {review_task_id} — "
                 f"the review result stands, the fix was not enqueued"
             )
+
+    def _readmit_provider_capacity(task_id: str, cap: dict, delay_s: float, tag: str) -> str:
+        """Re-admit capacity-refused work whose receipt §8 superseded (#581).
+
+        Under enforcement the attempt budget (default one) is spent by the
+        first capacity refusal, and a SUPERSEDED receipt never re-enters (P4),
+        so the row cannot simply go back to pending. The work goes back through
+        admission instead, exactly as `_auto_retry_failed_task` does it: a
+        successor with a deterministic id via the `retry.failed_task` ingress,
+        lineage in `original_task_id`, its own receipt verified at every gate.
+        The id is `retry-<root>-a<n>` off the streak's first task, not nested
+        per hop, so a long outage neither grows the id nor walks the lineage
+        past `_CEA_LINEAGE_MAX_DEPTH` (parent → id → root, always two hops).
+        It inherits the cooldown and the capacity streak (so the 60-min event
+        stays one per streak) and not `retry_attempt` — the transient budget is
+        not spent. The old row is cancelled only after the successor exists.
+        """
+        original = q().get_task(task_id)
+        if original is None:
+            return ""
+        ctx = _successor_context(original.context)
+        for key in (RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY):
+            ctx.pop(key, None)
+        root = str(ctx.get("provider_capacity_root") or task_id)
+        ctx.update({"original_task_id": task_id, "provider_capacity_root": root,
+                    "push_not_before": time.time() + delay_s,
+                    "push_refusal_reason": tag,
+                    "provider_capacity_count": cap["count"],
+                    "provider_capacity_since": cap["since"]})
+        successor = TaskRequest(
+            task_id=f"retry-{root}-a{cap['count']}",
+            task_type=original.task_type, description=original.description,
+            branch=original.branch, priority=original.priority, context=ctx,
+            project=(str(getattr(original, "project", "") or "").strip()
+                     or _successor_project_for(task_id, ctx)),
+        )
+        from agent_crew.queue import TaskAlreadyExistsError as _TAE
+        try:
+            q().enqueue(successor, ingress="retry.failed_task",
+                        _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+        except _TAE:
+            logger.info("dispatcher: capacity successor %s already exists", successor.task_id)
+        q().cancel(task_id, reason=f"provider_capacity_readmitted:{successor.task_id}",
+                   expected_status="in_progress")
+        return successor.task_id
 
     def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> None:
         """Auto-retry a failed task if it hasn't exceeded max retries.
