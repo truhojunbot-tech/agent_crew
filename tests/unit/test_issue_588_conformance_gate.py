@@ -8,6 +8,7 @@ import hashlib
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
@@ -29,6 +30,13 @@ if mode == "crash":
     sys.stderr.write("boom")
     sys.exit(2)
 change = json.load(open(args[args.index("--input") + 1]))
+if mode == "contract":
+    valid = (isinstance(change.get("capability_id"), str)
+             and change.get("change_type") in ("create", "reuse", "modify")
+             and isinstance(change.get("portable_core"), bool)
+             and isinstance(change.get("dependencies"), list)
+             and isinstance(change.get("role"), str) and bool(change["role"]))
+    mode = "ALLOW" if valid else "REVIEW"
 with open(args[args.index("--receipt") + 1], "w") as fh:
     json.dump({"verdict": mode, "change": change}, fh)
 sys.exit(10 if mode == "BLOCK" and "--enforce" in args else 0)
@@ -110,6 +118,34 @@ def test_allow_merges_and_records_receipt(tmp_path, monkeypatch, gate, comments)
     assert q.get_task_status("impl-1") == "pending"
 
 
+def test_declared_change_evidence_reaches_gate_contract(tmp_path, monkeypatch, gate, comments):
+    monkeypatch.setenv("FAKE_GATE_MODE", "contract")
+    q = _queue(tmp_path, {"capability_id": "cap.widget", "change_type": "create",
+                          "portable_core": False, "dependencies": [], "role": "worker"})
+
+    assert _gate(q, tmp_path) is True
+    rec = _record(q)
+    assert rec["verdict"] == "ALLOW"
+    change = json.loads(Path(rec["receipt_path"]).read_text())["change"]
+    assert change["portable_core"] is False
+    assert change["dependencies"] == []
+    assert change["role"] == "worker"
+    assert change["change_type"] == "create"
+
+
+def test_missing_change_evidence_is_not_invented(tmp_path, monkeypatch, gate, comments):
+    monkeypatch.setenv("FAKE_GATE_MODE", "contract")
+    q = _queue(tmp_path, {"capability_id": "cap.widget"})
+
+    assert _gate(q, tmp_path) is True
+    rec = _record(q)
+    assert rec["verdict"] == "REVIEW"
+    change = json.loads(Path(rec["receipt_path"]).read_text())["change"]
+    assert "portable_core" not in change
+    assert "dependencies" not in change
+    assert "role" not in change
+
+
 def test_review_merges_records_receipt_and_comments(tmp_path, monkeypatch, gate, comments):
     monkeypatch.setenv("FAKE_GATE_MODE", "REVIEW")
     q = _queue(tmp_path)
@@ -148,6 +184,34 @@ def test_gate_timeout_is_review(tmp_path, monkeypatch, gate, comments):
     rec = _record(q)
     assert rec["verdict"] == "REVIEW" and "timeout" in rec["error"]
     assert json.load(open(rec["receipt_path"]))["verdict"] == "REVIEW"
+
+
+def test_malformed_command_is_review_and_merges(tmp_path, monkeypatch, comments):
+    monkeypatch.setenv("AGENT_CREW_CONFORMANCE_GATE_CMD", "'")
+    merges, q, impl_id, _ = _run_auto_merge(tmp_path, monkeypatch)
+    assert len(merges) == 1
+    rec = q.get_task_context(impl_id)["conformance_gate"]
+    assert rec["verdict"] == "REVIEW"
+    assert "No closing quotation" in rec["error"]
+    assert Path(rec["receipt_path"]).exists()
+    assert len(comments) == 1
+
+
+def test_unwritable_receipt_location_is_review_and_merges(tmp_path, monkeypatch, gate, comments):
+    monkeypatch.setenv("FAKE_GATE_MODE", "ALLOW")
+    q = _queue(tmp_path)
+    blocked_path = tmp_path / "file-instead-of-directory"
+    blocked_path.write_text("occupied")
+
+    assert _conformance_gate_allows_merge(
+        q, "impl-1", project="proj", pr_number=42, title="add widget",
+        task_desc="add widget", issue=588, receipt_dir=str(blocked_path),
+        repo="owner/repo") is True
+    rec = _record(q)
+    assert rec["verdict"] == "REVIEW"
+    assert Path(rec["receipt_path"]).exists()
+    assert len(comments) == 1
+    assert gate() == []
 
 
 def test_block_does_not_merge_and_needs_human(tmp_path, monkeypatch, gate, comments):

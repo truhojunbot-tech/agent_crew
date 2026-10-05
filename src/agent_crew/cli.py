@@ -2266,17 +2266,26 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
     }
     if ctx.get("capability_id"):
         change["capability_id"] = str(ctx["capability_id"])
-    os.makedirs(receipt_dir, exist_ok=True)
+    # The external checker requires these facts before it can reach the
+    # registry matcher.  Forward only declarations the task actually carries;
+    # absent evidence must remain REVIEW, rather than an invented default.
+    if isinstance(ctx.get("portable_core"), bool):
+        change["portable_core"] = ctx["portable_core"]
+    if isinstance(ctx.get("dependencies"), list):
+        change["dependencies"] = ctx["dependencies"]
+    if isinstance(ctx.get("role"), str) and ctx["role"]:
+        change["role"] = ctx["role"]
     stem = os.path.join(receipt_dir, f"{task_id}-pr{pr_number}")
     change_path, receipt_path = f"{stem}.change.json", f"{stem}.receipt.json"
-    with open(change_path, "w") as fh:
-        json.dump(change, fh, indent=2)
-    if os.path.exists(receipt_path):
-        os.remove(receipt_path)
-    cmd = shlex.split(prefix) + ["capability-conformance-check", "--input", change_path,
-                                 "--receipt", receipt_path, "--enforce"]
     verdict, error, exit_code = "REVIEW", "", None
     try:
+        os.makedirs(receipt_dir, exist_ok=True)
+        with open(change_path, "w") as fh:
+            json.dump(change, fh, indent=2)
+        if os.path.exists(receipt_path):
+            os.remove(receipt_path)
+        cmd = shlex.split(prefix) + ["capability-conformance-check", "--input", change_path,
+                                     "--receipt", receipt_path, "--enforce"]
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
         exit_code = r.returncode
         if exit_code == 10:
@@ -2296,11 +2305,22 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         error = "gate timeout after 30s"
     except Exception as exc:
         error = f"gate error: {exc}"
-    if error or not os.path.exists(receipt_path):
-        with open(receipt_path, "w") as fh:
+    try:
+        if error or not os.path.exists(receipt_path):
+            with open(receipt_path, "w") as fh:
+                json.dump({"verdict": verdict, "error": error, "source": "agent_crew"}, fh, indent=2)
+        with open(receipt_path, "rb") as fh:
+            receipt_bytes = fh.read()
+    except OSError as exc:
+        # A broken receipt directory is a gate failure, not a merge veto.
+        # Keep the REVIEW/BLOCK evidence at a usable fallback path.
+        import tempfile
+        error = f"{error}; receipt error: {exc}".strip("; ")
+        fd, receipt_path = tempfile.mkstemp(prefix="agent_crew_conformance_", suffix=".json")
+        with os.fdopen(fd, "w") as fh:
             json.dump({"verdict": verdict, "error": error, "source": "agent_crew"}, fh, indent=2)
-    with open(receipt_path, "rb") as fh:
-        receipt_bytes = fh.read()
+        with open(receipt_path, "rb") as fh:
+            receipt_bytes = fh.read()
     record = {"verdict": verdict, "receipt_path": receipt_path,
               "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
               "exit_code": exit_code, "pr_number": pr_number,
