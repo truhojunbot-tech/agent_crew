@@ -3,7 +3,10 @@
 import subprocess
 
 import pytest
+from click.testing import CliRunner
 
+from agent_crew.cli import _sync_worktrees_to_main, crew
+from agent_crew.protocol import TaskResult
 from agent_crew.server import WorktreeTargetUnresolved, _prepare_worktree_for_task
 
 
@@ -106,3 +109,72 @@ def test_unborn_head_heals_from_remote_default_not_provisional_main(tmp_path, mo
         str(worker), "impl-555", "fix/output", "implementer",
     ) == commits["trunk"]
     assert _git("-C", worker, "rev-parse", "refs/heads/fix/output") == commits["trunk"]
+
+
+def test_cli_sync_falls_back_to_master_without_origin_head(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    worker, commits = _worktree(tmp_path)
+    _git("-C", worker, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+
+    landed = _sync_worktrees_to_main({"codex": str(worker)}, base_branch="main")
+
+    assert landed["codex"] == {
+        "requested_ref": "origin/main",
+        "actual_ref": "origin/master",
+        "sha": commits["master"],
+        "status": "fallback",
+    }
+    assert _git("-C", worker, "rev-parse", "HEAD") == commits["master"]
+
+
+@pytest.mark.parametrize(
+    ("configured_main", "branch_args", "expected_base", "expected_run_branch"),
+    [
+        pytest.param(None, [], "master", False, id="implicit-master"),
+        pytest.param("main", [], "main", False, id="configured-main-wins"),
+        pytest.param(None, ["--branch", "main"], "master", True,
+                     id="explicit-main-is-a-run-branch"),
+    ],
+)
+def test_crew_run_records_resolved_or_configured_base(
+        tmp_path, monkeypatch, configured_main, branch_args,
+        expected_base, expected_run_branch):
+    import agent_crew.cli as cli
+    import agent_crew.loop as loop
+
+    if configured_main is None:
+        monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_CREW_MAIN_BRANCH", configured_main)
+    worker, commits = _worktree(tmp_path)
+    _git("-C", worker, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
+    monkeypatch.setattr(cli, "_read_state", lambda *_args: {
+        "port": 0, "pane_ids": [], "worktrees": {"codex": str(worker)},
+    })
+
+    class Queue:
+        def list_tasks(self):
+            return []
+
+        def get_result(self, task_id):
+            return TaskResult(task_id, "failed", "fixture stops after enqueue")
+
+    monkeypatch.setattr(cli, "_writable_queue", lambda *_args, **_kwargs: Queue())
+    captured = []
+    monkeypatch.setattr(loop, "enqueue_implement", lambda *_args, **kwargs:
+                        captured.append(kwargs["context"]) or "impl-555-cli")
+
+    result = CliRunner().invoke(crew, [
+        "run", "implement requested work", "--project", "test",
+        "--db", str(tmp_path / "tasks.db"), "--no-tester", "--max-iter", "1",
+        *branch_args,
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert captured[0]["base_branch"] == expected_base
+    assert captured[0]["crew_run_branch"] is expected_run_branch
+    assert captured[0]["sync_landed_bases"]["codex"]["sha"] == commits["master"]
+    if configured_main is None:
+        assert _prepare_worktree_for_task(
+            str(worker), "impl-555-cli", "main", "implementer", captured[0],
+        ) == commits["master"]
