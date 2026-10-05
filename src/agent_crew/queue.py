@@ -3791,6 +3791,34 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def mark_needs_human(self, task_id: str, summary: str, extra: dict) -> bool:
+        """Move a task to ``needs_human`` and merge ``extra`` into its context.
+
+        #588: a BLOCK from the PRE_MERGE conformance gate stops an auto-merge
+        after the loop's tasks have already completed; this parks the task for
+        a human with the gate receipt attached. Returns False if no such task.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT context FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            if row is None:
+                conn.execute("ROLLBACK")
+                return False
+            merged = {**json.loads(row["context"] or "{}"), **extra}
+            conn.execute(
+                "UPDATE tasks SET status='needs_human', summary=?, context=? WHERE task_id=?",
+                (summary, json.dumps(merged), task_id))
+            conn.execute("COMMIT")
+            return True
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def merge_task_context(self, task_id: str, updates: dict) -> None:
         """Best-effort-safe JSON merge for result metadata written after submit.
 
