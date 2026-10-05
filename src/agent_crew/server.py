@@ -5327,7 +5327,8 @@ def create_app(
         if shadow_memory_enabled:
             try:
                 try:
-                    _predecessors, _ = task_lineage(db_path, task.task_id)
+                    _predecessors, _ = await asyncio.to_thread(
+                        task_lineage, db_path, task.task_id)
                 except Exception:
                     logger.exception("dispatcher: lineage lookup failed for %s", task.task_id)
                     _parent = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
