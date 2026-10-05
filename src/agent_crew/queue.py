@@ -6496,12 +6496,38 @@ class TaskQueue:
         now = time.time()
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 """INSERT OR IGNORE INTO tokenomics_shadow_receipts
                    (task_id, decision_source, policy_version, recommendation_json,
                     actual_execution_json, created_at, updated_at)
                    VALUES (?, 'baseline', NULL, NULL, ?, ?, ?)""",
                 (task_id, json.dumps({"cascade": "baseline", "task_type": "review"}), now, now),
+            )
+            row = conn.execute(
+                "SELECT evidence_json FROM tokenomics_shadow_receipts WHERE task_id=?",
+                (task_id,),
+            ).fetchone()
+            try:
+                evidence = json.loads(row["evidence_json"] or "{}") if row else {}
+            except (TypeError, ValueError):
+                evidence = {}
+            if not isinstance(evidence, dict):
+                evidence = {}
+            history = evidence.get("canary_history")
+            history = list(history) if isinstance(history, list) else []
+            history.append({
+                "at": now, "decision_source": decision_source,
+                "recommendation": recommendation, "applied": bool(applied),
+                "counterfactual": counterfactual, "reason": reason,
+                "cea_receipt_id": cea_receipt_id,
+            })
+            evidence["canary_history"] = history
+            # This append is unconditional: preserve_applied only protects the
+            # latest columns, not the record of evaluations (#579).
+            conn.execute(
+                "UPDATE tokenomics_shadow_receipts SET evidence_json=?, updated_at=? "
+                "WHERE task_id=?", (json.dumps(evidence), now, task_id),
             )
             conn.execute(
                 """UPDATE tokenomics_shadow_receipts
