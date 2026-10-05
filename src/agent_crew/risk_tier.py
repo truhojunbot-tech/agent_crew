@@ -119,18 +119,18 @@ def _explicit_risk_declaration(context: Mapping | None) -> dict | None:
     if any(value is True for value in values.values()):
         return {**values, "declaration_source": "explicit", "confidence": "high"}
 
-    # A durable coordinator-supplied tier is also an explicit escalation, but
-    # its lower tiers still do not establish that safety is false.
+    # An operator-supplied tier is a complete declaration, including the
+    # absence of each risk flag and the all-false Tier 0.
     tier = _override(context)
-    if tier == TIER_3:
-        values["safety_or_live_change"] = True
-        values["human_gate_required"] = True
-    elif tier == TIER_2:
-        values["broad_architecture_change"] = True
-    elif tier == TIER_1:
-        values["bounded_routine_fix"] = True
-    if any(value is True for value in values.values()):
-        return {**values, "declaration_source": "explicit", "confidence": "high"}
+    if tier is not None:
+        return {
+            "safety_or_live_change": tier == TIER_3,
+            "broad_architecture_change": tier == TIER_2,
+            "bounded_routine_fix": tier == TIER_1,
+            "human_gate_required": tier == TIER_3,
+            "declaration_source": "explicit",
+            "confidence": "high",
+        }
     return None
 
 
@@ -155,6 +155,16 @@ def risk_declaration(description: str, context: Mapping | None = None) -> dict:
             if any(explicit[field] is not True for field in stronger):
                 return {**explicit, **stronger,
                         "declaration_source": "heuristic", "confidence": "low"}
+        # A tier is a floor for the classifier. Preserve a stronger live/safety
+        # signal when this declaration came from the tier, without overriding
+        # an operator's separate risk_declaration or structured risk flags.
+        if (isinstance(context, Mapping) and _override(context) is not None
+                and _explicit_risk_declaration(
+                    {key: value for key, value in context.items() if key != "risk_tier"}
+                ) is None
+                and classify_task(description, context) == TIER_3):
+            return {**explicit, "safety_or_live_change": True,
+                    "human_gate_required": True}
         return explicit
 
     tier = classify_task(description, context)
