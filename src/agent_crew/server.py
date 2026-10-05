@@ -81,6 +81,7 @@ from agent_crew import claude_cloud as _claude_cloud
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
+from agent_crew.risk_tier import risk_declaration as _risk_declaration
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
     load_scope as _load_test_scope,
@@ -6255,10 +6256,14 @@ def create_app(
 
             # Create retry task with incremented retry count
             retry_context = _successor_context(original_task.context)
-            retry_risk = retry_context.get("risk_declaration")
+            retry_risk = retry_context.pop("risk_declaration", None)
+            # Both fields are post-admission observations. Older brokers sign
+            # them when they arrive in an admission context, while claim-time
+            # verification excludes them (#578).
+            retry_context.pop("risk_tier_shadow", None)
             if (isinstance(retry_risk, dict)
                     and retry_risk.get("declaration_source", "explicit") == "explicit"):
-                retry_context["risk_declaration"] = {
+                retry_risk = {
                     **retry_risk,
                     "inherited_from": retry_risk.get("inherited_from") or task_id,
                 }
@@ -6286,6 +6291,16 @@ def create_app(
                             _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             except _TAE:
                 logger.info(f"_auto_retry_failed_task: {retry_req.task_id} 이미 존재 — 멱등 skip")
+            else:
+                if isinstance(retry_risk, dict):
+                    try:
+                        q().patch_context(retry_req.task_id, {
+                            "risk_declaration": _risk_declaration(
+                                retry_req.description,
+                                {**retry_context, "risk_declaration": retry_risk}),
+                        })
+                    except Exception:
+                        logger.exception("retry risk telemetry failed for %s", retry_req.task_id)
             logger.info(f"Task {task_id} auto-retried (attempt {result.retry_count + 1}/{MAX_RETRIES})")
             # Try to push the retry task
             role = _TYPE_TO_ROLE.get(task_type)

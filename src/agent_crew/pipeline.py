@@ -44,7 +44,8 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import (TaskQueue, PausedError, TaskAlreadyExistsError,
                               DuplicateReviewError,
-                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              risk_declaration)
 from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
 from agent_crew import tokenomics_canary as _tokenomics_canary
 # §11.2 #14: the review/test contract comes from admission, already decided.
@@ -76,6 +77,18 @@ def successor_context(parent_context: object) -> dict:
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
 CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
 ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS = 60
+ROUNDS_CAP_CASCADE_MAX_ATTEMPTS = 3
+
+
+def _rounds_cap_wait_seconds() -> float:
+    """Bound the switch-on wait without changing switch-off's 60s window."""
+    try:
+        value = float(os.getenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS", "120"))
+        return max(0.0, value) if math.isfinite(value) else 120.0
+    except ValueError:
+        return 120.0
+
+
 #: Bounds on how much review text is copied into the fix task description.
 MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
@@ -996,6 +1009,23 @@ def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
         }
 
 
+def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
+                                 tasks_by_id: dict, parent_task, *,
+                                 ingress: str, successor_provenance=None) -> None:
+    """Keep inherited risk out of the broker payload, then record it (#578)."""
+    inherited: dict = {}
+    _inherit_root_risk(tasks_by_id, parent_task, inherited)
+    queue.enqueue(task, ingress=ingress,
+                  _successor_provenance=successor_provenance)
+    if inherited:
+        try:
+            context = task.context if isinstance(task.context, dict) else {}
+            queue.patch_context(task.task_id, {"risk_declaration": risk_declaration(
+                task.description, {**context, **inherited})})
+        except Exception:
+            logger.exception("inherited risk telemetry failed for %s", task.task_id)
+
+
 def _round_cap_pinned(tasks_by_id: dict, review_task, queue: TaskQueue,
                       server_project: Optional[str] = None) -> bool:
     return _tokenomics_canary._is_pinned(
@@ -1150,11 +1180,28 @@ def _lineage_tasks(tasks_by_id: dict, task):
         task = tasks_by_id[previous]
 
 
-def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = None) -> int:
-    """Settle switch-off shadows against the first post-verdict contract.
+def _resume_pending_rounds_cap(queue: TaskQueue, row: dict,
+                               counterfactual: dict, raw: str) -> None:
+    """Replay the idempotent cascade with a durable retry bound."""
+    review_id = counterfactual["review_task_id"]
+    auto_enqueue_fix(queue, review_id,
+                     server_project=counterfactual.get("server_project"),
+                     repo=counterfactual.get("repo") or "",
+                     repo_cwd=counterfactual.get("repo_cwd") or "",
+                     require_repo_default=bool(counterfactual.get("require_repo_default")),
+                     suppress_side_effects=True)
+    fix_id = fix_task_id(review_id, counterfactual["round"])
+    receipt = queue.get_tokenomics_shadow_receipt(row["task_id"])
+    if queue.get_task(fix_id) or (receipt and receipt.get("canary_applied") == 1):
+        queue.mark_rounds_cap_cascade_complete(row["task_id"], raw)
+    elif queue.note_rounds_cap_cascade_attempt(
+            row["task_id"], raw, max_attempts=ROUNDS_CAP_CASCADE_MAX_ATTEMPTS):
+        logger.warning("rounds-cap cascade %s did not enqueue after %s attempts",
+                       review_id, ROUNDS_CAP_CASCADE_MAX_ATTEMPTS)
 
-    This only updates receipts. It never replays a cascade or changes a live cap.
-    """
+
+def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = None) -> int:
+    """Settle pending citations and resume switch-on fixes after the wait."""
     now = datetime.now(timezone.utc).timestamp() if now is None else now
     settled = 0
     for row in queue.pending_rounds_cap_reresolutions():
@@ -1169,7 +1216,13 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
         review_id = counterfactual.get("review_task_id")
         if not isinstance(verdict_at, (int, float)) or not isinstance(review_id, str):
             continue
-        expired = now > verdict_at + ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS
+        switch_on = counterfactual.get("switch_on") is True
+        if switch_on and not counterfactual.get("pending_reresolve"):
+            _resume_pending_rounds_cap(queue, row, counterfactual, raw)
+            continue
+        window = (_rounds_cap_wait_seconds() if switch_on
+                  else ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS)
+        expired = now > verdict_at + window
         citation = None
         cap = counterfactual["baseline_cap"]
         allowed_task_ids = set()
@@ -1198,7 +1251,7 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
         produced = _contract_time((citation or {}).get("produced_at"))
         fresh = (not expired and produced is not None
                  and verdict_at < produced.timestamp() <= min(
-                     now, verdict_at + ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS)
+                     now, verdict_at + window)
                  and (citation or {}).get("decision_source") == "quota_core_contract"
                  and (citation or {}).get("cited_task_id") in allowed_task_ids)
         if not fresh and not expired:
@@ -1209,6 +1262,7 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
                 cap = recommended
         counterfactual.update({
             "pending_reresolve": False,
+            **({"cascade_pending": True} if switch_on else {}),
             "counterfactual_cap": cap if fresh else counterfactual["baseline_cap"],
             "would_fire": bool(fresh and cap < counterfactual["baseline_cap"]
                                and counterfactual["round"] > cap
@@ -1218,9 +1272,14 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
             row["task_id"], expected_counterfactual=raw,
             decision_source=(citation or {}).get("decision_source", "baseline") if fresh else "baseline",
             recommendation=(citation or {}) if fresh else {}, counterfactual=counterfactual,
-            reason="switch_off:fresh_reresolved" if fresh else f"switch_off:{counterfactual['stale_reason']}",
+            reason=("switch_on:fresh_reresolved" if fresh else "contract_wait_timeout")
+                   if switch_on else ("switch_off:fresh_reresolved" if fresh
+                                      else f"switch_off:{counterfactual['stale_reason']}"),
         ):
             settled += 1
+            if switch_on:
+                _resume_pending_rounds_cap(queue, row, counterfactual,
+                                           json.dumps(counterfactual))
     return settled
 
 
@@ -1438,10 +1497,18 @@ def auto_enqueue_fix(
             isinstance(prior_counterfactual, dict)
             and "pending_reresolve" in prior_counterfactual
             and prior_counterfactual.get("review_task_id") == review_task_id)
+        prior_switch_on = (same_review_observation
+                           and prior_counterfactual.get("switch_on") is True)
+        if prior_switch_on and prior_counterfactual.get("pending_reresolve"):
+            return None
         counterfactual_cap, canary_citation, canary_reason = _canary_round_cap(
             tasks_by_id, review_task, baseline_cap, queue, server_project)
         switch_enabled = _tokenomics_canary.rounds_cap_enabled()
         canary_pinned = _round_cap_pinned(tasks_by_id, review_task, queue, server_project)
+        if prior_switch_on and not prior_counterfactual.get("pending_reresolve"):
+            counterfactual_cap = prior_counterfactual["counterfactual_cap"]
+            canary_citation = json.loads((held or {}).get("canary_recommendation_json") or "{}")
+            canary_reason = (held or {}).get("canary_reason") or canary_reason
         max_rounds = counterfactual_cap if switch_enabled else baseline_cap
         if canary_pinned:
             try:
@@ -1457,6 +1524,27 @@ def auto_enqueue_fix(
         # per-task_id counter (the transient-retry shape) could not work here:
         # every round mints new task ids, so it would always read zero.
         fix_round = int(review_ctx.get("fix_round") or 0) + 1
+        if (switch_enabled and canary_pinned and not prior_switch_on
+                and fix_round <= baseline_cap
+                and canary_reason in ("contract_predates_latest_result",
+                                      "contract_predates_latest_fix")):
+            verdict_state = queue.get_exec_state(review_task_id)
+            verdict_at = (verdict_state or {}).get("result_posted_at")
+            if isinstance(verdict_at, (int, float)):
+                queue.record_tokenomics_canary_receipt(
+                    lineage_root_id,
+                    decision_source=(canary_citation or {}).get("decision_source") or "baseline",
+                    recommendation=canary_citation or {}, applied=False,
+                    counterfactual=json.dumps({
+                        "baseline_cap": baseline_cap, "counterfactual_cap": baseline_cap,
+                        "round": fix_round, "would_fire": False,
+                        "pending_reresolve": True, "switch_on": True,
+                        "verdict_at": verdict_at, "review_task_id": review_task_id,
+                        "stale_reason": canary_reason, "server_project": server_project,
+                        "repo": repo, "repo_cwd": repo_cwd,
+                        "require_repo_default": require_repo_default,
+                    }), reason="switch_on:pending_reresolve", preserve_applied=True)
+                return None
         would_fire = (canary_pinned and counterfactual_cap < baseline_cap
                       and fix_round > counterfactual_cap and fix_round <= baseline_cap)
         if canary_pinned and not switch_enabled and not same_review_observation:
@@ -1499,7 +1587,7 @@ def auto_enqueue_fix(
                 counterfactual="", reason="fix_already_enqueued",
                 preserve_applied=True)
             return None
-        if switch_enabled and canary_pinned and not canary_fired:
+        if switch_enabled and canary_pinned and not canary_fired and not prior_switch_on:
             try:
                 queue.record_tokenomics_canary_receipt(
                     lineage_root_id, decision_source=(canary_citation or {}).get(
@@ -1595,7 +1683,6 @@ def auto_enqueue_fix(
             "fix_round": fix_round,
             "review_findings": list(review_result.findings or []),
         }
-        _inherit_root_risk(tasks_by_id, review_task, fix_context)
         if pr_number is not None:
             # #186: lets the dispatcher check out the PR head for this task.
             fix_context["pr_number"] = pr_number
@@ -1636,16 +1723,15 @@ def auto_enqueue_fix(
             )
             return None
         try:
-            queue.enqueue(TaskRequest(
+            _enqueue_with_inherited_risk(queue, TaskRequest(
                 task_id=fix_id,
                 task_type="implement",  # type: ignore[arg-type]
                 description="\n".join(parts),
                 branch=review_task.branch,
                 context=fix_context,
                 project=_successor_project(queue, review_task, server_project),
-            ),
-                          ingress="cascade.fix",
-                          _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+            ), tasks_by_id, review_task, ingress="cascade.fix",
+                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.
@@ -2016,8 +2102,6 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
-        _inherit_root_risk({t.task_id: t for t in queue.list_tasks()},
-                           impl_task, review_context)
         if enforce_risk_tier:
             review_context.update(risk)
         if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
@@ -2070,7 +2154,9 @@ def auto_enqueue_review(
             project=_successor_project(queue, impl_task, server_project),
         )
         try:
-            queue.enqueue(review_req, ingress="cascade.review")
+            _enqueue_with_inherited_risk(
+                queue, review_req, {t.task_id: t for t in queue.list_tasks()},
+                impl_task, ingress="cascade.review")
         except TaskAlreadyExistsError:
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
@@ -2191,7 +2277,6 @@ def auto_enqueue_test(
                          "provider": "gemini",
                          "cooldown_until": until if math.isfinite(until) else "unknown"}
         test_context: dict = {"prev_task_id": review_task_id}
-        _inherit_root_risk(tasks_by_id, review_task, test_context)
         # Test the exact revision approved by the reviewer. This is also the
         # artifact component of the test's CEA intent identity.
         if review_ctx.get("reviewed_sha"):
@@ -2244,7 +2329,9 @@ def auto_enqueue_test(
             project=_successor_project(queue, review_task, server_project),
         )
         try:
-            queue.enqueue(test_req, ingress="cascade.test")
+            _enqueue_with_inherited_risk(
+                queue, test_req, tasks_by_id, review_task,
+                ingress="cascade.test")
         except TaskAlreadyExistsError:
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
         except DuplicateReviewError as exc:
