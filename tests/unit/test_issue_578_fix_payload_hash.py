@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from fastapi.testclient import TestClient
 
 from agent_crew.cea import signed_receipt
 from agent_crew.cea.engine import EngineConfig
@@ -14,6 +15,7 @@ from agent_crew.cea.input_providers.snapshot import _canonical
 from agent_crew.pipeline import auto_enqueue_fix, auto_enqueue_review, auto_enqueue_test
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from agent_crew.server import create_app
 
 
 def _broker_payload(task, context):
@@ -153,5 +155,62 @@ def test_review_and_test_successors_match_signed_broker_payload(
     assert signed_receipt.verify_signature(receipt, key.public_key())
     assert signed_receipt.verify(
         receipt, key.public_key(), task_id=successor_id, payload=payload,
+        receipt_id=receipt["receipt_id"])[0]
+    assert context["risk_declaration"]["inherited_from"] == "risk-root"
+
+
+def test_failed_task_retry_matches_signed_broker_payload(tmp_db, monkeypatch):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(
+        "risk-root", "implement", "implement feature", branch="feature/risk",
+        context={"risk_declaration": {
+            "safety_or_live_change": False, "broad_architecture_change": False,
+            "bounded_routine_fix": True, "human_gate_required": False,
+            "declaration_source": "explicit", "confidence": "high"}},
+    ))
+    key = Ed25519PrivateKey.generate()
+    signed = {}
+    authorize = TaskQueue.authorize_task
+
+    def broker_authorize(self, task, *, context, provenance, retry):
+        auth = authorize(self, task, context=context, provenance=provenance, retry=retry)
+        if task.task_id.startswith("retry-"):
+            receipt = dict(auth.receipt, decision="ALLOW",
+                           reason={"code": "OK", "text": "admitted"})
+            signed["admission_context"] = dict(context)
+            signed["receipt"] = signed_receipt.sign(
+                receipt, key, payload=_broker_payload(task, context),
+                build_commit="broker-test-build")
+            return replace(auth, receipt=signed["receipt"])
+        return auth
+
+    monkeypatch.setattr(TaskQueue, "authorize_task", broker_authorize)
+    from agent_crew import queue as queue_module
+    monkeypatch.setattr(queue_module._cea_callsites, "gate_enqueue", lambda *a, **k:
+                        SimpleNamespace(proceed=True, outcome=SimpleNamespace(value="PROCEED"),
+                                        as_record=lambda: {"proceed": True}))
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks/risk-root/result", json={
+            "task_id": "risk-root", "status": "failed", "summary": "usage limit hit",
+            "findings": [],
+        })
+    assert response.status_code == 200, response.text
+    retry_id = "retry-risk-root-a1"
+    conn = queue._connect()
+    try:
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?", (retry_id,)).fetchone()
+    finally:
+        conn.close()
+    assert row is not None
+    context = json.loads(row["context"])
+    receipt = signed["receipt"]
+    payload = signed_receipt.payload_hash(
+        task_type=row["task_type"], branch=row["branch"],
+        description=row["description"], context=context)
+    assert "risk_declaration" not in signed["admission_context"]
+    assert signed_receipt.verify_signature(receipt, key.public_key())
+    assert signed_receipt.verify(
+        receipt, key.public_key(), task_id=retry_id, payload=payload,
         receipt_id=receipt["receipt_id"])[0]
     assert context["risk_declaration"]["inherited_from"] == "risk-root"
