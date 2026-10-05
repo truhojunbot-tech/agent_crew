@@ -155,6 +155,16 @@ def risk_declaration(description: str, context: Mapping | None = None) -> dict:
             if any(explicit[field] is not True for field in stronger):
                 return {**explicit, **stronger,
                         "declaration_source": "heuristic", "confidence": "low"}
+        # A tier is a floor for the classifier. Preserve a stronger live/safety
+        # signal when this declaration came from the tier, without overriding
+        # an operator's separate risk_declaration or structured risk flags.
+        if (isinstance(context, Mapping) and _override(context) is not None
+                and _explicit_risk_declaration(
+                    {key: value for key, value in context.items() if key != "risk_tier"}
+                ) is None
+                and classify_task(description, context) == TIER_3):
+            return {**explicit, "safety_or_live_change": True,
+                    "human_gate_required": True}
         return explicit
 
     tier = classify_task(description, context)
