@@ -139,6 +139,15 @@ def capture_task_outcome(storage: SQLiteMemoryStorage, *, project: str, repo: st
     return records
 
 
+def _task_context(raw: object) -> dict:
+    """Legacy task contexts may be malformed; shadow recall must stay optional."""
+    try:
+        context = json.loads(raw or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return context if isinstance(context, dict) else {}
+
+
 def task_lineage(db_path: str, task_id: str) -> tuple[tuple[str, ...], int | None]:
     """Read this task's predecessor chain and earlier terminal tasks on its PR."""
     uri = Path(db_path).resolve().as_uri() + "?mode=ro"
@@ -150,9 +159,7 @@ def task_lineage(db_path: str, task_id: str) -> tuple[tuple[str, ...], int | Non
         ).fetchone()
         if row is None:
             return (), None
-        context = json.loads(row["context"] or "{}")
-        if not isinstance(context, dict):
-            context = {}
+        context = _task_context(row["context"])
         pr_number = row["pr_number"] or context.get("pr_number")
         predecessors: list[str] = []
         seen = {task_id}
@@ -170,15 +177,14 @@ def task_lineage(db_path: str, task_id: str) -> tuple[tuple[str, ...], int | Non
             if previous["project"] != row["project"]:
                 break
             predecessors.append(parent)
-            previous_context = json.loads(previous["context"] or "{}")
-            parent = (previous_context.get("prev_task_id")
-                      if isinstance(previous_context, dict) else None)
+            parent = _task_context(previous["context"]).get("prev_task_id")
         if pr_number:
             # rowid is insertion order; it excludes this task and later work
             # even when several tasks have the same created_at timestamp.
             for previous in db.execute(
                 "SELECT task_id FROM tasks WHERE project=? "
-                "AND COALESCE(pr_number,json_extract(context,'$.pr_number'))=? "
+                "AND COALESCE(pr_number,CASE WHEN json_valid(context) "
+                "THEN json_extract(context,'$.pr_number') END)=? "
                 "AND rowid<? AND status IN ('completed','failed','needs_human','timed_out') "
                 "ORDER BY rowid DESC",
                 (row["project"], pr_number, row["rowid"]),

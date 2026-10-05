@@ -63,6 +63,38 @@ def test_same_pr_predecessor_is_required_without_prev_link(tmp_path):
     assert task_lineage(db_path, "later") == (("earlier",), 590)
 
 
+def test_lineage_read_and_index_migration_tolerate_malformed_context(tmp_path):
+    db_path = str(tmp_path / "tasks.db")
+    TaskQueue(db_path)
+    # Model a database created by the first #590 index revision.
+    with sqlite3.connect(db_path) as db:
+        db.execute("DROP INDEX idx_tasks_project_pr_context_valid")
+        db.execute("CREATE INDEX idx_tasks_project_pr_context ON tasks(project, "
+                   "COALESCE(pr_number,json_extract(context,'$.pr_number')))")
+    TaskQueue(db_path)
+    with sqlite3.connect(db_path) as db:
+        names = {row[1] for row in db.execute("PRAGMA index_list(tasks)")}
+        assert "idx_tasks_project_pr_context" not in names
+        assert "idx_tasks_project_pr_context_valid" in names
+        db.execute(
+            "INSERT INTO tasks (task_id,task_type,description,project,context,"
+            "pr_number,status,created_at,receipt_id) VALUES "
+            "('prior','implement','prior','agent_crew','not JSON',590,'completed',1,'r-prior')")
+        db.execute(
+            "INSERT INTO tasks (task_id,task_type,description,project,context,"
+            "pr_number,created_at,receipt_id) VALUES "
+            "('current','implement','current','agent_crew',"
+            "'{\"prev_task_id\":\"prior\"}',590,2,'r-current')")
+        plan = db.execute(
+            "EXPLAIN QUERY PLAN SELECT task_id FROM tasks WHERE project=? "
+            "AND COALESCE(pr_number,CASE WHEN json_valid(context) "
+            "THEN json_extract(context,'$.pr_number') END)=? AND rowid<?",
+            ("agent_crew", 590, 2),
+        ).fetchall()
+        assert any("idx_tasks_project_pr_context_valid" in row[3] for row in plan)
+    assert task_lineage(db_path, "current") == (("prior",), 590)
+
+
 def test_keyed_lineage_read_keeps_project_boundary(tmp_path):
     storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
     storage.put(MemoryRecord(
