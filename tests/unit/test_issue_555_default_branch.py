@@ -127,11 +127,25 @@ def test_cli_sync_falls_back_to_master_without_origin_head(tmp_path, monkeypatch
     assert _git("-C", worker, "rev-parse", "HEAD") == commits["master"]
 
 
-def test_crew_run_records_master_as_implicit_base(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("configured_main", "branch_args", "expected_base", "expected_run_branch"),
+    [
+        pytest.param(None, [], "master", False, id="implicit-master"),
+        pytest.param("main", [], "main", False, id="configured-main-wins"),
+        pytest.param(None, ["--branch", "main"], "master", True,
+                     id="explicit-main-is-a-run-branch"),
+    ],
+)
+def test_crew_run_records_resolved_or_configured_base(
+        tmp_path, monkeypatch, configured_main, branch_args,
+        expected_base, expected_run_branch):
     import agent_crew.cli as cli
     import agent_crew.loop as loop
 
-    monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    if configured_main is None:
+        monkeypatch.delenv("AGENT_CREW_MAIN_BRANCH", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_CREW_MAIN_BRANCH", configured_main)
     worker, commits = _worktree(tmp_path)
     _git("-C", worker, "symbolic-ref", "--delete", "refs/remotes/origin/HEAD")
     monkeypatch.setattr(cli, "_read_state", lambda *_args: {
@@ -153,12 +167,14 @@ def test_crew_run_records_master_as_implicit_base(tmp_path, monkeypatch):
     result = CliRunner().invoke(crew, [
         "run", "implement requested work", "--project", "test",
         "--db", str(tmp_path / "tasks.db"), "--no-tester", "--max-iter", "1",
+        *branch_args,
     ])
 
     assert result.exit_code == 0, result.output
-    assert captured[0]["base_branch"] == "master"
-    assert captured[0]["crew_run_branch"] is False
+    assert captured[0]["base_branch"] == expected_base
+    assert captured[0]["crew_run_branch"] is expected_run_branch
     assert captured[0]["sync_landed_bases"]["codex"]["sha"] == commits["master"]
-    assert _prepare_worktree_for_task(
-        str(worker), "impl-555-cli", "main", "implementer", captured[0],
-    ) == commits["master"]
+    if configured_main is None:
+        assert _prepare_worktree_for_task(
+            str(worker), "impl-555-cli", "main", "implementer", captured[0],
+        ) == commits["master"]
