@@ -63,23 +63,28 @@ def _clock(monkeypatch, when):
 
 def test_fresh_contract_cuts_without_enqueuing_fix(pending, monkeypatch):
     queue, policy, verdict_at = pending
+    assert auto_enqueue_fix(queue, "review-591", repo="owner/repo",
+                            pr_state_fn=lambda _: "open") is None
     _contract(policy, verdict_at + 60)
     _clock(monkeypatch, verdict_at + 61)
     monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
-    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 61) == 1
+    restarted = TaskQueue(queue.db_path)
+    assert reresolve_pending_rounds_caps(restarted, now=verdict_at + 61) == 1
     assert queue.get_task(pipeline.fix_task_id("review-591", 2)) is None
     receipt = queue.get_tokenomics_shadow_receipt("impl-591")
     assert receipt["canary_applied"] == 1
     assert receipt["canary_reason"] == "round_cap_reached"
+    assert reresolve_pending_rounds_caps(restarted, now=verdict_at + 62) == 0
 
 
 def test_timeout_enqueues_at_baseline_with_explicit_reason(pending, monkeypatch):
     queue, _, verdict_at = pending
     _clock(monkeypatch, verdict_at + 121)
     monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
-    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 121) == 1
+    restarted = TaskQueue(queue.db_path)
+    assert reresolve_pending_rounds_caps(restarted, now=verdict_at + 121) == 1
     assert queue.get_task(pipeline.fix_task_id("review-591", 2)) is not None
     receipt = queue.get_tokenomics_shadow_receipt("impl-591")
     assert receipt["canary_reason"] == "contract_wait_timeout"
     assert receipt["canary_applied"] == 0
-    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 122) == 0
+    assert reresolve_pending_rounds_caps(restarted, now=verdict_at + 122) == 0

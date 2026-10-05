@@ -82,9 +82,12 @@ ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS = 60
 def _rounds_cap_wait_seconds() -> float:
     """Bound the switch-on wait without changing switch-off's 60s window."""
     try:
-        return max(0.0, float(os.getenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS", "120")))
+        value = float(os.getenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS", "120"))
+        return max(0.0, value) if math.isfinite(value) else 120.0
     except ValueError:
         return 120.0
+
+
 #: Bounds on how much review text is copied into the fix task description.
 MAX_EMBEDDED_FINDINGS = 20
 MAX_FINDING_CHARS = 1000
