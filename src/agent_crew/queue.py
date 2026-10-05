@@ -1243,6 +1243,7 @@ _DDL_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_tasks_type_status ON tasks(task_type, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_priority ON tasks(priority DESC, created_at ASC);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_pr_context ON tasks(project, COALESCE(pr_number, json_extract(context,'$.pr_number')));
 CREATE INDEX IF NOT EXISTS idx_checkpoints_task_num ON checkpoints(task_id, checkpoint_num DESC);
 CREATE INDEX IF NOT EXISTS idx_gates_status ON gates(status);
 """

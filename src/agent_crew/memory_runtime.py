@@ -10,6 +10,7 @@ import time
 import re
 from contextlib import closing
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import Optional, Protocol
 
 LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
@@ -127,6 +128,8 @@ class SQLiteMemoryStorage:
         self.path = path
         with closing(sqlite3.connect(path)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))")
+            db.execute("CREATE INDEX IF NOT EXISTS idx_adr001_shadow_project_created "
+                       "ON adr001_memory(COALESCE(json_extract(scope,'$.project'),''), created DESC)")
             self._migrate_legacy_generation_zero(db)
             db.commit()
 
@@ -263,7 +266,7 @@ class SQLiteMemoryStorage:
         return sorted(result, key=lambda record: _retrieval_rank(record, terms))
 
     def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int,
-                        query: str = ""
+                        query: str = "", predecessor_task_ids: tuple[str, ...] = ()
                         ) -> tuple[list[MemoryRecord], int]:
         """Bound parsing to recent candidates and count project-less drops."""
         if not scope.project or not layers or limit <= 0:
@@ -295,21 +298,41 @@ class SQLiteMemoryStorage:
                 + " AND json_extract(value,'$.superseded_at') IS NULL"
                 + " AND COALESCE(json_extract(value,'$.superseded'),0)=0")
         args = [*sorted(layers), *params]
-        with closing(sqlite3.connect(self.path, timeout=shadow_sqlite_timeout_seconds())) as db:
+        uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True,
+                                     timeout=shadow_sqlite_timeout_seconds())) as db:
             dropped = db.execute("SELECT count(*) FROM adr001_memory WHERE " + base +
                 " AND COALESCE(json_extract(scope,'$.project'),'')=''", args).fetchone()[0]
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
-                + base + " AND json_extract(scope,'$.project')=? "
-                "ORDER BY created DESC,rowid DESC LIMIT ?",
+                + base + " AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                "ORDER BY created DESC LIMIT ?",
                 [*args, scope.project, (SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
                                         else min(limit, SHADOW_RETRIEVAL_MAX_ROWS))]).fetchall()
+            predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
+                                if "decision" in layers else [])
+            lineage_rows = db.execute(
+                "SELECT layer,key,value,scope,version FROM adr001_memory "
+                "WHERE layer='decision' AND key IN (" + ",".join("?" for _ in predecessor_keys)
+                + ") AND COALESCE(json_extract(scope,'$.project'),'')=?",
+                [*predecessor_keys, scope.project],
+            ).fetchall() if predecessor_keys else []
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
         if query.strip():
             terms = set(query.lower().replace('-', ' ').split())
             scoped.sort(key=lambda record: _retrieval_rank(record, terms))
-        return scoped[:min(limit, SHADOW_RETRIEVAL_MAX_ROWS)], dropped
+        lineage = {key: MemoryRecord(layer, key, json.loads(value),
+                                    _scope_from_json(record_scope), version)
+                   for layer, key, value, record_scope, version in lineage_rows}
+        pinned = [lineage[key] for key in predecessor_keys if key in lineage
+                  and lineage[key].scope.fleet in ("", scope.fleet)
+                  and not lineage[key].value.get("invalidated_at")
+                  and not lineage[key].value.get("superseded_at")
+                  and not lineage[key].value.get("superseded")]
+        pinned_keys = {record.key for record in pinned}
+        return (pinned + [record for record in scoped if record.key not in pinned_keys])[
+            :min(limit, SHADOW_RETRIEVAL_MAX_ROWS)], dropped
 
 
 def owner_statement_key(project: str, channel: str, chat_id: str,
@@ -458,7 +481,8 @@ class RuntimeMemoryProvider:
         allowed &= {"procedural", "episodic", "decision", "failure_pattern"}
         if isinstance(self.storage, SQLiteMemoryStorage):
             scoped, dropped = self.storage.retrieve_shadow(
-                scope, allowed, request.limit, query=request.retrieval_query)
+                scope, allowed, request.limit, query=request.retrieval_query,
+                predecessor_task_ids=request.predecessor_task_ids)
         else:
             records = [record for record in self.storage.retrieve(scope,
                 query=request.retrieval_query) if record.layer in allowed]

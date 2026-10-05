@@ -45,6 +45,7 @@ class MemoryRequest:
     retrieval_query: str = ""
     query_source: str = ""
     issue: str = ""
+    predecessor_task_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
