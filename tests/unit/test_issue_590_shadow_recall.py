@@ -76,15 +76,24 @@ def test_lineage_read_and_index_migration_tolerate_malformed_context(tmp_path):
         names = {row[1] for row in db.execute("PRAGMA index_list(tasks)")}
         assert "idx_tasks_project_pr_context" not in names
         assert "idx_tasks_project_pr_context_valid" in names
+        # Leave malformed legacy data in place before TaskQueue rebuilds its index.
+        db.execute("DROP INDEX idx_tasks_project_pr_context_valid")
         db.execute(
             "INSERT INTO tasks (task_id,task_type,description,project,context,"
             "pr_number,status,created_at,receipt_id) VALUES "
             "('prior','implement','prior','agent_crew','not JSON',590,'completed',1,'r-prior')")
         db.execute(
             "INSERT INTO tasks (task_id,task_type,description,project,context,"
+            "pr_number,status,created_at,receipt_id) VALUES "
+            "('broken-unrelated','implement','broken','agent_crew','not JSON',"
+            "NULL,'completed',1.5,'r-broken')")
+        db.execute(
+            "INSERT INTO tasks (task_id,task_type,description,project,context,"
             "pr_number,created_at,receipt_id) VALUES "
             "('current','implement','current','agent_crew',"
             "'{\"prev_task_id\":\"prior\"}',590,2,'r-current')")
+    TaskQueue(db_path)
+    with sqlite3.connect(db_path) as db:
         plan = db.execute(
             "EXPLAIN QUERY PLAN SELECT task_id FROM tasks WHERE project=? "
             "AND COALESCE(pr_number,CASE WHEN json_valid(context) "
