@@ -865,6 +865,12 @@ def _prepare_worktree_for_task_inner(
         # Once prepared, the recorded SHA pins a second preparation of the same
         # task even if origin/main advances between push and dispatch.
         pinned_base = _object_id_or_empty(task_context.get("worktree_base_sha"))
+        # #595: a fix on an existing PR branch must compare its result with
+        # that branch's head at dispatch, not with a newer default-branch tip.
+        # Resolve after fetch, and keep the pinned SHA authoritative on a
+        # second preparation of the same task.
+        remote_branch = (_branch_ref(worktree_path, f"refs/remotes/origin/{branch}")
+                         if task_type in ("", "implement") else "")
         branch_start = ""
         if task_context.get("crew_run_branch"):
             # The caller's existing branch supplies its own content. Only a
@@ -875,9 +881,9 @@ def _prepare_worktree_for_task_inner(
                 branch_start = local
             else:
                 branch_start = remote or local
-        if discover_default and not pinned_base and not branch_start:
+        if discover_default and not pinned_base and not branch_start and not remote_branch:
             main_branch = _remote_default_branch(worktree_path)
-        base_ref = pinned_base or f"origin/{main_branch}"
+        base_ref = pinned_base or remote_branch or f"origin/{main_branch}"
         base_sha = _branch_ref(worktree_path, base_ref)
         checkout_base = base_sha or base_ref
         if task_context.get("crew_run_branch"):
