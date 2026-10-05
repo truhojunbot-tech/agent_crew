@@ -3812,7 +3812,7 @@ class TaskQueue:
     def dequeue(
         self, agent: str = "", role: str = "", *, claimed_via: str = "",
         claim_source: str = "", skip_task_ids: Optional[set[str]] = None,
-        skip_deferred: bool = False,
+        skip_deferred: bool = False, skip_capacity_deferred: bool = False,
     ) -> Optional[TaskRequest]:
         """Atomically dequeue the next pending task for ``agent`` / ``role``.
 
@@ -3835,12 +3835,19 @@ class TaskQueue:
         winning the ORDER BY and starving the tasks behind it. Other consumers
         (dispatcher, MCP) leave it False — the backoff is about a pane, not
         the task.
+        ``skip_capacity_deferred`` (#581): the dispatcher passes True so it
+        honours only the provider-capacity backoff (`push_refusal_reason ==
+        'codex_capacity'`), not a pane refusal it can still deliver past.
         ``claim_source`` is server-owned provenance for recovery. Skipped IDs
         let push delivery pass a busy queue head during this scheduling pass.
         """
         _now = time.time()
         _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "
                       + repr(_now)) if skip_deferred else ""
+        if skip_capacity_deferred and not skip_deferred:
+            _defer_sql = (" AND NOT (COALESCE(json_extract(context, '$.push_refusal_reason'), '')"
+                          " = 'codex_capacity' AND COALESCE(json_extract(context,"
+                          " '$.push_not_before'), 0) > " + repr(_now) + ")")
         # #311/#314 STOP 전파: 런타임 STOP 활성이면 어떤 task도 claim/start하지 않는다.
         # 이 한 지점이 tmux push(_try_push_next)와 MCP GET /tasks/next를 모두 덮어
         # 큐 드레인·successor/retry stage 시작을 막는다. in-flight는 자기 원자단위까지만.

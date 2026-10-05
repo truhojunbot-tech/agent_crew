@@ -4473,6 +4473,18 @@ def create_app(
         _MAX_TRANSIENT_RETRY = int(os.getenv("AGENT_CREW_TRANSIENT_RETRY_MAX", "3"))
     except ValueError:
         _MAX_TRANSIENT_RETRY = 3
+    # #581: codex "Selected model is at capacity" outlasts an immediate retry —
+    # three back-to-back requeues burned out in ~4 min. Capacity alone backs
+    # off via `push_not_before`: base * 2**(n-1) = 2/4/8/16 min (~30 min),
+    # then fails as before. No implementer fallback (owner policy: HOLD).
+    try:
+        _CAPACITY_BACKOFF_S = float(os.getenv("AGENT_CREW_CAPACITY_BACKOFF_S", "120"))
+    except ValueError:
+        _CAPACITY_BACKOFF_S = 120.0
+    try:
+        _MAX_CAPACITY_RETRY = int(os.getenv("AGENT_CREW_CAPACITY_RETRY_MAX", "4"))
+    except ValueError:
+        _MAX_CAPACITY_RETRY = 4
 
     # #202: append-only context lifecycle event stream, separate from
     # attribution.jsonl (see context_identity.record_context_event).
@@ -5597,13 +5609,22 @@ def create_app(
             elif _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
-                if _n <= _MAX_TRANSIENT_RETRY:
+                _capacity = _transient == "codex_capacity"
+                _max_retry = _MAX_CAPACITY_RETRY if _capacity else _MAX_TRANSIENT_RETRY
+                if _n <= _max_retry:
                     try:
+                        if _capacity:
+                            # Before the requeue, so no dequeue sees it undelayed.
+                            _delay = _CAPACITY_BACKOFF_S * (2 ** (_n - 1))
+                            q().patch_context(task.task_id, {
+                                "push_not_before": time.time() + _delay,
+                                "push_refusal_reason": _transient})
                         q().requeue(task.task_id)
                         logger.warning(
                             f"dispatcher: transient {_transient} on "
                             f"task={task.task_id} — requeued "
-                            f"(attempt {_n}/{_MAX_TRANSIENT_RETRY})"
+                            f"(attempt {_n}/{_max_retry})"
+                            + (f", not before +{_delay:.0f}s" if _capacity else "")
                         )
                         _terminal = False
                         return
@@ -5615,7 +5636,7 @@ def create_app(
                     logger.error(
                         f"dispatcher: transient {_transient} on "
                         f"task={task.task_id} — giving up after "
-                        f"{_MAX_TRANSIENT_RETRY} retries"
+                        f"{_max_retry} retries"
                     )
                 _fail_if_active(task.task_id, f"transient_{_transient}_max_retries")
             elif _transient in _TRANSIENT_NONRETRIABLE_TAGS:
@@ -5831,7 +5852,7 @@ def create_app(
                             # Stage 1 checks overrides independent of task type;
                             # Stage 2 checks each role this worker owns.
                             task = q().dequeue(agent=worker, role=_candidate_role, claimed_via="dispatcher",
-                                               claim_source="dispatcher")
+                                               claim_source="dispatcher", skip_capacity_deferred=True)
                             if task is not None:
                                 break
                         if task is None:
