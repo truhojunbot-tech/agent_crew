@@ -6836,6 +6836,32 @@ def create_app(
             _ok, _detail = verify_task_artifact(
                 _task, result, repo_cwd=_any_worktree_path(),
                 commit_verifier=verify_implement_artifact)
+            if (not _ok and _detail.startswith(MISSING_IMPLEMENT_REF_DETAIL)
+                    and _task is not None and _task.task_type == "implement"):
+                # A result with no refs may still have a git-proven artifact
+                # in the exact worktree recorded for this dispatch (#573).
+                # Never infer one from the summary or from another role's tree.
+                try:
+                    attribution = q().get_attribution(task_id) or {}
+                    wt = str(attribution.get("worktree_path") or "")
+                    base = str(_artifact_context.get("worktree_base_sha") or "")
+                    if wt and base:
+                        head = _branch_ref(wt, "HEAD")
+                        if head and head != base and _is_ancestor(wt, base, head):
+                            current_branch = subprocess.run(
+                                ["git", "-C", wt, "symbolic-ref", "--quiet", "--short", "HEAD"],
+                                capture_output=True, text=True, timeout=30,
+                            )
+                            branch = (current_branch.stdout.strip()
+                                      if current_branch.returncode == 0 else "")
+                            candidate = dataclasses.replace(result, commit=head, branch=branch)
+                            candidate_ok, candidate_detail = verify_task_artifact(
+                                _task, candidate, repo_cwd=wt,
+                                commit_verifier=verify_implement_artifact)
+                            result, _ok, _detail = candidate, candidate_ok, candidate_detail
+                except Exception:
+                    logger.exception("POST /tasks/%s/result: worktree artifact probe failed",
+                                     task_id)
             if not _ok:
                 _artifact_held = _detail
                 result = no_artifact_result(result, _detail)
