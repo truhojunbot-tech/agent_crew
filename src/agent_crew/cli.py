@@ -2229,6 +2229,125 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
         return {}
 
 
+def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
+                                   pr_number: int, title: str, task_desc: str,
+                                   issue: int | None, receipt_dir: str,
+                                   repo: str) -> bool:
+    """#588: run the ADR-004 conformance gate (``--enforce``) before auto-merge.
+
+    Off unless ``AGENT_CREW_CONFORMANCE_GATE_CMD`` names the gate command
+    prefix; the gate itself lives in the alfred repo and is only called here.
+    The verdict, receipt path and sha are recorded on ``task_id``:
+
+    * ALLOW  — merge.
+    * REVIEW — merge, and post the receipt as a PR comment for the reviewer.
+      Any gate error, timeout, non-zero exit other than 10, or
+      EVIDENCE_UNAVAILABLE counts as REVIEW.
+    * BLOCK (exit 10) — do not merge; the task goes to ``needs_human``.
+    """
+    prefix = os.environ.get("AGENT_CREW_CONFORMANCE_GATE_CMD", "").strip()
+    if not prefix:
+        return True
+    import hashlib
+    import shlex
+    from agent_crew import github
+    ctx: dict = {}
+    try:
+        ctx = queue.get_task_context(task_id) or {}
+    except Exception:
+        pass
+    change = {
+        "stage": "PRE_MERGE",
+        "project": project,
+        "text": "\n".join([title, *task_desc.splitlines()[:5]]).strip(),
+        "change_type": ctx.get("change_type") if ctx.get("change_type") in ("create", "modify") else "modify",
+        "owner_evidence": {"project": project,
+                           "ref": f"issue#{issue}" if issue else f"pr#{pr_number}"},
+    }
+    if ctx.get("capability_id"):
+        change["capability_id"] = str(ctx["capability_id"])
+    # The external checker requires these facts before it can reach the
+    # registry matcher.  Forward only declarations the task actually carries;
+    # absent evidence must remain REVIEW, rather than an invented default.
+    if isinstance(ctx.get("portable_core"), bool):
+        change["portable_core"] = ctx["portable_core"]
+    if isinstance(ctx.get("dependencies"), list):
+        change["dependencies"] = ctx["dependencies"]
+    if isinstance(ctx.get("role"), str) and ctx["role"]:
+        change["role"] = ctx["role"]
+    stem = os.path.join(receipt_dir, f"{task_id}-pr{pr_number}")
+    change_path, receipt_path = f"{stem}.change.json", f"{stem}.receipt.json"
+    verdict, error, exit_code = "REVIEW", "", None
+    try:
+        os.makedirs(receipt_dir, exist_ok=True)
+        with open(change_path, "w") as fh:
+            json.dump(change, fh, indent=2)
+        if os.path.exists(receipt_path):
+            os.remove(receipt_path)
+        cmd = shlex.split(prefix) + ["capability-conformance-check", "--input", change_path,
+                                     "--receipt", receipt_path, "--enforce"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        exit_code = r.returncode
+        if exit_code == 10:
+            verdict = "BLOCK"
+        elif exit_code != 0:
+            error = f"gate exit {exit_code}: {(r.stderr or r.stdout).strip()[-500:]}"
+        else:
+            with open(receipt_path) as fh:
+                raw = json.load(fh)
+            reported = str(raw.get("verdict") or raw.get("decision") or "").upper()
+            if reported in ("ALLOW", "REVIEW"):
+                verdict = reported
+            else:
+                # EVIDENCE_UNAVAILABLE, or BLOCK without exit 10, is REVIEW.
+                error = f"gate verdict {reported!r} with exit 0"
+    except subprocess.TimeoutExpired:
+        error = "gate timeout after 30s"
+    except Exception as exc:
+        error = f"gate error: {exc}"
+    try:
+        if error or not os.path.exists(receipt_path):
+            with open(receipt_path, "w") as fh:
+                json.dump({"verdict": verdict, "error": error, "source": "agent_crew"}, fh, indent=2)
+        with open(receipt_path, "rb") as fh:
+            receipt_bytes = fh.read()
+    except OSError as exc:
+        # A broken receipt directory is a gate failure, not a merge veto.
+        # Keep the REVIEW/BLOCK evidence at a usable fallback path.
+        import tempfile
+        error = f"{error}; receipt error: {exc}".strip("; ")
+        fd, receipt_path = tempfile.mkstemp(prefix="agent_crew_conformance_", suffix=".json")
+        with os.fdopen(fd, "w") as fh:
+            json.dump({"verdict": verdict, "error": error, "source": "agent_crew"}, fh, indent=2)
+        with open(receipt_path, "rb") as fh:
+            receipt_bytes = fh.read()
+    record = {"verdict": verdict, "receipt_path": receipt_path,
+              "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
+              "exit_code": exit_code, "pr_number": pr_number,
+              "merge_allowed": verdict != "BLOCK"}
+    if error:
+        record["error"] = error
+    click.echo(f"  Conformance gate: {verdict} — receipt {receipt_path}")
+    try:
+        if verdict == "BLOCK":
+            queue.mark_needs_human(
+                task_id, f"conformance gate BLOCK on PR #{pr_number}; receipt {receipt_path}",
+                {"conformance_gate": record})
+        else:
+            queue.patch_context(task_id, {"conformance_gate": record})
+    except Exception as exc:
+        click.echo(f"Warning: could not record conformance gate receipt: {exc}")
+    if verdict == "REVIEW":
+        body = (f"**Conformance gate (ADR-004, PRE_MERGE): REVIEW** — merging, "
+                f"reviewer must address this receipt.\n\n"
+                f"task `{task_id}` · receipt `{receipt_path}` · sha256 `{record['receipt_sha256']}`"
+                + (f"\n\nerror: {error}" if error else "")
+                + f"\n\n```json\n{receipt_bytes.decode('utf-8', 'replace')[:6000]}\n```")
+        if not github.post_pr_comment(pr_number, body, repo=repo):
+            click.echo("Warning: could not post conformance gate receipt to the PR")
+    return verdict != "BLOCK"
+
+
 def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
                             port: int = 0, project: str = "",
                             role_to_agent: dict | None = None) -> dict[str, dict]:
@@ -2313,6 +2432,33 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
             landed_bases[agent] = {"requested_ref": f"origin/{main_branch}", "actual_ref": None,
                                    "sha": None, "status": "unknown"}
     return landed_bases
+
+
+def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = "",
+                      timeout: float = 30.0, poll_interval: float = 1.0) -> list:
+    """Return the fix tasks whose ``prev_task_id`` is ``review_id`` (#582).
+
+    The server cascade enqueues the fix ~10 s after the review result lands,
+    so poll for it before falling back to a local ``auto_enqueue_fix``. The
+    fallback names the repo and a checkout of it; without them
+    ``pr_is_actionable`` resolves to unknown and no fix is created.
+    """
+    def _fixes():
+        return [t for t in queue.list_tasks()
+                if t.task_type == "implement"
+                and isinstance(t.context, dict)
+                and t.context.get("prev_task_id") == review_id]
+
+    deadline = time.time() + timeout
+    fixes = _fixes()
+    while not fixes and time.time() < deadline:
+        time.sleep(poll_interval)
+        fixes = _fixes()
+    if not fixes:
+        from agent_crew.pipeline import auto_enqueue_fix
+        auto_enqueue_fix(queue, review_id, repo=repo, repo_cwd=repo_cwd)
+        fixes = _fixes()
+    return fixes
 
 
 @crew.command("run")
@@ -2689,6 +2835,14 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         if not resolved_repo:
             click.echo("Warning: cannot auto-merge — repo not determined")
             return
+        if not _conformance_gate_allows_merge(
+                queue, impl_id, project=_adapter_project(queue, project),
+                pr_number=pr_number, title=task.split('\n')[0][:72], task_desc=task,
+                issue=issue, repo=resolved_repo, receipt_dir=os.path.join(
+                    os.path.dirname(os.path.abspath(db)), "conformance_receipts")):
+            click.echo(f"  Conformance gate BLOCK — not merging PR #{pr_number}; "
+                       f"task {impl_id} needs_human.")
+            return
         r = subprocess.run(
             ["gh", "pr", "merge", str(pr_number), "--repo", resolved_repo,
              "--squash", "--delete-branch"],
@@ -3019,17 +3173,10 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             impl_id = enqueue_implement(queue, task, impl_branch or branch,
                                         context=retry_context, port=_run_port)
             continue
-        from agent_crew.pipeline import auto_enqueue_fix
-        fixes = [t for t in queue.list_tasks()
-                 if t.task_type == "implement"
-                 and isinstance(t.context, dict)
-                 and t.context.get("prev_task_id") == review_id]
-        if not fixes:
-            auto_enqueue_fix(queue, review_id)
-            fixes = [t for t in queue.list_tasks()
-                     if t.task_type == "implement"
-                     and isinstance(t.context, dict)
-                     and t.context.get("prev_task_id") == review_id]
+        _impl_agent = implementer or _run_role_to_agent.get("implementer", "")
+        fixes = _await_review_fix(
+            queue, review_id, repo=repo,
+            repo_cwd=_run_worktrees.get(_impl_agent, "") if _run_worktrees else "")
         if len(fixes) != 1:
             click.echo(f"[{iteration}/{max_iter}] ❌ Expected one actionable fix for {review_id}; found {len(fixes)}. Stopping.")
             return
