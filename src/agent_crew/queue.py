@@ -2760,7 +2760,8 @@ class TaskQueue:
         return auth
 
     def enqueue_with_receipt(self, task: TaskRequest, receipt: dict, *,
-                             context: Optional[dict] = None) -> str:
+                             context: Optional[dict] = None,
+                             _capacity_predecessor: str = "") -> str:
         """Write the task row for an admitted intent. **The only writer there is.**
 
         P2: "without a valid receipt there is no enqueue". That is a property of
@@ -2841,7 +2842,8 @@ class TaskQueue:
             expired_reservations: list = []
             duplicate_id = self._duplicate_review_in_txn(
                 conn, task, context, now=admit_at, ttl=reservation_ttl,
-                expired=expired_reservations, resolved_sha=resolved_review_sha)
+                expired=expired_reservations, resolved_sha=resolved_review_sha,
+                ignore_active_task_id=_capacity_predecessor)
             if duplicate_id:
                 if context.get("allow_duplicate_review") is True:
                     self._append_exec_event_on(
@@ -3025,7 +3027,8 @@ class TaskQueue:
                                  now: Optional[float] = None,
                                  ttl: Optional[float] = None,
                                  expired: Optional[list] = None,
-                                 resolved_sha: str = "") -> Optional[str]:
+                                 resolved_sha: str = "",
+                                 ignore_active_task_id: str = "") -> Optional[str]:
         """Find a standing review/test of this target under the write lock.
 
         Pending reviews without a pin will use the current head at dispatch, so
@@ -3064,6 +3067,12 @@ class TaskQueue:
             (task.project, task.task_type, task.task_id),
         ).fetchall()
         for row in rows:
+            # Capacity re-admission creates the replacement before cancelling
+            # its active predecessor. Only that trusted predecessor is ignored;
+            # another review/test of this target still blocks admission.
+            if (row["task_id"] == ignore_active_task_id
+                    and row["status"] == "in_progress"):
+                continue
             try:
                 old = json.loads(row["context"] or "{}")
             except (TypeError, ValueError):
@@ -3217,7 +3226,15 @@ class TaskQueue:
             else:
                 auth = self._refuse_admission(task, context=context, provenance=provenance,
                                               code=refusal[0], text=refusal[1])
-            return self.enqueue_with_receipt(task, auth.receipt, context=context)
+            capacity_predecessor = ""
+            if (_successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE
+                    and ingress == "retry.failed_task"
+                    and context.get("push_refusal_reason") == "codex_capacity"
+                    and context.get("provider_capacity_root")):
+                capacity_predecessor = str(context.get("original_task_id") or "")
+            return self.enqueue_with_receipt(
+                task, auth.receipt, context=context,
+                _capacity_predecessor=capacity_predecessor)
 
     def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
                           provenance: "_CeaProvenance", code: str, text: str):

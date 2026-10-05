@@ -445,3 +445,153 @@ def test_u_581_capacity_redispatches_under_cea_enforcement(tmp_path, enforcing_c
     # same work (P4): every admission in the streak anchors on the root
     from agent_crew.queue import _cea_lineage_root_task_id
     assert _cea_lineage_root_task_id("retry-t-enf-a2", ctx) == "t-enf"
+
+
+@pytest.mark.parametrize("task_type", ["review", "test"])
+def test_u_581_capacity_successor_can_replace_its_active_review_target(
+        tmp_path, enforcing_codex_queues, task_type):
+    """The duplicate-target guard must ignore only the trusted active parent."""
+    from agent_crew.queue import (AdmissionRefused,
+                                  _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    from agent_crew.pipeline import successor_context
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import admitted
+
+    q = TaskQueue(str(tmp_path / "capacity-review.db"))
+    parent = TaskRequest(
+        task_id="review-parent", task_type=task_type, description="Review PR #581",
+        branch="feature/581", project="agent_crew",
+        context=admitted({"pr_number": 581, "reviewed_sha": "a" * 40}),
+    )
+    q.enqueue(parent)
+    claimed = q.dequeue(agent="codex" if task_type == "review" else "gemini",
+                        role="reviewer" if task_type == "review" else "tester")
+    assert claimed is not None and claimed.task_id == parent.task_id
+    ctx = successor_context(q.get_task_context(parent.task_id))
+    ctx.update({"original_task_id": parent.task_id,
+                "provider_capacity_root": parent.task_id,
+                "push_refusal_reason": "codex_capacity",
+                "provider_capacity_count": 1})
+    successor = TaskRequest(
+        task_id="retry-review-parent-a1", task_type=task_type,
+        description=parent.description, branch=parent.branch,
+        project=parent.project, context=ctx,
+    )
+    # Caller-provided lineage does not grant a duplicate-target exemption.
+    with pytest.raises(AdmissionRefused):
+        q.enqueue(successor, ingress="retry.failed_task")
+    assert q.enqueue(successor, ingress="retry.failed_task",
+                     _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE) == successor.task_id
+    assert q.get_task_status(parent.task_id) == "in_progress"
+    assert q.get_task_status(successor.task_id) == "pending"
+
+
+@pytest.mark.parametrize("task_type,agent,role", [
+    ("review", "codex", "reviewer"), ("test", "gemini", "tester"),
+])
+def test_u_581_capacity_review_readmission_claims_with_signed_receipt(
+        tmp_path, monkeypatch, task_type, agent, role):
+    """A replacement review/test passes real admission and signed claim gates."""
+    import sqlite3
+    from types import SimpleNamespace
+
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+    from agent_crew.cea import signed_receipt, store as receipt_store
+    from agent_crew.cea.auth import AdapterIdentity, StaticTokenAuthenticator
+    from agent_crew.cea.broker import Broker, BROKER_TREE_USER_WRITABLE
+    from agent_crew.cea.engine import AuthorizationEngine, EngineConfig
+    from agent_crew.cea.intent import CallerProvenance
+    from agent_crew.cea.service import encode_intent
+    from agent_crew.pipeline import successor_context
+    from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE, intent_for_task
+    from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED, admitted
+
+    key = Ed25519PrivateKey.generate()
+    private_path = tmp_path / "signing.key"
+    private_path.write_bytes(key.private_bytes(
+        serialization.Encoding.Raw, serialization.PrivateFormat.Raw,
+        serialization.NoEncryption()))
+    build_path = tmp_path / "SRC_COMMIT"
+    build_path.write_text("test-build")
+    monkeypatch.setenv("AGENT_CREW_CEA_RECEIPT_SIGNING_KEY_FILE", str(private_path))
+    monkeypatch.setenv("AGENT_CREW_AUTHZ_SRC_COMMIT_PATH", str(build_path))
+    monkeypatch.setattr(signed_receipt, "load_public", lambda path: key.public_key())
+    config = EngineConfig(mode="enforce",
+                          enforce_codes=frozenset({"RUNTIME_STATE_FORBIDS"}))
+    q = TaskQueue(str(tmp_path / "signed-capacity.db"),
+                  cea_config=config, cea_providers=dict(WIRED))
+    def resign_lifecycle(receipt):
+        binding = receipt["provenance"]["signed_dispatch"]
+        return signed_receipt.sign(
+            receipt, key, payload=binding["payload_hash"], build_commit="test-build")
+
+    # In production the broker owns lifecycle signing. The local test engine
+    # otherwise replaces the broker signature with its own HMAC on transition.
+    monkeypatch.setattr(q.cea_engine(), "_resign", resign_lifecycle)
+    monkeypatch.setattr(q.cea_engine("agent_crew"), "_resign", resign_lifecycle)
+    broker = Broker(str(tmp_path / "socket"), degraded=True,
+                    client_uids=(os.geteuid(),), integrity_paths=(str(tmp_path),),
+                    decision_engine=AuthorizationEngine(
+                        config=EngineConfig(mode="enforce",
+                                            fallback_reason=BROKER_TREE_USER_WRITABLE),
+                        **WIRED), connect=q._connect,
+                    authenticator=StaticTokenAuthenticator({"test-token": AdapterIdentity(
+                        "test", CallerProvenance.DIRECT)}))
+
+    def authorize(item, *, context=None, retry=False, **kwargs):
+        reply = broker._authorize(encode_intent(
+            intent_for_task(item, context=context), "test-token", retry=retry))
+        assert "receipt" in reply, reply
+        return SimpleNamespace(receipt=reply["receipt"])
+
+    monkeypatch.setattr(q, "authorize_task", authorize)
+    parent = TaskRequest(
+        task_id="signed-parent", task_type=task_type,
+        description="Review PR #581", branch="feature/581", project="agent_crew",
+        context=admitted({"pr_number": 581, "reviewed_sha": "a" * 40}),
+    )
+    q.enqueue(parent)
+    with sqlite3.connect(q.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        initial_row = conn.execute("SELECT * FROM tasks WHERE task_id=?",
+                                   (parent.task_id,)).fetchone()
+        initial_receipt = receipt_store.current_receipt(conn, initial_row["receipt_id"])
+    initial_payload = signed_receipt.payload_hash(
+        task_type=initial_row["task_type"], branch=initial_row["branch"],
+        description=initial_row["description"], context=json.loads(initial_row["context"]))
+    assert signed_receipt.verify_signature(initial_receipt, key.public_key())
+    assert initial_receipt["provenance"]["signed_dispatch"]["payload_hash"] == initial_payload
+    assert q.dequeue(agent=agent, role=role).task_id == parent.task_id
+    cap = q.defer_provider_capacity(parent.task_id, delay_s=0,
+                                    blocked_after_s=3600)
+    assert cap is not None and cap["readmit"] is True
+    ctx = successor_context(q.get_task_context(parent.task_id))
+    ctx.update({"original_task_id": parent.task_id,
+                "provider_capacity_root": parent.task_id,
+                "push_refusal_reason": "codex_capacity",
+                "push_not_before": 0,
+                "provider_capacity_count": cap["count"],
+                "provider_capacity_since": cap["since"]})
+    successor = TaskRequest(
+        task_id="retry-signed-parent-a1", task_type=task_type,
+        description=parent.description, branch=parent.branch,
+        project=parent.project, context=ctx)
+    q.enqueue(successor, ingress="retry.failed_task",
+              _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    q.cancel(parent.task_id, reason="capacity readmitted", expected_status="in_progress")
+    with sqlite3.connect(q.db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute("SELECT * FROM tasks WHERE task_id=?",
+                           (successor.task_id,)).fetchone()
+        receipt = receipt_store.current_receipt(conn, row["receipt_id"])
+    verified, _nonce = signed_receipt.verify(
+        receipt, key.public_key(), task_id=successor.task_id,
+        receipt_id=row["receipt_id"], enforce_codes=config.enforce_codes,
+        payload=signed_receipt.payload_hash(
+            task_type=row["task_type"], branch=row["branch"],
+            description=row["description"], context=json.loads(row["context"])))
+    assert verified and _nonce
+    assert q.dequeue(agent=agent, role=role).task_id == successor.task_id
+    assert q.record_prepared_review_base(
+        successor.task_id, {"reviewed_sha": "a" * 40}) is True
