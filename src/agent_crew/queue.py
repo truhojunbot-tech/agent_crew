@@ -6570,14 +6570,25 @@ class TaskQueue:
         )
 
     def pending_rounds_cap_reresolutions(self) -> list[dict]:
-        """Return only switch-off observations awaiting a fresh contract."""
+        """Return pending switch-off observations and switch-on cascades."""
         conn = self._connect()
         try:
             rows = conn.execute(
                 "SELECT task_id, canary_counterfactual FROM tokenomics_shadow_receipts "
-                "WHERE canary_reason='switch_off:pending_reresolve' AND canary_applied=0"
+                "WHERE canary_reason IN ('switch_off:pending_reresolve', "
+                "'switch_on:pending_reresolve', 'switch_on:fresh_reresolved', "
+                "'contract_wait_timeout') AND canary_applied=0"
             ).fetchall()
-            return [dict(row) for row in rows]
+            pending = []
+            for row in rows:
+                try:
+                    state = json.loads(row["canary_counterfactual"] or "null")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(state, dict) and (state.get("pending_reresolve")
+                                                or state.get("cascade_pending")):
+                    pending.append(dict(row))
+            return pending
         finally:
             conn.close()
 
@@ -6597,7 +6608,8 @@ class TaskQueue:
                        canary_counterfactual=?, canary_reason=?,
                        canary_resolved_at=?, updated_at=?
                    WHERE task_id=? AND canary_applied=0
-                     AND canary_reason='switch_off:pending_reresolve'
+                     AND canary_reason IN ('switch_off:pending_reresolve',
+                                           'switch_on:pending_reresolve')
                      AND canary_counterfactual=?""",
                 (decision_source, json.dumps(recommendation), json.dumps(counterfactual),
                  reason, now, now, task_id, expected_counterfactual),
@@ -6608,6 +6620,29 @@ class TaskQueue:
                     recommendation=recommendation, applied=False,
                     counterfactual=counterfactual, reason=reason, cea_receipt_id=None,
                 )
+            conn.commit()
+            return changed == 1
+        finally:
+            conn.close()
+
+    def mark_rounds_cap_cascade_complete(
+        self, task_id: str, expected_counterfactual: str,
+    ) -> bool:
+        """Close a settled switch-on cascade after its idempotent replay."""
+        try:
+            counterfactual = json.loads(expected_counterfactual)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(counterfactual, dict) or not counterfactual.get("cascade_pending"):
+            return False
+        counterfactual["cascade_pending"] = False
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE tokenomics_shadow_receipts SET canary_counterfactual=?, updated_at=? "
+                "WHERE task_id=? AND canary_counterfactual=? AND canary_applied=0",
+                (json.dumps(counterfactual), time.time(), task_id, expected_counterfactual),
+            ).rowcount
             conn.commit()
             return changed == 1
         finally:
