@@ -6776,10 +6776,11 @@ def create_app(
         # #586: a review result that `_resolve_verdict` cannot map to a verdict
         # used to be marked done (200) and then dropped by the cascade, so the
         # reviewer never learned it was rejected. Refuse it before anything is
-        # written; the task stays in_progress for a re-post with `verdict`.
+        # written; the task stays live for a re-post with `verdict`.
         # Never inferred from the summary text.
         if (not _REPLAYING.get() and _task is not None
-                and _task.task_type == "review" and _task.status == "in_progress"
+                and _task.task_type == "review"
+                and _task.status in ("pending", "in_progress")
                 and _resolve_verdict(result) not in ("approve", "request_changes")):
             raise HTTPException(status_code=422, detail=(
                 "review result requires a `verdict` field: \"approve\" with no "

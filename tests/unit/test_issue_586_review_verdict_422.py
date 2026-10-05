@@ -53,3 +53,17 @@ def test_invalid_verdict_shape_is_422(tmp_db):
     assert response.status_code == 422
     assert "verdict" in response.json()["detail"]
     assert _task(queue, "review-586").status == "in_progress"
+
+
+def test_pending_review_without_verdict_is_422_and_stays_pending(tmp_db):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="review-586", task_type="review",
+                              description="Review PR #586", context={"pr_number": 586}))
+    with TestClient(create_app(tmp_db)) as client:
+        response = client.post("/tasks/review-586/result", json={
+            "task_id": "review-586", "status": "completed", "summary": SUMMARY,
+            "findings": [FINDING], "pr_number": 586,
+        })
+    assert response.status_code == 422
+    assert "verdict" in response.json()["detail"]
+    assert _task(queue, "review-586").status == "pending"
