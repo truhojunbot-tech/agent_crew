@@ -77,6 +77,7 @@ def successor_context(parent_context: object) -> dict:
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
 CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
 ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS = 60
+ROUNDS_CAP_CASCADE_MAX_ATTEMPTS = 3
 
 
 def _rounds_cap_wait_seconds() -> float:
@@ -1181,7 +1182,7 @@ def _lineage_tasks(tasks_by_id: dict, task):
 
 def _resume_pending_rounds_cap(queue: TaskQueue, row: dict,
                                counterfactual: dict, raw: str) -> None:
-    """Replay the idempotent cascade; leave it pending if enqueue could not finish."""
+    """Replay the idempotent cascade with a durable retry bound."""
     review_id = counterfactual["review_task_id"]
     auto_enqueue_fix(queue, review_id,
                      server_project=counterfactual.get("server_project"),
@@ -1193,6 +1194,10 @@ def _resume_pending_rounds_cap(queue: TaskQueue, row: dict,
     receipt = queue.get_tokenomics_shadow_receipt(row["task_id"])
     if queue.get_task(fix_id) or (receipt and receipt.get("canary_applied") == 1):
         queue.mark_rounds_cap_cascade_complete(row["task_id"], raw)
+    elif queue.note_rounds_cap_cascade_attempt(
+            row["task_id"], raw, max_attempts=ROUNDS_CAP_CASCADE_MAX_ATTEMPTS):
+        logger.warning("rounds-cap cascade %s did not enqueue after %s attempts",
+                       review_id, ROUNDS_CAP_CASCADE_MAX_ATTEMPTS)
 
 
 def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = None) -> int:

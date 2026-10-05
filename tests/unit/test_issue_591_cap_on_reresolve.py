@@ -88,3 +88,26 @@ def test_timeout_enqueues_at_baseline_with_explicit_reason(pending, monkeypatch)
     assert receipt["canary_reason"] == "contract_wait_timeout"
     assert receipt["canary_applied"] == 0
     assert reresolve_pending_rounds_caps(restarted, now=verdict_at + 122) == 0
+
+
+def test_terminal_pr_does_not_replay_unfinishable_cascade_forever(pending, monkeypatch):
+    queue, _, verdict_at = pending
+    _clock(monkeypatch, verdict_at + 121)
+    gate_calls = []
+
+    def terminal_pr(*_args, **_kwargs):
+        gate_calls.append(True)
+        return True
+
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", terminal_pr)
+    for tick in range(5):
+        reresolve_pending_rounds_caps(TaskQueue(queue.db_path),
+                                     now=verdict_at + 121 + tick)
+
+    assert len(gate_calls) == 3
+    assert queue.pending_rounds_cap_reresolutions() == []
+    assert queue.get_task(pipeline.fix_task_id("review-591", 2)) is None
+    counterfactual = json.loads(queue.get_tokenomics_shadow_receipt(
+        "impl-591")["canary_counterfactual"])
+    assert counterfactual["cascade_attempts"] == 3
+    assert counterfactual["cascade_replay_exhausted"] is True

@@ -6648,6 +6648,37 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def note_rounds_cap_cascade_attempt(
+        self, task_id: str, expected_counterfactual: str, *, max_attempts: int,
+    ) -> bool:
+        """Bound failed cascade replays using the durable receipt state.
+
+        Returns True only when this attempt exhausts the replay budget.
+        """
+        try:
+            counterfactual = json.loads(expected_counterfactual)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(counterfactual, dict) or not counterfactual.get("cascade_pending"):
+            return False
+        attempts = int(counterfactual.get("cascade_attempts") or 0) + 1
+        counterfactual["cascade_attempts"] = attempts
+        exhausted = attempts >= max_attempts
+        if exhausted:
+            counterfactual["cascade_pending"] = False
+            counterfactual["cascade_replay_exhausted"] = True
+        conn = self._connect()
+        try:
+            changed = conn.execute(
+                "UPDATE tokenomics_shadow_receipts SET canary_counterfactual=?, updated_at=? "
+                "WHERE task_id=? AND canary_counterfactual=? AND canary_applied=0",
+                (json.dumps(counterfactual), time.time(), task_id, expected_counterfactual),
+            ).rowcount
+            conn.commit()
+            return changed == 1 and exhausted
+        finally:
+            conn.close()
+
     def hold_tokenomics_canary_fix(
         self, review_task: TaskRequest, *, receipt_task_id: str, fix_round: int,
         recommendation: dict, counterfactual: dict,
