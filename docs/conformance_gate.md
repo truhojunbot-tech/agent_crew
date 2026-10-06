@@ -1,6 +1,6 @@
 # ADR-004 conformance gate before auto-merge
 
-`crew run --auto-merge` calls the ADR-004 conformance gate immediately before it attempts `gh pr merge`. The integration is implemented by `_conformance_gate_allows_merge` in `src/agent_crew/cli.py`. It is enabled only when `AGENT_CREW_CONFORMANCE_GATE_CMD` contains a command prefix. With the variable unset or empty, the gate is not called and the auto-merge path proceeds without a conformance receipt.
+`crew run --auto-merge` and the server's review/test-result auto-merge paths call the ADR-004 conformance gate before publishing the independent-review status or merging. Both use `_conformance_gate_allows_merge` in `src/agent_crew/conformance_gate.py`. It is enabled only when `AGENT_CREW_CONFORMANCE_GATE_CMD` contains a command prefix. With the variable unset or empty, the gate is not called and auto-merge proceeds without a conformance receipt. The server must receive this variable in its own environment; the CLI wrapper's default does not configure an already-running server.
 
 The shared `~/.local/bin/crew` wrapper currently sets the prefix fleet-wide, unless it is already set, to:
 
@@ -30,7 +30,7 @@ The change file declares `PRE_MERGE`, the project, a short title and task descri
 
 The gate reads `gh pr diff --patch` once. It appends up to 20 changed paths to the change text for registry matching and uses the same diff for `portable_core` and `dependencies`. If the diff read fails, those two fields stay absent unless task context supplied them; the checker then returns `REVIEW` rather than treating an unknown diff as evidence of no portable change or private dependency. A registry path tie also leaves the synthetic capability ID in place.
 
-The task context records `conformance_gate` with the verdict, receipt path, SHA-256 of the receipt, exit code, PR number, and whether merging is allowed. If the normal receipt path cannot be written, the CLI tries a temporary receipt file and records that path instead.
+The implement task context records `conformance_gate` with the verdict, receipt path, SHA-256 of the receipt, exit code, PR number, PR head when available, and whether merging is allowed. A retry on the same PR head reuses a verified receipt. If the normal receipt path cannot be written, the gate tries a temporary receipt file and records that path instead.
 
 ## Merge behavior
 
