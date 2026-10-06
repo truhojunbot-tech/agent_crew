@@ -122,6 +122,9 @@ def _existing_successor_id(queue, task_type: str, prev_task_id: str,
             task_ctx = task.context if isinstance(task.context, dict) else {}
             if task_ctx.get("prev_task_id") != prev_task_id:
                 continue
+            expected_sha = (context or {}).get("reviewed_sha")
+            if expected_sha and task_ctx.get("reviewed_sha") not in (None, expected_sha):
+                continue
             if task_type == "review":
                 # A failed review cannot satisfy a retry (#302).
                 try:
@@ -138,6 +141,41 @@ def _existing_successor_id(queue, task_type: str, prev_task_id: str,
     except Exception:
         pass  # The HTTP path may still create or reveal the successor.
     return None
+
+
+def _adopt_duplicate_successor(queue, existing_task_id: str, task_type: str,
+                               prev_task_id: str, context: dict | None = None) -> str | None:
+    """Adopt the row that won the admission race, after checking its target."""
+    try:
+        existing = queue.get_task(existing_task_id)
+        if existing is None or existing.task_type != task_type:
+            return None
+        old = existing.context if isinstance(existing.context, dict) else {}
+        expected_sha = (context or {}).get("reviewed_sha")
+        same_parent = old.get("prev_task_id") == prev_task_id
+        same_head = bool(expected_sha and old.get("reviewed_sha") == expected_sha)
+        if not (same_parent or same_head):
+            return None
+        if expected_sha and old.get("reviewed_sha") not in (None, expected_sha):
+            return None
+        return existing_task_id
+    except (AttributeError, KeyError):
+        return None
+
+
+def _adopt_http_duplicate(queue, exc: urllib.error.HTTPError, task_type: str,
+                          prev_task_id: str, context: dict | None = None) -> str | None:
+    try:
+        body = json.loads(exc.read())
+        existing_id = body.get("detail", {}).get("existing_task_id", "")
+        if existing_id:
+            adopted = _adopt_duplicate_successor(
+                queue, existing_id, task_type, prev_task_id, context)
+            if adopted:
+                return adopted
+    except (AttributeError, TypeError, ValueError):
+        pass
+    return _successor_after_conflict(queue, task_type, prev_task_id, context)
 
 
 def _successor_after_conflict(queue, task_type: str, prev_task_id: str,
@@ -178,18 +216,26 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
             return _post_task_http(port, req)
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
-                existing = _successor_after_conflict(queue, "review", prev_task_id, context)
+                existing = _adopt_http_duplicate(queue, exc, "review", prev_task_id, context)
                 if existing:
                     return existing
             raise
-    return queue.enqueue(req, ingress="loop.review")
+    from agent_crew.queue import DuplicateReviewError
+    try:
+        return queue.enqueue(req, ingress="loop.review")
+    except DuplicateReviewError as exc:
+        existing = _adopt_duplicate_successor(
+            queue, exc.existing_task_id, "review", prev_task_id, context)
+        if existing:
+            return existing
+        raise
 
 
 def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", context: dict = {},
                  port: int = 0, project: str = "") -> str:
     # Check if a test task already exists for this review task (auto-transition case).
     # This makes enqueue_test idempotent when the server has auto-created a test.
-    existing = _existing_successor_id(queue, "test", prev_task_id)
+    existing = _existing_successor_id(queue, "test", prev_task_id, context)
     if existing:
         return existing
 
@@ -207,11 +253,19 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
             return _post_task_http(port, req)
         except urllib.error.HTTPError as exc:
             if exc.code == 409:
-                existing = _successor_after_conflict(queue, "test", prev_task_id)
+                existing = _adopt_http_duplicate(queue, exc, "test", prev_task_id, context)
                 if existing:
                     return existing
             raise
-    return queue.enqueue(req, ingress="loop.test")
+    from agent_crew.queue import DuplicateReviewError
+    try:
+        return queue.enqueue(req, ingress="loop.test")
+    except DuplicateReviewError as exc:
+        existing = _adopt_duplicate_successor(
+            queue, exc.existing_task_id, "test", prev_task_id, context)
+        if existing:
+            return existing
+        raise
 
 
 _KNOWN_LAYERS = {"test_quality", "code_quality", "business_gap"}
