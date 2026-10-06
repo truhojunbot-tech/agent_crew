@@ -36,7 +36,7 @@ def checker(tmp_path, monkeypatch):
 
 
 def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
-                 change_type="create"):
+                 change_type="create", gate_failure=""):
     if not gate_enabled:
         monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -69,6 +69,12 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
     real_run = subprocess.run
 
     def run(args, **kwargs):
+        if gate_failure and args and args[0] == "gate-command":
+            if gate_failure == "timeout":
+                raise subprocess.TimeoutExpired(args, 30)
+            if gate_failure == "missing_receipt":
+                return subprocess.CompletedProcess(args, 0, "", "")
+            return subprocess.CompletedProcess(args, 2, "", "checker error")
         if args[:3] == ["gh", "pr", "diff"]:
             return subprocess.CompletedProcess(args, 0, DIFF, "")
         if args[:3] == ["gh", "issue", "view"]:
@@ -108,11 +114,23 @@ def test_server_review_comments_and_merges(tmp_path, monkeypatch, checker):
     assert json.loads(Path(record["receipt_path"]).read_text())["verdict"] == "REVIEW"
 
 
-def test_server_gate_unset_merges_as_before(tmp_path, monkeypatch):
+def test_server_gate_unset_refuses_merge(tmp_path, monkeypatch):
     queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
                                 gate_enabled=False)
-    assert calls == ["status", "merge"]
-    assert "conformance_gate" not in queue.get_task_context("impl-615")
+    assert calls == []
+    assert queue.get_task_status("impl-615") == "needs_human"
+    assert queue.external_op_get("merge:pr:615")["state"] == "failed"
+    assert "conformance gate not configured" in queue.external_op_get("merge:pr:615")["last_error"]
+
+
+@pytest.mark.parametrize("failure", ["error", "timeout", "missing_receipt"])
+def test_server_gate_failure_refuses_merge(tmp_path, monkeypatch, failure):
+    monkeypatch.setenv("AGENT_CREW_CONFORMANCE_GATE_CMD", "gate-command")
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                gate_failure=failure)
+    assert calls == []
+    assert queue.get_task_status("impl-615") == "needs_human"
+    assert queue.external_op_get("merge:pr:615")["state"] == "failed"
 
 
 def test_same_head_retry_reuses_receipt_and_comment(tmp_path, monkeypatch, checker):

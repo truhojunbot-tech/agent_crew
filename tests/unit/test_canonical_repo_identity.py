@@ -66,6 +66,8 @@ def _submit_result(client, task_id, task_type, pr_number=91001):
 
 
 def _patch_open_pr(monkeypatch):
+    monkeypatch.setattr("agent_crew.conformance_gate._conformance_gate_allows_merge",
+                        lambda *a, **k: True)
     monkeypatch.setattr("agent_crew.github.pr_state", lambda *args, **kwargs: "open")
     monkeypatch.setattr("agent_crew.github.post_review_comment", lambda **kwargs: True)
     monkeypatch.setattr("agent_crew.github.independent_review_for_head",
@@ -105,10 +107,13 @@ def test_A_merge_uses_worktree_repo_not_dispatcher_cwd(tmp_db, tmp_path, monkeyp
     monkeypatch.setattr("agent_crew.github.merge_pr",
                         lambda pr, **kwargs: calls.append(kwargs["repo"]) or True)
     monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: True)
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="impl-A", task_type="implement", description="work",
+                              branch="fix/canonical"))
     app = _app(tmp_db, state_path)
     with TestClient(app) as client:
-        assert _post_task(client, "review-A", "review", {"pr_number": 91002, "no_tester": True}, 91002).status_code == 200
-        assert _post_task(client, "test-A", "test", {"pr_number": 91003}, 91003).status_code == 200
+        assert _post_task(client, "review-A", "review", {"pr_number": 91002, "no_tester": True, "prev_task_id": "impl-A"}, 91002).status_code == 200
+        assert _post_task(client, "test-A", "test", {"pr_number": 91003, "prev_task_id": "impl-A"}, 91003).status_code == 200
     assert state_calls == calls == [TARGET_REPO, TARGET_REPO]
 
 
@@ -155,8 +160,10 @@ def test_D_no_tester_merge_uses_explicit_review_repo(tmp_db, tmp_path, monkeypat
     _patch_open_pr(monkeypatch)
     monkeypatch.setattr("agent_crew.github.merge_pr", lambda pr, **kw: calls.append(kw["repo"]) or True)
     monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: True)
+    TaskQueue(tmp_db).enqueue(TaskRequest(task_id="impl-D", task_type="implement",
+                                          description="work", branch="fix/canonical"))
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
-        assert _post_task(client, "review-D", "review", {"pr_number": 91006, "repo": TARGET_REPO, "no_tester": True}, 91006).status_code == 200
+        assert _post_task(client, "review-D", "review", {"pr_number": 91006, "repo": TARGET_REPO, "no_tester": True, "prev_task_id": "impl-D"}, 91006).status_code == 200
     assert calls == [TARGET_REPO]
     assert not [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "test"]
 
@@ -220,8 +227,10 @@ def test_I_coordinator_managed_no_tester_requires_independent_status(tmp_db, tmp
     monkeypatch.setattr("agent_crew.github.merge_pr",
                         lambda pr, **kwargs: merged.append((pr, kwargs["repo"])) or True)
     monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: False)
+    TaskQueue(tmp_db).enqueue(TaskRequest(task_id="impl-I", task_type="implement",
+                                          description="work", branch="fix/canonical"))
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
-        assert _post_task(client, "review-I", "review", {"pr_number": 91010, "repo": TARGET_REPO, "no_tester": True, "coordinator_managed": True}, 91010).status_code == 200
+        assert _post_task(client, "review-I", "review", {"pr_number": 91010, "repo": TARGET_REPO, "no_tester": True, "coordinator_managed": True, "prev_task_id": "impl-I"}, 91010).status_code == 200
     assert merged == []
     receipt = TaskQueue(tmp_db).external_op_get("merge:pr:91010")
     assert receipt["state"] == "failed"

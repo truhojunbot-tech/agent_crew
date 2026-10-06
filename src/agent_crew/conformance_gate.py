@@ -76,7 +76,7 @@ def _registry_capability_for_paths(project: str, paths: set[str], registry_path:
 def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                                    pr_number: int, title: str, task_desc: str,
                                    issue: int | None, receipt_dir: str,
-                                   repo: str) -> bool:
+                                   repo: str, fail_closed: bool = False) -> bool:
     """#588: run the ADR-004 conformance gate (``--enforce``) before auto-merge.
 
     Off unless ``AGENT_CREW_CONFORMANCE_GATE_CMD`` names the gate command
@@ -91,6 +91,13 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
     """
     prefix = os.environ.get("AGENT_CREW_CONFORMANCE_GATE_CMD", "").strip()
     if not prefix:
+        if fail_closed:
+            reason = "conformance gate not configured"
+            queue.mark_needs_human(task_id, reason,
+                                   {"conformance_gate": {"error": reason,
+                                                         "merge_allowed": False,
+                                                         "pr_number": pr_number}})
+            return False
         return True
     import hashlib
     import shlex
@@ -113,8 +120,8 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                                    == prior.get("receipt_sha256"))
         except (OSError, TypeError, ValueError):
             receipt_matches = False
-        if receipt_matches:
-            return prior["verdict"] != "BLOCK"
+        if receipt_matches and (not fail_closed or not prior.get("error")):
+            return bool(prior.get("merge_allowed", prior["verdict"] != "BLOCK"))
     change = {
         "stage": "PRE_MERGE",
         "project": project,
@@ -228,6 +235,7 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         error = "gate timeout after 30s"
     except Exception as exc:
         error = f"gate error: {exc}"
+    receipt_error = False
     try:
         if error or not os.path.exists(receipt_path):
             with open(receipt_path, "w") as fh:
@@ -239,30 +247,32 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         # Keep the REVIEW/BLOCK evidence at a usable fallback path.
         import tempfile
         error = f"{error}; receipt error: {exc}".strip("; ")
+        receipt_error = True
         fd, receipt_path = tempfile.mkstemp(prefix="agent_crew_conformance_", suffix=".json")
         with os.fdopen(fd, "w") as fh:
             json.dump({"verdict": verdict, "error": error, "source": "agent_crew"}, fh, indent=2)
         with open(receipt_path, "rb") as fh:
             receipt_bytes = fh.read()
+    merge_allowed = verdict != "BLOCK" and not (fail_closed and (error or receipt_error))
     record = {"verdict": verdict, "receipt_path": receipt_path,
               "receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
               "exit_code": exit_code, "pr_number": pr_number,
-              "merge_allowed": verdict != "BLOCK"}
+              "merge_allowed": merge_allowed}
     if head_sha:
         record["head_sha"] = head_sha
     if error:
         record["error"] = error
     click.echo(f"  Conformance gate: {verdict} — receipt {receipt_path}")
     try:
-        if verdict == "BLOCK":
+        if not merge_allowed:
             queue.mark_needs_human(
-                task_id, f"conformance gate BLOCK on PR #{pr_number}; receipt {receipt_path}",
+                task_id, f"conformance gate {error or verdict} on PR #{pr_number}; receipt {receipt_path}",
                 {"conformance_gate": record})
         else:
             queue.patch_context(task_id, {"conformance_gate": record})
     except Exception as exc:
         click.echo(f"Warning: could not record conformance gate receipt: {exc}")
-    if verdict == "REVIEW":
+    if verdict == "REVIEW" and merge_allowed:
         body = (f"**Conformance gate (ADR-004, PRE_MERGE): REVIEW** — merging, "
                 f"reviewer must address this receipt.\n\n"
                 f"task `{task_id}` · receipt `{receipt_path}` · sha256 `{record['receipt_sha256']}`"
@@ -270,4 +280,4 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                 + f"\n\n```json\n{receipt_bytes.decode('utf-8', 'replace')[:6000]}\n```")
         if not github.post_pr_comment(pr_number, body, repo=repo):
             click.echo("Warning: could not post conformance gate receipt to the PR")
-    return verdict != "BLOCK"
+    return merge_allowed

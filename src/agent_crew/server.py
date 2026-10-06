@@ -6489,31 +6489,32 @@ def create_app(
                                  last_error="PR 상태 불명(gh 실패) — 다음 재확인 대기", inc_attempt=True)
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
             return
-        if os.environ.get("AGENT_CREW_CONFORMANCE_GATE_CMD", "").strip():
-            from agent_crew.conformance_gate import _conformance_gate_allows_merge
+        from agent_crew.conformance_gate import _conformance_gate_allows_merge
 
-            tasks_by_id = {task.task_id: task for task in q().list_tasks()}
-            review_task = tasks_by_id.get(review_task_id)
-            implement_task = (tasks_by_id.get(_lineage_root_task_id(tasks_by_id, review_task))
-                              if review_task else None)
-            if not implement_task or implement_task.task_type != "implement":
-                reason = f"conformance gate lineage unresolved for review {review_task_id}"
-                q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
-                logger.warning("_auto_merge_pr: PR #%s %s", pr_number, reason)
-                return
-            implement_ctx = (implement_task.context
-                             if isinstance(implement_task.context, dict) else {})
-            if not _conformance_gate_allows_merge(
-                    q(), implement_task.task_id, project=_server_identity()["project"],
-                    pr_number=int(pr_number),
-                    title=implement_task.description.splitlines()[0][:72],
-                    task_desc=implement_task.description, issue=implement_ctx.get("issue"),
-                    receipt_dir=os.path.join(os.path.dirname(os.path.abspath(db_path)),
-                                             "conformance_receipts"), repo=_merge_repo):
-                reason = f"conformance gate BLOCK on PR #{pr_number}"
-                q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
-                logger.warning("_auto_merge_pr: %s", reason)
-                return
+        tasks_by_id = {task.task_id: task for task in q().list_tasks()}
+        review_task = tasks_by_id.get(review_task_id)
+        implement_task = (tasks_by_id.get(_lineage_root_task_id(tasks_by_id, review_task))
+                          if review_task else None)
+        if not implement_task or implement_task.task_type != "implement":
+            reason = f"conformance gate lineage unresolved for review {review_task_id}"
+            q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
+            logger.warning("_auto_merge_pr: PR #%s %s", pr_number, reason)
+            return
+        implement_ctx = (implement_task.context
+                         if isinstance(implement_task.context, dict) else {})
+        if not _conformance_gate_allows_merge(
+                q(), implement_task.task_id, project=_server_identity()["project"],
+                pr_number=int(pr_number),
+                title=implement_task.description.splitlines()[0][:72],
+                task_desc=implement_task.description, issue=implement_ctx.get("issue"),
+                receipt_dir=os.path.join(os.path.dirname(os.path.abspath(db_path)),
+                                         "conformance_receipts"), repo=_merge_repo,
+                fail_closed=True):
+            gate_record = q().get_task_context(implement_task.task_id).get("conformance_gate", {})
+            reason = gate_record.get("error") or f"conformance gate BLOCK on PR #{pr_number}"
+            q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
+            logger.warning("_auto_merge_pr: %s", reason)
+            return
         # The HTTP cascade is allowed to run for every admitted task. Its
         # test result alone is not authority to merge: crew run and external
         # coordinators also submit test results and own their own merge policy.
