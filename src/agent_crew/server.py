@@ -6458,8 +6458,8 @@ def create_app(
             logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — "
                            f"STOP admission 거부({resv.get('state')})")
             return
-        if resv.get("state") in ("done", "skipped"):
-            logger.info(f"_auto_merge_pr: {op_key} already {resv['state']} — merge not retried")
+        if resv.get("state") == "done":
+            logger.info(f"_auto_merge_pr: {op_key} already done — merge not retried")
             return
         # 비가역 실패 누적(conflict/closed 등)은 자동 재시도 안 함 → escalation 대상.
         if resv.get("state") == "failed" and int(resv.get("attempt", 0)) >= _MAX_MERGE_ATTEMPTS:

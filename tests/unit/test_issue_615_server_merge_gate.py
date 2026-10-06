@@ -172,3 +172,53 @@ def test_server_auto_merge_unset_still_merges(tmp_path, monkeypatch, checker):
                                 change_type="modify")
     assert calls == ["comment", "status", "merge"]
     assert queue.external_op_get("merge:pr:615")["state"] == "done"
+
+
+def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
+    monkeypatch.setenv("AGENT_CREW_AUTO_MERGE", "0")
+    published = []
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify", status_details=published)
+    assert queue.external_op_get("merge:pr:615")["state"] == "skipped"
+
+    queue.enqueue(TaskRequest(
+        task_id="review-615-r1", task_type="review", branch="fix/615",
+        description="review new head", context={"prev_task_id": "impl-615",
+            "pr_number": 615, "repo": "owner/repo", "reviewed_sha": "b" * 40,
+            "allow_duplicate_review": True}))
+    queue.submit_result("review-615-r1", TaskResult(
+        "review-615-r1", "completed", "approved new head",
+        verdict="approve", pr_number=615))
+    queue.enqueue(TaskRequest(
+        task_id="test-615-r1", task_type="test", branch="fix/615",
+        description="test new head", context={"prev_task_id": "review-615-r1",
+            "pr_number": 615, "repo": "owner/repo", "allow_duplicate_review": True}))
+    monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "b" * 40)
+    monkeypatch.setattr(github, "independent_review_for_head",
+                        lambda *a, **k: ("b" * 40, "claude", "review-615-r1", "ok"))
+    app = create_app(str(tmp_path / "tasks.db"), pane_map={}, project="agent_crew",
+                     push_fn=lambda *a, **k: None,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks/test-615-r1/result", json={
+            "task_id": "test-615-r1", "status": "completed",
+            "summary": "tests passed", "pr_number": 615})
+    assert response.status_code == 200, response.text
+    assert published == [
+        ("owner/repo", "a" * 40, "review-615", "claude"),
+        ("owner/repo", "b" * 40, "review-615-r1", "claude")]
+    assert calls == ["comment", "status", "comment", "status"]
+    assert queue.external_op_get("merge:pr:615")["state"] == "skipped"
+
+    monkeypatch.delenv("AGENT_CREW_AUTO_MERGE", raising=False)
+    queue.enqueue(TaskRequest(
+        task_id="test-615-r1-retry", task_type="test", branch="fix/615",
+        description="test new head again", context={"prev_task_id": "review-615-r1",
+            "pr_number": 615, "repo": "owner/repo", "allow_duplicate_review": True}))
+    with TestClient(app) as client:
+        response = client.post("/tasks/test-615-r1-retry/result", json={
+            "task_id": "test-615-r1-retry", "status": "completed",
+            "summary": "tests passed", "pr_number": 615})
+    assert response.status_code == 200, response.text
+    assert calls[-2:] == ["status", "merge"]
+    assert queue.external_op_get("merge:pr:615")["state"] == "done"
