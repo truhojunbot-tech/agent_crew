@@ -20,14 +20,17 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from agent_crew.cea_launch import parse_env_file, resolve_cea_file
+
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 PROJECT = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
-ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO = SCRIPT_DIR.parent
 
@@ -43,20 +46,6 @@ def parse_args(argv=None):
     if not SHA.fullmatch(args.sha):
         parser.error("sha must be a full lowercase git object ID")
     return args
-
-
-def parse_env_file(path: Path) -> dict[str, str]:
-    values = {}
-    for number, line in enumerate(path.read_text().splitlines(), 1):
-        if not line or line.lstrip().startswith("#"):
-            continue
-        key, separator, value = line.partition("=")
-        if not separator or not ENV_KEY.fullmatch(key) or not key.startswith("AGENT_CREW_CEA_"):
-            raise ValueError(f"invalid env line {number}: expected AGENT_CREW_CEA_KEY=VALUE")
-        values[key] = value
-    if not values:
-        raise ValueError("CEA env file is empty")
-    return values
 
 
 def run(*args: str) -> str:
@@ -161,6 +150,23 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def mark_cea_expected(state_path: Path) -> None:
+    """Keep recover's CEA requirement after the swap listener exits."""
+    state = json.loads(state_path.read_text())
+    state["cea_env_expected"] = True
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_path.parent,
+                                         prefix=".state-", delete=False) as file:
+            temporary = Path(file.name)
+            json.dump(state, file, indent=2, sort_keys=True)
+            file.write("\n")
+        os.replace(temporary, state_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     home = Path.home()
@@ -175,7 +181,7 @@ def main(argv=None) -> int:
         raise RuntimeError("DB path escapes project directory")
     checkout = home / "alfred" / "runtime" / f"agent_crew-{args.sha[:7]}"
     evidence = home / ".sev0-evidence" / f"crew-swap-{args.project}-{args.sha[:7]}"
-    cea_file = Path(os.environ.get("AGENT_CREW_SWAP_CEA_ENV_FILE", str(directory / "cea.env")))
+    cea_file = resolve_cea_file(directory)
     if not cea_file.is_file():
         raise RuntimeError(f"CEA env file missing: {cea_file}")
     cea_env = parse_env_file(cea_file)
@@ -265,6 +271,8 @@ def main(argv=None) -> int:
         if after.get("build", {}).get("commit") != args.sha:
             raise RuntimeError(f"relaunch build SHA differs: {after.get('build', {}).get('commit')} != {args.sha}")
         write_json(evidence / "health.post.json", after)
+        if any(key.startswith("AGENT_CREW_CEA_") for key in cea_env):
+            mark_cea_expected(state_path)
         print(f"GO_DONE evidence={evidence}; run post")
         return 0
     # post: all evidence gates are mandatory and failures are explicit.
