@@ -15,6 +15,7 @@ from click.core import ParameterSource
 
 from agent_crew import setup as setup_module
 from agent_crew.cea_launch import client_command, parse_env_file, resolve_cea_file
+from agent_crew.cea.wiring import capability_registry_path
 from agent_crew.pipeline import ARTIFACT_KINDS
 from agent_crew.queue import _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
@@ -2493,7 +2494,7 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                 change["text"] += "\n" + "\n".join(sorted(paths)[:20])
             if change["evidence_source"]["capability_id"] == "derived":
                 cap_id = _registry_capability_for_paths(
-                    project, paths, os.environ.get("AGENT_CREW_CAPABILITY_REGISTRY", ""))
+                    project, paths, capability_registry_path(os.environ))
                 if cap_id:
                     change["capability_id"] = cap_id
                     change["evidence_source"]["capability_id"] = "registry_path"

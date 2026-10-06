@@ -131,6 +131,12 @@ def _first(env: dict, *names: str) -> str:
     return ""
 
 
+def capability_registry_path(env: dict) -> str:
+    """Use the same capability registry for CEA and conformance evidence."""
+    return (_first(env, "AGENT_CREW_CEA_REGISTRY_PATH",
+                   "AGENT_CREW_CEA_CAPABILITY_REGISTRY") or DEFAULT_REGISTRY_PATH)
+
+
 def _readable_file(path: str) -> bool:
     return bool(path) and os.path.isfile(path) and os.access(path, os.R_OK)
 
@@ -299,8 +305,7 @@ def _memory_client(env: dict):
     if not script or not _readable_file(script):
         return None, ProviderStatus("l3_memory", False,
                                     f"no readable L2/L3 command script at {script or command!r}")
-    registry = _first(env, "AGENT_CREW_CEA_REGISTRY_PATH",
-                      "AGENT_CREW_CEA_CAPABILITY_REGISTRY") or DEFAULT_REGISTRY_PATH
+    registry = capability_registry_path(env)
     child = {"AGENT_CREW_CEA_CAPABILITY_REGISTRY": registry}
     incident = _first(env, "AGENT_CREW_CEA_INCIDENT_MEMORY")
     if incident:
@@ -316,8 +321,7 @@ def _capabilities(env: dict, client):
     from agent_crew.cea.memory import MemoryCapabilities
     from agent_crew.cea.input_providers.capability import E4CapabilityProvider
 
-    registry = _first(env, "AGENT_CREW_CEA_REGISTRY_PATH",
-                      "AGENT_CREW_CEA_CAPABILITY_REGISTRY") or DEFAULT_REGISTRY_PATH
+    registry = capability_registry_path(env)
     if client is None:
         # E4 is reached *through* the L2/L3 command (it is the only matcher, §5.1);
         # a registry file we can see but not query is not a matcher.
@@ -468,4 +472,4 @@ def install_from_env(env: Optional[dict] = None, *, db_path: Optional[str] = Non
 
 __all__ = ["DEFAULT_MEMORY_CMD", "DEFAULT_REGISTRY_PATH", "DEFAULT_SNAPSHOT_PATH", "SLOTS",
            "UNAVAILABLE", "WIRED", "ProviderStatus", "Wiring", "build_engine_from_env",
-           "build_wiring", "install_from_env"]
+           "build_wiring", "capability_registry_path", "install_from_env"]

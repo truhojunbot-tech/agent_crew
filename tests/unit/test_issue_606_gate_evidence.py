@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from agent_crew import github
+from agent_crew.cea import wiring
 from agent_crew.github import publish_independent_review_status as real_publish_status
 from agent_crew.cli import _conformance_gate_allows_merge, _registry_capability_for_paths
 from agent_crew.protocol import TaskRequest
@@ -30,6 +31,8 @@ def real_gate(tmp_path, monkeypatch):
     wrapper.chmod(0o755)
     monkeypatch.setenv("AGENT_CREW_CONFORMANCE_GATE_CMD", str(wrapper))
     monkeypatch.delenv("AGENT_CREW_CAPABILITY_REGISTRY", raising=False)
+    monkeypatch.delenv("AGENT_CREW_CEA_REGISTRY_PATH", raising=False)
+    monkeypatch.delenv("AGENT_CREW_CEA_CAPABILITY_REGISTRY", raising=False)
     monkeypatch.setattr(github, "post_pr_comment", lambda *a, **k: True)
     return wrapper
 
@@ -115,7 +118,7 @@ def _single_path_registry(tmp_path, monkeypatch, lifecycle="active"):
     record["lifecycle_state"] = lifecycle
     data["records"] = [record]
     registry.write_text(json.dumps(data))
-    monkeypatch.setenv("AGENT_CREW_CAPABILITY_REGISTRY", str(registry))
+    monkeypatch.setenv("AGENT_CREW_CEA_REGISTRY_PATH", str(registry))
     return record
 
 
@@ -133,6 +136,23 @@ def test_registry_path_yields_declared_capability_and_real_allow(tmp_path, monke
     assert change["capability_id"] == record["capability_id"]
     assert change["evidence_source"]["capability_id"] == "registry_path"
     assert "src/agent_crew/context_identity.py" in change["text"]
+    assert allowed and receipt["verdict"] == "ALLOW", receipt
+
+
+def test_registry_path_uses_cea_wiring_default(tmp_path, monkeypatch, real_gate):
+    record = _single_path_registry(tmp_path, monkeypatch)
+    e8_registry = tmp_path / "e8_registry.json"
+    e8_registry.write_text(json.dumps({"generation": 1, "capabilities": []}))
+    monkeypatch.setenv("AGENT_CREW_CAPABILITY_REGISTRY", str(e8_registry))
+    monkeypatch.delenv("AGENT_CREW_CEA_REGISTRY_PATH", raising=False)
+    monkeypatch.delenv("AGENT_CREW_CEA_CAPABILITY_REGISTRY", raising=False)
+    monkeypatch.setattr(wiring, "DEFAULT_REGISTRY_PATH", str(tmp_path / "registry.json"))
+
+    _, allowed, change, receipt = _gate(
+        tmp_path, monkeypatch, text="Improve durable attribution lifecycle",
+        diff=_CONTEXT_DIFF)
+    assert change["capability_id"] == record["capability_id"]
+    assert change["evidence_source"]["capability_id"] == "registry_path"
     assert allowed and receipt["verdict"] == "ALLOW", receipt
 
 
@@ -157,7 +177,7 @@ def test_withdrawn_registry_path_stays_synthetic_and_review(tmp_path, monkeypatc
 
 
 def test_registry_env_unset_keeps_synthetic_capability(tmp_path, monkeypatch, real_gate):
-    monkeypatch.delenv("AGENT_CREW_CAPABILITY_REGISTRY", raising=False)
+    monkeypatch.setattr(wiring, "DEFAULT_REGISTRY_PATH", str(tmp_path / "missing.json"))
     _, _, change, _ = _gate(tmp_path, monkeypatch, diff=_CONTEXT_DIFF)
     assert change["capability_id"] == "agent-crew.issue-606"
     assert change["evidence_source"]["capability_id"] == "derived"

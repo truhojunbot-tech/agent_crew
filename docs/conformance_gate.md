@@ -23,7 +23,7 @@ The change file declares `PRE_MERGE`, the project, a short title and task descri
 
 | Field | Value derived when task context does not supply it |
 | --- | --- |
-| `capability_id` | First, an issue-body line beginning `capability:` or `capability_id:`. Next, the unique active, project-owned registry record best matched by changed file paths when `AGENT_CREW_CAPABILITY_REGISTRY` names a readable registry. Otherwise `<project with underscores changed to hyphens>.issue-<N>`, or `.pr-<N>` without an issue. |
+| `capability_id` | First, an issue-body line beginning `capability:` or `capability_id:`. Next, the unique active, project-owned registry record best matched by changed file paths. The registry path follows CEA wiring: `AGENT_CREW_CEA_REGISTRY_PATH`, then `AGENT_CREW_CEA_CAPABILITY_REGISTRY`, then its default registry path. If the resolved file is unreadable or no record qualifies, use `<project with underscores changed to hyphens>.issue-<N>`, or `.pr-<N>` without an issue. |
 | `role` | `implementer` for the implement task. |
 | `portable_core` | `true` if the PR changes a path under `src/agent_crew/`; otherwise `false`. |
 | `dependencies` | One `{"kind":"private_fleet","project":"alfred","file":<path>}` per changed `src/agent_crew/` file whose added lines reference `/alfred/`, `alfred/tools`, `import alfred`, or `from alfred`; otherwise `[]`. |
