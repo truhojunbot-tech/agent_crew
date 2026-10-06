@@ -324,7 +324,7 @@ def test_broker_probe_refuses_missing_socket(tmp_path):
 
 
 def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch):
-    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    swap, directory, _ = _swap_fixture(tmp_path, monkeypatch)
     evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
     evidence.mkdir(parents=True)
     (evidence / 'preflight.json').write_text(json.dumps({'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': __import__('os').getpid()}))
@@ -347,6 +347,54 @@ def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch):
     assert len(killed) == 1
     assert (evidence / 'tasks.db.pre').exists()
     assert json.loads((evidence / 'pending.pre.json').read_text()) == []
+    assert not json.loads((directory / 'state.json').read_text()).get('cea_env_expected')
+
+
+def test_swap_cea_launch_makes_dead_server_recovery_require_cea(tmp_path, monkeypatch):
+    from click.testing import CliRunner
+    from agent_crew import cli
+
+    swap, directory, _ = _swap_fixture(tmp_path, monkeypatch)
+    configured = tmp_path / 'configured.env'
+    configured.write_text('AGENT_CREW_CEA_MODE=enforce\n')
+    (directory / 'cea.env').unlink()
+    monkeypatch.setenv('AGENT_CREW_SWAP_CEA_ENV_FILE', str(configured))
+    state_path = directory / 'state.json'
+    state = json.loads(state_path.read_text())
+    state.update(session='crew-test', server_pid=999999, agents=[], pane_ids=[], worktrees={})
+    state_path.write_text(json.dumps(state))
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    evidence.mkdir(parents=True)
+    (evidence / 'preflight.json').write_text(json.dumps({
+        'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid(),
+    }))
+    (evidence / 'env.pre.nul').write_bytes(b'X=Y\0')
+    (evidence / 'cwd.pre').write_text(str(tmp_path))
+    listener_calls = iter([os.getpid(), None])
+
+    def listener(_port):
+        pid = next(listener_calls)
+        if pid is None:
+            raise RuntimeError('no listener')
+        return pid
+
+    monkeypatch.setattr(swap, 'listener_pid', listener)
+    monkeypatch.setattr(swap.os, 'kill', lambda *_args: None)
+    monkeypatch.setattr(swap.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(swap.subprocess, 'run', lambda *_args, **_kwargs: None)
+    assert swap.main(['demo', 'a' * 40, 'go']) == 0
+    assert json.loads(state_path.read_text())['cea_env_expected'] is True
+
+    # The swap override is no longer available and the old listener is dead.
+    monkeypatch.delenv('AGENT_CREW_SWAP_CEA_ENV_FILE')
+    monkeypatch.setattr(cli, '_port_listening', lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(cli.subprocess, 'Popen',
+                        lambda *_args, **_kwargs: pytest.fail('recover launched without CEA'))
+    result = CliRunner().invoke(cli.crew, [
+        'recover', 'demo', '--base', str(tmp_path / '.agent_crew'),
+    ])
+    assert result.exit_code != 0
+    assert 'CEA env file missing' in result.output
 
 
 def test_go_broker_probe_failure_keeps_old_server(tmp_path, monkeypatch):

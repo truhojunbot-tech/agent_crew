@@ -20,6 +20,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from datetime import datetime, timezone
@@ -145,6 +146,23 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def mark_cea_expected(state_path: Path) -> None:
+    """Keep recover's CEA requirement after the swap listener exits."""
+    state = json.loads(state_path.read_text())
+    state["cea_env_expected"] = True
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", dir=state_path.parent,
+                                         prefix=".state-", delete=False) as file:
+            temporary = Path(file.name)
+            json.dump(state, file, indent=2, sort_keys=True)
+            file.write("\n")
+        os.replace(temporary, state_path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def main(argv=None) -> int:
     args = parse_args(argv)
     home = Path.home()
@@ -249,6 +267,8 @@ def main(argv=None) -> int:
         if after.get("build", {}).get("commit") != args.sha:
             raise RuntimeError(f"relaunch build SHA differs: {after.get('build', {}).get('commit')} != {args.sha}")
         write_json(evidence / "health.post.json", after)
+        if any(key.startswith("AGENT_CREW_CEA_") for key in cea_env):
+            mark_cea_expected(state_path)
         print(f"GO_DONE evidence={evidence}; run post")
         return 0
     # post: all evidence gates are mandatory and failures are explicit.
