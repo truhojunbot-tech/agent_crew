@@ -12,6 +12,20 @@ logger = logging.getLogger(__name__)
 _MAX_GH_STDERR_LOG_CHARS = 300
 
 
+def _extract_repo_from_url(url: str) -> Optional[str]:
+    """Extract `owner/repo` from a GitHub remote URL (https or ssh)."""
+    if not url:
+        return None
+    url = url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    if "github.com/" in url:
+        return url.split("github.com/", 1)[1] or None
+    if "github.com:" in url:
+        return url.split("github.com:", 1)[1] or None
+    return None
+
+
 def _log_gh_failure(op: str, repo: Optional[str], pr_number: Optional[int], result) -> None:
     """Safe, bounded failure record — never logs credentials/tokens (gh's own
     subprocess stderr for a resolution/API error contains neither)."""
@@ -287,15 +301,20 @@ def pr_head_sha(pr_number: int, repo: Optional[str] = None,
 
     Read the PR head from the REST API; this gh build rejects headRefOid.
 
-    `repo` should be supplied by the caller. The `cwd` fallback exists for
-    callers that know a checkout but not its slug; falling through to neither
-    means asking whatever repository the process happens to be standing in.
+    `repo` should be supplied by the caller as a slug or GitHub remote URL.
+    The `cwd` fallback exists for callers that know a checkout but not its
+    slug; falling through to neither means asking whatever repository the
+    process happens to be standing in.
     """
     if not pr_number or not check_gh_installed():
         return ""
     if not repo:
         repo = get_repo(cwd=cwd)
     if not repo:
+        return ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
+        repo = _extract_repo_from_url(repo) or ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo):
         return ""
     try:
         r = subprocess.run(
