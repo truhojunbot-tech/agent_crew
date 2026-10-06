@@ -20,3 +20,7 @@ A health timeout or build SHA mismatch means the swap is **not complete**. Keep 
 5. The backed-up `tasks.db.pre` is a consistent SQLite backup and `tasks.db.pre.sha256` verifies it. Restore it, `state.json.pre`, or `pause.json.pre` only after confirming no task or receipt was created since the backup, with the server stopped. These files are recovery evidence, not an automatic rewind of live state.
 
 On a successful `post`, the script retains `env.pre.sha256` and deletes the secret-bearing `env.pre.nul`. If `go` fails, keep the dump in its `0700` evidence directory until recovery is verified, then delete it manually. The evidence root is also `0700`; nonsecret metadata and backups remain for the incident record.
+
+## Related docs
+
+- [ADR-004 conformance gate before auto-merge](conformance_gate.md)
