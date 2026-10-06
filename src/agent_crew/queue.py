@@ -4117,7 +4117,8 @@ class TaskQueue:
                 raise LateResultRejected(
                     prior_status, fallback["task_id"] if ignored_for_fallback else None)
             if row["task_type"] == "review" and validate_review:
-                review_error = validate_review_result(result)
+                review_error = validate_review_result(
+                    result, require_verdict=prior_status in ("pending", "in_progress"))
                 if review_error:
                     conn.execute("ROLLBACK")
                     raise InvalidReviewResult(review_error)
