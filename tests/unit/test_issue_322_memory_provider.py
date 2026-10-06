@@ -256,6 +256,20 @@ def test_slow_shadow_provider_cannot_hold_baseline_dispatch(tmp_path, monkeypatc
     assert events[0]["state"] == "timeout"
 
 
+def test_shadow_dispatch_uses_250ms_default_timeout(tmp_path, monkeypatch, *, unused_tcp_port):
+    monkeypatch.delenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", raising=False)
+    observed = []
+
+    def bounded_retrieve(provider, request, timeout_seconds):
+        observed.append(timeout_seconds)
+        return MemoryResult(provider="fake", backend="test", state="empty")
+
+    monkeypatch.setattr("agent_crew.server.shadow_retrieve_bounded", bounded_retrieve)
+    _dispatch_snapshot(tmp_path / "default-budget", monkeypatch, FakeMemoryProvider([]),
+                       unused_tcp_port=unused_tcp_port)
+    assert observed == [0.25]
+
+
 def test_shadow_retrieve_defense_in_depth_removes_cross_project_provider_items():
     result = shadow_retrieve(_CrossProjectProvider(), MemoryRequest(project="project-a"))
 

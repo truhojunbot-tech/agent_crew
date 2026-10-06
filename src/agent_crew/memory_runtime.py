@@ -18,7 +18,8 @@ LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
 SHADOW_RETENTION_ROWS_PER_PROJECT = 900
 SHADOW_PRUNE_BATCH_ROWS = 50
 SHADOW_RETRIEVAL_MAX_ROWS = 50
-SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS = 0.05
+SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS = 0.25
+SHADOW_MEMORY_CAPTURE_TIMEOUT_SECONDS = 0.05
 
 
 def shadow_sqlite_timeout_seconds(*, capture: bool = False) -> float:
@@ -30,7 +31,7 @@ def shadow_sqlite_timeout_seconds(*, capture: bool = False) -> float:
         configured = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
     if not math.isfinite(configured) or configured <= 0:
         configured = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
-    return min(SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS, configured) if capture else configured
+    return min(SHADOW_MEMORY_CAPTURE_TIMEOUT_SECONDS, configured) if capture else configured
 
 
 @dataclass(frozen=True)
