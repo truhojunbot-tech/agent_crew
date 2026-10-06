@@ -271,7 +271,8 @@ class SQLiteMemoryStorage:
 
     def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int,
                         query: str = "", predecessor_task_ids: tuple[str, ...] = (),
-                        pr_number: Optional[int] = None
+                        pr_number: Optional[int] = None,
+                        timing: Optional[dict[str, float]] = None,
                         ) -> tuple[list[MemoryRecord], int]:
         """Bound parsing to recent candidates and count project-less drops."""
         if not scope.project or not layers or limit <= 0:
@@ -304,32 +305,43 @@ class SQLiteMemoryStorage:
                 + " AND COALESCE(json_extract(value,'$.superseded'),0)=0")
         args = [*sorted(layers), *params]
         uri = Path(self.path).resolve().as_uri() + "?mode=ro"
-        with closing(sqlite3.connect(uri, uri=True,
-                                     timeout=shadow_sqlite_timeout_seconds())) as db:
-            dropped = db.execute("SELECT count(*) FROM adr001_memory WHERE " + base +
-                " AND COALESCE(json_extract(scope,'$.project'),'')=''", args).fetchone()[0]
-            rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
-                + base + " AND COALESCE(json_extract(scope,'$.project'),'')=? "
-                "ORDER BY created DESC LIMIT ?",
-                [*args, scope.project, (SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
-                                        else min(limit, SHADOW_RETRIEVAL_MAX_ROWS))]).fetchall()
-            predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
-                                if "decision" in layers else [])
-            lineage_rows = db.execute(
-                "SELECT layer,key,value,scope,version FROM adr001_memory "
-                "WHERE layer='decision' AND key IN (" + ",".join("?" for _ in predecessor_keys)
-                + ") AND COALESCE(json_extract(scope,'$.project'),'')=?",
-                [*predecessor_keys, scope.project],
-            ).fetchall() if predecessor_keys else []
-            pr_rows = db.execute(
-                "SELECT layer,key,value,scope,version FROM adr001_memory "
-                "WHERE layer='decision' "
-                "AND COALESCE(json_extract(scope,'$.project'),'')=? "
-                "AND json_extract(value,'$.pr_number')=? "
-                "AND json_extract(value,'$.task_id')<>? "
-                "ORDER BY created DESC LIMIT ?",
-                (scope.project, pr_number, scope.task_id, SHADOW_RETRIEVAL_MAX_ROWS),
-            ).fetchall() if pr_number and "decision" in layers else []
+        connect_started = time.perf_counter()
+        try:
+            db_connection = sqlite3.connect(
+                uri, uri=True, timeout=shadow_sqlite_timeout_seconds())
+        finally:
+            if timing is not None:
+                timing["connect_ms"] = (time.perf_counter() - connect_started) * 1000
+        query_started = time.perf_counter()
+        try:
+            with closing(db_connection) as db:
+                dropped = db.execute("SELECT count(*) FROM adr001_memory WHERE " + base +
+                    " AND COALESCE(json_extract(scope,'$.project'),'')=''", args).fetchone()[0]
+                rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
+                    + base + " AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                    "ORDER BY created DESC LIMIT ?",
+                    [*args, scope.project, (SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
+                                            else min(limit, SHADOW_RETRIEVAL_MAX_ROWS))]).fetchall()
+                predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
+                                    if "decision" in layers else [])
+                lineage_rows = db.execute(
+                    "SELECT layer,key,value,scope,version FROM adr001_memory "
+                    "WHERE layer='decision' AND key IN (" + ",".join("?" for _ in predecessor_keys)
+                    + ") AND COALESCE(json_extract(scope,'$.project'),'')=?",
+                    [*predecessor_keys, scope.project],
+                ).fetchall() if predecessor_keys else []
+                pr_rows = db.execute(
+                    "SELECT layer,key,value,scope,version FROM adr001_memory "
+                    "WHERE layer='decision' "
+                    "AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                    "AND json_extract(value,'$.pr_number')=? "
+                    "AND json_extract(value,'$.task_id')<>? "
+                    "ORDER BY created DESC LIMIT ?",
+                    (scope.project, pr_number, scope.task_id, SHADOW_RETRIEVAL_MAX_ROWS),
+                ).fetchall() if pr_number and "decision" in layers else []
+        finally:
+            if timing is not None:
+                timing["query_ms"] = (time.perf_counter() - query_started) * 1000
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
@@ -502,11 +514,17 @@ class RuntimeMemoryProvider:
         allowed = set(request.memory_types) if request.memory_types else {
             "procedural", "episodic", "decision", "failure_pattern"}
         allowed &= {"procedural", "episodic", "decision", "failure_pattern"}
+        timing: dict[str, float] = {}
         if isinstance(self.storage, SQLiteMemoryStorage):
-            scoped, dropped = self.storage.retrieve_shadow(
-                scope, allowed, request.limit, query=request.retrieval_query,
-                predecessor_task_ids=request.predecessor_task_ids,
-                pr_number=request.pr_number)
+            try:
+                scoped, dropped = self.storage.retrieve_shadow(
+                    scope, allowed, request.limit, query=request.retrieval_query,
+                    predecessor_task_ids=request.predecessor_task_ids,
+                    pr_number=request.pr_number, timing=timing)
+            except Exception as exc:
+                return MemoryResult(provider=self.name, backend=self.backend,
+                                    state="error", error_type=type(exc).__name__,
+                                    error_message=str(exc), **timing)
         else:
             records = [record for record in self.storage.retrieve(scope,
                 query=request.retrieval_query) if record.layer in allowed]
@@ -522,7 +540,7 @@ class RuntimeMemoryProvider:
         ) for index, record in enumerate(scoped[:max(0, request.limit)], 1))
         return MemoryResult(provider=self.name, backend=self.backend,
                             state="results" if items else "empty", items=items,
-                            dropped_cross_project=dropped)
+                            dropped_cross_project=dropped, **timing)
 
 
 def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: MemoryScope) -> dict:
