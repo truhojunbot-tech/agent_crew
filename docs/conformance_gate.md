@@ -1,6 +1,6 @@
 # ADR-004 conformance gate before auto-merge
 
-`crew run --auto-merge` calls the ADR-004 conformance gate immediately before it attempts `gh pr merge`. The integration is implemented by `_conformance_gate_allows_merge` in `src/agent_crew/cli.py`. It is enabled only when `AGENT_CREW_CONFORMANCE_GATE_CMD` contains a command prefix. With the variable unset or empty, the gate is not called and the auto-merge path proceeds without a conformance receipt.
+`crew run --auto-merge` and the server's review/test-result auto-merge paths call the ADR-004 conformance gate before publishing the independent-review status or merging. Both use `_conformance_gate_allows_merge` in `src/agent_crew/conformance_gate.py`. The CLI leaves the gate off when `AGENT_CREW_CONFORMANCE_GATE_CMD` is unset. The server refuses auto-merge and marks the implement task `needs_human` with reason `conformance gate not configured` when it is unset. The server must receive this variable in its own environment; the CLI wrapper's default does not configure an already-running server.
 
 The shared `~/.local/bin/crew` wrapper currently sets the prefix fleet-wide, unless it is already set, to:
 
@@ -30,7 +30,7 @@ The change file declares `PRE_MERGE`, the project, a short title and task descri
 
 The gate reads `gh pr diff --patch` once. It appends up to 20 changed paths to the change text for registry matching and uses the same diff for `portable_core` and `dependencies`. If the diff read fails, those two fields stay absent unless task context supplied them; the checker then returns `REVIEW` rather than treating an unknown diff as evidence of no portable change or private dependency. A registry path tie also leaves the synthetic capability ID in place.
 
-The task context records `conformance_gate` with the verdict, receipt path, SHA-256 of the receipt, exit code, PR number, and whether merging is allowed. If the normal receipt path cannot be written, the CLI tries a temporary receipt file and records that path instead.
+The implement task context records `conformance_gate` with the verdict, receipt path, SHA-256 of the receipt, exit code, PR number, PR head when available, and whether merging is allowed. A retry on the same PR head reuses a verified receipt. If the normal receipt path cannot be written, the gate tries a temporary receipt file and records that path instead.
 
 ## Merge behavior
 
@@ -39,9 +39,9 @@ The task context records `conformance_gate` with the verdict, receipt path, SHA-
 | `ALLOW` with exit 0 | Continue to the independent review check before `gh pr merge`. |
 | `REVIEW` with exit 0 | Post the receipt and its SHA-256 as a PR comment for reviewer follow-up, then continue to the independent review check. |
 | Exit 10 (`BLOCK`) | Do not merge. Mark the implement task `needs_human` with the receipt record. |
-| Timeout, setup or command error, other nonzero exit, missing or unrecognized verdict, or `EVIDENCE_UNAVAILABLE` | Treat as `REVIEW`: attempt the PR receipt comment, then continue to the independent review check. |
+| Timeout, setup or command error, other nonzero exit, missing or unrecognized verdict, or `EVIDENCE_UNAVAILABLE` | CLI: treat as `REVIEW` and continue after the receipt comment. Server: refuse merge, mark `needs_human`, and record a failed merge operation. |
 
-Only exit 10 blocks on conformance grounds. A reported `BLOCK` in a receipt with exit 0 is treated as `REVIEW`. If recording the task context or posting a `REVIEW` comment fails, the CLI warns; that failure does not block the merge. The independent review check below can still prevent it.
+Exit 10 is an explicit checker `BLOCK`. A reported `BLOCK` in a receipt with exit 0 is treated as `REVIEW` by the CLI. Server gate failures, including an unreadable receipt, also prevent merge. If recording the task context or posting a `REVIEW` comment fails, the CLI warns; that failure does not block the merge. The independent review check below can still prevent it.
 
 ## Independent review status before merge
 

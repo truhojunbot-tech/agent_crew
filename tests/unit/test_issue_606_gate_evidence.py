@@ -302,6 +302,8 @@ def _server_review_fixture(tmp_path, monkeypatch, *, reviewer, head, publish=Tru
     q.record_attribution("review-server", agent=reviewer, task_type="review")
     calls = []
     monkeypatch.setattr(github, "pr_state", lambda *a, **k: "open")
+    monkeypatch.setattr("agent_crew.conformance_gate._conformance_gate_allows_merge",
+                        lambda *a, **k: True)
     heads = iter(["a" * 40, head]) if move_after_publication else None
     monkeypatch.setattr(github, "pr_head_sha",
                         lambda *a, **k: next(heads, head) if heads else head)
