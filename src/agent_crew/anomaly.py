@@ -12,6 +12,7 @@ from typing import Any, Callable, Iterable, Optional
 
 import httpx
 
+from agent_crew.github import _extract_repo_from_url
 from agent_crew.notify import notify_telegram
 
 COMMENT_EVENT_TYPES = (
@@ -50,20 +51,6 @@ def _fetch_user_events(
         return data if isinstance(data, list) else []
     except Exception:
         return []
-
-
-def _extract_repo_from_url(url: str) -> Optional[str]:
-    """Extract `owner/repo` from a GitHub remote URL (https or ssh)."""
-    if not url:
-        return None
-    url = url.strip().rstrip("/")
-    if url.endswith(".git"):
-        url = url[:-4]
-    if "github.com/" in url:
-        return url.split("github.com/", 1)[1] or None
-    if "github.com:" in url:
-        return url.split("github.com:", 1)[1] or None
-    return None
 
 
 def auto_detect_expected_repos(state_path: str) -> list[str]:

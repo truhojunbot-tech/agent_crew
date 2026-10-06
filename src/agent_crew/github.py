@@ -12,6 +12,29 @@ logger = logging.getLogger(__name__)
 _MAX_GH_STDERR_LOG_CHARS = 300
 
 
+def _extract_repo_from_url(url: str) -> Optional[str]:
+    """Extract `owner/repo` from a GitHub remote URL (https or ssh)."""
+    if not url:
+        return None
+    url = url.strip().rstrip("/")
+    if url.endswith(".git"):
+        url = url[:-4]
+    if "github.com/" in url:
+        return url.split("github.com/", 1)[1] or None
+    if "github.com:" in url:
+        return url.split("github.com:", 1)[1] or None
+    return None
+
+
+def _repo_slug(repo: Optional[str]) -> str:
+    """Return a validated owner/name slug from a slug or GitHub remote URL."""
+    if not repo:
+        return ""
+    slug = repo if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) else (
+        _extract_repo_from_url(repo) or "")
+    return slug if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug) else ""
+
+
 def _log_gh_failure(op: str, repo: Optional[str], pr_number: Optional[int], result) -> None:
     """Safe, bounded failure record — never logs credentials/tokens (gh's own
     subprocess stderr for a resolution/API error contains neither)."""
@@ -287,14 +310,18 @@ def pr_head_sha(pr_number: int, repo: Optional[str] = None,
 
     Read the PR head from the REST API; this gh build rejects headRefOid.
 
-    `repo` should be supplied by the caller. The `cwd` fallback exists for
-    callers that know a checkout but not its slug; falling through to neither
-    means asking whatever repository the process happens to be standing in.
+    `repo` should be supplied by the caller as a slug or GitHub remote URL.
+    The `cwd` fallback exists for callers that know a checkout but not its
+    slug; falling through to neither means asking whatever repository the
+    process happens to be standing in.
     """
     if not pr_number or not check_gh_installed():
         return ""
     if not repo:
         repo = get_repo(cwd=cwd)
+    if not repo:
+        return ""
+    repo = _repo_slug(repo)
     if not repo:
         return ""
     try:
@@ -445,6 +472,7 @@ def branch_head_commit_message(branch: str, repo: Optional[str] = None,
         return None
     if not repo:
         repo = get_repo()
+    repo = _repo_slug(repo)
     if not repo:
         return None
     try:
@@ -505,6 +533,7 @@ def independent_review_succeeded(pr_number: int, repo: str) -> bool:
     A missing status, failed API call, or changed head is not merge authority.
     GitHub's combined-status endpoint lists the latest state for each context.
     """
+    repo = _repo_slug(repo)
     if not repo or not check_gh_installed():
         return False
     try:
@@ -560,6 +589,7 @@ def independent_review_for_head(queue, pr_number: int, repo: str,
 def publish_independent_review_status(repo: str, sha: str, review_task_id: str,
                                       reviewer_agent: str) -> bool:
     """Publish validated review evidence as the protected-branch status."""
+    repo = _repo_slug(repo)
     if (not repo or not re.fullmatch(r"[0-9a-fA-F]{40}", sha or "") or
             not review_task_id or not reviewer_agent or not check_gh_installed()):
         return False
