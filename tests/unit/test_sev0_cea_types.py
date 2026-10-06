@@ -140,6 +140,7 @@ def test_input_providers_return_data_not_decisions():
 # gate — adding a call site means editing it, which is the point.
 CEA_IMPORTERS = {
     "cli.py",         # P6: CLI resume must verify T0 against the signed snapshot before loosening
+    "conformance_gate.py",  # #611: ADR-004 gate resolves capability_id from the CEA-wired registry path
     "queue.py",        # step 1: the receipt store rides on the tasks DB connection
     "server.py",       # step 4c: T5 reads the project's rollout mode at /result
     "pipeline.py",     # step 4m: the cascade READS the review/test contract
