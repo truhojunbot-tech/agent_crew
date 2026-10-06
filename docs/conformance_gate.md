@@ -19,16 +19,16 @@ For task `<task>` and PR `<N>`, the CLI writes these files next to the crew data
 <crew dir>/conformance_receipts/<task>-pr<N>.receipt.json
 ```
 
-The change file declares `PRE_MERGE`, the project, a short title and task description, `change_type` (default `modify`), and an issue or PR reference. For each field below, a valid task-context value takes precedence: nonempty strings for `capability_id` and `role`, a boolean for `portable_core`, and a list for `dependencies`. `evidence_source` records `context` or `derived` for every value included in the change.
+The change file declares `PRE_MERGE`, the project, a short title and task description, `change_type` (default `modify`), and an issue or PR reference. For each field below, a valid task-context value takes precedence: nonempty strings for `capability_id` and `role`, a boolean for `portable_core`, and a list for `dependencies`. `evidence_source` records `context`, `issue`, `registry_path`, or `derived` according to how `capability_id` was selected; other fields record `context` or `derived`.
 
 | Field | Value derived when task context does not supply it |
 | --- | --- |
-| `capability_id` | `<project with underscores changed to hyphens>.issue-<N>`, or `.pr-<N>` without an issue. This identifies the proposed change; it does not claim a registry declaration. |
+| `capability_id` | First, an issue-body line beginning `capability:` or `capability_id:`. Next, the unique active, project-owned registry record best matched by changed file paths when `AGENT_CREW_CAPABILITY_REGISTRY` names a readable registry. Otherwise `<project with underscores changed to hyphens>.issue-<N>`, or `.pr-<N>` without an issue. |
 | `role` | `implementer` for the implement task. |
 | `portable_core` | `true` if the PR changes a path under `src/agent_crew/`; otherwise `false`. |
 | `dependencies` | One `{"kind":"private_fleet","project":"alfred","file":<path>}` per changed `src/agent_crew/` file whose added lines reference `/alfred/`, `alfred/tools`, `import alfred`, or `from alfred`; otherwise `[]`. |
 
-The last two fields come from one `gh pr diff --patch` read. If that read fails, fields without context values stay absent and the checker returns `REVIEW` rather than treating an unknown diff as evidence of no portable change or private dependency.
+The gate reads `gh pr diff --patch` once. It appends up to 20 changed paths to the change text for registry matching and uses the same diff for `portable_core` and `dependencies`. If the diff read fails, those two fields stay absent unless task context supplied them; the checker then returns `REVIEW` rather than treating an unknown diff as evidence of no portable change or private dependency. A registry path tie also leaves the synthetic capability ID in place.
 
 The task context records `conformance_gate` with the verdict, receipt path, SHA-256 of the receipt, exit code, PR number, and whether merging is allowed. If the normal receipt path cannot be written, the CLI tries a temporary receipt file and records that path instead.
 

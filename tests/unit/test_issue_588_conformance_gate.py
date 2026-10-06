@@ -50,6 +50,14 @@ def gate(tmp_path, monkeypatch):
     log = tmp_path / "gate.log"
     monkeypatch.setenv("AGENT_CREW_CONFORMANCE_GATE_CMD", f"{sys.executable} {script}")
     monkeypatch.setenv("FAKE_GATE_LOG", str(log))
+    real_run = subprocess.run
+
+    def run(cmd, *args, **kwargs):
+        if cmd[:3] in (["gh", "issue", "view"], ["gh", "pr", "diff"]):
+            return subprocess.CompletedProcess(cmd, 1, "", "unavailable")
+        return real_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module.subprocess, "run", run)
 
     def calls():
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -245,6 +253,8 @@ def _run_auto_merge(tmp_path, monkeypatch, review_evidence=None, events=None):
     real_run = subprocess.run
 
     def fake_run(cmd, *a, **k):
+        if cmd[:3] == ["gh", "issue", "view"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "issue unavailable")
         if cmd[:3] == ["gh", "pr", "diff"]:
             return subprocess.CompletedProcess(cmd, 1, "", "diff unavailable")
         if cmd[:3] == ["gh", "pr", "merge"]:
