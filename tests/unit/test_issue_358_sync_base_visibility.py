@@ -250,7 +250,7 @@ def test_implement_dispatch_ignores_prior_pr_branch_head(
     with TestClient(app) as client:
         response = client.post("/tasks", json={
             "task_id": "impl-397", "task_type": "implement", "description": "next task",
-            "branch": "fix/prior", "priority": 3,
+            "branch": "fix/next", "priority": 3,
             "context": {"base_branch": explicit_base} if explicit_base else {},
             "project": "demo",
         })
@@ -267,7 +267,7 @@ def test_implement_dispatch_ignores_prior_pr_branch_head(
     _git(clone, "commit", "-m", "advance base")
     _git(clone, "push", "origin", explicit_base or "main")
     from agent_crew.server import _prepare_worktree_for_task
-    assert _prepare_worktree_for_task(str(worker), "impl-397", "fix/prior",
+    assert _prepare_worktree_for_task(str(worker), "impl-397", "fix/next",
                                       "implementer", stored["context"]) == expected_sha
 
     (worker / "next.txt").write_text("valid task B commit\n")
