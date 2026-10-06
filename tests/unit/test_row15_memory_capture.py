@@ -129,12 +129,12 @@ def test_shadow_prune_keeps_table_at_or_below_retention_size(tmp_path):
 
 def test_shadow_sqlite_wait_is_bounded_by_capture_timeout(monkeypatch):
     monkeypatch.delenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", raising=False)
-    assert shadow_sqlite_timeout_seconds() == 0.05
+    assert shadow_sqlite_timeout_seconds() == 0.25
     monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.01")
     assert shadow_sqlite_timeout_seconds() == 0.01
     monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_TIMEOUT_SECONDS", "0.2")
     assert shadow_sqlite_timeout_seconds() == 0.2
-    assert shadow_sqlite_timeout_seconds(capture=True) == 0.05
+    assert shadow_sqlite_timeout_seconds(capture=True) == 0.2
 
 
 def test_raised_shadow_timeout_waits_for_locked_retrieval_db(tmp_path, monkeypatch):
