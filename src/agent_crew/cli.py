@@ -15,6 +15,7 @@ from click.core import ParameterSource
 
 from agent_crew import setup as setup_module
 from agent_crew.cea_launch import client_command, parse_env_file, resolve_cea_file
+from agent_crew.cea.wiring import capability_registry_path
 from agent_crew.pipeline import ARTIFACT_KINDS
 from agent_crew.queue import _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
@@ -2335,6 +2336,69 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
         return {}
 
 
+def _registry_capability_for_paths(project: str, paths: set[str], registry_path: str) -> str:
+    """Find the one active, project-owned capability best supported by changed paths."""
+    if not paths or not registry_path:
+        return ""
+    try:
+        with open(registry_path, encoding="utf-8") as fh:
+            records = json.load(fh)["records"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return ""
+    if not isinstance(records, list):
+        return ""
+
+    def locations(value: str) -> list[str]:
+        if not isinstance(value, str):
+            return []
+        expanded = [value]
+        while any("{" in item for item in expanded):
+            next_items = []
+            for item in expanded:
+                group = re.search(r"\{([^{}]+)\}", item)
+                if group:
+                    next_items.extend(item[:group.start()] + part.strip() + item[group.end():]
+                                      for part in group.group(1).split(","))
+                else:
+                    next_items.append(item)
+            if next_items == expanded:
+                break
+            expanded = next_items
+        return [part.strip().replace("\\", "/").removeprefix("./")
+                for item in expanded for part in re.split(r"[,;]", item) if part.strip()]
+
+    def matches(changed: str, registered: str) -> bool:
+        changed = changed.replace("\\", "/").removeprefix("./")
+        return bool(registered and (changed == registered or
+                    changed.endswith("/" + registered)))
+
+    norm_project = project.lower().replace("-", "_")
+    scored = []
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        if str(record.get("owning_project", "")).lower().replace("-", "_") != norm_project:
+            continue
+        if str(record.get("lifecycle_state", "")).lower() in {
+                "withdrawn", "deprecated", "superseded"}:
+            continue
+        cap_id = record.get("capability_id")
+        if not isinstance(cap_id, str) or not cap_id:
+            continue
+        registered_paths = set(locations(record.get("implementation_location")))
+        for evidence in record.get("evidence") or []:
+            if isinstance(evidence, dict):
+                registered_paths.update(locations(evidence.get("path")))
+        score = sum(any(matches(path, registered) for registered in registered_paths)
+                    for path in paths)
+        if score:
+            scored.append((score, cap_id))
+    if not scored:
+        return ""
+    scored.sort(reverse=True)
+    return scored[0][1] if len(scored) == 1 or scored[0][0] > scored[1][0] else ""
+
+
 def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                                    pr_number: int, title: str, task_desc: str,
                                    issue: int | None, receipt_dir: str,
@@ -2378,6 +2442,21 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         change["capability_id"] = (project.replace("_", "-") +
                                    (f".issue-{issue}" if issue else f".pr-{pr_number}"))
         change["evidence_source"]["capability_id"] = "derived"
+        if issue:
+            try:
+                issue_result = subprocess.run(
+                    ["gh", "issue", "view", str(issue), "--repo", repo,
+                     "--json", "body", "--jq", ".body"],
+                    capture_output=True, text=True, timeout=5)
+                if issue_result.returncode == 0:
+                    declared = re.search(
+                        r"^capability(?:_id)?:\s*([A-Za-z0-9][A-Za-z0-9_.:-]*)",
+                        issue_result.stdout or "", re.IGNORECASE | re.MULTILINE)
+                    if declared:
+                        change["capability_id"] = declared.group(1)
+                        change["evidence_source"]["capability_id"] = "issue"
+            except Exception:
+                pass
     if isinstance(ctx.get("role"), str) and ctx["role"].strip():
         change["role"] = ctx["role"].strip()
         change["evidence_source"]["role"] = "context"
@@ -2390,39 +2469,46 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
     if isinstance(ctx.get("dependencies"), list):
         change["dependencies"] = ctx["dependencies"]
         change["evidence_source"]["dependencies"] = "context"
-    if "portable_core" not in change or "dependencies" not in change:
-        try:
-            diff = subprocess.run(
-                ["gh", "pr", "diff", str(pr_number), "--repo", repo, "--patch"],
-                capture_output=True, text=True, timeout=30)
-            if diff.returncode == 0:
-                paths, private_files = set(), set()
-                path = ""
-                for line in diff.stdout.splitlines():
-                    if line.startswith("diff --git "):
-                        parts = shlex.split(line[len("diff --git "):])
-                        path = parts[1][2:] if len(parts) == 2 and parts[1].startswith("b/") else ""
-                        if path:
-                            paths.add(path)
-                    elif line.startswith("+++ b/"):
-                        path = line[6:]
+    try:
+        diff = subprocess.run(
+            ["gh", "pr", "diff", str(pr_number), "--repo", repo, "--patch"],
+            capture_output=True, text=True, timeout=30)
+        if diff.returncode == 0:
+            paths, private_files = set(), set()
+            path = ""
+            for line in diff.stdout.splitlines():
+                if line.startswith("diff --git "):
+                    parts = shlex.split(line[len("diff --git "):])
+                    path = parts[1][2:] if len(parts) == 2 and parts[1].startswith("b/") else ""
+                    if path:
                         paths.add(path)
-                    elif line.startswith("+") and not line.startswith("+++") and path.startswith("src/agent_crew/"):
-                        added = line[1:]
-                        if ("/alfred/" in added or "alfred/tools" in added or
-                                "import alfred" in added or "from alfred" in added):
-                            private_files.add(path)
-                if "portable_core" not in change:
-                    change["portable_core"] = any(p.startswith("src/agent_crew/") for p in paths)
-                    change["evidence_source"]["portable_core"] = "derived"
-                if "dependencies" not in change:
-                    change["dependencies"] = [
-                        {"kind": "private_fleet", "project": "alfred", "file": p}
-                        for p in sorted(private_files)]
-                    change["evidence_source"]["dependencies"] = "derived"
-        except Exception:
-            # No diff is evidence unavailable; the checker keeps REVIEW.
-            pass
+                elif line.startswith("+++ b/"):
+                    path = line[6:]
+                    paths.add(path)
+                elif line.startswith("+") and not line.startswith("+++") and path.startswith("src/agent_crew/"):
+                    added = line[1:]
+                    if ("/alfred/" in added or "alfred/tools" in added or
+                            "import alfred" in added or "from alfred" in added):
+                        private_files.add(path)
+            if paths:
+                change["text"] += "\n" + "\n".join(sorted(paths)[:20])
+            if change["evidence_source"]["capability_id"] == "derived":
+                cap_id = _registry_capability_for_paths(
+                    project, paths, capability_registry_path(os.environ))
+                if cap_id:
+                    change["capability_id"] = cap_id
+                    change["evidence_source"]["capability_id"] = "registry_path"
+            if "portable_core" not in change:
+                change["portable_core"] = any(p.startswith("src/agent_crew/") for p in paths)
+                change["evidence_source"]["portable_core"] = "derived"
+            if "dependencies" not in change:
+                change["dependencies"] = [
+                    {"kind": "private_fleet", "project": "alfred", "file": p}
+                    for p in sorted(private_files)]
+                change["evidence_source"]["dependencies"] = "derived"
+    except Exception:
+        # No diff is evidence unavailable; the checker keeps REVIEW.
+        pass
     stem = os.path.join(receipt_dir, f"{task_id}-pr{pr_number}")
     change_path, receipt_path = f"{stem}.change.json", f"{stem}.receipt.json"
     verdict, error, exit_code = "REVIEW", "", None
