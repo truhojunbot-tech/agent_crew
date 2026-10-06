@@ -1,4 +1,6 @@
 from unittest.mock import MagicMock, patch
+import io
+import urllib.error
 
 from agent_crew.loop import (
     DEFAULT_MAX_ITER,
@@ -259,3 +261,26 @@ def test_u_l15_enqueue_review_creates_new_if_none_exist():
     req = queue.enqueue.call_args[0][0]
     assert req.task_type == "review"
     assert req.context.get("prev_task_id") == "impl-1"
+
+
+def test_http_duplicate_adopts_server_successor_by_id():
+    """The HTTP 409 names the task that won the race after the first lookup."""
+    from agent_crew.protocol import TaskRequest
+
+    existing = TaskRequest(
+        task_id="review-server", task_type="review", description="work",
+        branch="main", context={"prev_task_id": "impl-1", "reviewed_sha": "a" * 40},
+    )
+    queue = MagicMock()
+    queue.list_tasks.return_value = []
+    queue.get_task.return_value = existing
+    body = io.BytesIO(b'{"detail":{"error":"DUPLICATE_REVIEW",'
+                      b'"existing_task_id":"review-server"}}')
+    conflict = urllib.error.HTTPError("http://localhost/tasks", 409, "Conflict", {}, body)
+    with patch("agent_crew.loop._post_task_http", side_effect=conflict):
+        task_id = enqueue_review(
+            queue, "work", "main", prev_task_id="impl-1",
+            context={"reviewed_sha": "a" * 40}, port=8105)
+
+    assert task_id == "review-server"
+    queue.enqueue.assert_not_called()

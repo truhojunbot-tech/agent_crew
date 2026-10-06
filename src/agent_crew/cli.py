@@ -2861,6 +2861,11 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         if not resolved_repo:
             click.echo("Warning: Could not determine repo, skipping PR creation")
             return
+        existing_pr = github.pr_number_for_branch(branch_name, repo=resolved_repo)
+        if existing_pr and github.pr_state(existing_pr, repo=resolved_repo) == "open":
+            click.echo(f"Using existing PR #{existing_pr}: "
+                       f"{github.get_pr_url(resolved_repo, existing_pr)}")
+            return
         pr_number = github.create_pr(
             title=task_desc.split('\n')[0][:72],
             body=task_desc,
@@ -2872,7 +2877,13 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             pr_url = github.get_pr_url(resolved_repo, pr_number)
             click.echo(f"Created PR #{pr_number}: {pr_url}")
         else:
-            click.echo("Warning: Failed to create GitHub PR")
+            # A parallel server/client may have opened the same branch's PR.
+            existing_pr = github.pr_number_for_branch(branch_name, repo=resolved_repo)
+            if existing_pr and github.pr_state(existing_pr, repo=resolved_repo) == "open":
+                click.echo(f"Using existing PR #{existing_pr}: "
+                           f"{github.get_pr_url(resolved_repo, existing_pr)}")
+            else:
+                click.echo("Warning: Failed to create GitHub PR")
 
     # Determine port and worktrees (available when --project is set)
     _run_port = 0
@@ -3098,8 +3109,13 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             if _run_port:
                 _drain_resolvable_gates(_run_port)
             if not no_tester:
+                test_context = {**_CM}
+                if reviewed_head:
+                    test_context["reviewed_sha"] = reviewed_head
+                if _loop_pr_number:
+                    test_context["pr_number"] = _loop_pr_number
                 test_id = enqueue_test(queue, task, branch, prev_task_id=review_id,
-                                       context={**_CM}, port=_run_port)
+                                       context=test_context, port=_run_port)
                 click.echo(f"[{iteration}/{max_iter}] Testing... ({test_id})")
                 test_start = time.time()
                 test_result = _wait(test_id)

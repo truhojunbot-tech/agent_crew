@@ -220,6 +220,92 @@ def test_run_adopts_identical_first_implement(tmp_path, monkeypatch, status):
     assert "(task already in flight, adopted impl-existing)" in invocation.output
 
 
+def test_run_adopts_server_review_and_test_that_win_enqueue_race(tmp_path, monkeypatch):
+    """The server can enqueue each successor after the CLI's lookup (#610)."""
+    from agent_crew.queue import DuplicateReviewError
+
+    class RacingQueue:
+        project_identity = ""
+
+        def __init__(self):
+            self.tasks = {}
+            self.enqueued = []
+
+        def list_tasks(self):
+            return list(self.tasks.values())
+
+        def enqueue(self, request, **_kwargs):
+            self.enqueued.append(request.task_type)
+            if request.task_type in {"review", "test"}:
+                server_id = f"server-{request.task_type}"
+                self.tasks[server_id] = TaskRequest(
+                    task_id=server_id, task_type=request.task_type,
+                    description=request.description, branch=request.branch,
+                    context=request.context, status="completed",
+                )
+                raise DuplicateReviewError(server_id)
+            self.tasks[request.task_id] = request
+            return request.task_id
+
+        def get_task(self, task_id):
+            return self.tasks.get(task_id)
+
+        def get_result(self, task_id):
+            if task_id.startswith("impl-"):
+                return TaskResult(task_id=task_id, status="completed", summary="done",
+                                  branch="main", commit=COMMIT)
+            if task_id == "server-review":
+                return TaskResult(task_id=task_id, status="completed", summary="approved",
+                                  verdict="approve", findings=[])
+            if task_id == "server-test":
+                return TaskResult(task_id=task_id, status="completed", summary="passed")
+            return None
+
+        def get_task_context(self, task_id):
+            return self.tasks[task_id].context
+
+    queue = RacingQueue()
+    monkeypatch.setattr("agent_crew.queue.TaskQueue", lambda _db: queue)
+    result = CliRunner().invoke(crew, [
+        "run", "race", "--db", str(tmp_path / "tasks.db"), "--branch", "main",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert queue.enqueued == ["implement", "review", "test"]
+    assert len([t for t in queue.list_tasks() if t.task_type == "review"]) == 1
+    assert len([t for t in queue.list_tasks() if t.task_type == "test"]) == 1
+    assert "Loop complete" in result.output
+
+
+def test_run_reuses_open_pr_without_creating_another(tmp_path, monkeypatch):
+    import agent_crew.loop as loop
+
+    queue = _LoopQueue([
+        TaskResult(task_id="impl-1", status="completed", summary="done"),
+        TaskResult(task_id="review-1", status="completed", summary="approved",
+                   verdict="approve", findings=[]),
+    ])
+    monkeypatch.setattr("agent_crew.queue.TaskQueue", lambda _db: queue)
+    monkeypatch.setattr(loop, "enqueue_implement", lambda *_args, **_kwargs: "impl-1")
+    monkeypatch.setattr(loop, "enqueue_review", lambda *_args, **_kwargs: "review-1")
+    monkeypatch.setattr("agent_crew.github.check_gh_installed", lambda: True)
+    monkeypatch.setattr("agent_crew.github.pr_number_for_branch", lambda *_args, **_kwargs: 609)
+    monkeypatch.setattr("agent_crew.github.pr_state", lambda *_args, **_kwargs: "open")
+
+    def no_create_pr(**_kwargs):
+        raise AssertionError("existing PR must be reused")
+
+    monkeypatch.setattr("agent_crew.github.create_pr", no_create_pr)
+    result = CliRunner().invoke(crew, [
+        "run", "race", "--db", str(tmp_path / "tasks.db"), "--branch", "main",
+        "--no-tester", "--create-pr", "--repo", "owner/repo",
+    ])
+
+    assert result.exit_code == 0, result.output
+    assert "Using existing PR #609" in result.output
+    assert "Failed to create GitHub PR" not in result.output
+
+
 @pytest.mark.parametrize("existing", [
     _inflight_impl(branch="other"),
     _inflight_impl(status="completed"),
