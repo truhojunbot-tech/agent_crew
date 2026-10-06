@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
-import grp
 import os
-import shlex
 import socket
 import subprocess
 import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
+from agent_crew.cea_launch import client_command, parse_env_file
 
 KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -27,11 +28,6 @@ def parse_env(raw: bytes) -> dict[str, str]:
 
 
 def launch_env(env_file: Path, cea_file: Path, source: Path) -> dict[str, str]:
-    try:
-        from .runtime_swap import parse_env_file
-    except ImportError:  # executed as a file by runtime_swap.py
-        from runtime_swap import parse_env_file
-
     env = parse_env(env_file.read_bytes())
     for key in list(env):
         if key in {"_", "OLDPWD", "PWD", "SHLVL"} or key.startswith("AGENT_CREW_CEA_"):
@@ -44,15 +40,6 @@ def launch_env(env_file: Path, cea_file: Path, source: Path) -> dict[str, str]:
     env["PYTHONPATH"] = ":".join([str(source), *other])
     env.update(parse_env_file(cea_file))
     return env
-
-
-def client_command(env: dict[str, str], command: list[str]) -> list[str]:
-    """Start with the socket's client group, even when this login predates usermod."""
-    sock = env.get("AGENT_CREW_CEA_BROKER_SOCKET")
-    if not sock:
-        return command
-    group = grp.getgrgid(os.stat(Path(sock).parent).st_gid).gr_name
-    return ["sg", group, "-c", shlex.join(command)]
 
 
 def probe_broker(env_file: Path, cea_file: Path, source: Path) -> None:

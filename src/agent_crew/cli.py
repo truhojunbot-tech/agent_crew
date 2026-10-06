@@ -7,11 +7,13 @@ import socket
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import click
 from click.core import ParameterSource
 
 from agent_crew import setup as setup_module
+from agent_crew.cea_launch import client_command, parse_env_file, resolve_cea_file
 from agent_crew.pipeline import ARTIFACT_KINDS
 from agent_crew.queue import _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
@@ -38,6 +40,28 @@ def _crew_log(proj_dir: str, msg: str) -> None:
             f.write(line)
     except OSError:
         pass
+
+
+def _server_spawn_args(proj_dir: str, port: int, server_env: dict[str, str],
+                       allow_no_cea: bool) -> tuple[list[str], dict[str, str]]:
+    """Use the swap CEA source and broker client group for every CLI server start."""
+    cea_file = resolve_cea_file(Path(proj_dir))
+    env = {key: value for key, value in server_env.items()
+           if not key.startswith("AGENT_CREW_CEA_")}
+    if cea_file.is_file():
+        try:
+            env.update(parse_env_file(cea_file))
+        except (OSError, ValueError) as exc:
+            raise click.ClickException(f"invalid CEA env file {cea_file}: {exc}") from exc
+    elif not allow_no_cea:
+        raise click.ClickException(
+            f"CEA env file missing: {cea_file}. Use --allow-no-cea to start without CEA.")
+    command = [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
+               "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"]
+    try:
+        return client_command(env, command), env
+    except (OSError, KeyError) as exc:
+        raise click.ClickException("cannot enter CEA broker client group") from exc
 
 
 def _tmux_snapshot(session: str) -> str:
@@ -855,7 +879,8 @@ def roles_show(project: str, base: str):
 @click.option("--agents", default=_DEFAULT_AGENTS,
               help="Comma-separated agent names. e.g. --agents codex  (single-agent mode)")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True, help="Base directory for state/worktrees")
-def setup(project: str, agents: str, base: str):
+@click.option("--allow-no-cea", is_flag=True, help="Explicitly start without a CEA env file")
+def setup(project: str, agents: str, base: str, allow_no_cea: bool):
     """Configure environment for PROJECT.
 
     Examples:
@@ -1207,11 +1232,12 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
+        server_command, server_env = _server_spawn_args(
+            proj_dir, port, server_env, allow_no_cea)
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_file = open(os.path.join(proj_dir, "server.log"), "w")
         server_proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
-             "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
+            server_command,
             env=server_env,
             stdout=log_file,
             stderr=log_file,
@@ -1240,14 +1266,6 @@ def setup(project: str, agents: str, base: str):
     else:
         # Pane-recreation path: kill old server and restart on the same port so it
         # picks up the new pane_map.json. The DB is preserved — no tasks are lost.
-        old_pid = existing_state.get("server_pid") if existing_state else None
-        if old_pid:
-            try:
-                os.kill(old_pid, signal.SIGTERM)
-                _crew_log(proj_dir, f"old server SIGTERM pid={old_pid}")
-                time.sleep(1)
-            except (ProcessLookupError, OSError):
-                pass
         state_file = _state_path(base, project)
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         context_pack_value, context_pack_source = _context_pack_launch_value(
@@ -1266,11 +1284,20 @@ def setup(project: str, agents: str, base: str):
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
+        server_command, server_env = _server_spawn_args(
+            proj_dir, port, server_env, allow_no_cea)
+        old_pid = existing_state.get("server_pid") if existing_state else None
+        if old_pid:
+            try:
+                os.kill(old_pid, signal.SIGTERM)
+                _crew_log(proj_dir, f"old server SIGTERM pid={old_pid}")
+                time.sleep(1)
+            except (ProcessLookupError, OSError):
+                pass
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_file = open(os.path.join(proj_dir, "server.log"), "a")
         server_proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
-             "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
+            server_command,
             env=server_env,
             stdout=log_file,
             stderr=log_file,
@@ -1875,7 +1902,9 @@ def task_expire_stale(project: str, allow_cross_project: bool, base: str, db: st
               help="Reset in_progress tasks idle > --stale-seconds back to pending so they can be retried")
 @click.option("--stale-seconds", default=600, type=int, show_default=True,
               help="Idle threshold for --reset-stale")
-def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
+@click.option("--allow-no-cea", is_flag=True, help="Explicitly start without a CEA env file")
+def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
+            allow_no_cea: bool):
     """Recover a crashed PROJECT: restart server and recreate tmux panes."""
     state = _read_state(base, project)
     if state is None:
@@ -1931,12 +1960,13 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int):
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
+        server_command, server_env = _server_spawn_args(
+            proj_dir, port, server_env, allow_no_cea)
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_path = os.path.join(proj_dir, "server.log")
         log_file = open(log_path, "a")
         server_proc = subprocess.Popen(
-            [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
-             "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"],
+            server_command,
             env=server_env,
             stdout=log_file,
             stderr=log_file,
