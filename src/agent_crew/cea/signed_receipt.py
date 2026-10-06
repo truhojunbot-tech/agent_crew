@@ -19,7 +19,8 @@ DEFAULT_PUBLIC = "/opt/agent_crew-authz/receipt-signing.pub"
 DISPATCH_BINDING = "signed_dispatch"
 VOLATILE_CONTEXT = frozenset({"cea_enqueue", "cea_cascade", "push_refusals",
     "push_refusal_reason", "push_not_before", "test_lock_defer_count",
-    "test_lock_first_deferred_at", "risk_declaration", "risk_tier_shadow"})
+    "test_lock_first_deferred_at", "risk_declaration", "risk_tier_shadow",
+    "provider_capacity_count", "provider_capacity_since", "provider_capacity_blocked_at"})
 
 
 def payload_hash(*, task_type: str, branch: str, description: str, context: dict) -> str:

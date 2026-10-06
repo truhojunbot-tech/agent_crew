@@ -547,6 +547,10 @@ def intent_for_task(task: TaskRequest, *, context: Optional[dict] = None,
 
 logger = logging.getLogger(__name__)
 
+#: #581 waste reason for a provider capacity refusal (codex "Selected model is
+#: at capacity"). Infra waste, not a task outcome.
+PROVIDER_CAPACITY = "provider_capacity"
+
 
 def _unknown_risk_declaration() -> dict:
     return {
@@ -2761,7 +2765,8 @@ class TaskQueue:
         return auth
 
     def enqueue_with_receipt(self, task: TaskRequest, receipt: dict, *,
-                             context: Optional[dict] = None) -> str:
+                             context: Optional[dict] = None,
+                             _capacity_predecessor: str = "") -> str:
         """Write the task row for an admitted intent. **The only writer there is.**
 
         P2: "without a valid receipt there is no enqueue". That is a property of
@@ -2842,7 +2847,8 @@ class TaskQueue:
             expired_reservations: list = []
             duplicate_id = self._duplicate_review_in_txn(
                 conn, task, context, now=admit_at, ttl=reservation_ttl,
-                expired=expired_reservations, resolved_sha=resolved_review_sha)
+                expired=expired_reservations, resolved_sha=resolved_review_sha,
+                ignore_active_task_id=_capacity_predecessor)
             if duplicate_id:
                 if context.get("allow_duplicate_review") is True:
                     self._append_exec_event_on(
@@ -3026,7 +3032,8 @@ class TaskQueue:
                                  now: Optional[float] = None,
                                  ttl: Optional[float] = None,
                                  expired: Optional[list] = None,
-                                 resolved_sha: str = "") -> Optional[str]:
+                                 resolved_sha: str = "",
+                                 ignore_active_task_id: str = "") -> Optional[str]:
         """Find a standing review/test of this target under the write lock.
 
         Pending reviews without a pin will use the current head at dispatch, so
@@ -3065,6 +3072,12 @@ class TaskQueue:
             (task.project, task.task_type, task.task_id),
         ).fetchall()
         for row in rows:
+            # Capacity re-admission creates the replacement before cancelling
+            # its active predecessor. Only that trusted predecessor is ignored;
+            # another review/test of this target still blocks admission.
+            if (row["task_id"] == ignore_active_task_id
+                    and row["status"] == "in_progress"):
+                continue
             try:
                 old = json.loads(row["context"] or "{}")
             except (TypeError, ValueError):
@@ -3218,7 +3231,15 @@ class TaskQueue:
             else:
                 auth = self._refuse_admission(task, context=context, provenance=provenance,
                                               code=refusal[0], text=refusal[1])
-            return self.enqueue_with_receipt(task, auth.receipt, context=context)
+            capacity_predecessor = ""
+            if (_successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE
+                    and ingress == "retry.failed_task"
+                    and context.get("push_refusal_reason") == "codex_capacity"
+                    and context.get("provider_capacity_root")):
+                capacity_predecessor = str(context.get("original_task_id") or "")
+            return self.enqueue_with_receipt(
+                task, auth.receipt, context=context,
+                _capacity_predecessor=capacity_predecessor)
 
     def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
                           provenance: "_CeaProvenance", code: str, text: str):
@@ -3868,12 +3889,20 @@ class TaskQueue:
         winning the ORDER BY and starving the tasks behind it. Other consumers
         (dispatcher, MCP) leave it False — the backoff is about a pane, not
         the task.
+        Provider-capacity backoff (`push_refusal_reason == 'codex_capacity'`)
+        applies to every claimant, including MCP and HTTP polling (#581).
+        Pane refusals remain specific to push delivery.
         ``claim_source`` is server-owned provenance for recovery. Skipped IDs
         let push delivery pass a busy queue head during this scheduling pass.
         """
         _now = time.time()
-        _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "
-                      + repr(_now)) if skip_deferred else ""
+        if skip_deferred:
+            _defer_sql = (" AND COALESCE(json_extract(context, '$.push_not_before'), 0) <= "
+                          + repr(_now))
+        else:
+            _defer_sql = (" AND NOT (COALESCE(json_extract(context, '$.push_refusal_reason'), '')"
+                          " = 'codex_capacity' AND COALESCE(json_extract(context,"
+                          " '$.push_not_before'), 0) > " + repr(_now) + ")")
         # #311/#314 STOP 전파: 런타임 STOP 활성이면 어떤 task도 claim/start하지 않는다.
         # 이 한 지점이 tmux push(_try_push_next)와 MCP GET /tasks/next를 모두 덮어
         # 큐 드레인·successor/retry stage 시작을 막는다. in-flight는 자기 원자단위까지만.
@@ -5133,6 +5162,90 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def defer_provider_capacity(self, task_id: str, *, delay_s: float, blocked_after_s: float,
+                                provider_tag: str = "codex_capacity") -> Optional[dict]:
+        """Requeue a task its provider refused for capacity, not before ``delay_s`` (#581).
+
+        Capacity is an external outage, not a task failure: there is no
+        attempt cap here and the task never ends from capacity alone. In one
+        transaction it sets ``push_not_before`` with ``push_refusal_reason =
+        provider_tag`` (honoured by every dequeue), counts the streak in the
+        context, requeues through the §8 gate, and records the end as
+        ``requeued`` with ``waste_reason='provider_capacity'`` (infra waste —
+        tokenomics consumers exclude it from the #80 cohort). Once the streak
+        has lasted ``blocked_after_s`` it appends ``provider_capacity_blocked``
+        once, for the coordinator. Returns the streak state, or None if the
+        task was not in_progress or the gate kept it.
+
+        ⛔When the gate answers ``RE_ADMIT`` under enforcement (the attempt
+          budget is spent, or B drifted), the receipt is SUPERSEDED and a
+          pending row on it could never be claimed again. The row is then NOT
+          put back to pending: it stays in_progress, the result carries
+          ``readmit=True``, and the caller re-admits the work as a successor
+          through admission (``server._readmit_provider_capacity``) and
+          cancels this row. Nothing here mints or repoints a receipt.
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, context FROM tasks WHERE task_id = ?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.execute("ROLLBACK")
+                return None
+            now = time.time()
+            ctx = json.loads(row["context"] or "{}")
+            count = int(ctx.get("provider_capacity_count") or 0) + 1
+            since = float(ctx.get("provider_capacity_since") or now)
+            blocked = (now - since >= blocked_after_s
+                       and not ctx.get("provider_capacity_blocked_at"))
+            requeued, _gate = self.requeue_through_gate(
+                conn, task_id, path="queue.defer_provider_capacity",
+                reason=f"{PROVIDER_CAPACITY}: {provider_tag}")
+            if not requeued:
+                conn.execute("COMMIT")   # keep the refusal's runtime event
+                return None
+            readmit = bool(_gate is not None and _gate.outcome is _CeaOutcome.RE_ADMIT
+                           and _gate.enforced)
+            # ⛔Re-read: requeue_through_gate patched the context (§8 answer).
+            ctx = json.loads(conn.execute("SELECT context FROM tasks WHERE task_id = ?",
+                                          (task_id,)).fetchone()["context"] or "{}")
+            ctx.update({"push_not_before": now + delay_s,
+                        "push_refusal_reason": provider_tag,
+                        "provider_capacity_count": count,
+                        "provider_capacity_since": since})
+            if blocked:
+                ctx["provider_capacity_blocked_at"] = now
+            if readmit:     # stays in_progress until the caller cancels it
+                conn.execute("UPDATE tasks SET context = ? WHERE task_id = ?",
+                             (json.dumps(ctx), task_id))
+            else:
+                conn.execute(
+                    "UPDATE tasks SET context = ?, status = 'pending', claim_source = '' "
+                    "WHERE task_id = ? AND status = 'in_progress'",
+                    (json.dumps(ctx), task_id))
+            waste = {"waste_reason": PROVIDER_CAPACITY, "waste_class": "infra",
+                     "provider_tag": provider_tag, "capacity_refusals": count,
+                     "capacity_since": since}
+            if readmit:
+                self._append_exec_event_on(conn, task_id, "provider_capacity_readmit", now,
+                                           gate_reason=_gate.reason, **waste)
+            else:
+                self._record_end_on(conn, task_id, now, "requeued", posted=False,
+                                    not_before=now + delay_s, **waste)
+            if blocked:
+                self._append_exec_event_on(conn, task_id, "provider_capacity_blocked", now,
+                                           blocked_for_s=round(now - since, 1), **waste)
+            conn.execute("COMMIT")
+            return {"count": count, "since": since, "not_before": now + delay_s,
+                    "blocked": blocked, "readmit": readmit}
+        except Exception:
+            with contextlib.suppress(Exception):
+                conn.execute("ROLLBACK")
+            raise
+        finally:
+            conn.close()
+
     def requeue(self, task_id: str, *, reason: str = "") -> None:
         """Roll an in_progress task back to pending so it can be dequeued again.
 
@@ -5587,8 +5700,9 @@ class TaskQueue:
                     ctx = json.loads(row["context"]) if row["context"] else {}
                 except Exception:
                     continue
-                if skip_deferred and float(ctx.get("push_not_before") or 0) > time.time():
-                    continue            # G_DT backoff — see dequeue()
+                if ((skip_deferred or ctx.get("push_refusal_reason") == "codex_capacity")
+                        and float(ctx.get("push_not_before") or 0) > time.time()):
+                    continue            # Pane push or provider-capacity backoff — see dequeue()
                 if ctx.get("agent") == agent:
                     chosen = row
                     break
