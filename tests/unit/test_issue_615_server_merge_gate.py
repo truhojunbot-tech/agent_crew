@@ -36,7 +36,7 @@ def checker(tmp_path, monkeypatch):
 
 
 def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
-                 change_type="create", gate_failure=""):
+                 change_type="create", gate_failure="", status_details=None):
     if not gate_enabled:
         monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -60,8 +60,13 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
     monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "a" * 40)
     monkeypatch.setattr(github, "independent_review_for_head",
                         lambda *a, **k: ("a" * 40, "claude", "review-615", "ok"))
-    monkeypatch.setattr(github, "publish_independent_review_status",
-                        lambda *a, **k: calls.append("status") or True)
+    def publish_status(*args, **kwargs):
+        calls.append("status")
+        if status_details is not None:
+            status_details.append(args)
+        return True
+
+    monkeypatch.setattr(github, "publish_independent_review_status", publish_status)
     monkeypatch.setattr(github, "independent_review_succeeded", lambda *a, **k: True)
     monkeypatch.setattr(github, "merge_pr", lambda *a, **k: calls.append("merge") or True)
     monkeypatch.setattr(github, "post_pr_comment",
@@ -146,3 +151,24 @@ def test_same_head_retry_reuses_receipt_and_comment(tmp_path, monkeypatch, check
         title="add widget", task_desc="add widget", issue=615,
         receipt_dir=str(tmp_path / "conformance_receipts"), repo="owner/repo")
     assert calls == ["comment", "status", "merge"]
+
+
+@pytest.mark.parametrize("setting", ["0", "false", "no", "off"])
+def test_server_auto_merge_opt_out_publishes_status_but_skips_merge(
+        tmp_path, monkeypatch, checker, setting):
+    monkeypatch.setenv("AGENT_CREW_AUTO_MERGE", setting)
+    published = []
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify", status_details=published)
+    assert calls == ["comment", "status"]
+    assert published == [("owner/repo", "a" * 40, "review-615", "claude")]
+    op = queue.external_op_get("merge:pr:615")
+    assert op["state"] == "skipped" and op["attempt"] == 0
+
+
+def test_server_auto_merge_unset_still_merges(tmp_path, monkeypatch, checker):
+    monkeypatch.delenv("AGENT_CREW_AUTO_MERGE", raising=False)
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify")
+    assert calls == ["comment", "status", "merge"]
+    assert queue.external_op_get("merge:pr:615")["state"] == "done"
