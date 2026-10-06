@@ -131,7 +131,7 @@ def _review_queue(tmp_path, reviewer="claude"):
     return q
 
 
-def test_independent_approval_publishes_status_before_merge(tmp_path, monkeypatch):
+def test_independent_approval_publishes_status(tmp_path, monkeypatch):
     q = _review_queue(tmp_path)
     monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "a" * 40)
     monkeypatch.setattr(github, "check_gh_installed", lambda: True)
@@ -148,8 +148,7 @@ def test_independent_approval_publishes_status_before_merge(tmp_path, monkeypatc
     assert real_publish_status("owner/repo", sha, review_id, reviewer)
     assert calls[0][:5] == ["gh", "api", "-X", "POST", f"repos/owner/repo/statuses/{sha}"]
     assert "context=crew/independent-review" in calls[0]
-    calls.append(["gh", "pr", "merge"])
-    assert calls[-2][0:3] == ["gh", "api", "-X"] and calls[-1][0:3] == ["gh", "pr", "merge"]
+    assert len(calls) == 1
 
 
 @pytest.mark.parametrize("reviewer,head,reason_part", [
@@ -178,3 +177,62 @@ def test_latest_review_lookup_skips_malformed_older_context(tmp_path):
         db.execute("UPDATE tasks SET status='completed', context='{', pr_number=NULL "
                    "WHERE task_id='old-review'")
     assert q.latest_completed_review_for_pr(606).task_id == "review-a"
+
+
+def _server_review_fixture(tmp_path, monkeypatch, *, reviewer, head, publish=True,
+                           move_after_publication=False):
+    """Submit a real HTTP review result through server._auto_merge_pr."""
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    db = str(tmp_path / "server.db")
+    q = TaskQueue(db)
+    q.enqueue(TaskRequest(task_id="impl-server", task_type="implement", description="work",
+                          branch="fix/606", context={"pr_number": 606}))
+    q.enqueue(TaskRequest(task_id="review-server", task_type="review", description="review",
+                          branch="fix/606", context={"pr_number": 606,
+                                                     "repo": "owner/repo",
+                                                     "no_tester": True,
+                                                     "prev_task_id": "impl-server",
+                                                     "reviewed_sha": "a" * 40}))
+    q.record_attribution("impl-server", agent="codex", task_type="implement")
+    q.record_attribution("review-server", agent=reviewer, task_type="review")
+    calls = []
+    monkeypatch.setattr(github, "pr_state", lambda *a, **k: "open")
+    heads = iter(["a" * 40, head]) if move_after_publication else None
+    monkeypatch.setattr(github, "pr_head_sha",
+                        lambda *a, **k: next(heads, head) if heads else head)
+    monkeypatch.setattr(github, "post_review_comment", lambda **k: True)
+    monkeypatch.setattr(github, "publish_independent_review_status",
+                        lambda *a, **k: calls.append("status") or publish)
+    monkeypatch.setattr(github, "independent_review_succeeded", lambda *a, **k: True)
+    monkeypatch.setattr(github, "merge_pr", lambda *a, **k: calls.append("merge") or True)
+    app = create_app(db_path=db, pane_map={}, push_fn=lambda *a, **k: None,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks/review-server/result", json={
+            "task_id": "review-server", "status": "completed",
+            "summary": "Reviewed the PR head and found no blocking changes.",
+            "verdict": "approve", "findings": [], "pr_number": 606})
+    assert response.status_code == 200, response.text
+    return calls, q.external_op_get("merge:pr:606")
+
+
+@pytest.mark.parametrize("reviewer,head,reason_part", [
+    ("codex", "a" * 40, "equals"),
+    ("claude", "b" * 40, "differs"),
+])
+def test_server_refuses_nonindependent_or_moved_review(tmp_path, monkeypatch,
+                                                       reviewer, head, reason_part):
+    calls, op = _server_review_fixture(
+        tmp_path, monkeypatch, reviewer=reviewer, head=head,
+        move_after_publication=(head != "a" * 40))
+    assert calls == []
+    assert op["state"] == "failed" and reason_part in op["last_error"]
+
+
+def test_server_publish_failure_blocks_merge(tmp_path, monkeypatch):
+    calls, op = _server_review_fixture(tmp_path, monkeypatch, reviewer="claude",
+                                       head="a" * 40, publish=False)
+    assert calls == ["status"]
+    assert op["state"] == "failed" and "publish failed" in op["last_error"]
