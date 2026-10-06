@@ -3466,7 +3466,8 @@ def create_app(
             if not (task.context or {}).get("post_recovery_verification"):
                 pr_number = (task.context or {}).get("pr_number")
                 if isinstance(pr_number, int):
-                    _auto_merge_pr(pr_number, repo=(task.context or {}).get("repo") or "")
+                    _auto_merge_pr(pr_number, repo=(task.context or {}).get("repo") or "",
+                                   review_task_id=(task.context or {}).get("prev_task_id") or "")
             action = "held" if (task.context or {}).get("post_recovery_verification") else "skipped"
         else:
             q().requeue(task.task_id, reason="provider_cooldown")
@@ -6107,7 +6108,8 @@ def create_app(
             if skipped.get("reason") == "gemini tester stage not run (provider limit)":
                 pr_number = review_ctx.get("pr_number")
                 if isinstance(pr_number, int):
-                    _auto_merge_pr(pr_number, repo=repo or review_ctx.get("repo") or "")
+                    _auto_merge_pr(pr_number, repo=repo or review_ctx.get("repo") or "",
+                                   review_task_id=review_task_id)
 
     def _any_worktree_path() -> str:
         """A worktree that is a checkout of THIS project's repository.
@@ -6432,7 +6434,8 @@ def create_app(
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
             pass
 
-    def _auto_merge_pr(pr_number: int, repo: str = "", repo_cwd: str = "") -> None:
+    def _auto_merge_pr(pr_number: int, repo: str = "", repo_cwd: str = "",
+                       review_task_id: str = "") -> None:
         """Merge PR via gh CLI after the pipeline approves it (#171).
 
         Failures are logged and swallowed — a merge error must never break
@@ -6442,8 +6445,9 @@ def create_app(
         # IMMEDIATE 트랜잭션에서 runtime_stop을 확인해 unpaused일 때만 admit+reserve → STOP이
         # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
         # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
-        from agent_crew.github import (get_repo, independent_review_succeeded,
-                                       merge_pr, pr_state)
+        from agent_crew.github import (get_repo, independent_review_for_head,
+                                       independent_review_succeeded, merge_pr, pr_state,
+                                       publish_independent_review_status)
         _merge_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         op_key = f"merge:pr:{pr_number}"
         resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
@@ -6489,6 +6493,18 @@ def create_app(
         # coordinators also submit test results and own their own merge policy.
         # Require the independent review status on the current PR head for
         # every server-side merge, regardless of caller-controlled context.
+        head, reviewer_agent, approved_review_id, reason = independent_review_for_head(
+            q(), int(pr_number), _merge_repo, review_task_id)
+        if not head:
+            q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
+            logger.warning("_auto_merge_pr: PR #%s review status refused: %s", pr_number, reason)
+            return
+        if not publish_independent_review_status(
+                _merge_repo, head, approved_review_id, reviewer_agent):
+            q().external_op_mark(op_key, "failed", last_error="review status publish failed",
+                                 inc_attempt=True)
+            logger.warning("_auto_merge_pr: PR #%s review status publish failed", pr_number)
+            return
         if not independent_review_succeeded(int(pr_number), _merge_repo):
             q().external_op_mark(
                 op_key, "failed",
@@ -7449,7 +7465,8 @@ def create_app(
                     logger.info(f"POST /tasks/{task_id}/result: review approved but no_tester=True — skipping test enqueue")
                     # #171: no tester stage → merge immediately on review approval
                     if pr_number:
-                        _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt)
+                        _auto_merge_pr(int(pr_number), repo=_review_repo, repo_cwd=_reviewer_wt,
+                                       review_task_id=task_id)
                 else:
                     logger.info(f"POST /tasks/{task_id}/result: review task approved, auto-enqueueing test")
                     _auto_enqueue_test(task_id, repo=_review_repo)
@@ -7469,7 +7486,8 @@ def create_app(
                 if test_pr:
                     _test_wt = _any_worktree_path()
                     _test_repo = _task_ctx.get("repo") or ""
-                    _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt)
+                    _auto_merge_pr(int(test_pr), repo=_test_repo, repo_cwd=_test_wt,
+                                   review_task_id=_task_ctx.get("prev_task_id") or "")
             # Task done → that role is now idle → push the next pending task of the same role.
             role = _TYPE_TO_ROLE.get(task_type)
             logger.info(f"POST /tasks/{task_id}/result: task_type={task_type} -> role={role}, calling _try_push_next")

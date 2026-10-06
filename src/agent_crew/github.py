@@ -285,8 +285,7 @@ def pr_head_sha(pr_number: int, repo: Optional[str] = None,
                 timeout: float = 20.0, cwd: Optional[str] = None) -> str:
     """The commit a PR currently points at, or ``""`` when it cannot be read.
 
-    Uses the last entry of `--json commits`: this `gh` build has no
-    `headRefOid` field, and asking for one fails the whole call.
+    Read the PR head from the REST API; this gh build rejects headRefOid.
 
     `repo` should be supplied by the caller. The `cwd` fallback exists for
     callers that know a checkout but not its slug; falling through to neither
@@ -300,12 +299,12 @@ def pr_head_sha(pr_number: int, repo: Optional[str] = None,
         return ""
     try:
         r = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--repo", repo, "--json", "commits"],
+            ["gh", "api", f"repos/{repo}/pulls/{pr_number}", "--jq", ".head.sha"],
             capture_output=True, text=True, timeout=timeout)
         if r.returncode != 0:
             return ""
-        commits = (json.loads(r.stdout or "{}") or {}).get("commits") or []
-        return (commits[-1].get("oid") or "") if commits else ""
+        sha = (r.stdout or "").strip().lower()
+        return sha if re.fullmatch(r"[0-9a-f]{40}", sha) else ""
     except Exception:
         return ""
 
@@ -509,14 +508,8 @@ def independent_review_succeeded(pr_number: int, repo: str) -> bool:
     if not repo or not check_gh_installed():
         return False
     try:
-        head = subprocess.run(
-            ["gh", "pr", "view", str(pr_number), "--repo", repo,
-             "--json", "headRefOid"],
-            capture_output=True, text=True, timeout=20)
-        if head.returncode != 0:
-            return False
-        sha = json.loads(head.stdout or "{}").get("headRefOid", "")
-        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        sha = pr_head_sha(pr_number, repo=repo)
+        if not sha:
             return False
         status = subprocess.run(
             ["gh", "api", f"repos/{repo}/commits/{sha}/status"],
@@ -526,5 +519,59 @@ def independent_review_succeeded(pr_number: int, repo: str) -> bool:
         statuses = json.loads(status.stdout or "{}").get("statuses", [])
         return any(s.get("context") == "crew/independent-review"
                    and s.get("state") == "success" for s in statuses)
+    except Exception:
+        return False
+
+
+def independent_review_for_head(queue, pr_number: int, repo: str,
+                                review_task_id: str = "") -> tuple[str, str, str, str]:
+    """Return (head SHA, reviewer agent, review task id, reason) for the latest independent approval.
+
+    Empty SHA means there is no authority to publish a success status or merge.
+    Attribution is dispatch evidence, not a provider name inferred from prose.
+    """
+    head = pr_head_sha(pr_number, repo=repo)
+    if not head:
+        return "", "", "", "PR head unavailable"
+    latest = queue.latest_completed_review_for_pr(pr_number)
+    if not latest:
+        return "", "", "", "no completed review for PR"
+    if review_task_id and latest.task_id != review_task_id:
+        return "", "", "", f"latest completed review is {latest.task_id}"
+    if latest.verdict != "approve":
+        return "", "", "", f"latest review {latest.task_id} is {latest.verdict or 'without verdict'}"
+    reviewed_sha = (latest.context or {}).get("reviewed_sha")
+    if not isinstance(reviewed_sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", reviewed_sha):
+        return "", "", "", f"review {latest.task_id} lacks reviewed_sha"
+    if reviewed_sha.lower() != head:
+        return "", "", "", f"PR head {head[:7]} differs from reviewed SHA {reviewed_sha[:7]}"
+    reviewer = queue.get_attribution(latest.task_id) or {}
+    parent_id = (latest.context or {}).get("prev_task_id")
+    parent = queue.get_task(parent_id) if parent_id else None
+    author = queue.get_attribution(parent_id) if parent and parent.task_type == "implement" else {}
+    reviewer_agent, author_agent = reviewer.get("agent"), (author or {}).get("agent")
+    if not reviewer_agent or not author_agent:
+        return "", "", "", "author or reviewer attribution unavailable"
+    if reviewer_agent == author_agent:
+        return "", "", "", f"reviewer agent equals implementer agent ({reviewer_agent})"
+    return head, reviewer_agent, latest.task_id, "independent approval"
+
+
+def publish_independent_review_status(repo: str, sha: str, review_task_id: str,
+                                      reviewer_agent: str) -> bool:
+    """Publish validated review evidence as the protected-branch status."""
+    if (not repo or not re.fullmatch(r"[0-9a-fA-F]{40}", sha or "") or
+            not review_task_id or not reviewer_agent or not check_gh_installed()):
+        return False
+    description = f"{reviewer_agent} approved ({review_task_id})"[:140]
+    try:
+        result = subprocess.run(
+            ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{sha}",
+             "-f", "state=success", "-f", "context=crew/independent-review",
+             "-f", f"description={description}"],
+            capture_output=True, text=True, timeout=20)
+        if result.returncode != 0:
+            _log_gh_failure("publish_independent_review_status", repo, None, result)
+        return result.returncode == 0
     except Exception:
         return False

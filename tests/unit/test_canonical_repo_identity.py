@@ -68,6 +68,11 @@ def _submit_result(client, task_id, task_type, pr_number=91001):
 def _patch_open_pr(monkeypatch):
     monkeypatch.setattr("agent_crew.github.pr_state", lambda *args, **kwargs: "open")
     monkeypatch.setattr("agent_crew.github.post_review_comment", lambda **kwargs: True)
+    monkeypatch.setattr("agent_crew.github.independent_review_for_head",
+                        lambda q, pr, repo, review_id="": ("a" * 40, "claude",
+                                                            review_id or "review-fixture", "ok"))
+    monkeypatch.setattr("agent_crew.github.publish_independent_review_status",
+                        lambda *args, **kwargs: True)
 
 
 def test_G_unresolved_repo_is_unknown_not_a_process_cwd_guess(monkeypatch):

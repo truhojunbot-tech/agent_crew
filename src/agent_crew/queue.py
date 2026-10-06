@@ -5813,6 +5813,26 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def latest_completed_review_for_pr(self, pr_number: int) -> Optional[TaskRequest]:
+        """Read only the latest completed review for a PR, tolerating legacy rows.
+
+        The context fallback covers reviews whose PR number was carried only
+        in context. Malformed historical context must not break merge checks.
+        """
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM tasks WHERE task_type='review' AND status='completed' "
+                "AND (pr_number=? OR CAST(CASE WHEN json_valid(context) "
+                "THEN json_extract(context, '$.pr_number') END AS TEXT)=?) "
+                "ORDER BY COALESCE(NULLIF(status_changed_at, 0), last_activity_at, created_at) "
+                "DESC, rowid DESC LIMIT 1",
+                (pr_number, str(pr_number)),
+            ).fetchone()
+            return self._task_from_row(row) if row is not None else None
+        finally:
+            conn.close()
+
     def list_fallback_tasks_for_original(self, task_id: str) -> List[TaskRequest]:
         """Read fallback candidates for one original without decoding every task."""
         conn = self._connect()

@@ -34,6 +34,7 @@ GITHUB_WRITE_FUNCTIONS = (
     "create_pr",
     "create_issue",
     "merge_pr",
+    "publish_independent_review_status",
 )
 
 
@@ -108,6 +109,13 @@ def _gh_write_argv(argv) -> bool:
     command = _gh_command(parts)
     if not command:
         return False                      # `gh --version`, `gh --help`
+    if (len(parts) == 5 and parts[1] == "api" and
+            re.fullmatch(r"repos/[^/]+/[^/]+/pulls/\d+", parts[2]) and
+            parts[3:] == ["--jq", ".head.sha"]):
+        return False                     # Exact PR-head REST read (#606).
+    if (len(parts) == 3 and parts[1] == "api" and
+            re.fullmatch(r"repos/[^/]+/[^/]+/commits/[0-9a-fA-F]{40}/status", parts[2])):
+        return False                     # Exact combined-status REST read.
     return command not in GH_READ_ONLY_COMMANDS
 
 

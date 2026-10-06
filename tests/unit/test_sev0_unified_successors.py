@@ -56,7 +56,7 @@ def test_independent_status_must_succeed_on_pr_head(monkeypatch):
 
     sha = "a" * 40
     monkeypatch.setattr(github, "check_gh_installed", lambda: True)
-    responses = [Mock(returncode=0, stdout=json.dumps({"headRefOid": sha})),
+    responses = [Mock(returncode=0, stdout=sha + "\n"),
                  Mock(returncode=0, stdout=json.dumps({"statuses": [
                      {"context": "crew/independent-review", "state": "success"}]}))]
     calls = []
@@ -71,6 +71,6 @@ def test_independent_status_must_succeed_on_pr_head(monkeypatch):
 
     for statuses in ([], [{"context": "crew/independent-review", "state": "pending"}],
                      [{"context": "other", "state": "success"}]):
-        responses[:] = [Mock(returncode=0, stdout=json.dumps({"headRefOid": sha})),
+        responses[:] = [Mock(returncode=0, stdout=sha + "\n"),
                         Mock(returncode=0, stdout=json.dumps({"statuses": statuses}))]
         assert github.independent_review_succeeded(51, "owner/repo") is False
