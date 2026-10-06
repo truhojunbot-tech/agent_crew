@@ -96,8 +96,12 @@ def require_no_running_work(payload) -> None:
         raise RuntimeError(f"queue not idle: {len(running)} in-progress task(s)")
 
 
-def api(port: int, path: str):
-    with urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=8) as response:
+def api(port: int, path: str, project: str):
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}{path}",
+        headers={"X-Agent-Crew-Project": project},
+    )
+    with urllib.request.urlopen(request, timeout=8) as response:
         return json.load(response)
 
 
@@ -179,9 +183,9 @@ def main(argv=None) -> int:
         enter_client_group(cea_env.get("AGENT_CREW_CEA_BROKER_SOCKET", ""),
                            list(sys.argv[1:] if argv is None else argv), cea_file)
     prepare_checkout(checkout, args.sha)
-    health = api(port, "/health")
+    health = api(port, "/health", args.project)
     paused(db_path, health)
-    require_no_running_work(api(port, "/tasks"))
+    require_no_running_work(api(port, "/tasks", args.project))
     try:
         pid = listener_pid(port)
     except RuntimeError:
@@ -251,7 +255,7 @@ def main(argv=None) -> int:
         for _ in range(40):
             time.sleep(1)
             try:
-                after = api(port, "/health")
+                after = api(port, "/health", args.project)
                 break
             except Exception:
                 continue
