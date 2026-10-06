@@ -4,10 +4,14 @@ import os
 import socket
 import subprocess
 import threading
+import urllib.error
+from io import BytesIO
 
 import pytest
+from fastapi.testclient import TestClient
 
-from scripts.runtime_swap import (parse_args, parse_env_file, check_checkout,
+from agent_crew.server import create_app
+from scripts.runtime_swap import (api, parse_args, parse_env_file, check_checkout,
                                   complete_environ, require_no_running_work)
 
 
@@ -62,6 +66,29 @@ def test_queue_check_allows_pending_but_refuses_running_and_malformed():
             require_no_running_work(payload)
 
 
+def test_api_reads_tasks_from_identity_required_server(tmp_path, monkeypatch):
+    import scripts.runtime_swap as swap
+    with TestClient(create_app(str(tmp_path / 'tasks.db'), project='demo',
+                               identity_required=True, watchdog_disabled=True,
+                               anomaly_disabled=True)) as client:
+        assert client.get('/tasks').status_code == 428
+        created = client.post('/tasks', headers={'X-Agent-Crew-Project': 'demo'},
+                              json={'task_id': 'swap-task', 'task_type': 'implement',
+                                    'description': 'work', 'project': 'demo'})
+        assert created.status_code == 201
+
+        def urlopen(request, timeout):
+            response = client.get(request.full_url, headers=dict(request.header_items()))
+            if response.status_code >= 400:
+                raise urllib.error.HTTPError(request.full_url, response.status_code,
+                                             response.text, response.headers, None)
+            return BytesIO(response.content)
+
+        monkeypatch.setattr(swap.urllib.request, 'urlopen', urlopen)
+        tasks = api(8765, '/tasks', 'demo')
+        assert any(task['task_id'] == 'swap-task' for task in tasks)
+
+
 def test_stop_interlock_requires_health_and_database(tmp_path):
     import sqlite3
     from scripts.runtime_swap import paused
@@ -102,7 +129,7 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     (directory / 'pause.json').write_text('{"paused": true}')
     (directory / 'cea.env').write_text('AGENT_CREW_CEA_MODE=shadow\n')
     monkeypatch.setattr(swap, 'prepare_checkout', lambda *args: None)
-    monkeypatch.setattr(swap, 'api', lambda port, path: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}} if path == '/health' else [])
+    monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}} if path == '/health' else [])
     monkeypatch.setattr(swap, 'listener_pid', lambda port: __import__('os').getpid())
     return swap, directory, db
 
@@ -153,13 +180,13 @@ def test_post_hidden_pid_refuses_wrong_or_unreachable_health(tmp_path, monkeypat
     assert swap.main(['demo', 'a' * 40, 'preflight']) == 0
     monkeypatch.setattr(swap, 'listener_pid',
                         lambda port: (_ for _ in ()).throw(RuntimeError('no listener')))
-    monkeypatch.setattr(swap, 'api', lambda port, path: {
+    monkeypatch.setattr(swap, 'api', lambda port, path, project: {
         'stop': {'paused': True}, 'build': {'commit': 'b' * 40}} if path == '/health' else [])
     with pytest.raises(RuntimeError, match='build SHA differs'):
         swap.main(['demo', 'a' * 40, 'post'])
 
     monkeypatch.setattr(swap, 'api',
-                        lambda port, path: (_ for _ in ()).throw(OSError('health down')))
+                        lambda port, path, project: (_ for _ in ()).throw(OSError('health down')))
     with pytest.raises(OSError, match='health down'):
         swap.main(['demo', 'a' * 40, 'post'])
 
@@ -207,7 +234,7 @@ def test_pending_only_preflight_and_post_requires_same_ids(tmp_path, monkeypatch
     swap, _, db = _swap_fixture(tmp_path, monkeypatch)
     with sqlite3.connect(db) as conn:
         conn.execute("INSERT INTO tasks VALUES ('pending-1', 'pending')")
-    monkeypatch.setattr(swap, 'api', lambda port, path: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}} if path == '/health' else [{'task_id': 'pending-1', 'status': 'pending'}])
+    monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}} if path == '/health' else [{'task_id': 'pending-1', 'status': 'pending'}])
     assert swap.main(['demo', 'a' * 40, 'preflight']) == 0
     evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
     (evidence / 'counts.pre.json').write_text(json.dumps([['completed', 1], ['pending', 1]]))
@@ -341,7 +368,7 @@ def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch):
     monkeypatch.setattr(swap, 'listener_pid', listener)
     monkeypatch.setattr(swap.time, 'sleep', lambda _: None)
     monkeypatch.setattr(swap.subprocess, 'run', lambda *args, **kwargs: None)
-    monkeypatch.setattr(swap, 'api', lambda port, path: {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}} if path == '/health' else [])
+    monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}} if path == '/health' else [])
     with pytest.raises(RuntimeError, match='build SHA differs'):
         swap.main(['demo', 'a' * 40, 'go'])
     assert len(killed) == 1
