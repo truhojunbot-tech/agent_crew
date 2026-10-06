@@ -6,8 +6,9 @@ checkpoint recovery, prompt construction, task routing, or retry decisions.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import hashlib
+import logging
 from time import perf_counter
 import threading
 from typing import Optional, Protocol
@@ -23,6 +24,8 @@ PIPELINE_STAGES = (
     "freshness_validation",
     "bounded_results",
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -76,7 +79,11 @@ class MemoryResult:
     items: tuple[MemoryItem, ...] = ()
     latency_ms: float = 0.0
     error_type: str = ""
+    error_message: str = ""
     dropped_cross_project: int = 0
+    start_delay_ms: Optional[float] = None
+    connect_ms: Optional[float] = None
+    query_ms: Optional[float] = None
 
 
 def same_memory_project(request_project: str, item_project: str) -> bool:
@@ -160,20 +167,25 @@ def shadow_retrieve(provider: MemoryProvider, request: MemoryRequest) -> MemoryR
             items=scoped,
             latency_ms=(perf_counter() - started) * 1000,
             error_type=result.error_type,
+            error_message=result.error_message,
             dropped_cross_project=(result.dropped_cross_project
                                    + len(result.items) - len(scoped)),
+            connect_ms=result.connect_ms,
+            query_ms=result.query_ms,
         )
     except TimeoutError as exc:
         return MemoryResult(
             provider=name, backend=backend, state="timeout",
             latency_ms=(perf_counter() - started) * 1000,
             error_type=type(exc).__name__,
+            error_message=str(exc),
         )
     except Exception as exc:  # shadow memory is explicitly non-critical
         return MemoryResult(
             provider=name, backend=backend, state="error",
             latency_ms=(perf_counter() - started) * 1000,
             error_type=type(exc).__name__,
+            error_message=str(exc),
         )
 
 
@@ -189,13 +201,42 @@ def shadow_retrieve_bounded(provider: MemoryProvider, request: MemoryRequest,
     name = getattr(provider, "name", provider.__class__.__name__)
     backend = getattr(provider, "backend", "")
     done = threading.Event()
+    timed_out = threading.Event()
+    log_lock = threading.Lock()
     observed = {}
 
+    def log_late_result() -> None:
+        with log_lock:
+            if observed.get("logged") or not done.is_set():
+                return
+            observed["logged"] = True
+            result = observed["result"]
+            total_ms = observed["total_ms"]
+        logger.warning(
+            "shadow memory retrieval finished after timeout task_id=%s project=%s "
+            "start_delay_ms=%.3f connect_ms=%s query_ms=%s total_ms=%.3f "
+            "exception_type=%s exception_message=%r",
+            request.task_id, request.project, result.start_delay_ms or 0.0,
+            f"{result.connect_ms:.3f}" if result.connect_ms is not None else "none",
+            f"{result.query_ms:.3f}" if result.query_ms is not None else "none",
+            total_ms, result.error_type or "none", result.error_message,
+        )
+
     def observe() -> None:
+        start_delay_ms = (perf_counter() - started) * 1000
         try:
-            observed["result"] = shadow_retrieve(provider, request)
+            observed["result"] = replace(shadow_retrieve(provider, request),
+                                         start_delay_ms=start_delay_ms)
+        except BaseException as exc:  # the orphan thread must never raise
+            observed["result"] = MemoryResult(
+                provider=name, backend=backend, state="error",
+                error_type=type(exc).__name__, error_message=str(exc),
+                start_delay_ms=start_delay_ms)
         finally:
+            observed["total_ms"] = (perf_counter() - started) * 1000
             done.set()
+            if timed_out.is_set():
+                log_late_result()
 
     threading.Thread(target=observe, name="agent-crew-shadow-memory", daemon=True).start()
     if done.wait(max(0.0, timeout_seconds)):
@@ -204,6 +245,9 @@ def shadow_retrieve_bounded(provider: MemoryProvider, request: MemoryRequest,
             latency_ms=(perf_counter() - started) * 1000,
             error_type="MissingShadowResult",
         ))
+    timed_out.set()
+    if done.is_set():
+        log_late_result()
     return MemoryResult(
         provider=name, backend=backend, state="timeout",
         latency_ms=(perf_counter() - started) * 1000,
@@ -227,6 +271,8 @@ def shadow_telemetry(result: MemoryResult, request: MemoryRequest | None = None)
         "freshness": [item.freshness for item in result.items],
         "superseded": [item.superseded for item in result.items],
     }
+    if result.state != "timeout" and result.start_delay_ms is not None:
+        telemetry["start_delay_ms"] = round(result.start_delay_ms, 3)
     if request is not None and request.retrieval_query:
         telemetry["query_hash"] = hashlib.sha256(
             request.retrieval_query.encode("utf-8")
