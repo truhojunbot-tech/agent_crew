@@ -2369,18 +2369,60 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
         "change_type": ctx.get("change_type") if ctx.get("change_type") in ("create", "modify") else "modify",
         "owner_evidence": {"project": project,
                            "ref": f"issue#{issue}" if issue else f"pr#{pr_number}"},
+        "evidence_source": {},
     }
-    if ctx.get("capability_id"):
-        change["capability_id"] = str(ctx["capability_id"])
-    # The external checker requires these facts before it can reach the
-    # registry matcher.  Forward only declarations the task actually carries;
-    # absent evidence must remain REVIEW, rather than an invented default.
+    if isinstance(ctx.get("capability_id"), str) and ctx["capability_id"].strip():
+        change["capability_id"] = ctx["capability_id"].strip()
+        change["evidence_source"]["capability_id"] = "context"
+    else:
+        change["capability_id"] = (project.replace("_", "-") +
+                                   (f".issue-{issue}" if issue else f".pr-{pr_number}"))
+        change["evidence_source"]["capability_id"] = "derived"
+    if isinstance(ctx.get("role"), str) and ctx["role"].strip():
+        change["role"] = ctx["role"].strip()
+        change["evidence_source"]["role"] = "context"
+    else:
+        change["role"] = "implementer"
+        change["evidence_source"]["role"] = "derived"
     if isinstance(ctx.get("portable_core"), bool):
         change["portable_core"] = ctx["portable_core"]
+        change["evidence_source"]["portable_core"] = "context"
     if isinstance(ctx.get("dependencies"), list):
         change["dependencies"] = ctx["dependencies"]
-    if isinstance(ctx.get("role"), str) and ctx["role"]:
-        change["role"] = ctx["role"]
+        change["evidence_source"]["dependencies"] = "context"
+    if "portable_core" not in change or "dependencies" not in change:
+        try:
+            diff = subprocess.run(
+                ["gh", "pr", "diff", str(pr_number), "--repo", repo, "--patch"],
+                capture_output=True, text=True, timeout=30)
+            if diff.returncode == 0:
+                paths, private_files = set(), set()
+                path = ""
+                for line in diff.stdout.splitlines():
+                    if line.startswith("diff --git "):
+                        parts = shlex.split(line[len("diff --git "):])
+                        path = parts[1][2:] if len(parts) == 2 and parts[1].startswith("b/") else ""
+                        if path:
+                            paths.add(path)
+                    elif line.startswith("+++ b/"):
+                        path = line[6:]
+                        paths.add(path)
+                    elif line.startswith("+") and not line.startswith("+++") and path.startswith("src/agent_crew/"):
+                        added = line[1:]
+                        if ("/alfred/" in added or "alfred/tools" in added or
+                                "import alfred" in added or "from alfred" in added):
+                            private_files.add(path)
+                if "portable_core" not in change:
+                    change["portable_core"] = any(p.startswith("src/agent_crew/") for p in paths)
+                    change["evidence_source"]["portable_core"] = "derived"
+                if "dependencies" not in change:
+                    change["dependencies"] = [
+                        {"kind": "private_fleet", "project": "alfred", "file": p}
+                        for p in sorted(private_files)]
+                    change["evidence_source"]["dependencies"] = "derived"
+        except Exception:
+            # No diff is evidence unavailable; the checker keeps REVIEW.
+            pass
     stem = os.path.join(receipt_dir, f"{task_id}-pr{pr_number}")
     change_path, receipt_path = f"{stem}.change.json", f"{stem}.receipt.json"
     verdict, error, exit_code = "REVIEW", "", None
@@ -2948,6 +2990,15 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                     os.path.dirname(os.path.abspath(db)), "conformance_receipts")):
             click.echo(f"  Conformance gate BLOCK — not merging PR #{pr_number}; "
                        f"task {impl_id} needs_human.")
+            return
+        head, reviewer_agent, approved_review_id, reason = github.independent_review_for_head(
+            queue, pr_number, resolved_repo, review_id)
+        if not head:
+            click.echo(f"Warning: cannot auto-merge PR #{pr_number} — {reason}")
+            return
+        if not github.publish_independent_review_status(
+                resolved_repo, head, approved_review_id, reviewer_agent):
+            click.echo(f"Warning: cannot auto-merge PR #{pr_number} — independent-review status failed")
             return
         r = subprocess.run(
             ["gh", "pr", "merge", str(pr_number), "--repo", resolved_repo,

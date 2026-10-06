@@ -423,6 +423,9 @@ from tests.conftest import _gh_argv_repo, _gh_write_argv  # noqa: E402
     (["gh", "issue", "create", "--title", "t"], True),
     (["gh", "issue", "edit", "1", "--add-label", "x"], True),
     (["gh", "api", "graphql", "-f", "query=mutation{...}"], True),
+    (["gh", "api", "repos/o/r/pulls/1", "--jq", ".head.sha"], False),
+    (["gh", "api", "repos/o/r/pulls/1", "--method", "POST"], True),
+    (["gh", "api", "repos/o/r/statuses/" + "a" * 40, "-f", "state=success"], True),
     (["gh", "some-future-verb", "thing"], True),
     # ⛔Global flags come BEFORE the command. Treating any leading flag as
     #   "not a command" let this exact form through both the block and the

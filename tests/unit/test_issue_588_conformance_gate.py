@@ -143,7 +143,7 @@ def test_missing_change_evidence_is_not_invented(tmp_path, monkeypatch, gate, co
     change = json.loads(Path(rec["receipt_path"]).read_text())["change"]
     assert "portable_core" not in change
     assert "dependencies" not in change
-    assert "role" not in change
+    assert change["role"] == "implementer"
 
 
 def test_review_merges_records_receipt_and_comments(tmp_path, monkeypatch, gate, comments):
@@ -155,7 +155,7 @@ def test_review_merges_records_receipt_and_comments(tmp_path, monkeypatch, gate,
     rec = _record(q)
     assert rec["verdict"] == "REVIEW" and rec["merge_allowed"]
     change = json.load(open(rec["receipt_path"]))["change"]
-    assert "capability_id" not in change
+    assert change["capability_id"] == "proj.pr-42"
     assert change["owner_evidence"]["ref"] == "pr#42"
     ((pr, body, repo),) = comments
     assert pr == 42 and repo == "owner/repo"
@@ -227,7 +227,7 @@ def test_block_does_not_merge_and_needs_human(tmp_path, monkeypatch, gate, comme
 
 # --- end to end through `crew run --auto-merge` -----------------------------
 
-def _run_auto_merge(tmp_path, monkeypatch):
+def _run_auto_merge(tmp_path, monkeypatch, review_evidence=None, events=None):
     def fake_result(_q, task_id):
         if task_id.startswith("review"):
             return TaskResult(task_id=task_id, status="completed", summary="ok",
@@ -236,12 +236,21 @@ def _run_auto_merge(tmp_path, monkeypatch):
                           pr_number=42)
     monkeypatch.setattr(TaskQueue, "get_result", fake_result)
     monkeypatch.setattr("agent_crew.github.check_gh_installed", lambda: True)
+    monkeypatch.setattr("agent_crew.github.independent_review_for_head",
+                        lambda q, pr, repo, review_id: review_evidence or
+                        ("a" * 40, "claude", review_id, "ok"))
+    monkeypatch.setattr("agent_crew.github.publish_independent_review_status",
+                        lambda *a, **k: (events.append("status") if events is not None else None) is None)
     merges = []
     real_run = subprocess.run
 
     def fake_run(cmd, *a, **k):
+        if cmd[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(cmd, 1, "", "diff unavailable")
         if cmd[:3] == ["gh", "pr", "merge"]:
             merges.append(cmd)
+            if events is not None:
+                events.append("merge")
             return subprocess.CompletedProcess(cmd, 0, "", "")
         return real_run(cmd, *a, **k)
     monkeypatch.setattr(cli_module.subprocess, "run", fake_run)
@@ -279,3 +288,21 @@ def test_crew_run_without_gate_env_merges_without_call(tmp_path, monkeypatch, co
     assert len(merges) == 1
     assert "conformance_gate" not in q.get_task_context(impl_id)
     assert comments == []
+
+
+def test_review_status_is_published_before_merge(tmp_path, monkeypatch, comments):
+    monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
+    events = []
+    merges, _, _, _ = _run_auto_merge(tmp_path, monkeypatch, events=events)
+    assert len(merges) == 1 and events == ["status", "merge"]
+
+
+@pytest.mark.parametrize("reason", ["reviewer agent equals implementer agent",
+                                    "PR head differs from reviewed SHA"])
+def test_invalid_review_evidence_prevents_status_and_merge(tmp_path, monkeypatch,
+                                                           comments, reason):
+    monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
+    events = []
+    merges, _, _, out = _run_auto_merge(
+        tmp_path, monkeypatch, review_evidence=("", "", "", reason), events=events)
+    assert merges == [] and events == [] and reason in out

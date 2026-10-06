@@ -257,14 +257,14 @@ def _fake_gh(recorder, stdout):
     return run
 
 
-def test_the_head_lookup_names_the_repo_from_the_review_context(monkeypatch, q):
+def test_the_head_lookup_names_the_repo_from_the_review_context(monkeypatch, q, caplog):
     """★No `head_sha_fn`: the real `gh` argv is inspected."""
     import agent_crew.github as gh
 
     calls = []
     monkeypatch.setattr(gh, "check_gh_installed", lambda: True)
     monkeypatch.setattr(gh.subprocess, "run",
-                        _fake_gh(calls, '{"commits":[{"oid":"%s"}]}' % NEW))
+                        _fake_gh(calls, NEW + "\n"))
 
     rid = f"review-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=rid, task_type="review", description="review",
@@ -276,16 +276,17 @@ def test_the_head_lookup_names_the_repo_from_the_review_context(monkeypatch, q):
                                     pr_number=PR))
 
     assert auto_enqueue_fix(q, rid, repo="truhojunbot-tech/agent_crew") is None, "a superseded review still created work"
+    assert not [t for t in q.list_tasks() if t.task_type == "implement"]
+    assert any(OLD[:9] in rec.message and NEW[:9] in rec.message
+               for rec in caplog.records), "the cascade must see the newer head, not an unknown SHA"
 
     assert calls, "no gh call was made — the default lookup path was skipped"
     # Several subprocesses run in this path (#250's state gate too); find the
     # PR-head lookup rather than assuming it is first.
-    gh_calls = [c["argv"] for c in calls
-                if c["argv"][:1] == ["gh"] and "commits" in c["argv"]]
-    assert gh_calls, f"no `gh pr view --json commits` call: {[c['argv'] for c in calls]}"
-    argv = gh_calls[0]
-    assert "--repo" in argv and "truhojunbot-tech/agent_crew" in argv, \
-        f"gh was not told which repository to ask: {argv}"
+    expected = ["gh", "api", f"repos/truhojunbot-tech/agent_crew/pulls/{PR}",
+                "--jq", ".head.sha"]
+    assert expected in [c["argv"] for c in calls], \
+        f"the PR-head lookup did not name the review's repo: {[c['argv'] for c in calls]}"
 
 
 def test_a_worktree_supplies_the_repo_when_the_context_does_not(monkeypatch, q):
