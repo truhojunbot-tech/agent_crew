@@ -2,6 +2,8 @@ from unittest.mock import MagicMock, patch
 import io
 import urllib.error
 
+import pytest
+
 from agent_crew.loop import (
     DEFAULT_MAX_ITER,
     build_feedback,
@@ -284,3 +286,58 @@ def test_http_duplicate_adopts_server_successor_by_id():
 
     assert task_id == "review-server"
     queue.enqueue.assert_not_called()
+
+
+@pytest.mark.parametrize("stage", ["review", "test"])
+@pytest.mark.parametrize("transport", ["in_process", "http"])
+@pytest.mark.parametrize("collision", [
+    "wrong_sha", "wrong_type", "unrelated_parent", "same_sha_other_parent",
+])
+def test_duplicate_successor_adoption_checks_stage_and_reviewed_head(
+        stage, transport, collision):
+    """A 409 may name another task; only the same lineage or head is safe."""
+    from agent_crew.protocol import TaskRequest
+    from agent_crew.queue import DuplicateReviewError
+
+    parent = "impl-current" if stage == "review" else "review-current"
+    old_parent = "other-parent" if collision in {
+        "unrelated_parent", "same_sha_other_parent"} else parent
+    old_stage = ("test" if stage == "review" else "review") if collision == "wrong_type" else stage
+    old_sha = "b" * 40 if collision == "wrong_sha" else "a" * 40
+    old_context = {"prev_task_id": old_parent}
+    if collision != "unrelated_parent":
+        old_context["reviewed_sha"] = old_sha
+    existing = TaskRequest(
+        task_id="server-successor", task_type=old_stage, description="work",
+        branch="main", status="completed", context=old_context,
+    )
+    queue = MagicMock()
+    queue.list_tasks.return_value = []  # Server wins after CLI's first lookup.
+    queue.get_task.return_value = existing
+    enqueue = enqueue_review if stage == "review" else enqueue_test
+    kwargs = {"prev_task_id": parent, "context": {"reviewed_sha": "a" * 40}}
+
+    if transport == "in_process":
+        conflict = DuplicateReviewError(existing.task_id)
+        queue.enqueue.side_effect = conflict
+        call = lambda: enqueue(queue, "work", "main", **kwargs)
+        error_type = DuplicateReviewError
+        conflict_patch = patch("agent_crew.loop._post_task_http")
+    else:
+        body = io.BytesIO(b'{"detail":{"error":"DUPLICATE_REVIEW",'
+                          b'"existing_task_id":"server-successor"}}')
+        conflict = urllib.error.HTTPError("http://localhost/tasks", 409, "Conflict", {}, body)
+        call = lambda: enqueue(queue, "work", "main", port=8105, **kwargs)
+        error_type = urllib.error.HTTPError
+        conflict_patch = patch("agent_crew.loop._post_task_http", side_effect=conflict)
+
+    # Avoid the five-second visibility poll when the named row is unsafe.
+    with conflict_patch, patch("agent_crew.loop._successor_after_conflict", return_value=None):
+        if collision == "same_sha_other_parent":
+            assert call() == existing.task_id
+        else:
+            with pytest.raises(error_type) as raised:
+                call()
+            assert raised.value is conflict
+    if transport == "http":
+        queue.enqueue.assert_not_called()
