@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -42,26 +43,75 @@ def _crew_log(proj_dir: str, msg: str) -> None:
         pass
 
 
-def _server_spawn_args(proj_dir: str, port: int, server_env: dict[str, str],
-                       allow_no_cea: bool) -> tuple[list[str], dict[str, str]]:
-    """Use the swap CEA source and broker client group for every CLI server start."""
+def _server_had_cea(state: dict | None) -> bool:
+    """Remember a CEA launch, including a still-running legacy server."""
+    if not state:
+        return False
+    if state.get("cea_env_expected"):
+        return True
+    pid = state.get("server_pid")
+    if not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        environ = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return False
+    return any(item.startswith(b"AGENT_CREW_CEA_") for item in environ.split(b"\0"))
+
+
+def _load_server_cea_env(proj_dir: str, allow_no_cea: bool,
+                         required: bool) -> dict[str, str]:
+    """Resolve and validate CEA before setup changes state or panes."""
     cea_file = resolve_cea_file(Path(proj_dir))
-    env = {key: value for key, value in server_env.items()
-           if not key.startswith("AGENT_CREW_CEA_")}
     if cea_file.is_file():
         try:
-            env.update(parse_env_file(cea_file))
+            return parse_env_file(cea_file)
         except (OSError, ValueError) as exc:
             raise click.ClickException(f"invalid CEA env file {cea_file}: {exc}") from exc
-    elif not allow_no_cea:
+    if required and not allow_no_cea:
         raise click.ClickException(
             f"CEA env file missing: {cea_file}. Use --allow-no-cea to start without CEA.")
+    return {}
+
+
+def _server_spawn_args(port: int, server_env: dict[str, str],
+                       cea_env: dict[str, str]) -> tuple[list[str], dict[str, str]]:
+    """Use the swap CEA source and broker client group for every CLI server start."""
+    env = {key: value for key, value in server_env.items()
+           if not key.startswith("AGENT_CREW_CEA_")}
+    env.update(cea_env)
     command = [sys.executable, "-m", "uvicorn", "agent_crew.server:app",
                "--host", "127.0.0.1", "--port", str(port), "--log-level", "info"]
     try:
         return client_command(env, command), env
     except (OSError, KeyError) as exc:
         raise click.ClickException("cannot enter CEA broker client group") from exc
+
+
+def _server_listener_pid(port: int) -> int:
+    """Find the uvicorn listener rather than an sg/sh launch wrapper."""
+    result = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True)
+    if result.returncode == 0:
+        for line in result.stdout.splitlines():
+            if f"127.0.0.1:{port} " in line:
+                found = re.search(r"pid=(\d+)", line)
+                if found:
+                    return int(found.group(1))
+    raise click.ClickException(f"cannot verify server listener PID on port {port}")
+
+
+def _server_pid(proc: subprocess.Popen, command: list[str], port: int) -> int:
+    return _server_listener_pid(port) if command and command[0] == "sg" else proc.pid
+
+
+def _stop_server_launch(proc: subprocess.Popen, command: list[str]) -> None:
+    if command and command[0] == "sg":
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    else:
+        proc.terminate()
 
 
 def _tmux_snapshot(session: str) -> str:
@@ -901,6 +951,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             setup_module.require_exclusive_port(existing_state["port"], project, base)
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
+    existing_pane_ids = []
     if existing_state is not None:
         existing_pane_ids = existing_state.get("pane_ids", [])
         alive_panes = [p for p in existing_pane_ids if _pane_alive(p)]
@@ -943,17 +994,21 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
         else:
             click.echo(f"Project {project!r} has stale state (server down). Re-initializing...")
 
-        # Kill old (dead) panes to prevent duplicates when creating new ones
-        for pane_id in existing_pane_ids:
-            subprocess.run(
-                ["tmux", "kill-pane", "-t", pane_id],
-                capture_output=True, text=True,
-            )
-
     _reuse_server = locals().get("_reuse_server", False)
 
-    # proj_dir needed early for logging in _resolve_tmux_window
+    # Validate CEA before creating worktrees, panes, or state. A project that
+    # previously ran with CEA may only omit the file by explicit operator flag.
     proj_dir = _proj_dir(base, project)
+    cea_env = _load_server_cea_env(
+        proj_dir, allow_no_cea, _server_had_cea(existing_state))
+    # Kill old (dead) panes only after the launch preflight succeeds.
+    for pane_id in existing_pane_ids:
+        subprocess.run(
+            ["tmux", "kill-pane", "-t", pane_id],
+            capture_output=True, text=True,
+        )
+
+    # proj_dir needed early for logging in _resolve_tmux_window
     os.makedirs(proj_dir, exist_ok=True)
 
     # Warn if other project panes exist in the SAME SESSION (skip on pane-recreation path)
@@ -1192,6 +1247,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
         "dispatcher_mode": _dispatcher_mode,
         "tokenomics_policy_path": policy_path,
         "context_pack_enabled": context_pack_enabled,
+        "cea_env_expected": bool(cea_env) or _server_had_cea(existing_state),
     }
     if existing_state and "codex_session_mode" in existing_state:
         state_to_write["codex_session_mode"] = existing_state["codex_session_mode"]
@@ -1232,8 +1288,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
-        server_command, server_env = _server_spawn_args(
-            proj_dir, port, server_env, allow_no_cea)
+        server_command, server_env = _server_spawn_args(port, server_env, cea_env)
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_file = open(os.path.join(proj_dir, "server.log"), "w")
         server_proc = subprocess.Popen(
@@ -1241,28 +1296,34 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             env=server_env,
             stdout=log_file,
             stderr=log_file,
+            start_new_session=server_command[0] == "sg",
         )
-        server_pid = server_proc.pid
-        _crew_log(proj_dir, f"server started pid={server_pid} port={port}")
-
-        # Persist server_pid immediately — before any later step that could
-        # still raise (port-listening wait, pretrust, pane/log-viewer
-        # startup) — so a partial-setup failure never leaves state.json
-        # pointing at the pid=0 placeholder while a real server process is
-        # still running and undiscoverable by cleanup tooling (#210 review).
-        _pid_state = _read_state(base, project) or {}
-        _pid_state["server_pid"] = server_pid
-        _write_state(base, project, _pid_state)
+        if server_command[0] != "sg":
+            # A direct launch can persist its real PID immediately (#210).
+            _pid_state = _read_state(base, project) or {}
+            _pid_state["server_pid"] = server_proc.pid
+            _write_state(base, project, _pid_state)
 
         # Wait until server is ready (up to 15 s) before returning
         if not _port_listening(port, timeout=15.0):
-            server_proc.terminate()
+            _stop_server_launch(server_proc, server_command)
             log_file.close()
             _crew_log(proj_dir, f"server failed to start on port {port}")
             raise click.ClickException(
                 f"server failed to start on port {port}. "
                 f"Check {os.path.join(proj_dir, 'server.log')}"
             )
+        try:
+            server_pid = _server_pid(server_proc, server_command, port)
+        except click.ClickException:
+            _stop_server_launch(server_proc, server_command)
+            log_file.close()
+            raise
+        if server_command[0] == "sg":
+            _pid_state = _read_state(base, project) or {}
+            _pid_state["server_pid"] = server_pid
+            _write_state(base, project, _pid_state)
+        _crew_log(proj_dir, f"server started pid={server_pid} port={port}")
     else:
         # Pane-recreation path: kill old server and restart on the same port so it
         # picks up the new pane_map.json. The DB is preserved — no tasks are lost.
@@ -1284,8 +1345,7 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
-        server_command, server_env = _server_spawn_args(
-            proj_dir, port, server_env, allow_no_cea)
+        server_command, server_env = _server_spawn_args(port, server_env, cea_env)
         old_pid = existing_state.get("server_pid") if existing_state else None
         if old_pid:
             try:
@@ -1301,23 +1361,31 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
             env=server_env,
             stdout=log_file,
             stderr=log_file,
+            start_new_session=server_command[0] == "sg",
         )
-        server_pid = server_proc.pid
-        _crew_log(proj_dir, f"server restarted pid={server_pid} port={port}")
-
-        # See the not-_reuse_server branch above: persist immediately so a
-        # later failure can't leave state.json pointing at a stale/zero pid.
-        _pid_state = _read_state(base, project) or {}
-        _pid_state["server_pid"] = server_pid
-        _write_state(base, project, _pid_state)
+        if server_command[0] != "sg":
+            _pid_state = _read_state(base, project) or {}
+            _pid_state["server_pid"] = server_proc.pid
+            _write_state(base, project, _pid_state)
 
         if not _port_listening(port, timeout=15.0):
-            server_proc.terminate()
+            _stop_server_launch(server_proc, server_command)
             log_file.close()
             raise click.ClickException(
                 f"server failed to restart on port {port}. "
                 f"Check {os.path.join(proj_dir, 'server.log')}"
             )
+        try:
+            server_pid = _server_pid(server_proc, server_command, port)
+        except click.ClickException:
+            _stop_server_launch(server_proc, server_command)
+            log_file.close()
+            raise
+        if server_command[0] == "sg":
+            _pid_state = _read_state(base, project) or {}
+            _pid_state["server_pid"] = server_pid
+            _write_state(base, project, _pid_state)
+        _crew_log(proj_dir, f"server restarted pid={server_pid} port={port}")
 
     # Pre-accept Claude's workspace-trust dialog for the claude worktree path
     # so --dangerously-skip-permissions doesn't get blocked on an interactive
@@ -1339,9 +1407,8 @@ def setup(project: str, agents: str, base: str, allow_no_cea: bool):
         click.echo("Dispatcher mode: panes show tail -f logs. Agents spawn per task.")
         _crew_log(proj_dir, "dispatcher mode: log viewers started")
 
-    # server_pid was already persisted immediately after each Popen above
-    # (both the fresh-start and pane-recreation-reuse branches) — no
-    # backfill needed here.
+    # Direct launch PIDs are persisted immediately; sg launch PIDs are the
+    # verified listeners, persisted once the port is ready.
 
     click.echo(f"Setup complete: {project} on port {port}")
     click.echo("Tip: use --agents <name> to spawn only specific agents (e.g. --agents claude)")
@@ -1909,6 +1976,10 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
     state = _read_state(base, project)
     if state is None:
         raise click.ClickException(f"project {project!r} not found. Run setup first.")
+    proj_dir = _proj_dir(base, project)
+    restart_server = not _port_listening(state["port"], timeout=1.0)
+    cea_env = (_load_server_cea_env(
+        proj_dir, allow_no_cea, _server_had_cea(state)) if restart_server else {})
     durable_state = _codex_context_cap_state(project, state)
     if durable_state != state:
         _write_state(base, project, durable_state)
@@ -1918,7 +1989,6 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
     port = state["port"]
     worktrees = state.get("worktrees", {})
     db_file = state["db"]
-    proj_dir = _proj_dir(base, project)
     port_file = os.path.join(proj_dir, "port")
     _dispatcher_mode = state.get("dispatcher_mode", False)
     recovered = []
@@ -1940,7 +2010,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
     setup_module.write_mcp_configs(worktrees, db_file)
 
     # Restart server if not listening
-    if not _port_listening(port, timeout=1.0):
+    if restart_server:
         pythonpath = os.pathsep.join(p for p in sys.path if p)
         pane_map_file = os.path.join(proj_dir, "pane_map.json")
         state_file = _state_path(base, project)
@@ -1960,8 +2030,7 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
             "AGENT_CREW_CODEX_CONTEXT_MAX_MB": codex_cap_value,
             **({"AGENT_CREW_DISPATCHER": "1"} if _dispatcher_mode else {}),
         }
-        server_command, server_env = _server_spawn_args(
-            proj_dir, port, server_env, allow_no_cea)
+        server_command, server_env = _server_spawn_args(port, server_env, cea_env)
         _crew_log(proj_dir, f"context pack effective={context_pack_value!r} source={context_pack_source}")
         log_path = os.path.join(proj_dir, "server.log")
         log_file = open(log_path, "a")
@@ -1970,13 +2039,20 @@ def recover(project: str, base: str, reset_stale: bool, stale_seconds: int,
             env=server_env,
             stdout=log_file,
             stderr=log_file,
+            start_new_session=server_command[0] == "sg",
         )
         if _port_listening(port, timeout=15.0):
-            state["server_pid"] = server_proc.pid
+            try:
+                state["server_pid"] = _server_pid(server_proc, server_command, port)
+            except click.ClickException:
+                _stop_server_launch(server_proc, server_command)
+                log_file.close()
+                raise
+            state["cea_env_expected"] = bool(cea_env) or _server_had_cea(state)
             _write_state(base, project, state)
             recovered.append("server")
         else:
-            server_proc.terminate()
+            _stop_server_launch(server_proc, server_command)
             log_file.close()
             raise click.ClickException(
                 f"Failed to restart server on port {port}. Check {log_path}"

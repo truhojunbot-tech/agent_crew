@@ -819,7 +819,7 @@ def test_u_c49_setup_prints_tip_after_completion(tmp_path):
          patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
          patch("agent_crew.cli._write_state"), \
          patch("os.getcwd", return_value=str(tmp_path)):
-        result = runner.invoke(crew, ["setup", "myproj", "--base", str(tmp_path), "--allow-no-cea"])
+        result = runner.invoke(crew, ["setup", "myproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
     output = result.output.lower()
@@ -868,7 +868,7 @@ def test_u_c50_single_agent_setup_fills_all_roles(tmp_path):
          patch("agent_crew.cli.setup_module.start_agents_in_panes"), \
          patch("agent_crew.cli._write_state"), \
          patch("os.getcwd", return_value=str(tmp_path)):
-        result = runner.invoke(crew, ["setup", "soloproj", "--agents", "codex", "--base", str(tmp_path), "--allow-no-cea"])
+        result = runner.invoke(crew, ["setup", "soloproj", "--agents", "codex", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
     pane_map = json.loads((tmp_path / "soloproj" / "pane_map.json").read_text())
@@ -1037,7 +1037,7 @@ def test_u_c56_dispatcher_setup_creates_panes_with_empty_server_pane_map(tmp_pat
          patch("agent_crew.cli.setup_module.start_log_viewers_in_panes"), \
          patch("agent_crew.cli._write_state"), \
          patch("os.getcwd", return_value=str(tmp_path)):
-        result = runner.invoke(crew, ["setup", "dispproj", "--base", str(tmp_path), "--allow-no-cea"])
+        result = runner.invoke(crew, ["setup", "dispproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
 
@@ -1174,7 +1174,7 @@ def test_u_c57_dispatcher_setup_split_window_fail_graceful(tmp_path):
          patch("agent_crew.cli.setup_module.start_log_viewers_in_panes", side_effect=_fake_log_viewers), \
          patch("agent_crew.cli._write_state"), \
          patch("os.getcwd", return_value=str(tmp_path)):
-        result = runner.invoke(crew, ["setup", "failproj", "--base", str(tmp_path), "--agents", "claude", "--allow-no-cea"])
+        result = runner.invoke(crew, ["setup", "failproj", "--base", str(tmp_path), "--agents", "claude"])
 
     assert result.exit_code == 0, result.output
 
@@ -1242,7 +1242,7 @@ def test_u_c58_recover_passes_dispatcher_env_to_server(tmp_path):
          patch("agent_crew.cli._write_state"), \
          patch("agent_crew.cli._pane_alive", return_value=True), \
          patch("os.path.isdir", return_value=True):
-        result = runner.invoke(crew, ["recover", "recproj", "--base", str(tmp_path), "--allow-no-cea"])
+        result = runner.invoke(crew, ["recover", "recproj", "--base", str(tmp_path)])
 
     assert result.exit_code == 0, result.output
     assert popen_envs, "Server must have been (re)started via Popen"
@@ -1383,7 +1383,7 @@ def test_u_c60_agent_to_role_fallback_for_unknown_agents(tmp_path):
          patch("os.getcwd", return_value=str(tmp_path)):
         result = runner.invoke(crew, [
             "setup", "unknownproj", "--base", str(tmp_path),
-            "--agents", "analyst,critic", "--allow-no-cea"
+            "--agents", "analyst,critic"
         ])
 
     assert result.exit_code == 0, result.output
