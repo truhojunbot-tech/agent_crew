@@ -26,7 +26,7 @@ The change file declares `PRE_MERGE`, the project, a short title and task descri
 | `capability_id` | First, an issue-body line beginning `capability:` or `capability_id:`. Next, the unique active, project-owned registry record best matched by changed file paths. The registry path follows CEA wiring: `AGENT_CREW_CEA_REGISTRY_PATH`, then `AGENT_CREW_CEA_CAPABILITY_REGISTRY`, then its default registry path. If the resolved file is unreadable or no record qualifies, use `<project with underscores changed to hyphens>.issue-<N>`, or `.pr-<N>` without an issue. |
 | `role` | `implementer` for the implement task. |
 | `portable_core` | `true` if the PR changes a path under `src/agent_crew/`; otherwise `false`. |
-| `dependencies` | One `{"kind":"private_fleet","project":"alfred","file":<path>}` per changed `src/agent_crew/` file whose added lines reference `/alfred/`, `alfred/tools`, `import alfred`, or `from alfred`; otherwise `[]`. |
+| `dependencies` | One `{"kind":"private_fleet","project":"alfred","file":<path>}` per changed `src/agent_crew/` file whose added code imports an `alfred` module or contains a quoted absolute `/home/<user>/alfred/` path; comment-only lines are ignored. Otherwise `[]`. |
 
 The gate reads `gh pr diff --patch` once. It appends up to 20 changed paths to the change text for registry matching and uses the same diff for `portable_core` and `dependencies`. If the diff read fails, those two fields stay absent unless task context supplied them; the checker then returns `REVIEW` rather than treating an unknown diff as evidence of no portable change or private dependency. A registry path tie also leaves the synthetic capability ID in place.
 

@@ -110,6 +110,40 @@ def test_diff_finds_private_fleet_dependency_once_per_portable_file(tmp_path, mo
         "dependencies": "derived"}
 
 
+@pytest.mark.parametrize("added_lines", [
+    pytest.param("self_source", id="detector-source"),
+    pytest.param('if ("/alfred/" in added or "alfred/tools" in added or\n'
+                 '    "import alfred" in added or "from alfred" in added):',
+                 id="original-612-lines"),
+    pytest.param('# This change mentions /home/u/alfred/tools/a.py', id="comment"),
+])
+def test_detector_source_and_comments_are_not_dependencies(tmp_path, monkeypatch,
+                                                            real_gate, added_lines):
+    if added_lines == "self_source":
+        added_lines = (Path(__file__).parents[2] / "src/agent_crew/conformance_gate.py").read_text()
+    diff = ("diff --git a/src/agent_crew/conformance_gate.py "
+            "b/src/agent_crew/conformance_gate.py\n"
+            "+++ b/src/agent_crew/conformance_gate.py\n"
+            + "".join("+" + line + "\n" for line in added_lines.splitlines()))
+    _, _, change, receipt = _gate(tmp_path, monkeypatch, diff=diff)
+    assert change["dependencies"] == []
+    assert receipt["reason"] != "PORTABLE_CORE_DEPENDENCY"
+
+
+@pytest.mark.parametrize("added_line", [
+    "from alfred.tools import x",
+    'P = "/home/u/alfred/tools/a.py"',
+])
+def test_real_private_dependency_blocks(tmp_path, monkeypatch, real_gate, added_line):
+    diff = ("diff --git a/src/agent_crew/x.py b/src/agent_crew/x.py\n"
+            "+++ b/src/agent_crew/x.py\n+" + added_line + "\n")
+    _, allowed, change, receipt = _gate(tmp_path, monkeypatch, diff=diff)
+    assert change["dependencies"] == [
+        {"kind": "private_fleet", "project": "alfred", "file": "src/agent_crew/x.py"}]
+    assert not allowed and receipt["verdict"] == "BLOCK"
+    assert receipt["reason"] == "PORTABLE_CORE_DEPENDENCY"
+
+
 def _single_path_registry(tmp_path, monkeypatch, lifecycle="active"):
     registry = tmp_path / "registry.json"
     data = json.loads(registry.read_text())

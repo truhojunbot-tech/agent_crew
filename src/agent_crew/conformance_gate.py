@@ -10,6 +10,12 @@ import click
 from agent_crew.cea.wiring import capability_registry_path
 
 
+_PRIVATE_FLEET_IMPORT = re.compile(r"^\s*(?:from|import)\s+alfred(?:\.|\s|$)")
+# Split the project name so an added line containing this detector is not evidence.
+_PRIVATE_HOME_LITERAL = re.compile(
+    r"""(['"])[^'"\n]*?/home/[^/'"\s]+/""" + "alf" + r"""red/[^'"\n]*?\1""")
+
+
 def _registry_capability_for_paths(project: str, paths: set[str], registry_path: str) -> str:
     """Find the one active, project-owned capability best supported by changed paths."""
     if not paths or not registry_path:
@@ -183,8 +189,9 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                     paths.add(path)
                 elif line.startswith("+") and not line.startswith("+++") and path.startswith("src/agent_crew/"):
                     added = line[1:]
-                    if ("/alfred/" in added or "alfred/tools" in added or
-                            "import alfred" in added or "from alfred" in added):
+                    if not added.lstrip().startswith("#") and (
+                            _PRIVATE_FLEET_IMPORT.search(added) or
+                            _PRIVATE_HOME_LITERAL.search(added)):
                         private_files.add(path)
             if paths:
                 change["text"] += "\n" + "\n".join(sorted(paths)[:20])
