@@ -77,16 +77,18 @@ def successor_context(parent_context: object) -> dict:
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
 CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
 ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS = 60
+ROUNDS_CAP_CONTRACT_WAIT_SECONDS = 90
 ROUNDS_CAP_CASCADE_MAX_ATTEMPTS = 3
 
 
 def _rounds_cap_wait_seconds() -> float:
     """Bound the switch-on wait without changing switch-off's 60s window."""
     try:
-        value = float(os.getenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS", "120"))
-        return max(0.0, value) if math.isfinite(value) else 120.0
+        value = float(os.getenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS",
+                                str(ROUNDS_CAP_CONTRACT_WAIT_SECONDS)))
+        return max(0.0, value) if math.isfinite(value) else ROUNDS_CAP_CONTRACT_WAIT_SECONDS
     except ValueError:
-        return 120.0
+        return ROUNDS_CAP_CONTRACT_WAIT_SECONDS
 
 
 #: Bounds on how much review text is copied into the fix task description.
@@ -955,10 +957,8 @@ def _record_risk_tier_shadow(queue: TaskQueue, task, actual_action: str) -> None
 def _lineage_root_task_id(tasks_by_id: dict, task) -> str:
     """Walk ``prev_task_id`` back to the task this lineage started from.
 
-    quota-core publishes one decision per ORIGINATING task, so every round of
-    a review↔fix lineage has to cite the same root decision — cite the review
-    instead and round 2's recommendation is simply absent, which reads as "the
-    contract said nothing" rather than "we looked in the wrong place".
+    The canary pin and receipt use the originating task id. Contract citations
+    may come from any task in this lineage after its latest result.
 
     ``seen`` is not defensive dressing: contexts are operator-writable JSON, so
     a cycle is reachable without a code bug, and this runs inside the cascade.
@@ -1140,8 +1140,6 @@ def _canary_round_cap(tasks_by_id: dict, review_task,
         reason = "contract_missing_or_stale"
     elif (latest := _latest_lineage_implement(tasks_by_id, review_task)) is None:
         reason = "contract_predates_latest_fix"
-    elif citation["cited_task_id"] != latest.task_id:
-        reason = "contract_predates_latest_fix"
     elif not (latest_state := queue.get_exec_state(latest.task_id)):
         reason = "contract_predates_latest_fix"
     elif not isinstance(latest_state.get("result_posted_at"), (int, float)):
@@ -1224,10 +1222,12 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
                   else ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS)
         expired = now > verdict_at + window
         citation = None
+        citation_task = None
+        review = None
+        tasks_by_id = {}
         cap = counterfactual["baseline_cap"]
         allowed_task_ids = set()
         if not expired:
-            tasks_by_id = {}
             current = queue.get_task(review_id)
             while current and current.task_id not in tasks_by_id:
                 tasks_by_id[current.task_id] = current
@@ -1249,9 +1249,24 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
                         citation_task = fix
                 citation = _shadow_rounds_citation(tasks_by_id, citation_task, queue)
         produced = _contract_time((citation or {}).get("produced_at"))
+        latest = (_latest_lineage_implement(tasks_by_id, review)
+                  if review is not None else None)
+        latest_state = queue.get_exec_state(latest.task_id) if latest else None
+        result_is_current = bool(
+            produced and review is not None
+            and isinstance(latest_state, dict)
+            and isinstance(latest_state.get("result_posted_at"), (int, float))
+            and all(
+                not isinstance((state := queue.get_exec_state(task.task_id)), dict)
+                or not isinstance(state.get("result_posted_at"), (int, float))
+                or produced.timestamp() > state["result_posted_at"]
+                for task in _lineage_tasks(tasks_by_id, review)
+            )) if not expired else False
         fresh = (not expired and produced is not None
                  and verdict_at < produced.timestamp() <= min(
                      now, verdict_at + window)
+                 and now - produced.timestamp() <= CANARY_CONTRACT_MAX_AGE_SECONDS
+                 and result_is_current
                  and (citation or {}).get("decision_source") == "quota_core_contract"
                  and (citation or {}).get("cited_task_id") in allowed_task_ids)
         if not fresh and not expired:
@@ -1262,6 +1277,11 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
                 cap = recommended
         counterfactual.update({
             "pending_reresolve": False,
+            **({"wait_timed_out": True, "timeout_reason": "contract_wait_timeout",
+                "fallback_reason": ("contract_predates_latest_result"
+                                    if counterfactual.get("stale_reason") == "contract_predates_latest_fix"
+                                    else counterfactual.get("stale_reason"))}
+               if expired else {}),
             **({"cascade_pending": True} if switch_on else {}),
             "counterfactual_cap": cap if fresh else counterfactual["baseline_cap"],
             "would_fire": bool(fresh and cap < counterfactual["baseline_cap"]
@@ -1526,7 +1546,8 @@ def auto_enqueue_fix(
         fix_round = int(review_ctx.get("fix_round") or 0) + 1
         if (switch_enabled and canary_pinned and not prior_switch_on
                 and fix_round <= baseline_cap
-                and canary_reason in ("contract_predates_latest_result",
+                and canary_reason in ("contract_missing_or_stale",
+                                      "contract_predates_latest_result",
                                       "contract_predates_latest_fix")):
             verdict_state = queue.get_exec_state(review_task_id)
             verdict_at = (verdict_state or {}).get("result_posted_at")

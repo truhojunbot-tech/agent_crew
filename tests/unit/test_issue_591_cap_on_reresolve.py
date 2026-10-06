@@ -41,11 +41,11 @@ def pending(tmp_path, monkeypatch):
     return queue, policy, verdict_at
 
 
-def _contract(path, produced_at):
+def _contract(path, produced_at, *, task_id="impl-591"):
     path.write_text(json.dumps({
         "contract_version": "1.0", "mode": "shadow",
         "produced_at": datetime.fromtimestamp(produced_at, timezone.utc).isoformat(),
-        "decisions": [{"task_id": "impl-591",
+        "decisions": [{"task_id": task_id,
                        "recommended_max_review_fix_rounds": 1}],
     }))
 
@@ -75,6 +75,39 @@ def test_fresh_contract_cuts_without_enqueuing_fix(pending, monkeypatch):
     assert receipt["canary_applied"] == 1
     assert receipt["canary_reason"] == "round_cap_reached"
     assert reresolve_pending_rounds_caps(restarted, now=verdict_at + 62) == 0
+
+
+def test_next_review_cited_emission_cuts_with_default_wait(pending, monkeypatch):
+    queue, policy, verdict_at = pending
+    monkeypatch.delenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS")
+    assert pipeline._rounds_cap_wait_seconds() == 90
+    _contract(policy, verdict_at + 60, task_id="review-591")
+    _clock(monkeypatch, verdict_at + 61)
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+
+    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 61) == 1
+    assert queue.get_task(pipeline.fix_task_id("review-591", 2)) is None
+    receipt = queue.get_tokenomics_shadow_receipt("impl-591")
+    assert receipt["canary_applied"] == 1
+    assert json.loads(receipt["canary_recommendation_json"])["cited_task_id"] == "review-591"
+
+
+def test_default_wait_times_out_with_baseline_and_reason(pending, monkeypatch):
+    queue, _, verdict_at = pending
+    monkeypatch.delenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS")
+    _clock(monkeypatch, verdict_at + 91)
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+
+    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 91) == 1
+    assert queue.get_task(pipeline.fix_task_id("review-591", 2)) is not None
+    receipt = queue.get_tokenomics_shadow_receipt("impl-591")
+    assert receipt["canary_applied"] == 0
+    assert receipt["canary_reason"] == "contract_wait_timeout"
+    counterfactual = json.loads(receipt["canary_counterfactual"])
+    assert counterfactual["counterfactual_cap"] == counterfactual["baseline_cap"]
+    assert counterfactual["stale_reason"] == "contract_predates_latest_fix"
+    assert counterfactual["fallback_reason"] == "contract_predates_latest_result"
+    assert counterfactual["wait_timed_out"] is True
 
 
 def test_timeout_enqueues_at_baseline_with_explicit_reason(pending, monkeypatch):

@@ -7,8 +7,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from agent_crew import pipeline
 from agent_crew.pipeline import (_canary_round_cap, auto_enqueue_fix,
-                                 auto_enqueue_test, resume_tier3_gate)
+                                 auto_enqueue_test, reresolve_pending_rounds_caps,
+                                 resume_tier3_gate)
 from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
@@ -121,6 +123,34 @@ def test_contract_after_review_verdict_narrows(q, tmp_path, monkeypatch):
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_applied"] == 1
 
 
+def test_review_cited_contract_cuts_second_fix_in_602_lineage(
+        tmp_path, monkeypatch):
+    q = TaskQueue(str(tmp_path / "impl-602.db"))
+    q.enqueue(TaskRequest(task_id="impl-602", task_type="implement",
+                          description="root", branch="canary-branch"))
+    q.submit_result("impl-602", TaskResult("impl-602", "completed", "root completed"))
+    monkeypatch.setenv(CANARY_ENV, "impl-602")
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "2")
+    review_r0 = _review(q, "review-impl-602-r0", root="impl-602", fix_round=0)
+    _contract_after_verdict(q, review_r0, tmp_path, monkeypatch,
+                            task_id=review_r0)
+    assert _run(q, review_r0) is not None, q.get_tokenomics_shadow_receipt("impl-602")
+
+    fix_r1 = "fix-review-impl-602-r0-r1"
+    assert q.get_task(fix_r1) is not None
+    q.submit_result(fix_r1, TaskResult(fix_r1, "completed", "fix completed"))
+    review_r1 = _review(q, "review-fix-impl-602-r1", root=fix_r1)
+    _contract_after_verdict(q, review_r1, tmp_path, monkeypatch,
+                            task_id=review_r1)
+
+    assert _run(q, review_r1) is None
+    assert q.get_task("fix-review-fix-impl-602-r1-r2") is None
+    receipt = q.get_tokenomics_shadow_receipt("impl-602")
+    assert receipt["canary_applied"] == 1
+    assert receipt["canary_reason"] == "round_cap_reached"
+
+
 def test_switch_off_records_fresh_counterfactual_without_holding(
         q, tmp_path, monkeypatch):
     monkeypatch.setenv(CANARY_ENV, ROOT)
@@ -143,12 +173,18 @@ def _run(q, review_id, comments=None):
                             repo="owner/repo")
 
 
+def _expire_pending(q, review_id, monkeypatch):
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **kw: False)
+    verdict_at = q.get_exec_state(review_id)["result_posted_at"]
+    assert reresolve_pending_rounds_caps(q, now=verdict_at + 91) == 1
+
+
 @pytest.mark.parametrize("decision_for_latest,produced_after_result,expected_reason", [
     (False, False, "contract_predates_latest_fix"),
     (True, False, "contract_predates_latest_fix"),
     (True, True, "cap_not_reached"),
 ])
-def test_latest_fix_requires_its_own_post_result_decision(
+def test_lineage_contract_requires_post_result_timestamp(
         q, tmp_path, monkeypatch, decision_for_latest,
         produced_after_result, expected_reason):
     monkeypatch.setenv(CANARY_ENV, ROOT)
@@ -363,8 +399,15 @@ def test_contract_mtime_only_when_produced_at_absent(q, tmp_path, monkeypatch,
     _contract(tmp_path, monkeypatch, recommended=1, age=age,
               produced=produced, mtime_age=mtime_age)
     review = _review(q, fix_round=0)
-    assert _run(q, review) is not None
-    assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == expected_reason
+    fix = _run(q, review)
+    row = q.get_tokenomics_shadow_receipt(ROOT)
+    if expected_reason == "contract_missing_or_stale":
+        assert fix is None
+        assert row["canary_reason"] == "switch_on:pending_reresolve"
+        assert json.loads(row["canary_counterfactual"])["stale_reason"] == expected_reason
+    else:
+        assert fix is not None
+        assert row["canary_reason"] == expected_reason
 
 
 @pytest.mark.parametrize("recommended,age,expected_reason", [
@@ -378,10 +421,16 @@ def test_no_narrowing_uses_baseline(q, tmp_path, monkeypatch,
     monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
     _contract(tmp_path, monkeypatch, recommended, age=age)
     review = _review(q)
-    assert _run(q, review) is not None
+    fix = _run(q, review)
     row = q.get_tokenomics_shadow_receipt(ROOT)
     assert row["canary_applied"] == 0
-    assert row["canary_reason"] == expected_reason
+    if expected_reason == "contract_missing_or_stale":
+        assert fix is None
+        assert row["canary_reason"] == "switch_on:pending_reresolve"
+        assert json.loads(row["canary_counterfactual"])["stale_reason"] == expected_reason
+    else:
+        assert fix is not None
+        assert row["canary_reason"] == expected_reason
 
 
 def test_other_lineage_uses_baseline(q, tmp_path, monkeypatch):
@@ -415,7 +464,7 @@ def test_cap_not_reached_keeps_review_then_test(q, tmp_path, monkeypatch):
     _contract(tmp_path, monkeypatch)
     review = _review(q, fix_round=0)
     fix = _run(q, review)
-    assert fix is not None
+    assert q.get_task(fix) is not None
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
     approved = _review(q, task_id="review-canary-approved", fix_round=1,
                        verdict="approve")
@@ -440,10 +489,11 @@ def test_contract_produced_after_review_decision_cannot_narrow_retroactively(
         "decisions": [{"task_id": ROOT, "recommended_max_review_fix_rounds": 1}],
     }))
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(path))
-    assert _run(q, review) is not None
+    assert _run(q, review) is None
     row = q.get_tokenomics_shadow_receipt(ROOT)
     assert row["canary_applied"] == 0
-    assert row["canary_reason"] == "contract_missing_or_stale"
+    assert row["canary_reason"] == "switch_on:pending_reresolve"
+    assert json.loads(row["canary_counterfactual"])["stale_reason"] == "contract_missing_or_stale"
 
 
 def test_pre_verdict_lineage_receipt_cannot_narrow_with_future_contract(
@@ -531,10 +581,10 @@ def test_recently_read_stale_contract_receipt_uses_baseline(q, tmp_path, monkeyp
                 "recommendation": {"recommended_max_review_fix_rounds": 1}}),
              decision_at - 1, ROOT))
     monkeypatch.delenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", raising=False)
-    assert _run(q, review) is not None
+    assert _run(q, review) is None
     row = q.get_tokenomics_shadow_receipt(ROOT)
     assert row["canary_applied"] == 0
-    assert row["canary_reason"] == "contract_missing_or_stale"
+    assert row["canary_reason"] == "switch_on:pending_reresolve"
     assert json.loads(row["canary_recommendation_json"])[
         "recommended_max_review_fix_rounds"] == 1
 
@@ -558,11 +608,16 @@ def test_untimed_legacy_contract_has_no_citation_or_recommended_value(
                WHERE task_id=?""",
             (json.dumps({"recommended_max_review_fix_rounds": 1}),
              q.get_exec_state(review)["events"][-1]["at"] - 1, ROOT))
-    fix = _run(q, review)
-    assert fix is not None
+    assert _run(q, review) is None
+    _expire_pending(q, review, monkeypatch)
+    fix = "fix-review-canary-rounds-r2"
+    assert q.get_task(fix) is not None
     citation = {t.task_id: t for t in q.list_tasks()}[fix].context["tokenomics_shadow"]
     assert citation["decision_source"] == "baseline"
     assert citation["recommended_max_review_fix_rounds"] is None
     row = q.get_tokenomics_shadow_receipt(ROOT)
     assert row["canary_applied"] == 0
-    assert row["canary_reason"] == "contract_missing_or_stale"
+    assert row["canary_reason"] == "contract_wait_timeout"
+    counterfactual = json.loads(row["canary_counterfactual"])
+    assert counterfactual["stale_reason"] == "contract_missing_or_stale"
+    assert counterfactual["wait_timed_out"] is True
