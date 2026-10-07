@@ -64,8 +64,7 @@ def _agent_of(cmd0: str) -> str:
     return "claude"
 
 
-def _run_dispatcher(tmp_db, tmp_path, payloads, settle_s: float = 1.6,
-                    preenqueue: bool = False):
+def _run_dispatcher(tmp_db, tmp_path, payloads, preenqueue: bool = False):
     """태스크를 넣고 디스패처를 돌린 뒤, worker 별 (시작, 끝) 구간을 돌려준다."""
     spans: list[tuple[str, float, float]] = []
 
@@ -112,7 +111,12 @@ def _run_dispatcher(tmp_db, tmp_path, payloads, settle_s: float = 1.6,
                     if not preenqueue:
                         for p in payloads:
                             assert client.post("/tasks", json=p).status_code == 201
-                    time.sleep(settle_s)
+                    # The first tick can be delayed by admission/SQLite work.
+                    # Wait for the subprocesses to finish rather than guessing
+                    # how many wall-clock seconds a tick will take under load.
+                    deadline = time.monotonic() + 5
+                    while len(spans) < len(payloads) and time.monotonic() < deadline:
+                        time.sleep(0.01)
     return spans
 
 
@@ -166,7 +170,7 @@ def test_same_worker_runs_its_two_tasks_serially(tmp_db, tmp_path):
     spans = _run_dispatcher(tmp_db, tmp_path, [
         _payload("impl_a"),
         _payload("impl_b"),
-    ], settle_s=2.2)
+    ])
     codex = [s for s in spans if s[0] == "codex"]
     assert len(codex) == 2, f"codex 태스크 2건이 다 안 돌았다: {spans}"
     assert _overlap_s(codex[0], codex[1]) <= 0, (
@@ -183,7 +187,7 @@ def test_two_roles_resolving_to_one_worktree_do_not_overlap(tmp_db, tmp_path):
     spans = _run_dispatcher(tmp_db, tmp_path, [
         _payload("rev_c", task_type="review"),
         _payload("impl_c", override="claude"),
-    ], settle_s=2.2)
+    ])
     claude = [s for s in spans if s[0] == "claude"]
     assert len(claude) == 2, f"claude 태스크 2건이 다 안 돌았다: {spans}"
     assert _overlap_s(claude[0], claude[1]) <= 0, (
@@ -246,7 +250,6 @@ def test_one_worker_assigned_two_roles_claims_review_tasks(tmp_db, tmp_path, mon
     monkeypatch.setattr(sys.modules[__name__], "_state", shared_roles)
     spans = _run_dispatcher(
         tmp_db, tmp_path, [_payload("review_only", task_type="review")],
-        settle_s=0.8,
     )
     assert len(spans) == 1 and spans[0][0] == "claude"
 

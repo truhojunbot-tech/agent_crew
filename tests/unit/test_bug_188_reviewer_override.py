@@ -9,7 +9,7 @@ both the agent command and the worktree to the override agent's worktree.
 """
 import json
 import os
-import time
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -49,6 +49,7 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path, *, 
     state_file.write_text(json.dumps(state))
 
     spawn_log: list[tuple[str, str]] = []  # (agent, cwd)
+    spawned = threading.Event()
 
     async def fake_subprocess(*args, **kwargs):
         cmd0 = str(args[0]) if args else ""
@@ -61,6 +62,7 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path, *, 
             spawn_log.append(("codex", cwd))
         else:
             spawn_log.append(("claude", cwd))
+        spawned.set()
         proc = MagicMock()
         proc.returncode = 0
         proc.kill = MagicMock()
@@ -85,7 +87,7 @@ def test_u_b188_reviewer_override_routes_to_override_agent(tmp_db, tmp_path, *, 
                 with TestClient(app) as client:
                     resp = client.post("/tasks", json=_review_payload("review-1", "gemini"))
                     assert resp.status_code == 201
-                    time.sleep(0.4)
+                    assert spawned.wait(5), "review task was never dispatched"
 
     assert spawn_log, "review task was never dispatched"
     spawned_agent, spawned_cwd = spawn_log[0]
@@ -117,6 +119,7 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_p
     state_file.write_text(json.dumps(state))
 
     spawn_log: list[tuple[str, str]] = []
+    spawned = threading.Event()
 
     async def fake_subprocess(*args, **kwargs):
         cmd0 = str(args[0]) if args else ""
@@ -129,6 +132,7 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_p
             spawn_log.append(("codex", cwd))
         else:
             spawn_log.append(("claude", cwd))
+        spawned.set()
         proc = MagicMock()
         proc.returncode = 0
         proc.kill = MagicMock()
@@ -155,7 +159,7 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_p
                     payload["context"] = {}  # no agent_override
                     resp = client.post("/tasks", json=payload)
                     assert resp.status_code == 201
-                    time.sleep(0.4)
+                    assert spawned.wait(5), "review task was never dispatched"
 
     assert spawn_log, "review task was never dispatched"
     spawned_agent, spawned_cwd = spawn_log[0]
