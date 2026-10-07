@@ -12,7 +12,7 @@ The CLI appends `capability-conformance-check --input <change path> --receipt <r
 
 ## Change evidence and receipts
 
-For task `<task>` and PR `<N>`, the CLI writes these files next to the crew database:
+For implement task `<task>` and PR `<N>`, the CLI and server write these files next to the crew database:
 
 ```text
 <crew dir>/conformance_receipts/<task>-pr<N>.change.json
@@ -23,7 +23,7 @@ The change file declares `PRE_MERGE`, the project, a short title and task descri
 
 | Field | Value derived when task context does not supply it |
 | --- | --- |
-| `capability_id` | First, an issue-body line beginning `capability:` or `capability_id:`. Next, the unique active, project-owned registry record best matched by changed file paths. The registry path follows CEA wiring: `AGENT_CREW_CEA_REGISTRY_PATH`, then `AGENT_CREW_CEA_CAPABILITY_REGISTRY`, then its default registry path. If the resolved file is unreadable or no record qualifies, use `<project with underscores changed to hyphens>.issue-<N>`, or `.pr-<N>` without an issue. |
+| `capability_id` | First, an issue-body line beginning `capability:` or `capability_id:`. Next, the unique project-owned registry record best matched by changed file paths. Records whose `lifecycle_state` is `withdrawn`, `deprecated`, or `superseded` are skipped. The registry path follows CEA wiring: `AGENT_CREW_CEA_REGISTRY_PATH`, then `AGENT_CREW_CEA_CAPABILITY_REGISTRY`, then its default registry path. If the resolved file is unreadable or no record qualifies, use `<project with underscores changed to hyphens>.issue-<N>`, or `.pr-<N>` without an issue. |
 | `role` | `implementer` for the implement task. |
 | `portable_core` | `true` if the PR changes a path under `src/agent_crew/`; otherwise `false`. |
 | `dependencies` | One `{"kind":"private_fleet","project":"alfred","file":<path>}` per changed `src/agent_crew/` file whose added code imports an `alfred` module or contains a quoted absolute `/home/<user>/alfred/` path; comment-only lines are ignored. Otherwise `[]`. |
@@ -42,6 +42,12 @@ The implement task context records `conformance_gate` with the verdict, receipt 
 | Timeout, setup or command error, other nonzero exit, missing or unrecognized verdict, or `EVIDENCE_UNAVAILABLE` | CLI: treat as `REVIEW` and continue after the receipt comment. Server: refuse merge, mark `needs_human`, and record a failed merge operation. |
 
 Exit 10 is an explicit checker `BLOCK`. A reported `BLOCK` in a receipt with exit 0 is treated as `REVIEW` by the CLI. Server gate failures, including an unreadable receipt, also prevent merge. If recording the task context or posting a `REVIEW` comment fails, the CLI warns; that failure does not block the merge. The independent review check below can still prevent it.
+
+## Leave server merges to the coordinator
+
+Set `AGENT_CREW_AUTO_MERGE` to `0`, `false`, `no`, or `off` (case-insensitive; surrounding whitespace is ignored) in the **server** environment to opt out of the server's final merge call. Unset or any other value retains normal server auto-merge behavior. This setting does not change the CLI's `crew run --auto-merge` flag.
+
+The server still reserves the merge operation under STOP admission, checks the PR state, runs the fail-closed conformance gate, and validates and publishes the `crew/independent-review` status for the current head. If those checks succeed, it records the merge operation as `skipped` and logs `PR #N merge left to coordinator`; it does not call `merge_pr`. STOP denial and an already completed merge operation still return before these checks. A gate or review-status refusal still prevents the coordinator handoff and follows the normal failure path.
 
 ## Independent review status before merge
 

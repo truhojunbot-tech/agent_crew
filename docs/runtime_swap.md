@@ -23,4 +23,4 @@ On a successful `post`, the script retains `env.pre.sha256` and deletes the secr
 
 ## Related docs
 
-- [ADR-004 conformance gate before auto-merge](conformance_gate.md)
+- [ADR-004 conformance gate, receipts, and coordinator-owned merges](conformance_gate.md)
