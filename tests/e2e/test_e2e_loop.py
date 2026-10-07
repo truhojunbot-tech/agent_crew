@@ -35,8 +35,11 @@ def _find_free_port() -> int:
 
 
 @pytest.fixture
-def live_server(tmp_path):
+def live_server(tmp_path, monkeypatch):
     """Start a real uvicorn server; yield (port, db_path); stop after test."""
+    # Stub agents own HTTP claims in this fixture. An inherited live dispatcher
+    # would claim the same tasks with no worktree and fail them first.
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     db_path = str(tmp_path / "tasks.db")
     port = _find_free_port()
     app = create_app(db_path)
@@ -63,7 +66,8 @@ def live_server(tmp_path):
     thread.join(timeout=5.0)
 
 
-def _stub(port: int, role: str, verdict: str | None = None, status: str = "completed", timeout: float = 30.0) -> subprocess.CompletedProcess:
+def _stub(port: int, role: str, verdict: str | None = None, status: str = "completed",
+          timeout: float = 30.0, task_id: str = "") -> subprocess.CompletedProcess:
     """Run stub_agent.py as a subprocess and wait for it to finish."""
     env = {
         **os.environ,
@@ -71,6 +75,7 @@ def _stub(port: int, role: str, verdict: str | None = None, status: str = "compl
         "STUB_ROLE": role,
         "STUB_STATUS": status,
         "STUB_TIMEOUT": str(timeout),
+        "STUB_TASK_ID": task_id,
     }
     if verdict:
         env["STUB_VERDICT"] = verdict
@@ -80,6 +85,21 @@ def _stub(port: int, role: str, verdict: str | None = None, status: str = "compl
         capture_output=True,
         timeout=timeout + 5,
     )
+
+
+def _wait_for_pending_stage(db_path: str, task_type: str, *, prev_task_id: str = "") -> str:
+    """Wait for the server/CLI stage to exist, then pin the stub to its ID."""
+    queue = TaskQueue(db_path)
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        matches = [task for task in queue.list_tasks()
+                   if task.task_type == task_type and task.status == "pending"
+                   and (task.context or {}).get("prev_task_id", "") == prev_task_id]
+        assert len(matches) <= 1, f"duplicate {task_type} successor of {prev_task_id}"
+        if matches:
+            return matches[0].task_id
+        time.sleep(0.05)
+    pytest.fail(f"{task_type} successor of {prev_task_id} never became pending")
 
 
 def _start_cli(args: list[str]):
@@ -122,12 +142,17 @@ def test_e_lo02_request_changes_then_approve(live_server):
                                 "--branch", "feat/review-loop"])
 
     # iteration 1: coder done, reviewer rejects
-    assert _stub(port, "coder").returncode == 0
-    assert _stub(port, "reviewer", verdict="request_changes").returncode == 0
+    impl_1 = _wait_for_pending_stage(db_path, "implement")
+    assert _stub(port, "coder", task_id=impl_1).returncode == 0
+    review_1 = _wait_for_pending_stage(db_path, "review", prev_task_id=impl_1)
+    assert _stub(port, "reviewer", verdict="request_changes", task_id=review_1).returncode == 0
     # iteration 2: coder done, reviewer approves, tester passes
-    assert _stub(port, "coder").returncode == 0
-    assert _stub(port, "reviewer", verdict="approve").returncode == 0
-    assert _stub(port, "tester").returncode == 0
+    impl_2 = _wait_for_pending_stage(db_path, "implement", prev_task_id=review_1)
+    assert _stub(port, "coder", task_id=impl_2).returncode == 0
+    review_2 = _wait_for_pending_stage(db_path, "review", prev_task_id=impl_2)
+    assert _stub(port, "reviewer", verdict="approve", task_id=review_2).returncode == 0
+    test_id = _wait_for_pending_stage(db_path, "test", prev_task_id=review_2)
+    assert _stub(port, "tester", task_id=test_id).returncode == 0
 
     cli_t.join(timeout=60.0)
     assert not cli_t.is_alive(), "CLI thread timed out"
