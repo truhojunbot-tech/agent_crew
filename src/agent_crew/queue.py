@@ -398,14 +398,18 @@ def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
     return bool(task_id) and _cea_lineage_root_task_id(task_id, ctx) != task_id
 
 
-def _is_implement_root(task: TaskRequest, ctx: dict) -> bool:
+def _is_implement_root(task: TaskRequest, ctx: dict, *,
+                       successor_provenance: object | None = None) -> bool:
     """Only a new implement intent needs root risk metadata validation.
 
-    The system's retry/fallback parent keys are the lineage proof. Untrusted
-    callers lose those keys in ``_trusted_enqueue_context`` before this runs.
+    Parent keys prove succession only when the in-process constructor supplied
+    the private provenance token. In particular, HTTP callers may supply
+    ``prev_task_id`` as ordinary context and must still be checked as roots.
     """
-    return (task.task_type == "implement" and not ctx.get("prev_task_id")
-            and not _cea_lineage_parent_from_ctx(ctx))
+    trusted_successor = (successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    return (task.task_type == "implement"
+            and not (trusted_successor
+                     and (ctx.get("prev_task_id") or _cea_lineage_parent_from_ctx(ctx))))
 
 
 def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ...]:
@@ -2782,7 +2786,8 @@ class TaskQueue:
 
     def enqueue_with_receipt(self, task: TaskRequest, receipt: dict, *,
                              context: Optional[dict] = None,
-                             _capacity_predecessor: str = "") -> str:
+                             _capacity_predecessor: str = "",
+                             _successor_provenance: object | None = None) -> str:
         """Write the task row for an admitted intent. **The only writer there is.**
 
         P2: "without a valid receipt there is no enqueue". That is a property of
@@ -2808,7 +2813,9 @@ class TaskQueue:
         raises :class:`AdmissionRefused` and nothing is written.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
-        missing_root_risk = (_is_implement_root(task, context)
+        missing_root_risk = (_is_implement_root(
+                                 task, context,
+                                 successor_provenance=_successor_provenance)
                              and "risk_tier" not in context
                              and "risk_declaration" not in context)
         scope = self._admission_project(task)
@@ -3237,7 +3244,8 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
-            if _is_implement_root(task, context):
+            if _is_implement_root(task, context,
+                                  successor_provenance=_successor_provenance):
                 if "risk_tier" in context and (
                         isinstance(context["risk_tier"], bool)
                         or not isinstance(context["risk_tier"], int)
@@ -3281,7 +3289,8 @@ class TaskQueue:
                 capacity_predecessor = str(context.get("original_task_id") or "")
             return self.enqueue_with_receipt(
                 task, auth.receipt, context=context,
-                _capacity_predecessor=capacity_predecessor)
+                _capacity_predecessor=capacity_predecessor,
+                _successor_provenance=_successor_provenance)
 
     def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
                           provenance: "_CeaProvenance", code: str, text: str):

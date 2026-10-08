@@ -26,6 +26,7 @@ def test_inherited_explicit_tier3_keeps_provenance_and_records_escalation():
 @pytest.mark.parametrize("context", [
     {"risk_tier": "high"},
     {"risk_tier": "high", "original_task_id": "forged-parent"},
+    {"risk_tier": "high", "prev_task_id": "forged-parent"},
 ])
 def test_invalid_tier_on_implement_root_returns_422(tmp_path, context):
     db = str(tmp_path / "tasks.db")
@@ -51,6 +52,22 @@ def test_missing_metadata_is_accepted_warned_and_visible(tmp_path, caplog):
         response = client.post("/tasks", json={
             "task_id": "unknown-root", "task_type": "implement",
             "description": "work", "context": {}},
+            headers={"X-Agent-Crew-Project": "agent_crew"})
+        health = client.get("/health")
+    assert response.status_code == 201
+    assert "missing risk_tier and risk_declaration" in caplog.text
+    assert health.json()["risk_declaration"]["missing_root_count"] == 1
+
+
+def test_forged_prev_task_id_does_not_hide_missing_root_metadata(tmp_path, caplog):
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db, pane_map={}, project="agent_crew",
+                     push_fn=lambda *a, **k: None,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with caplog.at_level(logging.WARNING), TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "task_id": "forged-root", "task_type": "implement",
+            "description": "work", "context": {"prev_task_id": "forged-parent"}},
             headers={"X-Agent-Crew-Project": "agent_crew"})
         health = client.get("/health")
     assert response.status_code == 201
@@ -99,4 +116,16 @@ def test_system_successor_with_legacy_string_tier_is_not_refused(
                                        "risk_tier": "high"}),
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     assert queue.get_task_status(task_id) == "pending"
+    assert queue.missing_root_risk_metadata_count() == 0
+
+
+def test_trusted_fix_prev_task_id_is_successor_proof(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-root", "implement", "work", context={"risk_tier": 1}))
+    queue.submit_result("impl-root", TaskResult("impl-root", "completed", "done"))
+    queue.enqueue(TaskRequest("fix-root-r1", "implement", "fix", context={
+        "prev_task_id": "impl-root", "fix_round": 1, "risk_tier": "high"}),
+        ingress="cascade.fix",
+        _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    assert queue.get_task_status("fix-root-r1") == "pending"
     assert queue.missing_root_risk_metadata_count() == 0
