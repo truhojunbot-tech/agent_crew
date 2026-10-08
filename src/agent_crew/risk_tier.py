@@ -154,7 +154,7 @@ def risk_declaration(description: str, context: Mapping | None = None) -> dict:
             # Keep the root's explicit fact; still escalate live/safety work.
             if any(explicit[field] is not True for field in stronger):
                 return {**explicit, **stronger,
-                        "declaration_source": "heuristic", "confidence": "low"}
+                        "escalated_by": "classifier_tier3"}
         # A tier is a floor for the classifier. Preserve a stronger live/safety
         # signal when this declaration came from the tier, without overriding
         # an operator's separate risk_declaration or structured risk flags.

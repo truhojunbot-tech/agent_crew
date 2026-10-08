@@ -577,6 +577,8 @@ def _normalize_risk_declaration(value: object) -> dict:
     inherited_from = value.get("inherited_from")
     if isinstance(inherited_from, str) and inherited_from:
         normalized["inherited_from"] = inherited_from
+    if value.get("escalated_by") == "classifier_tier3":
+        normalized["escalated_by"] = "classifier_tier3"
     return normalized
 
 
@@ -1340,6 +1342,10 @@ class DuplicateReviewError(Exception):
     def __init__(self, existing_task_id: str):
         self.existing_task_id = existing_task_id
         super().__init__(f"DUPLICATE_REVIEW: existing task {existing_task_id}")
+
+
+class InvalidRiskTierError(ValueError):
+    """An implement root declared a tier outside integer 0-3."""
 
 
 def _is_issue_number(value) -> bool:
@@ -2792,6 +2798,10 @@ class TaskQueue:
         raises :class:`AdmissionRefused` and nothing is written.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
+        missing_root_risk = (task.task_type == "implement"
+                             and not context.get("prev_task_id")
+                             and "risk_tier" not in context
+                             and "risk_declaration" not in context)
         scope = self._admission_project(task)
         engine = self.cea_engine(scope)
         # ENQUEUE is the one call site that resolves rollout from the *task*:
@@ -2913,6 +2923,9 @@ class TaskQueue:
                     receipt_id,
                 ),
             )
+            if missing_root_risk:
+                self._append_exec_event_on(conn, task.task_id, "missing_risk_metadata",
+                                           admit_at)
             # §3: the row exists, so the receipt is QUEUED. Inside the same
             # transaction, through the engine's guarded transition — which is
             # where the lifecycle graph and the lineage claim are kept in step.
@@ -2942,6 +2955,9 @@ class TaskQueue:
             raise TaskAlreadyExistsError(task.task_id, existing_status) from None
         finally:
             conn.close()
+        if missing_root_risk:
+            logger.warning("implement root %s missing risk_tier and risk_declaration",
+                           task.task_id)
         # #342(C): risk declaration is strictly post-commit telemetry.  Even
         # an unexpected classifier exception can never veto the task INSERT,
         # and a failure leaves the declaration honestly unknown.
@@ -2987,6 +3003,16 @@ class TaskQueue:
         except Exception:
             logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
         return task.task_id
+
+    def missing_root_risk_metadata_count(self) -> int:
+        """Durable count of admitted implement roots lacking both risk inputs."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM task_exec_events WHERE event='missing_risk_metadata'").fetchone()
+            return int(row[0])
+        finally:
+            conn.close()
 
     #: #415: how long a pending, unpinned review/test may reserve its PR or
     #: branch. Same bound as the reviewer's absolute dispatch cap
@@ -3202,6 +3228,13 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
+            if task.task_type == "implement" and not context.get("prev_task_id"):
+                if "risk_tier" in context and (
+                        isinstance(context["risk_tier"], bool)
+                        or not isinstance(context["risk_tier"], int)
+                        or not 0 <= context["risk_tier"] <= 3):
+                    raise InvalidRiskTierError(
+                        "implement root context.risk_tier must be an integer 0-3")
             if refusal is None and task.task_type == "implement":
                 cap = self._max_open_implement()
                 is_system_successor = (
