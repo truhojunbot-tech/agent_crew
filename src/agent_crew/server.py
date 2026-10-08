@@ -4216,6 +4216,13 @@ def create_app(
             _claude_cloud.reconcile_all_cloud_tasks(q())
         except Exception:
             logger.exception("watchdog: claude_cloud reconciliation failed")
+        try:
+            for successor_id in q().readmit_parked_owner_conflicts():
+                successor = q().get_task(successor_id)
+                if successor is not None:
+                    _try_push_next(_TYPE_TO_ROLE.get(successor.task_type, "implementer"))
+        except Exception:
+            logger.exception("watchdog: owner approval re-admission failed")
         if not pane_map:
             return actions
 
@@ -5941,6 +5948,10 @@ def create_app(
                             pane_map=pane_map, on_fix_enqueued=_try_push_next)
                     except Exception:
                         logger.exception("rounds-cap shadow re-resolution failed — continuing dispatch")
+                    try:
+                        await asyncio.to_thread(q().readmit_parked_owner_conflicts)
+                    except Exception:
+                        logger.exception("owner approval re-admission failed — continuing dispatch")
                     logger.debug(
                         f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} "
                         f"active_workers={sorted(active_workers)} "
@@ -6729,7 +6740,9 @@ def create_app(
         # that number reaching zero, so it rides on the endpoint an operator
         # already polls rather than living only in a log nobody greps.
         try:
-            _cea_out = {"legacy_rows": q().cea_legacy_rows()}
+            _cea_out = {"legacy_rows": q().cea_legacy_rows(),
+                        "owner_conflicts_parked": q().parked_owner_conflict_count(),
+                        "owner_approval_requests": q().owner_approval_request_counts()}
         except Exception as exc:
             _cea_out = {"legacy_rows": {"error": f"{type(exc).__name__}: {exc}"}}
         try:
@@ -6883,6 +6896,12 @@ def create_app(
                 status_code=409,
                 detail={"error": e.code, "existing_task_id": e.existing_task_id},
             )
+        parked = q().get_task(task_id)
+        if parked is not None and parked.status == "needs_human" and (
+                parked.context or {}).get("owner_conflict"):
+            return _JSONResponse(status_code=423, content={
+                "error": "admission held", "reason": "OWNER_CONFLICT",
+                "task_id": task_id, "receipt_id": q().task_receipt_id(task_id)})
         logger.info(f"POST /tasks: enqueued task_id={task_id}")
         if not _push_enabled:
             logger.warning(

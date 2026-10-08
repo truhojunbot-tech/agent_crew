@@ -384,6 +384,71 @@ def test_owner_conflict_is_a_human_gate_not_a_shadow_allow(conn):
     assert auth.receipt["reuse"]["approver_identity_verified"] is False
 
 
+@pytest.mark.parametrize("change,approved", [
+    ({}, True),
+    ({"capabilities": ("reuse:other.capability",)}, False),
+    ({"projects": ("another_project",)}, False),
+    ({"projects": ()}, False),
+    ({"intent_hash": "sha256:" + "0" * 64}, False),
+    ({"intent_hash": None}, True),
+    ({"expires_at": 1.0}, False),
+])
+def test_signed_owner_reuse_requires_matching_scope(conn, change, approved):
+    requested = intent()
+    grant = DecisionRev("OWNER-594", "c" * 32, **{
+        "capabilities": (f"reuse:{CAPABILITY.id}",),
+        "projects": (requested.identity.project,),
+        "intent_hash": intent_hash(requested.identity), **change})
+    snap = FakeSnapshot(decisions=(DECISION, grant), in_scope=(DECISION, grant))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,)), snapshots=snap).authorize(
+        conn, requested, caller())
+    assert (auth.code != "OWNER_CONFLICT") is approved
+    assert auth.receipt["reuse"]["approved_by"] == ("OWNER-594" if approved else None)
+    assert auth.receipt["reuse"]["approver_identity_verified"] is approved
+
+
+@pytest.mark.parametrize("signature", [SignatureStatus.UNSIGNED, SignatureStatus.INVALID])
+def test_unsigned_owner_reuse_never_approves(conn, signature):
+    requested = intent()
+    grant = DecisionRev("OWNER-594", "c" * 32,
+                        capabilities=(f"reuse:{CAPABILITY.id}",),
+                        projects=(requested.identity.project,))
+    snap = FakeSnapshot(signature=signature, decisions=(DECISION, grant),
+                        in_scope=(DECISION, grant))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,)), snapshots=snap).authorize(
+        conn, requested, caller())
+    assert auth.receipt["reuse"]["approved_by"] is None
+    assert auth.receipt["reuse"]["approver_identity_verified"] is False
+
+
+def test_owner_reuse_record_with_wrong_repo_does_not_approve(conn):
+    requested = intent()
+    grant = DecisionRev("OWNER-594", "c" * 32,
+                        capabilities=(f"reuse:{CAPABILITY.id}",),
+                        projects=(requested.identity.project,),
+                        scope_repo="another/repo")
+    snap = FakeSnapshot(decisions=(DECISION, grant), in_scope=(DECISION,))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,)), snapshots=snap).authorize(
+        conn, requested, caller())
+    assert auth.code == "OWNER_CONFLICT"
+
+
+def test_owner_reuse_uses_signed_producer_record_even_when_generic_scope_excludes_it(conn):
+    requested = intent()
+    grant = DecisionRev("OWNER-594", "c" * 32,
+                        capabilities=(f"reuse:{CAPABILITY.id}",),
+                        projects=(requested.identity.project,),
+                        project=requested.identity.project,
+                        scope_capability_id=f"reuse:{CAPABILITY.id}")
+    # policy_producer expands the list capability into a scalar that the
+    # general J2 filter cannot match against the plain intent capability id.
+    snap = FakeSnapshot(decisions=(DECISION, grant), in_scope=(DECISION,))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,)), snapshots=snap).authorize(
+        conn, requested, caller())
+    assert auth.code != "OWNER_CONFLICT"
+    assert auth.receipt["reuse"]["approved_by"] == "OWNER-594"
+
+
 def test_a_snapshot_cannot_reduce_the_review_floor(conn):
     """§7.2 / J7: the matrix may require more, never less. A snapshot saying
     'implement needs no reviewer' is exactly the reduction the fold forbids."""

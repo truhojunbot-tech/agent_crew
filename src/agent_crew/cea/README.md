@@ -57,7 +57,15 @@ than answered:
 | judgement | while UNVERIFIED |
 |-----------|------------------|
 | J9 who may do OPS (`IDENTITY_DEPENDENT_WORK_CLASSES`) | `HUMAN_GATE` / `IDENTITY_UNVERIFIED_WHO_MAY_ACT` — never `ALLOW`, and not `REVIEW` either: a reviewer checks the work, not the entitlement |
-| J5 ownership / reuse | read from intent scope only; `caller.principal` is not an input. An unowned-by-this-project match is `REUSE` → `HUMAN_GATE` / `OWNER_CONFLICT` for everyone |
+| J5 ownership / reuse | read from intent scope and verified snapshot decisions only; `caller.principal` is not an input. A cross-project match requires a signed, unexpired decision scoped to `reuse:<capability_id>` and the intent project (and matching `intent_hash` when supplied). Otherwise it is `REUSE` → `HUMAN_GATE` / `OWNER_CONFLICT`. |
+
+When `OWNER_CONFLICT` is enforced, the task stays in `needs_human` with a HELD
+receipt; HTTP enqueue returns 423 with its task and receipt IDs. The optional
+`AGENT_CREW_CEA_OWNER_REQUEST_CMD` receives one JSON request per intent hash on
+stdin. Without it, the request is logged and counted. `/health` reports parked
+tasks and owner request counts. A later verified snapshot generation triggers
+one re-admission attempt; an approved intent runs as a new lineage task, keeping
+the original task and receipt in the audit trail.
 | J7 review/test contract, J8 human gate | identity-dependent → `REVIEW` with the named reviewer, or `HUMAN_GATE` |
 
 A forged, minted or registry-injected caller therefore obtains **exactly** what

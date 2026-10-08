@@ -26,7 +26,8 @@ from agent_crew.cea.engine import EngineConfig
 from agent_crew.cea.intent import WorkClass
 from agent_crew.cea.providers import CapabilityLookup, PolicySnapshotRef, SignatureStatus
 from agent_crew.cea.receipt import (
-    BudgetClass, DecisionRev, HumanGate, HumanGateState, ProviderBudget, RegistryRef)
+    BudgetClass, DecisionRev, HumanGate, HumanGateState, MatchedCapability,
+    ProviderBudget, RegistryRef)
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
 from agent_crew.cea.schema import validate_receipt
 from agent_crew.cea.validator import ValidationPoint
@@ -214,6 +215,231 @@ def test_every_enqueued_row_names_the_receipt_that_admitted_it(tmp_path):
     stored = receipt_of(q)
     assert stored["task_id"] == "t1"
     assert stored["state"] == "QUEUED", "the row exists, so the receipt is QUEUED (§3)"
+
+
+def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
+        tmp_path, monkeypatch):
+    from agent_crew.cea.engine import intent_hash
+    owner_match = MatchedCapability(id="shared.owner-capability", owner="other_project",
+                                    repo="example/other_project")
+
+    class OwnerRegistry(Registry):
+        def lookup(self, intent):
+            return CapabilityLookup(registry=RegistryRef(generation="1", hash="r" * 16),
+                                    matches=(owner_match,))
+
+    class OwnerSnapshot(Snapshot):
+        generation = 7
+        grant = None
+
+        def current(self, intent=None):
+            decisions = (DECISION,) + ((self.grant,) if self.grant else ())
+            return PolicySnapshotRef(generation=self.generation, hash=f"h{self.generation}" * 8,
+                                     produced_at=None, decisions=decisions, in_scope=decisions,
+                                     signature=SignatureStatus.VALID, available=True, tier="T0")
+
+    class OwnerRuntime(Runtime):
+        state = RuntimeState.ACTIVE
+
+        def current(self):
+            return RuntimeStateSnapshot(state=self.state, epoch=3, read_failed=False)
+
+    class OwnerBudget(Budget):
+        state = BudgetClass.OK
+
+        def budget(self, provider):
+            return ProviderBudget(provider=provider, state=self.state, observed_at=None)
+
+    snapshot = OwnerSnapshot()
+    runtime = OwnerRuntime()
+    budget = OwnerBudget()
+    q = TaskQueue(str(tmp_path / "t.db"), cea_config=EngineConfig(mode="test"),
+                  cea_providers={**WIRED, "snapshots": snapshot,
+                                 "capabilities": OwnerRegistry(), "runtime": runtime,
+                                 "budgets": budget})
+    import subprocess
+    requests = []
+    original_run = subprocess.run
+    def record_owner_request(*args, **kwargs):
+        if args and args[0] == ["owner-request"]:
+            requests.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        return original_run(*args, **kwargs)
+    monkeypatch.setenv("AGENT_CREW_CEA_OWNER_REQUEST_CMD", "owner-request")
+    monkeypatch.setattr("agent_crew.queue.subprocess.run", record_owner_request)
+    t = task(context=admitted({"pr_number": 594}))
+    q.enqueue(t)
+    assert q.get_task("t1").status == "needs_human"
+    assert q.parked_owner_conflict_count() == 1
+    assert receipt_of(q)["state"] == "HELD"
+    assert q.external_op_get(f"owner-approval:{receipt_of(q)['intent_hash']}")["state"] == "done"
+    q._request_owner_approval(t, receipt_of(q))
+    assert len(requests) == 1
+    request = json.loads(requests[0][1]["input"])
+    assert request["project"] == "agent_crew"
+    assert request["capability_id"] == owner_match.id
+    assert request["capability_owner"] == owner_match.owner
+    assert request["task_id"] == "t1"
+    assert request["pr_number"] == 594
+    from fastapi.testclient import TestClient
+    import agent_crew.server as server
+    from agent_crew.server import create_app
+    monkeypatch.setattr(server, "TaskQueue", lambda *args, **kwargs: q)
+    with TestClient(create_app(q._db_path, pane_map={}, project="agent_crew",
+                               watchdog_disabled=True, anomaly_disabled=True)) as client:
+        health_cea = client.get("/health").json()["cea"]
+        assert health_cea["owner_conflicts_parked"] == 1
+        assert health_cea["owner_approval_requests"] == {"total": 1, "failed": 0}
+        held = client.post("/tasks", json={"task_id": "t2", "task_type": "implement",
+                                           "description": "another owner conflict", "branch": "feature",
+                                           "context": admitted({"pr_number": 594}),
+                                           "project": "agent_crew"})
+        assert held.status_code == 423
+        assert held.json()["reason"] == "OWNER_CONFLICT"
+        assert q.get_task("t2").status == "needs_human"
+        assert q.parked_owner_conflict_count() == 2
+    assert q.readmit_parked_owner_conflicts() == []
+    snapshot.generation = 8
+    assert q.readmit_parked_owner_conflicts() == []
+    assert q.get_task("t1").status == "needs_human"
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    with sqlite3.connect(q._db_path) as connection:
+        receipts_at_gen8 = connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0]
+    assert q.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_gen8
+    snapshot.generation = 9
+    snapshot.grant = DecisionRev("OWNER-594", "c" * 32,
+                                 capabilities=(f"reuse:{owner_match.id}",),
+                                 projects=(t.project,),
+                                 intent_hash=intent_hash(intent_for_task(t, context=t.context,
+                                                                         queue_identity=t.project).identity))
+    restarted = TaskQueue(q._db_path, cea_config=EngineConfig(mode="test"),
+                          cea_providers={**WIRED, "snapshots": snapshot,
+                                         "capabilities": OwnerRegistry(), "runtime": runtime,
+                                         "budgets": budget})
+    import agent_crew.queue as queue_module
+    now = [queue_module.time.time()]
+    monkeypatch.setattr(queue_module.time, "time", lambda: now[0])
+    original_enqueue = restarted.enqueue_with_receipt
+    enqueue_calls = []
+    failed_once = False
+
+    def transient_enqueue_failure(successor, receipt, **kwargs):
+        nonlocal failed_once
+        enqueue_calls.append(successor.task_id)
+        if successor.task_id == "owner-readmit-t1-g9" and not failed_once:
+            failed_once = True
+            raise RuntimeError("transient enqueue failure")
+        return original_enqueue(successor, receipt, **kwargs)
+
+    monkeypatch.setattr(restarted, "enqueue_with_receipt", transient_enqueue_failure)
+    runtime.state = RuntimeState.STOPPED
+    assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        receipts_during_stop = connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0]
+    for _ in range(10):
+        assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_during_stop
+    assert enqueue_calls == []  # A signed BLOCK must never reach the row writer.
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    assert q.get_task("owner-readmit-t1-g9") is None
+    runtime.state = RuntimeState.ACTIVE
+    assert restarted.readmit_parked_owner_conflicts() == []  # still in backoff
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
+    original_authorize = restarted.authorize_task
+    auth_failed_once = False
+
+    def transient_authorize_failure(successor, **kwargs):
+        nonlocal auth_failed_once
+        if successor.task_id == "owner-readmit-t1-g9" and not auth_failed_once:
+            auth_failed_once = True
+            raise RuntimeError("transient authorization failure")
+        return original_authorize(successor, **kwargs)
+
+    monkeypatch.setattr(restarted, "authorize_task", transient_authorize_failure)
+    assert restarted.readmit_parked_owner_conflicts() == []
+    assert auth_failed_once
+    assert enqueue_calls == []
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
+    assert restarted.readmit_parked_owner_conflicts() == []
+    assert failed_once
+    assert q.get_task("t1").status == "needs_human"
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
+    assert restarted.readmit_parked_owner_conflicts() == ["owner-readmit-t1-g9"]
+    assert q.get_task("t1").status == "cancelled"
+    assert q.get_task("owner-readmit-t1-g9").status == "pending"
+    assert q.parked_owner_conflict_count() == 1  # t2 still awaits its own approval
+    t2 = q.get_task("t2")
+    snapshot.generation = 10
+    snapshot.grant = DecisionRev("OWNER-594-t2", "d" * 32,
+                                 capabilities=(f"reuse:{owner_match.id}",),
+                                 projects=(t2.project,),
+                                 intent_hash=intent_hash(intent_for_task(
+                                     t2, context=t2.context,
+                                     queue_identity=t2.project).identity))
+    budget.state = BudgetClass.EXHAUSTED
+    assert restarted.readmit_parked_owner_conflicts() == []
+    budget_marker = q.get_task("t2").context["owner_conflict"]
+    assert budget_marker["last_attempt_generation"] == 9
+    assert budget_marker["retry_generation"] == 10
+    with sqlite3.connect(q._db_path) as connection:
+        receipts_at_budget_block = connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0]
+    for _ in range(10):
+        assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_budget_block
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
+    assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_budget_block + 1
+    for _ in range(10):
+        assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_budget_block + 1
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
+    unenforced_budget = TaskQueue(
+        q._db_path,
+        cea_config=EngineConfig(mode="test", enforce_codes=frozenset({
+            "RUNTIME_STATE_FORBIDS", "SNAPSHOT_ROLLBACK"})),
+        cea_providers={**WIRED, "snapshots": snapshot,
+                       "capabilities": OwnerRegistry(), "runtime": runtime,
+                       "budgets": budget})
+    with sqlite3.connect(q._db_path) as connection:
+        connection.execute("CREATE TRIGGER fail_owner_cancel BEFORE UPDATE OF status ON tasks "
+                           "WHEN OLD.task_id='t2' AND NEW.status='cancelled' "
+                           "BEGIN SELECT RAISE(ABORT, 'cancel failed'); END")
+    assert unenforced_budget.readmit_parked_owner_conflicts() == []
+    assert q.get_task("t2").status == "needs_human"
+    assert q.get_task("owner-readmit-t2-g10").status == "pending"
+    with sqlite3.connect(q._db_path) as connection:
+        connection.execute("DROP TRIGGER fail_owner_cancel")
+    snapshot.generation = 11
+    assert unenforced_budget.readmit_parked_owner_conflicts() == []
+    assert q.get_task("t2").status == "cancelled"
+    assert q.get_task("owner-readmit-t2-g11") is None
+
+
+def test_owner_request_without_command_is_counted_once(tmp_path, monkeypatch, caplog):
+    q = queue(tmp_path)
+    monkeypatch.delenv("AGENT_CREW_CEA_OWNER_REQUEST_CMD", raising=False)
+    receipt = {"intent_hash": "sha256:" + "a" * 64,
+               "binding": {"matched_capability": {"id": "c", "owner": "owner"}}}
+    q._request_owner_approval(task(), receipt)
+    q._request_owner_approval(task(), receipt)
+    assert q.owner_approval_request_counts() == {"total": 1, "failed": 0}
+    assert "approval request unconfigured" in caplog.text
 
 
 # ═══════════════════════════════════════════════════════════════════════════
