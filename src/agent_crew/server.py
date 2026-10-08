@@ -72,7 +72,8 @@ from agent_crew.protocol import (
     RESULT_COMMIT_CONTEXT_KEY,
 )
 from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError,
-                              DuplicateReviewResult, InvalidReviewResult, LateResultRejected,
+                              DuplicateReviewResult, InvalidReviewResult, InvalidRiskTierError,
+                              LateResultRejected,
                               TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
@@ -6731,6 +6732,11 @@ def create_app(
             _cea_out = {"legacy_rows": q().cea_legacy_rows()}
         except Exception as exc:
             _cea_out = {"legacy_rows": {"error": f"{type(exc).__name__}: {exc}"}}
+        try:
+            _risk_out = {"missing_root_count": q().missing_root_risk_metadata_count()}
+        except Exception as exc:
+            _risk_out = {"missing_root_count": None,
+                         "error": f"{type(exc).__name__}: {exc}"}
         return {
             "status": "ok",
             "project": ident["project"],
@@ -6738,6 +6744,7 @@ def create_app(
             "stop": _stop_out,
             "runtime_state": _runtime_state_out,
             "cea": _cea_out,
+            "risk_declaration": _risk_out,
             # G_DT: pushes refused because the target pane runs no agent CLI.
             "delivery_guard": {"delivery": _delivery_raw,
                                "refusals": dict(delivery_guard_refusals)},
@@ -6860,6 +6867,8 @@ def create_app(
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
             task_id = q().enqueue(task, ingress="http.tasks")
+        except InvalidRiskTierError as e:
+            raise HTTPException(status_code=422, detail=str(e))
         except TaskAlreadyExistsError as e:
             raise HTTPException(
                 status_code=409,
