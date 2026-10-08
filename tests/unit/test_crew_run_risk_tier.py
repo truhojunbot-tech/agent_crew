@@ -70,6 +70,35 @@ def test_tier_one_records_explicit_high_declaration(monkeypatch, tmp_path):
     assert declaration["confidence"] == "high"
 
 
+def test_cli_review_and_test_inherit_declared_root_tier(monkeypatch, tmp_path):
+    db = tmp_path / "tasks.db"
+
+    def result_for(_queue, task_id):
+        if task_id.startswith("impl-"):
+            return TaskResult(task_id, "completed", "implemented",
+                              branch="fix/risk-tier", commit="a" * 40)
+        if task_id.startswith("review-"):
+            return TaskResult(task_id, "completed", "approved", verdict="approve")
+        return TaskResult(task_id, "completed", "tests passed")
+
+    monkeypatch.setattr(TaskQueue, "get_result", result_for)
+    result = CliRunner().invoke(crew, [
+        "run", "implement a routine change", "--db", str(db),
+        "--branch", "fix/risk-tier", "--risk-tier", "2",
+    ])
+    assert result.exit_code == 0, result.output
+    tasks = TaskQueue(str(db)).list_tasks()
+    assert {task.task_type for task in tasks} == {"implement", "review", "test"}
+    root = next(task for task in tasks if task.task_type == "implement")
+    for successor in (task for task in tasks if task.task_type in {"review", "test"}):
+        assert successor.context["risk_tier"] == 2
+        declaration = successor.context["risk_declaration"]
+        assert declaration["declaration_source"] == "explicit"
+        assert declaration["broad_architecture_change"] is True
+        assert declaration["broad_architecture_change"] is root.context[
+            "risk_declaration"]["broad_architecture_change"]
+
+
 def test_help_documents_risk_tier():
     result = CliRunner().invoke(crew, ["run", "--help"])
     assert result.exit_code == 0

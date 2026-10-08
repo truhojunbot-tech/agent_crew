@@ -8,6 +8,7 @@ from agent_crew.discussion import (
     multi_round,
     then_run,
 )
+from agent_crew.queue import TaskQueue
 
 
 # U-D01: enqueue_panel_tasks — agents 수만큼 task_type=discuss 태스크 등록됨, task_id 유일성 보장
@@ -30,6 +31,24 @@ def test_u_d01_enqueue_panel_tasks():
         req = c[0][0]
         assert req.task_type == "discuss"
         assert topic in req.description
+
+
+def test_panel_tasks_have_explicit_no_rounds_risk_declaration(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    ids = enqueue_panel_tasks(queue, ["claude", "codex", "gemini"],
+                              "Analyze a possible change", {"round": 1})
+    assert len(ids) == 3
+    for task_id in ids:
+        task = queue.get_task(task_id)
+        assert task.task_type == "discuss"
+        assert task.context["risk_declaration"] == {
+            "safety_or_live_change": False,
+            "broad_architecture_change": False,
+            "bounded_routine_fix": False,
+            "human_gate_required": False,
+            "declaration_source": "explicit",
+            "confidence": "high",
+        }
 
 
 # U-D01b: enqueue_panel_tasks — multi-round 호출 시 task_id 충돌 없음
