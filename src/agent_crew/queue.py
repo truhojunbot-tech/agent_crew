@@ -4791,6 +4791,22 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def external_op_reset_failed_head(self, op_key: str, head_sha: str) -> Optional[dict]:
+        """Give a new PR head its own retry budget in the existing merge receipt."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
+            if row and row["state"] == "failed" and head_sha and not (
+                    row["last_error"] or "").startswith(f"head={head_sha} "):
+                conn.execute("UPDATE external_op SET state='reserved', attempt=0, "
+                             "last_error=NULL WHERE op_key=?", (op_key,))
+                row = conn.execute("SELECT * FROM external_op WHERE op_key=?", (op_key,)).fetchone()
+            conn.commit()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
     # ── G12 / D6: execution-state instrumentation ─────────────────────────
     #
     # Most recorders are best-effort instrumentation. A dispatcher failure's
