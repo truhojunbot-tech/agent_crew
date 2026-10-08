@@ -2821,11 +2821,6 @@ class TaskQueue:
                                  successor_provenance=_successor_provenance)
                              and "risk_tier" not in context
                              and "risk_declaration" not in context)
-        # Admission telemetry belongs to the task context, not the G12
-        # claim/dispatch event history. Override any caller-supplied value.
-        context.pop("_missing_root_risk_metadata", None)
-        if missing_root_risk:
-            context["_missing_root_risk_metadata"] = True
         scope = self._admission_project(task)
         engine = self.cea_engine(scope)
         # ENQUEUE is the one call site that resolves rollout from the *task*:
@@ -2960,6 +2955,9 @@ class TaskQueue:
                     receipt_id,
                 ),
             )
+            if missing_root_risk:
+                self._append_exec_event_on(conn, task.task_id, "missing_risk_metadata",
+                                           admit_at)
             # §3: the row exists, so the receipt is QUEUED. Inside the same
             # transaction, through the engine's guarded transition — which is
             # where the lifecycle graph and the lineage claim are kept in step.
@@ -3283,12 +3281,7 @@ class TaskQueue:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT COUNT(*) FROM tasks t WHERE "
-                "(CASE WHEN json_valid(t.context) THEN "
-                "json_extract(t.context, '$._missing_root_risk_metadata') END)=1 "
-                "OR EXISTS (SELECT 1 FROM task_exec_events e "
-                "WHERE e.task_id=t.task_id AND e.event='missing_risk_metadata')"
-            ).fetchone()
+                "SELECT COUNT(*) FROM task_exec_events WHERE event='missing_risk_metadata'").fetchone()
             return int(row[0])
         finally:
             conn.close()

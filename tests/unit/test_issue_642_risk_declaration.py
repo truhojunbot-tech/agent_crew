@@ -58,7 +58,7 @@ def test_missing_metadata_is_accepted_warned_and_visible(tmp_path, caplog):
     assert "missing risk_tier and risk_declaration" in caplog.text
     assert health.json()["risk_declaration"]["missing_root_count"] == 1
     queue = TaskQueue(db)
-    assert queue.get_task("unknown-root").context["_missing_root_risk_metadata"] is True
+    assert "_missing_root_risk_metadata" not in queue.get_task("unknown-root").context
     assert queue.get_exec_state("unknown-root")["events"] == []
 
 
@@ -78,7 +78,7 @@ def test_forged_prev_task_id_does_not_hide_missing_root_metadata(tmp_path, caplo
     assert health.json()["risk_declaration"]["missing_root_count"] == 1
 
 
-def test_legacy_missing_risk_event_still_counts_without_polluting_history(tmp_path):
+def test_missing_risk_event_counts_without_polluting_history(tmp_path):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("legacy-root", "implement", "work",
                               context={"risk_tier": 1}))
