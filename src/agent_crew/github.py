@@ -546,6 +546,81 @@ def independent_review_succeeded(pr_number: int, repo: str) -> bool:
         return False
 
 
+def head_checks_state(repo: str, sha: str) -> tuple[str, str]:
+    """Return (green|red|pending|none|error, detail) for a PR head's CI.
+
+    Check runs and commit statuses are separate GitHub APIs. Ignore skipped
+    runs and the crew review status, which is verified independently.
+    """
+    repo = _repo_slug(repo)
+    if not repo or not re.fullmatch(r"[0-9a-fA-F]{40}", sha or "") or not check_gh_installed():
+        return "error", "CI identity unavailable"
+    try:
+        runs = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{sha}/check-runs?per_page=100",
+             "--paginate"],
+            capture_output=True, text=True, timeout=20)
+        statuses = subprocess.run(
+            ["gh", "api", f"repos/{repo}/commits/{sha}/status"],
+            capture_output=True, text=True, timeout=20)
+        if runs.returncode or statuses.returncode:
+            return "error", "CI checks lookup failed"
+        # This gh version has no --slurp: --paginate concatenates page objects.
+        raw = runs.stdout or "{}"
+        decoder = json.JSONDecoder()
+        pages = []
+        offset = 0
+        while offset < len(raw):
+            while offset < len(raw) and raw[offset].isspace():
+                offset += 1
+            if offset < len(raw):
+                page, offset = decoder.raw_decode(raw, offset)
+                pages.extend(page if isinstance(page, list) else [page])
+        status_data = json.loads(statuses.stdout or "{}")
+        check_runs = [run for page in pages for run in page.get("check_runs", [])]
+        latest_statuses = status_data.get("statuses", [])
+        if not isinstance(check_runs, list) or not isinstance(latest_statuses, list):
+            return "error", "CI checks response malformed"
+        # GitHub can return prior attempts. Use the newest run for each check
+        # name and the newest commit status for each context.
+        latest_runs = {}
+        for run in check_runs:
+            name = str(run.get("name") or "check run")
+            if name not in latest_runs or run.get("id", 0) > latest_runs[name].get("id", 0):
+                latest_runs[name] = run
+        latest_by_context = {}
+        for status in latest_statuses:
+            latest_by_context.setdefault(str(status.get("context") or "commit status"), status)
+        red = []
+        pending = []
+        for run in latest_runs.values():
+            if run.get("conclusion") == "skipped":
+                continue
+            name = str(run.get("name") or "check run")
+            if run.get("conclusion") in ("failure", "cancelled", "timed_out"):
+                red.append(name)
+            elif (run.get("status") != "completed" or
+                  run.get("conclusion") not in ("success", "neutral")):
+                pending.append(name)
+        for status in latest_by_context.values():
+            name = str(status.get("context") or "commit status")
+            if name == "crew/independent-review":
+                continue
+            if status.get("state") in ("failure", "error"):
+                red.append(name)
+            elif status.get("state") == "pending":
+                pending.append(name)
+        if red:
+            return "red", ", ".join(red[:5])
+        if pending:
+            return "pending", ", ".join(pending[:5])
+        return ("green" if check_runs or any(
+            s.get("context") != "crew/independent-review" for s in latest_statuses)
+            else "none"), ""
+    except Exception as exc:
+        return "error", type(exc).__name__
+
+
 def independent_review_for_head(queue, pr_number: int, repo: str,
                                 review_task_id: str = "") -> tuple[str, str, str, str]:
     """Return (head SHA, reviewer agent, review task id, reason) for the latest independent approval.
