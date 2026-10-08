@@ -264,6 +264,9 @@ def test_run_adopts_server_review_and_test_that_win_enqueue_race(tmp_path, monke
         def get_task_context(self, task_id):
             return self.tasks[task_id].context
 
+        def patch_context(self, task_id, extra):
+            self.tasks[task_id].context.update(extra)
+
     queue = RacingQueue()
     monkeypatch.setattr("agent_crew.queue.TaskQueue", lambda _db: queue)
     result = CliRunner().invoke(crew, [

@@ -286,6 +286,8 @@ def test_http_duplicate_adopts_server_successor_by_id():
 
     assert task_id == "review-server"
     queue.enqueue.assert_not_called()
+    queue.patch_context.assert_called_once_with(
+        "review-server", {"reviewed_sha": "a" * 40})
 
 
 @pytest.mark.parametrize("stage", ["review", "test"])
@@ -341,3 +343,7 @@ def test_duplicate_successor_adoption_checks_stage_and_reviewed_head(
             assert raised.value is conflict
     if transport == "http":
         queue.enqueue.assert_not_called()
+    if stage == "review" and collision == "same_sha_other_parent":
+        queue.patch_context.assert_called_once_with(existing.task_id, kwargs["context"])
+    else:
+        queue.patch_context.assert_not_called()
