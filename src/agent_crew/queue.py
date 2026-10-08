@@ -3103,6 +3103,24 @@ class TaskQueue:
         "BUDGET_EXHAUSTED", "BUDGET_UNVERIFIED",
     })
 
+    def _finish_owner_readmission(self, task_id: str, successor_id: str) -> bool:
+        """Retire a parked task only after its recorded successor exists."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            changed = conn.execute(
+                "UPDATE tasks SET status='cancelled', summary=? "
+                "WHERE task_id=? AND status='needs_human' "
+                "AND json_extract(context, '$.owner_conflict.successor_task_id')=? "
+                "AND EXISTS (SELECT 1 FROM tasks WHERE task_id=?)",
+                (f"owner approval re-admitted as {successor_id}", task_id,
+                 successor_id, successor_id),
+            ).rowcount
+            conn.commit()
+            return bool(changed)
+        finally:
+            conn.close()
+
     def readmit_parked_owner_conflicts(self) -> list[str]:
         """Recheck parked intents on a new generation or bounded transient retry."""
         from agent_crew.cea.providers import SignatureStatus
@@ -3138,6 +3156,10 @@ class TaskQueue:
                     continue
                 if self.cea_config(scope).mode == "enforce" and not engine.verify(source_receipt):
                     continue
+                recorded_successor = marker.get("successor_task_id")
+                if recorded_successor and self._finish_owner_readmission(
+                        task_id, recorded_successor):
+                    continue
                 if self.external_op_get(f"owner-approval:{source_receipt['intent_hash']}") is None:
                     self._request_owner_approval(task, source_receipt, context=task.context)
                 reader = getattr(engine, "snapshots", None)
@@ -3153,6 +3175,7 @@ class TaskQueue:
                     continue
                 # Claim the generation before calling the broker. A second dispatcher
                 # process cannot make another attempt for this task and generation.
+                successor_id = f"owner-readmit-{task_id}-g{snapshot.generation}"
                 conn = self._connect()
                 try:
                     conn.execute("BEGIN IMMEDIATE")
@@ -3172,6 +3195,7 @@ class TaskQueue:
                         conn.rollback()
                         continue
                     owner_marker["last_attempt_generation"] = snapshot.generation
+                    owner_marker["successor_task_id"] = successor_id
                     owner_marker.pop("retry_generation", None)
                     owner_marker.pop("retry_not_before", None)
                     context["owner_conflict"] = owner_marker
@@ -3182,7 +3206,6 @@ class TaskQueue:
                     conn.close()
                 # The task receipt is immutable at the database boundary. Re-admit
                 # into a successor row; the parked row remains as the audit record.
-                successor_id = f"owner-readmit-{task_id}-g{snapshot.generation}"
                 successor_context = dict(context)
                 successor_context.pop("owner_conflict", None)
                 successor_context["original_task_id"] = task_id
@@ -3247,14 +3270,7 @@ class TaskQueue:
                             conn.commit()
                         finally:
                             conn.close()
-                conn = self._connect()
-                try:
-                    conn.execute("UPDATE tasks SET status='cancelled', summary=? "
-                                 "WHERE task_id=? AND status='needs_human'",
-                                 (f"owner approval re-admitted as {successor_id}", task_id))
-                    conn.commit()
-                finally:
-                    conn.close()
+                self._finish_owner_readmission(task_id, successor_id)
                 admitted.append(successor_id)
             except Exception:
                 logger.exception("owner approval re-admission failed for %s", task_id)

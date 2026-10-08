@@ -416,9 +416,19 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
         cea_providers={**WIRED, "snapshots": snapshot,
                        "capabilities": OwnerRegistry(), "runtime": runtime,
                        "budgets": budget})
-    assert unenforced_budget.readmit_parked_owner_conflicts() == ["owner-readmit-t2-g10"]
-    assert q.get_task("t2").status == "cancelled"
+    with sqlite3.connect(q._db_path) as connection:
+        connection.execute("CREATE TRIGGER fail_owner_cancel BEFORE UPDATE OF status ON tasks "
+                           "WHEN OLD.task_id='t2' AND NEW.status='cancelled' "
+                           "BEGIN SELECT RAISE(ABORT, 'cancel failed'); END")
+    assert unenforced_budget.readmit_parked_owner_conflicts() == []
+    assert q.get_task("t2").status == "needs_human"
     assert q.get_task("owner-readmit-t2-g10").status == "pending"
+    with sqlite3.connect(q._db_path) as connection:
+        connection.execute("DROP TRIGGER fail_owner_cancel")
+    snapshot.generation = 11
+    assert unenforced_budget.readmit_parked_owner_conflicts() == []
+    assert q.get_task("t2").status == "cancelled"
+    assert q.get_task("owner-readmit-t2-g11") is None
 
 
 def test_owner_request_without_command_is_counted_once(tmp_path, monkeypatch, caplog):
