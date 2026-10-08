@@ -19,6 +19,7 @@ def pending(tmp_path, monkeypatch):
     monkeypatch.setenv("ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS", "120")
     policy = tmp_path / "policy.json"
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    monkeypatch.setattr(pipeline, "_announce_fix_budget_exhausted", lambda **kwargs: None)
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest(task_id="impl-591", task_type="implement",
                               description="root", branch="feature"))
@@ -88,6 +89,78 @@ def test_timeout_enqueues_at_baseline_with_explicit_reason(pending, monkeypatch)
     assert receipt["canary_reason"] == "contract_wait_timeout"
     assert receipt["canary_applied"] == 0
     assert reresolve_pending_rounds_caps(restarted, now=verdict_at + 122) == 0
+
+
+def test_resume_routes_new_fix_and_only_once(pending, monkeypatch):
+    queue, _, verdict_at = pending
+    _clock(monkeypatch, verdict_at + 121)
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+    created = []
+    reresolve_pending_rounds_caps(queue, now=verdict_at + 121,
+                                  pane_map={"implementer": "%1", "codex": "%1"},
+                                  on_fix_enqueued=created.append)
+    assert created == ["implementer"]
+    fix = queue.get_task(pipeline.fix_task_id("review-591", 2))
+    assert fix.context["implementer_agent"] == "codex"
+    reresolve_pending_rounds_caps(queue, now=verdict_at + 122,
+                                  on_fix_enqueued=created.append)
+    assert len(created) == 1
+
+
+def test_resume_first_settle_allows_budget_comment_then_replay_suppresses_it(pending, monkeypatch):
+    queue, policy, verdict_at = pending
+    _contract(policy, verdict_at + 60)
+    _clock(monkeypatch, verdict_at + 61)
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+    calls = []
+    monkeypatch.setattr(pipeline, "_announce_fix_budget_exhausted",
+                        lambda **kwargs: calls.append(kwargs))
+    reresolve_pending_rounds_caps(queue, now=verdict_at + 61)
+    assert len(calls) == 1
+    reresolve_pending_rounds_caps(queue, now=verdict_at + 62)
+    assert len(calls) == 1
+
+
+def test_resume_retry_suppresses_side_effects(pending, monkeypatch):
+    queue, _, verdict_at = pending
+    _clock(monkeypatch, verdict_at + 121)
+    calls = []
+
+    def no_fix(*args, **kwargs):
+        calls.append(kwargs["suppress_side_effects"])
+        return None
+
+    monkeypatch.setattr(pipeline, "auto_enqueue_fix", no_fix)
+    reresolve_pending_rounds_caps(queue, now=verdict_at + 121)
+    reresolve_pending_rounds_caps(queue, now=verdict_at + 122)
+    assert calls == [False, True]
+
+
+def test_unpinned_during_wait_uses_baseline_cap(pending, monkeypatch):
+    queue, policy, verdict_at = pending
+    _contract(policy, verdict_at + 60)
+    _clock(monkeypatch, verdict_at + 61)
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+    resume = pipeline._resume_pending_rounds_cap
+
+    def unpin_then_resume(*args, **kwargs):
+        monkeypatch.setenv(CANARY_ENV, "different-root")
+        return resume(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "_resume_pending_rounds_cap", unpin_then_resume)
+    assert reresolve_pending_rounds_caps(queue, now=verdict_at + 61) == 1
+    assert queue.get_task(pipeline.fix_task_id("review-591", 2)) is not None
+
+
+def test_pending_and_resolved_history_counterfactual_are_objects(pending, monkeypatch):
+    queue, _, verdict_at = pending
+    history = json.loads(queue.get_tokenomics_shadow_receipt("impl-591")["evidence_json"])["canary_history"]
+    assert isinstance(history[-1]["counterfactual"], dict)
+    _clock(monkeypatch, verdict_at + 121)
+    monkeypatch.setattr(pipeline, "_skip_terminal_pr", lambda *a, **k: False)
+    reresolve_pending_rounds_caps(queue, now=verdict_at + 121)
+    history = json.loads(queue.get_tokenomics_shadow_receipt("impl-591")["evidence_json"])["canary_history"]
+    assert isinstance(history[-1]["counterfactual"], dict)
 
 
 def test_terminal_pr_does_not_replay_unfinishable_cascade_forever(pending, monkeypatch):

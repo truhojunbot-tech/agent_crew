@@ -6741,6 +6741,16 @@ class TaskQueue:
             evidence = {}
         history = evidence.get("canary_history")
         history = list(history) if isinstance(history, list) else []
+        # Pending observations store JSON text in the receipt column for the
+        # compare-and-set replay. Keep history typed consistently with settled
+        # observations, while preserving free-form legacy counterfactuals.
+        if isinstance(counterfactual, str):
+            try:
+                parsed_counterfactual = json.loads(counterfactual)
+            except (TypeError, ValueError):
+                parsed_counterfactual = None
+            if isinstance(parsed_counterfactual, dict):
+                counterfactual = parsed_counterfactual
         history.append({
             "at": at, "decision_source": decision_source,
             "recommendation": recommendation, "applied": bool(applied),
