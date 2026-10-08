@@ -345,6 +345,7 @@ def _server_review_fixture(tmp_path, monkeypatch, *, reviewer, head, publish=Tru
     monkeypatch.setattr(github, "publish_independent_review_status",
                         lambda *a, **k: calls.append("status") or publish)
     monkeypatch.setattr(github, "independent_review_succeeded", lambda *a, **k: True)
+    monkeypatch.setattr(github, "head_checks_state", lambda *a, **k: ("none", ""))
     monkeypatch.setattr(github, "merge_pr", lambda *a, **k: calls.append("merge") or True)
     app = create_app(db_path=db, pane_map={}, push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)

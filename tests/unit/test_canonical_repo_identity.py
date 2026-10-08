@@ -107,6 +107,7 @@ def test_A_merge_uses_worktree_repo_not_dispatcher_cwd(tmp_db, tmp_path, monkeyp
     monkeypatch.setattr("agent_crew.github.merge_pr",
                         lambda pr, **kwargs: calls.append(kwargs["repo"]) or True)
     monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: True)
+    monkeypatch.setattr("agent_crew.github.head_checks_state", lambda *a, **k: ("none", ""))
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(task_id="impl-A", task_type="implement", description="work",
                               branch="fix/canonical"))
@@ -160,6 +161,7 @@ def test_D_no_tester_merge_uses_explicit_review_repo(tmp_db, tmp_path, monkeypat
     _patch_open_pr(monkeypatch)
     monkeypatch.setattr("agent_crew.github.merge_pr", lambda pr, **kw: calls.append(kw["repo"]) or True)
     monkeypatch.setattr("agent_crew.github.independent_review_succeeded", lambda *a, **k: True)
+    monkeypatch.setattr("agent_crew.github.head_checks_state", lambda *a, **k: ("none", ""))
     TaskQueue(tmp_db).enqueue(TaskRequest(task_id="impl-D", task_type="implement",
                                           description="work", branch="fix/canonical"))
     with TestClient(_app(tmp_db, _state_path(tmp_path, []))) as client:
