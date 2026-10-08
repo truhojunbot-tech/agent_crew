@@ -6447,7 +6447,7 @@ def create_app(
         # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
         # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
         from agent_crew.github import (get_repo, independent_review_for_head,
-                                       independent_review_succeeded, merge_pr, pr_state,
+                                       independent_review_succeeded, merge_pr, pr_head_sha, pr_state,
                                        publish_independent_review_status)
         _merge_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         op_key = f"merge:pr:{pr_number}"
@@ -6461,17 +6461,23 @@ def create_app(
         if resv.get("state") == "done":
             logger.info(f"_auto_merge_pr: {op_key} already done — merge not retried")
             return
+        head_sha = pr_head_sha(int(pr_number), repo=_merge_repo) if _merge_repo else ""
+        if head_sha:
+            resv = q().external_op_reset_failed_head(op_key, head_sha) or resv
+
+        def fail(reason: str) -> None:
+            q().external_op_mark(op_key, "failed",
+                                 last_error=f"head={head_sha or 'unknown'} {reason}",
+                                 inc_attempt=True)
+
         # 비가역 실패 누적(conflict/closed 등)은 자동 재시도 안 함 → escalation 대상.
         if resv.get("state") == "failed" and int(resv.get("attempt", 0)) >= _MAX_MERGE_ATTEMPTS:
             logger.warning(f"_auto_merge_pr: {op_key} 실패 {resv.get('attempt')}회(≥{_MAX_MERGE_ATTEMPTS}) — "
                            f"자동 재시도 중단, escalation 필요(last_error={resv.get('last_error')})")
             return
         if not _merge_repo:
-            q().external_op_mark(
-                op_key, "failed",
-                last_error="repo identity unresolved (no explicit repo, no "
-                           "project worktree) — fail-closed, no merge attempted",
-                inc_attempt=True)
+            fail("repo identity unresolved (no explicit repo, no "
+                 "project worktree) — fail-closed, no merge attempted")
             logger.warning(f"_auto_merge_pr: repo identity 미확정 — merge 억제(PR #{pr_number}, "
                            f"mutation 0)")
             return
@@ -6482,13 +6488,11 @@ def create_app(
             logger.info(f"_auto_merge_pr: PR #{pr_number} 이미 merged(재확인) → done 기록, 재merge 안 함")
             return
         if st == "closed":
-            q().external_op_mark(op_key, "failed",
-                                 last_error="PR closed(비가역) — 자동 merge 불가", inc_attempt=True)
+            fail("PR closed(비가역) — 자동 merge 불가")
             logger.warning(f"_auto_merge_pr: PR #{pr_number} closed — 자동 재시도 안 함, escalation 필요")
             return
         if st == "unknown":
-            q().external_op_mark(op_key, "failed",
-                                 last_error="PR 상태 불명(gh 실패) — 다음 재확인 대기", inc_attempt=True)
+            fail("PR 상태 불명(gh 실패) — 다음 재확인 대기")
             logger.warning(f"_auto_merge_pr: PR #{pr_number} 상태 불명 → merge 보류(fail-closed, 재확인)")
             return
         from agent_crew.conformance_gate import _conformance_gate_allows_merge
@@ -6499,7 +6503,7 @@ def create_app(
                           if review_task else None)
         if not implement_task or implement_task.task_type != "implement":
             reason = f"conformance gate lineage unresolved for review {review_task_id}"
-            q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
+            fail(reason)
             logger.warning("_auto_merge_pr: PR #%s %s", pr_number, reason)
             return
         implement_ctx = (implement_task.context
@@ -6514,7 +6518,7 @@ def create_app(
                 fail_closed=True):
             gate_record = q().get_task_context(implement_task.task_id).get("conformance_gate", {})
             reason = gate_record.get("error") or f"conformance gate BLOCK on PR #{pr_number}"
-            q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
+            fail(reason)
             logger.warning("_auto_merge_pr: %s", reason)
             return
         # The HTTP cascade is allowed to run for every admitted task. Its
@@ -6525,20 +6529,16 @@ def create_app(
         head, reviewer_agent, approved_review_id, reason = independent_review_for_head(
             q(), int(pr_number), _merge_repo, review_task_id)
         if not head:
-            q().external_op_mark(op_key, "failed", last_error=reason, inc_attempt=True)
+            fail(reason)
             logger.warning("_auto_merge_pr: PR #%s review status refused: %s", pr_number, reason)
             return
         if not publish_independent_review_status(
                 _merge_repo, head, approved_review_id, reviewer_agent):
-            q().external_op_mark(op_key, "failed", last_error="review status publish failed",
-                                 inc_attempt=True)
+            fail("review status publish failed")
             logger.warning("_auto_merge_pr: PR #%s review status publish failed", pr_number)
             return
         if not independent_review_succeeded(int(pr_number), _merge_repo):
-            q().external_op_mark(
-                op_key, "failed",
-                last_error="crew/independent-review success missing on PR head",
-                inc_attempt=True)
+            fail("crew/independent-review success missing on PR head")
             logger.warning(f"_auto_merge_pr: PR #{pr_number} lacks successful "
                            "crew/independent-review status — merge refused")
             return
@@ -6552,8 +6552,7 @@ def create_app(
             q().external_op_mark(op_key, "done")
             logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) → done(receipt) — #171/§5")
         else:
-            q().external_op_mark(op_key, "failed",
-                                 last_error="gh pr merge 실패", inc_attempt=True)
+            fail("gh pr merge 실패")
             logger.warning(f"_auto_merge_pr: gh pr merge #{pr_number} 실패 — failed 기록(재시도 가능)")
 
     def _auto_fallback_failed_task(
