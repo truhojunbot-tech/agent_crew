@@ -3122,7 +3122,8 @@ class TaskQueue:
                         continue
                     context = json.loads(row["context"])
                     owner_marker = dict(context.get("owner_conflict") or {})
-                    if snapshot.generation <= int(owner_marker.get("last_attempt_generation", 0)):
+                    previous_generation = int(owner_marker.get("last_attempt_generation", 0))
+                    if snapshot.generation <= previous_generation:
                         conn.rollback()
                         continue
                     owner_marker["last_attempt_generation"] = snapshot.generation
@@ -3144,13 +3145,40 @@ class TaskQueue:
                     description=task.description, branch=task.branch,
                     priority=task.priority, context=successor_context,
                     project=task.project, pr_number=task.pr_number)
-                auth = self.authorize_task(successor, context=successor_context, retry=True)
-                receipt = auth.receipt
-                if not (receipt.get("reuse") or {}).get("approver_identity_verified"):
-                    continue
-                if (receipt.get("reuse") or {}).get("approved_by") is None:
-                    continue
-                self.enqueue_with_receipt(successor, receipt, context=successor_context)
+                approved: bool | None = None
+                enqueued = False
+                try:
+                    auth = self.authorize_task(successor, context=successor_context, retry=True)
+                    receipt = auth.receipt
+                    reuse = receipt.get("reuse") or {}
+                    approved = bool(reuse.get("approver_identity_verified")
+                                    and reuse.get("approved_by"))
+                    if not approved:
+                        continue
+                    # Owner approval does not override STOP, budget, or other
+                    # admission decisions. Those may change without a new policy
+                    # generation, so keep this approved attempt retryable.
+                    if receipt.get("decision") not in ("ALLOW", "REVIEW"):
+                        continue
+                    self.enqueue_with_receipt(successor, receipt, context=successor_context)
+                    enqueued = True
+                finally:
+                    # An authorization error is not a decision that the owner
+                    # withheld approval, so it must not consume this generation.
+                    if approved is not False and not enqueued and self.get_task(successor_id) is None:
+                        conn = self._connect()
+                        try:
+                            conn.execute("BEGIN IMMEDIATE")
+                            conn.execute(
+                                "UPDATE tasks SET context=json_set(context, "
+                                "'$.owner_conflict.last_attempt_generation', ?) "
+                                "WHERE task_id=? AND status='needs_human' "
+                                "AND json_extract(context, "
+                                "'$.owner_conflict.last_attempt_generation')=?",
+                                (previous_generation, task_id, snapshot.generation))
+                            conn.commit()
+                        finally:
+                            conn.close()
                 conn = self._connect()
                 try:
                     conn.execute("UPDATE tasks SET status='cancelled', summary=? "

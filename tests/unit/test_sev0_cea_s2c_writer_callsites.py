@@ -238,10 +238,17 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
                                      produced_at=None, decisions=decisions, in_scope=decisions,
                                      signature=SignatureStatus.VALID, available=True, tier="T0")
 
+    class OwnerRuntime(Runtime):
+        state = RuntimeState.ACTIVE
+
+        def current(self):
+            return RuntimeStateSnapshot(state=self.state, epoch=3, read_failed=False)
+
     snapshot = OwnerSnapshot()
+    runtime = OwnerRuntime()
     q = TaskQueue(str(tmp_path / "t.db"), cea_config=EngineConfig(mode="test"),
                   cea_providers={**WIRED, "snapshots": snapshot,
-                                 "capabilities": OwnerRegistry()})
+                                 "capabilities": OwnerRegistry(), "runtime": runtime})
     import subprocess
     requests = []
     original_run = subprocess.run
@@ -303,7 +310,45 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
                                                                          queue_identity=t.project).identity))
     restarted = TaskQueue(q._db_path, cea_config=EngineConfig(mode="test"),
                           cea_providers={**WIRED, "snapshots": snapshot,
-                                         "capabilities": OwnerRegistry()})
+                                         "capabilities": OwnerRegistry(), "runtime": runtime})
+    original_enqueue = restarted.enqueue_with_receipt
+    enqueue_calls = []
+    failed_once = False
+
+    def transient_enqueue_failure(successor, receipt, **kwargs):
+        nonlocal failed_once
+        enqueue_calls.append(successor.task_id)
+        if successor.task_id == "owner-readmit-t1-g9" and not failed_once:
+            failed_once = True
+            raise RuntimeError("transient enqueue failure")
+        return original_enqueue(successor, receipt, **kwargs)
+
+    monkeypatch.setattr(restarted, "enqueue_with_receipt", transient_enqueue_failure)
+    runtime.state = RuntimeState.STOPPED
+    assert restarted.readmit_parked_owner_conflicts() == []
+    assert enqueue_calls == []  # A signed BLOCK must never reach the row writer.
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    assert q.get_task("owner-readmit-t1-g9") is None
+    runtime.state = RuntimeState.ACTIVE
+    original_authorize = restarted.authorize_task
+    auth_failed_once = False
+
+    def transient_authorize_failure(successor, **kwargs):
+        nonlocal auth_failed_once
+        if successor.task_id == "owner-readmit-t1-g9" and not auth_failed_once:
+            auth_failed_once = True
+            raise RuntimeError("transient authorization failure")
+        return original_authorize(successor, **kwargs)
+
+    monkeypatch.setattr(restarted, "authorize_task", transient_authorize_failure)
+    assert restarted.readmit_parked_owner_conflicts() == []
+    assert auth_failed_once
+    assert enqueue_calls == []
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    assert restarted.readmit_parked_owner_conflicts() == []
+    assert failed_once
+    assert q.get_task("t1").status == "needs_human"
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
     assert restarted.readmit_parked_owner_conflicts() == ["owner-readmit-t1-g9"]
     assert q.get_task("t1").status == "cancelled"
     assert q.get_task("owner-readmit-t1-g9").status == "pending"
