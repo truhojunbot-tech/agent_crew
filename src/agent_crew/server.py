@@ -5878,7 +5878,10 @@ def create_app(
         async def _recheck_merge_ci(number: int, repo: str, review_id: str) -> None:
             try:
                 await asyncio.to_thread(_auto_merge_pr, number, repo=repo,
+                                        repo_cwd=_any_worktree_path(),
                                         review_task_id=review_id)
+            except Exception:
+                logger.exception("CI merge recheck failed for PR #%s — continuing dispatch", number)
             finally:
                 ci_rechecks.discard(number)
 
@@ -5913,19 +5916,22 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
-                    for op in q().pending_ci_merge_ops():
-                        number = op.get("pr_number")
-                        detail = op.get("last_error") or ""
-                        checked = re.search(r" checked=([0-9.]+)", detail)
-                        if (not number or number in ci_rechecks or
-                                (checked and time.time() - float(checked.group(1)) < 10)):
-                            continue
-                        review = q().latest_completed_review_for_pr(int(number))
-                        if not review:
-                            continue
-                        repo = (review.context or {}).get("repo") or ""
-                        ci_rechecks.add(int(number))
-                        asyncio.create_task(_recheck_merge_ci(int(number), repo, review.task_id))
+                    try:
+                        for op in q().pending_ci_merge_ops():
+                            number = op.get("pr_number")
+                            detail = op.get("last_error") or ""
+                            checked = re.search(r" checked=([0-9.]+)", detail)
+                            if (not number or number in ci_rechecks or
+                                    (checked and time.time() - float(checked.group(1)) < 10)):
+                                continue
+                            review = q().latest_completed_review_for_pr(int(number))
+                            if not review:
+                                continue
+                            repo = (review.context or {}).get("repo") or ""
+                            ci_rechecks.add(int(number))
+                            asyncio.create_task(_recheck_merge_ci(int(number), repo, review.task_id))
+                    except Exception:
+                        logger.exception("CI merge recheck scan failed — continuing dispatch")
                     # Shadow-only receipt refresh; a slow contract read must not
                     # delay dispatch or HTTP responses.
                     try:
