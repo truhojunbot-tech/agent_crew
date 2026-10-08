@@ -315,33 +315,48 @@ class SQLiteMemoryStorage:
         query_started = time.perf_counter()
         try:
             with closing(db_connection) as db:
-                dropped = db.execute("SELECT count(*) FROM adr001_memory WHERE " + base +
-                    " AND COALESCE(json_extract(scope,'$.project'),'')=''", args).fetchone()[0]
-                rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
+                # One Python-visible SQLite row for all four reads avoids a GIL
+                # reacquisition for every candidate under CPU contention.
+                def packed_rows(sql: str) -> str:
+                    return ("SELECT json_group_array(json_array(layer,key,value,scope,version)) "
+                            "FROM (" + sql + ")")
+
+                dropped_sql = ("SELECT count(*) FROM adr001_memory WHERE " + base +
+                               " AND COALESCE(json_extract(scope,'$.project'),'')=''")
+                scoped_sql = packed_rows("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
                     + base + " AND COALESCE(json_extract(scope,'$.project'),'')=? "
-                    "ORDER BY created DESC LIMIT ?",
-                    [*args, scope.project, (SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
-                                            else min(limit, SHADOW_RETRIEVAL_MAX_ROWS))]).fetchall()
+                    "ORDER BY created DESC LIMIT ?")
                 predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
                                     if "decision" in layers else [])
-                lineage_rows = db.execute(
+                lineage_sql = packed_rows(
                     "SELECT layer,key,value,scope,version FROM adr001_memory "
                     "WHERE layer='decision' AND key IN (" + ",".join("?" for _ in predecessor_keys)
-                    + ") AND COALESCE(json_extract(scope,'$.project'),'')=?",
-                    [*predecessor_keys, scope.project],
-                ).fetchall() if predecessor_keys else []
-                pr_rows = db.execute(
+                    + ") AND COALESCE(json_extract(scope,'$.project'),'')=?") if predecessor_keys else "'[]'"
+                pr_sql = packed_rows(
                     "SELECT layer,key,value,scope,version FROM adr001_memory "
                     "WHERE layer='decision' "
                     "AND COALESCE(json_extract(scope,'$.project'),'')=? "
                     "AND json_extract(value,'$.pr_number')=? "
                     "AND json_extract(value,'$.task_id')<>? "
-                    "ORDER BY created DESC LIMIT ?",
-                    (scope.project, pr_number, scope.task_id, SHADOW_RETRIEVAL_MAX_ROWS),
-                ).fetchall() if pr_number and "decision" in layers else []
+                    "ORDER BY created DESC LIMIT ?") if pr_number and "decision" in layers else "'[]'"
+                parameters = [*args, *args, scope.project,
+                              SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
+                              else min(limit, SHADOW_RETRIEVAL_MAX_ROWS)]
+                if predecessor_keys:
+                    parameters.extend([*predecessor_keys, scope.project])
+                if pr_number and "decision" in layers:
+                    parameters.extend([scope.project, pr_number, scope.task_id,
+                                       SHADOW_RETRIEVAL_MAX_ROWS])
+                dropped, rows_json, lineage_json, pr_json = db.execute(
+                    "SELECT (" + dropped_sql + "), (" + scoped_sql + "), (" +
+                    lineage_sql + "), (" + pr_sql + ")", parameters,
+                ).fetchone()
         finally:
             if timing is not None:
                 timing["query_ms"] = (time.perf_counter() - query_started) * 1000
+        rows = json.loads(rows_json)
+        lineage_rows = json.loads(lineage_json)
+        pr_rows = json.loads(pr_json)
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
