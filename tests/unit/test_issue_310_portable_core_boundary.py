@@ -21,7 +21,7 @@ PRIVATE_LITERAL_ALLOWLIST = {
         "Optional CEA subprocess default; an environment path can replace it.",
     ("cea/input_providers/budget.py", 36, "/home/truhojun"):
         "Optional CEA quota cache default; an environment path can replace it.",
-    ("cea/input_providers/snapshot.py", 45, "/home/truhojun"):
+    ("cea/input_providers/snapshot.py", 46, "/home/truhojun"):
         "Optional CEA snapshot default; an environment path can replace it.",
     ("cea/wiring.py", 69, "/home/truhojun"):
         "Optional CEA capability registry default; environment configurable.",
