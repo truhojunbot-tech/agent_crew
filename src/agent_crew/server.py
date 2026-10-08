@@ -5880,6 +5880,17 @@ def create_app(
         active_worktrees: set[str] = set()    # worktree lease: 해석된 worktree 경로
         active_tasks: dict[str, asyncio.Task] = {}   # task_id → asyncio.Task
         task_slots: dict[str, str] = {}       # task_id → worker_id
+        ci_rechecks: set[int] = set()
+
+        async def _recheck_merge_ci(number: int, repo: str, review_id: str) -> None:
+            try:
+                await asyncio.to_thread(_auto_merge_pr, number, repo=repo,
+                                        repo_cwd=_any_worktree_path(),
+                                        review_task_id=review_id)
+            except Exception:
+                logger.exception("CI merge recheck failed for PR #%s — continuing dispatch", number)
+            finally:
+                ci_rechecks.discard(number)
 
         # Keep every configured role for an agent; the execution slot still
         # serializes that agent's tasks across those roles.
@@ -5912,6 +5923,22 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    try:
+                        for op in q().pending_ci_merge_ops():
+                            number = op.get("pr_number")
+                            detail = op.get("last_error") or ""
+                            checked = re.search(r" checked=([0-9.]+)", detail)
+                            if (not number or number in ci_rechecks or
+                                    (checked and time.time() - float(checked.group(1)) < 10)):
+                                continue
+                            review = q().latest_completed_review_for_pr(int(number))
+                            if not review:
+                                continue
+                            repo = (review.context or {}).get("repo") or ""
+                            ci_rechecks.add(int(number))
+                            asyncio.create_task(_recheck_merge_ci(int(number), repo, review.task_id))
+                    except Exception:
+                        logger.exception("CI merge recheck scan failed — continuing dispatch")
                     # Shadow-only receipt refresh; a slow contract read must not
                     # delay dispatch or HTTP responses.
                     try:
@@ -6461,7 +6488,8 @@ def create_app(
         # reservation보다 먼저 linearize되면 admitted=False로 차단(별도 STOP 체크와 reserve 사이의
         # TOCTOU 제거). §5: crash(merge 후 done 전)는 재기동 시 reserved 보고 pr_state 재확인.
         from agent_crew.github import (get_repo, independent_review_for_head,
-                                       independent_review_succeeded, merge_pr, pr_head_sha, pr_state,
+                                       independent_review_succeeded, head_checks_state,
+                                       merge_pr, pr_head_sha, pr_state,
                                        publish_independent_review_status)
         _merge_repo = repo or (get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
         op_key = f"merge:pr:{pr_number}"
@@ -6478,6 +6506,16 @@ def create_app(
         head_sha = pr_head_sha(int(pr_number), repo=_merge_repo) if _merge_repo else ""
         if head_sha:
             resv = q().external_op_reset_failed_head(op_key, head_sha) or resv
+
+        if (resv.get("state") == "failed" and
+                (resv.get("last_error") or "").startswith(f"head={head_sha} CI red:")):
+            logger.warning("_auto_merge_pr: PR #%s red CI on unchanged head — merge refused",
+                           pr_number)
+            return
+        if (resv.get("state") == "skipped" and
+                (resv.get("last_error") or "").startswith(
+                    f"head={head_sha} CI pending timed out")):
+            return
 
         def fail(reason: str) -> None:
             q().external_op_mark(op_key, "failed",
@@ -6559,6 +6597,26 @@ def create_app(
         if leave_to_coordinator:
             q().external_op_mark(op_key, "skipped")
             logger.info("_auto_merge_pr: PR #%s merge left to coordinator", pr_number)
+            return
+        ci_state, ci_detail = head_checks_state(_merge_repo, head)
+        if ci_state in ("red", "error"):
+            reason = f"CI {ci_state}: {ci_detail}"
+            fail(reason)
+            logger.warning("_auto_merge_pr: PR #%s %s — merge refused", pr_number, reason)
+            return
+        if ci_state == "pending":
+            previous = resv.get("last_error") or ""
+            match = re.match(rf"head={re.escape(head)} CI pending since=([0-9.]+)", previous)
+            since = float(match.group(1)) if match else time.time()
+            if time.time() - since >= 120:
+                q().external_op_mark(op_key, "skipped",
+                                     last_error=f"head={head} CI pending timed out: {ci_detail}")
+                logger.info("_auto_merge_pr: PR #%s CI pending beyond 120s; merge left to coordinator",
+                            pr_number)
+                return
+            q().external_op_mark(op_key, "reserved",
+                                 last_error=f"head={head} CI pending since={since} "
+                                            f"checked={time.time()}: {ci_detail}")
             return
         # st == 'open' → merge 시도
         ok = merge_pr(int(pr_number), merge_method="squash", repo=_merge_repo)

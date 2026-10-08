@@ -52,6 +52,7 @@ def test_new_head_runs_after_three_failures_while_same_head_stays_capped(
     monkeypatch.setattr(github, "publish_independent_review_status",
                         lambda *a, **k: calls.append(("status", a[1])) or True)
     monkeypatch.setattr(github, "independent_review_succeeded", lambda *a, **k: True)
+    monkeypatch.setattr(github, "head_checks_state", lambda *a, **k: ("none", ""))
     monkeypatch.setattr(github, "merge_pr",
                         lambda *a, **k: calls.append(("merge", head[0])) or True)
     app = create_app(str(tmp_path / "tasks.db"), pane_map={}, project="agent_crew",

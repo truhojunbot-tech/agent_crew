@@ -4967,6 +4967,17 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def pending_ci_merge_ops(self) -> list[dict]:
+        """Merge receipts awaiting a bounded CI recheck on dispatcher ticks."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM external_op WHERE state='reserved' AND "
+                "op_key LIKE 'merge:pr:%' AND last_error LIKE '% CI pending since=%'").fetchall()
+            return [dict(row) for row in rows]
+        finally:
+            conn.close()
+
     def external_op_reset_failed_head(self, op_key: str, head_sha: str) -> Optional[dict]:
         """Give a new PR head its own retry budget in the existing merge receipt."""
         conn = self._connect()

@@ -36,7 +36,8 @@ def checker(tmp_path, monkeypatch):
 
 
 def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
-                 change_type="create", gate_failure="", status_details=None):
+                 change_type="create", gate_failure="", status_details=None,
+                 ci_state=None):
     if not gate_enabled:
         monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -68,6 +69,8 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
 
     monkeypatch.setattr(github, "publish_independent_review_status", publish_status)
     monkeypatch.setattr(github, "independent_review_succeeded", lambda *a, **k: True)
+    monkeypatch.setattr(github, "head_checks_state",
+                        lambda *a, **k: ci_state.pop(0) if ci_state else ("none", ""))
     monkeypatch.setattr(github, "merge_pr", lambda *a, **k: calls.append("merge") or True)
     monkeypatch.setattr(github, "post_pr_comment",
                         lambda *a, **k: calls.append("comment") or True)
@@ -171,6 +174,70 @@ def test_server_auto_merge_unset_still_merges(tmp_path, monkeypatch, checker):
     queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
                                 change_type="modify")
     assert calls == ["comment", "status", "merge"]
+    assert queue.external_op_get("merge:pr:615")["state"] == "done"
+
+
+def _post_followup_test(tmp_path, queue, task_id, review_id):
+    queue.enqueue(TaskRequest(
+        task_id=task_id, task_type="test", branch="fix/615", description="test",
+        context={"prev_task_id": review_id, "pr_number": 615,
+                 "repo": "owner/repo", "allow_duplicate_review": True}))
+    app = create_app(str(tmp_path / "tasks.db"), pane_map={}, project="agent_crew",
+                     push_fn=lambda *a, **k: None,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post(f"/tasks/{task_id}/result", json={
+            "task_id": task_id, "status": "completed", "summary": "tests passed",
+            "pr_number": 615})
+    assert response.status_code == 200, response.text
+
+
+def test_red_ci_refuses_merge_and_records_error(tmp_path, monkeypatch, checker):
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify", ci_state=[("red", "unit")])
+    op = queue.external_op_get("merge:pr:615")
+    assert "merge" not in calls
+    assert op["state"] == "failed" and "CI red: unit" in op["last_error"]
+    _post_followup_test(tmp_path, queue, "test-615-red-again", "review-615")
+    assert "merge" not in calls
+
+
+def test_pending_ci_then_green_merges_on_later_result(tmp_path, monkeypatch, checker):
+    states = [("pending", "unit"), ("green", "")]
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify", ci_state=states)
+    assert "merge" not in calls
+    assert "CI pending since=" in queue.external_op_get("merge:pr:615")["last_error"]
+    assert [op["pr_number"] for op in queue.pending_ci_merge_ops()] == [615]
+    _post_followup_test(tmp_path, queue, "test-615-green", "review-615")
+    assert calls[-1] == "merge"
+    assert queue.pending_ci_merge_ops() == []
+
+
+def test_no_ci_checks_allows_merge(tmp_path, monkeypatch, checker):
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify", ci_state=[("none", "")])
+    assert calls[-1] == "merge"
+    assert queue.external_op_get("merge:pr:615")["state"] == "done"
+
+
+def test_new_head_after_red_ci_is_rechecked(tmp_path, monkeypatch, checker):
+    states = [("red", "unit"), ("green", "")]
+    queue, calls = _submit_test(tmp_path, monkeypatch, title="add widget",
+                                change_type="modify", ci_state=states)
+    assert "merge" not in calls
+    queue.enqueue(TaskRequest(
+        task_id="review-615-new", task_type="review", branch="fix/615",
+        description="review new head", context={"prev_task_id": "impl-615",
+            "pr_number": 615, "repo": "owner/repo", "reviewed_sha": "b" * 40,
+            "allow_duplicate_review": True}))
+    queue.submit_result("review-615-new", TaskResult(
+        "review-615-new", "completed", "approved", verdict="approve", pr_number=615))
+    monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "b" * 40)
+    monkeypatch.setattr(github, "independent_review_for_head",
+                        lambda *a, **k: ("b" * 40, "claude", "review-615-new", "ok"))
+    _post_followup_test(tmp_path, queue, "test-615-new", "review-615-new")
+    assert calls[-1] == "merge"
     assert queue.external_op_get("merge:pr:615")["state"] == "done"
 
 
