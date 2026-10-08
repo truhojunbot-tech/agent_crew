@@ -32,6 +32,7 @@ import json
 import math
 import os
 import fcntl
+import re
 import tempfile
 from contextlib import contextmanager
 import time
@@ -184,10 +185,16 @@ class CanonicalPolicySnapshotReader:
             status = SignatureStatus.UNKEYED if isinstance(sig, dict) else SignatureStatus.UNSIGNED
         now = self._clock()
         content_hash = "sha256:" + hashlib.sha256(canon).hexdigest()
+        signed_content_hash = body.get("content_hash")
+        malformed_content_hash = ("content_hash" in body and not (
+            isinstance(signed_content_hash, str)
+            and re.fullmatch(r"sha256:[0-9a-f]{64}", signed_content_hash)))
+        hwm_hash = content_hash if signed_content_hash is None else signed_content_hash
         rollback_status = None
         if self.hwm_path and status is SignatureStatus.VALID:
-            rollback_status = check_high_water_mark(self.hwm_path, generation, content_hash,
-                                                     bootstrap=not self.hwm_enforce)
+            rollback_status = ("SNAPSHOT_ROLLBACK" if malformed_content_hash else
+                               check_high_water_mark(self.hwm_path, generation, hwm_hash,
+                                                     bootstrap=not self.hwm_enforce))
         elif self.hwm_path and self.hwm_enforce:
             rollback_status = "SNAPSHOT_ROLLBACK"
         if rollback_status and self.hwm_enforce:
