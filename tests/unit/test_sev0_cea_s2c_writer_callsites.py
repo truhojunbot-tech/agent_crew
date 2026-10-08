@@ -244,11 +244,19 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
         def current(self):
             return RuntimeStateSnapshot(state=self.state, epoch=3, read_failed=False)
 
+    class OwnerBudget(Budget):
+        state = BudgetClass.OK
+
+        def budget(self, provider):
+            return ProviderBudget(provider=provider, state=self.state, observed_at=None)
+
     snapshot = OwnerSnapshot()
     runtime = OwnerRuntime()
+    budget = OwnerBudget()
     q = TaskQueue(str(tmp_path / "t.db"), cea_config=EngineConfig(mode="test"),
                   cea_providers={**WIRED, "snapshots": snapshot,
-                                 "capabilities": OwnerRegistry(), "runtime": runtime})
+                                 "capabilities": OwnerRegistry(), "runtime": runtime,
+                                 "budgets": budget})
     import subprocess
     requests = []
     original_run = subprocess.run
@@ -310,7 +318,11 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
                                                                          queue_identity=t.project).identity))
     restarted = TaskQueue(q._db_path, cea_config=EngineConfig(mode="test"),
                           cea_providers={**WIRED, "snapshots": snapshot,
-                                         "capabilities": OwnerRegistry(), "runtime": runtime})
+                                         "capabilities": OwnerRegistry(), "runtime": runtime,
+                                         "budgets": budget})
+    import agent_crew.queue as queue_module
+    now = [queue_module.time.time()]
+    monkeypatch.setattr(queue_module.time, "time", lambda: now[0])
     original_enqueue = restarted.enqueue_with_receipt
     enqueue_calls = []
     failed_once = False
@@ -326,10 +338,20 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
     monkeypatch.setattr(restarted, "enqueue_with_receipt", transient_enqueue_failure)
     runtime.state = RuntimeState.STOPPED
     assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        receipts_during_stop = connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0]
+    for _ in range(10):
+        assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_during_stop
     assert enqueue_calls == []  # A signed BLOCK must never reach the row writer.
     assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
     assert q.get_task("owner-readmit-t1-g9") is None
     runtime.state = RuntimeState.ACTIVE
+    assert restarted.readmit_parked_owner_conflicts() == []  # still in backoff
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
     original_authorize = restarted.authorize_task
     auth_failed_once = False
 
@@ -345,14 +367,36 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
     assert auth_failed_once
     assert enqueue_calls == []
     assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
     assert restarted.readmit_parked_owner_conflicts() == []
     assert failed_once
     assert q.get_task("t1").status == "needs_human"
     assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
     assert restarted.readmit_parked_owner_conflicts() == ["owner-readmit-t1-g9"]
     assert q.get_task("t1").status == "cancelled"
     assert q.get_task("owner-readmit-t1-g9").status == "pending"
     assert q.parked_owner_conflict_count() == 1  # t2 still awaits its own approval
+    t2 = q.get_task("t2")
+    snapshot.generation = 10
+    snapshot.grant = DecisionRev("OWNER-594-t2", "d" * 32,
+                                 capabilities=(f"reuse:{owner_match.id}",),
+                                 projects=(t2.project,),
+                                 intent_hash=intent_hash(intent_for_task(
+                                     t2, context=t2.context,
+                                     queue_identity=t2.project).identity))
+    budget.state = BudgetClass.EXHAUSTED
+    assert restarted.readmit_parked_owner_conflicts() == []
+    assert q.get_task("t2").context["owner_conflict"]["last_attempt_generation"] == 10
+    with sqlite3.connect(q._db_path) as connection:
+        receipts_at_budget_block = connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0]
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS * 10
+    for _ in range(10):
+        assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_budget_block
 
 
 def test_owner_request_without_command_is_counted_once(tmp_path, monkeypatch, caplog):

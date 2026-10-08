@@ -3065,8 +3065,10 @@ class TaskQueue:
         finally:
             conn.close()
 
+    OWNER_CONFLICT_RETRY_SECONDS = 60.0
+
     def readmit_parked_owner_conflicts(self) -> list[str]:
-        """Recheck parked intents once per verified snapshot generation, never per tick."""
+        """Recheck parked intents on a new generation or bounded transient retry."""
         from agent_crew.cea.providers import SignatureStatus
         from agent_crew.cea.wiring import _snapshot
 
@@ -3110,6 +3112,9 @@ class TaskQueue:
                         or snapshot.signature is not SignatureStatus.VALID
                         or snapshot.generation <= int(marker["last_attempt_generation"])):
                     continue
+                if (snapshot.generation == marker.get("retry_generation")
+                        and time.time() < float(marker.get("retry_not_before") or 0)):
+                    continue
                 # Claim the generation before calling the broker. A second dispatcher
                 # process cannot make another attempt for this task and generation.
                 conn = self._connect()
@@ -3126,7 +3131,13 @@ class TaskQueue:
                     if snapshot.generation <= previous_generation:
                         conn.rollback()
                         continue
+                    if (snapshot.generation == owner_marker.get("retry_generation")
+                            and time.time() < float(owner_marker.get("retry_not_before") or 0)):
+                        conn.rollback()
+                        continue
                     owner_marker["last_attempt_generation"] = snapshot.generation
+                    owner_marker.pop("retry_generation", None)
+                    owner_marker.pop("retry_not_before", None)
                     context["owner_conflict"] = owner_marker
                     conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
                                  (json.dumps(context), task_id))
@@ -3147,6 +3158,7 @@ class TaskQueue:
                     project=task.project, pr_number=task.pr_number)
                 approved: bool | None = None
                 enqueued = False
+                retryable = False
                 try:
                     auth = self.authorize_task(successor, context=successor_context, retry=True)
                     receipt = auth.receipt
@@ -3155,27 +3167,43 @@ class TaskQueue:
                                     and reuse.get("approved_by"))
                     if not approved:
                         continue
-                    # Owner approval does not override STOP, budget, or other
-                    # admission decisions. Those may change without a new policy
-                    # generation, so keep this approved attempt retryable.
+                    # Owner approval does not override other admission decisions.
+                    # Only a runtime pause retries on this generation; a permanent
+                    # non-owner refusal must not mint another receipt every tick.
                     if receipt.get("decision") not in ("ALLOW", "REVIEW"):
+                        retryable = ((receipt.get("reason") or {}).get("code")
+                                     == "RUNTIME_STATE_FORBIDS")
                         continue
                     self.enqueue_with_receipt(successor, receipt, context=successor_context)
                     enqueued = True
+                except AdmissionRefused as exc:
+                    # A validator refusal unrelated to runtime state is a
+                    # completed decision for this generation, not a retry.
+                    retryable = (approved is not False
+                                 and exc.gate.reason.partition(":")[0].strip()
+                                 in ("RUNTIME_STATE_FORBIDS", "RUNTIME_EPOCH_ADVANCED"))
+                    raise
+                except Exception:
+                    # Transport/write errors are not owner decisions. Retry them
+                    # with a bound even if authorization returned no receipt.
+                    retryable = approved is not False
+                    raise
                 finally:
-                    # An authorization error is not a decision that the owner
-                    # withheld approval, so it must not consume this generation.
-                    if approved is not False and not enqueued and self.get_task(successor_id) is None:
+                    if retryable and not enqueued and self.get_task(successor_id) is None:
                         conn = self._connect()
                         try:
                             conn.execute("BEGIN IMMEDIATE")
                             conn.execute(
                                 "UPDATE tasks SET context=json_set(context, "
-                                "'$.owner_conflict.last_attempt_generation', ?) "
+                                "'$.owner_conflict.last_attempt_generation', ?, "
+                                "'$.owner_conflict.retry_generation', ?, "
+                                "'$.owner_conflict.retry_not_before', ?) "
                                 "WHERE task_id=? AND status='needs_human' "
                                 "AND json_extract(context, "
                                 "'$.owner_conflict.last_attempt_generation')=?",
-                                (previous_generation, task_id, snapshot.generation))
+                                (previous_generation, snapshot.generation,
+                                 time.time() + self.OWNER_CONFLICT_RETRY_SECONDS,
+                                 task_id, snapshot.generation))
                             conn.commit()
                         finally:
                             conn.close()
