@@ -784,7 +784,7 @@ class AuthorizationEngine:
 
         unavailable = self._unavailable_inputs(snapshot, registry, runtime) + raised
         reviewer, tester = self._j7_contract(intent, snapshot, executor)
-        reuse = self._j5_reuse(intent, registry)
+        reuse = self._j5_reuse(intent, registry, snapshot)
 
         receipt = self._build(
             intent=intent, caller=caller, intent_hash_value=ih, snapshot=snapshot,
@@ -1077,13 +1077,11 @@ class AuthorizationEngine:
                              if r != "implementer" and a != executor), None)
         return reviewer, tester
 
-    def _j5_reuse(self, intent: Intent, registry: CapabilityLookup):
+    def _j5_reuse(self, intent: Intent, registry: CapabilityLookup, snapshot: PolicySnapshotRef):
         """J4/J5 — the registry matched something someone else owns (§6.2, CX-4i).
 
-        Reuse is only ever *recorded* here. Approval is an owner act with a
-        verified identity; under P2a nothing in this process can verify one, so
-        ``approver_identity_verified`` is False and the decision path treats the
-        receipt as identity-dependent — which is exactly why it cannot be ALLOW.
+        Approval comes only from an in-scope record in the verified snapshot.
+        Without one, reuse is identity-dependent and remains OWNER_CONFLICT.
 
         ⛔There is deliberately **no caller argument**. This test used to read
           ``owner != caller.principal``, so "am I the owner?" was answered by the
@@ -1108,6 +1106,22 @@ class AuthorizationEngine:
             return Reuse(ReuseDecision.NEW) if registry.available else None
         owner = matches[0].owner
         if owner and owner != intent.identity.project:
+            capability_id = matches[0].id
+            if snapshot.available and snapshot.signature == SignatureStatus.VALID:
+                now = self._clock()
+                for decision in snapshot.decisions:
+                    if (f"reuse:{capability_id}" in decision.capabilities
+                            and decision.project in (None, intent.identity.project)
+                            and intent.identity.project in decision.projects
+                            and decision.scope_capability_id in (None, f"reuse:{capability_id}")
+                            and decision.scope_work_class in (
+                                None, _work_class_value(intent.identity.work_class))
+                            and decision.scope_repo in (None, intent.identity.target.repo)
+                            and (not decision.intent_hash
+                                 or decision.intent_hash == intent_hash(intent.identity))
+                            and (decision.expires_at is None or decision.expires_at > now)):
+                        return Reuse(ReuseDecision.REUSE, approved_by=decision.decision_id,
+                                     approver_identity_verified=True)
             return Reuse(ReuseDecision.REUSE, approved_by=None, approver_identity_verified=False)
         return Reuse(ReuseDecision.EXTEND, approved_by=None, approver_identity_verified=False)
 
@@ -1281,7 +1295,7 @@ class AuthorizationEngine:
 
         owner_conflict = (reuse is not None
                           and getattr(reuse.decision, "value", reuse.decision) == "REUSE")
-        if owner_conflict:
+        if owner_conflict and not reuse.approver_identity_verified:
             # CXC-2: E4's own answer here was a shadow ALLOW on OWNER_CONFLICT.
             # An unapproved reuse of somebody else's capability is the decision a
             # human owns, and no amount of confidence in the match substitutes.

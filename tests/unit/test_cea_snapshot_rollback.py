@@ -1,6 +1,7 @@
 """Signed snapshot generations cannot move behind the installed high-water mark."""
 import base64
 import hashlib
+import time
 import json
 
 from cryptography.hazmat.primitives import serialization
@@ -60,3 +61,31 @@ def test_invalid_signature_never_advances_and_shadow_is_advisory(tmp_path):
     snapshot.write_text(json.dumps(doc))
     assert shadow.current().signature is SignatureStatus.INVALID
     assert json.loads(mark.read_text())["generation"] == 2
+
+
+def test_signed_owner_reuse_scope_is_preserved_and_tampering_invalidates_it(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    path = tmp_path / "snapshot.json"
+    body = {"generation": 7, "produced_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "decisions": [{"decision_id": "OWNER-594", "body_hash": "a" * 32,
+                           "scope": {"capabilities": ["reuse:other.capability"],
+                                     "projects": ["agent_crew"],
+                                     "capability_id": "reuse:other.capability",
+                                     "project": "agent_crew"},
+                           "intent_hash": "sha256:" + "b" * 64}]}
+    canonical = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    doc = {**body, "signature": {"ed25519": {
+        "key_id": hashlib.sha256(raw).hexdigest()[:16],
+        "value": base64.b64encode(key.sign(canonical)).decode()}}}
+    path.write_text(json.dumps(doc))
+    reader = CanonicalPolicySnapshotReader(str(path), verifier=ed25519_verifier(raw))
+    snapshot = reader.current()
+    assert snapshot.signature is SignatureStatus.VALID
+    assert snapshot.decisions[0].capabilities == ("reuse:other.capability",)
+    assert snapshot.decisions[0].projects == ("agent_crew",)
+    assert snapshot.decisions[0].scope_capability_id == "reuse:other.capability"
+    assert snapshot.decisions[0].intent_hash == "sha256:" + "b" * 64
+    doc["decisions"][0]["scope"]["projects"] = ["another_project"]
+    path.write_text(json.dumps(doc))
+    assert reader.current().signature is SignatureStatus.INVALID

@@ -26,7 +26,8 @@ from agent_crew.cea.engine import EngineConfig
 from agent_crew.cea.intent import WorkClass
 from agent_crew.cea.providers import CapabilityLookup, PolicySnapshotRef, SignatureStatus
 from agent_crew.cea.receipt import (
-    BudgetClass, DecisionRev, HumanGate, HumanGateState, ProviderBudget, RegistryRef)
+    BudgetClass, DecisionRev, HumanGate, HumanGateState, MatchedCapability,
+    ProviderBudget, RegistryRef)
 from agent_crew.cea.runtime_state import RuntimeState, RuntimeStateSnapshot
 from agent_crew.cea.schema import validate_receipt
 from agent_crew.cea.validator import ValidationPoint
@@ -214,6 +215,110 @@ def test_every_enqueued_row_names_the_receipt_that_admitted_it(tmp_path):
     stored = receipt_of(q)
     assert stored["task_id"] == "t1"
     assert stored["state"] == "QUEUED", "the row exists, so the receipt is QUEUED (§3)"
+
+
+def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
+        tmp_path, monkeypatch):
+    from agent_crew.cea.engine import intent_hash
+    owner_match = MatchedCapability(id="shared.owner-capability", owner="other_project",
+                                    repo="example/other_project")
+
+    class OwnerRegistry(Registry):
+        def lookup(self, intent):
+            return CapabilityLookup(registry=RegistryRef(generation="1", hash="r" * 16),
+                                    matches=(owner_match,))
+
+    class OwnerSnapshot(Snapshot):
+        generation = 7
+        grant = None
+
+        def current(self, intent=None):
+            decisions = (DECISION,) + ((self.grant,) if self.grant else ())
+            return PolicySnapshotRef(generation=self.generation, hash=f"h{self.generation}" * 8,
+                                     produced_at=None, decisions=decisions, in_scope=decisions,
+                                     signature=SignatureStatus.VALID, available=True, tier="T0")
+
+    snapshot = OwnerSnapshot()
+    q = TaskQueue(str(tmp_path / "t.db"), cea_config=EngineConfig(mode="test"),
+                  cea_providers={**WIRED, "snapshots": snapshot,
+                                 "capabilities": OwnerRegistry()})
+    import subprocess
+    requests = []
+    original_run = subprocess.run
+    def record_owner_request(*args, **kwargs):
+        if args and args[0] == ["owner-request"]:
+            requests.append((args, kwargs))
+            return subprocess.CompletedProcess(args[0], 0)
+        return original_run(*args, **kwargs)
+    monkeypatch.setenv("AGENT_CREW_CEA_OWNER_REQUEST_CMD", "owner-request")
+    monkeypatch.setattr("agent_crew.queue.subprocess.run", record_owner_request)
+    t = task(context=admitted({"pr_number": 594}))
+    q.enqueue(t)
+    assert q.get_task("t1").status == "needs_human"
+    assert q.parked_owner_conflict_count() == 1
+    assert receipt_of(q)["state"] == "HELD"
+    assert q.external_op_get(f"owner-approval:{receipt_of(q)['intent_hash']}")["state"] == "done"
+    q._request_owner_approval(t, receipt_of(q))
+    assert len(requests) == 1
+    request = json.loads(requests[0][1]["input"])
+    assert request["project"] == "agent_crew"
+    assert request["capability_id"] == owner_match.id
+    assert request["capability_owner"] == owner_match.owner
+    assert request["task_id"] == "t1"
+    assert request["pr_number"] == 594
+    from fastapi.testclient import TestClient
+    import agent_crew.server as server
+    from agent_crew.server import create_app
+    monkeypatch.setattr(server, "TaskQueue", lambda *args, **kwargs: q)
+    with TestClient(create_app(q._db_path, pane_map={}, project="agent_crew",
+                               watchdog_disabled=True, anomaly_disabled=True)) as client:
+        health_cea = client.get("/health").json()["cea"]
+        assert health_cea["owner_conflicts_parked"] == 1
+        assert health_cea["owner_approval_requests"] == {"total": 1, "failed": 0}
+        held = client.post("/tasks", json={"task_id": "t2", "task_type": "implement",
+                                           "description": "another owner conflict", "branch": "feature",
+                                           "context": admitted({"pr_number": 594}),
+                                           "project": "agent_crew"})
+        assert held.status_code == 423
+        assert held.json()["reason"] == "OWNER_CONFLICT"
+        assert q.get_task("t2").status == "needs_human"
+        assert q.parked_owner_conflict_count() == 2
+    assert q.readmit_parked_owner_conflicts() == []
+    snapshot.generation = 8
+    assert q.readmit_parked_owner_conflicts() == []
+    assert q.get_task("t1").status == "needs_human"
+    assert q.get_task("t1").context["owner_conflict"]["last_attempt_generation"] == 8
+    with sqlite3.connect(q._db_path) as connection:
+        receipts_at_gen8 = connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0]
+    assert q.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_gen8
+    snapshot.generation = 9
+    snapshot.grant = DecisionRev("OWNER-594", "c" * 32,
+                                 capabilities=(f"reuse:{owner_match.id}",),
+                                 projects=(t.project,),
+                                 intent_hash=intent_hash(intent_for_task(t, context=t.context,
+                                                                         queue_identity=t.project).identity))
+    restarted = TaskQueue(q._db_path, cea_config=EngineConfig(mode="test"),
+                          cea_providers={**WIRED, "snapshots": snapshot,
+                                         "capabilities": OwnerRegistry()})
+    assert restarted.readmit_parked_owner_conflicts() == ["owner-readmit-t1-g9"]
+    assert q.get_task("t1").status == "cancelled"
+    assert q.get_task("owner-readmit-t1-g9").status == "pending"
+    assert q.parked_owner_conflict_count() == 1  # t2 still awaits its own approval
+
+
+def test_owner_request_without_command_is_counted_once(tmp_path, monkeypatch, caplog):
+    q = queue(tmp_path)
+    monkeypatch.delenv("AGENT_CREW_CEA_OWNER_REQUEST_CMD", raising=False)
+    receipt = {"intent_hash": "sha256:" + "a" * 64,
+               "binding": {"matched_capability": {"id": "c", "owner": "owner"}}}
+    q._request_owner_approval(task(), receipt)
+    q._request_owner_approval(task(), receipt)
+    assert q.owner_approval_request_counts() == {"total": 1, "failed": 0}
+    assert "approval request unconfigured" in caplog.text
 
 
 # ═══════════════════════════════════════════════════════════════════════════

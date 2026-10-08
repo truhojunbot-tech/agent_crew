@@ -8,7 +8,9 @@ import logging
 import math
 import os
 import re
+import shlex
 import sqlite3
+import subprocess
 import threading
 import time
 import uuid
@@ -2788,8 +2790,9 @@ class TaskQueue:
         about the database rather than a convention.
 
         In ``shadow`` mode a refusal is recorded on the row
-        (``context.cea_enqueue``) and the task proceeds; in ``enforce`` it
-        raises :class:`AdmissionRefused` and nothing is written.
+        (``context.cea_enqueue``) and the task proceeds. In ``enforce`` a
+        verified OWNER_CONFLICT human gate is parked; other refusals raise
+        :class:`AdmissionRefused` without writing a task row.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
         scope = self._admission_project(task)
@@ -2816,8 +2819,20 @@ class TaskQueue:
         # stops it being a second decision implementation (guard inventory §3).
         context[_cea_cascade.CONTEXT_KEY] = _cea_cascade.decide(
             task.description, context, receipt).as_record()
-        if not gate.proceed:
+        owner_conflict = (not gate.proceed
+                          and gate.outcome is _CeaOutcome.HUMAN_GATE
+                          and (receipt.get("reason") or {}).get("code") == "OWNER_CONFLICT"
+                          and receipt.get("decision") == "HUMAN_GATE"
+                          and receipt.get("intent_hash")
+                          and receipt.get("binding", {}).get("matched_capability"))
+        if not gate.proceed and not owner_conflict:
             raise AdmissionRefused(gate)
+        if owner_conflict:
+            context["owner_conflict"] = {
+                "intent_hash": receipt["intent_hash"],
+                "generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
+                "last_attempt_generation": int(receipt.get("binding", {}).get("policy_generation") or 0),
+            }
         receipt_id = receipt.get("receipt_id")
         # A coordinator can enqueue a review before it has a reviewed_sha.
         # Resolve outside the SQLite write lock; the dispatch-time check still
@@ -2899,7 +2914,7 @@ class TaskQueue:
             conn.execute(
                 """
                 INSERT INTO tasks (task_id, task_type, description, branch, priority, context, status, created_at, project, receipt_id)
-                VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     task.task_id,
@@ -2908,6 +2923,7 @@ class TaskQueue:
                     task.branch,
                     task.priority,
                     json.dumps(context),
+                    "needs_human" if owner_conflict else "pending",
                     time.time(),
                     task.project,
                     receipt_id,
@@ -2916,7 +2932,8 @@ class TaskQueue:
             # §3: the row exists, so the receipt is QUEUED. Inside the same
             # transaction, through the engine's guarded transition — which is
             # where the lifecycle graph and the lineage claim are kept in step.
-            self._cea_transition_in_txn(conn, engine, receipt_id, "QUEUED",
+            self._cea_transition_in_txn(conn, engine, receipt_id,
+                                        "HELD" if owner_conflict else "QUEUED",
                                         note=f"enqueue: {gate.outcome.value}")
             conn.commit()
         except sqlite3.IntegrityError as e:
@@ -2986,7 +3003,166 @@ class TaskQueue:
                 conn.close()
         except Exception:
             logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
+        if owner_conflict:
+            try:
+                self._request_owner_approval(task, receipt, context=context)
+            except Exception:
+                logger.exception("OWNER_CONFLICT request failed after parking %s", task.task_id)
         return task.task_id
+
+    def _request_owner_approval(self, task: TaskRequest, receipt: dict, *,
+                                context: Optional[dict] = None) -> None:
+        """One best-effort coordinator request per intent, with STOP admission."""
+        intent_hash = receipt["intent_hash"]
+        op_key = f"owner-approval:{intent_hash}"
+        reserved = self.external_op_reserve(op_key, task.pr_number)
+        if not reserved.get("admitted") or not reserved.get("reserved"):
+            return
+        matched = (receipt.get("binding") or {}).get("matched_capability") or {}
+        payload = {
+            "project": task.project,
+            "capability_id": matched.get("id"),
+            "intent_hash": intent_hash,
+            "task_id": task.task_id,
+            "pr_number": task.pr_number or (context or task.context).get("pr_number"),
+            "capability_owner": matched.get("owner"),
+            "owner_coordinator": matched.get("owner"),
+        }
+        command = os.getenv("AGENT_CREW_CEA_OWNER_REQUEST_CMD", "").strip()
+        try:
+            if command:
+                subprocess.run(shlex.split(command), input=json.dumps(payload), text=True,
+                               capture_output=True, timeout=10, check=True)
+            else:
+                logger.warning("OWNER_CONFLICT approval request unconfigured: task=%s intent=%s",
+                               task.task_id, intent_hash)
+            self.external_op_mark(op_key, "done")
+        except Exception as exc:
+            logger.warning("OWNER_CONFLICT approval request failed: task=%s type=%s",
+                           task.task_id, type(exc).__name__)
+            self.external_op_mark(op_key, "failed", last_error=type(exc).__name__)
+
+    def parked_owner_conflict_count(self) -> int:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE status='needs_human' "
+                "AND json_valid(context) AND json_type(context, '$.owner_conflict')='object'"
+            ).fetchone()
+            return int(row["n"])
+        finally:
+            conn.close()
+
+    def owner_approval_request_counts(self) -> dict[str, int]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT state, COUNT(*) AS n FROM external_op "
+                "WHERE op_key LIKE 'owner-approval:%' GROUP BY state"
+            ).fetchall()
+            counts = {r["state"]: int(r["n"]) for r in rows}
+            return {"total": sum(counts.values()), "failed": counts.get("failed", 0)}
+        finally:
+            conn.close()
+
+    def readmit_parked_owner_conflicts(self) -> list[str]:
+        """Recheck parked intents once per verified snapshot generation, never per tick."""
+        from agent_crew.cea.providers import SignatureStatus
+        from agent_crew.cea.wiring import _snapshot
+
+        conn = self._connect()
+        try:
+            task_ids = [r["task_id"] for r in conn.execute(
+                "SELECT task_id FROM tasks WHERE status='needs_human' "
+                "AND json_valid(context) AND json_type(context, '$.owner_conflict')='object'"
+            ).fetchall()]
+        finally:
+            conn.close()
+        admitted = []
+        for task_id in task_ids:
+            task = self.get_task(task_id)
+            if task is None or task.status != "needs_human":
+                continue
+            try:
+                scope = self._admission_project(task)
+                intent = intent_for_task(task, context=task.context, queue_identity=scope)
+                engine = self.cea_engine(scope)
+                conn = self._connect()
+                try:
+                    _, source_receipt = self._cea_receipt_for_task_on(conn, task_id)
+                finally:
+                    conn.close()
+                marker = task.context["owner_conflict"]
+                if (source_receipt is None
+                        or source_receipt.get("decision") != "HUMAN_GATE"
+                        or (source_receipt.get("reason") or {}).get("code") != "OWNER_CONFLICT"
+                        or source_receipt.get("intent_hash") != marker.get("intent_hash")):
+                    continue
+                if self.cea_config(scope).mode == "enforce" and not engine.verify(source_receipt):
+                    continue
+                if self.external_op_get(f"owner-approval:{source_receipt['intent_hash']}") is None:
+                    self._request_owner_approval(task, source_receipt, context=task.context)
+                reader = getattr(engine, "snapshots", None)
+                if reader is None:
+                    reader, _, _ = _snapshot(dict(os.environ), mode=self.cea_config(scope).mode)
+                snapshot = reader.current(intent) if reader is not None else None
+                if (snapshot is None or not snapshot.available
+                        or snapshot.signature is not SignatureStatus.VALID
+                        or snapshot.generation <= int(marker["last_attempt_generation"])):
+                    continue
+                # Claim the generation before calling the broker. A second dispatcher
+                # process cannot make another attempt for this task and generation.
+                conn = self._connect()
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    row = conn.execute("SELECT context, status FROM tasks WHERE task_id=?",
+                                       (task_id,)).fetchone()
+                    if row is None or row["status"] != "needs_human":
+                        conn.rollback()
+                        continue
+                    context = json.loads(row["context"])
+                    owner_marker = dict(context.get("owner_conflict") or {})
+                    if snapshot.generation <= int(owner_marker.get("last_attempt_generation", 0)):
+                        conn.rollback()
+                        continue
+                    owner_marker["last_attempt_generation"] = snapshot.generation
+                    context["owner_conflict"] = owner_marker
+                    conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                                 (json.dumps(context), task_id))
+                    conn.commit()
+                finally:
+                    conn.close()
+                # The task receipt is immutable at the database boundary. Re-admit
+                # into a successor row; the parked row remains as the audit record.
+                successor_id = f"owner-readmit-{task_id}-g{snapshot.generation}"
+                successor_context = dict(context)
+                successor_context.pop("owner_conflict", None)
+                successor_context["original_task_id"] = task_id
+                successor_context["prev_task_id"] = task_id
+                successor = TaskRequest(
+                    task_id=successor_id, task_type=task.task_type,
+                    description=task.description, branch=task.branch,
+                    priority=task.priority, context=successor_context,
+                    project=task.project, pr_number=task.pr_number)
+                auth = self.authorize_task(successor, context=successor_context, retry=True)
+                receipt = auth.receipt
+                if not (receipt.get("reuse") or {}).get("approver_identity_verified"):
+                    continue
+                if (receipt.get("reuse") or {}).get("approved_by") is None:
+                    continue
+                self.enqueue_with_receipt(successor, receipt, context=successor_context)
+                conn = self._connect()
+                try:
+                    conn.execute("UPDATE tasks SET status='cancelled', summary=? "
+                                 "WHERE task_id=? AND status='needs_human'",
+                                 (f"owner approval re-admitted as {successor_id}", task_id))
+                    conn.commit()
+                finally:
+                    conn.close()
+                admitted.append(successor_id)
+            except Exception:
+                logger.exception("owner approval re-admission failed for %s", task_id)
+        return admitted
 
     #: #415: how long a pending, unpinned review/test may reserve its PR or
     #: branch. Same bound as the reviewer's absolute dispatch cap

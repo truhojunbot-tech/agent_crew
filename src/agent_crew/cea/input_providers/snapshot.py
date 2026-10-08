@@ -135,6 +135,9 @@ def _in_scope(scope: dict, intent: Optional[Intent]) -> bool:
     if intent is None:
         return True
     ident = intent.identity
+    projects = _strs(scope.get("projects"))
+    if projects and ident.project not in projects:
+        return False
     want = {"project": ident.project,
             "work_class": getattr(ident.work_class, "value", ident.work_class),
             "capability_id": ident.capability_id, "repo": ident.target.repo}
@@ -210,14 +213,23 @@ class CanonicalPolicySnapshotReader:
             #   be granted through the production reader, only through a test
             #   fake that built DecisionRev directly. A verifier that structurally
             #   cannot say yes is not a verifier.
+            scope = d.get("scope") if isinstance(d.get("scope"), dict) else {}
             rev = DecisionRev(decision_id=str(d["decision_id"]), body_hash=str(d["body_hash"]),
                               supersedes=_strs(d.get("supersedes")),
                               principals=_strs(d.get("principals")),
                               build_commits=_strs(d.get("build_commits")),
                               runtimes=_strs(d.get("runtimes")),
-                              project=_scope_project(d.get("scope")), expires_at=expiry)
+                              project=_scope_project(scope), expires_at=expiry,
+                              capabilities=_strs(scope.get("capabilities")),
+                              projects=_strs(scope.get("projects")),
+                              intent_hash=(str(d["intent_hash"]) if d.get("intent_hash") else None),
+                              scope_capability_id=(str(scope["capability_id"])
+                                                   if scope.get("capability_id") else None),
+                              scope_work_class=(str(scope["work_class"])
+                                                if scope.get("work_class") else None),
+                              scope_repo=(str(scope["repo"]) if scope.get("repo") else None))
             decisions.append(rev)
-            if _in_scope(d.get("scope") or {}, intent):
+            if _in_scope(scope, intent):
                 in_scope.append(rev)
         produced = _epoch(doc.get("produced_at"))
         age = None if produced is None else max(0.0, now - produced)

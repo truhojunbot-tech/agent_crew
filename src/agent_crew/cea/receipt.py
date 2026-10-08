@@ -121,6 +121,13 @@ class DecisionRev:
     ``supersedes``."""
     expires_at: Optional[float] = None
     """Parsed expiry of this signed record, retained for ambiguity checks (#494)."""
+    capabilities: tuple[str, ...] = ()
+    projects: tuple[str, ...] = ()
+    intent_hash: Optional[str] = None
+    """Signed owner reuse scope. Empty projects grants no cross-project reuse."""
+    scope_capability_id: Optional[str] = None
+    scope_work_class: Optional[str] = None
+    scope_repo: Optional[str] = None
 
 
 @dataclass(frozen=True)
