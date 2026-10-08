@@ -1181,15 +1181,21 @@ def _lineage_tasks(tasks_by_id: dict, task):
 
 
 def _resume_pending_rounds_cap(queue: TaskQueue, row: dict,
-                               counterfactual: dict, raw: str) -> None:
+                               counterfactual: dict, raw: str, *,
+                               pane_map: Optional[dict] = None,
+                               on_fix_enqueued=None,
+                               first_settle: bool = False) -> None:
     """Replay the idempotent cascade with a durable retry bound."""
     review_id = counterfactual["review_task_id"]
-    auto_enqueue_fix(queue, review_id,
+    created = auto_enqueue_fix(queue, review_id,
+                     pane_map=pane_map,
                      server_project=counterfactual.get("server_project"),
                      repo=counterfactual.get("repo") or "",
                      repo_cwd=counterfactual.get("repo_cwd") or "",
                      require_repo_default=bool(counterfactual.get("require_repo_default")),
-                     suppress_side_effects=True)
+                     suppress_side_effects=not first_settle)
+    if created and on_fix_enqueued is not None:
+        on_fix_enqueued("implementer")
     fix_id = fix_task_id(review_id, counterfactual["round"])
     receipt = queue.get_tokenomics_shadow_receipt(row["task_id"])
     if queue.get_task(fix_id) or (receipt and receipt.get("canary_applied") == 1):
@@ -1200,7 +1206,9 @@ def _resume_pending_rounds_cap(queue: TaskQueue, row: dict,
                        review_id, ROUNDS_CAP_CASCADE_MAX_ATTEMPTS)
 
 
-def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = None) -> int:
+def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = None,
+                                 pane_map: Optional[dict] = None,
+                                 on_fix_enqueued=None) -> int:
     """Settle pending citations and resume switch-on fixes after the wait."""
     now = datetime.now(timezone.utc).timestamp() if now is None else now
     settled = 0
@@ -1218,7 +1226,8 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
             continue
         switch_on = counterfactual.get("switch_on") is True
         if switch_on and not counterfactual.get("pending_reresolve"):
-            _resume_pending_rounds_cap(queue, row, counterfactual, raw)
+            _resume_pending_rounds_cap(queue, row, counterfactual, raw,
+                                       pane_map=pane_map, on_fix_enqueued=on_fix_enqueued)
             continue
         window = (_rounds_cap_wait_seconds() if switch_on
                   else ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS)
@@ -1279,7 +1288,8 @@ def reresolve_pending_rounds_caps(queue: TaskQueue, *, now: Optional[float] = No
             settled += 1
             if switch_on:
                 _resume_pending_rounds_cap(queue, row, counterfactual,
-                                           json.dumps(counterfactual))
+                                           json.dumps(counterfactual), pane_map=pane_map,
+                                           on_fix_enqueued=on_fix_enqueued, first_settle=True)
     return settled
 
 
@@ -1509,7 +1519,7 @@ def auto_enqueue_fix(
             counterfactual_cap = prior_counterfactual["counterfactual_cap"]
             canary_citation = json.loads((held or {}).get("canary_recommendation_json") or "{}")
             canary_reason = (held or {}).get("canary_reason") or canary_reason
-        max_rounds = counterfactual_cap if switch_enabled else baseline_cap
+        max_rounds = counterfactual_cap if switch_enabled and canary_pinned else baseline_cap
         if canary_pinned:
             try:
                 queue.record_shadow_rounds_vs_cap(

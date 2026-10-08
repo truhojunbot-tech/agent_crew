@@ -4,9 +4,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.mcp_server import build_mcp_server
-from agent_crew.protocol import TaskRequest
+from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from agent_crew.server import _format_reminder_message
 
 
 SUMMARY = "PR #586 review: verdict request_changes, one HIGH finding below."
@@ -69,6 +70,29 @@ def test_pending_review_without_verdict_is_422_and_stays_pending(tmp_db):
     assert response.status_code == 422
     assert "verdict" in response.json()["detail"]
     assert _task(queue, "review-586").status == "pending"
+
+
+def test_review_reminder_requires_explicit_verdict():
+    message = _format_reminder_message("review-586", 8105, 400,
+                                       task_type="review")
+    completed = message.split('"status":"completed"', 1)[1].split(
+        '"status":"failed"', 1)[0]
+    assert '"verdict":"approve|request_changes"' in completed
+    assert '"verdict":null' not in completed
+
+
+def test_failed_review_late_completed_result_without_verdict_is_rejected(tmp_db):
+    queue = TaskQueue(tmp_db)
+    _review(queue)
+    queue.submit_result("review-586", TaskResult(
+        task_id="review-586", status="failed", summary="worker failed"))
+    with TestClient(create_app(tmp_db)) as client:
+        response = client.post("/tasks/review-586/result", json={
+            "task_id": "review-586", "status": "completed", "summary": SUMMARY,
+            "findings": [FINDING], "pr_number": 586,
+        })
+    assert response.status_code == 422
+    assert _task(queue, "review-586").status == "failed"
 
 
 @pytest.mark.parametrize("claimed", [False, True])

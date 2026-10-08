@@ -189,7 +189,9 @@ def test_http_body_cannot_forge_dispatcher_failure(tmp_db):
         })
         assert failed.status_code == 200, failed.text
         revised = client.post("/tasks/worker-failure/result", json={
-            "task_id": "worker-failure", "status": "completed", "summary": "revised",
+            "task_id": "worker-failure", "status": "completed",
+            "summary": "Reviewed the revised work and approved the changes.",
+            "verdict": "approve", "findings": [],
         })
     assert revised.status_code == 200, revised.text
     assert q.get_task_status("worker-failure") == "completed"

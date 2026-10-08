@@ -2775,7 +2775,7 @@ def _default_push(pane_id: str, text: str) -> None:
     )
 
 
-def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, project: str = "", mcp_mode: bool = False) -> str:
+def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, project: str = "", mcp_mode: bool = False, task_type: str = "") -> str:
     """Watchdog nudge: agent has been silent past the heartbeat threshold.
 
     In MCP mode (#162) emits a short one-liner — agents already have
@@ -2793,6 +2793,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, pr
             f"If done or blocked call submit_result(...)."
         )
     identity_header = f"    -H 'X-Agent-Crew-Project: {project}' \\\n" if project else ""
+    completed_verdict = '"approve|request_changes"' if task_type == "review" else "null"
     return (
         f"=== AGENT_CREW REMINDER ===\n"
         f"task_id: {task_id}\n"
@@ -2807,7 +2808,7 @@ def _format_reminder_message(task_id: str, port: int, idle_seconds: float, *, pr
         f"{identity_header}"
         f"    -H 'Content-Type: application/json' \\\n"
         f"    -d '{{\"task_id\":\"{task_id}\",\"status\":\"completed\","
-        f"\"summary\":\"...\",\"verdict\":null,\"findings\":[],\"pr_number\":null}}'\n"
+        f"\"summary\":\"...\",\"verdict\":{completed_verdict},\"findings\":[],\"pr_number\":null}}'\n"
         f"\n"
         f"2) STREAM/API TIMEOUT (partial response, can't recover) — POST\n"
         f"   status=\"failed\". The fallback policy will reroute this task\n"
@@ -4387,7 +4388,7 @@ def create_app(
                     try:
                         push_fn(pane_id, _format_reminder_message(
                             task_id, port, idle_for, project=_server_identity()["project"],
-                            mcp_mode=not _push_enabled))
+                            mcp_mode=not _push_enabled, task_type=row["task_type"]))
                     except Exception:
                         logger.exception(
                             f"watchdog: failed to push reminder for {task_id}"
@@ -5907,7 +5908,9 @@ def create_app(
                     # Shadow-only receipt refresh; a slow contract read must not
                     # delay dispatch or HTTP responses.
                     try:
-                        await asyncio.to_thread(_pipeline_reresolve_pending_rounds_caps, q())
+                        await asyncio.to_thread(
+                            _pipeline_reresolve_pending_rounds_caps, q(),
+                            pane_map=pane_map, on_fix_enqueued=_try_push_next)
                     except Exception:
                         logger.exception("rounds-cap shadow re-resolution failed — continuing dispatch")
                     logger.debug(
@@ -6987,7 +6990,8 @@ def create_app(
         # Never inferred from the summary text.
         if (not _REPLAYING.get() and _task is not None
                 and _task.task_type == "review"
-                and _task.status in ("pending", "in_progress")
+                and (_task.status in ("pending", "in_progress")
+                     or (_task.status == "failed" and result.status == "completed"))
                 and _resolve_verdict(result) not in ("approve", "request_changes")):
             raise HTTPException(status_code=422, detail=(
                 "review result requires a `verdict` field: \"approve\" with no "
