@@ -31,6 +31,14 @@ def enqueue_panel_tasks(
     task_ids = []
     for agent in agents:
         ctx = {**context, "agent": agent, "perspective": perspective_map.get(agent, "")}
+        # A panel opinion has no implementation, review, or fix rounds. Keep
+        # that explicit fact in the task's normal risk attribution record.
+        ctx.setdefault("risk_declaration", {
+            "safety_or_live_change": False,
+            "broad_architecture_change": False,
+            "bounded_routine_fix": False,
+            "human_gate_required": False,
+        })
         req = TaskRequest(
             task_id=f"{agent}-{uuid.uuid4().hex[:8]}",
             task_type="discuss",

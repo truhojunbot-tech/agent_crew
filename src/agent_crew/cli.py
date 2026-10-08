@@ -3025,7 +3025,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             return
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
-        review_context = {**_CM}
+        review_context = {**_CM, **risk_context}
         if reviewer:
             review_context["agent_override"] = reviewer
         if no_tester:
@@ -3109,7 +3109,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             if _run_port:
                 _drain_resolvable_gates(_run_port)
             if not no_tester:
-                test_context = {**_CM}
+                test_context = {**_CM, **risk_context}
                 if reviewed_head:
                     test_context["reviewed_sha"] = reviewed_head
                 if _loop_pr_number:
