@@ -154,7 +154,7 @@ def test_server_same_role_retry_marks_root_declaration_inherited(tmp_db, monkeyp
     assert retry["risk_declaration_confidence"] == "high"
 
 
-def test_risky_descendant_heuristic_overrides_inherited_routine(tmp_db):
+def test_risky_descendant_escalates_inherited_routine_without_losing_source(tmp_db):
     queue = TaskQueue(tmp_db)
     _root(queue)
     review_id = _review(queue)
@@ -167,7 +167,9 @@ def test_risky_descendant_heuristic_overrides_inherited_routine(tmp_db):
     attribution = _attribution(queue, fix_id)
     assert attribution["safety_or_live_change"] == 1
     assert attribution["human_gate_required"] == 1
-    assert attribution["risk_declaration_source"] == "heuristic"
+    assert attribution["risk_declaration_source"] == "explicit"
+    assert attribution["risk_declaration_confidence"] == "high"
+    assert queue.get_task_context(fix_id)["risk_declaration"]["escalated_by"] == "classifier_tier3"
 
 
 def test_rate_limit_does_not_create_cross_provider_successor(tmp_db):

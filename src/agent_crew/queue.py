@@ -400,6 +400,20 @@ def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
     return bool(task_id) and _cea_lineage_root_task_id(task_id, ctx) != task_id
 
 
+def _is_implement_root(task: TaskRequest, ctx: dict, *,
+                       successor_provenance: object | None = None) -> bool:
+    """Only a new implement intent needs root risk metadata validation.
+
+    Parent keys prove succession only when the in-process constructor supplied
+    the private provenance token. In particular, HTTP callers may supply
+    ``prev_task_id`` as ordinary context and must still be checked as roots.
+    """
+    trusted_successor = (successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    return (task.task_type == "implement"
+            and not (trusted_successor
+                     and (ctx.get("prev_task_id") or _cea_lineage_parent_from_ctx(ctx))))
+
+
 def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ...]:
     """``target.scope_anchors`` — derived, in this order, from what the task carries.
 
@@ -579,6 +593,8 @@ def _normalize_risk_declaration(value: object) -> dict:
     inherited_from = value.get("inherited_from")
     if isinstance(inherited_from, str) and inherited_from:
         normalized["inherited_from"] = inherited_from
+    if value.get("escalated_by") == "classifier_tier3":
+        normalized["escalated_by"] = "classifier_tier3"
     return normalized
 
 
@@ -1342,6 +1358,10 @@ class DuplicateReviewError(Exception):
     def __init__(self, existing_task_id: str):
         self.existing_task_id = existing_task_id
         super().__init__(f"DUPLICATE_REVIEW: existing task {existing_task_id}")
+
+
+class InvalidRiskTierError(ValueError):
+    """An implement root declared a tier outside integer 0-3."""
 
 
 def _is_issue_number(value) -> bool:
@@ -2768,7 +2788,8 @@ class TaskQueue:
 
     def enqueue_with_receipt(self, task: TaskRequest, receipt: dict, *,
                              context: Optional[dict] = None,
-                             _capacity_predecessor: str = "") -> str:
+                             _capacity_predecessor: str = "",
+                             _successor_provenance: object | None = None) -> str:
         """Write the task row for an admitted intent. **The only writer there is.**
 
         P2: "without a valid receipt there is no enqueue". That is a property of
@@ -2795,6 +2816,11 @@ class TaskQueue:
         :class:`AdmissionRefused` without writing a task row.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
+        missing_root_risk = (_is_implement_root(
+                                 task, context,
+                                 successor_provenance=_successor_provenance)
+                             and "risk_tier" not in context
+                             and "risk_declaration" not in context)
         scope = self._admission_project(task)
         engine = self.cea_engine(scope)
         # ENQUEUE is the one call site that resolves rollout from the *task*:
@@ -2929,6 +2955,9 @@ class TaskQueue:
                     receipt_id,
                 ),
             )
+            if missing_root_risk:
+                self._append_exec_event_on(conn, task.task_id, "missing_risk_metadata",
+                                           admit_at)
             # §3: the row exists, so the receipt is QUEUED. Inside the same
             # transaction, through the engine's guarded transition — which is
             # where the lifecycle graph and the lineage claim are kept in step.
@@ -2959,6 +2988,9 @@ class TaskQueue:
             raise TaskAlreadyExistsError(task.task_id, existing_status) from None
         finally:
             conn.close()
+        if missing_root_risk:
+            logger.warning("implement root %s missing risk_tier and risk_declaration",
+                           task.task_id)
         # #342(C): risk declaration is strictly post-commit telemetry.  Even
         # an unexpected classifier exception can never veto the task INSERT,
         # and a failure leaves the declaration honestly unknown.
@@ -3228,7 +3260,17 @@ class TaskQueue:
                 logger.exception("owner approval re-admission failed for %s", task_id)
         return admitted
 
-    #: #415: how long a pending, unpinned review/test may reserve its PR or
+    def missing_root_risk_metadata_count(self) -> int:
+        """Durable count of admitted implement roots lacking both risk inputs."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM task_exec_events WHERE event='missing_risk_metadata'").fetchone()
+            return int(row[0])
+        finally:
+            conn.close()
+
+     #: #415: how long a pending, unpinned review/test may reserve its PR or
     #: branch. Same bound as the reviewer's absolute dispatch cap
     #: (``AGENT_CREW_DISPATCH_TIMEOUT_REVIEWER`` default): a reservation that
     #: has waited longer than a review may even run is not about to run — its
@@ -3442,6 +3484,14 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
+            if _is_implement_root(task, context,
+                                  successor_provenance=_successor_provenance):
+                if "risk_tier" in context and (
+                        isinstance(context["risk_tier"], bool)
+                        or not isinstance(context["risk_tier"], int)
+                        or not 0 <= context["risk_tier"] <= 3):
+                    raise InvalidRiskTierError(
+                        "implement root context.risk_tier must be an integer 0-3")
             if refusal is None and task.task_type == "implement":
                 cap = self._max_open_implement()
                 is_system_successor = (
@@ -3479,7 +3529,8 @@ class TaskQueue:
                 capacity_predecessor = str(context.get("original_task_id") or "")
             return self.enqueue_with_receipt(
                 task, auth.receipt, context=context,
-                _capacity_predecessor=capacity_predecessor)
+                _capacity_predecessor=capacity_predecessor,
+                _successor_provenance=_successor_provenance)
 
     def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
                           provenance: "_CeaProvenance", code: str, text: str):
