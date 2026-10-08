@@ -3066,6 +3066,10 @@ class TaskQueue:
             conn.close()
 
     OWNER_CONFLICT_RETRY_SECONDS = 60.0
+    OWNER_CONFLICT_TRANSIENT_CODES = frozenset({
+        "RUNTIME_STATE_FORBIDS", "RUNTIME_EPOCH_ADVANCED",
+        "BUDGET_EXHAUSTED", "BUDGET_UNVERIFIED",
+    })
 
     def readmit_parked_owner_conflicts(self) -> list[str]:
         """Recheck parked intents on a new generation or bounded transient retry."""
@@ -3167,21 +3171,25 @@ class TaskQueue:
                                     and reuse.get("approved_by"))
                     if not approved:
                         continue
-                    # Owner approval does not override other admission decisions.
-                    # Only a runtime pause retries on this generation; a permanent
-                    # non-owner refusal must not mint another receipt every tick.
+                    # The enqueue gate is the authority on which receipt codes
+                    # this rollout enforces. An unenforced BLOCK still goes
+                    # through that gate and may be admitted with its audit row.
                     if receipt.get("decision") not in ("ALLOW", "REVIEW"):
-                        retryable = ((receipt.get("reason") or {}).get("code")
-                                     == "RUNTIME_STATE_FORBIDS")
-                        continue
+                        code = str((receipt.get("reason") or {}).get("code") or "")
+                        if _cea_callsites.enforcing(self.cea_config(scope),
+                                                    reason_code=code):
+                            retryable = code in self.OWNER_CONFLICT_TRANSIENT_CODES
+                            continue
                     self.enqueue_with_receipt(successor, receipt, context=successor_context)
                     enqueued = True
                 except AdmissionRefused as exc:
                     # A validator refusal unrelated to runtime state is a
                     # completed decision for this generation, not a retry.
+                    code = exc.gate.reason.partition(":")[0].strip()
+                    if code in ("DECISION_BLOCK", "DECISION_HUMAN_GATE"):
+                        code = str((receipt.get("reason") or {}).get("code") or code)
                     retryable = (approved is not False
-                                 and exc.gate.reason.partition(":")[0].strip()
-                                 in ("RUNTIME_STATE_FORBIDS", "RUNTIME_EPOCH_ADVANCED"))
+                                 and code in self.OWNER_CONFLICT_TRANSIENT_CODES)
                     raise
                 except Exception:
                     # Transport/write errors are not owner decisions. Retry them

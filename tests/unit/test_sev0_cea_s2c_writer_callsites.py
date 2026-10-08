@@ -387,16 +387,38 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
                                      queue_identity=t2.project).identity))
     budget.state = BudgetClass.EXHAUSTED
     assert restarted.readmit_parked_owner_conflicts() == []
-    assert q.get_task("t2").context["owner_conflict"]["last_attempt_generation"] == 10
+    budget_marker = q.get_task("t2").context["owner_conflict"]
+    assert budget_marker["last_attempt_generation"] == 9
+    assert budget_marker["retry_generation"] == 10
     with sqlite3.connect(q._db_path) as connection:
         receipts_at_budget_block = connection.execute(
             "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0]
-    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS * 10
     for _ in range(10):
         assert restarted.readmit_parked_owner_conflicts() == []
     with sqlite3.connect(q._db_path) as connection:
         assert connection.execute(
             "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_budget_block
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
+    assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_budget_block + 1
+    for _ in range(10):
+        assert restarted.readmit_parked_owner_conflicts() == []
+    with sqlite3.connect(q._db_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(DISTINCT receipt_id) FROM authorization_receipts").fetchone()[0] == receipts_at_budget_block + 1
+    now[0] += restarted.OWNER_CONFLICT_RETRY_SECONDS + 1
+    unenforced_budget = TaskQueue(
+        q._db_path,
+        cea_config=EngineConfig(mode="test", enforce_codes=frozenset({
+            "RUNTIME_STATE_FORBIDS", "SNAPSHOT_ROLLBACK"})),
+        cea_providers={**WIRED, "snapshots": snapshot,
+                       "capabilities": OwnerRegistry(), "runtime": runtime,
+                       "budgets": budget})
+    assert unenforced_budget.readmit_parked_owner_conflicts() == ["owner-readmit-t2-g10"]
+    assert q.get_task("t2").status == "cancelled"
+    assert q.get_task("owner-readmit-t2-g10").status == "pending"
 
 
 def test_owner_request_without_command_is_counted_once(tmp_path, monkeypatch, caplog):
