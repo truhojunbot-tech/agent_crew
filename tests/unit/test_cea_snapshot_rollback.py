@@ -90,6 +90,57 @@ def test_same_signed_content_hash_survives_timestamp_only_reemit(tmp_path):
     assert enforcing.current().available
 
 
+def test_same_generation_legacy_body_mark_migrates_to_signed_content_hash(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    snapshot, mark = tmp_path / "snapshot.json", tmp_path / "hwm.json"
+    doc = _signed(key, 2, signed_content_hash=True)
+    snapshot.write_text(json.dumps(doc))
+    body = {k: v for k, v in doc.items() if k != "signature"}
+    legacy_hash = "sha256:" + hashlib.sha256(json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()).hexdigest()
+    assert legacy_hash != doc["content_hash"]
+    mark.write_text(json.dumps({"generation": 2, "content_hash": legacy_hash}))
+    reader = CanonicalPolicySnapshotReader(str(snapshot), verifier=ed25519_verifier(raw),
+        hwm_path=str(mark), hwm_enforce=True, clock=lambda: 1790467200)
+    first = reader.current()
+    assert first.signature is SignatureStatus.VALID
+    assert first.rollback_status is None and first.available
+    assert json.loads(mark.read_text()) == {
+        "generation": 2, "content_hash": doc["content_hash"]}
+    assert reader.current().rollback_status is None
+
+
+def test_same_generation_unknown_mark_still_rolls_back(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    snapshot, mark = tmp_path / "snapshot.json", tmp_path / "hwm.json"
+    snapshot.write_text(json.dumps(_signed(key, 2, signed_content_hash=True)))
+    mark.write_text(json.dumps({"generation": 2, "content_hash": "sha256:" + "0" * 64}))
+    reader = CanonicalPolicySnapshotReader(str(snapshot), verifier=ed25519_verifier(raw),
+        hwm_path=str(mark), hwm_enforce=True, clock=lambda: 1790467200)
+    assert reader.current().rollback_status == "SNAPSHOT_ROLLBACK"
+    assert json.loads(mark.read_text())["content_hash"] == "sha256:" + "0" * 64
+
+
+def test_legacy_body_mark_at_newer_generation_still_rolls_back(tmp_path):
+    key = Ed25519PrivateKey.generate()
+    raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
+    snapshot, mark = tmp_path / "snapshot.json", tmp_path / "hwm.json"
+    doc = _signed(key, 2, signed_content_hash=True)
+    snapshot.write_text(json.dumps(doc))
+    body = {k: v for k, v in doc.items() if k != "signature"}
+    legacy_hash = "sha256:" + hashlib.sha256(json.dumps(
+        body, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()).hexdigest()
+    mark.write_text(json.dumps({"generation": 3, "content_hash": legacy_hash}))
+    reader = CanonicalPolicySnapshotReader(str(snapshot), verifier=ed25519_verifier(raw),
+        hwm_path=str(mark), hwm_enforce=True, clock=lambda: 1790467200)
+    assert reader.current().rollback_status == "SNAPSHOT_ROLLBACK"
+    assert json.loads(mark.read_text())["generation"] == 3
+
+
 def test_changed_signed_content_hash_same_generation_is_rollback(tmp_path):
     key = Ed25519PrivateKey.generate()
     raw = key.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)

@@ -59,12 +59,15 @@ def _directory_fd(path: str):
 
 
 def check_high_water_mark(path: str, generation: int, content_hash: str, *,
-                          bootstrap: bool = False) -> Optional[str]:
+                          bootstrap: bool = False,
+                          legacy_body_hash: Optional[str] = None) -> Optional[str]:
     """Compare and atomically advance a signed snapshot's generation.
 
     The owner installer alone may bootstrap an absent enforce mark. Locking the
     private directory serializes readers so an older concurrent read cannot
-    replace a newer mark. An invalid or unreadable mark always fails closed.
+    replace a newer mark. At the same generation, a legacy whole-body mark for
+    this verified snapshot may be rewritten to its signed content hash. An
+    invalid or unreadable mark always fails closed.
     """
     directory = os.path.dirname(os.path.abspath(path))
     try:
@@ -81,9 +84,15 @@ def check_high_water_mark(path: str, generation: int, content_hash: str, *,
                 if not bootstrap:
                     return "SNAPSHOT_ROLLBACK"
                 old_generation, old_hash = -1, ""
-            if generation < old_generation or (generation == old_generation and content_hash != old_hash):
+            migrate_legacy = (generation == old_generation
+                              and legacy_body_hash is not None
+                              and old_hash == legacy_body_hash
+                              and old_hash != content_hash)
+            if generation < old_generation or (generation == old_generation
+                                               and content_hash != old_hash
+                                               and not migrate_legacy):
                 return "SNAPSHOT_ROLLBACK"
-            if generation > old_generation:
+            if generation > old_generation or migrate_legacy:
                 fd, temporary = tempfile.mkstemp(prefix=".snapshot-hwm-", dir=directory)
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -194,7 +203,9 @@ class CanonicalPolicySnapshotReader:
         if self.hwm_path and status is SignatureStatus.VALID:
             rollback_status = ("SNAPSHOT_ROLLBACK" if malformed_content_hash else
                                check_high_water_mark(self.hwm_path, generation, hwm_hash,
-                                                     bootstrap=not self.hwm_enforce))
+                                                     bootstrap=not self.hwm_enforce,
+                                                     legacy_body_hash=(content_hash if signed_content_hash
+                                                                       is not None else None)))
         elif self.hwm_path and self.hwm_enforce:
             rollback_status = "SNAPSHOT_ROLLBACK"
         if rollback_status and self.hwm_enforce:
