@@ -30,6 +30,23 @@ Both non-root previews print the full plan if the existing root-owned `broker.en
 
 The broker socket has group `crew-authz-clients` and mode 0660. A crew server started before group enrollment cannot use new membership inherited from its old process. The swap launcher uses `sg crew-authz-clients` for the new server when `AGENT_CREW_CEA_BROKER_SOCKET` is set; preflight and `go` test a socket connection through that same launcher before stopping the old server. A manual server launch must likewise use a fresh login with the group or `sg crew-authz-clients -c '<server command>'`.
 
+## Snapshot high-water-mark transition (#639)
+
+The signed snapshot `content_hash` is the HWM comparison value. An existing
+same-generation mark written with the legacy whole-body hash migrates only
+when that mark matches the **exact current verified snapshot body**. In that
+case the reader rewrites the mark to the signed `content_hash` under the HWM
+lock. A mark from an earlier emission at the same generation does not match
+the current body and still returns `SNAPSHOT_ROLLBACK`; the reader does not
+guess that the two emissions had equivalent content.
+
+At the #639 review, the live generation-146 mark began `de440a`, while the
+current body's hash began `ff0d7f` and its signed content hash began `c26f72`.
+That mark cannot migrate through the exact-body rule. #639's acceptance is
+observable there only after the producer advances the generation or the owner
+approves a T0 HWM re-bootstrap. Do not edit or lower the mark as an ordinary
+deploy step.
+
 ## Rollback
 
 Unset `AGENT_CREW_CEA_BROKER_SOCKET`, swap the crew server back to the recorded pre-change build with `scripts/runtime_swap.sh`, and verify `/health`, process PID/port, and a fresh receipt. Stop the broker after the server no longer points at its socket. Do not alter the live sudoers rule outside the phase-2 owner step. Preserve the evidence and failed receipts for review.
