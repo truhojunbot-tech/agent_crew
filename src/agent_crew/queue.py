@@ -398,6 +398,16 @@ def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
     return bool(task_id) and _cea_lineage_root_task_id(task_id, ctx) != task_id
 
 
+def _is_implement_root(task: TaskRequest, ctx: dict) -> bool:
+    """Only a new implement intent needs root risk metadata validation.
+
+    The system's retry/fallback parent keys are the lineage proof. Untrusted
+    callers lose those keys in ``_trusted_enqueue_context`` before this runs.
+    """
+    return (task.task_type == "implement" and not ctx.get("prev_task_id")
+            and not _cea_lineage_parent_from_ctx(ctx))
+
+
 def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ...]:
     """``target.scope_anchors`` — derived, in this order, from what the task carries.
 
@@ -2798,8 +2808,7 @@ class TaskQueue:
         raises :class:`AdmissionRefused` and nothing is written.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
-        missing_root_risk = (task.task_type == "implement"
-                             and not context.get("prev_task_id")
+        missing_root_risk = (_is_implement_root(task, context)
                              and "risk_tier" not in context
                              and "risk_declaration" not in context)
         scope = self._admission_project(task)
@@ -3228,7 +3237,7 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
-            if task.task_type == "implement" and not context.get("prev_task_id"):
+            if _is_implement_root(task, context):
                 if "risk_tier" in context and (
                         isinstance(context["risk_tier"], bool)
                         or not isinstance(context["risk_tier"], int)

@@ -2,10 +2,11 @@
 
 import logging
 
+import pytest
 from fastapi.testclient import TestClient
 
-from agent_crew.protocol import TaskRequest
-from agent_crew.queue import TaskQueue
+from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.queue import TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 from agent_crew.risk_tier import risk_declaration
 from agent_crew.server import create_app
 
@@ -22,7 +23,11 @@ def test_inherited_explicit_tier3_keeps_provenance_and_records_escalation():
     assert declaration["escalated_by"] == "classifier_tier3"
 
 
-def test_invalid_tier_on_implement_root_returns_422(tmp_path):
+@pytest.mark.parametrize("context", [
+    {"risk_tier": "high"},
+    {"risk_tier": "high", "original_task_id": "forged-parent"},
+])
+def test_invalid_tier_on_implement_root_returns_422(tmp_path, context):
     db = str(tmp_path / "tasks.db")
     app = create_app(db, pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
@@ -30,7 +35,7 @@ def test_invalid_tier_on_implement_root_returns_422(tmp_path):
     with TestClient(app) as client:
         response = client.post("/tasks", json={
             "task_id": "bad-root", "task_type": "implement",
-            "description": "work", "context": {"risk_tier": "high"}},
+            "description": "work", "context": context},
             headers={"X-Agent-Crew-Project": "agent_crew"})
     assert response.status_code == 422
     assert "risk_tier" in response.text and "0-3" in response.text
@@ -61,3 +66,37 @@ def test_review_and_test_keep_inherited_tier_unchanged(tmp_path):
             "risk_tier": "high", "risk_declaration": {
                 "bounded_routine_fix": True, "inherited_from": "impl-root"}}))
         assert queue.get_task_status(task_id) == "pending"
+
+
+@pytest.mark.parametrize("task_id,parent_key", [
+    ("retry-impl-root-a1", "original_task_id"),
+    ("fallback-impl-root-d1", "fallback_from_task_id"),
+])
+def test_system_successor_without_risk_metadata_is_not_counted_as_root(
+        tmp_path, task_id, parent_key):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-root", "implement", "work", context={"risk_tier": 1}))
+    queue.submit_result("impl-root", TaskResult("impl-root", "failed", "retry needed"))
+    assert queue.missing_root_risk_metadata_count() == 0
+    queue.enqueue(TaskRequest(task_id, "implement", "work",
+                              context={parent_key: "impl-root"}),
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    assert queue.get_task_status(task_id) == "pending"
+    assert queue.missing_root_risk_metadata_count() == 0
+
+
+@pytest.mark.parametrize("task_id,parent_key", [
+    ("retry-impl-root-a1", "original_task_id"),
+    ("fallback-impl-root-d1", "fallback_from_task_id"),
+])
+def test_system_successor_with_legacy_string_tier_is_not_refused(
+        tmp_path, task_id, parent_key):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-root", "implement", "work", context={"risk_tier": 1}))
+    queue.submit_result("impl-root", TaskResult("impl-root", "failed", "retry needed"))
+    queue.enqueue(TaskRequest(task_id, "implement", "work",
+                              context={parent_key: "impl-root",
+                                       "risk_tier": "high"}),
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    assert queue.get_task_status(task_id) == "pending"
+    assert queue.missing_root_risk_metadata_count() == 0
