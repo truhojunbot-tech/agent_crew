@@ -13,6 +13,8 @@ from agent_crew.github import publish_independent_review_status as real_publish_
     "git@github.com:o/r",
     "git@github.com:o/r.git",
     "https://github.com/o/r.git",
+    "https://WWW.GITHUB.COM/o/r.git",
+    "ssh://git@github.com/o/r.git",
     "o/r",
 ])
 def test_pr_head_sha_normalizes_repo(repo, monkeypatch):
@@ -28,13 +30,29 @@ def test_pr_head_sha_normalizes_repo(repo, monkeypatch):
     assert calls == [["gh", "api", "repos/o/r/pulls/42", "--jq", ".head.sha"]]
 
 
-@pytest.mark.parametrize("repo", ["", "not-a-repo", "o/r/extra", "https://gitlab.com/o/r"])
+@pytest.mark.parametrize("repo", [
+    "", "not-a-repo", "o/r/extra", "https://gitlab.com/o/r",
+    "https://notgithub.com/o/r", "https://gitlab.com/g/github.com/o/r",
+    "o/..", "../r", "o/.", "./r",
+])
 def test_pr_head_sha_rejects_invalid_repo(repo, monkeypatch):
     monkeypatch.setattr(github, "check_gh_installed", lambda: True)
     monkeypatch.setattr(github, "get_repo", lambda **kwargs: "")
     monkeypatch.setattr(github.subprocess, "run",
                         lambda *a, **k: pytest.fail("invalid repo reached gh api"))
     assert github.pr_head_sha(42, repo=repo) == ""
+
+
+@pytest.mark.parametrize("remote,expected", [
+    ("https://notgithub.com/o/r.git", None),
+    ("https://gitlab.com/g/github.com/o/r.git", None),
+    ("https://WWW.GITHUB.COM/o/r.git", "o/r"),
+    ("git@github.com:o/r.git", "o/r"),
+])
+def test_get_repo_keeps_github_host_boundary(remote, expected, monkeypatch):
+    monkeypatch.setattr(github.subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, remote, ""))
+    assert github.get_repo(cwd="/tmp") == expected
 
 
 def test_independent_review_status_reads_ssh_repo(monkeypatch):

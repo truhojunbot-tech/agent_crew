@@ -19,11 +19,10 @@ def _extract_repo_from_url(url: str) -> Optional[str]:
     url = url.strip().rstrip("/")
     if url.endswith(".git"):
         url = url[:-4]
-    if "github.com/" in url:
-        return url.split("github.com/", 1)[1] or None
-    if "github.com:" in url:
-        return url.split("github.com:", 1)[1] or None
-    return None
+    match = re.fullmatch(
+        r"(?i)(?:https?://|ssh://git@)(?:www\.)?github\.com/([^?#]+)"
+        r"|git@(?:www\.)?github\.com:([^?#]+)", url)
+    return (match.group(1) or match.group(2)) if match else None
 
 
 def _repo_slug(repo: Optional[str]) -> str:
@@ -32,7 +31,9 @@ def _repo_slug(repo: Optional[str]) -> str:
         return ""
     slug = repo if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repo) else (
         _extract_repo_from_url(repo) or "")
-    return slug if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug) else ""
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug):
+        return ""
+    return slug if all(part not in (".", "..") for part in slug.split("/")) else ""
 
 
 def _log_gh_failure(op: str, repo: Optional[str], pr_number: Optional[int], result) -> None:
@@ -80,14 +81,7 @@ def get_repo(cwd: Optional[str] = None) -> Optional[str]:
         )
         if result.returncode != 0:
             return None
-        remote = result.stdout.strip()
-        # Extract owner/repo from github.com:owner/repo.git or https://github.com/owner/repo.git
-        if "github.com" in remote:
-            if remote.endswith(".git"):
-                remote = remote[:-4]
-            parts = remote.split("/")
-            if len(parts) >= 2:
-                return f"{parts[-2]}/{parts[-1]}"
+        return _repo_slug(_extract_repo_from_url(result.stdout.strip())) or None
     except Exception:
         pass
     return None
