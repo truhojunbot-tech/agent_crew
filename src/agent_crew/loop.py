@@ -132,15 +132,20 @@ def _existing_successor_id(queue, task_type: str, prev_task_id: str,
                         continue
                 except Exception:
                     pass
-                if context:
-                    try:
-                        queue.patch_context(task.task_id, context)
-                    except Exception:
-                        pass
+                try:
+                    _patch_adopted_review_context(queue, task.task_id, context)
+                except Exception:
+                    continue
             return task.task_id
     except Exception:
         pass  # The HTTP path may still create or reveal the successor.
     return None
+
+
+def _patch_adopted_review_context(queue, task_id: str,
+                                  context: dict | None) -> None:
+    if context:
+        queue.patch_context(task_id, context)
 
 
 def _adopt_duplicate_successor(queue, existing_task_id: str, task_type: str,
@@ -158,6 +163,8 @@ def _adopt_duplicate_successor(queue, existing_task_id: str, task_type: str,
             return None
         if expected_sha and old.get("reviewed_sha") not in (None, expected_sha):
             return None
+        if task_type == "review":
+            _patch_adopted_review_context(queue, existing_task_id, context)
         return existing_task_id
     except (AttributeError, KeyError):
         return None
