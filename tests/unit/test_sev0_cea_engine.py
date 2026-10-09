@@ -67,7 +67,7 @@ def set_task_status(conn, receipt_id, status):
 
 DECISION = DecisionRev(decision_id="T0-1234", body_hash="b" * 32)
 CAPABILITY = MatchedCapability(id="tokenomics.work_class_gate", owner="quota-core",
-                               repo="example/quota-core")
+                               repo="quota-core")
 
 
 class FakeSnapshot:
@@ -146,6 +146,10 @@ def intent(task_id="t1", *, ident=None, **kw) -> Intent:
     return Intent(identity=ident or identity(), task_id=task_id,
                   task_type=kw.pop("task_type", "implement"),
                   description=kw.pop("description", "Add a --json flag"), **kw)
+
+
+def owner_repo_intent(task_id="t1") -> Intent:
+    return intent(task_id, ident=identity(repo="example/quota-core"))
 
 
 def caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON) -> Caller:
@@ -376,12 +380,58 @@ def test_an_unobservable_budget_is_recorded_honestly_and_fails_closed(conn):
 # J5 / J7 / J8
 # ---------------------------------------------------------------------------
 
+def test_reusing_another_owners_capability_in_own_repo_needs_no_owner_gate(conn):
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
+        conn, intent(), caller())
+    assert auth.receipt["reuse"]["decision"] == "REUSE"
+    assert auth.receipt["reuse"]["approved_by"] is None
+    assert auth.code != "OWNER_CONFLICT"
+    assert auth.decision != "HUMAN_GATE"
+
+
+def test_implementing_another_owners_declared_capability_in_own_repo_needs_owner_gate(conn):
+    requested = intent(ident=identity(capability_id=CAPABILITY.id))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
+        conn, requested, caller())
+    assert auth.decision == "HUMAN_GATE" and auth.code == "OWNER_CONFLICT"
+
+
+def test_referencing_another_owners_capability_does_not_claim_implementation(conn):
+    requested = intent(ident=identity(capability_id="agent_crew.own-capability"))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
+        conn, requested, caller())
+    assert auth.code != "OWNER_CONFLICT"
+
+
 def test_owner_conflict_is_a_human_gate_not_a_shadow_allow(conn):
     """CXC-2: E4's own answer was a shadow ALLOW on OWNER_CONFLICT."""
     auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
-        conn, intent(), caller(principal="manual:operator"))
+        conn, owner_repo_intent(), caller(principal="manual:operator"))
     assert auth.decision == "HUMAN_GATE" and auth.code == "OWNER_CONFLICT"
     assert auth.receipt["reuse"]["approver_identity_verified"] is False
+
+
+@pytest.mark.parametrize("target_repo", [
+    "truhojunbot-tech/agent_crew",
+    "git@github.com:truhojunbot-tech/agent_crew.git",
+])
+def test_owner_conflict_normalizes_live_repo_formats(conn, target_repo):
+    capability = MatchedCapability(id="agent-crew.task-pipeline-lifecycle",
+                                   owner="agent_crew", repo="agent_crew")
+    requested = intent(ident=identity(project="alfred", repo=target_repo))
+    auth = engine(capabilities=FakeRegistry(matches=(capability,))).authorize(
+        conn, requested, caller())
+    assert auth.decision == "HUMAN_GATE" and auth.code == "OWNER_CONFLICT"
+
+
+def test_own_repo_slug_reuse_does_not_need_owner_gate(conn):
+    capability = MatchedCapability(id="agent-crew.task-pipeline-lifecycle",
+                                   owner="agent_crew", repo="agent_crew")
+    requested = intent(ident=identity(project="alfred", repo="truhojun/alfred"))
+    auth = engine(capabilities=FakeRegistry(matches=(capability,))).authorize(
+        conn, requested, caller())
+    assert auth.receipt["reuse"]["decision"] == "REUSE"
+    assert auth.code != "OWNER_CONFLICT"
 
 
 @pytest.mark.parametrize("change,approved", [
@@ -394,7 +444,7 @@ def test_owner_conflict_is_a_human_gate_not_a_shadow_allow(conn):
     ({"expires_at": 1.0}, False),
 ])
 def test_signed_owner_reuse_requires_matching_scope(conn, change, approved):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32, **{
         "capabilities": (f"reuse:{CAPABILITY.id}",),
         "projects": (requested.identity.project,),
@@ -409,7 +459,7 @@ def test_signed_owner_reuse_requires_matching_scope(conn, change, approved):
 
 @pytest.mark.parametrize("signature", [SignatureStatus.UNSIGNED, SignatureStatus.INVALID])
 def test_unsigned_owner_reuse_never_approves(conn, signature):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32,
                         capabilities=(f"reuse:{CAPABILITY.id}",),
                         projects=(requested.identity.project,))
@@ -422,7 +472,7 @@ def test_unsigned_owner_reuse_never_approves(conn, signature):
 
 
 def test_owner_reuse_record_with_wrong_repo_does_not_approve(conn):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32,
                         capabilities=(f"reuse:{CAPABILITY.id}",),
                         projects=(requested.identity.project,),
@@ -434,7 +484,7 @@ def test_owner_reuse_record_with_wrong_repo_does_not_approve(conn):
 
 
 def test_owner_reuse_uses_signed_producer_record_even_when_generic_scope_excludes_it(conn):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32,
                         capabilities=(f"reuse:{CAPABILITY.id}",),
                         projects=(requested.identity.project,),
