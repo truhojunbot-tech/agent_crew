@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import hashlib
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -6747,14 +6748,20 @@ def create_app(
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
+            fallback_marker = threading.Event()
+            response_state = {}
             return await asyncio.wait_for(asyncio.to_thread(
-                _ranked_memory.retrieve_ranked, scope, query, role, k, byte_budget),
+                _ranked_memory.retrieve_ranked, scope, query, role, k, byte_budget,
+                fallback_marker=fallback_marker, response_state=response_state),
                 timeout=.300)
         except asyncio.TimeoutError:
-            _ranked_memory.fallback_count += 1
-            head = _ranked_memory.render_head(scope.project)
+            _ranked_memory._record_fallback(fallback_marker)
+            head = response_state.get("head") or {
+                "records": [], "standing_trimmed": 0,
+                "head_hash": hashlib.sha256(b"[]").hexdigest(),
+            }
             return {"head": head["records"], "middle": [], "mode": "fallback",
-                    "pending_vectors": _ranked_memory.missing_vector_count(),
+                    "pending_vectors": response_state.get("pending", 0),
                     "latency_ms": 300.0, "trimmed_bytes": 0,
                     "standing_trimmed": head["standing_trimmed"],
                     "model_id": _ranked_memory.model_id, "head_hash": head["head_hash"]}

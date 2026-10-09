@@ -4,9 +4,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+import re
 import sqlite3
+import threading
 import time
+from array import array
 from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
@@ -20,9 +24,11 @@ from .memory_runtime import (
 logger = logging.getLogger(__name__)
 LATENCY_BUDGET_SECONDS = 0.300
 LAZY_EMBED_LIMIT = 32
+LAZY_EMBED_BATCH = 2
 RRF_K = 60
 HEAD_PRINCIPLE_BYTES = 3600
 HEAD_STANDING_BYTES = 2000
+MIDDLE_CANDIDATE_LIMIT = 96
 
 
 def _body_sql(alias: str) -> str:
@@ -33,10 +39,7 @@ def _body_sql(alias: str) -> str:
 
 def ensure_index_schema(db: sqlite3.Connection) -> None:
     """Install additive indexes and triggers, then backfill old rows idempotently."""
-    names = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
-    for name in ("superseded_by", "invalidated_at"):
-        if name not in names:
-            db.execute(f"ALTER TABLE adr001_memory ADD COLUMN {name} TEXT")
+    # Keep the six-column live table intact: older producers use positional INSERT.
     fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone() is None
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
@@ -50,7 +53,7 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
             ELSE new.value END);
       END;
       CREATE TRIGGER IF NOT EXISTS adr001_fts_au
-        AFTER UPDATE OF value,superseded_by,invalidated_at ON adr001_memory BEGIN
+        AFTER UPDATE OF value ON adr001_memory BEGIN
         DELETE FROM adr001_fts WHERE rowid=old.rowid;
         INSERT INTO adr001_fts(rowid,layer,key,body)
           VALUES(new.rowid,new.layer,new.key,
@@ -73,8 +76,7 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
 
 
 def _effective_sql(alias: str = "m") -> str:
-    return (f"{alias}.superseded_by IS NULL AND {alias}.invalidated_at IS NULL "
-            f"AND json_extract({alias}.value,'$.superseded_at') IS NULL "
+    return (f"json_extract({alias}.value,'$.superseded_at') IS NULL "
             f"AND json_extract({alias}.value,'$.invalidated_at') IS NULL "
             f"AND COALESCE(json_extract({alias}.value,'$.superseded'),0)=0")
 
@@ -157,7 +159,16 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         self.embedder = embedder if embedder is not None else configured_embedder()
         self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
         self.fallback_count = 0
+        self._fallback_lock = threading.Lock()
         self.last_retrieval_mode = "lexical_only"
+
+    def _record_fallback(self, marker: Optional[threading.Event] = None) -> None:
+        with self._fallback_lock:
+            if marker is not None and marker.is_set():
+                return
+            if marker is not None:
+                marker.set()
+            self.fallback_count += 1
 
     def backfill(self) -> None:
         with closing(sqlite3.connect(self.path)) as db:
@@ -169,11 +180,28 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             return db.execute("SELECT count(*) FROM adr001_memory m LEFT JOIN adr001_vec v "
                               "ON v.rowid=m.rowid WHERE v.rowid IS NULL OR v.vec IS NULL").fetchone()[0]
 
-    def _candidates(self, db: sqlite3.Connection, scope: MemoryScope) -> list[dict]:
+    def _candidates(self, db: sqlite3.Connection, scope: MemoryScope,
+                    query: str = "") -> list[dict]:
         clause, params = _scope_sql(scope)
-        rows = db.execute("SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created "
-                          "FROM adr001_memory m WHERE " + clause + " AND " + _effective_sql(),
-                          params).fetchall()
+        prefix = ("SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created "
+                  "FROM adr001_memory m ")
+        terms = re.findall(r"[\w]+", query)[:12]
+        rows = []
+        if terms:
+            expression = " OR ".join('"' + term + '"' for term in terms)
+            rows = db.execute(
+                prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
+                clause + " AND " + _effective_sql() +
+                " AND adr001_fts MATCH ? ORDER BY bm25(adr001_fts) "
+                "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT],
+            ).fetchall()
+        if len(rows) < MIDDLE_CANDIDATE_LIMIT:
+            seen = {row[0] for row in rows}
+            recent = db.execute(prefix + "WHERE " + clause + " AND " + _effective_sql() +
+                                " ORDER BY m.created DESC,m.rowid DESC LIMIT ?",
+                                [*params, MIDDLE_CANDIDATE_LIMIT]).fetchall()
+            rows.extend(row for row in recent if row[0] not in seen)
+            rows = rows[:MIDDLE_CANDIDATE_LIMIT]
         result = [_row_record(row) for row in rows]
         decisions = {hashlib.sha256(json.dumps(row["value"], sort_keys=True).encode()).hexdigest()
                      for row in result if row["layer"] == "decision"}
@@ -213,34 +241,39 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 "standing_trimmed": len([r for r in overflow if r in standing]),
                 "head_hash": hashlib.sha256(rendered).hexdigest()}
 
-    def _lazy_embed(self, candidates: list[dict]) -> int:
+    def _lazy_embed(self, candidates: list[dict], deadline: float) -> int:
         if self.embedder is None:
             return len(candidates)
-        import numpy as np
 
         by_id = {r["rowid"]: r for r in candidates}
         with closing(sqlite3.connect(self.path, timeout=.1)) as db:
             rows = db.execute("SELECT m.rowid,f.body,v.model_id,v.content_sha FROM adr001_memory m "
                               "JOIN adr001_fts f ON f.rowid=m.rowid LEFT JOIN adr001_vec v "
                               "ON v.rowid=m.rowid WHERE m.rowid IN (" +
-                              ",".join("?" for _ in by_id) + ") ORDER BY m.created,m.rowid",
+                              ",".join("?" for _ in by_id) + ") ORDER BY m.created DESC,m.rowid DESC",
                               list(by_id)).fetchall() if by_id else []
             missing = [(rowid, body, hashlib.sha256(body.encode()).hexdigest())
                        for rowid, body, model, digest in rows
                        if model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest()]
-            for rowid, body, digest in missing[:LAZY_EMBED_LIMIT]:
-                try:
-                    vector = np.asarray(self.embedder(body), dtype=np.float32).reshape(-1)
-                    if not vector.size or not np.isfinite(vector).all():
-                        continue
+        # Compute outside a write transaction; other producers share this DB.
+        attempted = 0
+        for rowid, body, digest in missing[:min(LAZY_EMBED_LIMIT, LAZY_EMBED_BATCH)]:
+            if time.perf_counter() >= deadline:
+                break
+            attempted += 1
+            try:
+                vector = array("f", self.embedder(body))
+                if not vector or not all(math.isfinite(v) for v in vector):
+                    continue
+                with closing(sqlite3.connect(self.path, timeout=.1)) as db:
                     db.execute("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
                                "VALUES(?,?,?,?) ON CONFLICT(rowid) DO UPDATE SET "
                                "model_id=excluded.model_id,content_sha=excluded.content_sha,vec=excluded.vec",
                                (rowid, self.model_id, digest, vector.tobytes()))
-                except Exception as exc:
-                    logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
-            db.commit()
-        return max(0, len(missing) - LAZY_EMBED_LIMIT)
+                    db.commit()
+            except Exception as exc:
+                logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
+        return max(0, len(missing) - attempted)
 
     def _rank_middle(self, candidates: list[dict], query: str) -> tuple[list[dict], bool]:
         import re
@@ -265,19 +298,19 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 ",".join("?" for _ in ids) + ")", list(ids))}
         semantic = []
         if self.embedder and vectors:
-            import numpy as np
-            q = np.asarray(self.embedder(query), dtype=np.float32).reshape(-1)
-            qnorm = float(np.linalg.norm(q))
+            q = array("f", self.embedder(query))
+            qnorm = math.sqrt(sum(v * v for v in q))
             for rowid, model, digest, blob in vectors:
                 body = bodies.get(rowid, "")
                 if model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest():
                     continue
-                vector = np.frombuffer(blob, dtype=np.float32)
-                if vector.size != q.size:
+                vector = array("f")
+                vector.frombytes(blob)
+                if len(vector) != len(q):
                     continue
-                denom = qnorm * float(np.linalg.norm(vector))
+                denom = qnorm * math.sqrt(sum(v * v for v in vector))
                 if denom:
-                    semantic.append((rowid, float(np.dot(q, vector) / denom)))
+                    semantic.append((rowid, sum(a * b for a, b in zip(q, vector)) / denom))
         semantic.sort(key=lambda item: (-item[1], item[0]))
         vector_rank = {rowid: rank for rank, (rowid, _) in enumerate(semantic, 1)}
         lexical = {r["rowid"]: rank for rank, r in enumerate(candidates, 1)}
@@ -288,15 +321,24 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         return candidates, bool(vector_rank)
 
     def retrieve_ranked(self, scope: MemoryScope, query: str, role: str,
-                        k: int, byte_budget: int) -> dict:
+                        k: int, byte_budget: int, *,
+                        fallback_marker: Optional[threading.Event] = None,
+                        response_state: Optional[dict] = None) -> dict:
         started = time.perf_counter()
+        deadline = started + LATENCY_BUDGET_SECONDS
         head = self.render_head(scope.project)
+        if response_state is not None:
+            response_state["head"] = head
+        candidates = []
+        pending = 0
         try:
             with closing(sqlite3.connect(self.path)) as db:
-                candidates = self._candidates(db, scope)
+                candidates = self._candidates(db, scope, query)
             head_ids = {r["rowid"] for r in head["records"]}
             middle = [r for r in candidates if r["rowid"] not in head_ids]
-            pending = self._lazy_embed(middle)
+            pending = self._lazy_embed(middle, deadline)
+            if response_state is not None:
+                response_state["pending"] = pending
             middle, vector_used = self._rank_middle(middle, query)
             overflow_ids = {r["rowid"] for r in head["standing_overflow"]}
             middle = head["standing_overflow"] + [r for r in middle
@@ -314,7 +356,13 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                     trimmed += size
             # Refresh effectiveness at the point of rendering, after ranking.
             with closing(sqlite3.connect(self.path)) as db:
-                fresh = {r["rowid"] for r in self._candidates(db, scope)}
+                clause, params = _scope_sql(scope)
+                ids = [r["rowid"] for r in selected]
+                fresh = {row[0] for row in db.execute(
+                    "SELECT m.rowid FROM adr001_memory m WHERE m.rowid IN (" +
+                    ",".join("?" for _ in ids) + ") AND " + clause +
+                    " AND " + _effective_sql(), [*ids, *params],
+                )} if ids else set()
             selected = [r for r in selected if r["rowid"] in fresh]
             elapsed = (time.perf_counter() - started) * 1000
             if elapsed > LATENCY_BUDGET_SECONDS * 1000:
@@ -322,11 +370,10 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             mode = "hybrid" if vector_used else "lexical_only"
         except Exception as exc:
             logger.warning("memory retrieval fallback: %s: %s", type(exc).__name__, exc)
-            self.fallback_count += 1
+            self._record_fallback(fallback_marker)
             terms = set(query.lower().replace("-", " ").split())
-            with closing(sqlite3.connect(self.path)) as db:
-                selected = [r for r in self._candidates(db, scope)
-                            if r["rowid"] not in {h["rowid"] for h in head["records"]}]
+            selected = [r for r in candidates
+                        if r["rowid"] not in {h["rowid"] for h in head["records"]}]
             selected.sort(key=lambda r: _retrieval_rank(
                 MemoryRecord(r["layer"], r["key"], r["value"], MemoryScope(**r["scope"])), terms))
             bounded, used = [], 0
@@ -339,7 +386,6 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                     used += size
             selected = bounded
             trimmed = 0
-            pending = self.missing_vector_count()
             mode = "fallback"
             elapsed = (time.perf_counter() - started) * 1000
         self.last_retrieval_mode = mode
