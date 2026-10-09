@@ -126,6 +126,36 @@ def test_hybrid_shadow_retirement_writes_column(store):
     assert "retired" not in keys(query(store))
 
 
+def test_hybrid_drop_restores_positional_writer_without_resurrection(tmp_path):
+    from scripts.drop_hybrid_memory import drop_hybrid_schema
+
+    path = tmp_path / "memory.db"
+    store = HybridMemoryStorage(str(path))
+    put(store, "retired", layer="failure_pattern", value={"text": "retired"})
+    put(store, "replaced", layer="failure_pattern", value={"text": "replaced"})
+    with sqlite3.connect(path) as db:
+        db.execute("UPDATE adr001_memory SET invalidated_at=123.0 WHERE key='retired'")
+        db.execute("UPDATE adr001_memory SET superseded_by='new' WHERE key='replaced'")
+        db.commit()
+    result = drop_hybrid_schema(path, apply=True)
+    assert result["invalidated"] == 1
+    assert result["superseded"] == 1
+    assert result["backup"]
+    with sqlite3.connect(path) as db:
+        assert len(db.execute("PRAGMA table_info(adr001_memory)").fetchall()) == 6
+        assert db.execute("SELECT count(*) FROM sqlite_master WHERE name IN "
+                          "('adr001_fts','adr001_vec')").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM sqlite_master WHERE type='trigger' "
+                          "AND name LIKE 'adr001_%'").fetchone()[0] == 0
+        db.execute("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)",
+                   ("failure_pattern", "legacy-writer", json.dumps({"text": "live"}),
+                    json.dumps({"project": "alfred"}), 1, 1.0))
+        db.commit()
+    records, _ = SQLiteMemoryStorage(str(path)).retrieve_shadow(
+        MemoryScope(project="alfred"), {"failure_pattern"}, 10)
+    assert {row.key for row in records} == {"legacy-writer"}
+
+
 def test_vector_path_ranks_without_optional_numpy(store):
     put(store, "car-memory", value={"text": "car signal"})
     result = query(store, text="automobile")
