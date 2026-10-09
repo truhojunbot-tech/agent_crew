@@ -149,6 +149,14 @@ def test_closed_pr_records_closer_when_state_lookup_returns_it(q):
     assert q.get_task_context(task_id)["pr_closed_by"] == "github-actions"
 
 
+def test_open_pr_with_state_details_still_cascades(q):
+    task_id = _implement(q)
+    assert auto_enqueue_review(
+        q, task_id, PR, pr_state_fn=lambda _: {"state": "open"},
+    ) is not None
+    assert q.get_task(task_id).status == "completed"
+
+
 def test_closed_pr_actor_lookup_uses_github_event(monkeypatch):
     from agent_crew.github import pr_closed_by
 

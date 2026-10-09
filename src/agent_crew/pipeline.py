@@ -662,6 +662,8 @@ def pr_is_actionable(pr_number, *, pr_state_fn=None, repo: str = "",
     except Exception as e:  # noqa: BLE001 — a lookup never breaks a cascade
         logger.warning(f"pr_is_actionable: lookup failed for PR #{pr_number}: {e}")
         return (False, "unknown")
+    if isinstance(state, dict):
+        return (state.get("state") == "open", state)
     return (state == "open", state or "unknown")
 
 
