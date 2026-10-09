@@ -53,11 +53,12 @@ def test_invalid_env_is_a_usage_error(monkeypatch, tmp_path, raw):
     assert tasks == []
 
 
-def test_absent_tier_preserves_context(monkeypatch, tmp_path):
+def test_absent_tier_refuses_root(monkeypatch, tmp_path):
     monkeypatch.delenv("AGENT_CREW_DEFAULT_RISK_TIER", raising=False)
     result, tasks, _ = _run(monkeypatch, tmp_path)
-    assert result.exit_code == 0, result.output
-    assert "risk_tier" not in tasks[0].context
+    assert result.exit_code != 0
+    assert "--risk-tier" in result.output
+    assert tasks == []
 
 
 def test_tier_one_records_explicit_high_declaration(monkeypatch, tmp_path):

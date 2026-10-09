@@ -43,7 +43,7 @@ def test_invalid_tier_on_implement_root_returns_422(tmp_path, context):
     assert TaskQueue(db).get_task("bad-root") is None
 
 
-def test_missing_metadata_is_accepted_warned_and_visible(tmp_path, caplog):
+def test_missing_metadata_is_refused_at_http_root(tmp_path, caplog):
     db = str(tmp_path / "tasks.db")
     app = create_app(db, pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
@@ -54,15 +54,14 @@ def test_missing_metadata_is_accepted_warned_and_visible(tmp_path, caplog):
             "description": "work", "context": {}},
             headers={"X-Agent-Crew-Project": "agent_crew"})
         health = client.get("/health")
-    assert response.status_code == 201
-    assert "missing risk_tier and risk_declaration" in caplog.text
-    assert health.json()["risk_declaration"]["missing_root_count"] == 1
+    assert response.status_code == 422
+    assert "--risk-tier" in response.text
+    assert health.json()["risk_declaration"]["missing_root_count"] == 0
     queue = TaskQueue(db)
-    assert "_missing_root_risk_metadata" not in queue.get_task("unknown-root").context
-    assert queue.get_exec_state("unknown-root")["events"] == []
+    assert queue.get_task("unknown-root") is None
 
 
-def test_forged_prev_task_id_does_not_hide_missing_root_metadata(tmp_path, caplog):
+def test_forged_prev_task_id_does_not_hide_missing_root_tier(tmp_path, caplog):
     db = str(tmp_path / "tasks.db")
     app = create_app(db, pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
@@ -73,9 +72,9 @@ def test_forged_prev_task_id_does_not_hide_missing_root_metadata(tmp_path, caplo
             "description": "work", "context": {"prev_task_id": "forged-parent"}},
             headers={"X-Agent-Crew-Project": "agent_crew"})
         health = client.get("/health")
-    assert response.status_code == 201
-    assert "missing risk_tier and risk_declaration" in caplog.text
-    assert health.json()["risk_declaration"]["missing_root_count"] == 1
+    assert response.status_code == 422
+    assert "--risk-tier" in response.text
+    assert health.json()["risk_declaration"]["missing_root_count"] == 0
 
 
 def test_missing_risk_event_counts_without_polluting_history(tmp_path):

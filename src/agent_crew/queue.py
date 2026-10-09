@@ -3009,7 +3009,9 @@ class TaskQueue:
         declaration = _unknown_risk_declaration()
         try:
             declaration = _normalize_risk_declaration(
-                risk_declaration(task.description, context)
+                context["risk_declaration"] if isinstance(
+                    context.get("risk_declaration"), dict)
+                else risk_declaration(task.description, context)
             )
             self.patch_context(task.task_id, {"risk_declaration": declaration})
         except Exception:
@@ -3512,6 +3514,37 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
+            # HTTP is the public root-dispatch boundary. A claimed parent in
+            # untrusted context is not proof of succession; only a verified
+            # queue lineage may waive the root declaration.
+            if ingress == "http.tasks" and task.task_type in {
+                    "implement", "review", "test", "discuss"}:
+                parent_id = context.get("prev_task_id")
+                parent = self.get_task(parent_id) if isinstance(parent_id, str) and parent_id else None
+                is_successor = parent is not None and parent.task_id != task.task_id
+                if is_successor:
+                    seen = {task.task_id}
+                    while parent.task_id not in seen:
+                        seen.add(parent.task_id)
+                        previous = parent.context.get("prev_task_id") if isinstance(parent.context, dict) else None
+                        ancestor = self.get_task(previous) if isinstance(previous, str) and previous else None
+                        if ancestor is None:
+                            break
+                        parent = ancestor
+                    root_context = parent.context if isinstance(parent.context, dict) else {}
+                    root_tier = root_context.get("risk_tier")
+                    if (isinstance(root_tier, bool) or not isinstance(root_tier, int)
+                            or not 0 <= root_tier <= 3):
+                        raise InvalidRiskTierError(
+                            "parent lineage lacks --risk-tier (context.risk_tier integer 0-3)")
+                    context["risk_tier"] = root_tier
+                    if isinstance(root_context.get("risk_declaration"), dict):
+                        context["risk_declaration"] = root_context["risk_declaration"]
+                tier = context.get("risk_tier")
+                if not is_successor and (isinstance(tier, bool) or
+                                         not isinstance(tier, int) or not 0 <= tier <= 3):
+                    raise InvalidRiskTierError(
+                        "root task requires --risk-tier (context.risk_tier integer 0-3)")
             if _is_implement_root(task, context,
                                   successor_provenance=_successor_provenance):
                 if "risk_tier" in context and (
