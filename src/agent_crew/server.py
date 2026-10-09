@@ -7234,10 +7234,9 @@ def create_app(
         _artifact_held = None
         _task = q().get_task(task_id)
         _attempt = q().dispatch_binding(task_id).get("attempt_id")
-        if _attempt and not result.attempt_id:
-            raise HTTPException(status_code=422,
-                                detail=str(MissingAttemptRejected(task_id)))
-        if _attempt and result.attempt_id != _attempt:
+        # Legacy worker templates omit attempt_id. Fence only a presented
+        # attempt that disagrees with the current dispatch binding.
+        if _attempt and result.attempt_id and result.attempt_id != _attempt:
             if q().reject_stale_attempt(task_id, result.attempt_id):
                 raise HTTPException(status_code=409,
                                     detail=str(StaleAttemptRejected(task_id)))
@@ -7368,7 +7367,10 @@ def create_app(
             if len(_fallbacks) == 1 and _fallbacks[0].status in ("pending", "in_progress"):
                 _fallback_id = _fallbacks[0].task_id
                 try:
-                    _cancelled = cancel_task(_fallback_id)
+                    # This is an internal worker-result transition. Passing
+                    # the default Header marker directly looks like a stale
+                    # coordinator claim to the generation fence.
+                    _cancelled = cancel_task(_fallback_id, None)
                     if isinstance(_cancelled, dict) and _cancelled.get("status") == "cancelled":
                         _adopted_fallback_id = _fallback_id
                         logger.info("POST /tasks/%s/result: adopted late original; "
@@ -7385,7 +7387,7 @@ def create_app(
             task_type = q().submit_result(task_id, result, nonce=_nonce,
                                           presenter=_presenter,
                                           attempt_id=result.attempt_id,
-                                          require_attempt=True,
+                                          require_attempt=False,
                                           # This one held result is an invitation
                                           # to correct the same execution's refs.
                                           # Keep its RUNNING receipt so P2 can

@@ -244,7 +244,10 @@ DOCUMENTED_MUTATING_ROUTES = {
     ("POST", "/gates"), ("POST", "/gates/{gate_id}/resolve"),
     # Read-only memory query, not a task ingress; no CEA transport required.
     ("POST", "/memory/retrieve_ranked"),
-    ("POST", "/pane_map/reload"), ("POST", "/runtime/coordinator/handoff"),
+    ("POST", "/pane_map/reload"),
+    # Coordinator checkpoint records handoff evidence; it does not enqueue a task.
+    ("POST", "/runtime/coordinator/checkpoint"),
+    ("POST", "/runtime/coordinator/handoff"),
     ("POST", "/tasks"), ("POST", "/tasks/expire-stale"),
     ("POST", "/tasks/{task_id}/checkpoint"), ("POST", "/tasks/{task_id}/result"),
     ("POST", "/tasks/{task_id}/start"),

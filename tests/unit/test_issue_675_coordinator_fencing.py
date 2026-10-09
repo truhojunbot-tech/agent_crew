@@ -110,19 +110,21 @@ def test_headerless_worker_enqueue_and_cancel_survive_first_handoff(tmp_path, mo
         assert client.delete("/tasks/worker-task").status_code == 200
 
 
-def test_missing_attempt_is_distinct_and_stale_probe_never_commits_result(tmp_path, monkeypatch):
+def test_http_allows_legacy_result_without_attempt_but_fences_stale_probe(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     db = str(tmp_path / "tasks.db")
     app = create_app(db, pane_map={}, project="demo", watchdog_disabled=True,
                      anomaly_disabled=True, identity_required=False)
     with TestClient(app) as client:
+        assert client.post("/tasks", json=asdict(_task("legacy"))).status_code == 201
         assert client.post("/tasks", json=asdict(_task("bound"))).status_code == 201
         queue = TaskQueue(db)
+        queue.record_dispatch("legacy", channel="api")
         queue.record_dispatch("bound", channel="api")
-        missing = client.post("/tasks/bound/result", json={
-            "task_id": "bound", "status": "completed", "summary": "done"})
-        assert missing.status_code == 422
-        assert "missing_attempt" in missing.text
+        legacy = client.post("/tasks/legacy/result", json={
+            "task_id": "legacy", "status": "completed", "summary": "done"})
+        assert legacy.status_code == 200
+        assert queue.get_task("legacy").status == "completed"
         assert queue.stale_attempt_count() == 0
         stale = client.post("/tasks/bound/result", json={
             "task_id": "bound", "status": "completed", "summary": "done",
@@ -130,6 +132,25 @@ def test_missing_attempt_is_distinct_and_stale_probe_never_commits_result(tmp_pa
         assert stale.status_code == 409
         assert queue.get_task("bound").status != "completed"
         assert queue.stale_attempt_count() == 1
+
+
+def test_mcp_allows_legacy_result_without_attempt_but_fences_stale_probe(tmp_path):
+    from agent_crew.mcp_server import build_mcp_server
+
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    queue.enqueue(_task("legacy-mcp"))
+    queue.enqueue(_task("bound-mcp"))
+    queue.record_dispatch("legacy-mcp", channel="api")
+    queue.record_dispatch("bound-mcp", channel="api")
+    submit = build_mcp_server(db)._tool_manager._tools["submit_result"].fn
+    accepted = submit(task_id="legacy-mcp", status="completed", summary="done")
+    assert accepted["acknowledged"] is True
+    assert queue.get_task("legacy-mcp").status == "completed"
+    rejected = submit(task_id="bound-mcp", status="completed", summary="done",
+                      attempt_id="old")
+    assert rejected["stale_attempt"] is True
+    assert queue.get_task("bound-mcp").status != "completed"
 
 
 def test_push_message_and_protocol_include_attempt(tmp_path, monkeypatch):
