@@ -1397,6 +1397,9 @@ def task_issue_number(task) -> Optional[int]:
     number = context.get("issue")
     if _is_issue_number(number):
         return number
+    number = context.get("issue_number")
+    if _is_issue_number(number):
+        return number
     return issue_from_description(getattr(task, "description", None))
 
 
@@ -2400,8 +2403,10 @@ class TaskQueue:
         resolved = task_issue_number(task)
         if resolved is not None:
             context["issue"] = resolved
-        elif "issue" in context and not _is_issue_number(context["issue"]):
-            context.pop("issue")
+            context["issue_number"] = resolved
+        else:
+            context.pop("issue", None)
+            context.pop("issue_number", None)
         return context
 
     def _trusted_enqueue_context(self, task: TaskRequest, *,
@@ -2821,6 +2826,10 @@ class TaskQueue:
                                  successor_provenance=_successor_provenance)
                              and "risk_tier" not in context
                              and "risk_declaration" not in context)
+        missing_root_issue = (_is_implement_root(
+                                  task, context,
+                                  successor_provenance=_successor_provenance)
+                              and not _is_issue_number(context.get("issue")))
         scope = self._admission_project(task)
         engine = self.cea_engine(scope)
         # ENQUEUE is the one call site that resolves rollout from the *task*:
@@ -2990,6 +2999,9 @@ class TaskQueue:
             conn.close()
         if missing_root_risk:
             logger.warning("implement root %s missing risk_tier and risk_declaration",
+                           task.task_id)
+        if missing_root_issue:
+            logger.warning("implement root %s enqueued without issue_number",
                            task.task_id)
         # #342(C): risk declaration is strictly post-commit telemetry.  Even
         # an unexpected classifier exception can never veto the task INSERT,
