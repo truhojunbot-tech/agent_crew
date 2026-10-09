@@ -138,6 +138,14 @@ def download_model(model_id: str, cache_dir: Path, query_texts: set[str]):
     if model_id == "all-MiniLM-L6-v2":
         directory = Path.home() / ".cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx"
         model, tokenizer = directory / "model.onnx", directory / "tokenizer.json"
+        if not model.is_file() or not tokenizer.is_file():
+            from huggingface_hub import hf_hub_download
+
+            repo = "sentence-transformers/all-MiniLM-L6-v2"
+            model = Path(hf_hub_download(repo, "onnx/model.onnx",
+                                         cache_dir=str(cache_dir)))
+            tokenizer = Path(hf_hub_download(repo, "tokenizer.json",
+                                             cache_dir=str(cache_dir)))
     else:
         from huggingface_hub import hf_hub_download
 

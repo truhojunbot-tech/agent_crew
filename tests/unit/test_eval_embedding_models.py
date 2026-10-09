@@ -7,7 +7,7 @@ import sqlite3
 import pytest
 
 from scripts.eval_embedding_models import (
-    choose_model, copy_database, load_eval_set, score_hit,
+    choose_model, copy_database, download_model, load_eval_set, score_hit,
 )
 
 
@@ -56,3 +56,33 @@ def test_choose_model_enforces_retrieve_budget_and_uses_recall():
          "p95_retrieve_ms": 1, "model_size_bytes": 0},
     ]
     assert choose_model(rows)["model_id"] == "better"
+
+
+def test_english_control_downloads_to_external_cache_when_chroma_copy_absent(
+        tmp_path, monkeypatch):
+    import huggingface_hub
+    import scripts.eval_embedding_models as evaluator
+
+    monkeypatch.setattr(evaluator.Path, "home", lambda: tmp_path)
+    cache = tmp_path / "model-cache"
+    cache.mkdir()
+    model = cache / "model.onnx"
+    tokenizer = cache / "tokenizer.json"
+    model.write_bytes(b"model")
+    tokenizer.write_bytes(b"tokenizer")
+    calls = []
+
+    def fake_download(repo_id, filename, *, cache_dir):
+        calls.append((repo_id, filename, cache_dir))
+        return str(model if filename == "onnx/model.onnx" else tokenizer)
+
+    monkeypatch.setattr(huggingface_hub, "hf_hub_download", fake_download)
+    monkeypatch.setattr(evaluator, "EvalOnnxEmbedder",
+                        lambda model_path, tokenizer_path, model_id, query_texts: model_id)
+    embedder, size = download_model("all-MiniLM-L6-v2", cache, set())
+    assert embedder == "all-MiniLM-L6-v2"
+    assert size == len(b"modeltokenizer")
+    assert calls == [
+        ("sentence-transformers/all-MiniLM-L6-v2", "onnx/model.onnx", str(cache)),
+        ("sentence-transformers/all-MiniLM-L6-v2", "tokenizer.json", str(cache)),
+    ]
