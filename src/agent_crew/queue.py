@@ -179,6 +179,13 @@ class StaleAttemptRejected(RuntimeError):
         super().__init__(f"stale_attempt: result for {task_id} has an obsolete attempt_id")
 
 
+class MissingAttemptRejected(RuntimeError):
+    """A dispatched worker omitted its attempt binding."""
+
+    def __init__(self, task_id: str):
+        super().__init__(f"missing_attempt: result for {task_id} requires attempt_id")
+
+
 class StaleCoordinatorGeneration(RuntimeError):
     """A coordinator write lost the project's generation fence."""
 
@@ -1659,6 +1666,15 @@ class TaskQueue:
                 conn.execute("COMMIT")
                 return {"accepted": False, "quarantined": True, "receipt_hash": receipt_hash,
                         "current": current, "reason": "stale coordinator_generation"}
+            if current_generation:
+                ready = conn.execute(
+                    "SELECT 1 FROM coordinator_receipts WHERE receipt_hash=? "
+                    "AND event='handoff_checkpoint_ready' AND coordinator_generation=? "
+                    "AND coordinator_id=?",
+                    (checkpoint_ref, current_generation, current["coordinator_id"]),
+                ).fetchone()
+                if ready is None:
+                    raise ValueError("handoff requires a complete, prepared checkpoint_ref")
             state = {
                 "project": project, "coordinator_id": self._unknown(coordinator_id),
                 "coordinator_generation": requested, "provider": self._unknown(provider),
@@ -4501,6 +4517,9 @@ class TaskQueue:
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
+            if row["attempt_id"] and require_attempt and not presented_attempt:
+                conn.execute("ROLLBACK")
+                raise MissingAttemptRejected(task_id)
             if row["attempt_id"] and (presented_attempt or require_attempt):
                 if presented_attempt != row["attempt_id"]:
                     now = time.time()
@@ -5465,6 +5484,43 @@ class TaskQueue:
             return ({"attempt_id": row["attempt_id"],
                      "coordinator_generation": row["coordinator_generation"]}
                     if row else {})
+        finally:
+            conn.close()
+
+    def reject_stale_attempt(self, task_id: str, presented_attempt: str) -> bool:
+        """Record a stale result without touching result or cascade state."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT attempt_id FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            current_attempt = row["attempt_id"] if row else None
+            if not current_attempt or current_attempt == presented_attempt:
+                conn.rollback()
+                return False
+            now = time.time()
+            self._append_exec_event_on(
+                conn, task_id, "stale_attempt", now,
+                presented_attempt=presented_attempt,
+                current_attempt=current_attempt)
+            coordinator = self._coordinator_state_on(conn)
+            digest = hashlib.sha256(json.dumps(
+                [task_id, presented_attempt, current_attempt, now]).encode()).hexdigest()
+            conn.execute(
+                "INSERT INTO coordinator_receipts "
+                "(receipt_hash,event,project,coordinator_id,coordinator_generation,provider,model,"
+                "provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (digest, "stale_attempt_rejected", coordinator["project"],
+                 coordinator["coordinator_id"], coordinator["coordinator_generation"],
+                 coordinator["provider"], coordinator["model"],
+                 coordinator["provider_session_id"], coordinator["checkpoint_ref"],
+                 coordinator["previous_receipt_hash"], task_id, now))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             conn.close()
 

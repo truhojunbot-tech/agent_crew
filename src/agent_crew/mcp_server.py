@@ -49,7 +49,8 @@ from agent_crew.protocol import (
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
     AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
-    LateResultRejected, StaleAttemptRejected, PausedError as _PausedError, TaskQueue,
+    LateResultRejected, MissingAttemptRejected, StaleAttemptRejected,
+    PausedError as _PausedError, TaskQueue,
 )
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
@@ -274,6 +275,9 @@ def build_mcp_server(
         except StaleAttemptRejected as exc:
             return {"acknowledged": False, "accepted": False,
                     "stale_attempt": True, "error": str(exc)}
+        except MissingAttemptRejected as exc:
+            return {"acknowledged": False, "accepted": False,
+                    "missing_attempt": True, "error": str(exc)}
         except LateResultRejected as exc:
             # Same single guard as HTTP (queue.submit_result under the write
             # lock); only the evidence event was committed, so no cascade.

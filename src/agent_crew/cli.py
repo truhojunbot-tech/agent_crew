@@ -242,6 +242,45 @@ def _writable_queue(db: str, *, base: str = "", project: str = ""):
     return TaskQueue(db)
 
 
+def _start_or_renew_run_coordinator(queue, project: str) -> int:
+    """Claim a crew-run coordinator generation without implicit takeover."""
+    if not project or not hasattr(queue, "get_coordinator_state"):
+        return 0
+    state = queue.get_coordinator_state()
+    if not isinstance(state, dict):
+        return 0
+    current = int(state.get("coordinator_generation") or 0)
+    coordinator_id = f"crew-run:{project}"
+    checkpoint_ref = ""
+    prior_hash = ""
+    if current:
+        if state.get("coordinator_id") != coordinator_id:
+            raise click.ClickException(
+                f"Coordinator {state.get('coordinator_id')} owns generation {current}; "
+                "prepare an explicit handoff before crew run")
+        receipts = queue.list_coordinator_receipts()
+        prior_hash = next((row["receipt_hash"] for row in receipts
+                           if row.get("event") == "handoff_accepted"
+                           and row.get("coordinator_generation") == current), "")
+        checkpoint = {
+            "objective": "crew run renewal",
+            "open_task_ids": [item.task_id for item in queue.list_tasks()
+                              if item.status in ("pending", "in_progress", "needs_human")],
+            "last_receipt_hash": prior_hash or "unknown",
+            "generation": current,
+        }
+        checkpoint_ref = queue.prepare_coordinator_handoff(checkpoint)["checkpoint_ref"]
+    result = queue.advance_coordinator(
+        coordinator_id=coordinator_id, generation=current + 1,
+        provider="agent_crew", model="crew run",
+        provider_session_id=str(os.getpid()),
+        handoff_reason="renewal" if current else "start",
+        previous_receipt_hash=prior_hash, checkpoint_ref=checkpoint_ref)
+    if not result.get("accepted"):
+        raise click.ClickException("Coordinator generation advanced concurrently; retry crew run")
+    return int(result["coordinator_generation"])
+
+
 def _write_state(base: str, project: str, state: dict) -> None:
     if "port" in state:
         setup_module.require_project_port(state["port"], project)
@@ -2609,6 +2648,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
 
     queue = _writable_queue(db, base=base, project=project)
 
+    _coordinator_generation = _start_or_renew_run_coordinator(queue, project)
+
     wait_timeout = float(timeout)
 
     # Resolve pane info for pane capture fallback
@@ -3030,6 +3071,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             role_to_agent=_run_role_to_agent)
 
     _CM: dict = {"coordinator_managed": True}
+    if _coordinator_generation:
+        _CM["coordinator_generation"] = _coordinator_generation
 
     declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
     if "AGENT_CREW_MAIN_BRANCH" not in os.environ:

@@ -73,7 +73,7 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError,
                               DuplicateReviewResult, InvalidReviewResult, InvalidRiskTierError,
-                              LateResultRejected, StaleAttemptRejected,
+                              LateResultRejected, MissingAttemptRejected, StaleAttemptRejected,
                               StaleCoordinatorGeneration,
                               TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
@@ -4080,8 +4080,11 @@ def create_app(
         except AdmissionRefused as exc:
             logger.warning("_try_push_next: dispatch refused for %s — %s", task.task_id, exc)
             return
+        _binding = q().dispatch_binding(task.task_id)
         push_fn(guarded_pane_id, _format_task_message(
-            task, port, nonce=_nonce, project=_server_identity()["project"]))
+            task, port, nonce=_nonce, project=_server_identity()["project"],
+            attempt_id=_binding.get("attempt_id"),
+            coordinator_generation=_binding.get("coordinator_generation")))
         # #152: record the moment the task was actually pushed to the pane
         # so the watchdog measures idle_for from push time, not dequeue time.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
@@ -4186,8 +4189,11 @@ def create_app(
         except AdmissionRefused as exc:
             logger.warning("_try_push_discuss: dispatch refused for %s — %s", task.task_id, exc)
             return
+        _binding = q().dispatch_binding(task.task_id)
         push_fn(guarded_pane_id, _format_task_message(
-            task, port, nonce=_nonce, project=_server_identity()["project"]))
+            task, port, nonce=_nonce, project=_server_identity()["project"],
+            attempt_id=_binding.get("attempt_id"),
+            coordinator_generation=_binding.get("coordinator_generation")))
         # #152: record push time for watchdog idle clock.
         q().set_push_at(task.task_id, pane_id=guarded_pane_id)
 
@@ -6904,8 +6910,9 @@ def create_app(
         return {"status": "ok", "pane_map": pane_map}
 
     def _coordinator_write_generation(value: Optional[int]) -> Optional[int]:
-        current = int(q().get_coordinator_state()["coordinator_generation"] or 0)
-        return (-1 if value is None else value) if current else value
+        # A missing header carries no coordinator claim (worker and legacy
+        # callers). Explicit claims are fenced atomically in the queue.
+        return value
 
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest,
@@ -7143,12 +7150,13 @@ def create_app(
         _artifact_held = None
         _task = q().get_task(task_id)
         _attempt = q().dispatch_binding(task_id).get("attempt_id")
+        if _attempt and not result.attempt_id:
+            raise HTTPException(status_code=422,
+                                detail=str(MissingAttemptRejected(task_id)))
         if _attempt and result.attempt_id != _attempt:
-            try:
-                q().submit_result(task_id, result, attempt_id=result.attempt_id,
-                                  require_attempt=True)
-            except StaleAttemptRejected as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            if q().reject_stale_attempt(task_id, result.attempt_id):
+                raise HTTPException(status_code=409,
+                                    detail=str(StaleAttemptRejected(task_id)))
         # #586: a review result that `_resolve_verdict` cannot map to a verdict
         # used to be marked done (200) and then dropped by the cascade, so the
         # reviewer never learned it was rejected. Refuse it before anything is
@@ -7358,6 +7366,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc))
         except StaleAttemptRejected as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except MissingAttemptRejected as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         except LateResultRejected as exc:
             # The queue decided this under its write lock and committed only a
             # late_result evidence event. No attribution or cascade may follow.

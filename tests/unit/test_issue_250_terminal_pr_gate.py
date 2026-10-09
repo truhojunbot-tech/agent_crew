@@ -19,6 +19,12 @@ import uuid
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _no_headless_dispatch_race(monkeypatch):
+    """These HTTP cascade tests drive result submission, not worker startup."""
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+
 from agent_crew.pipeline import (
     FIX_EXHAUSTED_MARKER,
     auto_enqueue_fix,
@@ -232,7 +238,7 @@ def _server(tmp_db, push):
     return create_app(db_path=tmp_db,
                       pane_map={"implementer": "%91", "reviewer": "%92", "tester": "%93"},
                       port=8105, push_fn=push, watchdog_disabled=True,
-                      anomaly_disabled=True)
+                      anomaly_disabled=True, identity_required=False)
 
 
 class _Push:
