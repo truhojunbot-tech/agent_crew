@@ -243,7 +243,7 @@ def _writable_queue(db: str, *, base: str = "", project: str = ""):
 
 
 def _start_or_renew_run_coordinator(queue, project: str) -> int:
-    """Claim a crew-run coordinator generation without implicit takeover."""
+    """Join the crew-run generation, claiming the first one if absent."""
     if not project or not hasattr(queue, "get_coordinator_state"):
         return 0
     state = queue.get_coordinator_state()
@@ -251,32 +251,23 @@ def _start_or_renew_run_coordinator(queue, project: str) -> int:
         return 0
     current = int(state.get("coordinator_generation") or 0)
     coordinator_id = f"crew-run:{project}"
-    checkpoint_ref = ""
-    prior_hash = ""
     if current:
         if state.get("coordinator_id") != coordinator_id:
             raise click.ClickException(
                 f"Coordinator {state.get('coordinator_id')} owns generation {current}; "
                 "prepare an explicit handoff before crew run")
-        receipts = queue.list_coordinator_receipts()
-        prior_hash = next((row["receipt_hash"] for row in receipts
-                           if row.get("event") == "handoff_accepted"
-                           and row.get("coordinator_generation") == current), "")
-        checkpoint = {
-            "objective": "crew run renewal",
-            "open_task_ids": [item.task_id for item in queue.list_tasks()
-                              if item.status in ("pending", "in_progress", "needs_human")],
-            "last_receipt_hash": prior_hash or "unknown",
-            "generation": current,
-        }
-        checkpoint_ref = queue.prepare_coordinator_handoff(checkpoint)["checkpoint_ref"]
+        return current
     result = queue.advance_coordinator(
-        coordinator_id=coordinator_id, generation=current + 1,
+        coordinator_id=coordinator_id, generation=1,
         provider="agent_crew", model="crew run",
         provider_session_id=str(os.getpid()),
-        handoff_reason="renewal" if current else "start",
-        previous_receipt_hash=prior_hash, checkpoint_ref=checkpoint_ref)
+        handoff_reason="start")
     if not result.get("accepted"):
+        # Another crew run may have won the first-generation CAS.
+        state = queue.get_coordinator_state()
+        if (state.get("coordinator_id") == coordinator_id
+                and int(state.get("coordinator_generation") or 0) > 0):
+            return int(state["coordinator_generation"])
         raise click.ClickException("Coordinator generation advanced concurrently; retry crew run")
     return int(result["coordinator_generation"])
 
