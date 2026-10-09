@@ -395,8 +395,10 @@ def test_http_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeyp
         c.post("/tasks", json={"task_id": "impl-http", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
                                "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
+        attempt_id = c.get("/tasks/impl-http").json()["execution"]["attempt_id"]
         r = c.post("/tasks/impl-http/result",
                    json={"task_id": "impl-http", "status": "completed",
+                         "attempt_id": attempt_id,
                          "summary": "done", "verdict": None, "findings": [],
                          "pr_number": None})            # the agent omits it
         assert r.status_code == 200
@@ -437,9 +439,12 @@ def test_http_result_omitting_the_pr_still_reviews_an_open_pr(tmp_db, monkeypatc
         c.post("/tasks", json={"task_id": "impl-open", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
                                "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
-        c.post("/tasks/impl-open/result",
+        attempt_id = c.get("/tasks/impl-open").json()["execution"]["attempt_id"]
+        response = c.post("/tasks/impl-open/result",
                json={"task_id": "impl-open", "status": "completed", "summary": "done",
+                     "attempt_id": attempt_id,
                      "verdict": None, "findings": [], "pr_number": None})
+        assert response.status_code == 200
 
     reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
     assert len(reviews) == 1
