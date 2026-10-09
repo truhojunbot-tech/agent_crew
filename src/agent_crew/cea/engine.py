@@ -1080,8 +1080,9 @@ class AuthorizationEngine:
     def _j5_reuse(self, intent: Intent, registry: CapabilityLookup, snapshot: PolicySnapshotRef):
         """J4/J5 — the registry matched something someone else owns (§6.2, CX-4i).
 
-        Approval comes only from an in-scope record in the verified snapshot.
-        Without one, reuse is identity-dependent and remains OWNER_CONFLICT.
+        Reuse in the intent's own repo does not modify the matched capability.
+        Modifying its owner's repo requires an in-scope approval record from
+        the verified snapshot, or remains OWNER_CONFLICT.
 
         ⛔There is deliberately **no caller argument**. This test used to read
           ``owner != caller.principal``, so "am I the owner?" was answered by the
@@ -1094,9 +1095,10 @@ class AuthorizationEngine:
           by choosing a string (codex P1, re-review of f1aee1d).
 
           The ownership question is now answered only from intent scope —
-          ``identity.project``, which is part of ``intent_hash`` and is scope,
-          not an identity claim. Every principal gets the same answer for the
-          same intent, which is what P2a requires while identity is UNVERIFIED.
+          ``identity.project`` and ``identity.target.repo``, which are part of
+          ``intent_hash`` and are scope, not an identity claim. Every principal
+          gets the same answer for the same intent, which is what P2a requires
+          while identity is UNVERIFIED.
           When the O21b broker can verify an owner, *that* is what restores the
           distinction — a verified approval recorded in ``approved_by``.
         """
@@ -1106,6 +1108,9 @@ class AuthorizationEngine:
             return Reuse(ReuseDecision.NEW) if registry.available else None
         owner = matches[0].owner
         if owner and owner != intent.identity.project:
+            if not _modifies_owner_capability(intent, matches[0]):
+                return Reuse(ReuseDecision.REUSE, approved_by=None,
+                             approver_identity_verified=False)
             capability_id = matches[0].id
             if snapshot.available and snapshot.signature == SignatureStatus.VALID:
                 now = self._clock()
@@ -1294,13 +1299,14 @@ class AuthorizationEngine:
                     "queued to fail (O9)")
 
         owner_conflict = (reuse is not None
-                          and getattr(reuse.decision, "value", reuse.decision) == "REUSE")
+                          and getattr(reuse.decision, "value", reuse.decision) == "REUSE"
+                          and _modifies_owner_capability(intent, _matched(registry)))
         if owner_conflict and not reuse.approver_identity_verified:
             # CXC-2: E4's own answer here was a shadow ALLOW on OWNER_CONFLICT.
-            # An unapproved reuse of somebody else's capability is the decision a
-            # human owns, and no amount of confidence in the match substitutes.
+            # Only an unapproved modification of somebody else's capability
+            # belongs to its owner; using it in the intent's repo does not.
             return ("HUMAN_GATE", "OWNER_CONFLICT",
-                    "J5: this intent reuses a capability owned elsewhere with no verified owner "
+                    "J5: this intent targets a capability owner's repo with no verified owner "
                     "approval (§6.2); the owner decides, the engine does not")
 
         work_class = _work_class_value(intent.identity.work_class)
@@ -1472,6 +1478,13 @@ def _denied_gate():
 def _matched(registry: CapabilityLookup):
     matches = tuple(registry.matches) + tuple(registry.anchor_matches)
     return matches[0] if matches else None
+
+
+def _modifies_owner_capability(intent: Intent, matched) -> bool:
+    """J5's owner boundary comes from the intent target, never the caller."""
+    return bool(matched and matched.owner
+                and matched.owner != intent.identity.project
+                and intent.identity.target.repo == (matched.repo or matched.owner))
 
 
 def _registry_ref(registry: CapabilityLookup) -> dict:

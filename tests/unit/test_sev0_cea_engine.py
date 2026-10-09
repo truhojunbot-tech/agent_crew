@@ -148,6 +148,10 @@ def intent(task_id="t1", *, ident=None, **kw) -> Intent:
                   description=kw.pop("description", "Add a --json flag"), **kw)
 
 
+def owner_repo_intent(task_id="t1") -> Intent:
+    return intent(task_id, ident=identity(repo=CAPABILITY.repo))
+
+
 def caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON) -> Caller:
     """Minted the only way a Caller can be minted: an authenticator matched a
     credential (J9). There is no ``status`` parameter because there is nowhere
@@ -376,10 +380,19 @@ def test_an_unobservable_budget_is_recorded_honestly_and_fails_closed(conn):
 # J5 / J7 / J8
 # ---------------------------------------------------------------------------
 
+def test_reusing_another_owners_capability_in_own_repo_needs_no_owner_gate(conn):
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
+        conn, intent(), caller())
+    assert auth.receipt["reuse"]["decision"] == "REUSE"
+    assert auth.receipt["reuse"]["approved_by"] is None
+    assert auth.code != "OWNER_CONFLICT"
+    assert auth.decision != "HUMAN_GATE"
+
+
 def test_owner_conflict_is_a_human_gate_not_a_shadow_allow(conn):
     """CXC-2: E4's own answer was a shadow ALLOW on OWNER_CONFLICT."""
     auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
-        conn, intent(), caller(principal="manual:operator"))
+        conn, owner_repo_intent(), caller(principal="manual:operator"))
     assert auth.decision == "HUMAN_GATE" and auth.code == "OWNER_CONFLICT"
     assert auth.receipt["reuse"]["approver_identity_verified"] is False
 
@@ -394,7 +407,7 @@ def test_owner_conflict_is_a_human_gate_not_a_shadow_allow(conn):
     ({"expires_at": 1.0}, False),
 ])
 def test_signed_owner_reuse_requires_matching_scope(conn, change, approved):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32, **{
         "capabilities": (f"reuse:{CAPABILITY.id}",),
         "projects": (requested.identity.project,),
@@ -409,7 +422,7 @@ def test_signed_owner_reuse_requires_matching_scope(conn, change, approved):
 
 @pytest.mark.parametrize("signature", [SignatureStatus.UNSIGNED, SignatureStatus.INVALID])
 def test_unsigned_owner_reuse_never_approves(conn, signature):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32,
                         capabilities=(f"reuse:{CAPABILITY.id}",),
                         projects=(requested.identity.project,))
@@ -422,7 +435,7 @@ def test_unsigned_owner_reuse_never_approves(conn, signature):
 
 
 def test_owner_reuse_record_with_wrong_repo_does_not_approve(conn):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32,
                         capabilities=(f"reuse:{CAPABILITY.id}",),
                         projects=(requested.identity.project,),
@@ -434,7 +447,7 @@ def test_owner_reuse_record_with_wrong_repo_does_not_approve(conn):
 
 
 def test_owner_reuse_uses_signed_producer_record_even_when_generic_scope_excludes_it(conn):
-    requested = intent()
+    requested = owner_repo_intent()
     grant = DecisionRev("OWNER-594", "c" * 32,
                         capabilities=(f"reuse:{CAPABILITY.id}",),
                         projects=(requested.identity.project,),
