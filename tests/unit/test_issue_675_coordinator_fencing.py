@@ -155,24 +155,46 @@ def test_push_message_and_protocol_include_attempt(tmp_path, monkeypatch):
                                     delivery="dispatcher")
 
 
-def test_crew_run_start_and_renewal_record_coordinator_receipts(tmp_path):
+def test_overlapping_crew_runs_join_one_coordinator_generation(tmp_path):
     from agent_crew.cli import _start_or_renew_run_coordinator
 
     queue = TaskQueue(str(tmp_path / "tasks.db"))
-    assert _start_or_renew_run_coordinator(queue, "demo") == 1
-    assert _start_or_renew_run_coordinator(queue, "demo") == 2
+    first = _start_or_renew_run_coordinator(queue, "demo")
+    second = _start_or_renew_run_coordinator(queue, "demo")
+    assert first == second == 1
+    queue.enqueue(_task("first-run-task"), coordinator_generation=first)
+    queue.enqueue(_task("second-run-task"), coordinator_generation=second)
     assert queue.get_coordinator_state()["coordinator_id"] == "crew-run:demo"
     assert [r["event"] for r in queue.list_coordinator_receipts()].count(
-        "handoff_accepted") == 2
+        "handoff_accepted") == 1
+    assert not any(r["event"] == "handoff_checkpoint_ready"
+                   for r in queue.list_coordinator_receipts())
     queue.prepare_coordinator_handoff({
-        "objective": "owner handoff", "open_task_ids": [],
-        "last_receipt_hash": "prior", "generation": 2})
+        "objective": "owner handoff", "open_task_ids": ["first-run-task", "second-run-task"],
+        "last_receipt_hash": queue.list_coordinator_receipts()[0]["receipt_hash"], "generation": 1})
     ready = next(r for r in queue.list_coordinator_receipts()
                  if r["event"] == "handoff_checkpoint_ready")
-    queue.advance_coordinator(coordinator_id="other", generation=3,
+    queue.advance_coordinator(coordinator_id="other", generation=2,
                               checkpoint_ref=ready["receipt_hash"])
     with pytest.raises(Exception, match="explicit handoff"):
         _start_or_renew_run_coordinator(queue, "demo")
+
+
+def test_simultaneous_first_crew_run_claim_joins_winner(tmp_path, monkeypatch):
+    from agent_crew.cli import _start_or_renew_run_coordinator
+
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    advance = queue.advance_coordinator
+
+    def raced_advance(**kwargs):
+        assert advance(**kwargs)["accepted"]
+        return advance(**kwargs)
+
+    monkeypatch.setattr(queue, "advance_coordinator", raced_advance)
+    assert _start_or_renew_run_coordinator(queue, "demo") == 1
+    assert queue.get_coordinator_state()["coordinator_generation"] == 1
+    assert [r["event"] for r in queue.list_coordinator_receipts()].count(
+        "handoff_accepted") == 1
 
 
 def test_resume_cea_env_overrides_shell_and_names_missing_pieces(tmp_path, monkeypatch):
