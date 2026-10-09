@@ -3521,7 +3521,8 @@ def create_app(
                  and _codex_quota_ready(row["marker"], cache, now)]
         if not ready:
             return []
-        probes = [row for row in rows if row["marker"].get("probe")]
+        probes = q().codex_quota_probes(
+            since=min(row["marker"].get("failed_at", now) for row in ready))
         for probe in probes:
             resumed_at = probe["marker"].get("resumed_at") or 0
             dispatched_at = probe["dispatched_at"] or 0

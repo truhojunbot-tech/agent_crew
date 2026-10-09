@@ -5682,6 +5682,31 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def codex_quota_probes(self, *, since: float) -> List[dict]:
+        """Recover dispatched probes after a completed result clears error_info."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT t.task_id, t.status, t.dispatched_at, t.dispatch_target, "
+                "e.at, e.fields FROM task_exec_events e "
+                "JOIN tasks t ON t.task_id=e.task_id "
+                "WHERE e.event='codex_quota_resumed' AND e.at>=? ORDER BY e.at DESC",
+                (since,)).fetchall()
+            probes = []
+            for row in rows:
+                try:
+                    if not json.loads(row["fields"] or "{}").get("probe"):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                probes.append({"task_id": row["task_id"], "status": row["status"],
+                               "marker": {"probe": True, "resumed_at": row["at"]},
+                               "dispatched_at": row["dispatched_at"],
+                               "dispatch_target": row["dispatch_target"]})
+            return probes
+        finally:
+            conn.close()
+
     def resume_codex_quota(self, task_id: str, *, probe: bool, now: float) -> bool:
         """Requeue a parked task once, through STOP and the existing CEA gate."""
         conn = self._connect()

@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
-from agent_crew.protocol import TaskRequest
+from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import (_detect_transient_error_in_log,
                                _codex_quota_reset_at, create_app)
@@ -65,6 +65,9 @@ def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path,
         queue.record_dispatch("quota-a", channel="codex_exec", agent="codex")
         assert app.state.resume_codex_quota_holds() == []
         queue.bind_dispatch_target("quota-a", target="pid:1234")
+        queue.submit_result("quota-a", TaskResult(task_id="quota-a", status="completed",
+                                                  summary="probe finished"))
+        assert queue.get_task("quota-a").error_info is None
         assert app.state.resume_codex_quota_holds() == ["quota-b"]
         assert app.state.resume_codex_quota_holds() == []
         assert queue.get_task_status("quota-b") == "pending"
