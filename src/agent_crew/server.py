@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import hashlib
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -3028,6 +3029,17 @@ def create_app(
             if shadow_db:
                 logger.warning("AGENT_CREW_SHADOW_MEMORY_DB does not name an existing file: %s", shadow_db)
             _memory_provider = NullMemoryProvider()
+    _ranked_memory = None
+    if os.getenv("AGENT_CREW_MEMORY_BACKEND", "").strip().lower() == "hybrid":
+        from agent_crew.memory_hybrid import HybridMemoryStorage, backup_daily
+        ranked_db = (os.getenv("AGENT_CREW_MEMORY_DB") or
+                     os.getenv("AGENT_CREW_SHADOW_MEMORY_DB") or "").strip()
+        if ranked_db and os.path.isfile(os.path.expanduser(ranked_db)):
+            try:
+                _ranked_memory = HybridMemoryStorage(os.path.expanduser(ranked_db))
+                backup_daily(_ranked_memory.path)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                logger.warning("hybrid memory unavailable: %s", exc)
     if shadow_memory_enabled is None:
         shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
             "1", "true", "yes",
@@ -6743,6 +6755,47 @@ def create_app(
         raise HTTPException(status_code=409, detail=(
             f"project identity mismatch: expected project={client_project!r}, "
             f"server project={server_project!r}"))
+
+    @app.post("/memory/retrieve_ranked")
+    async def memory_retrieve_ranked(
+            payload: dict = Body(...),
+            x_agent_crew_project: Optional[str] = Header(None)):
+        """Serve the A2 middle to coordinator hooks under a 300 ms bound."""
+        _require_project_identity(x_agent_crew_project)
+        if _ranked_memory is None:
+            raise HTTPException(status_code=503, detail="hybrid memory is not configured")
+        from agent_crew.memory_runtime import MemoryScope
+        fields = payload.get("scope") or {}
+        if not isinstance(fields, dict):
+            raise HTTPException(status_code=422, detail="scope must be an object")
+        try:
+            scope = MemoryScope(**fields)
+            if scope.project != project:
+                raise HTTPException(status_code=409, detail="memory project mismatch")
+            query = str(payload.get("query") or "")
+            role = str(payload.get("role") or "implementer")
+            k = int(payload.get("k", 20))
+            byte_budget = int(payload.get("byte_budget", 16000))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            fallback_marker = threading.Event()
+            response_state = {}
+            return await asyncio.wait_for(asyncio.to_thread(
+                _ranked_memory.retrieve_ranked, scope, query, role, k, byte_budget,
+                fallback_marker=fallback_marker, response_state=response_state),
+                timeout=.300)
+        except asyncio.TimeoutError:
+            _ranked_memory._record_fallback(fallback_marker)
+            head = response_state.get("head") or {
+                "records": [], "standing_trimmed": 0,
+                "head_hash": hashlib.sha256(b"[]").hexdigest(),
+            }
+            return {"head": head["records"], "middle": [], "mode": "fallback",
+                    "pending_vectors": response_state.get("pending", 0),
+                    "latency_ms": 300.0, "trimmed_bytes": 0,
+                    "standing_trimmed": head["standing_trimmed"],
+                    "model_id": _ranked_memory.model_id, "head_hash": head["head_hash"]}
 
     @app.get("/health")
     def health():
