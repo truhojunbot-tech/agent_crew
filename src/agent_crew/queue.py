@@ -3428,7 +3428,10 @@ class TaskQueue:
             if pr is not None:
                 if old_pr != pr:
                     continue
-            elif old_pr is not None or row["branch"] != task.branch:
+            # PR-less reports can share a branch and head without reviewing
+            # the same implement task.
+            elif (old_pr is not None or row["branch"] != task.branch
+                  or old.get("prev_task_id") != context.get("prev_task_id")):
                 continue
             old_sha = (old.get("reviewed_sha") if dispatch else
                        old.get("reviewed_sha") or old.get("expected_head_sha")

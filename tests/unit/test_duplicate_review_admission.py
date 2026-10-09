@@ -37,8 +37,10 @@ def queue(tmp_path):
 
 
 def task(task_id, *, kind="review", pr=23, sha=SHA_A, project="owner/repo", branch="feature",
-         allow_duplicate_review=False):
+         allow_duplicate_review=False, prev_task_id=None):
     context = {"risk_tier": 1, "allow_duplicate_review": allow_duplicate_review}
+    if prev_task_id is not None:
+        context["prev_task_id"] = prev_task_id
     if pr is not None:
         context["pr_number"] = pr
     if sha is not None:
@@ -172,6 +174,34 @@ def test_same_head_is_refused_and_records_event(queue, kind):
         assert json.loads(row["fields"])["existing_task_id"] == "first"
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize("kind", ["review", "test"])
+def test_prless_same_head_different_reviewed_tasks_are_admitted(queue, kind):
+    queue.enqueue(task("first", kind=kind, pr=None, prev_task_id="impl-report-a"))
+    queue.enqueue(task("second", kind=kind, pr=None, prev_task_id="impl-report-b"))
+    assert [t.task_id for t in queue.list_tasks()] == ["first", "second"]
+    role = "reviewer" if kind == "review" else "tester"
+    first = queue.dequeue(role=role)
+    assert queue.record_prepared_review_base(first.task_id, {"reviewed_sha": SHA_A})
+    second = queue.dequeue(role=role)
+    assert queue.record_prepared_review_base(second.task_id, {"reviewed_sha": SHA_A})
+
+
+@pytest.mark.parametrize("kind", ["review", "test"])
+def test_prless_same_head_same_reviewed_task_is_refused(queue, kind):
+    queue.enqueue(task("first", kind=kind, pr=None, prev_task_id="impl-report-a"))
+    with pytest.raises(DuplicateReviewError) as exc:
+        queue.enqueue(task("second", kind=kind, pr=None,
+                           prev_task_id="impl-report-a"))
+    assert exc.value.existing_task_id == "first"
+
+
+def test_pr_keyed_same_head_different_reviewed_tasks_still_refused(queue):
+    queue.enqueue(task("first", prev_task_id="impl-report-a"))
+    with pytest.raises(DuplicateReviewError) as exc:
+        queue.enqueue(task("second", prev_task_id="impl-report-b"))
+    assert exc.value.existing_task_id == "first"
 
 
 def test_new_head_and_other_pr_are_allowed(queue):

@@ -1,7 +1,7 @@
 import os
 
 from agent_crew.prompts.task_loop import build_task_loop_prompt
-from agent_crew.testing_policy import load_scope, render_scope
+from agent_crew.testing_policy import load_scope, render_scope, render_implementer_scope
 from agent_crew.port_validation import require_project_port
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
@@ -449,6 +449,8 @@ You write production code following TDD where practical:
 2. Implement until tests pass.
 3. Refactor, commit (with tests + impl together), and open a PR if the task
    requests one.
+
+<implementer_test_scope>
 
 ### ⛔You may start on a DETACHED HEAD — check before you push
 
@@ -913,6 +915,10 @@ def generate(role: str, project: str, port: int, agent: str = "",
         body = body.replace(
             "<test_scope>",
             render_scope(load_scope(worktree_path, project)))
+    if "<implementer_test_scope>" in body:
+        body = body.replace(
+            "<implementer_test_scope>",
+            render_implementer_scope(load_scope(worktree_path, project)))
     content = body.replace("<project>", project).replace("<port>", str(port))
     content = content.replace(
         '-H "Content-Type: application/json"',
