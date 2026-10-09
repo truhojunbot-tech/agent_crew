@@ -2921,6 +2921,10 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             click.echo(f"Created GitHub issue #{issue_number}")
         else:
             raise click.ClickException("Failed to create GitHub issue")
+    if issue is None and issue_number is not None:
+        issue_context = {"issue": issue_number}
+    if not issue_context:
+        click.echo("Warning: crew run without --issue; the task will not be linked to an issue.")
 
     # coordinator_managed is provenance only (§7.2). The loop adopts the
     # server's persisted successors below; this flag never decides a transition.
