@@ -1187,7 +1187,9 @@ def assemble_task_context(task_context: dict, *, project: str = "", repo: str = 
                     ctx[field] = parent[field]
     if issue is not None:
         ctx["issue"] = issue
-    slug = _repo_slug(ctx.get("repo")) or _repo_slug(repo)
+    # The dispatch checkout is verified by the server; context.repo is only
+    # a fallback when a caller has no checkout to bind this pack to.
+    slug = _repo_slug(repo) or _repo_slug(ctx.get("repo"))
     if slug:
         ctx["repo"] = slug
     if project:

@@ -57,6 +57,9 @@ def test_assembly_inherits_issue_and_repo_and_parses_done_heading():
     )
     assert context["issue"] == 661
     assert context["repo"] == "truhojunbot-tech/agent_crew"
+    assert pack.assemble_task_context(
+        {"issue": 661, "repo": "wrong/project"},
+        repo="truhojunbot-tech/agent_crew")["repo"] == "truhojunbot-tech/agent_crew"
     assert pack.IssueProvider.extract_ac("## Done (numeric)\n- Live rows served\n") == "- Live rows served"
     assert pack.assemble_task_context({"issue": "661"})["issue"] == 661
 
