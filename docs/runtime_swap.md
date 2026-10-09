@@ -1,6 +1,6 @@
 # Crew runtime swap and recovery
 
-Run `scripts/runtime_swap.sh PROJECT FULL_SHA preflight`, then `go`, then `post` with `AGENT_CREW_SWAP_CEA_ENV_FILE` pointing to a private file of `AGENT_CREW_CEA_KEY=VALUE` lines. The script reads port and database paths from `~/.agent_crew/PROJECT/state.json`. Keep runtime STOP paused throughout. A healthy rollback uses the same three commands with the previous full SHA. Do not run this against a live dispatcher without the owner's operational approval.
+Run `scripts/runtime_swap.sh PROJECT FULL_SHA preflight`, then `go`, then `post` with `AGENT_CREW_SWAP_CEA_ENV_FILE` pointing to a private file of `AGENT_CREW_CEA_KEY=VALUE` lines. Set `AGENT_CREW_SWAP_PRECHECK` to the owner-state command and its arguments; the wrapper appends `PROJECT` and requires a zero exit before entering any swap step. A failed check prints its output and stops. An unset command refuses the swap; `AGENT_CREW_SWAP_PRECHECK=none` explicitly skips this check. The script reads port and database paths from `~/.agent_crew/PROJECT/state.json`. Keep runtime STOP paused throughout. A healthy rollback uses the same three commands with the previous full SHA. Do not run this against a live dispatcher without the owner's operational approval.
 
 ## If `go` fails after SIGTERM
 
