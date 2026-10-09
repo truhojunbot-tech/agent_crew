@@ -58,11 +58,71 @@ def test_real_shape_maps_artifacts_and_request(monkeypatch):
     assert "high" in items["forge:crew-adr-17"].provenance
     assert "hybrid" in items["forge:crew-adr-17"].provenance
     request, timeout = calls[0]
-    assert request.full_url == "http://127.0.0.1:9002/get_context"
-    assert timeout == 5.0
-    assert json.loads(request.data)["situation"] == {
+    assert request.full_url == "http://127.0.0.1:8769/get_context"
+    assert timeout == 0.3
+    body = json.loads(request.data)
+    assert body["situation"] == {
         "project": "agent_crew", "task_type": "implement", "fix_round": True,
     }
+    assert (body["repo"], body["project"], body["role"], body["byte_budget"]) == (
+        "org/agent_crew", "agent_crew", "implementer", 8000)
+
+
+def test_live_shape_maps_tail_and_telemetry(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    tail_text = "x" * 900
+    body = {"items": [{"source_path": "src/worker.py", "repo": "org/agent_crew",
+                       "commit_sha": "a" * 40, "content_sha": "b" * 64,
+                       "bytes": 900, "score": 0.7, "text": tail_text}],
+            "mode": "hybrid", "model_id": "small", "tail_bytes": 900}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, *_): return json.dumps(body).encode()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **k: Response())
+    pack = _build()
+    forge = [a for a in pack.items if a.artifact_id.startswith("forge:")]
+    assert len(forge) == 1
+    assert forge[0].uri == "src/worker.py"
+    assert forge[0].revision == "a" * 40
+    assert forge[0].excerpt == tail_text
+    assert pack.telemetry()["tail_bytes"] == 900
+
+
+def test_url_and_timeout_use_environment(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_URL", "http://127.0.0.1:9123/")
+    monkeypatch.setenv("AGENT_CREW_FORGE_TIMEOUT_MS", "125")
+    provider = cp.ForgeProvider()
+    assert provider._url == "http://127.0.0.1:9123"
+    assert provider._timeout == 0.125
+
+
+def test_default_timeout_omits_tail_and_counts_once(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    release = threading.Event()
+    exited = threading.Event()
+
+    def stalled(*a, **k):
+        try:
+            release.wait(1)
+            return None
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", stalled)
+    started = time.monotonic()
+    try:
+        pack = _build()
+    finally:
+        release.set()
+        exited.wait(1)
+    assert time.monotonic() - started < 0.6
+    assert pack.telemetry()["forge_timeout"] == 1
+    assert "timeout" in pack.telemetry()["forge_error"]
+    assert pack.telemetry()["tail_bytes"] == 0
+    assert pack.telemetry()["forge_items"] == 0
 
 
 @pytest.mark.parametrize("error", [URLError("refused"), TimeoutError("timeout")])
