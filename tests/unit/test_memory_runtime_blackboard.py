@@ -27,7 +27,7 @@ def test_scope_hierarchy_and_invalidated_records(tmp_path):
     }
 
 
-def test_runtime_provider_returns_only_exact_project_and_counts_drops(tmp_path, monkeypatch):
+def test_runtime_provider_includes_fleet_ancestor_without_sibling_project(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
     store = SQLiteMemoryStorage(str(tmp_path / "memory.sqlite"))
     for key, scope in (
@@ -38,9 +38,9 @@ def test_runtime_provider_returns_only_exact_project_and_counts_drops(tmp_path, 
         store.put(MemoryRecord("episodic", key, {"link": "https://example.test/" + key}, scope))
     provider = RuntimeMemoryProvider(store, fleet="f")
     result = shadow_retrieve(provider, MemoryRequest(project="p", memory_types=("episodic",)))
-    assert {item.item_id for item in result.items} == {"project"}
+    assert {item.item_id for item in result.items} == {"fleet", "project"}
     assert {item.project for item in result.items} == {"p"}
-    assert result.dropped_cross_project == 1
+    assert result.dropped_cross_project == 0
 
 
 def test_blackboard_ingest_is_idempotent(tmp_path):

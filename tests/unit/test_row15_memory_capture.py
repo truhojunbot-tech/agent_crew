@@ -221,6 +221,28 @@ def test_shadow_retrieves_fleet_failure_pattern_for_project_query(tmp_path):
     rows, _ = storage.retrieve_shadow(
         MemoryScope(fleet="named-fleet", project="agent_crew"), {"failure_pattern"}, 10)
     assert [row.key for row in rows] == ["wc1:x"]
+    result = shadow_retrieve(RuntimeMemoryProvider(storage), MemoryRequest(
+        project="agent_crew", memory_types=("failure_pattern",), limit=10))
+    assert [item.item_id for item in result.items] == ["project-only", "wc1:x"]
+
+
+def test_shadow_reserves_project_and_fleet_failure_patterns_under_shared_limit(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    with sqlite3.connect(storage.path) as db:
+        for number in range(15):
+            db.execute("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)",
+                       ("decision", f"recent-{number}", "{}",
+                        json.dumps({"project": "agent_crew"}), 1, 100 + number))
+        db.execute("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)",
+                   ("failure_pattern", "project-failure", "{}",
+                    json.dumps({"project": "agent_crew"}), 1, 2))
+        db.execute("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)",
+                   ("failure_pattern", "fleet-failure", "{}",
+                    json.dumps({"fleet": "fleet", "project": ""}), 1, 1))
+    rows, _ = storage.retrieve_shadow(
+        MemoryScope(project="agent_crew"), {"decision", "failure_pattern"}, 10)
+    assert len(rows) == 10
+    assert {"project-failure", "fleet-failure"} <= {row.key for row in rows}
 
 
 def _query_storage(tmp_path):

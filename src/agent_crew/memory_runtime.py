@@ -332,6 +332,17 @@ class SQLiteMemoryStorage:
                     + base + " AND (COALESCE(json_extract(scope,'$.project'),'')=? OR "
                     + fleet_ancestor + ") "
                     "ORDER BY created DESC LIMIT ?")
+                project_failure_sql = fleet_failure_sql = "'[]'"
+                if "failure_pattern" in layers:
+                    project_failure_sql = packed_rows(
+                        "SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
+                        + base + " AND layer='failure_pattern' "
+                        "AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                        "ORDER BY created DESC LIMIT 1")
+                    fleet_failure_sql = packed_rows(
+                        "SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
+                        + base + " AND layer='failure_pattern' AND "
+                        + fleet_ancestor + " ORDER BY created DESC LIMIT 1")
                 predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
                                     if "decision" in layers else [])
                 lineage_sql = packed_rows(
@@ -348,23 +359,29 @@ class SQLiteMemoryStorage:
                 parameters = [*args, *args, scope.project,
                               SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
                               else min(limit, SHADOW_RETRIEVAL_MAX_ROWS)]
+                if "failure_pattern" in layers:
+                    parameters.extend([*args, scope.project, *args])
                 if predecessor_keys:
                     parameters.extend([*predecessor_keys, scope.project])
                 if pr_number and "decision" in layers:
                     parameters.extend([scope.project, pr_number, scope.task_id,
                                        SHADOW_RETRIEVAL_MAX_ROWS])
-                dropped, rows_json, lineage_json, pr_json = db.execute(
+                dropped, rows_json, project_failure_json, fleet_failure_json, lineage_json, pr_json = db.execute(
                     "SELECT (" + dropped_sql + "), (" + scoped_sql + "), (" +
+                    project_failure_sql + "), (" + fleet_failure_sql + "), (" +
                     lineage_sql + "), (" + pr_sql + ")", parameters,
                 ).fetchone()
         finally:
             if timing is not None:
                 timing["query_ms"] = (time.perf_counter() - query_started) * 1000
         rows = json.loads(rows_json)
+        failure_rows = json.loads(project_failure_json) + json.loads(fleet_failure_json)
         lineage_rows = json.loads(lineage_json)
         pr_rows = json.loads(pr_json)
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
+        failures = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+                                 version) for layer, key, value, record_scope, version in failure_rows]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
         if query.strip():
             terms = set(query.lower().replace('-', ' ').split())
@@ -387,7 +404,10 @@ class SQLiteMemoryStorage:
         pinned_keys = {record.key for record in pinned}
         selected = pinned + [record for record in same_pr if record.key not in pinned_keys]
         selected_keys = {record.key for record in selected}
-        return (selected + [record for record in scoped if record.key not in selected_keys])[
+        floor = [record for record in failures if record.key not in selected_keys]
+        floor_keys = {record.key for record in floor}
+        return (selected + floor + [record for record in scoped
+                                    if record.key not in selected_keys | floor_keys])[
             :min(limit, SHADOW_RETRIEVAL_MAX_ROWS)], dropped
 
 
@@ -553,7 +573,10 @@ class RuntimeMemoryProvider:
             dropped = len(records) - len(scoped)
         items = tuple(MemoryItem(
             item_id=record.key,
-            project=record.scope.project,
+            # MemoryItem.project is the consumer boundary checked by the
+            # shadow wrapper. Fleet-only ancestors have no source project.
+            project=request.project if record.scope.fleet and not record.scope.project
+                    else record.scope.project,
             memory_type=record.layer,
             source_ref=str(record.value.get("link") or record.value.get("source_ref") or record.key),
             excerpt=str(record.value.get("topic") or record.value.get("text") or ""),
