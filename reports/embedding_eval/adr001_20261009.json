@@ -9,58 +9,73 @@
   "k": 10,
   "rows": [
     {
-      "fallback_count": 4,
+      "fallback_count": 0,
       "model_id": "intfloat/multilingual-e5-small",
       "model_size_bytes": 487351240,
       "owner_hits": 6,
-      "p95_embed_ms": 75.0263724476099,
-      "p95_retrieve_ms": 311.4296328276396,
+      "p95_embed_ms": 80.13549633324146,
+      "p95_retrieve_ms": 122.70458228886127,
       "retrieval_modes": {
-        "fallback": 4,
-        "hybrid": 32,
+        "hybrid": 36,
         "lexical_only": 5
       },
-      "task_hits": 0
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
     },
     {
       "fallback_count": 0,
       "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
       "model_size_bytes": 479383128,
-      "owner_hits": 8,
-      "p95_embed_ms": 36.16577014327049,
-      "p95_retrieve_ms": 195.65418735146523,
+      "owner_hits": 6,
+      "p95_embed_ms": 61.40422262251377,
+      "p95_retrieve_ms": 101.19110904633999,
       "retrieval_modes": {
         "hybrid": 36,
         "lexical_only": 5
       },
-      "task_hits": 0
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
     },
     {
-      "fallback_count": 33,
+      "fallback_count": 21,
       "model_id": "BAAI/bge-m3",
       "model_size_bytes": 2284643639,
-      "owner_hits": 3,
-      "p95_embed_ms": 741.5591347962618,
-      "p95_retrieve_ms": 839.638976380229,
+      "owner_hits": 9,
+      "p95_embed_ms": 590.583024546504,
+      "p95_retrieve_ms": 685.5728011578321,
       "retrieval_modes": {
-        "fallback": 33,
-        "hybrid": 3,
+        "fallback": 21,
+        "hybrid": 15,
         "lexical_only": 5
       },
-      "task_hits": 0
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
     },
     {
       "fallback_count": 0,
       "model_id": "all-MiniLM-L6-v2",
       "model_size_bytes": 91099267,
       "owner_hits": 8,
-      "p95_embed_ms": 34.787148237228394,
-      "p95_retrieve_ms": 174.91709254682064,
+      "p95_embed_ms": 18.50867085158825,
+      "p95_retrieve_ms": 55.587297305464745,
       "retrieval_modes": {
         "hybrid": 36,
         "lexical_only": 5
       },
-      "task_hits": 0
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
     },
     {
       "fallback_count": 0,
@@ -68,11 +83,15 @@
       "model_size_bytes": 0,
       "owner_hits": 8,
       "p95_embed_ms": null,
-      "p95_retrieve_ms": 25.678711012005806,
+      "p95_retrieve_ms": 36.79559379816055,
       "retrieval_modes": {
         "lexical_only": 41
       },
-      "task_hits": 0
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 0,
+        "total": 4271
+      }
     }
   ],
   "source_db": "/home/truhojun/.agent_crew/memory/adr001_memory.db"
