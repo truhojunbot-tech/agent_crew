@@ -67,7 +67,7 @@ def set_task_status(conn, receipt_id, status):
 
 DECISION = DecisionRev(decision_id="T0-1234", body_hash="b" * 32)
 CAPABILITY = MatchedCapability(id="tokenomics.work_class_gate", owner="quota-core",
-                               repo="example/quota-core")
+                               repo="quota-core")
 
 
 class FakeSnapshot:
@@ -149,7 +149,7 @@ def intent(task_id="t1", *, ident=None, **kw) -> Intent:
 
 
 def owner_repo_intent(task_id="t1") -> Intent:
-    return intent(task_id, ident=identity(repo=CAPABILITY.repo))
+    return intent(task_id, ident=identity(repo="example/quota-core"))
 
 
 def caller(principal="cron:admitted_trigger", provenance=CallerProvenance.CRON) -> Caller:
@@ -395,6 +395,29 @@ def test_owner_conflict_is_a_human_gate_not_a_shadow_allow(conn):
         conn, owner_repo_intent(), caller(principal="manual:operator"))
     assert auth.decision == "HUMAN_GATE" and auth.code == "OWNER_CONFLICT"
     assert auth.receipt["reuse"]["approver_identity_verified"] is False
+
+
+@pytest.mark.parametrize("target_repo", [
+    "truhojunbot-tech/agent_crew",
+    "git@github.com:truhojunbot-tech/agent_crew.git",
+])
+def test_owner_conflict_normalizes_live_repo_formats(conn, target_repo):
+    capability = MatchedCapability(id="agent-crew.task-pipeline-lifecycle",
+                                   owner="agent_crew", repo="agent_crew")
+    requested = intent(ident=identity(project="alfred", repo=target_repo))
+    auth = engine(capabilities=FakeRegistry(matches=(capability,))).authorize(
+        conn, requested, caller())
+    assert auth.decision == "HUMAN_GATE" and auth.code == "OWNER_CONFLICT"
+
+
+def test_own_repo_slug_reuse_does_not_need_owner_gate(conn):
+    capability = MatchedCapability(id="agent-crew.task-pipeline-lifecycle",
+                                   owner="agent_crew", repo="agent_crew")
+    requested = intent(ident=identity(project="alfred", repo="truhojun/alfred"))
+    auth = engine(capabilities=FakeRegistry(matches=(capability,))).authorize(
+        conn, requested, caller())
+    assert auth.receipt["reuse"]["decision"] == "REUSE"
+    assert auth.code != "OWNER_CONFLICT"
 
 
 @pytest.mark.parametrize("change,approved", [

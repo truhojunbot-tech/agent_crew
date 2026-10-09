@@ -1482,9 +1482,15 @@ def _matched(registry: CapabilityLookup):
 
 def _modifies_owner_capability(intent: Intent, matched) -> bool:
     """J5's owner boundary comes from the intent target, never the caller."""
+    def repo_name(value: str) -> str:
+        name = str(value or "").strip().rstrip("/").rsplit("/", 1)[-1]
+        return name.rsplit(":", 1)[-1].removesuffix(".git").lower()
+
+    target_repo = repo_name(intent.identity.target.repo)
+    owner_repo = repo_name(matched.repo or matched.owner) if matched else ""
     return bool(matched and matched.owner
                 and matched.owner != intent.identity.project
-                and intent.identity.target.repo == (matched.repo or matched.owner))
+                and target_repo and target_repo == owner_repo)
 
 
 def _registry_ref(registry: CapabilityLookup) -> dict:
