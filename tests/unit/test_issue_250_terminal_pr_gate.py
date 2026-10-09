@@ -104,6 +104,8 @@ def test_request_changes_on_a_terminal_pr_enqueues_no_fix(q, state):
 
     assert auto_enqueue_fix(q, review_id, pr_state_fn=_state(state)) is None
     assert not [t for t in q.list_tasks() if t.task_type == "implement"]
+    if state == "merged":
+        assert q.get_task(review_id).status == "completed"
 
 
 def test_a_merged_pr_stops_the_review_cascade(q):
@@ -111,6 +113,7 @@ def test_a_merged_pr_stops_the_review_cascade(q):
 
     assert auto_enqueue_review(q, impl_id, PR, pr_state_fn=_state("merged")) is None
     assert not [t for t in q.list_tasks() if t.task_type == "review"]
+    assert q.get_task(impl_id).status == "completed"
 
 
 def test_a_merged_pr_stops_the_test_cascade(q):
@@ -118,6 +121,7 @@ def test_a_merged_pr_stops_the_test_cascade(q):
 
     assert auto_enqueue_test(q, review_id, pr_state_fn=_state("merged")) is None
     assert not [t for t in q.list_tasks() if t.task_type == "test"]
+    assert q.get_task(review_id).status == "completed"
 
 
 @pytest.mark.parametrize("stage", ["review", "fix", "test"])
