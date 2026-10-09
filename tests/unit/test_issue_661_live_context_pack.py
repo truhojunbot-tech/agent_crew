@@ -1,9 +1,13 @@
 """#661: fleet failure patterns reach the live, bounded Context Pack."""
 
 from agent_crew import context_pack as pack
-from agent_crew.memory_runtime import MemoryRecord, MemoryScope, SQLiteMemoryStorage
+from agent_crew.memory_runtime import (MemoryRecord, MemoryScope, SQLiteMemoryStorage,
+                                       dispatch_memory_block)
 import hashlib
 import json
+import time
+
+import pytest
 
 
 def test_strict_retrieve_treats_fleet_only_records_as_project_ancestors(tmp_path):
@@ -126,3 +130,75 @@ def test_adr001_project_aliases_are_operator_configured(monkeypatch):
     assert _adr001_project("quota-ops") == "Quota"
     assert _adr001_project("agent_crew") == "Crew"
     assert _adr001_project("alpha_engine") == "alpha_engine"
+
+
+def test_dispatch_memory_uses_only_effective_project_owner_statements(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+
+    def owner(project, message, text, supersedes=()):
+        key = f"owner:{project}:telegram:6419236710:{message}"
+        storage.put(MemoryRecord("authoritative", key, {
+            "kind": "owner_statement", "text": text,
+            "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "chat_id": "6419236710", "message_id": message,
+            "verification_status": "VERIFIED", "supersedes": list(supersedes),
+        }, MemoryScope(project=project)))
+        return key
+
+    old = owner("agent_crew", "1", "superseded decision")
+    current = owner("agent_crew", "2", "effective decision", (old,))
+    foreign = owner("other", "3", "other project decision")
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-661", MemoryScope(project="agent_crew"))
+    assert current in block
+    assert old not in block
+    assert foreign not in block
+    assert counts == {"authoritative": 1, "failure_pattern": 0}
+
+
+def test_dispatch_memory_budget_counts_only_rendered_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    for number in range(30):
+        storage.put(MemoryRecord("authoritative", f"fact:{number:02d}",
+                                 {"text": "long excerpt " * 40},
+                                 MemoryScope(project="agent_crew")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:budget", {"text": "warning"},
+                             MemoryScope(fleet="fleet")))
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-661", MemoryScope(project="agent_crew"),
+        max_chars=1600)
+    assert len(block) <= 1600
+    assert counts["authoritative"] == block.count("authoritative key=")
+    assert counts["failure_pattern"] == block.count("failure_pattern key=")
+    assert counts["authoritative"] < 30
+    assert "long excerpt" not in block
+
+
+@pytest.mark.parametrize("failure", ["missing", "exception", "timeout"])
+def test_adr001_live_read_failure_keeps_message_and_zero_receipt(
+        tmp_path, monkeypatch, unused_tcp_port, failure):
+    from tests.unit.test_context_pack_inject_gate import _dispatch
+    import agent_crew.server as server
+
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", str(tmp_path / "missing.db"))
+    if failure == "exception":
+        def fail(*args, **kwargs):
+            raise RuntimeError("read failed")
+        monkeypatch.setattr(server.SQLiteMemoryStorage, "existing", fail)
+    elif failure == "timeout":
+        storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+        monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+
+        def slow(*args, **kwargs):
+            time.sleep(2.1)
+            return "late", {"authoritative": 1, "failure_pattern": 0}
+        monkeypatch.setattr(server, "dispatch_memory_block", slow)
+    result = _dispatch(tmp_path / "dispatch", monkeypatch, unused_tcp_port,
+                       task_project="agent_crew")
+    assert result["message"] == "baseline message"
+    assert result["row_context"]["memory_served"] == {
+        "authoritative": 0, "failure_pattern": 0}
+    assert result["memory"][0]["memory_served"] == result["row_context"]["memory_served"]
