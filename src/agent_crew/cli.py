@@ -3909,12 +3909,14 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
 @click.option("--prev-task-id", default="",
               help="Task id this one depends on (typically the impl task id "
                    "for review, or the review id for test).")
+@click.option("--risk-tier", type=click.IntRange(0, 3), default=None,
+              help="Explicit risk tier 0-3 (default: AGENT_CREW_DEFAULT_RISK_TIER if set)")
 @click.option("--priority", default=3, type=int, show_default=True)
 @click.option("--task-id", default="",
               help="Override task_id (default: <type>-<random8hex>)")
 def enqueue(task_type: str, description: str, project: str, db: str, base: str,
             branch: str, pr_number: int, artifact_kind: str | None,
-            prev_task_id: str, priority: int,
+            prev_task_id: str, risk_tier: int | None, priority: int,
             task_id: str):
     """Enqueue a single TASK_TYPE task without entering the loop.
 
@@ -3935,6 +3937,16 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
     import uuid as _uuid
     import urllib.request as _urllib_req
 
+    if risk_tier is None and "AGENT_CREW_DEFAULT_RISK_TIER" in os.environ:
+        raw_tier = os.environ["AGENT_CREW_DEFAULT_RISK_TIER"].strip()
+        if raw_tier not in {"0", "1", "2", "3"}:
+            raise click.UsageError(
+                "AGENT_CREW_DEFAULT_RISK_TIER must be an integer 0-3; pass --risk-tier 0-3")
+        risk_tier = int(raw_tier)
+    if risk_tier is None and not prev_task_id:
+        raise click.UsageError(
+            "pass --risk-tier 0-3 or set AGENT_CREW_DEFAULT_RISK_TIER")
+
     if not db:
         if not project:
             raise click.ClickException("--db or --project is required")
@@ -3950,6 +3962,8 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
         task_id = f"{task_type[:9]}-{_uuid.uuid4().hex[:8]}"
 
     context: dict = {}
+    if risk_tier is not None:
+        context["risk_tier"] = risk_tier
     if prev_task_id:
         context["prev_task_id"] = prev_task_id
     if pr_number:

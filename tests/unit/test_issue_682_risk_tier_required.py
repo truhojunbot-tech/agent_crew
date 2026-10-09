@@ -57,3 +57,10 @@ def test_trusted_generated_successor_without_tier_is_accepted(tmp_path):
                               context={"prev_task_id": "root"}),
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     assert queue.get_task("review-root") is not None
+
+
+def test_explicit_declaration_accepts_root_without_tier(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("root", "review", "work", context={
+        "risk_declaration": {"bounded_routine_fix": True}}))
+    assert queue.get_task("root") is not None

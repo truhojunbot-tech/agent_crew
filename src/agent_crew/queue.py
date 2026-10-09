@@ -3519,7 +3519,10 @@ class TaskQueue:
                     "context.risk_tier must be an integer 0-3")
             if (_is_root_task(task, context,
                               successor_provenance=_successor_provenance)
-                    and "risk_tier" not in context):
+                    and "risk_tier" not in context
+                    and not (isinstance(context.get("risk_declaration"), dict)
+                             and any(isinstance(context["risk_declaration"].get(field), bool)
+                                     for field in RISK_DECLARATION_FIELDS))):
                 raise InvalidRiskTierError(
                     "root context.risk_tier must be an integer 0-3")
             if refusal is None and task.task_type == "implement":
