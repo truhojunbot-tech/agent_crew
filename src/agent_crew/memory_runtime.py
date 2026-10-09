@@ -187,7 +187,7 @@ class SQLiteMemoryStorage:
                     if json.loads(previous[0]) != record.value:
                         raise ValueError("owner statement is immutable")
                     return
-            db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
+            db.execute("""INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)
                 ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
                 WHERE excluded.version > adr001_memory.version""",
                 (record.layer, record.key, json.dumps(record.value), _canonical_scope_json(record.scope), record.version, time.time())); db.commit()
@@ -220,7 +220,7 @@ class SQLiteMemoryStorage:
                 if prior and json.loads(prior[0]) == record.value:
                     continue
                 version = old_version + 1
-                db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
+                db.execute("""INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)
                     ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,
                     version=excluded.version,created=excluded.created""",
                     (record.layer, record.key, json.dumps(record.value), scope,
@@ -605,3 +605,10 @@ def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: 
             unique[identity] = record
     return {"enabled": True, "role": role, "task_id": task_id,
             "records": [asdict(r) for r in unique.values()]}
+
+
+def __getattr__(name: str):
+    if name in {"HybridMemoryStorage", "memory_storage_from_env"}:
+        from . import memory_hybrid
+        return getattr(memory_hybrid, name)
+    raise AttributeError(name)
