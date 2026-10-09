@@ -3,6 +3,7 @@
 import json
 import os
 import time
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
@@ -42,6 +43,15 @@ def test_real_codex_message_is_classified_and_reset_parsed(tmp_path):
     # 2026-10-09 13:02 UTC -> 15:10 UTC on the same day.
     failed_at = 1791550920.0
     assert _codex_quota_reset_at(str(log), failed_at=failed_at) == 1791558600.0
+
+
+def test_dated_codex_reset_line_uses_the_stated_calendar_day(tmp_path):
+    log = tmp_path / "dated-dispatch.log"
+    log.write_text("ERROR: You've hit your usage limit. Try again at Sep 30th, 2026 4:48 PM.\n")
+    failed_at = datetime(2026, 9, 24, 13, 2, tzinfo=timezone.utc).timestamp()
+    reset_at = datetime(2026, 9, 30, 16, 48, tzinfo=timezone.utc).timestamp()
+    assert _detect_transient_error_in_log(str(log)) == "codex_quota_exhausted"
+    assert _codex_quota_reset_at(str(log), failed_at=failed_at) == reset_at
 
 
 def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path, monkeypatch):

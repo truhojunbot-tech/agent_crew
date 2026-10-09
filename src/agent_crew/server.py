@@ -1293,13 +1293,25 @@ def _codex_quota_reset_at(log_path: str, *, failed_at: float,
             tail = stream.read()[-16384:].decode("utf-8", errors="replace")
     except OSError:
         return None
-    match = re.search(r"try again at\s+(\d{1,2}):(\d{2})\s*(AM|PM)", tail, re.I)
+    match = re.search(
+        r"try again at\s+(?:(?P<month>[A-Za-z]{3,9})\s+"
+        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,\s+(?P<year>\d{4})\s+)?"
+        r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)\b",
+        tail, re.I)
     if not match:
         return None
-    hour, minute = int(match.group(1)), int(match.group(2))
+    hour, minute = int(match.group("hour")), int(match.group("minute"))
     if not 1 <= hour <= 12 or not 0 <= minute <= 59:
         return None
-    hour = hour % 12 + (12 if match.group(3).lower() == "pm" else 0)
+    hour = hour % 12 + (12 if match.group("ampm").lower() == "pm" else 0)
+    if match.group("month"):
+        try:
+            month = datetime.datetime.strptime(match.group("month")[:3].title(), "%b").month
+            return datetime.datetime(int(match.group("year")), month,
+                                     int(match.group("day")), hour, minute,
+                                     tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            return None
     day = datetime.datetime.fromtimestamp(failed_at, datetime.timezone.utc)
     reset = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
     if reset.timestamp() <= failed_at:
