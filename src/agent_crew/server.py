@@ -45,7 +45,7 @@ from agent_crew.context_identity import (
 )
 from agent_crew.fallback import has_rate_limit_signal, is_rate_limit_error
 from agent_crew import tokenomics_canary as _canary
-from agent_crew.github import get_repo
+from agent_crew.github import get_repo, _repo_slug
 from agent_crew.loop import _resolve_verdict
 from agent_crew.pipeline import (
     auto_enqueue_fix as _pipeline_auto_enqueue_fix,
@@ -4985,6 +4985,7 @@ def create_app(
 
         # Record durable attribution before dispatch so quota systems can map
         # token usage back to the project even after worktrees are torn down (#174).
+        _repo_url = ""
         try:
             _repo_url = (await asyncio.to_thread(subprocess.run,
                 ["git", "-C", wt, "remote", "get-url", "origin"],
@@ -5203,10 +5204,28 @@ def create_app(
         # mistaken for absence of fact.
         _pack = None
         _state_dir = os.path.dirname(db_path)
+        _pack_parents = []
+        if _cpack.enabled() or _cpack.inject_gate_enabled() or _cpack.shadow_enabled():
+            _parent_id = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
+            _seen_parents = set()
+            while (isinstance(_parent_id, str) and _parent_id
+                   and _parent_id not in _seen_parents and len(_pack_parents) < 8):
+                _seen_parents.add(_parent_id)
+                try:
+                    _parent_ctx = await asyncio.to_thread(q().get_task_context, _parent_id) or {}
+                except Exception:
+                    logger.exception("dispatcher: context pack lineage lookup failed for %s", task.task_id)
+                    break
+                _pack_parents.append(_parent_ctx)
+                _parent_id = (_parent_ctx.get("prev_task_id")
+                              if isinstance(_parent_ctx, dict) else None)
+        _pack_kwargs = {"project": _project, "repo": _repo_slug(_repo_url),
+                        "lineage_contexts": _pack_parents}
         if _cpack.enabled():
             _pack = _cpack.build_pack_for_task(
                 _ctx if isinstance(_ctx, dict) else {},
                 task_id=task.task_id, task_type=task.task_type, role=role,
+                **_pack_kwargs,
                 repo_path=wt, branch=task.branch,
                 episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
                 # #240: persisted procedures reach the dispatch from here.
@@ -5296,6 +5315,7 @@ def create_app(
                 _gate_pack = _cpack.build_pack_for_task(
                     _ctx if isinstance(_ctx, dict) else {},
                     task_id=task.task_id, task_type=task.task_type, role=role,
+                    **_pack_kwargs,
                     repo_path=wt, branch=task.branch,
                     episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
                     procedures_path=os.path.join(_state_dir, "procedures.jsonl"),
@@ -5329,6 +5349,7 @@ def create_app(
                 _shadow_pack = _cpack.build_pack_for_task(
                     _ctx if isinstance(_ctx, dict) else {},
                     task_id=task.task_id, task_type=task.task_type, role=role,
+                    **_pack_kwargs,
                     repo_path=wt, branch=task.branch,
                     episodes_path=os.path.join(_state_dir, "episodes.jsonl"),
                     procedures_path=os.path.join(_state_dir, "procedures.jsonl"),

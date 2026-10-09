@@ -107,8 +107,11 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
         (index for index, (_, value) in enumerate(record_fields) if not is_unset(value)),
         default=-1,
     )
+    fleet_ancestor = not record_scope.project and bool(record_scope.fleet)
     for index, (name, record_value) in enumerate(record_fields):
         query_value = query_fields[name]
+        if name == "fleet" and fleet_ancestor:
+            continue
         if not is_unset(record_value):
             if record_value != query_value:
                 return False
@@ -248,7 +251,13 @@ class SQLiteMemoryStorage:
         for name, value in fields.items():
             # A stored empty field is an ancestor; a nonempty one must agree.
             path = f"$.{name}"
-            if name == "context_generation":
+            if name == "fleet":
+                clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
+                               "OR json_extract(scope, ?) = ? OR "
+                               "(COALESCE(json_extract(scope,'$.project'),'')='' AND "
+                               "COALESCE(json_extract(scope,'$.fleet'),'')<>''))")
+                params.extend((path, path, path, value))
+            elif name == "context_generation":
                 clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' OR json_extract(scope, ?) = 0 OR json_extract(scope, ?) = ?)")
                 params.extend((path, path, path, path, value))
             else:
