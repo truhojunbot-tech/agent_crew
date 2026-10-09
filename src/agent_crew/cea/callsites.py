@@ -275,6 +275,7 @@ REQUEUE_CALL_SITES: dict[str, tuple[str, ...]] = {
     "queue.requeue_dispatcher_claim": ("server.recover_orphan_task",),
     "queue.defer_push_delivery": ("server tmux push refused by the pane (G_DT backoff)",),
     "queue.defer_provider_capacity": ("server dispatcher provider capacity cooldown (#581)",),
+    "queue.resume_codex_quota": ("server dispatcher codex quota hold release (#653)",),
     "queue.reset_stale_to_pending": ("cli.recover --reset-stale (#155)",),
 }
 """ADR §8 re-admission paths, registered so I2 can enumerate them.
