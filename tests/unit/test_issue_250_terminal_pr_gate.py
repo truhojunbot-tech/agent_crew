@@ -120,6 +120,63 @@ def test_a_merged_pr_stops_the_test_cascade(q):
     assert not [t for t in q.list_tasks() if t.task_type == "test"]
 
 
+@pytest.mark.parametrize("stage", ["review", "fix", "test"])
+def test_closed_unmerged_pr_parks_calling_task_without_successor(q, stage):
+    if stage == "review":
+        task_id = _implement(q)
+        result = auto_enqueue_review(q, task_id, PR, pr_state_fn=_state("closed"))
+        successor_type = "review"
+    else:
+        task_id = _review(q, verdict="request_changes" if stage == "fix" else "approve",
+                          findings=(FINDING,) if stage == "fix" else (),
+                          summary="request_changes" if stage == "fix" else "lgtm")
+        result = (auto_enqueue_fix(q, task_id, pr_state_fn=_state("closed"))
+                  if stage == "fix" else
+                  auto_enqueue_test(q, task_id, pr_state_fn=_state("closed")))
+        successor_type = "implement" if stage == "fix" else "test"
+    assert result is None
+    task = q.get_task(task_id)
+    assert task.status == "needs_human"
+    assert task.summary == f"cascade_stopped: pr_closed pr={PR} stage={stage}"
+    assert not [t for t in q.list_tasks() if t.task_type == successor_type]
+
+
+def test_closed_pr_records_closer_when_state_lookup_returns_it(q):
+    task_id = _implement(q)
+    assert auto_enqueue_review(q, task_id, PR,
+                               pr_state_fn=lambda pr: {"state": "closed",
+                                                            "closed_by": "github-actions"}) is None
+    assert q.get_task_context(task_id)["pr_closed_by"] == "github-actions"
+
+
+def test_closed_pr_actor_lookup_uses_github_event(monkeypatch):
+    from agent_crew.github import pr_closed_by
+
+    calls = []
+
+    def run(argv, **kwargs):
+        from types import SimpleNamespace
+        calls.append(argv)
+        return SimpleNamespace(returncode=0, stdout="person\ngithub-actions\n")
+
+    monkeypatch.setattr("agent_crew.github.subprocess.run", run)
+    assert pr_closed_by(PR, repo="owner/repo") == "github-actions"
+    assert calls == [["gh", "api", "--paginate", f"repos/owner/repo/issues/{PR}/events",
+                      "--jq", '.[] | select(.event=="closed") | .actor.login']]
+
+
+def test_closed_pr_5902_replay_parks_implement_result(q, caplog):
+    task_id = "impl-d8790877"
+    q.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="impl",
+                          branch=BRANCH, context={"pr_number": 5902, "repo": "owner/repo"}))
+    q.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
+                                        summary="done", pr_number=5902))
+    assert auto_enqueue_review(q, task_id, 5902, pr_state_fn=_state("closed")) is None
+    assert q.get_task(task_id).summary == "cascade_stopped: pr_closed pr=5902 stage=review"
+    assert q.get_task(task_id).status == "needs_human"
+    assert "PR #5902 is closed" in caplog.text
+
+
 def test_an_unverifiable_pr_state_defers_rather_than_guesses(q):
     """⛔GitHub unreachable → no NEW work.
 

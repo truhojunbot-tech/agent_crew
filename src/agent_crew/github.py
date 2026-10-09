@@ -246,6 +246,25 @@ def pr_state(pr_number: int, repo: Optional[str] = None,
     return "unknown"
 
 
+def pr_closed_by(pr_number: int, repo: Optional[str] = None,
+                 timeout: float = 20.0, cwd: Optional[str] = None) -> str:
+    """Return the last PR-close event actor when GitHub exposes one."""
+    slug = _repo_slug(repo or get_repo(cwd=cwd))
+    if not pr_number or not slug:
+        return ""
+    try:
+        result = subprocess.run(
+            ["gh", "api", "--paginate", f"repos/{slug}/issues/{pr_number}/events",
+             "--jq", '.[] | select(.event=="closed") | .actor.login'],
+            capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            return ""
+        actors = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+        return actors[-1] if actors else ""
+    except Exception:
+        return ""
+
+
 def pr_has_comment_containing(pr_number: int, needle: str,
                               repo: Optional[str] = None,
                               timeout: float = 20.0) -> Optional[bool]:
