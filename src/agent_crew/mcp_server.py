@@ -49,7 +49,7 @@ from agent_crew.protocol import (
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
     AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
-    LateResultRejected, PausedError as _PausedError, TaskQueue,
+    LateResultRejected, StaleAttemptRejected, PausedError as _PausedError, TaskQueue,
 )
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
@@ -65,7 +65,8 @@ _DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
 }
 
 
-def _task_to_dict(task: TaskRequest, *, nonce: Optional[str] = None) -> dict[str, Any]:
+def _task_to_dict(task: TaskRequest, *, nonce: Optional[str] = None,
+                  binding: Optional[dict] = None) -> dict[str, Any]:
     """Serialize a TaskRequest dataclass to a JSON-friendly dict.
 
     Applies the same task-type guard that the tmux push path uses
@@ -84,6 +85,8 @@ def _task_to_dict(task: TaskRequest, *, nonce: Optional[str] = None) -> dict[str
 
     payload = asdict(task)
     payload["dispatch_nonce"] = nonce
+    if binding:
+        payload.update(binding)
     try:
         payload["description"] = _guard_description(task)
     except Exception:
@@ -146,7 +149,7 @@ def build_mcp_server(
                                           target=f"mcp:{agent or 'anonymous'}")
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
-        return _task_to_dict(task, nonce=nonce)
+        return _task_to_dict(task, nonce=nonce, binding=queue.dispatch_binding(task.task_id))
 
     @mcp.tool()
     def get_next_discuss_task(agent: str) -> Optional[dict[str, Any]]:
@@ -159,7 +162,7 @@ def build_mcp_server(
                                           target=f"mcp:{agent or 'anonymous'}")
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
-        return _task_to_dict(task, nonce=nonce)
+        return _task_to_dict(task, nonce=nonce, binding=queue.dispatch_binding(task.task_id))
 
     @mcp.tool()
     def submit_result(
@@ -190,6 +193,7 @@ def build_mcp_server(
         # transports or neither: without it an MCP worker could never pass the
         # RESULT gate, so `enforce` would have refused the whole transport.
         executor_binding: Optional[dict] = None,
+        attempt_id: Optional[str] = None,
     ) -> dict[str, Any]:
         """Mark a task done and store its result.
 
@@ -212,6 +216,7 @@ def build_mcp_server(
                 commit=commit,
                 artifact=artifact,
                 executor_binding=executor_binding,
+                attempt_id=attempt_id,
             )
         except (ValueError, TypeError) as e:
             return {"acknowledged": False, "error": str(e)}
@@ -256,7 +261,8 @@ def build_mcp_server(
         try:
             task_type = queue.submit_result(task_id, result, nonce=_nonce,
                                             presenter=_presenter,
-                                            validate_review=True)
+                                            validate_review=True, attempt_id=attempt_id,
+                                            require_attempt=True)
             capture_result_best_effort(queue.db_path, task_id, result)
         except AdmissionRefused as exc:
             # Both transports or neither: HTTP answers 409 for a refused P2
@@ -265,6 +271,9 @@ def build_mcp_server(
             return {"acknowledged": False, "refused": exc.point,
                     "outcome": exc.outcome, "receipt_id": exc.receipt_id,
                     "error": str(exc)}
+        except StaleAttemptRejected as exc:
+            return {"acknowledged": False, "accepted": False,
+                    "stale_attempt": True, "error": str(exc)}
         except LateResultRejected as exc:
             # Same single guard as HTTP (queue.submit_result under the write
             # lock); only the evidence event was committed, so no cascade.
