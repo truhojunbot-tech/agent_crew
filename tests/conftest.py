@@ -116,6 +116,10 @@ def _gh_write_argv(argv) -> bool:
     if (len(parts) == 3 and parts[1] == "api" and
             re.fullmatch(r"repos/[^/]+/[^/]+/commits/[0-9a-fA-F]{40}/status", parts[2])):
         return False                     # Exact combined-status REST read.
+    if (len(parts) == 6 and parts[1:3] == ["api", "--paginate"] and
+            re.fullmatch(r"repos/[^/]+/[^/]+/issues/\d+/events", parts[3]) and
+            parts[4:] == ["--jq", '.[] | select(.event=="closed") | .actor.login']):
+        return False                     # Exact PR-closure actor REST read.
     return command not in GH_READ_ONLY_COMMANDS
 
 

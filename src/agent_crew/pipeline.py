@@ -685,8 +685,8 @@ def _skip_terminal_pr(queue, what: str, task_id: str, pr_number, *, pr_state_fn=
         stage = what.removeprefix("auto_enqueue_")
         reason = f"cascade_stopped: pr_closed pr={pr_number} stage={stage}"
         if not closer and pr_state_fn is None:
-            from agent_crew.github import pr_closed_by
-            closer = pr_closed_by(int(pr_number), repo=repo or None, cwd=repo_cwd or None)
+            from agent_crew.github import get_pr_closure_actor
+            closer = get_pr_closure_actor(int(pr_number), repo=repo or None, cwd=repo_cwd or None)
         detail = {"cascade_stopped": reason}
         if closer:
             detail["pr_closed_by"] = closer

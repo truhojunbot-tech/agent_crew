@@ -246,8 +246,8 @@ def pr_state(pr_number: int, repo: Optional[str] = None,
     return "unknown"
 
 
-def pr_closed_by(pr_number: int, repo: Optional[str] = None,
-                 timeout: float = 20.0, cwd: Optional[str] = None) -> str:
+def get_pr_closure_actor(pr_number: int, repo: Optional[str] = None,
+                         timeout: float = 20.0, cwd: Optional[str] = None) -> str:
     """Return the last PR-close event actor when GitHub exposes one."""
     slug = _repo_slug(repo or get_repo(cwd=cwd))
     if not pr_number or not slug:

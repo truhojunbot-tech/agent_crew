@@ -158,7 +158,7 @@ def test_open_pr_with_state_details_still_cascades(q):
 
 
 def test_closed_pr_actor_lookup_uses_github_event(monkeypatch):
-    from agent_crew.github import pr_closed_by
+    from agent_crew.github import get_pr_closure_actor
 
     calls = []
 
@@ -168,7 +168,7 @@ def test_closed_pr_actor_lookup_uses_github_event(monkeypatch):
         return SimpleNamespace(returncode=0, stdout="person\ngithub-actions\n")
 
     monkeypatch.setattr("agent_crew.github.subprocess.run", run)
-    assert pr_closed_by(PR, repo="owner/repo") == "github-actions"
+    assert get_pr_closure_actor(PR, repo="owner/repo") == "github-actions"
     assert calls == [["gh", "api", "--paginate", f"repos/owner/repo/issues/{PR}/events",
                       "--jq", '.[] | select(.event=="closed") | .actor.login']]
 
