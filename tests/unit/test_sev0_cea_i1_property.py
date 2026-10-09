@@ -242,6 +242,8 @@ from tests.unit.sev0_cea_acceptance_helpers import (  # noqa: E402
 DOCUMENTED_MUTATING_ROUTES = {
     ("DELETE", "/tasks/{task_id}"), ("POST", "/admin/replay-suppressed"),
     ("POST", "/gates"), ("POST", "/gates/{gate_id}/resolve"),
+    # Read-only memory query, not a task ingress; no CEA transport required.
+    ("POST", "/memory/retrieve_ranked"),
     ("POST", "/pane_map/reload"), ("POST", "/runtime/coordinator/handoff"),
     ("POST", "/tasks"), ("POST", "/tasks/expire-stale"),
     ("POST", "/tasks/{task_id}/checkpoint"), ("POST", "/tasks/{task_id}/result"),
