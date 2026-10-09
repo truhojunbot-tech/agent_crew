@@ -14,6 +14,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from array import array
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -98,7 +99,7 @@ class EvalOnnxEmbedder:
         from tokenizers import Tokenizer
 
         options = ort.SessionOptions()
-        options.intra_op_num_threads = 2
+        options.intra_op_num_threads = 8
         options.inter_op_num_threads = 1
         self.session = ort.InferenceSession(str(model_path), sess_options=options,
                                             providers=["CPUExecutionProvider"])
@@ -130,6 +131,32 @@ class EvalOnnxEmbedder:
         vector = vector[0].astype(np.float32)
         self.timings_ms.append((time.perf_counter() - started) * 1000)
         return vector
+
+    def embed_many(self, texts: list[str]):
+        """Batch corpus passages for the offline warmup, without retrieval timing."""
+        import numpy as np
+
+        if self.model_id == "intfloat/multilingual-e5-small":
+            texts = ["passage: " + text for text in texts]
+        encoded = [self.tokenizer.encode(text).ids[:256] for text in texts]
+        width = max(map(len, encoded))
+        ids = np.zeros((len(encoded), width), dtype=np.int64)
+        mask = np.zeros_like(ids)
+        for index, tokens in enumerate(encoded):
+            ids[index, :len(tokens)] = tokens
+            mask[index, :len(tokens)] = 1
+        segments = np.zeros_like(ids)
+        feeds = {meta.name: (mask if "mask" in meta.name else
+                             segments if "token_type" in meta.name else ids)
+                 for meta in self.session.get_inputs()}
+        output = self.session.run(None, feeds)[0]
+        if output.ndim == 3:
+            vectors = (output * mask[:, :, None]).sum(axis=1) / mask.sum(axis=1)[:, None]
+        elif output.ndim == 2:
+            vectors = output
+        else:
+            raise ValueError(f"unexpected ONNX output shape {output.shape}")
+        return vectors.astype(np.float32)
 
 
 def download_model(model_id: str, cache_dir: Path, query_texts: set[str]):
@@ -171,14 +198,57 @@ def count_available_keys(source: Path, cases: list[dict]) -> int:
     return sum(bool(keys.intersection(expected_keys(case))) for case in cases)
 
 
+def preembed_vectors(db_path: Path, embedder, model_id: str, batch_size: int = 32) -> dict:
+    """Populate every copied row before scoring; no retrieval deadline applies."""
+    with sqlite3.connect(db_path) as db:
+        rows = db.execute("SELECT m.rowid, f.body, v.model_id, v.content_sha "
+                          "FROM adr001_memory m JOIN adr001_fts f ON f.rowid=m.rowid "
+                          "LEFT JOIN adr001_vec v ON v.rowid=m.rowid ORDER BY m.rowid").fetchall()
+        total = len(rows)
+        if embedder is None:
+            return {"embedded": 0, "total": total}
+        missing = [(rowid, body, hashlib.sha256(body.encode()).hexdigest())
+                   for rowid, body, stored_model, stored_sha in rows
+                   if stored_model != model_id or
+                   stored_sha != hashlib.sha256(body.encode()).hexdigest()]
+        # Length buckets avoid padding short passages to a long neighbor.
+        missing.sort(key=lambda row: len(row[1]))
+        for offset in range(0, len(missing), batch_size):
+            batch = missing[offset:offset + batch_size]
+            texts = [body for _, body, _ in batch]
+            vectors = (embedder.embed_many(texts) if hasattr(embedder, "embed_many")
+                       else [embedder(text) for text in texts])
+            if len(vectors) != len(batch):
+                raise ValueError("embedder returned incomplete corpus batch")
+            values = []
+            for (rowid, _, digest), vector in zip(batch, vectors):
+                packed = array("f", vector)
+                if not packed or not all(math.isfinite(value) for value in packed):
+                    raise ValueError(f"invalid embedding for rowid={rowid}")
+                values.append((rowid, model_id, digest, packed.tobytes()))
+            db.executemany("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
+                           "VALUES(?,?,?,?) ON CONFLICT(rowid) DO UPDATE SET "
+                           "model_id=excluded.model_id,content_sha=excluded.content_sha,"
+                           "vec=excluded.vec", values)
+            db.commit()
+        embedded = db.execute("SELECT count(*) FROM adr001_vec WHERE model_id=?",
+                              (model_id,)).fetchone()[0]
+        if embedded != total:
+            raise ValueError(f"vector coverage incomplete: {embedded}/{total}")
+    return {"embedded": embedded, "total": total}
+
+
 def score_model(source: Path, workdir: Path, model_id: str, data: dict,
-                cache_dir: Path, *, k: int, byte_budget: int) -> dict:
+                cache_dir: Path, *, k: int, byte_budget: int,
+                resume: bool = False) -> dict:
     db_path = workdir / (model_id.replace("/", "_") + ".db")
-    copy_database(source, db_path)
+    if not resume or not db_path.exists():
+        copy_database(source, db_path)
     cases = data["owner_cases"] + data["task_cases"]
     embedder, size = download_model(model_id, cache_dir,
                                     {case["query"] for case in cases})
     storage = HybridMemoryStorage(str(db_path), embedder=embedder)
+    coverage = preembed_vectors(db_path, embedder, storage.model_id)
     hits = {"owner_cases": 0, "task_cases": 0}
     latencies: list[float] = []
     modes: dict[str, int] = {}
@@ -194,7 +264,8 @@ def score_model(source: Path, workdir: Path, model_id: str, data: dict,
             "task_hits": hits["task_cases"], "p95_embed_ms":
             p95(embedder.timings_ms) if embedder else None,
             "p95_retrieve_ms": p95(latencies), "model_size_bytes": size,
-            "retrieval_modes": modes, "fallback_count": storage.fallback_count}
+            "retrieval_modes": modes, "fallback_count": storage.fallback_count,
+            "vector_coverage": coverage}
 
 
 def main() -> None:
@@ -204,6 +275,8 @@ def main() -> None:
     parser.add_argument("--cache-dir", type=Path,
                         default=Path.home() / ".cache/huggingface/hub")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--resume-dir", type=Path,
+                        help="reuse a temporary snapshot and completed per-model copies")
     parser.add_argument("--models", nargs="+", choices=MODEL_IDS, default=MODEL_IDS)
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--byte-budget", type=int, default=65536)
@@ -214,12 +287,18 @@ def main() -> None:
     with tempfile.TemporaryDirectory(prefix="adr001-embed-eval-") as tmp:
         # Freeze one online snapshot before scoring so every model sees the
         # same corpus even if the live source receives new memory rows.
-        snapshot = Path(tmp) / "source-snapshot.db"
-        copy_database(args.db, snapshot)
+        workdir = args.resume_dir or Path(tmp)
+        snapshot = workdir / "source-snapshot.db"
+        if args.resume_dir:
+            if not snapshot.is_file():
+                parser.error("--resume-dir requires source-snapshot.db")
+        else:
+            copy_database(args.db, snapshot)
         coverage = {group: count_available_keys(snapshot, data[group])
                     for group in ("owner_cases", "task_cases")}
-        rows = [score_model(snapshot, Path(tmp), model, data, args.cache_dir,
-                            k=args.k, byte_budget=args.byte_budget)
+        rows = [score_model(snapshot, workdir, model, data, args.cache_dir,
+                            k=args.k, byte_budget=args.byte_budget,
+                            resume=bool(args.resume_dir))
                 for model in args.models]
     report = {"eval_sha256": EVAL_SHA256, "source_db": str(args.db),
               "k": args.k, "byte_budget": args.byte_budget,
