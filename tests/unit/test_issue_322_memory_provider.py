@@ -279,23 +279,29 @@ def test_shadow_retrieve_defense_in_depth_removes_cross_project_provider_items()
     assert shadow_telemetry(result)["dropped_cross_project"] == 2
 
 
-def test_shadow_results_leave_baseline_prompt_and_dispatch_byte_identical(tmp_path, monkeypatch, *, unused_tcp_port):
-    baseline, baseline_context, baseline_events, _ = _dispatch_snapshot(
-        tmp_path / "baseline", monkeypatch, NullMemoryProvider(), unused_tcp_port=unused_tcp_port)
+def test_live_memory_flag_serves_rows_into_dispatch(tmp_path, monkeypatch, *, unused_tcp_port):
+    monkeypatch.delenv("AGENT_CREW_ADR001_MEMORY_ENABLED", raising=False)
+    baseline, baseline_context, _, _ = _dispatch_snapshot(
+        tmp_path / "baseline", monkeypatch, NullMemoryProvider(),
+        shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    storage.put(MemoryRecord("authoritative", "owner:project-a:decision", {
+        "text": "authoritative owner decision"}, MemoryScope(project="project-a")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:dispatch", {
+        "title": "fleet failure"}, MemoryScope(fleet="fleet")))
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
     returned, returned_context, returned_events, _ = _dispatch_snapshot(
-        tmp_path / "returned", monkeypatch,
-        FakeMemoryProvider([_item("decision-1", "project-a")]),
-        unused_tcp_port=unused_tcp_port,
-    )
+        tmp_path / "returned", monkeypatch, None,
+        shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
 
-    assert returned == baseline
-    assert "prior decision" not in " ".join(map(str, returned)).lower()
-    assert ({key: value for key, value in returned_context.items() if key != "shadow_memory"}
-            == {key: value for key, value in baseline_context.items() if key != "shadow_memory"})
-    assert returned_events[0]["state"] == "results"
-    assert returned_events[0]["result_ids"] == ["decision-1"]
-    assert returned_events[0]["source_refs"] == ["git:abc"]
-    assert baseline_events[0]["state"] == "unavailable"
+    assert returned != baseline
+    assert "owner:project-a:decision" in " ".join(map(str, returned))
+    assert "wc1:dispatch" in " ".join(map(str, returned))
+    assert "memory_served" not in baseline_context
+    assert returned_context["memory_served"]["authoritative"] > 0
+    assert returned_context["memory_served"]["failure_pattern"] > 0
+    assert returned_events == []  # live recall replaces the shadow dispatch seam
 
 
 def test_shadow_failures_timeouts_and_empty_results_leave_baseline_unchanged(tmp_path, monkeypatch, *, unused_tcp_port):

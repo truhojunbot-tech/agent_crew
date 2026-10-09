@@ -36,7 +36,9 @@ from agent_crew.memory import (
 )
 from agent_crew.memory_capture import capture_result_best_effort, task_lineage
 from agent_crew.memory_runtime import (SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS,
-                                       SHADOW_RETRIEVAL_MAX_ROWS)
+                                       SHADOW_RETRIEVAL_MAX_ROWS,
+                                       SQLiteMemoryStorage, MemoryScope,
+                                       dispatch_memory_block, memory_enabled)
 from agent_crew.context_identity import (
     append_attribution_jsonl,
     detect_context_compaction,
@@ -2864,6 +2866,30 @@ def _guard_description(task: TaskRequest) -> str:
     return f"{guard}\n\n{task.description}"
 
 
+def _adr001_project(crew_project: str) -> str:
+    """Resolve operator-declared crew to ADR-001 project aliases."""
+    raw = os.getenv("AGENT_CREW_MEMORY_PROJECT_ALIASES", "").strip()
+    if not raw:
+        return crew_project
+    try:
+        aliases = json.loads(raw)
+    except (TypeError, ValueError):
+        logger.warning("AGENT_CREW_MEMORY_PROJECT_ALIASES is not valid JSON")
+        return crew_project
+    if not isinstance(aliases, dict):
+        logger.warning("AGENT_CREW_MEMORY_PROJECT_ALIASES must be an object")
+        return crew_project
+    exact = aliases.get(crew_project)
+    if isinstance(exact, str) and exact:
+        return exact
+    for prefix, target in aliases.items():
+        if (isinstance(prefix, str) and prefix.endswith("*")
+                and crew_project.startswith(prefix[:-1])
+                and isinstance(target, str) and target):
+            return target
+    return crew_project
+
+
 def _format_task_message(task: TaskRequest, port: int,
                          nonce: Optional[str] = None, *, project: str = "") -> str:
     """The block a worker receives — and, when one was minted, its dispatch nonce.
@@ -3012,12 +3038,16 @@ def create_app(
     _codex_cap_mb = _codex_context_cap_mb(state_path)
     _codex_mode = _codex_session_mode(state_path)
     logger.info("Codex context cap effective=%s MB", _codex_cap_mb)
-    if memory_provider is not None:
+    if memory_enabled():
+        # Live ADR-001 dispatch reads SQLiteMemoryStorage directly below.
+        # Do not also install the legacy RuntimeMemoryProvider shadow seam.
+        _memory_provider = memory_provider or NullMemoryProvider()
+    elif memory_provider is not None:
         _memory_provider = memory_provider
     else:
         shadow_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()
         if shadow_db and os.path.isfile(os.path.expanduser(shadow_db)):
-            from agent_crew.memory_runtime import RuntimeMemoryProvider, SQLiteMemoryStorage
+            from agent_crew.memory_runtime import RuntimeMemoryProvider
             try:
                 _memory_provider = RuntimeMemoryProvider(
                     SQLiteMemoryStorage(os.path.expanduser(shadow_db)))
@@ -5176,6 +5206,11 @@ def create_app(
             try:
                 from agent_crew.memory_runtime import effective_owner_statements
                 _storage = getattr(_memory_provider, "storage", None)
+                if _storage is None and memory_enabled():
+                    _memory_db = os.path.expanduser(os.getenv(
+                        "AGENT_CREW_SHADOW_MEMORY_DB", "").strip())
+                    if _memory_db:
+                        _storage = SQLiteMemoryStorage.existing(_memory_db)
                 if _storage is not None:
                     _owner_facts = [
                         {"source_ref": record.value.get("source_ref"),
@@ -5197,6 +5232,34 @@ def create_app(
                                     "previous_session_id": _renew_previous_session,
                                     "chain_root": _chain_root},
             })
+        # ADR-001 live recall is independent of Context Pack. Reuse its scoped
+        # storage reader and render keys so the worker can verify each source.
+        if memory_enabled():
+            _served = {"authoritative": 0, "failure_pattern": 0}
+            try:
+                _memory_db = os.path.expanduser(os.getenv(
+                    "AGENT_CREW_SHADOW_MEMORY_DB", "").strip())
+                if _memory_db:
+                    _storage = SQLiteMemoryStorage.existing(_memory_db)
+                    _memory_block, _served = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            dispatch_memory_block, _storage, role, task.task_id,
+                            MemoryScope(project=_adr001_project(_project))),
+                        timeout=2.0,
+                    )
+                    if _served["authoritative"] or _served["failure_pattern"]:
+                        message = _memory_block + "\n\n" + message
+            except Exception:
+                logger.exception("dispatcher: ADR-001 live read failed for %s", task.task_id)
+            try:
+                q().patch_context(task.task_id, {"memory_served": _served})
+                record_context_event(
+                    _context_events_path, "memory_served_live",
+                    task_id=task.task_id, project=_project,
+                    memory_served=_served,
+                )
+            except Exception:
+                logger.exception("dispatcher: ADR-001 receipt failed for %s", task.task_id)
         # #239: assemble a bounded, provenance-linked Context Pack from durable
         # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
         # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
@@ -5396,7 +5459,7 @@ def create_app(
         # and its result is deliberately never assigned to `message`, `task`,
         # routing, retry, or context-policy state.  A provider failure is
         # converted to telemetry by `shadow_retrieve`, not an execution error.
-        if shadow_memory_enabled:
+        if shadow_memory_enabled and not memory_enabled():
             try:
                 try:
                     _predecessors, _lineage_pr = await asyncio.to_thread(

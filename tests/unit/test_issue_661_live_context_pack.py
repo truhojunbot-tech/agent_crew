@@ -2,6 +2,8 @@
 
 from agent_crew import context_pack as pack
 from agent_crew.memory_runtime import MemoryRecord, MemoryScope, SQLiteMemoryStorage
+import hashlib
+import json
 
 
 def test_strict_retrieve_treats_fleet_only_records_as_project_ancestors(tmp_path):
@@ -86,3 +88,41 @@ def test_dispatch_event_names_the_served_failure_pattern(tmp_path, monkeypatch, 
     result = _dispatch(tmp_path / "dispatch", monkeypatch, unused_tcp_port, live=True)
     assert "wc1:dispatch" in result["built"][0]["result_ids"]
     assert "fleet warning" in result["message"]
+
+
+def test_adr001_live_dispatch_serves_owner_and_fleet_with_context_pack_off(
+        tmp_path, monkeypatch, unused_tcp_port):
+    from tests.unit.test_context_pack_inject_gate import _dispatch
+
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    owner_text = "Owner decision for this project"
+    owner_key = "owner:agent_crew:telegram:6419236710:2154"
+    storage.put(MemoryRecord("authoritative", owner_key, {
+        "kind": "owner_statement", "text": owner_text,
+        "text_sha256": hashlib.sha256(owner_text.encode()).hexdigest(),
+        "chat_id": "6419236710", "message_id": "2154",
+        "verification_status": "VERIFIED", "supersedes": [],
+    }, MemoryScope(project="agent_crew")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:live-replay", {
+        "kind": "worst_case", "title": "Fleet failure", "pattern": "Avoid stale owner state",
+    }, MemoryScope(fleet="fleet")))
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+    monkeypatch.setenv("AGENT_CREW_MEMORY_PROJECT_ALIASES", json.dumps({"agent_crew": "agent_crew"}))
+    result = _dispatch(tmp_path / "dispatch", monkeypatch, unused_tcp_port,
+                       task_project="agent_crew")
+    assert owner_key in result["message"]
+    assert "wc1:live-replay" in result["message"]
+    assert result["row_context"]["memory_served"]["authoritative"] > 0
+    assert result["row_context"]["memory_served"]["failure_pattern"] > 0
+    assert result["memory"][0]["memory_served"] == result["row_context"]["memory_served"]
+
+
+def test_adr001_project_aliases_are_operator_configured(monkeypatch):
+    from agent_crew.server import _adr001_project
+
+    monkeypatch.setenv("AGENT_CREW_MEMORY_PROJECT_ALIASES",
+                       json.dumps({"quota-*": "Quota", "agent_crew": "Crew"}))
+    assert _adr001_project("quota-ops") == "Quota"
+    assert _adr001_project("agent_crew") == "Crew"
+    assert _adr001_project("alpha_engine") == "alpha_engine"
