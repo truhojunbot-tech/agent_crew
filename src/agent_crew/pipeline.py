@@ -662,10 +662,12 @@ def pr_is_actionable(pr_number, *, pr_state_fn=None, repo: str = "",
     except Exception as e:  # noqa: BLE001 — a lookup never breaks a cascade
         logger.warning(f"pr_is_actionable: lookup failed for PR #{pr_number}: {e}")
         return (False, "unknown")
+    if isinstance(state, dict):
+        return (state.get("state") == "open", state)
     return (state == "open", state or "unknown")
 
 
-def _skip_terminal_pr(what: str, task_id: str, pr_number, *, pr_state_fn=None,
+def _skip_terminal_pr(queue, what: str, task_id: str, pr_number, *, pr_state_fn=None,
                       repo: str = "", repo_cwd: str = "") -> Optional[str]:
     """Shared guard for the cascade entry points.
 
@@ -673,8 +675,25 @@ def _skip_terminal_pr(what: str, task_id: str, pr_number, *, pr_state_fn=None,
     """
     actionable, state = pr_is_actionable(pr_number, pr_state_fn=pr_state_fn,
                                          repo=repo, repo_cwd=repo_cwd)
+    closer = None
+    if isinstance(state, dict):
+        closer = state.get("closed_by") or state.get("closedBy")
+        state = state.get("state") or "unknown"
     if actionable:
         return None
+    if state == "closed":
+        stage = what.removeprefix("auto_enqueue_")
+        reason = f"cascade_stopped: pr_closed pr={pr_number} stage={stage}"
+        if not closer and pr_state_fn is None:
+            from agent_crew.github import get_pr_closure_actor
+            closer = get_pr_closure_actor(int(pr_number), repo=repo or None, cwd=repo_cwd or None)
+        detail = {"cascade_stopped": reason}
+        if closer:
+            detail["pr_closed_by"] = closer
+        queue.mark_needs_human(task_id, reason, detail)
+        logger.warning("%s: PR #%s is closed — %s (task=%s, closed_by=%s)",
+                       what, pr_number, reason, task_id, closer or "unknown")
+        return state
     if state == "unknown":
         # ⛔Louder than the terminal case, deliberately. "The PR is merged" is a
         #   correct, permanent stop; "we could not ask GitHub" is a stop that
@@ -1461,7 +1480,7 @@ def auto_enqueue_fix(
         # #250: a terminal PR ends the cascade regardless of the round budget.
         # Checked BEFORE the budget so an exhausted lineage on a merged PR stays
         # silent instead of announcing itself to an already-decided artifact.
-        if _skip_terminal_pr("auto_enqueue_fix", review_task_id, pr_number,
+        if _skip_terminal_pr(queue, "auto_enqueue_fix", review_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=repo, repo_cwd=repo_cwd):
             return None
 
@@ -2043,7 +2062,7 @@ def auto_enqueue_review(
                 )
 
         # #250: reviewing a merged/closed PR cannot change the artifact.
-        if _skip_terminal_pr("auto_enqueue_review", impl_task_id, pr_number,
+        if _skip_terminal_pr(queue, "auto_enqueue_review", impl_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_impl_repo, repo_cwd=repo_cwd):
             return None
 
@@ -2264,7 +2283,7 @@ def auto_enqueue_test(
 
         pr_number = review_ctx.get("pr_number")
         # #250: same gate — a merged PR does not need testing on our account.
-        if _skip_terminal_pr("auto_enqueue_test", review_task_id, pr_number,
+        if _skip_terminal_pr(queue, "auto_enqueue_test", review_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_test_repo, repo_cwd=repo_cwd):
             return None
         # #308: a provider cooldown skips this optional tester stage. Keep the
