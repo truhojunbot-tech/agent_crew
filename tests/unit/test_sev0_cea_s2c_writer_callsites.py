@@ -267,7 +267,7 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
         return original_run(*args, **kwargs)
     monkeypatch.setenv("AGENT_CREW_CEA_OWNER_REQUEST_CMD", "owner-request")
     monkeypatch.setattr("agent_crew.queue.subprocess.run", record_owner_request)
-    t = task(context=admitted({"pr_number": 594}))
+    t = task(context=admitted({"pr_number": 594, "repo": owner_match.repo}))
     q.enqueue(t)
     assert q.get_task("t1").status == "needs_human"
     assert q.parked_owner_conflict_count() == 1
@@ -292,7 +292,7 @@ def test_owner_conflict_is_parked_and_readmitted_only_on_new_signed_generation(
         assert health_cea["owner_approval_requests"] == {"total": 1, "failed": 0}
         held = client.post("/tasks", json={"task_id": "t2", "task_type": "implement",
                                            "description": "another owner conflict", "branch": "feature",
-                                           "context": admitted({"pr_number": 594}),
+                                           "context": admitted({"pr_number": 594, "repo": owner_match.repo}),
                                            "project": "agent_crew"})
         assert held.status_code == 423
         assert held.json()["reason"] == "OWNER_CONFLICT"
