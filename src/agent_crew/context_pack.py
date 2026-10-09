@@ -801,7 +801,6 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
             elif isinstance(p, ForgeProvider):
                 retrieved = [a for a in retrieved if not any(
                     key in lexical_paths for key in _artifact_path_keys(a.uri, query.repo_path))]
-                pack.tail_bytes += p.last_tail_bytes
                 pack.forge_timeout += int(p.last_timeout)
                 pack.forge_error = p.last_error
                 if p.last_error:
@@ -844,6 +843,8 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
         per_type[a.artifact_type] = per_type.get(a.artifact_type, 0) + 1
 
     pack.items = selected
+    pack.tail_bytes = sum(len(a.excerpt.encode("utf-8")) for a in selected
+                          if a.artifact_id.startswith("forge:"))
     # Hybrid attribution describes what reached the pack, not which optional
     # provider was queried. Keep failed Forge attempts in degraded telemetry.
     if (mode == MODE_HYBRID and any(isinstance(p, ForgeProvider) for p in providers)
