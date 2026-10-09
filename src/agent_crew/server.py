@@ -73,7 +73,8 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError,
                               DuplicateReviewResult, InvalidReviewResult, InvalidRiskTierError,
-                              LateResultRejected,
+                              LateResultRejected, StaleAttemptRejected,
+                              StaleCoordinatorGeneration,
                               TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
@@ -163,6 +164,7 @@ def cancel_task_with_signal(
     pane_map: Optional[dict], events_path: str,
     reason: str = _CANCEL_REASON_ATTEMPT,
     expected_status: Optional[str] = None,
+    coordinator_generation: Optional[int] = None,
 ) -> dict:
     """Cancel in the DB and signal only its server-recorded, project-owned pane.
 
@@ -174,7 +176,8 @@ def cancel_task_with_signal(
     status. An unknown id raises ValueError.
     """
     cancelled, prior_status, bound_pane = queue.cancel_with_binding(
-        task_id, reason=reason, expected_status=expected_status)
+        task_id, reason=reason, expected_status=expected_status,
+        coordinator_generation=coordinator_generation)
     if prior_status is None:
         raise ValueError(f"Task not found: {task_id!r}")
     if not cancelled:
@@ -2865,7 +2868,9 @@ def _guard_description(task: TaskRequest) -> str:
 
 
 def _format_task_message(task: TaskRequest, port: int,
-                         nonce: Optional[str] = None, *, project: str = "") -> str:
+                         nonce: Optional[str] = None, *, project: str = "",
+                         attempt_id: Optional[str] = None,
+                         coordinator_generation: Optional[int] = None) -> str:
     """The block a worker receives — and, when one was minted, its dispatch nonce.
 
     ADR P4/§2.2: the nonce is single-use, presented once at ``/start`` for a
@@ -2907,6 +2912,8 @@ def _format_task_message(task: TaskRequest, port: int,
             f"go:true means start the work, even if outcome/reason show BLOCK with "
             f"enforced:false (shadow observation). On go:false, STOP.\n"
         )
+    if attempt_id:
+        result_body += f',"attempt_id":"{attempt_id}"'
     result_body += "}"
     result_instruction = (
         "Do the work described above, then POST result:\n"
@@ -2922,6 +2929,9 @@ def _format_task_message(task: TaskRequest, port: int,
         f"branch: {task.branch}\n"
         f"priority: {task.priority}\n"
         + (f"dispatch_nonce: {nonce}\n" if nonce else "")
+        + (f"attempt_id: {attempt_id}\n" if attempt_id else "")
+        + (f"coordinator_generation: {coordinator_generation}\n"
+           if coordinator_generation is not None else "")
         + f"context: {ctx}\n"
         f"description: {description}\n"
         f"=== END TASK ===\n"
@@ -3333,6 +3343,8 @@ def create_app(
             db_path=db_path, project=project, logger=logger)
         state["cea_wiring"] = _cea_wiring
         state["queue"] = TaskQueue(db_path, cea_providers=_cea_wiring.providers)
+        app.state.coordinator_generation = int(
+            state["queue"].get_coordinator_state()["coordinator_generation"] or 0)
         # #248: stamp the build into the durable event stream at startup, so a
         # production before/after cohort can be cut on the PROCESS boundary
         # instead of on a GitHub merge time. #247 showed those are not the same
@@ -5153,8 +5165,11 @@ def create_app(
             logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
             _release_dispatch_slot(task.task_id, _slot)
             return
+        _binding = q().dispatch_binding(task.task_id)
         message = _format_task_message(
-            task, port, nonce=_dispatch_nonce, project=_server_identity()["project"])
+            task, port, nonce=_dispatch_nonce, project=_server_identity()["project"],
+            attempt_id=_binding.get("attempt_id"),
+            coordinator_generation=_binding.get("coordinator_generation"))
         if _renew_previous_session:
             _summary = codex_latest_compaction_summary(_renew_previous_session)
             _seed = "summary_and_checkpoint" if _summary else "checkpoint_only"
@@ -6518,7 +6533,9 @@ def create_app(
         op_key = f"merge:pr:{pr_number}"
         leave_to_coordinator = os.getenv("AGENT_CREW_AUTO_MERGE", "").strip().lower() in (
             "0", "false", "no", "off")
-        resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
+        resv = q().external_op_reserve(
+            op_key, pr_number=int(pr_number),
+            coordinator_generation=getattr(app.state, "coordinator_generation", None))
         if not resv.get("admitted"):
             logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — "
                            f"STOP admission 거부({resv.get('state')})")
@@ -6780,6 +6797,7 @@ def create_app(
             "runtime_state": _runtime_state_out,
             "cea": _cea_out,
             "risk_declaration": _risk_out,
+            "coordinator_handoff_overdue": q().overdue_coordinator_handoff(),
             "dispatcher_tick_age_s": (
                 max(0.0, time.monotonic() - app.state.dispatcher_last_tick_monotonic)
                 if app.state.dispatcher_last_tick_monotonic is not None else None
@@ -6809,6 +6827,16 @@ def create_app(
         """Generic, project-scoped coordinator authority (#309 K1)."""
         return q().get_coordinator_state()
 
+    @app.post("/runtime/coordinator/checkpoint")
+    def checkpoint_runtime_coordinator(body: dict):
+        """Record an outgoing handoff checkpoint; monitoring alerts after 15 minutes."""
+        try:
+            return q().prepare_coordinator_handoff(body)
+        except StaleCoordinatorGeneration as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/runtime/coordinator/handoff")
     def handoff_runtime_coordinator(body: dict):
         """Advance coordinator authority with a generation CAS; never dispatches work."""
@@ -6816,16 +6844,22 @@ def create_app(
         missing = [key for key in required if key not in body]
         if missing:
             raise HTTPException(status_code=422, detail=f"missing required coordinator fields: {missing}")
-        result = q().advance_coordinator(
-            coordinator_id=str(body["coordinator_id"]), generation=body["generation"],
-            provider=str(body.get("provider") or "unknown"),
-            model=str(body.get("model") or "unknown"),
-            provider_session_id=str(body.get("provider_session_id") or "unknown"),
-            handoff_reason=str(body.get("handoff_reason") or ""),
-            previous_receipt_hash=str(body.get("previous_receipt_hash") or ""),
-        )
+        try:
+            result = q().advance_coordinator(
+                coordinator_id=str(body["coordinator_id"]), generation=body["generation"],
+                provider=str(body.get("provider") or "unknown"),
+                model=str(body.get("model") or "unknown"),
+                provider_session_id=str(body.get("provider_session_id") or "unknown"),
+                handoff_reason=str(body.get("handoff_reason") or ""),
+                previous_receipt_hash=str(body.get("previous_receipt_hash") or ""),
+                checkpoint=body.get("checkpoint"),
+                checkpoint_ref=str(body.get("checkpoint_ref") or ""),
+            )
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not result["accepted"]:
             raise HTTPException(status_code=409, detail=result)
+        app.state.coordinator_generation = result["coordinator_generation"]
         return result
 
     @app.get("/runtime/export")
@@ -6867,9 +6901,14 @@ def create_app(
         logger.info(f"pane_map reloaded: {pane_map}")
         return {"status": "ok", "pane_map": pane_map}
 
+    def _coordinator_write_generation(value: Optional[int]) -> Optional[int]:
+        current = int(q().get_coordinator_state()["coordinator_generation"] or 0)
+        return (-1 if value is None else value) if current else value
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest,
-                  x_agent_crew_project: Optional[str] = Header(default=None)):
+                  x_agent_crew_project: Optional[str] = Header(default=None),
+                  x_agent_crew_coordinator_generation: Optional[int] = Header(default=None)):
         """Enqueue a task.
 
         ``201`` → ``{"task_id": "..."}``.
@@ -6905,7 +6944,12 @@ def create_app(
         _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
-            task_id = q().enqueue(task, ingress="http.tasks")
+            task_id = q().enqueue(
+                task, ingress="http.tasks",
+                coordinator_generation=_coordinator_write_generation(
+                    x_agent_crew_coordinator_generation))
+        except StaleCoordinatorGeneration as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except InvalidRiskTierError as e:
             raise HTTPException(status_code=422, detail=str(e))
         except TaskAlreadyExistsError as e:
@@ -6976,7 +7020,8 @@ def create_app(
         #   is presented back at `/tasks/{id}/start` and with the result under
         #   `executor_binding`; `None` means none was minted and the two later
         #   call sites have nothing to check (P2).
-        return {**dataclasses.asdict(task), "dispatch_nonce": nonce}
+        return {**dataclasses.asdict(task), "dispatch_nonce": nonce,
+                **q().dispatch_binding(task.task_id)}
 
     @app.get("/tasks")
     def list_tasks(status: str = "", limit: Optional[int] = Query(default=None, ge=1),
@@ -7095,6 +7140,13 @@ def create_app(
         ctx = q().get_task_context(task_id)
         _artifact_held = None
         _task = q().get_task(task_id)
+        _attempt = q().dispatch_binding(task_id).get("attempt_id")
+        if _attempt and result.attempt_id != _attempt:
+            try:
+                q().submit_result(task_id, result, attempt_id=result.attempt_id,
+                                  require_attempt=True)
+            except StaleAttemptRejected as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
         # #586: a review result that `_resolve_verdict` cannot map to a verdict
         # used to be marked done (200) and then dropped by the cascade, so the
         # reviewer never learned it was rejected. Refuse it before anything is
@@ -7238,6 +7290,8 @@ def create_app(
         try:
             task_type = q().submit_result(task_id, result, nonce=_nonce,
                                           presenter=_presenter,
+                                          attempt_id=result.attempt_id,
+                                          require_attempt=True,
                                           # This one held result is an invitation
                                           # to correct the same execution's refs.
                                           # Keep its RUNNING receipt so P2 can
@@ -7300,6 +7354,8 @@ def create_app(
             # read a 500 and retry the same bypass.
             logger.warning(f"POST /tasks/{task_id}/result: refused — {exc}")
             raise HTTPException(status_code=409, detail=str(exc))
+        except StaleAttemptRejected as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except LateResultRejected as exc:
             # The queue decided this under its write lock and committed only a
             # late_result evidence event. No attribution or cascade may follow.
@@ -7685,7 +7741,8 @@ def create_app(
                 "pending_remaining": len(q().outbox_pending(include_replaying=False))}
 
     @app.delete("/tasks/{task_id}", status_code=200)
-    def cancel_task(task_id: str):
+    def cancel_task(task_id: str,
+                    x_agent_crew_coordinator_generation: Optional[int] = Header(default=None)):
         """G12 I-A then I-B, in that order.
 
         The authoritative cancel — status ``cancelled``, receipt ``REVOKED``,
@@ -7713,7 +7770,11 @@ def create_app(
             outcome = cancel_task_with_signal(
                 q(), task_id, state_path=state_path, pane_map=pane_map,
                 events_path=_context_events_path, reason=_CANCEL_REASON_ATTEMPT,
+                coordinator_generation=_coordinator_write_generation(
+                    x_agent_crew_coordinator_generation),
             )
+        except StaleCoordinatorGeneration as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError:
             return {"status": "unknown", "reason": "NO_SUCH_TASK",
                     "worker_termination": "skipped"}

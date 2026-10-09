@@ -1461,6 +1461,38 @@ def _fetch_provenance(port: int, expect: str, timeout: float = 5.0) -> dict:
                 "_reason": f"unreachable on port {port}: {str(e)[:70]}"}
 
 
+def _load_resume_cea_env(proj_dir: str) -> dict[str, str]:
+    """Load the project-local verifier configuration into this CLI process."""
+    path = resolve_cea_file(Path(proj_dir))
+    if not path.is_file():
+        return {}
+    values = parse_env_file(path)
+    for key in tuple(os.environ):
+        if key.startswith("AGENT_CREW_CEA_"):
+            os.environ.pop(key)
+    os.environ.update(values)
+    return values
+
+
+def _resume_missing_pieces(*, verifier_env: bool, decision_id: str,
+                           snapshot_generation, decision_present: bool,
+                           principals, build_bound: bool, generation: int,
+                           current_generation: int, cea_path: str,
+                           principal: str = "") -> list[str]:
+    missing = []
+    if not verifier_env:
+        missing.append(f"no verifier env ({cea_path} absent)")
+    if not decision_present:
+        missing.append(f"decision {decision_id or '<missing>'} not in snapshot gen {snapshot_generation}")
+    if not principals or (principal and principal not in principals):
+        missing.append("principals empty" if not principals else f"principal {principal} absent")
+    if not build_bound:
+        missing.append("build not bound")
+    if generation <= current_generation:
+        missing.append(f"stale resume generation {generation} <= current {current_generation}")
+    return missing
+
+
 @crew.command()
 @click.argument("project", default="", required=False)
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
@@ -1839,16 +1871,49 @@ def resume(project: str, base: str, generation: int, source: str, decision_id: s
         # P6: resume is a loosening — owner principal + T0 decision_id, or the queue
         # refuses. `crew resume` is the owner's own terminal, so it presents
         # `owner:<source>`; the decision id is what makes that claim auditable.
-        if not decision_id.strip():
-            click.echo(json.dumps(
-                {"resumed": False, "reason": "P6: resume requires --decision-id naming the "
-                                             "owner (T0) decision that authorises it"},
-                ensure_ascii=False))
-            raise SystemExit(1)
         from agent_crew.cea.wiring import install_from_env
-        install_from_env(db_path=db_path, project=project)
+        from agent_crew.cea.providers import SignatureStatus
+        from agent_crew.queue import set_default_runtime_authority
+        cea_path = resolve_cea_file(Path(state_dir))
         try:
-            res = _writable_queue(db_path, base=base, project=project).resume_stop(
+            cea_env = _load_resume_cea_env(state_dir)
+        except (OSError, ValueError) as exc:
+            click.echo(json.dumps({"resumed": False, "reason": f"invalid verifier env: {exc}"}))
+            raise SystemExit(1)
+        set_default_runtime_authority(None)
+        wiring = install_from_env(db_path=db_path, project=project)
+        queue = _writable_queue(db_path, base=base, project=project)
+        authority = wiring.authority
+        snapshot = None
+        if authority is not None:
+            try:
+                snapshot = authority._snapshots.current()
+            except Exception:
+                pass
+        valid = bool(snapshot is not None and snapshot.available
+                     and snapshot.signature is SignatureStatus.VALID)
+        records = (tuple(snapshot.in_scope or ()) or tuple(snapshot.decisions or ())) if valid else ()
+        matches = [record for record in records
+                   if record.decision_id == decision_id.strip()
+                   and record.project in (None, project)]
+        principal = f"owner:{source}"
+        build = authority._build() if authority is not None else None
+        state = queue.get_runtime_state()
+        missing = _resume_missing_pieces(
+            verifier_env=bool(cea_env and authority is not None),
+            decision_id=decision_id.strip(),
+            snapshot_generation=(snapshot.generation if snapshot else "unknown"),
+            decision_present=bool(matches),
+            principals=(matches[0].principals if matches else ()),
+            build_bound=bool(build and matches and build in (matches[0].build_commits or ())),
+            generation=generation, current_generation=int(state.get("epoch") or 0),
+            cea_path=str(cea_path), principal=principal)
+        if missing:
+            click.echo(json.dumps({"resumed": False, "reason": "; ".join(missing),
+                                   "missing": missing}, ensure_ascii=False))
+            raise SystemExit(1)
+        try:
+            res = queue.resume_stop(
                 generation=generation, who=f"owner:{source}", decision_id=decision_id.strip())
         except RuntimeTransitionRefused as exc:
             click.echo(json.dumps({"resumed": False, "reason": str(exc)}, ensure_ascii=False))
