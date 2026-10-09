@@ -107,8 +107,11 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
         (index for index, (_, value) in enumerate(record_fields) if not is_unset(value)),
         default=-1,
     )
+    fleet_ancestor = not record_scope.project and bool(record_scope.fleet)
     for index, (name, record_value) in enumerate(record_fields):
         query_value = query_fields[name]
+        if name == "fleet" and fleet_ancestor:
+            continue
         if not is_unset(record_value):
             if record_value != query_value:
                 return False
@@ -248,7 +251,13 @@ class SQLiteMemoryStorage:
         for name, value in fields.items():
             # A stored empty field is an ancestor; a nonempty one must agree.
             path = f"$.{name}"
-            if name == "context_generation":
+            if name == "fleet":
+                clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
+                               "OR json_extract(scope, ?) = ? OR "
+                               "(COALESCE(json_extract(scope,'$.project'),'')='' AND "
+                               "COALESCE(json_extract(scope,'$.fleet'),'')<>''))")
+                params.extend((path, path, path, value))
+            elif name == "context_generation":
                 clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' OR json_extract(scope, ?) = 0 OR json_extract(scope, ?) = ?)")
                 params.extend((path, path, path, path, value))
             else:
@@ -605,3 +614,51 @@ def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: 
             unique[identity] = record
     return {"enabled": True, "role": role, "task_id": task_id,
             "records": [asdict(r) for r in unique.values()]}
+
+
+def dispatch_memory_block(storage: MemoryStorage, role: str, task_id: str,
+                          scope: MemoryScope, *, max_chars: int = 32768) -> tuple[str, dict[str, int]]:
+    """Render scoped ADR-001 truth and fleet failures for one live dispatch."""
+    counts = {"authoritative": 0, "failure_pattern": 0}
+    reconstructed = reconstruct_context(storage, role, task_id, scope)
+    if not reconstructed["enabled"]:
+        return "", counts
+    effective_keys = {record.key for record in effective_owner_statements(
+        storage, scope.project)}
+    authoritative = [record for record in reconstructed["records"]
+                     if record["layer"] == "authoritative"
+                     and record["scope"]["project"] == scope.project
+                     and (record["value"].get("kind") != "owner_statement"
+                          or record["key"] in effective_keys)]
+    patterns = [record for record in storage.retrieve(scope)
+                if record.layer == "failure_pattern" and
+                (record.scope.project == scope.project or
+                 (not record.scope.project and bool(record.scope.fleet)))]
+    fleet = [record for record in patterns if not record.scope.project]
+    local = [record for record in patterns if record.scope.project]
+    selected = (fleet[:2] + local[:2]) or patterns[:4]
+    lines = ["=== ADR-001 MEMORY (scoped, verify current sources) ==="]
+    # Reserve room for every authoritative key before assigning excerpt space.
+    key_cost = sum(len(record["key"]) + 20 for record in authoritative)
+    excerpt_cap = min(160, max(0, (max_chars - key_cost - 1800) // max(1, len(authoritative))))
+    for record in authoritative:
+        value = record["value"]
+        excerpt = str(value.get("text") or value.get("title") or "")[:excerpt_cap]
+        line = f"authoritative key={record['key']}: {excerpt}"
+        if sum(map(len, lines)) + len(line) > max_chars - 1200:
+            line = f"authoritative key={record['key']}"
+        if sum(map(len, lines)) + len(line) > max_chars - 1200:
+            break
+        lines.append(line)
+        counts["authoritative"] += 1
+    for record in selected:
+        value = record.value
+        excerpt = str(value.get("title") or value.get("pattern") or
+                      value.get("text") or value.get("rule") or "")[:240]
+        line = f"failure_pattern key={record.key}: {excerpt}"
+        if sum(map(len, lines)) + len(line) > max_chars:
+            break
+        lines.append(line)
+        counts["failure_pattern"] += 1
+    lines.append("=== END ADR-001 MEMORY ===")
+    return "\n".join(lines), counts

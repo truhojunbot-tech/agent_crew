@@ -64,6 +64,7 @@ TYPE_CODE = "code"
 TYPE_TEST = "test"
 TYPE_REVIEW = "pr_review"
 TYPE_EPISODE = "episode"
+TYPE_FAILURE_PATTERN = "failure_pattern"
 #: #240 derived governance. Ranked below every authoritative type on
 #: purpose: a procedure may require a check, never overrule current code
 #: or the acceptance criteria.
@@ -88,6 +89,7 @@ DEFAULT_ROLE_BUDGETS: dict = {
                     "type_caps": {TYPE_EPISODE: 3, TYPE_TEST: 8, TYPE_CODE: 4}},
 }
 DEFAULT_BUDGET = {"max_tokens": 4000, "max_items": 16, "type_caps": {}}
+FAILURE_PATTERN_FLOOR = 2
 
 #: Rank order when scores tie. Authoritative beats episodic by construction —
 #: "relevant ADR/spec decisions outrank provider conversation recollection".
@@ -95,6 +97,7 @@ _TYPE_RANK = {
     TYPE_ISSUE: 0, TYPE_AC: 1, TYPE_ADR: 2, TYPE_SPEC: 3,
     TYPE_TEST: 4, TYPE_CODE: 5, TYPE_REVIEW: 6,
     TYPE_EVIDENCE: 7, TYPE_PROCEDURE: 8, TYPE_EPISODE: 9,
+    TYPE_FAILURE_PATTERN: 10,
 }
 
 
@@ -142,6 +145,7 @@ class RetrievalQuery:
     task_type: str = ""
     role: str = ""
     repo: str = ""
+    project: str = ""
     repo_path: str = ""
     issue_number: Optional[int] = None
     issue_title: str = ""
@@ -183,7 +187,8 @@ class ContextPack:
         for a in self.items:
             key = "mandatory" if a.mandatory else (
                 "procedural" if a.artifact_type == TYPE_PROCEDURE else
-                "episodic" if a.artifact_type == TYPE_EPISODE else "authoritative")
+                "episodic" if a.artifact_type in (TYPE_EPISODE, TYPE_FAILURE_PATTERN)
+                else "authoritative")
             out[key] = out.get(key, 0) + a.est_tokens
         return out
 
@@ -226,6 +231,8 @@ class ContextPack:
             "degraded": self.degraded,
             "degraded_reason": self.degraded_reason,
             "budget": dict(self.budget or {}),
+            "result_ids": [a.artifact_id.removeprefix("memory:") for a in self.items
+                           if a.artifact_type == TYPE_FAILURE_PATTERN][:20],
         }
 
     def to_prompt_block(self, inject_gate: Optional["InjectGate"] = None) -> str:
@@ -322,7 +329,8 @@ class IssueProvider(RetrievalProvider):
     version = 1
 
     _AC_RE = re.compile(
-        r"^#{1,4}\s*acceptance\s+criteria\s*$(.*?)(?=^#{1,4}\s|\Z)",
+        r"^#{1,4}\s*(?:acceptance(?:\s+criteria|\s+tests?)?|done(?:\s*\([^)]*\))?)"
+        r"\s*$(.*?)(?=^#{1,4}\s|\Z)",
         re.IGNORECASE | re.MULTILINE | re.DOTALL)
 
     def retrieve(self, query: RetrievalQuery) -> list:
@@ -371,6 +379,47 @@ class IssueProvider(RetrievalProvider):
     @classmethod
     def _strip_ac(cls, body: str) -> str:
         return cls._AC_RE.sub("", body or "").strip()
+
+
+class FailurePatternProvider(RetrievalProvider):
+    """Live ADR-001 failure patterns, bounded and scoped to this project."""
+
+    name = "adr001_failure_pattern"
+    version = 1
+
+    def __init__(self, storage):
+        self.storage = storage
+
+    def retrieve(self, query: RetrievalQuery) -> list:
+        if not query.project:
+            return []
+        from agent_crew.memory_runtime import MemoryScope, SQLiteMemoryStorage
+
+        storage = (SQLiteMemoryStorage.existing(self.storage)
+                   if isinstance(self.storage, str) else self.storage)
+        records = [record for record in storage.retrieve(
+            MemoryScope(project=query.project), query=" ".join(query.keywords))
+            if record.layer == TYPE_FAILURE_PATTERN]
+        local = [record for record in records if record.scope.project == query.project]
+        fleet = [record for record in records if not record.scope.project
+                 and record.scope.fleet]
+        # Reserve evidence from both scopes before recency or another layer
+        # can take every slot. The planner reserves the corresponding pack slots.
+        chosen = fleet[:1] + local[:1] + fleet[1:2] + local[1:2]
+        chosen += [record for record in records if record not in chosen][:2]
+        return [Artifact(
+            artifact_id=f"memory:{record.key}",
+            uri=str(record.value.get("source_ref") or record.value.get("link")
+                    or f"memory://{record.layer}/{record.key}"),
+            artifact_type=TYPE_FAILURE_PATTERN, revision=str(record.version),
+            score=float(len(chosen) - index),
+            score_components={"memory_rank": float(len(chosen) - index)},
+            provenance=("ADR-001 fleet ancestor" if not record.scope.project
+                        else f"ADR-001 project {query.project}"),
+            freshness=FRESH, subject_key=f"memory:{record.key}",
+            excerpt=str(record.value.get("text") or record.value.get("pattern")
+                        or record.value.get("topic") or record.value.get("rule") or "")[:800],
+        ) for index, record in enumerate(chosen)]
 
 
 class LexicalRepoProvider(RetrievalProvider):
@@ -745,7 +794,12 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
     caps = dict(b.get("type_caps") or {})
 
     selected, used, per_type, seen = [], 0, {}, set()
-    for a in sorted(candidates, key=_sort_key):
+    ordered = sorted(candidates, key=_sort_key)
+    reserved = [a for a in ordered if a.artifact_type == TYPE_FAILURE_PATTERN][
+        :FAILURE_PATTERN_FLOOR]
+    # The floor comes after mandatory issue/AC but before optional code and
+    # episodes, which can otherwise fill the whole item budget first.
+    for a in [x for x in ordered if x.mandatory] + reserved + ordered:
         if a.artifact_id in seen:
             continue
         if a.mandatory:
@@ -1104,10 +1158,50 @@ def _record_shadow(shadow_path: str, matched: list, task_id: str) -> None:
         logger.warning("context_pack: shadow record failed: %s", exc)
 
 
+def assemble_task_context(task_context: dict, *, project: str = "", repo: str = "",
+                          lineage_contexts=()) -> dict:
+    """Fill only missing issue/repo evidence from this task's known lineage."""
+    from agent_crew.github import _repo_slug
+
+    ctx = dict(task_context or {})
+
+    def issue_number(value):
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, int):
+            return value if value > 0 else None
+        if isinstance(value, str) and value.isdecimal():
+            return int(value) or None
+        return None
+
+    issue = issue_number(ctx.get("issue"))
+    for parent in lineage_contexts:
+        if not isinstance(parent, dict):
+            continue
+        inherited = issue_number(parent.get("issue"))
+        if issue is None and inherited is not None:
+            issue = inherited
+        if issue is not None and inherited == issue:
+            for field in ("issue_body", "issue_title"):
+                if not ctx.get(field) and parent.get(field):
+                    ctx[field] = parent[field]
+    if issue is not None:
+        ctx["issue"] = issue
+    # The dispatch checkout is verified by the server; context.repo is only
+    # a fallback when a caller has no checkout to bind this pack to.
+    slug = _repo_slug(repo) or _repo_slug(ctx.get("repo"))
+    if slug:
+        ctx["repo"] = slug
+    if project:
+        ctx["project"] = project
+    return ctx
+
+
 def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
                         role: str, repo_path: str = "", branch: str = "",
                         episodes_path: str = "", procedures_path: str = "",
                         shadow_path: str = "", issue_body_fn=None,
+                        project: str = "", repo: str = "", lineage_contexts=(),
                         budget: Optional[dict] = None,
                         extra_providers: Optional[list] = None,
                         mode: str = MODE_LEXICAL,
@@ -1118,18 +1212,23 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
       never a silent empty one. A caller must be able to tell "nothing was
       relevant" from "retrieval broke".
     """
-    ctx = task_context or {}
+    ctx = assemble_task_context(task_context, project=project, repo=repo,
+                                lineage_contexts=lineage_contexts)
     issue = ctx.get("issue") if isinstance(ctx.get("issue"), int) else None
     body, body_source = resolve_issue_body(ctx, issue_body_fn=issue_body_fn)
     title = ctx.get("issue_title", "") or ""
     query = RetrievalQuery(
         task_id=task_id, task_type=task_type, role=role,
-        repo=ctx.get("repo", "") or "", repo_path=repo_path,
+        repo=ctx.get("repo", "") or "", project=ctx.get("project", "") or "",
+        repo_path=repo_path,
         issue_number=issue, issue_title=title, issue_body=body, branch=branch,
         keywords=keywords_from(title, body),
         retry_of=str(ctx.get("retry_of") or ""),
     )
     providers = [IssueProvider(), LexicalRepoProvider()]
+    memory_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()
+    if memory_db:
+        providers.append(FailurePatternProvider(os.path.expanduser(memory_db)))
     if forge_enabled():
         providers.append(ForgeProvider(os.getenv("AGENT_CREW_FORGE_URL", "http://127.0.0.1:9002")))
     episodes = load_episodes(episodes_path) if episodes_path else []
