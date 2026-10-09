@@ -406,6 +406,7 @@ A role stays `in_progress` until `submit_result` is called. Silence stalls the c
 | `findings` | reviewers only | `approve` requires `[]`; `request_changes` lists only changes required to approve. Put non-blocking notes in the summary or GitHub PR comment. Empty list for non-reviewers. |
 | `pr_number` | if opened | GitHub PR number, otherwise `null`. |
 | `executor_binding` | if your task block had a `dispatch_nonce` | `{"nonce": "<it>", "presenter": "<your agent name>"}` |
+| `attempt_id` | if your task block had an `attempt_id` | Copy it exactly as a top-level result field. A missing attempt is refused; an old attempt gets `409 stale_attempt`. |
 
 ### The dispatch nonce (ADR P2, §2.2)
 
@@ -813,6 +814,9 @@ You MUST POST the result before exiting. **No exceptions.**
 
 The task block below contains the exact `curl` command with your task_id pre-filled.
 Copy it exactly. The result body must be JSON with these fields:
+
+If the task block carries `attempt_id`, keep that exact top-level field in the
+result JSON. A missing attempt is refused; an old attempt gets `409 stale_attempt`.
 
 ```json
 {

@@ -27,16 +27,20 @@ def test_coordinator_handoff_is_durable_and_does_not_change_task_lineage(tmp_pat
         coordinator_id="coord-stable", generation=1, provider="provider-a",
         model="model-a", provider_session_id="session-a", handoff_reason="initial",
     )
+    ready = queue.prepare_coordinator_handoff({
+        "objective": "provider rollover", "open_task_ids": ["impl-309"],
+        "last_receipt_hash": first["receipt_hash"], "generation": 1})
     changed = queue.advance_coordinator(
         coordinator_id="coord-stable", generation=2, provider="provider-b",
         model="model-b", provider_session_id="session-b", handoff_reason="provider rollover",
         previous_receipt_hash=first["receipt_hash"],
+        checkpoint_ref=ready["checkpoint_ref"],
     )
 
     assert first["accepted"] is True
     assert changed["accepted"] is True
     assert changed["coordinator_generation"] == 2
-    assert changed["checkpoint_ref"] == "coordinator:portable-project:coord-stable:2"
+    assert changed["checkpoint_ref"] == ready["checkpoint_ref"]
     restarted = TaskQueue(str(db))
     after = restarted.list_tasks()[0]
     assert (after.task_id, after.context, after.branch) == (before.task_id, before.context, before.branch)

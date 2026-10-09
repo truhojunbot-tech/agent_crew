@@ -33,11 +33,15 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
         # `http.tasks` even once the in-process variant named one.
         "project": req.project,
     }).encode()
+    headers = {"Content-Type": "application/json",
+               "X-Agent-Crew-Project": req.project}
+    generation = (req.context or {}).get("coordinator_generation")
+    if isinstance(generation, int) and not isinstance(generation, bool):
+        headers["X-Agent-Crew-Coordinator-Generation"] = str(generation)
     http_req = urllib.request.Request(
         f"http://127.0.0.1:{port}/tasks",
         data=payload,
-        headers={"Content-Type": "application/json",
-                 "X-Agent-Crew-Project": req.project},
+        headers=headers,
         method="POST",
     )
     def confirmed() -> bool:
@@ -76,6 +80,11 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
                 or isinstance(getattr(exc, "reason", None), TimeoutError)) and confirmed():
             return req.task_id
         raise
+
+
+def _coordinator_generation(req: TaskRequest) -> int | None:
+    value = (req.context or {}).get("coordinator_generation")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 _TDD_CONTEXT = {
     "tdd": True,
@@ -120,7 +129,8 @@ def enqueue_implement(queue, task_desc: str, branch: str, context: dict = {}, po
     )
     if port:
         return _post_task_http(port, req)
-    return queue.enqueue(req, ingress="loop.implement")
+    return queue.enqueue(req, ingress="loop.implement",
+                         coordinator_generation=_coordinator_generation(req))
 
 
 #: How many times a review that failed to RUN is re-dispatched before the loop
@@ -267,7 +277,8 @@ def enqueue_review(queue, task_desc: str, branch: str, prev_task_id: str, contex
             raise
     from agent_crew.queue import DuplicateReviewError
     try:
-        return queue.enqueue(req, ingress="loop.review")
+        return queue.enqueue(req, ingress="loop.review",
+                             coordinator_generation=_coordinator_generation(req))
     except DuplicateReviewError as exc:
         existing = _adopt_duplicate_successor(
             queue, exc.existing_task_id, "review", prev_task_id, context)
@@ -304,7 +315,8 @@ def enqueue_test(queue, task_desc: str, branch: str, prev_task_id: str = "", con
             raise
     from agent_crew.queue import DuplicateReviewError
     try:
-        return queue.enqueue(req, ingress="loop.test")
+        return queue.enqueue(req, ingress="loop.test",
+                             coordinator_generation=_coordinator_generation(req))
     except DuplicateReviewError as exc:
         existing = _adopt_duplicate_successor(
             queue, exc.existing_task_id, "test", prev_task_id, context)
