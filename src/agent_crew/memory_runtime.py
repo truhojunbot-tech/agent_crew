@@ -3,15 +3,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import sqlite3
 import time
 import re
+import urllib.request
 from contextlib import closing
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, Protocol
+
+logger = logging.getLogger(__name__)
 
 LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
                     "decision", "failure_pattern"})
@@ -270,6 +274,7 @@ class SQLiteMemoryStorage:
         terms = set(query.lower().replace('-', ' ').split())
         return sorted(result, key=lambda record: _retrieval_rank(record, terms))
 
+
     def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int,
                         query: str = "", predecessor_task_ids: tuple[str, ...] = (),
                         pr_number: Optional[int] = None,
@@ -409,6 +414,110 @@ class SQLiteMemoryStorage:
         return (selected + floor + [record for record in scoped
                                     if record.key not in selected_keys | floor_keys])[
             :min(limit, SHADOW_RETRIEVAL_MAX_ROWS)], dropped
+
+
+def _record_id(record: MemoryRecord) -> str:
+    identity = json.dumps((record.layer, record.key, _canonical_scope_json(record.scope)),
+                          separators=(",", ":"))
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+def export_effective_records(storage: MemoryStorage,
+                             scope: Optional[MemoryScope] = None):
+    """Yield effective SQLite rows for the Forge index, with stable identities."""
+    sqlite_store = storage.sqlite if isinstance(storage, HybridMemoryStorage) else storage
+    if not isinstance(sqlite_store, SQLiteMemoryStorage):
+        raise TypeError("effective export requires SQLite-backed memory")
+    with closing(sqlite3.connect(sqlite_store.path)) as db:
+        rows = db.execute(
+            "SELECT layer,key,value,scope,version FROM adr001_memory ORDER BY layer,key,scope"
+        ).fetchall()
+    records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(row_scope), version)
+               for layer, key, value, row_scope, version in rows]
+    records = [record for record in records
+               if (scope is None or _scope_applies(record.scope, scope))
+               and not record.value.get("invalidated_at")
+               and not record.value.get("superseded_at")
+               and not record.value.get("superseded")]
+    superseded_keys = {(record.scope.project, key) for record in records
+                       if record.layer == "authoritative"
+                       for key in record.value.get("supersedes", [])}
+    for record in records:
+        if (record.layer == "authoritative"
+                and (record.scope.project, record.key) in superseded_keys):
+            continue
+        record_id = _record_id(record)
+        yield {"id": record_id, "layer": record.layer, "key": record.key,
+               "value": record.value, "scope": asdict(record.scope),
+               "metadata": {"id": record_id, "layer": record.layer,
+                            "bot": str(record.value.get("bot") or record.value.get("from") or ""),
+                            "project": record.scope.project, "key": record.key,
+                            "superseded_by": None}}
+
+
+class HybridMemoryStorage(MemoryStorage):
+    """SQLite-scoped candidates ranked with optional Forge vector evidence."""
+
+    def __init__(self, sqlite: SQLiteMemoryStorage, *, forge_url: str,
+                 timeout_seconds: float = 0.5):
+        self.sqlite = sqlite
+        self.forge_url = forge_url.rstrip("/")
+        self.timeout_seconds = timeout_seconds
+        self.last_retrieval_mode = "lexical_fallback"
+
+    def put(self, record: MemoryRecord) -> None:
+        self.sqlite.put(record)
+
+    def retrieve(self, scope: MemoryScope, query: str = "",
+                 exact_key: str = "") -> list[MemoryRecord]:
+        lexical = self.sqlite.retrieve(scope, query=query, exact_key=exact_key)
+        self.last_retrieval_mode = "lexical_fallback"
+        if not lexical or not self.forge_url:
+            return lexical
+        candidates = {_record_id(record): record for record in lexical}
+        payload = {"query": query, "candidate_ids": list(candidates),
+                   "situation": {"project": scope.project}}
+        try:
+            request = urllib.request.Request(
+                self.forge_url + "/get_context", data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                body = json.load(response)
+            hits = body["context_items"]
+            if not isinstance(hits, list):
+                raise ValueError("Forge response has no context_items list")
+        except Exception as exc:
+            logger.warning("memory retrieval retrieval_mode=lexical_fallback error=%s: %s",
+                           type(exc).__name__, exc)
+            return lexical
+        vector_rank = {}
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            record_id = hit.get("id") or hit.get("chunk_id")
+            if record_id in candidates and record_id not in vector_rank:
+                vector_rank[record_id] = len(vector_rank) + 1
+        lex_rank = {_record_id(record): rank for rank, record in enumerate(lexical, 1)}
+        mandatory = [record for record in lexical if record.layer == "authoritative"]
+        others = [record for record in lexical if record.layer != "authoritative"]
+        others.sort(key=lambda record: (
+            -(1 / (60 + lex_rank[_record_id(record)])
+              + (1 / (60 + vector_rank[_record_id(record)])
+                 if _record_id(record) in vector_rank else 0)),
+            lex_rank[_record_id(record)]))
+        self.last_retrieval_mode = "hybrid"
+        logger.info("memory retrieval retrieval_mode=hybrid vector_ranked=%d candidates=%d",
+                    len(vector_rank), len(candidates))
+        return mandatory + others
+
+
+def memory_storage_from_env(path: str) -> MemoryStorage:
+    """Select the optional hybrid reader; SQLite remains the default."""
+    sqlite_store = SQLiteMemoryStorage.existing(path)
+    if os.getenv("AGENT_CREW_MEMORY_BACKEND", "").strip().lower() == "hybrid":
+        return HybridMemoryStorage(
+            sqlite_store, forge_url=os.getenv("AGENT_CREW_FORGE_URL", ""))
+    return sqlite_store
 
 
 def owner_statement_key(project: str, channel: str, chat_id: str,

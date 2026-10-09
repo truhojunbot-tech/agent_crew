@@ -3017,10 +3017,10 @@ def create_app(
     else:
         shadow_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()
         if shadow_db and os.path.isfile(os.path.expanduser(shadow_db)):
-            from agent_crew.memory_runtime import RuntimeMemoryProvider, SQLiteMemoryStorage
+            from agent_crew.memory_runtime import RuntimeMemoryProvider, memory_storage_from_env
             try:
                 _memory_provider = RuntimeMemoryProvider(
-                    SQLiteMemoryStorage(os.path.expanduser(shadow_db)))
+                    memory_storage_from_env(os.path.expanduser(shadow_db)))
             except (OSError, ValueError, sqlite3.Error) as exc:
                 logger.warning("AGENT_CREW_SHADOW_MEMORY_DB is unusable: %s", exc)
                 _memory_provider = NullMemoryProvider()
