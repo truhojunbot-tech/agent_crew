@@ -59,6 +59,8 @@ def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path,
         assert app.state.resume_codex_quota_holds() == []
         assert queue.dequeue(role="implementer", agent="codex").task_id == "quota-a"
         queue.record_dispatch("quota-a", channel="codex_exec", agent="codex")
+        assert app.state.resume_codex_quota_holds() == []
+        queue.bind_dispatch_target("quota-a", target="pid:1234")
         assert app.state.resume_codex_quota_holds() == ["quota-b"]
         assert app.state.resume_codex_quota_holds() == []
         assert queue.get_task_status("quota-b") == "pending"

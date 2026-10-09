@@ -3525,7 +3525,9 @@ def create_app(
         for probe in probes:
             resumed_at = probe["marker"].get("resumed_at") or 0
             dispatched_at = probe["dispatched_at"] or 0
-            if dispatched_at >= resumed_at and resumed_at:
+            if (dispatched_at >= resumed_at and resumed_at
+                    and str(probe.get("dispatch_target") or "").startswith("pid:")
+                    and probe["status"] in ("in_progress", "completed")):
                 cohort = [row for row in ready
                           if row["marker"].get("failed_at", now) <= resumed_at]
                 released = []

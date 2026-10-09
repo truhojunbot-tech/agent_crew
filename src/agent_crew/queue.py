@@ -5666,7 +5666,7 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, status, context, dispatched_at FROM tasks "
+                "SELECT task_id, status, context, dispatched_at, dispatch_target FROM tasks "
                 "WHERE context LIKE '%\"codex_quota_hold\"%' "
                 "ORDER BY created_at, task_id").fetchall()
             holds = []
@@ -5677,7 +5677,8 @@ class TaskQueue:
                     continue
                 if isinstance(marker, dict):
                     holds.append({"task_id": row["task_id"], "status": row["status"],
-                                  "marker": marker, "dispatched_at": row["dispatched_at"]})
+                                  "marker": marker, "dispatched_at": row["dispatched_at"],
+                                  "dispatch_target": row["dispatch_target"]})
             return holds
         finally:
             conn.close()
