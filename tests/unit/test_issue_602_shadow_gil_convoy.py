@@ -15,9 +15,12 @@ def _insert(db, layer, key, value, scope, created, version=1):
 
 
 def _four_query_reference(storage, scope, limit, predecessor_task_ids=(), pr_number=None):
-    """The pre-#630 row-by-row path for this fixture's empty-query request."""
+    """Row-by-row reference with the shadow fleet-ancestor rule."""
+    fleet_ancestor = ("(COALESCE(json_extract(scope,'$.project'),'')='' "
+                      "AND COALESCE(json_extract(scope,'$.fleet'),'')<>'')")
     base = ("layer IN ('decision','episodic') "
-            "AND COALESCE(json_extract(scope,'$.fleet'),'')=? "
+            "AND (COALESCE(json_extract(scope,'$.fleet'),'')=? OR "
+            + fleet_ancestor + ") "
             "AND (json_extract(scope,'$.task_id') IS NULL "
             "OR json_extract(scope,'$.task_id')='' "
             "OR json_extract(scope,'$.task_id')=?) "
@@ -27,11 +30,13 @@ def _four_query_reference(storage, scope, limit, predecessor_task_ids=(), pr_num
     with sqlite3.connect(storage.path) as db:
         dropped = db.execute(
             "SELECT count(*) FROM adr001_memory WHERE " + base +
-            " AND COALESCE(json_extract(scope,'$.project'),'')=''",
+            " AND COALESCE(json_extract(scope,'$.project'),'')=''"
+            " AND COALESCE(json_extract(scope,'$.fleet'),'')=''",
             (scope.fleet, scope.task_id)).fetchone()[0]
         scoped_rows = db.execute(
             "SELECT layer,key,value,scope,version FROM adr001_memory WHERE " + base +
-            " AND COALESCE(json_extract(scope,'$.project'),'')=? "
+            " AND (COALESCE(json_extract(scope,'$.project'),'')=? OR "
+            + fleet_ancestor + ") "
             "ORDER BY created DESC LIMIT ?",
             (scope.fleet, scope.task_id, scope.project, limit)).fetchall()
         predecessor_keys = [f"task:{task_id}:decision" for task_id in predecessor_task_ids]
@@ -158,8 +163,10 @@ def test_aggregated_rows_match_four_query_path_with_ties_limits_and_fleet(tmp_pa
             scope, {"decision", "episodic"}, limit,
             predecessor_task_ids=predecessors, pr_number=pr_number)
         assert actual == expected
-        assert expected[1] == 1
+        assert expected[1] == 0
         assert len(actual[0]) == limit
+        if not predecessors:
+            assert "projectless" in {record.key for record in actual[0]}
     assert any(record.version > 1 for record in
                storage.retrieve_shadow(scope, {"decision", "episodic"}, 5,
                                        predecessor_task_ids=("old", "new"),
