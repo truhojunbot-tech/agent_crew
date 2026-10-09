@@ -44,22 +44,86 @@ def query(store, project="alfred", *, fleet="", text="signal"):
 
 
 def test_r1_second_connection_supersession_is_not_served(store):
-    put(store, "old", value={"text": "signal"})
+    put(store, "sd:old", layer="authoritative", value={"text": "signal", "kind": "standing_decision"})
     with sqlite3.connect(store.path) as db:
-        db.execute("UPDATE adr001_memory SET value=json_set(value,'$.superseded_at','new') "
-                   "WHERE key='old'")
+        db.execute("BEGIN IMMEDIATE")
+        db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                   "SELECT layer,'sd:new',?,scope,1,created+1 FROM adr001_memory WHERE key='sd:old'",
+                   (json.dumps({"text": "signal", "kind": "standing_decision", "supersedes": "sd:old"}),))
+        db.execute("UPDATE adr001_memory SET superseded_by='sd:new' WHERE key='sd:old'")
         db.commit()
-    assert "old" not in keys(query(store))
+    assert "sd:old" not in keys(query(store))
+    assert [row["key"] for row in store.render_head("alfred")["records"] if row["key"].startswith("sd:")] == ["sd:new"]
 
 
-def test_hybrid_schema_preserves_six_column_positional_writers(store):
+def test_hybrid_schema_accepts_named_six_column_writers(store):
     with sqlite3.connect(store.path) as db:
-        assert len(db.execute("PRAGMA table_info(adr001_memory)").fetchall()) == 6
-        db.execute("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)",
+        assert len(db.execute("PRAGMA table_info(adr001_memory)").fetchall()) == 8
+        db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)",
                    ("episodic", "legacy-writer", json.dumps({"text": "signal"}),
                     json.dumps({"project": "alfred"}), 1, 1.0))
         db.commit()
     assert "legacy-writer" in keys(query(store))
+
+
+def test_legacy_json_flags_migrate_once_and_supersedes_links_same_scope(tmp_path, caplog):
+    path = tmp_path / "legacy.db"
+    SQLiteMemoryStorage(str(path))
+    rows = [
+        ("failure_pattern", "old-flag", {"text": "signal", "superseded": True}, "alfred"),
+        ("failure_pattern", "old-time", {"text": "signal", "superseded_at": 43.0}, "alfred"),
+        ("failure_pattern", "invalid", {"text": "signal", "invalidated_at": 42.0}, "alfred"),
+        ("failure_pattern", "old-link", {"text": "signal", "superseded": "new-link"}, "alfred"),
+        ("authoritative", "sd:old", {"text": "old"}, "alfred"),
+        ("authoritative", "sd:new", {"text": "new", "supersedes": "sd:old"}, "alfred"),
+        ("authoritative", "sd:old", {"text": "other project"}, "other"),
+    ]
+    with sqlite3.connect(path) as db:
+        db.executemany("INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)",
+                       [(layer, key, json.dumps(value), json.dumps({"project": project}), 1, float(i))
+                        for i, (layer, key, value, project) in enumerate(rows)])
+        db.commit()
+    with caplog.at_level("INFO"):
+        store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT count(*) FROM adr001_memory WHERE invalidated_at IS NOT NULL").fetchone()[0] == 3
+        assert db.execute("SELECT invalidated_at FROM adr001_memory WHERE key='old-time'").fetchone()[0] == 43.0
+        assert db.execute("SELECT superseded_by FROM adr001_memory WHERE key='old-link'").fetchone()[0] == "new-link"
+        assert db.execute("SELECT superseded_by FROM adr001_memory WHERE key='sd:old' AND scope=?",
+                          (json.dumps({"project": "alfred"}),)).fetchone()[0] == "sd:new"
+        assert db.execute("SELECT superseded_by FROM adr001_memory WHERE key='sd:old' AND scope=?",
+                          (json.dumps({"project": "other"}),)).fetchone()[0] is None
+    assert "invalidated=3" in caplog.text and "superseded=2" in caplog.text
+    assert "sd:old" not in keys(query(store))
+    with caplog.at_level("INFO"):
+        HybridMemoryStorage(str(path))
+    assert "invalidated=0" in caplog.text and "superseded=0" in caplog.text
+
+
+def test_hybrid_rejects_new_legacy_json_flags(store):
+    put(store, "valid", value={"text": "signal"})
+    with sqlite3.connect(store.path) as db:
+        for flag in ("superseded_at", "superseded", "invalidated_at"):
+            with pytest.raises(sqlite3.IntegrityError):
+                db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                           "VALUES (?,?,?,?,?,?)",
+                           ("episodic", flag, json.dumps({flag: True}), '{}', 1, 1.0))
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("UPDATE adr001_memory SET value=? WHERE key='valid'",
+                       (json.dumps({"invalidated_at": 1}),))
+
+
+def test_hybrid_shadow_retirement_writes_column(store):
+    put(store, "retired", layer="failure_pattern", value={"text": "signal"})
+    store.put_many_shadow([MemoryRecord(
+        "failure_pattern", "fresh", {"text": "signal"}, MemoryScope(project="alfred"))],
+        retire_keys=("retired",))
+    with sqlite3.connect(store.path) as db:
+        value, invalidated_at = db.execute(
+            "SELECT value,invalidated_at FROM adr001_memory WHERE key='retired'").fetchone()
+    assert invalidated_at is not None
+    assert "superseded_at" not in json.loads(value)
+    assert "retired" not in keys(query(store))
 
 
 def test_vector_path_ranks_without_optional_numpy(store):
@@ -69,15 +133,15 @@ def test_vector_path_ranks_without_optional_numpy(store):
     assert "car-memory" in keys(result)
 
 
-def test_json_effectiveness_flags_and_delete_trigger(store):
+def test_column_effectiveness_flags_and_delete_trigger(store):
     put(store, "superseded", value={"text": "signal"})
     put(store, "invalidated", value={"text": "signal"})
     put(store, "deleted", value={"text": "signal"})
     query(store)
     with sqlite3.connect(store.path) as db:
-        db.execute("UPDATE adr001_memory SET value=json_set(value,'$.superseded_at','now') "
+        db.execute("UPDATE adr001_memory SET superseded_by='replacement' "
                    "WHERE key='superseded'")
-        db.execute("UPDATE adr001_memory SET value=json_set(value,'$.invalidated_at','now') "
+        db.execute("UPDATE adr001_memory SET invalidated_at=123.0 "
                    "WHERE key='invalidated'")
         rowid = db.execute("SELECT rowid FROM adr001_memory WHERE key='deleted'").fetchone()[0]
         db.execute("DELETE FROM adr001_memory WHERE rowid=?", (rowid,))
@@ -96,7 +160,7 @@ def test_lazy_embedding_stops_at_32_per_call(store):
     store.embedder = embed
     store.model_id = embed.model_id
     with sqlite3.connect(store.path) as db:
-        db.executemany("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)", [
+        db.executemany("INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)", [
             ("episodic", f"cap-{i}", json.dumps({"text": f"unique-{i}"}),
              json.dumps({"project": "alfred"}), 1, float(i)) for i in range(40)
         ])
@@ -109,6 +173,8 @@ def test_backend_unset_and_backup_retention(tmp_path, monkeypatch):
     path = tmp_path / "memory.db"
     monkeypatch.delenv("AGENT_CREW_MEMORY_BACKEND", raising=False)
     assert type(memory_storage_from_env(str(path))) is SQLiteMemoryStorage
+    with sqlite3.connect(path) as db:
+        assert len(db.execute("PRAGMA table_info(adr001_memory)").fetchall()) == 6
     backup_dir = tmp_path / "backups"
     monkeypatch.setenv("AGENT_CREW_MEMORY_BACKUP_DIR", str(backup_dir))
     for day in range(1, 10):

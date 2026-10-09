@@ -227,13 +227,24 @@ class SQLiteMemoryStorage:
                      version, time.time()))
             for key in retire_keys:
                 # Preserve the failed observation for audit. Both retrieval
-                # paths already exclude values with a superseded_at timestamp;
-                # the ordinary retention prune still ages this row out.
-                db.execute("UPDATE adr001_memory SET value=json_set(value,'$.superseded_at',?) "
-                           "WHERE layer='failure_pattern' AND key=? "
-                           "AND json_extract(scope,'$.project')=? "
-                           "AND json_extract(value,'$.superseded_at') IS NULL",
-                           (time.time(), key, project))
+                # paths exclude it; the ordinary retention prune still ages it out.
+                if any(row[1] == "invalidated_at" for row in db.execute("PRAGMA table_info(adr001_memory)")):
+                    db.execute("UPDATE adr001_memory SET invalidated_at=? "
+                               "WHERE layer='failure_pattern' AND key=? "
+                               "AND json_extract(scope,'$.project')=? AND invalidated_at IS NULL",
+                               (time.time(), key, project))
+                else:
+                    # The default backend deliberately keeps the legacy schema.
+                    rows = db.execute("SELECT rowid,value FROM adr001_memory "
+                                      "WHERE layer='failure_pattern' AND key=? "
+                                      "AND json_extract(scope,'$.project')=?",
+                                      (key, project)).fetchall()
+                    for rowid, raw in rows:
+                        value = json.loads(raw)
+                        if "superseded_at" not in value:
+                            value["superseded_at"] = time.time()
+                            db.execute("UPDATE adr001_memory SET value=? WHERE rowid=?",
+                                       (json.dumps(value), rowid))
             db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
                 SELECT rowid FROM adr001_memory
                 WHERE layer IN ('episodic','decision','failure_pattern')

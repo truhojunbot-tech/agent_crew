@@ -39,12 +39,57 @@ def _body_sql(alias: str) -> str:
 
 def ensure_index_schema(db: sqlite3.Connection) -> None:
     """Install additive indexes and triggers, then backfill old rows idempotently."""
-    # Keep the six-column live table intact: older producers use positional INSERT.
+    # Only HybridMemoryStorage calls this initializer. The default store keeps
+    # its six-column schema until its producers have moved to named inserts.
+    columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
+    if "superseded_by" not in columns:
+        db.execute("ALTER TABLE adr001_memory ADD COLUMN superseded_by TEXT NULL")
+    if "invalidated_at" not in columns:
+        db.execute("ALTER TABLE adr001_memory ADD COLUMN invalidated_at REAL NULL")
+    # Translate old JSON tombstones before forbidding new ones. A legacy
+    # superseded flag has no pointer; retain its exclusion as invalidation.
+    invalidated = db.execute("""UPDATE adr001_memory SET invalidated_at =
+        CASE WHEN json_type(value,'$.invalidated_at') IN ('integer','real')
+             THEN CAST(json_extract(value,'$.invalidated_at') AS REAL)
+             WHEN json_type(value,'$.superseded_at') IN ('integer','real')
+             THEN CAST(json_extract(value,'$.superseded_at') AS REAL)
+             ELSE created END
+        WHERE invalidated_at IS NULL AND (
+          json_type(value,'$.invalidated_at') IS NOT NULL OR
+          json_type(value,'$.superseded_at') IS NOT NULL OR
+          json_type(value,'$.superseded')='true')""").rowcount
+    legacy_links = db.execute("""UPDATE adr001_memory
+        SET superseded_by=json_extract(value,'$.superseded')
+        WHERE superseded_by IS NULL AND json_type(value,'$.superseded')='text'
+          AND json_extract(value,'$.superseded')<>''""").rowcount
+    linked = db.execute("""UPDATE adr001_memory AS old SET superseded_by = (
+        SELECT newer.key FROM adr001_memory AS newer
+        WHERE newer.layer=old.layer AND newer.scope=old.scope
+          AND json_extract(newer.value,'$.supersedes')=old.key
+        ORDER BY newer.created DESC,newer.rowid DESC LIMIT 1)
+        WHERE old.superseded_by IS NULL AND EXISTS (
+          SELECT 1 FROM adr001_memory AS newer
+          WHERE newer.layer=old.layer AND newer.scope=old.scope
+            AND json_extract(newer.value,'$.supersedes')=old.key)""").rowcount
+    logger.info("memory hybrid legacy migration invalidated=%d superseded=%d",
+                invalidated, legacy_links + linked)
     fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone() is None
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
     db.executescript("""
+      CREATE TRIGGER IF NOT EXISTS adr001_no_legacy_flags_bi
+        BEFORE INSERT ON adr001_memory WHEN
+          json_type(new.value,'$.superseded_at') IS NOT NULL OR
+          json_type(new.value,'$.superseded') IS NOT NULL OR
+          json_type(new.value,'$.invalidated_at') IS NOT NULL
+        BEGIN SELECT RAISE(ABORT,'legacy memory flags forbidden'); END;
+      CREATE TRIGGER IF NOT EXISTS adr001_no_legacy_flags_bu
+        BEFORE UPDATE OF value ON adr001_memory WHEN
+          json_type(new.value,'$.superseded_at') IS NOT NULL OR
+          json_type(new.value,'$.superseded') IS NOT NULL OR
+          json_type(new.value,'$.invalidated_at') IS NOT NULL
+        BEGIN SELECT RAISE(ABORT,'legacy memory flags forbidden'); END;
       CREATE TRIGGER IF NOT EXISTS adr001_fts_ai AFTER INSERT ON adr001_memory BEGIN
         INSERT INTO adr001_fts(rowid,layer,key,body)
           VALUES(new.rowid,new.layer,new.key,
@@ -66,6 +111,10 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         DELETE FROM adr001_fts WHERE rowid=old.rowid;
         DELETE FROM adr001_vec WHERE rowid=old.rowid;
       END;
+      CREATE TRIGGER IF NOT EXISTS adr001_fts_effectiveness_au
+        AFTER UPDATE OF superseded_by,invalidated_at ON adr001_memory BEGIN
+        DELETE FROM adr001_vec WHERE rowid=new.rowid;
+      END;
     """)
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
     indexed = db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
@@ -76,9 +125,8 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
 
 
 def _effective_sql(alias: str = "m") -> str:
-    return (f"json_extract({alias}.value,'$.superseded_at') IS NULL "
-            f"AND json_extract({alias}.value,'$.invalidated_at') IS NULL "
-            f"AND COALESCE(json_extract({alias}.value,'$.superseded'),0)=0")
+    return (f"{alias}.superseded_by IS NULL "
+            f"AND {alias}.invalidated_at IS NULL")
 
 
 def _scope_sql(scope: MemoryScope) -> tuple[str, list]:
