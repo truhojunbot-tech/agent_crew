@@ -6,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.protocol import TaskRequest, TaskResult
-from agent_crew.queue import TaskQueue, InvalidRiskTierError, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
+from agent_crew.queue import TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 from agent_crew.risk_tier import risk_declaration
 from agent_crew.server import create_app
 
@@ -123,17 +123,17 @@ def test_system_successor_without_risk_metadata_is_not_counted_as_root(
     ("retry-impl-root-a1", "original_task_id"),
     ("fallback-impl-root-d1", "fallback_from_task_id"),
 ])
-def test_system_successor_with_legacy_string_tier_is_refused(
+def test_system_successor_with_legacy_string_tier_drops_invalid_value(
         tmp_path, task_id, parent_key):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("impl-root", "implement", "work", context={"risk_tier": 1}))
     queue.submit_result("impl-root", TaskResult("impl-root", "failed", "retry needed"))
-    with pytest.raises(InvalidRiskTierError):
-        queue.enqueue(TaskRequest(task_id, "implement", "work",
-                                  context={parent_key: "impl-root",
-                                           "risk_tier": "high"}),
-                      _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
-    assert queue.get_task(task_id) is None
+    queue.enqueue(TaskRequest(task_id, "implement", "work",
+                              context={parent_key: "impl-root",
+                                       "risk_tier": "high"}),
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    assert queue.get_task(task_id) is not None
+    assert "risk_tier" not in queue.get_task_context(task_id)
     assert queue.missing_root_risk_metadata_count() == 0
 
 

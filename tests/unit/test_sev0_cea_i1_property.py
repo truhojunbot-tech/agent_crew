@@ -275,6 +275,12 @@ def _app(db):
                       anomaly_disabled=True)
 
 
+def _client(db):
+    from pathlib import Path
+    return TestClient(_app(db), raise_server_exceptions=False,
+                      headers={"X-Agent-Crew-Project": Path(db).parent.name})
+
+
 def test_route_table_equals_the_documented_list():
     routes = {(m, r.path) for r in _app(__import__("tempfile").mktemp(suffix=".db")).routes
               if hasattr(r, "methods") for m in r.methods & {"POST", "PUT", "PATCH", "DELETE"}}
@@ -293,7 +299,7 @@ def test_http_recover_transport_carries_receipt_through_requeue(tmp_path, monkey
     db = str(tmp_path / "recover.db")
     live = LiveState(AuthorityState("active"))
     inject_cea(monkeypatch, live)
-    with TestClient(_app(db), raise_server_exceptions=False) as client:
+    with _client(db) as client:
         q = TaskQueue(db)
         q.enqueue(task("recover-1", context={"authority_decision_ids": ["T0-1234"]}),
                   ingress="http.tasks")
@@ -330,7 +336,7 @@ def test_every_registered_adapter_is_transport_driven_or_listed_as_remaining():
 
 def _via_http(tmp_path, req, name):
     # raise_server_exceptions=False: observe the wire answer, as a real client does
-    with TestClient(_app(tmp_path / name), raise_server_exceptions=False) as c:
+    with _client(tmp_path / name) as c:
         return c.post("/tasks", json=__import__("dataclasses").asdict(req))
 
 
@@ -343,20 +349,22 @@ def _drive(kind, tmp_path, live):
     elif kind == "cli":
         from agent_crew.cli import crew
         CliRunner().invoke(crew, ["enqueue", "implement", "add a --json flag", "--db", str(db),
-                                  "--task-id", "c1", "--project", "agent_crew"])
+                                  "--task-id", "c1", "--project", "agent_crew",
+                                  "--risk-tier", "1"])
     elif kind == "loop":
         from agent_crew.loop import enqueue_implement
         from agent_crew.queue import AdmissionRefused, TaskQueue
         try:
             enqueue_implement(TaskQueue(str(db)), "add a --json flag", "main",
-                              {"authority_decision_ids": ["T0-1234"]})
+                              {"authority_decision_ids": ["T0-1234"], "risk_tier": 1})
         except AdmissionRefused:
             pass
     elif kind == "discussion":
         from agent_crew.discussion import enqueue_panel_tasks
         from agent_crew.queue import AdmissionRefused, TaskQueue
         try:
-            enqueue_panel_tasks(TaskQueue(str(db)), ["claude"], "A vs B", {})
+            enqueue_panel_tasks(TaskQueue(str(db)), ["claude"], "A vs B",
+                                {"risk_tier": 1})
         except AdmissionRefused:
             pass
     elif kind == "cascade_review":
@@ -378,7 +386,8 @@ def _drive(kind, tmp_path, live):
 
         class _Gh:
             issues = [{"number": 7, "title": "add a --json flag", "body": "",
-                       "labels": [{"name": "agent-ready"}], "state": "OPEN"}]
+                       "labels": [{"name": "agent-ready"}, {"name": "risk-tier:1"}],
+                       "state": "OPEN"}]
 
             def list_issues(self, repo):
                 return [dict(i) for i in self.issues]
@@ -413,7 +422,9 @@ def _drive_r3(kind, db, live, monkeypatch):
     elif kind == "cron_triage":
         from agent_crew.triage import enqueue_task
         try:
-            enqueue_task(TaskQueue(db), {"parsed": {"issue": 7, "description": "add a --json flag"},
+            enqueue_task(TaskQueue(db), {"parsed": {"issue": 7,
+                                                    "description": "add a --json flag",
+                                                    "risk_tier": 1},
                                          "branch": "main"})
         except AdmissionRefused:
             pass
@@ -421,7 +432,8 @@ def _drive_r3(kind, db, live, monkeypatch):
         from agent_crew import loop
         fn = loop.enqueue_review if kind == "loop_review" else loop.enqueue_test
         try:
-            fn(TaskQueue(db), "add a --json flag", "feat/x", "impl-1")
+            fn(TaskQueue(db), "add a --json flag", "feat/x", "impl-1",
+               context={"risk_tier": 1})
         except AdmissionRefused:
             pass
     elif kind == "retry_http":
@@ -431,7 +443,7 @@ def _drive_r3(kind, db, live, monkeypatch):
         #   startup and its own result comes back 409 RECEIPT_SUPERSEDED, never reaching
         #   the retry enqueue this test is about. The scenario under test is an agent
         #   dispatched by the server that is already running.
-        with TestClient(_app(db), raise_server_exceptions=False) as c:
+        with _client(db) as c:
             nonce = dispatch_and_start(db, live, task("impl-r",
                                                       context={"authority_decision_ids":
                                                                ["T0-1234"]}),
@@ -447,7 +459,7 @@ def _drive_r3(kind, db, live, monkeypatch):
                                 publish=False, status="stale_head", reason="head moved",
                                 requeue_head="a" * 40))
         # Dispatched inside the client context for the same reason as ``retry_http``.
-        with TestClient(_app(db), raise_server_exceptions=False) as c:
+        with _client(db) as c:
             nonce = dispatch_and_start(db, live, task("rev-s", task_type="review",
                                                       branch="feat/x",
                                                       context={"pr_number": 42}),

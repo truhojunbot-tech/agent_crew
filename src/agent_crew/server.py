@@ -76,6 +76,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               LateResultRejected,
                               TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              validate_http_root_risk,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
                               RequestSqliteTiming, request_sqlite_timing)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -6230,7 +6231,11 @@ def create_app(
                             "coordinator_managed", "checklist_layers",
                             "findings_only")}
         context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
-                        "expected_head_sha": head})
+                        "expected_head_sha": head, "prev_task_id": review_task_id})
+        inherited_tier = base.get("risk_tier")
+        if (isinstance(inherited_tier, int) and not isinstance(inherited_tier, bool)
+                and 0 <= inherited_tier <= 3):
+            context["risk_tier"] = inherited_tier
         try:
             q().enqueue(TaskRequest(
                 task_id=new_id,
@@ -6247,7 +6252,8 @@ def create_app(
                 # already reports this dispatcher under (#248).
                 project=_successor_project_for(review_task_id, base),
             ),
-                        ingress="watchdog.stale_review")
+                        ingress="watchdog.stale_review",
+                        _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             logger.info(
                 f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
                 f"{head[:12]}, superseding {review_task_id} (#304)")
@@ -6905,6 +6911,7 @@ def create_app(
         _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
+            validate_http_root_risk(task.context)
             task_id = q().enqueue(task, ingress="http.tasks")
         except InvalidRiskTierError as e:
             raise HTTPException(status_code=422, detail=str(e))
