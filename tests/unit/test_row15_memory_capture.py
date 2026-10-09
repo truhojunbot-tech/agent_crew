@@ -199,6 +199,30 @@ def test_shadow_scope_restricts_explicit_dimensions_and_fleet(tmp_path):
                             worktree="/tmp/one", provider_session="session-one"))
 
 
+def test_shadow_retrieves_fleet_failure_pattern_for_project_query(tmp_path):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    storage.put(MemoryRecord("failure_pattern", "wc1:x", {"text": "failure"},
+                             MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:invalid", {"invalidated_at": 1},
+                             MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:superseded", {"superseded_at": 1},
+                             MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord("decision", "wc1:other-layer", {},
+                             MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord("failure_pattern", "project-only", {},
+                             MemoryScope(project="agent_crew")))
+    rows, _ = storage.retrieve_shadow(
+        MemoryScope(project="agent_crew"), {"failure_pattern"}, 10)
+    assert {row.key for row in rows} == {"wc1:x", "project-only"}
+    rows, dropped = storage.retrieve_shadow(
+        MemoryScope(project="other_project"), {"failure_pattern"}, 1)
+    assert [row.key for row in rows] == ["wc1:x"]
+    assert dropped == 0
+    rows, _ = storage.retrieve_shadow(
+        MemoryScope(fleet="named-fleet", project="agent_crew"), {"failure_pattern"}, 10)
+    assert [row.key for row in rows] == ["wc1:x"]
+
+
 def _query_storage(tmp_path):
     storage = SQLiteMemoryStorage(str(tmp_path / "query-memory.db"))
     scope = MemoryScope(project="agent_crew")

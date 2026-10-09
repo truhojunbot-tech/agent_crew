@@ -79,10 +79,11 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
     """Return whether a stored scope applies to a query under ADR-001 order."""
     if not strict:
         # Shadow comparisons can use evidence from a prior task when the
-        # request omits a dimension. A named fleet remains an exact boundary.
-        if record_scope.project != query_scope.project:
-            return False
-        if record_scope.fleet != query_scope.fleet:
+        # request omits a dimension. Fleet-only records are shared ancestors;
+        # project records still keep their exact fleet boundary.
+        fleet_ancestor = not record_scope.project and bool(record_scope.fleet)
+        if not fleet_ancestor and (record_scope.project != query_scope.project
+                                   or record_scope.fleet != query_scope.fleet):
             return False
         for name in ("worktree", "issue", "task_id", "context_generation",
                      "provider_session"):
@@ -278,6 +279,8 @@ class SQLiteMemoryStorage:
         if not scope.project or not layers or limit <= 0:
             return [], 0
         clauses, params = [], []
+        fleet_ancestor = ("(COALESCE(json_extract(scope,'$.project'),'')='' "
+                          "AND COALESCE(json_extract(scope,'$.fleet'),'')<>'')")
         for name, value in asdict(scope).items():
             if name == "project":
                 continue
@@ -288,7 +291,8 @@ class SQLiteMemoryStorage:
                 continue
             path = f"$.{name}"
             if name == "fleet":
-                clauses.append("COALESCE(json_extract(scope, ?),'') = ?")
+                clauses.append("(COALESCE(json_extract(scope, ?),'') = ? OR "
+                               + fleet_ancestor + ")")
                 params.extend((path, value))
             elif name == "context_generation":
                 clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
@@ -322,9 +326,11 @@ class SQLiteMemoryStorage:
                             "FROM (" + sql + ")")
 
                 dropped_sql = ("SELECT count(*) FROM adr001_memory WHERE " + base +
-                               " AND COALESCE(json_extract(scope,'$.project'),'')=''")
+                               " AND COALESCE(json_extract(scope,'$.project'),'')=''"
+                               " AND COALESCE(json_extract(scope,'$.fleet'),'')=''")
                 scoped_sql = packed_rows("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
-                    + base + " AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                    + base + " AND (COALESCE(json_extract(scope,'$.project'),'')=? OR "
+                    + fleet_ancestor + ") "
                     "ORDER BY created DESC LIMIT ?")
                 predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
                                     if "decision" in layers else [])
