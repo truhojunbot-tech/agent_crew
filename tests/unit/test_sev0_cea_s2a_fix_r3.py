@@ -186,9 +186,9 @@ def test_naming_yourself_the_owner_no_longer_downgrades_an_owner_decision(conn):
     owned = FakeRegistry(matches=(MatchedCapability(id="tokenomics.gate", owner="quota-core",
                                                     repo="example/quota-core"),))
     eng = engine(capabilities=owned)
-    honest = eng.authorize(conn, intent("own-1", ident=identity(anchors=("own/a.py",))),
+    honest = eng.authorize(conn, intent("own-1", ident=identity(repo="example/quota-core", anchors=("own/a.py",))),
                            caller())
-    impostor = eng.authorize(conn, intent("own-2", ident=identity(anchors=("own/b.py",))),
+    impostor = eng.authorize(conn, intent("own-2", ident=identity(repo="example/quota-core", anchors=("own/b.py",))),
                              mint_caller("quota-core", CallerProvenance.DIRECT, "adapter_token"))
 
     assert decision_of(honest) == decision_of(impostor) == ("HUMAN_GATE", "OWNER_CONFLICT")
