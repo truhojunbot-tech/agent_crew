@@ -251,8 +251,10 @@ def _enqueue_review(c, task_id):
 
 
 def _result(c, task_id):
+    attempt_id = c.get(f"/tasks/{task_id}").json()["execution"]["attempt_id"]
     return c.post(f"/tasks/{task_id}/result",
                   json={"task_id": task_id, "status": "completed",
+                        "attempt_id": attempt_id,
                         "summary": "request_changes: the cap is still broken after review",
                         "verdict": "request_changes", "findings": [FINDING],
                         "pr_number": PR})

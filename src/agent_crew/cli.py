@@ -1483,7 +1483,8 @@ def _resume_missing_pieces(*, verifier_env: bool, decision_id: str,
     if not verifier_env:
         missing.append(f"no verifier env ({cea_path} absent)")
     if not decision_present:
-        missing.append(f"decision {decision_id or '<missing>'} not in snapshot gen {snapshot_generation}")
+        label = decision_id or "--decision-id <missing>"
+        missing.append(f"decision {label} not in snapshot gen {snapshot_generation}")
     if not principals or (principal and principal not in principals):
         missing.append("principals empty" if not principals else f"principal {principal} absent")
     if not build_bound:
