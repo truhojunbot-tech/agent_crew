@@ -242,6 +242,36 @@ def _writable_queue(db: str, *, base: str = "", project: str = ""):
     return TaskQueue(db)
 
 
+def _start_or_renew_run_coordinator(queue, project: str) -> int:
+    """Join the crew-run generation, claiming the first one if absent."""
+    if not project or not hasattr(queue, "get_coordinator_state"):
+        return 0
+    state = queue.get_coordinator_state()
+    if not isinstance(state, dict):
+        return 0
+    current = int(state.get("coordinator_generation") or 0)
+    coordinator_id = f"crew-run:{project}"
+    if current:
+        if state.get("coordinator_id") != coordinator_id:
+            raise click.ClickException(
+                f"Coordinator {state.get('coordinator_id')} owns generation {current}; "
+                "prepare an explicit handoff before crew run")
+        return current
+    result = queue.advance_coordinator(
+        coordinator_id=coordinator_id, generation=1,
+        provider="agent_crew", model="crew run",
+        provider_session_id=str(os.getpid()),
+        handoff_reason="start")
+    if not result.get("accepted"):
+        # Another crew run may have won the first-generation CAS.
+        state = queue.get_coordinator_state()
+        if (state.get("coordinator_id") == coordinator_id
+                and int(state.get("coordinator_generation") or 0) > 0):
+            return int(state["coordinator_generation"])
+        raise click.ClickException("Coordinator generation advanced concurrently; retry crew run")
+    return int(result["coordinator_generation"])
+
+
 def _write_state(base: str, project: str, state: dict) -> None:
     if "port" in state:
         setup_module.require_project_port(state["port"], project)
@@ -1461,6 +1491,39 @@ def _fetch_provenance(port: int, expect: str, timeout: float = 5.0) -> dict:
                 "_reason": f"unreachable on port {port}: {str(e)[:70]}"}
 
 
+def _load_resume_cea_env(proj_dir: str) -> dict[str, str]:
+    """Load the project-local verifier configuration into this CLI process."""
+    path = resolve_cea_file(Path(proj_dir))
+    if not path.is_file():
+        return {}
+    values = parse_env_file(path)
+    for key in tuple(os.environ):
+        if key.startswith("AGENT_CREW_CEA_"):
+            os.environ.pop(key)
+    os.environ.update(values)
+    return values
+
+
+def _resume_missing_pieces(*, verifier_env: bool, decision_id: str,
+                           snapshot_generation, decision_present: bool,
+                           principals, build_bound: bool, generation: int,
+                           current_generation: int, cea_path: str,
+                           principal: str = "") -> list[str]:
+    missing = []
+    if not verifier_env:
+        missing.append(f"no verifier env ({cea_path} absent)")
+    if not decision_present:
+        label = decision_id or "--decision-id <missing>"
+        missing.append(f"decision {label} not in snapshot gen {snapshot_generation}")
+    if not principals or (principal and principal not in principals):
+        missing.append("principals empty" if not principals else f"principal {principal} absent")
+    if not build_bound:
+        missing.append("build not bound")
+    if generation <= current_generation:
+        missing.append(f"stale resume generation {generation} <= current {current_generation}")
+    return missing
+
+
 @crew.command()
 @click.argument("project", default="", required=False)
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
@@ -1839,16 +1902,49 @@ def resume(project: str, base: str, generation: int, source: str, decision_id: s
         # P6: resume is a loosening — owner principal + T0 decision_id, or the queue
         # refuses. `crew resume` is the owner's own terminal, so it presents
         # `owner:<source>`; the decision id is what makes that claim auditable.
-        if not decision_id.strip():
-            click.echo(json.dumps(
-                {"resumed": False, "reason": "P6: resume requires --decision-id naming the "
-                                             "owner (T0) decision that authorises it"},
-                ensure_ascii=False))
-            raise SystemExit(1)
         from agent_crew.cea.wiring import install_from_env
-        install_from_env(db_path=db_path, project=project)
+        from agent_crew.cea.providers import SignatureStatus
+        from agent_crew.queue import set_default_runtime_authority
+        cea_path = resolve_cea_file(Path(state_dir))
         try:
-            res = _writable_queue(db_path, base=base, project=project).resume_stop(
+            cea_env = _load_resume_cea_env(state_dir)
+        except (OSError, ValueError) as exc:
+            click.echo(json.dumps({"resumed": False, "reason": f"invalid verifier env: {exc}"}))
+            raise SystemExit(1)
+        set_default_runtime_authority(None)
+        wiring = install_from_env(db_path=db_path, project=project)
+        queue = _writable_queue(db_path, base=base, project=project)
+        authority = wiring.authority
+        snapshot = None
+        if authority is not None:
+            try:
+                snapshot = authority._snapshots.current()
+            except Exception:
+                pass
+        valid = bool(snapshot is not None and snapshot.available
+                     and snapshot.signature is SignatureStatus.VALID)
+        records = (tuple(snapshot.in_scope or ()) or tuple(snapshot.decisions or ())) if valid else ()
+        matches = [record for record in records
+                   if record.decision_id == decision_id.strip()
+                   and record.project in (None, project)]
+        principal = f"owner:{source}"
+        build = authority._build() if authority is not None else None
+        state = queue.get_runtime_state()
+        missing = _resume_missing_pieces(
+            verifier_env=bool(cea_env and authority is not None),
+            decision_id=decision_id.strip(),
+            snapshot_generation=(snapshot.generation if snapshot else "unknown"),
+            decision_present=bool(matches),
+            principals=(matches[0].principals if matches else ()),
+            build_bound=bool(build and matches and build in (matches[0].build_commits or ())),
+            generation=generation, current_generation=int(state.get("epoch") or 0),
+            cea_path=str(cea_path), principal=principal)
+        if missing:
+            click.echo(json.dumps({"resumed": False, "reason": "; ".join(missing),
+                                   "missing": missing}, ensure_ascii=False))
+            raise SystemExit(1)
+        try:
+            res = queue.resume_stop(
                 generation=generation, who=f"owner:{source}", decision_id=decision_id.strip())
         except RuntimeTransitionRefused as exc:
             click.echo(json.dumps({"resumed": False, "reason": str(exc)}, ensure_ascii=False))
@@ -2543,6 +2639,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
 
     queue = _writable_queue(db, base=base, project=project)
 
+    _coordinator_generation = _start_or_renew_run_coordinator(queue, project)
+
     wait_timeout = float(timeout)
 
     # Resolve pane info for pane capture fallback
@@ -2964,6 +3062,8 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             role_to_agent=_run_role_to_agent)
 
     _CM: dict = {"coordinator_managed": True}
+    if _coordinator_generation:
+        _CM["coordinator_generation"] = _coordinator_generation
 
     declared_base = os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
     if "AGENT_CREW_MAIN_BRANCH" not in os.environ:

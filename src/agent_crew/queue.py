@@ -172,6 +172,27 @@ class InvalidReviewResult(ValueError):
     """A worker's review is incomplete and must stay active."""
 
 
+class StaleAttemptRejected(RuntimeError):
+    """A result belongs to an older dispatch of this task."""
+
+    def __init__(self, task_id: str):
+        super().__init__(f"stale_attempt: result for {task_id} has an obsolete attempt_id")
+
+
+class MissingAttemptRejected(RuntimeError):
+    """A dispatched worker omitted its attempt binding."""
+
+    def __init__(self, task_id: str):
+        super().__init__(f"missing_attempt: result for {task_id} requires attempt_id")
+
+
+class StaleCoordinatorGeneration(RuntimeError):
+    """A coordinator write lost the project's generation fence."""
+
+    def __init__(self, generation: int, current: int):
+        super().__init__(f"stale_coordinator_generation: {generation} < current {current}")
+
+
 ResultBeforeCommit = Callable[[sqlite3.Connection, object, float], None]
 
 
@@ -737,6 +758,8 @@ _EXEC_STATE_COLUMN_TYPES = (
     ("dispatch_agent", "TEXT"),
     ("dispatch_target", "TEXT"),
     ("dispatch_attempt", "INTEGER"),
+    ("attempt_id", "TEXT"),
+    ("coordinator_generation", "INTEGER"),
     ("lease_owner", "TEXT"),
     ("lease_expires_at", "REAL"),
     ("last_heartbeat_at", "REAL"),
@@ -1594,6 +1617,7 @@ class TaskQueue:
         self, *, coordinator_id: str, generation: int, provider: str = "unknown",
         model: str = "unknown", provider_session_id: str = "unknown",
         handoff_reason: str = "", previous_receipt_hash: str = "",
+        checkpoint: Optional[dict] = None, checkpoint_ref: str = "",
     ) -> dict:
         """Atomically advance the durable coordinator generation (#309 K1).
 
@@ -1607,6 +1631,14 @@ class TaskQueue:
             requested = int(generation)
         except (TypeError, ValueError):
             requested = -1
+        if checkpoint is not None:
+            missing = [name for name in ("objective", "open_task_ids", "last_receipt_hash",
+                                       "generation") if name not in checkpoint
+                       or checkpoint[name] is None or checkpoint[name] == ""]
+            if missing:
+                raise ValueError("handoff checkpoint incomplete: missing " + ", ".join(missing))
+            if int(checkpoint["generation"]) != requested - 1:
+                raise ValueError("handoff checkpoint generation does not precede target")
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -1634,11 +1666,20 @@ class TaskQueue:
                 conn.execute("COMMIT")
                 return {"accepted": False, "quarantined": True, "receipt_hash": receipt_hash,
                         "current": current, "reason": "stale coordinator_generation"}
+            if current_generation:
+                ready = conn.execute(
+                    "SELECT 1 FROM coordinator_receipts WHERE receipt_hash=? "
+                    "AND event='handoff_checkpoint_ready' AND coordinator_generation=? "
+                    "AND coordinator_id=?",
+                    (checkpoint_ref, current_generation, current["coordinator_id"]),
+                ).fetchone()
+                if ready is None:
+                    raise ValueError("handoff requires a complete, prepared checkpoint_ref")
             state = {
                 "project": project, "coordinator_id": self._unknown(coordinator_id),
                 "coordinator_generation": requested, "provider": self._unknown(provider),
                 "model": self._unknown(model), "provider_session_id": self._unknown(provider_session_id),
-                "checkpoint_ref": f"coordinator:{project}:{self._unknown(coordinator_id)}:{requested}",
+                "checkpoint_ref": checkpoint_ref or f"coordinator:{project}:{self._unknown(coordinator_id)}:{requested}",
                 "previous_receipt_hash": previous_receipt_hash or "",
                 "handoff_reason": handoff_reason or "", "updated_at": now,
             }
@@ -1674,6 +1715,55 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def prepare_coordinator_handoff(self, checkpoint: dict) -> dict:
+        """Record the outgoing coordinator's complete checkpoint without transferring authority."""
+        required = ("objective", "open_task_ids", "last_receipt_hash", "generation")
+        missing = [key for key in required if key not in checkpoint
+                   or checkpoint[key] is None or checkpoint[key] == ""]
+        if missing:
+            raise ValueError("handoff checkpoint incomplete: missing " + ", ".join(missing))
+        if not isinstance(checkpoint["open_task_ids"], list):
+            raise ValueError("handoff checkpoint open_task_ids must be a list")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            current = self._coordinator_state_on(conn)
+            generation = int(checkpoint["generation"])
+            if generation != int(current["coordinator_generation"]):
+                raise StaleCoordinatorGeneration(generation, int(current["coordinator_generation"]))
+            now = time.time()
+            receipt_hash = hashlib.sha256(json.dumps(
+                {"checkpoint": checkpoint, "at": now}, sort_keys=True).encode()).hexdigest()
+            conn.execute(
+                "INSERT INTO coordinator_receipts "
+                "(receipt_hash,event,project,coordinator_id,coordinator_generation,provider,model,"
+                "provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (receipt_hash, "handoff_checkpoint_ready", current["project"],
+                 current["coordinator_id"], generation, current["provider"], current["model"],
+                 current["provider_session_id"], receipt_hash,
+                 checkpoint["last_receipt_hash"], checkpoint["objective"], now))
+            conn.commit()
+            return {"checkpoint_ref": receipt_hash, "coordinator_generation": generation}
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def overdue_coordinator_handoff(self, *, after_seconds: float = 900) -> Optional[dict]:
+        """Expose an overdue checkpoint for health monitoring; never take authority."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT r.* FROM coordinator_receipts r JOIN coordinator_state s ON s.id=1 "
+                "WHERE r.event='handoff_checkpoint_ready' AND "
+                "r.coordinator_generation=s.coordinator_generation AND r.created_at<=? "
+                "ORDER BY r.created_at DESC LIMIT 1", (time.time() - after_seconds,)).fetchone()
+            return dict(row) if row else None
+        finally:
+            conn.close()
+
     def list_coordinator_receipts(self, limit: int = 50) -> list:
         conn = self._connect()
         try:
@@ -1683,6 +1773,37 @@ class TaskQueue:
             return [dict(row) for row in rows]
         finally:
             conn.close()
+
+    def _check_coordinator_generation_on(self, conn, generation: Optional[int],
+                                         *, action: str, task_id: str = "") -> None:
+        """Fence a coordinator write under the caller's existing write lock."""
+        if generation is None:
+            return  # Internal and pre-C1.a callers carry no coordinator claim.
+        current = self._coordinator_state_on(conn)
+        now = time.time()
+        try:
+            proposed = int(generation)
+        except (TypeError, ValueError):
+            proposed = -1
+        active = int(current["coordinator_generation"] or 0)
+        if proposed >= active:
+            return
+        material = {"event": "stale_coordinator_generation", "action": action,
+                    "task_id": task_id, "proposed": proposed, "current": active,
+                    "at": now}
+        receipt_hash = hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+        conn.execute(
+            "INSERT INTO coordinator_receipts "
+            "(receipt_hash,event,project,coordinator_id,coordinator_generation,provider,model,"
+            "provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (receipt_hash, "stale_coordinator_generation", current["project"],
+             current["coordinator_id"], proposed, current["provider"], current["model"],
+             current["provider_session_id"], current["checkpoint_ref"],
+             current["previous_receipt_hash"], f"{action}:{task_id}", now),
+        )
+        conn.commit()  # Refusal receipt survives the exception and no domain write has run.
+        raise StaleCoordinatorGeneration(proposed, active)
 
     def export_project_runtime_state(self) -> dict:
         """A portable successor-coordinator snapshot; it never mutates runtime state."""
@@ -2794,7 +2915,8 @@ class TaskQueue:
     def enqueue_with_receipt(self, task: TaskRequest, receipt: dict, *,
                              context: Optional[dict] = None,
                              _capacity_predecessor: str = "",
-                             _successor_provenance: object | None = None) -> str:
+                             _successor_provenance: object | None = None,
+                             coordinator_generation: Optional[int] = None) -> str:
         """Write the task row for an admitted intent. **The only writer there is.**
 
         P2: "without a valid receipt there is no enqueue". That is a property of
@@ -2887,6 +3009,8 @@ class TaskQueue:
             # BEGIN IMMEDIATE로 write-lock을 쥔 뒤 pause를 확인한다 → submit_result의 사전 체크와
             # commit 사이에 STOP이 authoritative가 됐어도 여기서 잡혀 successor가 생성되지 않는다.
             conn.execute("BEGIN IMMEDIATE")
+            self._check_coordinator_generation_on(
+                conn, coordinator_generation, action="enqueue", task_id=task.task_id)
             # #314 §2: 권위는 runtime_stop 행. 같은 write-lock 트랜잭션에서 읽으므로
             # STOP writer의 commit이 이 INSERT 전에 끝났으면 반드시 보인다(TOCTOU 제거).
             if self._stop_active_in_txn(conn, point=_cea_validator.ValidationPoint.ENQUEUE):
@@ -3480,7 +3604,8 @@ class TaskQueue:
 
     def enqueue(self, task: TaskRequest, *, ingress: Optional[str] = None,
                 provenance: Optional["_CeaProvenance"] = None,
-                _successor_provenance: object | None = None) -> str:
+                _successor_provenance: object | None = None,
+                coordinator_generation: Optional[int] = None) -> str:
         """Admit a task and write its row — the one path every §7 adapter takes.
 
         ``ingress`` names the adapter from
@@ -3561,7 +3686,8 @@ class TaskQueue:
             return self.enqueue_with_receipt(
                 task, auth.receipt, context=context,
                 _capacity_predecessor=capacity_predecessor,
-                _successor_provenance=_successor_provenance)
+                _successor_provenance=_successor_provenance,
+                coordinator_generation=coordinator_generation)
 
     def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
                           provenance: "_CeaProvenance", code: str, text: str):
@@ -4338,6 +4464,8 @@ class TaskQueue:
     def submit_result(self, task_id: str, result: TaskResult, *,
                       nonce: Optional[str] = None,
                       presenter: Optional[str] = None,
+                      attempt_id: Optional[str] = None,
+                      require_attempt: bool = False,
                       before_commit: Optional[ResultBeforeCommit] = None,
                       consume_receipt: bool = True,
                       expected_status: Optional[str] = None,
@@ -4377,6 +4505,8 @@ class TaskQueue:
         try:
             if result.task_id != task_id:
                 raise ValueError(f"task_id mismatch: argument {task_id!r} != result.task_id {result.task_id!r}")
+            presented_attempt = attempt_id or result.attempt_id
+            result.attempt_id = None
             # Read the provider's own transcript before the terminal write. The
             # adapter boundary is deliberately provider-neutral here; failure
             # to observe a transcript is represented by NULL, never a guess.
@@ -4386,10 +4516,35 @@ class TaskQueue:
             # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT task_type, status FROM tasks WHERE task_id = ?",
+                "SELECT task_type, status, attempt_id FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
+            if row["attempt_id"] and require_attempt and not presented_attempt:
+                conn.execute("ROLLBACK")
+                raise MissingAttemptRejected(task_id)
+            if row["attempt_id"] and (presented_attempt or require_attempt):
+                if presented_attempt != row["attempt_id"]:
+                    now = time.time()
+                    self._append_exec_event_on(
+                        conn, task_id, "stale_attempt", now,
+                        presented_attempt=presented_attempt,
+                        current_attempt=row["attempt_id"])
+                    coordinator = self._coordinator_state_on(conn)
+                    digest = hashlib.sha256(json.dumps(
+                        [task_id, presented_attempt, row["attempt_id"], now]).encode()).hexdigest()
+                    conn.execute(
+                        "INSERT INTO coordinator_receipts "
+                        "(receipt_hash,event,project,coordinator_id,coordinator_generation,provider,model,"
+                        "provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,created_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (digest, "stale_attempt_rejected", coordinator["project"],
+                         coordinator["coordinator_id"], coordinator["coordinator_generation"],
+                         coordinator["provider"], coordinator["model"],
+                         coordinator["provider_session_id"], coordinator["checkpoint_ref"],
+                         coordinator["previous_receipt_hash"], task_id, now))
+                    conn.commit()
+                    raise StaleAttemptRejected(task_id)
             prior_status = row["status"]
             if (row["task_type"] == "review" and prior_status == "completed"
                     and not allow_review_replay):
@@ -4626,6 +4781,14 @@ class TaskQueue:
             except Exception:
                 pass
             raise
+        finally:
+            conn.close()
+
+    def stale_attempt_count(self) -> int:
+        conn = self._connect()
+        try:
+            return int(conn.execute(
+                "SELECT count(*) FROM task_exec_events WHERE event='stale_attempt'").fetchone()[0])
         finally:
             conn.close()
 
@@ -5040,7 +5203,8 @@ class TaskQueue:
 
     # ── #314 §5: external mutation receipt (merge idempotency) ────────────
 
-    def external_op_reserve(self, op_key: str, pr_number: Optional[int] = None) -> dict:
+    def external_op_reserve(self, op_key: str, pr_number: Optional[int] = None,
+                            *, coordinator_generation: Optional[int] = None) -> dict:
         """외부 GitHub mutation 시작 전 **원자적 STOP admission + reservation**(§5/재리뷰).
 
         같은 BEGIN IMMEDIATE 트랜잭션에서 runtime_stop을 확인해, unpaused일 때만 reservation과
@@ -5056,6 +5220,8 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._check_coordinator_generation_on(
+                conn, coordinator_generation, action="merge_decision", task_id=op_key)
             # 같은 txn: STOP이 먼저 commit됐으면 반드시 보인다. pause.json은 여기서
             # 행으로 화해되고, 판단은 그 행만 본다(P6: 게이트-타임 2차 권위 없음).
             state = self._runtime_state_in_txn(conn)
@@ -5076,6 +5242,9 @@ class TaskQueue:
             d["reserved"] = newly
             d["admitted"] = True
             return d
+        except StaleCoordinatorGeneration as exc:
+            return {"admitted": False, "state": "stale_coordinator_generation",
+                    "reserved": False, "reason": str(exc)}
         except Exception:
             try:
                 conn.execute("ROLLBACK")
@@ -5241,6 +5410,7 @@ class TaskQueue:
         nonce: Optional[str] = None
         conn = self._connect()
         try:
+            conn.execute("BEGIN IMMEDIATE")
             receipt_id, receipt = self._cea_receipt_for_task_on(conn, task_id)
             if receipt is None:
                 # A pre-2c row: there is no receipt, so DISPATCH cannot be asked
@@ -5269,12 +5439,17 @@ class TaskQueue:
                         # later call sites cannot check. Say so; do not invent one.
                         logger.warning("cea: dispatch nonce mint failed for %s", task_id,
                                        exc_info=True)
+            attempt_id = uuid.uuid4().hex
+            coordinator_generation = int(
+                self._coordinator_state_on(conn)["coordinator_generation"] or 0)
             cur = conn.execute(
                 "UPDATE tasks SET dispatched_at = ?, dispatch_channel = ?, dispatch_agent = ?,"
                 " dispatch_target = ?, dispatch_attempt = COALESCE(dispatch_attempt, 0) + 1,"
+                " attempt_id = ?, coordinator_generation = ?,"
                 " lease_owner = ?, lease_expires_at = ?"
                 " WHERE task_id = ?",
-                (at, channel, agent, target, lease_owner, expires, task_id),
+                (at, channel, agent, target, attempt_id, coordinator_generation,
+                 lease_owner, expires, task_id),
             )
             if cur.rowcount:
                 attempt = conn.execute(
@@ -5283,7 +5458,8 @@ class TaskQueue:
                 self._append_exec_event_on(
                     conn, task_id, "dispatched", at, channel=channel, agent=agent,
                     target=target, attempt=attempt, lease_owner=lease_owner,
-                    lease_expires_at=expires)
+                    lease_expires_at=expires, attempt_id=attempt_id,
+                    coordinator_generation=coordinator_generation)
             conn.commit()
         except AdmissionRefused:
             # ⛔Not swallowed with the telemetry failures below. A refused
@@ -5301,6 +5477,55 @@ class TaskQueue:
         finally:
             conn.close()
         return nonce
+
+    def dispatch_binding(self, task_id: str) -> dict:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT attempt_id, coordinator_generation FROM tasks WHERE task_id=?",
+                (task_id,)).fetchone()
+            return ({"attempt_id": row["attempt_id"],
+                     "coordinator_generation": row["coordinator_generation"]}
+                    if row else {})
+        finally:
+            conn.close()
+
+    def reject_stale_attempt(self, task_id: str, presented_attempt: str) -> bool:
+        """Record a stale result without touching result or cascade state."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT attempt_id FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            current_attempt = row["attempt_id"] if row else None
+            if not current_attempt or current_attempt == presented_attempt:
+                conn.rollback()
+                return False
+            now = time.time()
+            self._append_exec_event_on(
+                conn, task_id, "stale_attempt", now,
+                presented_attempt=presented_attempt,
+                current_attempt=current_attempt)
+            coordinator = self._coordinator_state_on(conn)
+            digest = hashlib.sha256(json.dumps(
+                [task_id, presented_attempt, current_attempt, now]).encode()).hexdigest()
+            conn.execute(
+                "INSERT INTO coordinator_receipts "
+                "(receipt_hash,event,project,coordinator_id,coordinator_generation,provider,model,"
+                "provider_session_id,checkpoint_ref,previous_receipt_hash,handoff_reason,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (digest, "stale_attempt_rejected", coordinator["project"],
+                 coordinator["coordinator_id"], coordinator["coordinator_generation"],
+                 coordinator["provider"], coordinator["model"],
+                 coordinator["provider_session_id"], coordinator["checkpoint_ref"],
+                 coordinator["previous_receipt_hash"], task_id, now))
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def bind_dispatch_target(self, task_id: str, *, target: str,
                              lease_owner: Optional[str] = None) -> None:
@@ -5674,12 +5899,15 @@ class TaskQueue:
             conn.close()
 
     def cancel(self, task_id: str, *, reason: str = CANCEL_REASON_ATTEMPT,
-               expected_status: Optional[str] = None) -> bool:
+               expected_status: Optional[str] = None,
+               coordinator_generation: Optional[int] = None) -> bool:
         return self.cancel_with_binding(task_id, reason=reason,
-                                        expected_status=expected_status)[0]
+                                        expected_status=expected_status,
+                                        coordinator_generation=coordinator_generation)[0]
 
     def cancel_with_binding(self, task_id: str, *, reason: str = CANCEL_REASON_ATTEMPT,
                             expected_status: Optional[str] = None,
+                            coordinator_generation: Optional[int] = None,
                             ) -> tuple[bool, Optional[str], str]:
         """Cancel a task. Dependent tasks (prev_task_id points to task_id) are marked
         'orphaned' rather than cancelled — operators can manually cancel them if desired.
@@ -5715,6 +5943,8 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            self._check_coordinator_generation_on(
+                conn, coordinator_generation, action="cancel", task_id=task_id)
             row = conn.execute(
                 "SELECT status, receipt_id, dispatch_pane_id FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()

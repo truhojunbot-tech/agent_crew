@@ -41,6 +41,7 @@ def _post_task(client, task_id="t1", task_type="implement", priority=3, ctx=None
 
 
 def _post_result(client, task_id, status="completed", summary="done", error_info=None):
+    execution = client.get(f"/tasks/{task_id}").json().get("execution") or {}
     return client.post(f"/tasks/{task_id}/result", json={
         "task_id": task_id,
         "status": status,
@@ -49,6 +50,7 @@ def _post_result(client, task_id, status="completed", summary="done", error_info
         "findings": [],
         "pr_number": None,
         "error_info": error_info,
+        "attempt_id": execution.get("attempt_id"),
     })
 
 
@@ -87,10 +89,8 @@ def test_auto_retry_skips_agent_reported_implement_failure(
             client, "self-report-probe", task_type=task_type,
             ctx={"pr_number": 123} if task_type == "review" else None,
         ).status_code == 201
-        response = client.post("/tasks/self-report-probe/result", json={
-            "task_id": "self-report-probe", "status": "failed",
-            "summary": "agent failed", "error_info": error_info,
-        })
+        response = _post_result(client, "self-report-probe", status="failed",
+                                summary="agent failed", error_info=error_info)
         assert response.status_code == 200
 
     tasks = TaskQueue(tmp_db).list_tasks()

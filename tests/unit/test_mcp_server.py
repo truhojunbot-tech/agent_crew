@@ -173,18 +173,20 @@ class TestSubmitResult:
     def test_completed_path_returns_ack(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-ok"))
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="implementer")  # transition to in_progress
+        dispatched = _call_tool(mcp, "get_next_task", role="implementer")
         ack = _call_tool(mcp, "submit_result", task_id="t-ok",
-                         status="completed", summary="done")
+                         status="completed", summary="done",
+                         attempt_id=dispatched["attempt_id"])
         assert ack["acknowledged"] is True
         assert ack["task_type"] == "implement"
 
     def test_failed_status_carries_summary(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-fail"))
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="implementer")
+        dispatched = _call_tool(mcp, "get_next_task", role="implementer")
         ack = _call_tool(mcp, "submit_result", task_id="t-fail",
-                         status="failed", summary="boom")
+                         status="failed", summary="boom",
+                         attempt_id=dispatched["attempt_id"])
         assert ack["acknowledged"] is True
 
     def test_invalid_status_returns_error_not_raise(self, tmp_db):
@@ -206,7 +208,7 @@ class TestSubmitResult:
     def test_review_findings_propagate_to_queue(self, tmp_db):
         TaskQueue(tmp_db).enqueue(_make_task("t-rev", task_type="review"))
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="reviewer")
+        dispatched = _call_tool(mcp, "get_next_task", role="reviewer")
         ack = _call_tool(
             mcp,
             "submit_result",
@@ -215,6 +217,7 @@ class TestSubmitResult:
             summary="Reviewed this change and found an off-by-one error.",
             verdict="request_changes",
             findings=["[bug] off-by-one in step 2"],
+            attempt_id=dispatched["attempt_id"],
         )
         assert ack["acknowledged"] is True
 
@@ -228,12 +231,13 @@ class TestSubmitResult:
         review.context = {"repo": "owner/repo"}
         q.enqueue(review)
         mcp = build_mcp_server(tmp_db)
-        _call_tool(mcp, "get_next_task", role="reviewer")
+        dispatched = _call_tool(mcp, "get_next_task", role="reviewer")
 
         ack = _call_tool(
             mcp, "submit_result", task_id=review.task_id, status="completed",
             summary="Reviewed this change and found a blocking issue on trunk.",
             verdict="request_changes", findings=["HIGH file.py:1 - blocking issue"],
+            attempt_id=dispatched["attempt_id"],
         )
 
         assert ack["acknowledged"] is True

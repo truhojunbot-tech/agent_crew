@@ -37,7 +37,7 @@ def checker(tmp_path, monkeypatch):
 
 def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
                  change_type="create", gate_failure="", status_details=None,
-                 ci_state=None):
+                 ci_state=None, advance_out_of_process=False):
     if not gate_enabled:
         monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -94,6 +94,11 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
+        if advance_out_of_process:
+            assert app.state.coordinator_generation == 0
+            assert TaskQueue(db).advance_coordinator(
+                coordinator_id="crew-run:agent_crew", generation=1)["accepted"]
+            assert app.state.coordinator_generation == 0
         response = client.post("/tasks/test-615/result", json={
             "task_id": "test-615", "status": "completed", "summary": "tests passed",
             "pr_number": 615})
@@ -120,6 +125,16 @@ def test_server_review_comments_and_merges(tmp_path, monkeypatch, checker):
     assert record["verdict"] == "REVIEW"
     assert Path(record["receipt_path"]).parent == tmp_path / "conformance_receipts"
     assert json.loads(Path(record["receipt_path"]).read_text())["verdict"] == "REVIEW"
+
+
+def test_auto_merge_survives_out_of_process_coordinator_advance(
+        tmp_path, monkeypatch, checker):
+    monkeypatch.delenv("AGENT_CREW_AUTO_MERGE", raising=False)
+    queue, calls = _submit_test(
+        tmp_path, monkeypatch, title="add widget", change_type="modify",
+        advance_out_of_process=True)
+    assert calls == ["comment", "status", "merge"]
+    assert queue.external_op_get("merge:pr:615")["state"] == "done"
 
 
 def test_server_gate_unset_refuses_merge(tmp_path, monkeypatch):

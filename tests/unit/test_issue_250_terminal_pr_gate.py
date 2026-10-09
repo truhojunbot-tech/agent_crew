@@ -19,6 +19,12 @@ import uuid
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _no_headless_dispatch_race(monkeypatch):
+    """These HTTP cascade tests drive result submission, not worker startup."""
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+
 from agent_crew.pipeline import (
     FIX_EXHAUSTED_MARKER,
     auto_enqueue_fix,
@@ -301,7 +307,7 @@ def _server(tmp_db, push):
     return create_app(db_path=tmp_db,
                       pane_map={"implementer": "%91", "reviewer": "%92", "tester": "%93"},
                       port=8105, push_fn=push, watchdog_disabled=True,
-                      anomaly_disabled=True)
+                      anomaly_disabled=True, identity_required=False)
 
 
 class _Push:
@@ -320,8 +326,10 @@ def _enqueue_review(c, task_id):
 
 
 def _result(c, task_id):
+    attempt_id = c.get(f"/tasks/{task_id}").json()["execution"]["attempt_id"]
     return c.post(f"/tasks/{task_id}/result",
                   json={"task_id": task_id, "status": "completed",
+                        "attempt_id": attempt_id,
                         "summary": "request_changes: the cap is still broken after review",
                         "verdict": "request_changes", "findings": [FINDING],
                         "pr_number": PR})
@@ -462,8 +470,10 @@ def test_http_result_omitting_the_pr_does_not_review_a_merged_pr(tmp_db, monkeyp
         c.post("/tasks", json={"task_id": "impl-http", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
                                "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
+        attempt_id = c.get("/tasks/impl-http").json()["execution"]["attempt_id"]
         r = c.post("/tasks/impl-http/result",
                    json={"task_id": "impl-http", "status": "completed",
+                         "attempt_id": attempt_id,
                          "summary": "done", "verdict": None, "findings": [],
                          "pr_number": None})            # the agent omits it
         assert r.status_code == 200
@@ -504,9 +514,12 @@ def test_http_result_omitting_the_pr_still_reviews_an_open_pr(tmp_db, monkeypatc
         c.post("/tasks", json={"task_id": "impl-open", "task_type": "implement",
                                "description": "impl", "branch": BRANCH, "priority": 3,
                                "context": {"pr_number": PR, "repo": "owner/repo"}, "project": ""})
-        c.post("/tasks/impl-open/result",
+        attempt_id = c.get("/tasks/impl-open").json()["execution"]["attempt_id"]
+        response = c.post("/tasks/impl-open/result",
                json={"task_id": "impl-open", "status": "completed", "summary": "done",
+                     "attempt_id": attempt_id,
                      "verdict": None, "findings": [], "pr_number": None})
+        assert response.status_code == 200
 
     reviews = [t for t in TaskQueue(tmp_db).list_tasks() if t.task_type == "review"]
     assert len(reviews) == 1
