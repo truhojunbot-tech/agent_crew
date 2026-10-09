@@ -2486,9 +2486,13 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         raw_tier = os.environ["AGENT_CREW_DEFAULT_RISK_TIER"].strip()
         if raw_tier not in {"0", "1", "2", "3"}:
             raise click.UsageError(
-                "AGENT_CREW_DEFAULT_RISK_TIER must be an integer from 0 to 3"
+                "AGENT_CREW_DEFAULT_RISK_TIER must be an integer 0-3; pass --risk-tier 0-3"
             )
         risk_tier = int(raw_tier)
+    if risk_tier is None:
+        raise click.UsageError(
+            "pass --risk-tier 0-3 or set AGENT_CREW_DEFAULT_RISK_TIER"
+        )
     risk_context = {"risk_tier": risk_tier} if risk_tier is not None else {}
     issue_context = {"issue": issue} if issue is not None else {}
     artifact_context = {"artifact_kind": artifact_kind} if artifact_kind is not None else {}
