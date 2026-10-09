@@ -58,11 +58,125 @@ def test_real_shape_maps_artifacts_and_request(monkeypatch):
     assert "high" in items["forge:crew-adr-17"].provenance
     assert "hybrid" in items["forge:crew-adr-17"].provenance
     request, timeout = calls[0]
-    assert request.full_url == "http://127.0.0.1:9002/get_context"
-    assert timeout == 5.0
-    assert json.loads(request.data)["situation"] == {
+    assert request.full_url == "http://127.0.0.1:8769/get_context"
+    assert timeout == 0.3
+    body = json.loads(request.data)
+    assert body["situation"] == {
         "project": "agent_crew", "task_type": "implement", "fix_round": True,
     }
+    assert (body["repo"], body["project"], body["role"], body["byte_budget"]) == (
+        "org/agent_crew", "agent_crew", "implementer", 8000)
+
+
+def test_live_shape_maps_tail_and_telemetry(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    tail_text = "x" * 900
+    body = {"items": [{"source_path": "src/worker.py", "repo": "org/agent_crew",
+                       "commit_sha": "a" * 40, "content_sha": "b" * 64,
+                       "bytes": 900, "score": 0.7, "text": tail_text}],
+            "mode": "hybrid", "model_id": "small", "tail_bytes": 900}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, *_): return json.dumps(body).encode()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **k: Response())
+    pack = _build()
+    forge = [a for a in pack.items if a.artifact_id.startswith("forge:")]
+    assert len(forge) == 1
+    assert forge[0].uri == "src/worker.py"
+    assert forge[0].revision == "a" * 40
+    assert forge[0].excerpt == tail_text
+    assert pack.telemetry()["tail_bytes"] == 900
+
+
+def test_tail_bytes_counts_only_delivered_forge_text(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
+        cp.Artifact("repo:src/duplicate.py", "src/duplicate.py", cp.TYPE_CODE)
+    ])
+    body = {"items": [
+        {"source_path": path, "repo": "org/agent_crew", "commit_sha": "a" * 40,
+         "content_sha": sha * 64, "bytes": len(text.encode()), "score": score,
+         "text": text}
+        for path, sha, text, score in (("src/duplicate.py", "a", "duplicate", 0.7),
+                                       ("src/delivered.py", "b", "café", 0.9),
+                                       ("src/dropped.py", "c", "dropped", 0.1))
+    ], "tail_bytes": 9999}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, *_): return json.dumps(body).encode()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **k: Response())
+    query = cp.RetrievalQuery(task_id="fix-1", role="implementer")
+    providers = [cp.LexicalRepoProvider(), cp.ForgeProvider()]
+    pack = cp.plan_pack(query, providers, mode=cp.MODE_HYBRID,
+                        budget={"max_tokens": 1000, "max_items": 2})
+    assert pack.telemetry()["forge_items"] == 1
+    assert pack.telemetry()["tail_bytes"] == len("café".encode())
+
+    dropped = cp.plan_pack(query, providers, mode=cp.MODE_HYBRID,
+                           budget={"max_tokens": 1000, "max_items": 1})
+    assert dropped.telemetry()["forge_items"] == 0
+    assert dropped.telemetry()["tail_bytes"] == 0
+
+
+def test_tail_bytes_without_server_count_uses_delivered_text(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    body = {"items": [{"source_path": "src/x.py", "repo": "org/agent_crew",
+                       "commit_sha": "a" * 40, "content_sha": "b" * 64,
+                       "bytes": 5, "score": 0.7, "text": "café"}]}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, *_): return json.dumps(body).encode()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **k: Response())
+    assert _build().telemetry()["tail_bytes"] == len("café".encode())
+
+
+def test_url_and_timeout_use_environment(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_URL", "http://127.0.0.1:9123/")
+    monkeypatch.setenv("AGENT_CREW_FORGE_TIMEOUT_MS", "125")
+    provider = cp.ForgeProvider()
+    assert provider._url == "http://127.0.0.1:9123"
+    assert provider._timeout == 0.125
+
+
+@pytest.mark.parametrize("raw", ["0", "-5", "abc", "nan"])
+def test_invalid_timeout_environment_falls_back_to_300ms(monkeypatch, raw):
+    monkeypatch.setenv("AGENT_CREW_FORGE_TIMEOUT_MS", raw)
+    assert cp.ForgeProvider()._timeout == 0.3
+
+
+def test_default_timeout_omits_tail_and_counts_once(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    release = threading.Event()
+    exited = threading.Event()
+
+    def stalled(*a, **k):
+        try:
+            release.wait(1)
+            return None
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", stalled)
+    started = time.monotonic()
+    try:
+        pack = _build()
+    finally:
+        release.set()
+        exited.wait(1)
+    assert time.monotonic() - started < 0.6
+    assert pack.telemetry()["forge_timeout"] == 1
+    assert "timeout" in pack.telemetry()["forge_error"]
+    assert pack.telemetry()["tail_bytes"] == 0
+    assert pack.telemetry()["forge_items"] == 0
 
 
 @pytest.mark.parametrize("error", [URLError("refused"), TimeoutError("timeout")])
@@ -108,8 +222,53 @@ def test_malformed_forge_response_keeps_lexical_results(monkeypatch, body):
     pack = _build()
     assert pack.mode == cp.MODE_LEXICAL
     assert pack.degraded and pack.provider_errors
+    assert pack.telemetry()["forge_error"]
     assert pack.telemetry()["forge_items"] == 0
     assert "repo:src/worker.py" in {item.artifact_id for item in pack.items}
+
+
+@pytest.mark.parametrize("change", [
+    {"commit_sha": None}, {"content_sha": None}, {"text": None},
+    {"bytes": "bad"}, {"bytes": -1},
+])
+def test_incomplete_live_item_omits_tail_and_records_error(monkeypatch, change):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    item = {"source_path": "src/x.py", "repo": "org/agent_crew",
+            "commit_sha": "a" * 40, "content_sha": "b" * 64,
+            "bytes": 4, "score": 0.7, "text": "text"}
+    item.update(change)
+    body = {"items": [item], "tail_bytes": 4}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, *_): return json.dumps(body).encode()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **k: Response())
+    pack = _build()
+    assert pack.telemetry()["forge_items"] == 0
+    assert pack.telemetry()["tail_bytes"] == 0
+    assert pack.telemetry()["forge_error"]
+
+
+@pytest.mark.parametrize("tail_bytes", ["bad", -1, None])
+def test_invalid_server_tail_bytes_omits_tail_and_records_error(monkeypatch, tail_bytes):
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    body = {"items": [{"source_path": "src/x.py", "repo": "org/agent_crew",
+                       "commit_sha": "a" * 40, "content_sha": "b" * 64,
+                       "bytes": 4, "score": 0.7, "text": "text"}],
+            "tail_bytes": tail_bytes}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_): pass
+        def read(self, *_): return json.dumps(body).encode()
+
+    monkeypatch.setattr(cp.urllib.request, "urlopen", lambda *a, **k: Response())
+    pack = _build()
+    assert pack.telemetry()["forge_items"] == 0
+    assert pack.telemetry()["tail_bytes"] == 0
+    assert pack.telemetry()["forge_error"]
 
 
 def test_stalled_forge_read_is_bounded_and_keeps_lexical_results(monkeypatch):
