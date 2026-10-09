@@ -21,6 +21,14 @@ def test_root_without_tier_fails_before_enqueue(tmp_path, monkeypatch):
     assert queue.list_tasks() == []
 
 
+def test_prev_task_id_still_requires_tier(tmp_path, monkeypatch):
+    monkeypatch.delenv("AGENT_CREW_DEFAULT_RISK_TIER", raising=False)
+    result, queue = invoke(tmp_path, "--prev-task-id", "impl-1")
+    assert result.exit_code != 0
+    assert "--risk-tier 0-3" in result.output
+    assert queue.list_tasks() == []
+
+
 def test_root_explicit_tier(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_CREW_DEFAULT_RISK_TIER", raising=False)
     result, queue = invoke(tmp_path, "--risk-tier", "0")

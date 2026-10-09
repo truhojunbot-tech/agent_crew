@@ -3263,6 +3263,8 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
                    "Defaults to analyst,critic,advocate,risk.")
 @click.option("--rounds", default=1, type=int, show_default=True, help="Number of discussion rounds")
 @click.option("--then-run", is_flag=True, help="Trigger code-review loop after synthesis")
+@click.option("--risk-tier", type=click.IntRange(0, 3), default=None,
+              help="Risk tier for --then-run (default: AGENT_CREW_DEFAULT_RISK_TIER if set)")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--project", default="", help="Project name (reads DB from state)")
 @click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
@@ -3281,11 +3283,23 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
                    "number once the discussion completes (#219). No effect with "
                    "--nowait, since there's no synthesis yet when that returns.")
 def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: bool,
+            risk_tier: int | None,
             db: str, project: str, allow_cross_project: bool, base: str, output: str, branch: str,
             timeout: int, nowait: bool, github_discussion: str, post_to: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
         raise click.UsageError("topic must not be empty")
+
+    if then_run:
+        if risk_tier is None and "AGENT_CREW_DEFAULT_RISK_TIER" in os.environ:
+            raw_tier = os.environ["AGENT_CREW_DEFAULT_RISK_TIER"].strip()
+            if raw_tier not in {"0", "1", "2", "3"}:
+                raise click.UsageError(
+                    "AGENT_CREW_DEFAULT_RISK_TIER must be an integer 0-3; pass --risk-tier 0-3")
+            risk_tier = int(raw_tier)
+        if risk_tier is None:
+            raise click.UsageError(
+                "pass --risk-tier 0-3 or set AGENT_CREW_DEFAULT_RISK_TIER for --then-run")
 
     project_state = None
     if not db:
@@ -3557,7 +3571,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         )
 
         max_iter = DEFAULT_MAX_ITER
-        impl_id = enqueue_implement(queue, topic, branch, port=_run_port)
+        impl_id = enqueue_implement(queue, topic, branch,
+                                    context={"risk_tier": risk_tier}, port=_run_port)
         click.echo(f"Code-review loop started: {impl_id}")
 
         for iteration in range(1, max_iter + 1):
@@ -3575,7 +3590,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             # the main loop above.
             _review_attempts = 0
             while True:
-                review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id, port=_run_port)
+                review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id,
+                                           context={"risk_tier": risk_tier}, port=_run_port)
                 review_result = None
                 deadline = time.time() + wait_timeout
                 while time.time() < deadline:
@@ -3622,7 +3638,9 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
                 return
 
             feedback = build_feedback(review_result)
-            impl_id = enqueue_implement(queue, topic, branch, context={"feedback": feedback}, port=_run_port)
+            impl_id = enqueue_implement(queue, topic, branch,
+                                        context={"feedback": feedback, "risk_tier": risk_tier},
+                                        port=_run_port)
 
         click.echo(f"Max iterations ({max_iter}) reached without approval.")
 
@@ -3929,10 +3947,10 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
 
         crew enqueue review "Review PR #1666" --project alpha_engine \\
             --branch agent/claude-cli/1665-feature --pr 1666 \\
-            --prev-task-id impl-abcd1234
+            --prev-task-id impl-abcd1234 --risk-tier 1
 
         crew enqueue test "Verify PR #1666" --project alpha_engine \\
-            --branch agent/claude-cli/1665-feature --prev-task-id review-...
+            --branch agent/claude-cli/1665-feature --prev-task-id review-... --risk-tier 1
     """
     import uuid as _uuid
     import urllib.request as _urllib_req
@@ -3943,7 +3961,7 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
             raise click.UsageError(
                 "AGENT_CREW_DEFAULT_RISK_TIER must be an integer 0-3; pass --risk-tier 0-3")
         risk_tier = int(raw_tier)
-    if risk_tier is None and not prev_task_id:
+    if risk_tier is None:
         raise click.UsageError(
             "pass --risk-tier 0-3 or set AGENT_CREW_DEFAULT_RISK_TIER")
 

@@ -512,18 +512,21 @@ task sits unrouted and the reviewer goes idle.
 
 **Correct pattern**: POST directly to the server with the explicit task_type:
 
+Set `risk_tier` to the current task's tier (integer 0-3), or choose and
+declare a tier for this new root. Replace the example value below.
+
 ```bash
 TASK_ID="review-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
 curl -sS -X POST http://127.0.0.1:<port>/tasks \\
   -H "Content-Type: application/json" \\
   -d '{
     "task_id": "'"$TASK_ID"'",
-    "task_type": "review",          // or "test" for tester
+    "task_type": "review",
     "description": "Review PR #<n> — <one-line context>",
     "branch": "<PR head branch>",
     "priority": 3,
     "project": "<your project name>",
-    "context": {"pr_number": <n>}
+    "context": {"pr_number": <n>, "risk_tier": 1}
   }'
 ```
 
@@ -627,6 +630,9 @@ forces `task_type=implement` and the tester pane only picks `task_type=test`.
 
 POST directly with the explicit type:
 
+Set `risk_tier` to the reviewed task's tier (integer 0-3), or choose and
+declare a tier for this new root. Replace the example value below.
+
 ```bash
 TASK_ID="test-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
 curl -sS -X POST http://127.0.0.1:<port>/tasks \\
@@ -638,7 +644,7 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks \\
     "branch": "<PR head branch>",
     "priority": 3,
     "project": "<your project name>",
-    "context": {"pr_number": <n>}
+    "context": {"pr_number": <n>, "risk_tier": 1}
   }'
 ```
 """,
