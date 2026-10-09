@@ -31,6 +31,10 @@ def _cache(tmp_path, monkeypatch, *, fetched_at, fingerprint, remaining):
     monkeypatch.setenv("AGENT_CREW_CEA_QUOTA_CACHE_DIR", str(root))
 
 
+def _marker(queue, task_id):
+    return queue.get_task(task_id).error_info["codex_quota_hold"]
+
+
 def test_real_codex_message_is_classified_and_reset_parsed(tmp_path):
     log = tmp_path / "dispatch.log"
     log.write_text("ERROR: You've hit your usage limit. Try again at 3:10 PM.\n")
@@ -68,6 +72,7 @@ def test_fresher_cache_releases_one_probe_then_rest_without_duplicates(tmp_path,
 
 def test_reset_releases_parked_task_when_cache_missing(tmp_path, monkeypatch):
     queue = _queued(tmp_path, "quota-reset")
+    signed_context = queue.get_task_context("quota-reset")
     monkeypatch.delenv("AGENT_CREW_CEA_QUOTA_CACHE_DIR", raising=False)
     assert queue.park_codex_quota("quota-reset", failed_at=time.time() - 120,
                                   reset_at=time.time() - 1, account_fingerprint="old")
@@ -76,6 +81,10 @@ def test_reset_releases_parked_task_when_cache_missing(tmp_path, monkeypatch):
     with TestClient(app):
         assert app.state.resume_codex_quota_holds() == ["quota-reset"]
         assert app.state.resume_codex_quota_holds() == []
+    # The signed receipt binds the task context; internal hold bookkeeping
+    # must not change that payload before the next claim.
+    assert queue.get_task_context("quota-reset") == signed_context
+    assert _marker(queue, "quota-reset")["probe"] is True
 
 
 def test_stop_keeps_ready_quota_hold_blocked(tmp_path, monkeypatch):
@@ -94,8 +103,9 @@ def test_stop_keeps_ready_quota_hold_blocked(tmp_path, monkeypatch):
 def test_dispatcher_tick_sees_fresh_cache_before_reset(tmp_path, monkeypatch):
     queue = _queued(tmp_path, "quota-tick")
     failed_at = time.time() - 10
+    reset_at = time.time() + 3600
     queue.park_codex_quota("quota-tick", failed_at=failed_at,
-                           reset_at=time.time() + 3600, account_fingerprint="old")
+                           reset_at=reset_at, account_fingerprint="old")
     _cache(tmp_path, monkeypatch, fetched_at=time.time(), fingerprint="old", remaining=78)
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", "0.02")
@@ -103,11 +113,13 @@ def test_dispatcher_tick_sees_fresh_cache_before_reset(tmp_path, monkeypatch):
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         deadline = time.monotonic() + 3
-        while (not queue.get_task_context("quota-tick")["codex_quota_hold"].get("resumed_at")
+        while (not any(e["event"] == "codex_quota_resumed"
+                       for e in queue.get_exec_state("quota-tick")["events"])
                and time.monotonic() < deadline):
             time.sleep(0.02)
-    marker = queue.get_task_context("quota-tick")["codex_quota_hold"]
-    assert marker["resumed_at"] < marker["reset_at"]
+    resumed = [e for e in queue.get_exec_state("quota-tick")["events"]
+               if e["event"] == "codex_quota_resumed"]
+    assert len(resumed) == 1 and resumed[0]["at"] < reset_at
 
 
 def test_dispatcher_parks_real_quota_failure_without_fallback(tmp_path, monkeypatch,
@@ -141,5 +153,5 @@ def test_dispatcher_parks_real_quota_failure_without_fallback(tmp_path, monkeypa
             while queue.get_task_status("quota-dispatch") != "blocked" and time.monotonic() < deadline:
                 time.sleep(0.02)
     assert queue.get_task_status("quota-dispatch") == "blocked"
-    assert isinstance(queue.get_task_context("quota-dispatch")["codex_quota_hold"]["reset_at"], float)
+    assert isinstance(_marker(queue, "quota-dispatch")["reset_at"], float)
     assert [t.task_id for t in queue.list_tasks() if t.task_id.startswith("fallback-")] == []

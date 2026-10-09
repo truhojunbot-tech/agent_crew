@@ -5635,22 +5635,21 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT status, context FROM tasks WHERE task_id=?",
+            row = conn.execute("SELECT status FROM tasks WHERE task_id=?",
                                (task_id,)).fetchone()
             if row is None or row["status"] != "in_progress":
                 conn.rollback()
                 return False
-            ctx = json.loads(row["context"] or "{}")
-            ctx["codex_quota_hold"] = {
+            marker = {
                 "failed_at": failed_at, "reset_at": reset_at,
                 "account_fingerprint": account_fingerprint,
             }
             conn.execute(
-                "UPDATE tasks SET status='blocked', claim_source='', context=?, "
+                "UPDATE tasks SET status='blocked', claim_source='', "
                 "summary='codex_quota_exhausted', error_info=? WHERE task_id=? "
                 "AND status='in_progress'",
-                (json.dumps(ctx), json.dumps({"reason": "codex_quota_exhausted",
-                                              "reset_at": reset_at}), task_id))
+                (json.dumps({"reason": "codex_quota_exhausted",
+                             "codex_quota_hold": marker}), task_id))
             self._record_end_on(conn, task_id, failed_at, "codex_quota_parked",
                                 posted=False, reset_at=reset_at)
             conn.commit()
@@ -5666,13 +5665,13 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, status, context, dispatched_at, dispatch_target FROM tasks "
-                "WHERE context LIKE '%\"codex_quota_hold\"%' "
+                "SELECT task_id, status, error_info, dispatched_at, dispatch_target FROM tasks "
+                "WHERE error_info LIKE '%\"codex_quota_hold\"%' "
                 "ORDER BY created_at, task_id").fetchall()
             holds = []
             for row in rows:
                 try:
-                    marker = json.loads(row["context"] or "{}").get("codex_quota_hold")
+                    marker = json.loads(row["error_info"] or "{}").get("codex_quota_hold")
                 except (TypeError, ValueError):
                     continue
                 if isinstance(marker, dict):
@@ -5688,13 +5687,13 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT status, context FROM tasks WHERE task_id=?",
+            row = conn.execute("SELECT status, context, error_info FROM tasks WHERE task_id=?",
                                (task_id,)).fetchone()
             if row is None or row["status"] != "blocked" or self._stop_active_in_txn(conn):
                 conn.rollback()
                 return False
-            ctx = json.loads(row["context"] or "{}")
-            marker = ctx.get("codex_quota_hold")
+            error_info = json.loads(row["error_info"] or "{}")
+            marker = error_info.get("codex_quota_hold")
             if not isinstance(marker, dict):
                 conn.rollback()
                 return False
@@ -5704,12 +5703,13 @@ class TaskQueue:
                                 and gate.enforced):
                 conn.rollback()
                 return False
-            # The gate patched context; re-read before adding the probe marker.
-            ctx = json.loads(conn.execute("SELECT context FROM tasks WHERE task_id=?",
-                                          (task_id,)).fetchone()["context"] or "{}")
-            ctx["codex_quota_hold"].update({"probe": probe, "resumed_at": now})
-            conn.execute("UPDATE tasks SET status='pending', claim_source='', context=? "
-                         "WHERE task_id=? AND status='blocked'", (json.dumps(ctx), task_id))
+            marker.update({"probe": probe, "resumed_at": now})
+            # §8 writes cea_requeue into context, but a broker-signed claim
+            # binds that context. Its decision is already in the receipt
+            # lifecycle; keep this task's signed payload unchanged.
+            conn.execute("UPDATE tasks SET status='pending', claim_source='', context=?, error_info=? "
+                         "WHERE task_id=? AND status='blocked'",
+                         (row["context"], json.dumps(error_info), task_id))
             self._append_exec_event_on(conn, task_id, "codex_quota_resumed", now,
                                        probe=probe)
             conn.commit()
