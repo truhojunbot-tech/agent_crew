@@ -6881,7 +6881,9 @@ def create_app(
             "runtime_state": _runtime_state_out,
             "cea": _cea_out,
             "risk_declaration": _risk_out,
-            "coordinator_handoff_overdue": q().overdue_coordinator_handoff(),
+            "coordinator_handoff_overdue": (
+                state["queue"].overdue_coordinator_handoff()
+                if state.get("queue") is not None else None),
             "dispatcher_tick_age_s": (
                 max(0.0, time.monotonic() - app.state.dispatcher_last_tick_monotonic)
                 if app.state.dispatcher_last_tick_monotonic is not None else None

@@ -550,6 +550,7 @@ def test_delete_on_a_completed_task_is_refused_with_no_side_effect(tmp_path):
         posted = client.post("/tasks/done-attempt/result", json={
             "task_id": "done-attempt", "status": "completed", "summary": "done",
             "commit": "cafebabe" * 5, "branch": "main",
+            "attempt_id": q.dispatch_binding("done-attempt")["attempt_id"],
         })
         assert posted.status_code == 200, posted.text
         assert q.get_task_status("done-attempt") == "completed"
