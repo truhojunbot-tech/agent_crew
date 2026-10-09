@@ -389,6 +389,20 @@ def test_reusing_another_owners_capability_in_own_repo_needs_no_owner_gate(conn)
     assert auth.decision != "HUMAN_GATE"
 
 
+def test_implementing_another_owners_declared_capability_in_own_repo_needs_owner_gate(conn):
+    requested = intent(ident=identity(capability_id=CAPABILITY.id))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
+        conn, requested, caller())
+    assert auth.decision == "HUMAN_GATE" and auth.code == "OWNER_CONFLICT"
+
+
+def test_referencing_another_owners_capability_does_not_claim_implementation(conn):
+    requested = intent(ident=identity(capability_id="agent_crew.own-capability"))
+    auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(
+        conn, requested, caller())
+    assert auth.code != "OWNER_CONFLICT"
+
+
 def test_owner_conflict_is_a_human_gate_not_a_shadow_allow(conn):
     """CXC-2: E4's own answer was a shadow ALLOW on OWNER_CONFLICT."""
     auth = engine(capabilities=FakeRegistry(matches=(CAPABILITY,))).authorize(

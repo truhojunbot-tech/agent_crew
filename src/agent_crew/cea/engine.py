@@ -1080,9 +1080,10 @@ class AuthorizationEngine:
     def _j5_reuse(self, intent: Intent, registry: CapabilityLookup, snapshot: PolicySnapshotRef):
         """J4/J5 — the registry matched something someone else owns (§6.2, CX-4i).
 
-        Reuse in the intent's own repo does not modify the matched capability.
-        Modifying its owner's repo requires an in-scope approval record from
-        the verified snapshot, or remains OWNER_CONFLICT.
+        Referencing a capability in the intent's own repo does not modify it.
+        Implementing the matched capability or changing its owner's repo
+        requires an in-scope approval record from the verified snapshot, or
+        remains OWNER_CONFLICT.
 
         ⛔There is deliberately **no caller argument**. This test used to read
           ``owner != caller.principal``, so "am I the owner?" was answered by the
@@ -1095,8 +1096,9 @@ class AuthorizationEngine:
           by choosing a string (codex P1, re-review of f1aee1d).
 
           The ownership question is now answered only from intent scope —
-          ``identity.project`` and ``identity.target.repo``, which are part of
-          ``intent_hash`` and are scope, not an identity claim. Every principal
+          ``identity.project``, ``identity.capability_id`` and
+          ``identity.target.repo``, which are part of ``intent_hash`` and are
+          scope, not an identity claim. Every principal
           gets the same answer for the same intent, which is what P2a requires
           while identity is UNVERIFIED.
           When the O21b broker can verify an owner, *that* is what restores the
@@ -1481,7 +1483,7 @@ def _matched(registry: CapabilityLookup):
 
 
 def _modifies_owner_capability(intent: Intent, matched) -> bool:
-    """J5's owner boundary comes from the intent target, never the caller."""
+    """J5's owner boundary comes from the declared work and target, never the caller."""
     def repo_name(value: str) -> str:
         name = str(value or "").strip().rstrip("/").rsplit("/", 1)[-1]
         return name.rsplit(":", 1)[-1].removesuffix(".git").lower()
@@ -1490,7 +1492,9 @@ def _modifies_owner_capability(intent: Intent, matched) -> bool:
     owner_repo = repo_name(matched.repo or matched.owner) if matched else ""
     return bool(matched and matched.owner
                 and matched.owner != intent.identity.project
-                and target_repo and target_repo == owner_repo)
+                and ((intent.task_type == "implement"
+                      and intent.identity.capability_id == matched.id)
+                     or (target_repo and target_repo == owner_repo)))
 
 
 def _registry_ref(registry: CapabilityLookup) -> dict:
