@@ -5882,6 +5882,29 @@ def create_app(
         active_tasks: dict[str, asyncio.Task] = {}   # task_id → asyncio.Task
         task_slots: dict[str, str] = {}       # task_id → worker_id
         ci_rechecks: set[int] = set()
+        refresh_tasks: dict[str, asyncio.Task] = {}
+        refresh_skips_logged: set[str] = set()
+
+        def _start_refresh(name: str, fn: Callable, *args, **kwargs) -> None:
+            previous = refresh_tasks.get(name)
+            if previous is not None and not previous.done():
+                if name not in refresh_skips_logged:
+                    logger.warning("dispatcher: %s refresh still running; skipping this tick", name)
+                    refresh_skips_logged.add(name)
+                return
+            refresh_skips_logged.discard(name)
+            task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+            refresh_tasks[name] = task
+
+            def _report_refresh(done: asyncio.Task) -> None:
+                if done.cancelled():
+                    return
+                try:
+                    done.result()
+                except Exception:
+                    logger.exception("dispatcher: %s refresh failed — continuing dispatch", name)
+
+            task.add_done_callback(_report_refresh)
 
         async def _recheck_merge_ci(number: int, repo: str, review_id: str) -> None:
             try:
@@ -5942,16 +5965,10 @@ def create_app(
                         logger.exception("CI merge recheck scan failed — continuing dispatch")
                     # Shadow-only receipt refresh; a slow contract read must not
                     # delay dispatch or HTTP responses.
-                    try:
-                        await asyncio.to_thread(
-                            _pipeline_reresolve_pending_rounds_caps, q(),
-                            pane_map=pane_map, on_fix_enqueued=_try_push_next)
-                    except Exception:
-                        logger.exception("rounds-cap shadow re-resolution failed — continuing dispatch")
-                    try:
-                        await asyncio.to_thread(q().readmit_parked_owner_conflicts)
-                    except Exception:
-                        logger.exception("owner approval re-admission failed — continuing dispatch")
+                    _start_refresh(
+                        "rounds-cap", _pipeline_reresolve_pending_rounds_caps, q(),
+                        pane_map=pane_map, on_fix_enqueued=_try_push_next)
+                    _start_refresh("owner approval", q().readmit_parked_owner_conflicts)
                     logger.debug(
                         f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} "
                         f"active_workers={sorted(active_workers)} "
@@ -6072,12 +6089,17 @@ def create_app(
                         active_tasks[task.task_id] = asyncio.create_task(_run_discuss())
                 except Exception:
                     logger.exception("dispatcher loop raised — continuing")
+                finally:
+                    app.state.dispatcher_last_tick_monotonic = time.monotonic()
         except asyncio.CancelledError:
             for t in active_tasks.values():
+                t.cancel()
+            for t in refresh_tasks.values():
                 t.cancel()
             return
 
     app.state.dispatcher_enabled = _dispatcher_enabled
+    app.state.dispatcher_last_tick_monotonic = None
     # Same rationale as watchdog_tick/anomaly_tick above: expose the dispatch
     # path so a test can drive one real dispatch deterministically, rather
     # than asserting against a helper the dispatcher may not actually call.
@@ -6758,6 +6780,10 @@ def create_app(
             "runtime_state": _runtime_state_out,
             "cea": _cea_out,
             "risk_declaration": _risk_out,
+            "dispatcher_tick_age_s": (
+                max(0.0, time.monotonic() - app.state.dispatcher_last_tick_monotonic)
+                if app.state.dispatcher_last_tick_monotonic is not None else None
+            ),
             # G_DT: pushes refused because the target pane runs no agent CLI.
             "delivery_guard": {"delivery": _delivery_raw,
                                "refusals": dict(delivery_guard_refusals)},
