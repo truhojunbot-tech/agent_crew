@@ -6358,6 +6358,37 @@ def create_app(
             original_task = q().get_task(task_id)
             if original_task is None:
                 return
+            # A reported commit at the pushed PR/branch head is already work
+            # for the coordinator to assess. Repeating the implement on that
+            # same head spends an agent invocation without changing the artifact.
+            if task_type == "implement" and result.commit:
+                from agent_crew.github import _repo_slug, branch_head_sha, get_repo, pr_head_sha
+                task_ctx = original_task.context if isinstance(original_task.context, dict) else {}
+                head = ""
+                try:
+                    repo = _repo_slug(str(task_ctx.get("repo") or ""))
+                    if not repo:
+                        attribution = q().get_attribution(task_id) or {}
+                        worktree = attribution.get("worktree_path") or _any_worktree_path()
+                        repo = _repo_slug(get_repo(cwd=worktree) if worktree else "")
+                    pr_number = result.pr_number or task_ctx.get("pr_number")
+                    branch = result.branch or original_task.branch
+                    if repo and isinstance(pr_number, int) and not isinstance(pr_number, bool):
+                        head = pr_head_sha(pr_number, repo=repo)
+                    if not head and repo and branch:
+                        head = branch_head_sha(branch, repo)
+                except Exception:
+                    # A read failure cannot be evidence that work was pushed.
+                    logger.exception("_auto_retry_failed_task: head lookup failed for %s", task_id)
+                if head and head.lower() == result.commit.lower():
+                    q().patch_context(task_id, {
+                        "retry_skipped_reason": "work_pushed_or_unchanged_head",
+                    })
+                    logger.info(
+                        "_auto_retry_failed_task: skipping %s; reported commit %s is pushed head",
+                        task_id, result.commit,
+                    )
+                    return
             # Opt-in for projects where repeating an agent-reported implement
             # failure has proved wasteful. Read per call so the default retry
             # behavior remains unchanged when the flag is unset.
