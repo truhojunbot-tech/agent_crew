@@ -1,0 +1,79 @@
+{
+  "byte_budget": 65536,
+  "chosen_model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "corpus_available_cases": {
+    "owner_cases": 17,
+    "task_cases": 0
+  },
+  "eval_sha256": "0bdb218d0c8e6ba3da8202c19201fee52a9605664ebe3ea4fb1d5de92de4ac61",
+  "k": 10,
+  "rows": [
+    {
+      "fallback_count": 4,
+      "model_id": "intfloat/multilingual-e5-small",
+      "model_size_bytes": 487351240,
+      "owner_hits": 6,
+      "p95_embed_ms": 75.0263724476099,
+      "p95_retrieve_ms": 311.4296328276396,
+      "retrieval_modes": {
+        "fallback": 4,
+        "hybrid": 32,
+        "lexical_only": 5
+      },
+      "task_hits": 0
+    },
+    {
+      "fallback_count": 0,
+      "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+      "model_size_bytes": 479383128,
+      "owner_hits": 8,
+      "p95_embed_ms": 36.16577014327049,
+      "p95_retrieve_ms": 195.65418735146523,
+      "retrieval_modes": {
+        "hybrid": 36,
+        "lexical_only": 5
+      },
+      "task_hits": 0
+    },
+    {
+      "fallback_count": 33,
+      "model_id": "BAAI/bge-m3",
+      "model_size_bytes": 2284643639,
+      "owner_hits": 3,
+      "p95_embed_ms": 741.5591347962618,
+      "p95_retrieve_ms": 839.638976380229,
+      "retrieval_modes": {
+        "fallback": 33,
+        "hybrid": 3,
+        "lexical_only": 5
+      },
+      "task_hits": 0
+    },
+    {
+      "fallback_count": 0,
+      "model_id": "all-MiniLM-L6-v2",
+      "model_size_bytes": 91099267,
+      "owner_hits": 8,
+      "p95_embed_ms": 34.787148237228394,
+      "p95_retrieve_ms": 174.91709254682064,
+      "retrieval_modes": {
+        "hybrid": 36,
+        "lexical_only": 5
+      },
+      "task_hits": 0
+    },
+    {
+      "fallback_count": 0,
+      "model_id": "lexical_only",
+      "model_size_bytes": 0,
+      "owner_hits": 8,
+      "p95_embed_ms": null,
+      "p95_retrieve_ms": 25.678711012005806,
+      "retrieval_modes": {
+        "lexical_only": 41
+      },
+      "task_hits": 0
+    }
+  ],
+  "source_db": "/home/truhojun/.agent_crew/memory/adr001_memory.db"
+}
