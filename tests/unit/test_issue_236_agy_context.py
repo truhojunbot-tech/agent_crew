@@ -41,6 +41,14 @@ def agy_home(tmp_path):
     return tmp_path
 
 
+@pytest.fixture(autouse=True)
+def _remove_finished_test_db(tmp_path):
+    yield
+    # Dispatch tests create SQLite state only for their assertions. Keeping it
+    # in pytest's basetemp obscures the sparse conversation fixture's footprint.
+    (tmp_path / "t.db").unlink(missing_ok=True)
+
+
 def _map_cwd(agy_home, cwd, conv_id):
     import json
     p = agy_home / "antigravity-cli" / "cache" / "last_conversations.json"
@@ -51,9 +59,11 @@ def _map_cwd(agy_home, cwd, conv_id):
 
 def _conversation(agy_home, conv_id, mb, *, wal_mb=0):
     d = agy_home / "antigravity-cli" / "conversations"
-    (d / f"{conv_id}.db").write_bytes(b"\0" * int(mb * 1024 * 1024))
+    with (d / f"{conv_id}.db").open("wb") as db:
+        db.truncate(int(mb * 1024 * 1024))
     if wal_mb:
-        (d / f"{conv_id}.db-wal").write_bytes(b"\0" * int(wal_mb * 1024 * 1024))
+        with (d / f"{conv_id}.db-wal").open("wb") as wal:
+            wal.truncate(int(wal_mb * 1024 * 1024))
 
 
 # ── 1. sizing the resumed conversation ────────────────────────────────
