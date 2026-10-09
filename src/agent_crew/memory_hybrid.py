@@ -332,13 +332,19 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         candidates = []
         pending = 0
         try:
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("head exceeded retrieval budget")
             with closing(sqlite3.connect(self.path)) as db:
                 candidates = self._candidates(db, scope, query)
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("candidate lookup exceeded retrieval budget")
             head_ids = {r["rowid"] for r in head["records"]}
             middle = [r for r in candidates if r["rowid"] not in head_ids]
             pending = self._lazy_embed(middle, deadline)
             if response_state is not None:
                 response_state["pending"] = pending
+            if time.perf_counter() >= deadline:
+                raise TimeoutError("embedding exceeded retrieval budget")
             middle, vector_used = self._rank_middle(middle, query)
             overflow_ids = {r["rowid"] for r in head["standing_overflow"]}
             middle = head["standing_overflow"] + [r for r in middle
