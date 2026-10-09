@@ -366,7 +366,7 @@ def _review_task_payload(task_id: str, branch: str) -> dict:
         "description": "Review PR",
         "branch": branch,
         "priority": 3,
-        "context": {},
+        "context": {"risk_tier": 1},
         "project": "",
     }
 
@@ -432,7 +432,7 @@ class TestAutoRetryReviewNoPrForBranchGuardEndToEnd:
     def test_u216_branch_has_pr_not_called_when_pr_number_already_known(self, tmp_db, github_writes):
         app = create_app(db_path=tmp_db, watchdog_disabled=True)
         payload = _review_task_payload("review-216d", "agent/claude/known-pr")
-        payload["context"] = {"pr_number": 42}
+        payload["context"] = {"pr_number": 42, "risk_tier": 1}
         with TestClient(app) as client, \
              patch("agent_crew.github.branch_has_pr") as mock_bhp:
             client.post("/tasks", json=payload)

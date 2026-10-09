@@ -121,7 +121,8 @@ def run_case(root: Path, failure: str, task_kind: str):
     capability = "shared-blackboard-poster" if task_kind == "duplicate" else "novel-sandbox-capability"
     body = {"task_id": task_id, "task_type": "implement", "project": "chaos-sandbox",
             "description": "Implement " + capability, "branch": "sandbox-only", "priority": 3,
-            "context": {"capability_id": capability, "scope_anchors": ["sandbox/" + capability],
+            "context": {"risk_tier": 1, "capability_id": capability,
+                        "scope_anchors": ["sandbox/" + capability],
                         "authority_decision_ids": ["SANDBOX-428"]}}
     wired = cea_wiring.Wiring(providers=providers, mode="test")
     with patch.dict(os.environ, env, clear=True), patch.object(TaskQueue, "__init__", sandbox_init), \

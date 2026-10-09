@@ -29,7 +29,7 @@ def _task_payload(task_id="t1", task_type="implement"):
         "description": "do work",
         "branch": "main",
         "priority": 3,
-        "context": {},
+        "context": {"risk_tier": 1},
         "project": "",
     }
 
@@ -148,7 +148,7 @@ def _review_task_payload(task_id="r1", no_tester=False):
         "description": "review the code",
         "branch": "feat",
         "priority": 3,
-        "context": {"no_tester": True} if no_tester else {},
+        "context": {"no_tester": True, "risk_tier": 1} if no_tester else {"risk_tier": 1},
         "project": "",
     }
 
