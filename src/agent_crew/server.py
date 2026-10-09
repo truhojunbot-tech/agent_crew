@@ -6582,9 +6582,10 @@ def create_app(
         op_key = f"merge:pr:{pr_number}"
         leave_to_coordinator = os.getenv("AGENT_CREW_AUTO_MERGE", "").strip().lower() in (
             "0", "false", "no", "off")
-        resv = q().external_op_reserve(
-            op_key, pr_number=int(pr_number),
-            coordinator_generation=getattr(app.state, "coordinator_generation", None))
+        # Auto-merge is an internal server transition, not a coordinator
+        # write. A separate crew-run process can advance the generation in
+        # the DB after this server starts, leaving app.state stale.
+        resv = q().external_op_reserve(op_key, pr_number=int(pr_number))
         if not resv.get("admitted"):
             logger.warning(f"[PAUSE-SUPPRESSED] _auto_merge_pr(#{pr_number}) 억제 — "
                            f"STOP admission 거부({resv.get('state')})")
