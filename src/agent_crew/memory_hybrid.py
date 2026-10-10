@@ -33,8 +33,27 @@ MIDDLE_CANDIDATE_LIMIT = 96
 
 def _body_sql(alias: str) -> str:
     return (f"CASE WHEN {alias}.layer='authoritative' THEN "
-            f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) "
+            f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || "
+            f"COALESCE(' ' || json_extract({alias}.value,'$.gloss_en'),'') "
             f"ELSE {alias}.value END")
+
+
+_FTS_AI_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_ai AFTER INSERT ON "
+               "adr001_memory BEGIN INSERT INTO adr001_fts(rowid,layer,key,body) "
+               f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); END;")
+_FTS_AU_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_au AFTER UPDATE OF value "
+               "ON adr001_memory BEGIN DELETE FROM adr001_fts WHERE rowid=old.rowid; "
+               "INSERT INTO adr001_fts(rowid,layer,key,body) "
+               f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); "
+               "DELETE FROM adr001_vec WHERE rowid=new.rowid; END;")
+
+
+def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str) -> bool:
+    row = db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                     (name,)).fetchone()
+    normalized = lambda sql: " ".join(sql.strip().rstrip(";").replace(
+        "IF NOT EXISTS ", "").split()).casefold()
+    return row is None or normalized(row[0]) != normalized(expected)
 
 
 def ensure_index_schema(db: sqlite3.Connection) -> None:
@@ -74,6 +93,8 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
     logger.info("memory hybrid legacy migration invalidated=%d superseded=%d",
                 invalidated, legacy_links + linked)
     fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone() is None
+    triggers_changed = any(_trigger_definition_changed(db, name, ddl) for name, ddl in (
+        ("adr001_fts_ai", _FTS_AI_SQL), ("adr001_fts_au", _FTS_AU_SQL)))
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
@@ -90,23 +111,6 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
           json_type(new.value,'$.superseded') IS NOT NULL OR
           json_type(new.value,'$.invalidated_at') IS NOT NULL
         BEGIN SELECT RAISE(ABORT,'legacy memory flags forbidden'); END;
-      CREATE TRIGGER IF NOT EXISTS adr001_fts_ai AFTER INSERT ON adr001_memory BEGIN
-        INSERT INTO adr001_fts(rowid,layer,key,body)
-          VALUES(new.rowid,new.layer,new.key,
-            CASE WHEN new.layer='authoritative' THEN
-              COALESCE(json_extract(new.value,'$.text'),new.value)
-            ELSE new.value END);
-      END;
-      CREATE TRIGGER IF NOT EXISTS adr001_fts_au
-        AFTER UPDATE OF value ON adr001_memory BEGIN
-        DELETE FROM adr001_fts WHERE rowid=old.rowid;
-        INSERT INTO adr001_fts(rowid,layer,key,body)
-          VALUES(new.rowid,new.layer,new.key,
-            CASE WHEN new.layer='authoritative' THEN
-              COALESCE(json_extract(new.value,'$.text'),new.value)
-            ELSE new.value END);
-        DELETE FROM adr001_vec WHERE rowid=new.rowid;
-      END;
       CREATE TRIGGER IF NOT EXISTS adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN
         DELETE FROM adr001_fts WHERE rowid=old.rowid;
         DELETE FROM adr001_vec WHERE rowid=old.rowid;
@@ -118,10 +122,19 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
     """)
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
     indexed = db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
-    if fresh or count != indexed:
+    if fresh or triggers_changed or count != indexed:
         db.execute("DELETE FROM adr001_fts")
         db.execute("INSERT INTO adr001_fts(rowid,layer,key,body) "
                    "SELECT m.rowid,m.layer,m.key," + _body_sql("m") + " FROM adr001_memory m")
+    if triggers_changed:
+        # executescript commits before it runs. Keep the old triggers until
+        # the rebuild starts, then swap them in that same transaction. A
+        # rollback leaves both the old body and old trigger definition, so
+        # the next initializer retries the rebuild.
+        db.execute("DROP TRIGGER IF EXISTS adr001_fts_ai")
+        db.execute("DROP TRIGGER IF EXISTS adr001_fts_au")
+        db.execute(_FTS_AI_SQL)
+        db.execute(_FTS_AU_SQL)
 
 
 def _effective_sql(alias: str = "m") -> str:
