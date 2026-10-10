@@ -12,7 +12,7 @@ from agent_crew.queue import TaskQueue
 
 
 def _dispatch_pair(tmp_path, monkeypatch, unused_tcp_port, *, related=False,
-                   scope=None, lineage_error=False):
+                   scope=None, lineage_error=False, cap_overlap=False):
     worktree = tmp_path / "claude"
     worktree.mkdir()
     (worktree / ".git").mkdir()
@@ -49,8 +49,18 @@ def _dispatch_pair(tmp_path, monkeypatch, unused_tcp_port, *, related=False,
     monkeypatch.setattr(server, "_resolve_pr_head_branch", lambda *_a, **_kw: "agent/713")
     monkeypatch.setattr(server, "_prepare_worktree_for_task", lambda *_a, **_kw: None)
     monkeypatch.setattr(server, "_stash_dirty_worktree", lambda *_a, **_kw: "")
-    monkeypatch.setattr(server, "claude_context_exceeds_cap",
-                        lambda *_a, **_kw: (False, {"provider": "claude", "bytes": 0}))
+    cap_checks = 0
+
+    def cap_check(*_args, **_kwargs):
+        nonlocal cap_checks
+        cap_checks += 1
+        if cap_overlap and cap_checks == 2:
+            return True, {"provider": "claude", "bytes": 0, "cap_mb": 64,
+                          "context_tokens": 100, "cap_tokens": 50,
+                          "tripped_by": "tokens"}
+        return False, {"provider": "claude", "bytes": 0}
+
+    monkeypatch.setattr(server, "claude_context_exceeds_cap", cap_check)
 
     app = server.create_app(db_path=db_path, state_path=str(state_path), pane_map={},
                             port=unused_tcp_port, project="p", watchdog_disabled=True,
@@ -99,6 +109,17 @@ def test_unrelated_previous_task_starts_fresh(tmp_path, monkeypatch, unused_tcp_
     assert identity["context_generation"] == 2
     assert any(e["event_type"] == "context_reset" and e.get("tripped_by") == "lineage"
                for e in events)
+
+
+def test_cap_and_lineage_overlap_preserves_cap_cause(tmp_path, monkeypatch, unused_tcp_port):
+    cmd, identity, events = _dispatch_pair(tmp_path, monkeypatch, unused_tcp_port,
+                                          cap_overlap=True)
+    assert "--continue" not in cmd
+    assert identity["context_generation"] == 2
+    assert any(e["event_type"] == "context_reset" and e.get("tripped_by") == "lineage"
+               for e in events)
+    assert any(e["event_type"] == "provider_context_capped"
+               and e.get("tripped_by") == "tokens" for e in events)
 
 
 def test_review_after_fix_in_same_lineage_resumes(tmp_path, monkeypatch, unused_tcp_port):

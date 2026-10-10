@@ -4827,6 +4827,8 @@ def create_app(
         #   task.context.context_reset sets it too (review-99ad8ad0).
         _ctx_over = False
         _ctx_cap_info = {}
+        # Keep lineage attribution separate from the byte/token cap cause.
+        _lineage_reset = False
         _codex_planned = ""      # the session a codex resume would use, if any
         _renew_previous_session = ""
         if agent == "gemini":
@@ -4868,7 +4870,7 @@ def create_app(
                         _lineage_ids, _ = task_lineage(db_path, task.task_id)
                         if _previous_task_id not in _lineage_ids:
                             _force_context_reset = True
-                            _ctx_cap_info = {**_ctx_cap_info, "tripped_by": "lineage"}
+                            _lineage_reset = True
                 except Exception:
                     logger.exception(
                         "dispatcher: Claude lineage lookup failed for task=%s; "
@@ -4911,7 +4913,7 @@ def create_app(
                 context_generation=_ctx_info["context_generation"],
                 session_task_index=_ctx_info["session_task_index"],
                 previous_task_id=_ctx_info["previous_task_id"],
-                **({"tripped_by": "lineage"} if _ctx_cap_info.get("tripped_by") == "lineage" else {}),
+                **({"tripped_by": "lineage"} if _lineage_reset else {}),
             )
             # A provider swap relative to the role's *configured default*
             # agent means retry/fallback routing redirected this dispatch —
