@@ -1,7 +1,9 @@
 """A2 ratification checks for the single ADR-001 store (#671)."""
+import hashlib
 import json
 import os
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -249,6 +251,95 @@ def test_r9_render_head_is_stable(store):
     assert "owner_principle:one" in [r["key"] for r in first["records"]]
 
 
+def test_overflow_principles_compete_in_ranked_middle(tmp_path):
+    store = HybridMemoryStorage(str(tmp_path / "principles.db"))
+    for index in range(12):
+        put(store, f"owner_principle:{index:02d}", layer="procedural",
+            value={"text": "irrelevant " + "x" * 400})
+    put(store, "relevant:needle", value={"text": "needle"})
+
+    head = store.render_head("alfred")
+    head_keys = {row["key"] for row in head["records"]}
+    overflow_keys = {f"owner_principle:{index:02d}" for index in range(12)} - head_keys
+    assert overflow_keys
+    assert head["standing_overflow"] == []
+    assert head["standing_trimmed"] == 0
+
+    result = store.retrieve_ranked(MemoryScope(project="alfred"), "needle",
+                                   "implementer", 20, 20000)
+    middle_keys = [row["key"] for row in result["middle"]]
+    assert result["mode"] == "lexical_only"
+    assert middle_keys[0] == "relevant:needle"
+    assert overflow_keys <= set(middle_keys)
+    assert head_keys.isdisjoint(middle_keys)
+
+
+def test_standing_decision_overflow_keeps_forced_middle_slot(tmp_path):
+    store = HybridMemoryStorage(str(tmp_path / "standing.db"))
+    for index in range(8):
+        put(store, f"standing:{index:02d}", layer="decision",
+            value={"kind": "standing_decision", "verb": f"verb-{index:02d}",
+                   "text": "irrelevant " + "x" * 400})
+    put(store, "relevant:needle", value={"text": "needle"})
+
+    head = store.render_head("alfred")
+    overflow_keys = [row["key"] for row in head["standing_overflow"]]
+    assert overflow_keys
+    assert head["standing_trimmed"] == len(overflow_keys)
+
+    result = store.retrieve_ranked(MemoryScope(project="alfred"), "needle",
+                                   "implementer", 20, 20000)
+    middle_keys = [row["key"] for row in result["middle"]]
+    assert result["mode"] == "lexical_only"
+    assert middle_keys[:len(overflow_keys)] == overflow_keys
+    assert "relevant:needle" in middle_keys
+    assert result["standing_trimmed"] == len(overflow_keys)
+
+
+def test_fleet_principle_and_project_decision_share_deterministic_head(store):
+    import subprocess
+    import sys
+
+    put(store, "owner_principle:fleet-rule", project="", fleet="fleet",
+        layer="procedural", value={"text": "fleet rule"})
+    put(store, "standing:project-rule", project="alfred", layer="decision",
+        value={"kind": "standing_decision", "text": "project rule"})
+    scope = MemoryScope(project="alfred", fleet="fleet")
+    first = store.retrieve_ranked(scope, "rule", "implementer", 10, 4000)
+    assert {"owner_principle:fleet-rule", "standing:project-rule"} <= {
+        row["key"] for row in first["head"]}
+    assert first["head_hash"] != hashlib.sha256(b"[]").hexdigest()
+    code = ("import json,sys; from agent_crew.memory_hybrid import HybridMemoryStorage; "
+            "s=HybridMemoryStorage(sys.argv[1]); "
+            "print(json.dumps(s.render_head('alfred','fleet'),sort_keys=True))")
+    env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[2] / "src"))
+    snapshots = [subprocess.check_output(
+                     [sys.executable, "-c", code, store.path], env=env)
+                 for _ in range(2)]
+    assert snapshots[0] == snapshots[1]
+    assert json.loads(snapshots[0])["head_hash"] == first["head_hash"]
+
+
+def test_head_rejoins_effectiveness_after_a_second_writer_supersedes(store, monkeypatch):
+    put(store, "owner_principle:retired", project="", fleet="fleet",
+        layer="procedural", value={"text": "signal"})
+    original_rank = store._rank_middle
+
+    def retire_during_rank(*args):
+        with sqlite3.connect(store.path) as db:
+            db.execute("UPDATE adr001_memory SET superseded_by='replacement' "
+                       "WHERE key='owner_principle:retired'")
+            db.commit()
+        return original_rank(*args)
+
+    monkeypatch.setattr(store, "_rank_middle", retire_during_rank)
+    result = query(store, fleet="fleet")
+    assert "owner_principle:retired" not in keys(result)
+    assert result["superseded_served"] == 0
+    assert result["head_bytes"] == len(json.dumps(result["head"], sort_keys=True,
+                                                  ensure_ascii=False).encode())
+
+
 def test_r27_fleet_and_project_ancestor_in_one_list(store):
     put(store, "owner:alfred:one", project="r27-project", layer="authoritative", value={"text": "r27signal"})
     put(store, "owner_principle:fleet", project="", fleet="fleet",
@@ -296,9 +387,9 @@ def test_ranked_http_timeout_does_not_block_event_loop_or_double_count(tmp_path,
         original_init(self, *args, **kwargs)
         instances.append(self)
 
-    def render(self, project):
+    def render(self, project, fleet=""):
         assert threading.current_thread() is not main_thread
-        return original_render(self, project)
+        return original_render(self, project, fleet)
 
     def slow_rank(self, *args):
         time.sleep(.45)

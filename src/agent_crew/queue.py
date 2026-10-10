@@ -6463,11 +6463,12 @@ class TaskQueue:
 
     def list_in_progress_with_activity(self) -> List[dict]:
         """Return dicts with the fields the watchdog needs to make timeout
-        decisions: task_id, task_type, context, last_activity_at, push_at, project."""
+        decisions, including dispatcher claim provenance."""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, task_type, context, last_activity_at, push_at, project "
+                "SELECT task_id, task_type, context, last_activity_at, last_heartbeat_at, "
+                "push_at, project, claim_source, dispatched_at "
                 "FROM tasks WHERE status = 'in_progress'"
             ).fetchall()
             return [
@@ -6476,11 +6477,37 @@ class TaskQueue:
                     "task_type": r["task_type"],
                     "context": json.loads(r["context"]) if r["context"] else {},
                     "last_activity_at": r["last_activity_at"] or 0.0,
+                    "last_heartbeat_at": r["last_heartbeat_at"] or 0.0,
                     "push_at": r["push_at"] or 0.0,
                     "project": r["project"] if r["project"] else "",
+                    "claim_source": r["claim_source"] or "",
+                    "dispatched_at": r["dispatched_at"] or 0.0,
                 }
                 for r in rows
             ]
+        finally:
+            conn.close()
+
+    def later_dispatcher_tasks_same_role(self, task_id: str) -> List[dict]:
+        """List launched successors on the same dispatcher role and agent."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT newer.task_id, newer.task_type, newer.context "
+                "FROM tasks AS older JOIN tasks AS newer "
+                "ON newer.task_type=older.task_type "
+                "AND newer.dispatch_agent=older.dispatch_agent "
+                "WHERE older.task_id=? AND older.claim_source='dispatcher' "
+                "AND older.dispatch_agent IS NOT NULL "
+                "AND newer.claim_source='dispatcher' "
+                "AND newer.dispatched_at>COALESCE(NULLIF(older.dispatched_at,0), "
+                "older.last_activity_at, 0) "
+                "AND newer.dispatch_target LIKE 'pid:%' "
+                "ORDER BY newer.dispatched_at ASC", (task_id,)
+            ).fetchall()
+            return [{"task_id": row["task_id"], "task_type": row["task_type"],
+                     "context": json.loads(row["context"] or "{}")}
+                    for row in rows]
         finally:
             conn.close()
 

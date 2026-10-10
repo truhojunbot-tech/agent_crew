@@ -228,6 +228,19 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             return db.execute("SELECT count(*) FROM adr001_memory m LEFT JOIN adr001_vec v "
                               "ON v.rowid=m.rowid WHERE v.rowid IS NULL OR v.vec IS NULL").fetchone()[0]
 
+    def effective_rows(self, rows: list[dict], scope: MemoryScope) -> list[dict]:
+        """Rejoin selected rowids immediately before rendering a response."""
+        if not rows:
+            return []
+        clause, params = _scope_sql(scope)
+        ids = [row["rowid"] for row in rows]
+        with closing(sqlite3.connect(self.path, timeout=.05)) as db:
+            effective = {row[0] for row in db.execute(
+                "SELECT m.rowid FROM adr001_memory m WHERE m.rowid IN (" +
+                ",".join("?" for _ in ids) + ") AND " + clause +
+                " AND " + _effective_sql(), [*ids, *params])}
+        return [row for row in rows if row["rowid"] in effective]
+
     def _candidates(self, db: sqlite3.Connection, scope: MemoryScope,
                     query: str = "") -> list[dict]:
         clause, params = _scope_sql(scope)
@@ -257,9 +270,9 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 hashlib.sha256(json.dumps(row["value"], sort_keys=True).encode()).hexdigest()
                 not in decisions]
 
-    def render_head(self, project: str) -> dict:
+    def render_head(self, project: str, fleet: str = "") -> dict:
         """Deterministic SQL view used by both dispatch and the HTTP hook."""
-        clause, params = _scope_sql(MemoryScope(project=project))
+        clause, params = _scope_sql(MemoryScope(project=project, fleet=fleet))
         prefix = ("SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created "
                   "FROM adr001_memory m WHERE " + clause + " AND " + _effective_sql())
         with closing(sqlite3.connect(self.path)) as db:
@@ -272,8 +285,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 "ORDER BY json_extract(m.value,'$.verb'),json_extract(m.value,'$.subject'),"
                 "json_extract(m.value,'$.source_message_id')", params)]
         head, overflow, seen = [], [], set()
-        for group, cap in ((principles, HEAD_PRINCIPLE_BYTES),
-                           (standing, HEAD_STANDING_BYTES)):
+        for group, cap, force_overflow in ((principles, HEAD_PRINCIPLE_BYTES, False),
+                                           (standing, HEAD_STANDING_BYTES, True)):
             used = 0
             for record in group:
                 if record["rowid"] in seen:
@@ -282,7 +295,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 size = _bytes(record)
                 if used + size <= cap:
                     head.append(record); used += size
-                else:
+                elif force_overflow:
                     overflow.append(record)
         rendered = json.dumps(head, sort_keys=True, ensure_ascii=False).encode()
         return {"records": head, "standing_overflow": overflow,
@@ -374,7 +387,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         response_state: Optional[dict] = None) -> dict:
         started = time.perf_counter()
         deadline = started + LATENCY_BUDGET_SECONDS
-        head = self.render_head(scope.project)
+        head = self.render_head(scope.project, scope.fleet)
         if response_state is not None:
             response_state["head"] = head
         candidates = []
@@ -442,11 +455,30 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             trimmed = 0
             mode = "fallback"
             elapsed = (time.perf_counter() - started) * 1000
+        # Rejoin every rendered row after ranking, including head rows. A
+        # second writer may have superseded one while this call was ranking.
+        try:
+            head["records"] = self.effective_rows(head["records"], scope)
+            selected = self.effective_rows(selected, scope)
+        except sqlite3.Error as exc:
+            logger.warning("memory render-time effectiveness check failed: %s", exc)
+            self._record_fallback(fallback_marker)
+            head["records"] = []
+            selected = []
+            mode = "fallback"
+        rendered_head = json.dumps(head["records"], sort_keys=True, ensure_ascii=False).encode()
+        head["head_hash"] = hashlib.sha256(rendered_head).hexdigest()
+        elapsed = (time.perf_counter() - started) * 1000
+        if elapsed > LATENCY_BUDGET_SECONDS * 1000 and mode != "fallback":
+            self._record_fallback(fallback_marker)
+            mode = "fallback"
+            selected = []
         self.last_retrieval_mode = mode
         return {"head": head["records"], "middle": selected, "mode": mode,
                 "pending_vectors": pending, "latency_ms": elapsed,
                 "trimmed_bytes": trimmed, "standing_trimmed": head["standing_trimmed"],
-                "model_id": self.model_id, "head_hash": head["head_hash"]}
+                "model_id": self.model_id, "head_hash": head["head_hash"],
+                "head_bytes": len(rendered_head), "superseded_served": 0}
 
 
 def memory_storage_from_env(path: str, *, embedder=None) -> MemoryStorage:
