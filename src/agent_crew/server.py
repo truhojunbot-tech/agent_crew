@@ -3033,6 +3033,7 @@ def create_app(
                 logger.warning("AGENT_CREW_SHADOW_MEMORY_DB does not name an existing file: %s", shadow_db)
             _memory_provider = NullMemoryProvider()
     _ranked_memory = None
+    _ranked_startup_fallback_count = 0
     if os.getenv("AGENT_CREW_MEMORY_BACKEND", "").strip().lower() == "hybrid":
         from agent_crew.memory_hybrid import HybridMemoryStorage, backup_daily
         ranked_db = (os.getenv("AGENT_CREW_MEMORY_DB") or
@@ -3043,6 +3044,7 @@ def create_app(
                 backup_daily(_ranked_memory.path)
             except (OSError, ValueError, sqlite3.Error) as exc:
                 logger.warning("hybrid memory unavailable: %s", exc)
+                _ranked_startup_fallback_count += 1
 
     def _ranked_timeout_response(scope, marker, response_state):
         """Return only effective head rows when the ranked worker times out."""
@@ -7002,6 +7004,8 @@ def create_app(
             "cea": _cea_out,
             "risk_declaration": _risk_out,
             "outbox": _outbox_out,
+            "hybrid_memory": {"available": _ranked_memory is not None,
+                              "startup_fallback_count": _ranked_startup_fallback_count},
             "dispatcher_tick_age_s": (
                 max(0.0, time.monotonic() - app.state.dispatcher_last_tick_monotonic)
                 if app.state.dispatcher_last_tick_monotonic is not None else None
