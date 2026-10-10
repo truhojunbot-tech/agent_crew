@@ -69,6 +69,23 @@ def successor_context(parent_context: object) -> dict:
     return {key: value for key, value in parent_context.items()
             if not key.startswith("cea_")}
 
+
+def _review_cascade_contract(queue: TaskQueue, review_task):
+    """Use the stricter admission contract when a pipeline review was blocked."""
+    standing = _cascade.stored(review_task)
+    ctx = review_task.context if isinstance(review_task.context, dict) else {}
+    blocked_id = ctx.get("duplicate_review_lineage_from")
+    if not isinstance(blocked_id, str):
+        return standing
+    blocked = queue.get_task(blocked_id)
+    if blocked is None or blocked.task_type != "review" or blocked.status != "blocked":
+        return standing
+    inherited = _cascade.stored(blocked)
+    if inherited.enforced and (not standing.enforced or
+                               (inherited.tier or 0) > (standing.tier or 0)):
+        return inherited
+    return standing
+
 #: Automated fix rounds allowed per review lineage (#244). The cap is the
 #: whole reason this transition is safe to automate: a reviewer that keeps
 #: rejecting would otherwise drive review→fix→review forever, burning quota on
@@ -1442,6 +1459,9 @@ def auto_enqueue_fix(
             return None
 
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
+        cascade_branch = (review_ctx.get("cascade_branch")
+                          if review_ctx.get("duplicate_review_lineage_from") else None)
+        cascade_branch = cascade_branch or review_task.branch
         review_project = review_task.project
         if review_project and server_project and review_project != server_project:
             logger.warning(
@@ -1469,10 +1489,10 @@ def auto_enqueue_fix(
                 "auto_enqueue_fix: %s cannot verify default branch for %r — "
                 "not creating an automated fix (#457)", review_task_id, repo)
             return None
-        if _normalize_branch(review_task.branch) in default_branches:
+        if _normalize_branch(cascade_branch) in default_branches:
             logger.warning(
                 f"auto_enqueue_fix: {review_task_id} reviewed default branch "
-                f"{review_task.branch!r} — not creating an automated fix (#457)"
+                f"{cascade_branch!r} — not creating an automated fix (#457)"
             )
             return None
 
@@ -1500,7 +1520,7 @@ def auto_enqueue_fix(
 
         # The operator ceiling remains the baseline. The quota-core citation
         # below may narrow it only for the pinned canary lineage.
-        contract = _cascade.stored(review_task)
+        contract = _review_cascade_contract(queue, review_task)
         if not contract.enforced:
             _record_risk_tier_shadow(queue, review_task, "fix_legacy_cap")
         baseline_cap = contract.fix_round_cap(review_fix_max_rounds())
@@ -1692,7 +1712,7 @@ def auto_enqueue_fix(
             return None
 
         where = (f"PR #{pr_number}" if pr_number
-                 else f"branch {review_task.branch!r}")
+                 else f"branch {cascade_branch!r}")
         parts = [
             f"Fix {where} per {review_task_id} request_changes "
             f"(automated fix round {fix_round}/{max_rounds}).",
@@ -1702,7 +1722,7 @@ def auto_enqueue_fix(
         if findings_text:
             parts.append(f"\nFindings to address:\n{findings_text}")
         parts.append(
-            f"\nCommit to the SAME branch {review_task.branch!r} — do not open a "
+            f"\nCommit to the SAME branch {cascade_branch!r} — do not open a "
             f"new PR. Reproduce each finding before fixing it, and say so if one "
             f"does not reproduce."
         )
@@ -1712,6 +1732,10 @@ def auto_enqueue_fix(
             "fix_round": fix_round,
             "review_findings": list(review_result.findings or []),
         }
+        inherited_tiers = [tier for tier in (review_ctx.get("risk_tier"), contract.tier)
+                           if type(tier) is int and 0 <= tier <= 3]
+        if inherited_tiers:
+            fix_context["risk_tier"] = max(inherited_tiers)
         if pr_number is not None:
             # #186: lets the dispatcher check out the PR head for this task.
             fix_context["pr_number"] = pr_number
@@ -1756,7 +1780,7 @@ def auto_enqueue_fix(
                 task_id=fix_id,
                 task_type="implement",  # type: ignore[arg-type]
                 description="\n".join(parts),
-                branch=review_task.branch,
+                branch=cascade_branch,
                 context=fix_context,
                 project=_successor_project(queue, review_task, server_project),
             ), tasks_by_id, review_task, ingress="cascade.fix",
@@ -2238,7 +2262,10 @@ def auto_enqueue_test(
         # Propagate upstream agent identities so review/test fallback can
         # avoid self-review and self-test (#117).
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
-        contract = _cascade.stored(review_task)
+        cascade_branch = (review_ctx.get("cascade_branch")
+                          if review_ctx.get("duplicate_review_lineage_from") else None)
+        cascade_branch = cascade_branch or review_task.branch
+        contract = _review_cascade_contract(queue, review_task)
         tasks_by_id = {t.task_id: t for t in queue.list_tasks()}
         if (_tokenomics_canary.rounds_cap_enabled()
                 and _round_cap_pinned(tasks_by_id, review_task, queue, server_project)):
@@ -2306,6 +2333,10 @@ def auto_enqueue_test(
                          "provider": "gemini",
                          "cooldown_until": until if math.isfinite(until) else "unknown"}
         test_context: dict = {"prev_task_id": review_task_id}
+        inherited_tiers = [tier for tier in (review_ctx.get("risk_tier"), contract.tier)
+                           if type(tier) is int and 0 <= tier <= 3]
+        if inherited_tiers:
+            test_context["risk_tier"] = max(inherited_tiers)
         # Test the exact revision approved by the reviewer. This is also the
         # artifact component of the test's CEA intent identity.
         if review_ctx.get("reviewed_sha"):
@@ -2316,7 +2347,7 @@ def auto_enqueue_test(
             test_context["fix_round"] = review_ctx["fix_round"]
         if enforce_risk_tier:
             test_context.update({
-                "risk_tier": contract.tier,
+                "risk_tier": max(inherited_tiers) if inherited_tiers else contract.tier,
                 "risk_tier_source": review_ctx.get("risk_tier_source", "metadata"),
             })
         if (enforce_risk_tier and contract.test_scope
@@ -2343,7 +2374,7 @@ def auto_enqueue_test(
             compact_desc = f"Test PR #{pr_number} for reviewed task {review_task_id}."
         else:
             compact_desc = (
-                f"Test branch {review_task.branch!r} for reviewed task {review_task_id}."
+                f"Test branch {cascade_branch!r} for reviewed task {review_task_id}."
             )
         if skip_note:
             compact_desc += " Post-recovery verification; report PASS or FAIL."
@@ -2353,7 +2384,7 @@ def auto_enqueue_test(
             task_id=test_id,
             task_type="test",  # type: ignore[arg-type]
             description=compact_desc,
-            branch=review_task.branch,
+            branch=cascade_branch,
             context=test_context,
             project=_successor_project(queue, review_task, server_project),
         )
