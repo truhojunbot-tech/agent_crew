@@ -65,14 +65,18 @@ def _review(q, task_id="review-canary-rounds", *, root=ROOT, fix_round=1,
         produced = contract.get("produced_at")
         observed = (datetime.fromisoformat(produced.replace("Z", "+00:00")).timestamp()
                     if produced else os.path.getmtime(path))
-        if 0 <= time.time() - observed < 1:
-            time.sleep(0.002)
+        verdict_at = q.get_exec_state(task_id)["result_posted_at"]
+        # A same-run contract follows the posted verdict even when returning
+        # from submit_result is slow. Leave deliberately days-old fixtures stale.
+        if 0 <= verdict_at - observed < timedelta(days=1).total_seconds():
+            refreshed_at = max(time.time(), verdict_at + 0.01)
             if produced:
-                contract["produced_at"] = datetime.now(timezone.utc).isoformat()
+                contract["produced_at"] = datetime.fromtimestamp(
+                    refreshed_at, timezone.utc).isoformat()
                 with open(path, "w") as handle:
                     json.dump(contract, handle)
             else:
-                os.utime(path, None)
+                os.utime(path, (refreshed_at, refreshed_at))
     return task_id
 
 
@@ -119,6 +123,32 @@ def test_contract_after_review_verdict_narrows(q, tmp_path, monkeypatch):
     _contract_after_verdict(q, review, tmp_path, monkeypatch)
     assert _run(q, review) is None
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_applied"] == 1
+
+
+@pytest.mark.parametrize("fix_round, expected_run_reason, expected_applied", [
+    (0, "cap_not_reached", 0),
+    (1, "round_cap_reached", 1),
+])
+def test_slow_result_submission_still_refreshes_fresh_contract(
+        q, tmp_path, monkeypatch, fix_round, expected_run_reason, expected_applied):
+    monkeypatch.setenv(CANARY_ENV, ROOT)
+    monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
+    _contract(tmp_path, monkeypatch)
+    submit_result = q.submit_result
+
+    def slow_submit_result(*args, **kwargs):
+        result = submit_result(*args, **kwargs)
+        time.sleep(2)
+        return result
+
+    monkeypatch.setattr(q, "submit_result", slow_submit_result)
+    review = _review(q, fix_round=fix_round)
+    tasks = {task.task_id: task for task in q.list_tasks()}
+    assert _canary_round_cap(tasks, tasks[review], 3, q)[2] == "cap_not_reached"
+    _run(q, review)
+    row = q.get_tokenomics_shadow_receipt(ROOT)
+    assert row["canary_reason"] == expected_run_reason
+    assert row["canary_applied"] == expected_applied
 
 
 def test_switch_off_records_fresh_counterfactual_without_holding(
@@ -330,7 +360,9 @@ def test_tier3_resume_uses_server_project_for_legacy_approved_review(q, tmp_path
                         lambda *args, **kwargs: (True, "open"))
     with TestClient(create_app(q._db_path, project="agent_crew",
                                watchdog_disabled=True, anomaly_disabled=True)) as client:
-        response = client.post(f"/gates/{gate_id}/resolve", json={"status": "approved"})
+        response = client.post(
+            f"/gates/{gate_id}/resolve", json={"status": "approved"},
+            headers={"X-Agent-Crew-Project": "agent_crew"})
     assert response.status_code == 200
     test_id = f"test-{review}"
     assert q.get_tokenomics_shadow_receipt(ROOT)["canary_reason"] == "cap_not_reached"
