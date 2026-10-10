@@ -386,9 +386,10 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
                                historic_files: dict[str, list[tuple[str, str]]] | None = None) -> int:
     """Idempotently scan explicit Git repositories and capture committed docs.
 
-    A later file commit gets its own key; unchanged files keep the same key and
-    version. Explicit untracked files use the repo snapshot commit plus a
-    content hash and are marked as working files. Sources are only read.
+    A later committed file revision gets its own key. Explicit untracked files
+    use the repo snapshot commit and are marked as working files; unchanged
+    content keeps its existing pointer across unrelated commits. Sources are
+    only read.
     """
     changed = 0
     with closing(sqlite3.connect(storage.path)) as memory:
@@ -437,6 +438,32 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
                     storage, repo=repo, project=project, path=path,
                     commit=commit, content=content, write=False,
                     source_state=source_state)
+                if source_state == "working_file":
+                    # HEAD is only an anchor for an untracked file. An
+                    # unrelated commit must not create another pointer to
+                    # identical bytes, and changed bytes replace the old
+                    # working-file pointer rather than accumulating forever.
+                    previous = memory.execute(
+                        "SELECT key,value FROM adr001_memory "
+                        "WHERE json_extract(value,'$.kind')='doc_pointer' "
+                        "AND json_extract(value,'$.source_state')='working_file' "
+                        "AND json_extract(value,'$.repo')=? "
+                        "AND json_extract(value,'$.path')=?",
+                        (repo, path)).fetchall()
+                    if any(json.loads(value).get("content_sha256") ==
+                           record.value["content_sha256"] for _, value in previous):
+                        continue
+                    storage.put_many_shadow([record])
+                    memory.execute(
+                        "DELETE FROM adr001_memory WHERE key<>? "
+                        "AND json_extract(value,'$.kind')='doc_pointer' "
+                        "AND json_extract(value,'$.source_state')='working_file' "
+                        "AND json_extract(value,'$.repo')=? "
+                        "AND json_extract(value,'$.path')=?",
+                        (record.key, repo, path))
+                    memory.commit()
+                    changed += 1
+                    continue
                 before = memory.execute("SELECT value FROM adr001_memory WHERE key=?",
                                         (record.key,)).fetchone()
                 if before is not None and json.loads(before[0]) == record.value:
