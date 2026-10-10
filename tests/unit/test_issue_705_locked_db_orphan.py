@@ -110,9 +110,32 @@ def test_record_dispatch_propagates_locked_write(tmp_db, monkeypatch):
     monkeypatch.setattr(TaskQueue, "_append_exec_event_on", staticmethod(locked))
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         queue.record_dispatch("locked-dispatch", channel="codex_exec",
-                              lease_owner="codex:pending")
+                              lease_owner="codex:pending", raise_on_locked=True)
     assert calls == 1
     assert queue.get_task_status("locked-dispatch") == "in_progress"
+
+
+def test_http_poll_hands_out_claim_when_dispatch_record_is_locked(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="http-locked", task_type="implement",
+                              description="work", branch="main"))
+
+    def locked(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(TaskQueue, "_append_exec_event_on", staticmethod(locked))
+    app = create_app(tmp_db, project="agent_crew", pane_map={}, worktree_map={},
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/tasks/next?role=implementer", headers={
+            "X-Agent-Crew-Project": "agent_crew"})
+
+    assert response.status_code == 200
+    assert response.json()["task_id"] == "http-locked"
+    assert queue.get_task_status("http-locked") == "in_progress"
 
 
 def test_crew_run_retries_locked_result_and_status_reads(monkeypatch):

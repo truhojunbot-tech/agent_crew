@@ -5298,7 +5298,7 @@ def create_app(
                 task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
                 agent=agent, target=f"{agent}:pending",
                 lease_owner=f"{agent}:pending",
-                lease_seconds=timeout_secs)
+                lease_seconds=timeout_secs, raise_on_locked=True)
         except AdmissionRefused as exc:
             logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
             _release_dispatch_slot(task.task_id, _slot)

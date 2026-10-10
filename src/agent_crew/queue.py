@@ -5217,7 +5217,8 @@ class TaskQueue:
     def record_dispatch(self, task_id: str, *, channel: str, agent: Optional[str] = None,
                         target: Optional[str] = None, lease_owner: Optional[str] = None,
                         lease_seconds: Optional[float] = None,
-                        ts: Optional[float] = None) -> Optional[str]:
+                        ts: Optional[float] = None,
+                        raise_on_locked: bool = False) -> Optional[str]:
         """Record that a claimed task was handed to a worker — the P2 DISPATCH point.
 
         ``channel`` uses D6's vocabulary: ``tmux_pane``, ``claude_p``,
@@ -5302,7 +5303,9 @@ class TaskQueue:
             logger.exception("exec-state: dispatch record failed task_id=%s", task_id)
             with contextlib.suppress(Exception):
                 conn.rollback()
-            if "database is locked" in str(exc).lower():
+            # Only the dispatcher has a retry/requeue path for a committed claim.
+            # Pane, HTTP, MCP and cloud callers retain the best-effort handoff.
+            if raise_on_locked and "database is locked" in str(exc).lower():
                 raise
         except Exception:
             logger.exception("exec-state: dispatch record failed task_id=%s", task_id)
