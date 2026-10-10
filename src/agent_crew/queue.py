@@ -5631,6 +5631,123 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def park_codex_quota(self, task_id: str, *, failed_at: float,
+                         reset_at: Optional[float],
+                         account_fingerprint: Optional[str]) -> bool:
+        """Hold an exhausted Codex claim on its existing task row (#653)."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "in_progress":
+                conn.rollback()
+                return False
+            marker = {
+                "failed_at": failed_at, "reset_at": reset_at,
+                "account_fingerprint": account_fingerprint,
+            }
+            conn.execute(
+                "UPDATE tasks SET status='blocked', claim_source='', "
+                "summary='codex_quota_exhausted', error_info=? WHERE task_id=? "
+                "AND status='in_progress'",
+                (json.dumps({"reason": "codex_quota_exhausted",
+                             "codex_quota_hold": marker}), task_id))
+            self._record_end_on(conn, task_id, failed_at, "codex_quota_parked",
+                                posted=False, reset_at=reset_at)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def codex_quota_holds(self) -> List[dict]:
+        """Read only rows carrying the durable quota marker, including a probe."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT task_id, status, error_info, dispatched_at, dispatch_target FROM tasks "
+                "WHERE error_info LIKE '%\"codex_quota_hold\"%' "
+                "ORDER BY created_at, task_id").fetchall()
+            holds = []
+            for row in rows:
+                try:
+                    marker = json.loads(row["error_info"] or "{}").get("codex_quota_hold")
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(marker, dict):
+                    holds.append({"task_id": row["task_id"], "status": row["status"],
+                                  "marker": marker, "dispatched_at": row["dispatched_at"],
+                                  "dispatch_target": row["dispatch_target"]})
+            return holds
+        finally:
+            conn.close()
+
+    def codex_quota_probes(self, *, since: float) -> List[dict]:
+        """Recover dispatched probes after a completed result clears error_info."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT t.task_id, t.status, t.dispatched_at, t.dispatch_target, "
+                "e.at, e.fields FROM task_exec_events e "
+                "JOIN tasks t ON t.task_id=e.task_id "
+                "WHERE e.event='codex_quota_resumed' AND e.at>=? ORDER BY e.at DESC",
+                (since,)).fetchall()
+            probes = []
+            for row in rows:
+                try:
+                    if not json.loads(row["fields"] or "{}").get("probe"):
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                probes.append({"task_id": row["task_id"], "status": row["status"],
+                               "marker": {"probe": True, "resumed_at": row["at"]},
+                               "dispatched_at": row["dispatched_at"],
+                               "dispatch_target": row["dispatch_target"]})
+            return probes
+        finally:
+            conn.close()
+
+    def resume_codex_quota(self, task_id: str, *, probe: bool, now: float) -> bool:
+        """Requeue a parked task once, through STOP and the existing CEA gate."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT status, context, error_info FROM tasks WHERE task_id=?",
+                               (task_id,)).fetchone()
+            if row is None or row["status"] != "blocked" or self._stop_active_in_txn(conn):
+                conn.rollback()
+                return False
+            error_info = json.loads(row["error_info"] or "{}")
+            marker = error_info.get("codex_quota_hold")
+            if not isinstance(marker, dict):
+                conn.rollback()
+                return False
+            admitted, gate = self.requeue_through_gate(
+                conn, task_id, path="queue.resume_codex_quota", reason="codex quota ready")
+            if not admitted or (gate is not None and gate.outcome is _CeaOutcome.RE_ADMIT
+                                and gate.enforced):
+                conn.rollback()
+                return False
+            marker.update({"probe": probe, "resumed_at": now})
+            # §8 writes cea_requeue into context, but a broker-signed claim
+            # binds that context. Its decision is already in the receipt
+            # lifecycle; keep this task's signed payload unchanged.
+            conn.execute("UPDATE tasks SET status='pending', claim_source='', context=?, error_info=? "
+                         "WHERE task_id=? AND status='blocked'",
+                         (row["context"], json.dumps(error_info), task_id))
+            self._append_exec_event_on(conn, task_id, "codex_quota_resumed", now,
+                                       probe=probe)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
     def requeue_dispatcher_claim(self, task_id: str) -> bool:
         """Recover only the in-progress claim made by the headless dispatcher."""
         conn = self._connect()

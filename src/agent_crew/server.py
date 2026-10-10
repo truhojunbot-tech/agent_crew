@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import contextvars
 import dataclasses
+import datetime
 import json
 import logging
 import math
@@ -1286,6 +1287,75 @@ _TRANSIENT_NONRETRIABLE_TAGS = frozenset({
 })
 
 
+def _codex_quota_reset_at(log_path: str, *, failed_at: float,
+                          since_offset: int = 0) -> Optional[float]:
+    """Parse Codex's account-local reset clock as the next UTC occurrence."""
+    try:
+        with open(log_path, "rb") as stream:
+            stream.seek(max(0, since_offset))
+            tail = stream.read()[-16384:].decode("utf-8", errors="replace")
+    except OSError:
+        return None
+    match = re.search(
+        r"try again at\s+(?:(?P<month>[A-Za-z]{3,9})\s+"
+        r"(?P<day>\d{1,2})(?:st|nd|rd|th)?,\s+(?P<year>\d{4})\s+)?"
+        r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*(?P<ampm>AM|PM)\b",
+        tail, re.I)
+    if not match:
+        return None
+    hour, minute = int(match.group("hour")), int(match.group("minute"))
+    if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+        return None
+    hour = hour % 12 + (12 if match.group("ampm").lower() == "pm" else 0)
+    if match.group("month"):
+        try:
+            month = datetime.datetime.strptime(match.group("month")[:3].title(), "%b").month
+            return datetime.datetime(int(match.group("year")), month,
+                                     int(match.group("day")), hour, minute,
+                                     tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            return None
+    day = datetime.datetime.fromtimestamp(failed_at, datetime.timezone.utc)
+    reset = day.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if reset.timestamp() <= failed_at:
+        reset += datetime.timedelta(days=1)
+    return reset.timestamp()
+
+
+def _codex_quota_cache() -> dict:
+    """Read only the cache's timestamp, account fingerprint, and pooled headroom."""
+    root = os.getenv("AGENT_CREW_CEA_QUOTA_CACHE_DIR", "").strip()
+    if not root:
+        return {}
+    try:
+        with open(os.path.join(root, "codex_monitor", "quota_cache.json"),
+                  encoding="utf-8") as stream:
+            cache = json.load(stream)
+        pooled = cache.get("pace") if isinstance(cache, dict) else None
+        if not isinstance(pooled, dict):
+            pooled = cache.get("pooled") if isinstance(cache, dict) else None
+        return {"fetched_at": cache.get("fetched_at"),
+                "account_fingerprint": cache.get("account_fingerprint"),
+                "base_remaining_pct": (pooled or {}).get("base_remaining_pct")}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def _codex_quota_ready(marker: dict, cache: dict, now: float) -> bool:
+    reset_at = marker.get("reset_at")
+    if isinstance(reset_at, (int, float)) and now >= reset_at:
+        return True
+    fetched = cache.get("fetched_at")
+    remaining = cache.get("base_remaining_pct")
+    current = cache.get("account_fingerprint")
+    previous = marker.get("account_fingerprint")
+    return (isinstance(fetched, (int, float)) and fetched > marker.get("failed_at", now)
+            and ((isinstance(current, str) and bool(current)
+                  and isinstance(previous, str) and bool(previous) and current != previous)
+                 or (isinstance(remaining, (int, float)) and not isinstance(remaining, bool)
+                     and remaining > 0)))
+
+
 def _detect_transient_error_in_log(
     log_path: str,
     tail_bytes: int = 16384,
@@ -1338,6 +1408,8 @@ def _detect_transient_error_in_log(
     # QUOTA_EXHAUSTED responses also contain "RESOURCE_EXHAUSTED").
     if "QUOTA_EXHAUSTED" in tail or "Your quota will reset" in tail:
         return "gemini_quota_exhausted"
+    if "you've hit your usage limit" in tail.lower() or "you’ve hit your usage limit" in tail.lower():
+        return "codex_quota_exhausted"
     if "IneligibleTierError" in tail:
         return "gemini_ineligible_tier"
     if "Individual quota reached" in tail:
@@ -3483,6 +3555,38 @@ def create_app(
 
     def q() -> TaskQueue:
         return state["queue"]
+
+    def _resume_codex_quota_holds() -> list[str]:
+        """Release one probe, then its cohort after a dispatch was recorded."""
+        rows = q().codex_quota_holds()
+        now = time.time()
+        cache = _codex_quota_cache()
+        ready = [row for row in rows if row["status"] == "blocked"
+                 and _codex_quota_ready(row["marker"], cache, now)]
+        if not ready:
+            return []
+        probes = q().codex_quota_probes(
+            since=min(row["marker"].get("failed_at", now) for row in ready))
+        for probe in probes:
+            resumed_at = probe["marker"].get("resumed_at") or 0
+            dispatched_at = probe["dispatched_at"] or 0
+            if (dispatched_at >= resumed_at and resumed_at
+                    and str(probe.get("dispatch_target") or "").startswith("pid:")
+                    and probe["status"] in ("in_progress", "completed")):
+                cohort = [row for row in ready
+                          if row["marker"].get("failed_at", now) <= resumed_at]
+                released = []
+                for row in cohort:
+                    if q().resume_codex_quota(row["task_id"], probe=False, now=now):
+                        released.append(row["task_id"])
+                return released
+            if probe["status"] in ("pending", "in_progress"):
+                return []
+        first = ready[0]
+        return ([first["task_id"]] if q().resume_codex_quota(
+            first["task_id"], probe=True, now=now) else [])
+
+    app.state.resume_codex_quota_holds = _resume_codex_quota_holds
 
     def _hold_or_skip_provider_limit(task: TaskRequest, agent: str,
                                      until: Optional[float]) -> None:
@@ -5826,6 +5930,20 @@ def create_app(
                     logger.exception(
                         f"dispatcher: capacity requeue failed for task={task.task_id}")
                 _fail_if_active(task.task_id, "provider_capacity_requeue_failed")
+            elif agent == "codex" and _transient == "codex_quota_exhausted":
+                failed_at = time.time()
+                cache = _codex_quota_cache()
+                reset_at = _codex_quota_reset_at(
+                    log_path, failed_at=_task_started_wall,
+                    since_offset=_task_log_start_offset)
+                if q().park_codex_quota(
+                    task.task_id, failed_at=failed_at, reset_at=reset_at,
+                    account_fingerprint=cache.get("account_fingerprint")):
+                    logger.warning("dispatcher: codex quota exhausted task=%s reset_at=%s; held",
+                                   task.task_id, reset_at)
+                    _terminal = False
+                    return
+                _fail_if_active(task.task_id, "codex_quota_park_failed")
             elif _transient in _TRANSIENT_RETRIABLE_TAGS:
                 _n = _transient_retries.get(task.task_id, 0) + 1
                 _transient_retries[task.task_id] = _n
@@ -6068,6 +6186,10 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    try:
+                        _resume_codex_quota_holds()
+                    except Exception:
+                        logger.exception("codex quota hold scan failed — continuing dispatch")
                     try:
                         for op in q().pending_ci_merge_ops():
                             number = op.get("pr_number")
