@@ -1814,6 +1814,31 @@ def pause(project: str, base: str, reason: str, source: str, incident: str, scop
                           ensure_ascii=False))
 
 
+def _replay_outbox_on_server(base: str, project: str) -> dict:
+    """Ask the running server to drain its existing outbox after a valid resume.
+
+    A stopped server is handled by its startup drain. Failure here must be
+    visible to the caller while preserving the successful runtime transition.
+    """
+    import urllib.request
+
+    state = _read_state(base, project)
+    port = (state or {}).get("port")
+    if not port:
+        logger.warning("outbox replay deferred for %s: server port unavailable", project)
+        return {"status": "deferred", "reason": "server_port_unavailable"}
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{port}/admin/replay-suppressed", data=b"{}",
+        headers={"Content-Type": "application/json",
+                 "X-Agent-Crew-Project": project}, method="POST")
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            return json.loads(response.read().decode())
+    except Exception as exc:
+        logger.warning("outbox replay deferred for %s: %s", project, exc)
+        return {"status": "deferred", "reason": str(exc)}
+
+
 @crew.command()
 @click.argument("project", default="", required=False)
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
@@ -1860,6 +1885,7 @@ def resume(project: str, base: str, generation: int, source: str, decision_id: s
             pausemod.set_pause(state_dir, False, scope=scope, reason="resumed",
                                source=source, generation=res["epoch"],
                                incident=res.get("incident"))
+            res["outbox_replay"] = _replay_outbox_on_server(base, project)
         click.echo(json.dumps(res, ensure_ascii=False))
         if not res.get("resumed"):
             raise SystemExit(1)

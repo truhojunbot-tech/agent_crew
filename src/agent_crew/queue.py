@@ -5040,6 +5040,41 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def outbox_finish_claim(self, parent_task_id: str, owner: str, *,
+                            state: str) -> bool:
+        """Resolve a replay lease without creating a successor.
+
+        ``expired`` is a known stale continuation; ``pending`` retains one
+        whose safety check could not be completed. Both require our lease so a
+        concurrent reclaimer cannot have its decision overwritten.
+        """
+        if state not in ("expired", "pending"):
+            raise ValueError("outbox claim may only become expired or pending")
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state=?, lease_owner=NULL, attempt_id=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE parent_task_id=? "
+                "AND lease_owner=? AND state='replaying'",
+                (state, time.time(), parent_task_id, owner))
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def outbox_counts(self) -> dict:
+        """Counts reported by /health for pending and expired continuations."""
+        conn = self._connect()
+        try:
+            counts = {"pending": 0, "expired": 0}
+            for state, count in conn.execute(
+                    "SELECT state, count(*) FROM cascade_outbox "
+                    "WHERE state IN ('pending','expired') GROUP BY state"):
+                counts[state] = count
+            return counts
+        finally:
+            conn.close()
+
     def outbox_reopen(self, parent_task_id: str) -> bool:
         """라이브 cascade 도중 STOP이 authoritative가 돼 successor enqueue가 PausedError로 거부되면,
         이미 'applied'로 찍힌 부모 outbox를 'pending'으로 되돌린다 → 재개 후 executor가 저장된
