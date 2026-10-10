@@ -4,6 +4,7 @@ import os
 import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -69,7 +70,10 @@ def _review(q, task_id="review-canary-rounds", *, root=ROOT, fix_round=1,
         # A same-run contract follows the posted verdict even when returning
         # from submit_result is slow. Leave deliberately days-old fixtures stale.
         if 0 <= verdict_at - observed < timedelta(days=1).total_seconds():
-            refreshed_at = max(time.time(), verdict_at + 0.01)
+            refreshed_at = time.time()
+            while refreshed_at <= verdict_at + 0.001:
+                time.sleep(0.001)
+                refreshed_at = time.time()
             if produced:
                 contract["produced_at"] = datetime.fromtimestamp(
                     refreshed_at, timezone.utc).isoformat()
@@ -149,6 +153,30 @@ def test_slow_result_submission_still_refreshes_fresh_contract(
     row = q.get_tokenomics_shadow_receipt(ROOT)
     assert row["canary_reason"] == expected_run_reason
     assert row["canary_applied"] == expected_applied
+
+
+@pytest.mark.parametrize("produced", [False, True])
+@pytest.mark.parametrize("clock_offset", [-0.002, 0.0])
+def test_fast_result_refresh_is_after_verdict_and_not_future(
+        q, tmp_path, monkeypatch, produced, clock_offset):
+    _contract(tmp_path, monkeypatch, produced=produced)
+    calls = 0
+
+    def clock_time():
+        nonlocal calls
+        calls += 1
+        verdict_at = q.get_exec_state("review-canary-rounds")["result_posted_at"]
+        return verdict_at + clock_offset + calls * 0.001
+
+    monkeypatch.setitem(_review.__globals__, "time",
+                        SimpleNamespace(time=clock_time, sleep=lambda _: None))
+    review = _review(q)
+    verdict_at = q.get_exec_state(review)["result_posted_at"]
+    path = tmp_path / "policy.json"
+    contract = json.loads(path.read_text())
+    refreshed_at = (datetime.fromisoformat(contract["produced_at"]).timestamp()
+                    if produced else os.path.getmtime(path))
+    assert verdict_at < refreshed_at <= clock_time()
 
 
 def test_switch_off_records_fresh_counterfactual_without_holding(
