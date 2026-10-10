@@ -6447,8 +6447,8 @@ class TaskQueue:
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, task_type, context, last_activity_at, push_at, project, "
-                "claim_source, dispatched_at "
+                "SELECT task_id, task_type, context, last_activity_at, last_heartbeat_at, "
+                "push_at, project, claim_source, dispatched_at "
                 "FROM tasks WHERE status = 'in_progress'"
             ).fetchall()
             return [
@@ -6457,6 +6457,7 @@ class TaskQueue:
                     "task_type": r["task_type"],
                     "context": json.loads(r["context"]) if r["context"] else {},
                     "last_activity_at": r["last_activity_at"] or 0.0,
+                    "last_heartbeat_at": r["last_heartbeat_at"] or 0.0,
                     "push_at": r["push_at"] or 0.0,
                     "project": r["project"] if r["project"] else "",
                     "claim_source": r["claim_source"] or "",

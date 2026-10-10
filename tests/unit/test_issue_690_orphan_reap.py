@@ -10,7 +10,8 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
-def _claimed(queue, task_id, *, source="dispatcher", dispatched_at=1000.0):
+def _claimed(queue, task_id, *, source="dispatcher", dispatched_at=1000.0,
+             heartbeat_at=None):
     queue.enqueue(TaskRequest(task_id=task_id, task_type="test",
                               description="run tests", branch="main"))
     with sqlite3.connect(queue._db_path) as db:
@@ -20,10 +21,12 @@ def _claimed(queue, task_id, *, source="dispatcher", dispatched_at=1000.0):
                    (source, dispatched_at,
                     "gemini_cli" if source == "dispatcher" else "tmux_pane",
                     "pid:123" if source == "dispatcher" else "%2915", task_id))
+    if heartbeat_at is not None:
+        queue.record_heartbeat(task_id, source="output_progress", ts=heartbeat_at)
 
 
 def _app(db, *, busy, panes=None):
-    return create_app(db, pane_map=panes or {"tester": "%2915"},
+    return create_app(db, pane_map={"tester": "%2915"} if panes is None else panes,
                       pane_busy_fn=lambda _: busy,
                       pane_liveness_fn=lambda _: "alive",
                       push_fn=lambda *_: None,
@@ -42,6 +45,39 @@ def test_dispatcher_orphan_expires_without_reminder(tmp_db, monkeypatch, caplog)
     assert queue.get_task_status("orphan") == "timed_out"
     assert app.state.watchdog_expiry_counts["dispatcher_idle"] == 1
     assert "reason=dispatcher_idle" in caplog.text
+
+
+def test_dispatcher_with_fresh_heartbeat_survives_alive_pane(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    _claimed(queue, "active", heartbeat_at=3990.0)
+    app = _app(tmp_db, busy=True)
+    with TestClient(app):
+        actions = app.state.watchdog_tick(now=4000.0)
+    assert actions["timed_out"] == []
+    assert queue.get_task_status("active") == "in_progress"
+
+
+def test_dispatcher_with_fresh_heartbeat_survives_without_pane(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    _claimed(queue, "active", heartbeat_at=3990.0)
+    app = _app(tmp_db, busy=False, panes={})
+    with TestClient(app):
+        actions = app.state.watchdog_tick(now=4000.0)
+    assert actions["timed_out"] == []
+    assert queue.get_task_status("active") == "in_progress"
+
+
+def test_dispatcher_with_stale_heartbeat_expires(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    _claimed(queue, "stale", heartbeat_at=1100.0)
+    app = _app(tmp_db, busy=True)
+    with TestClient(app):
+        actions = app.state.watchdog_tick(now=4000.0)
+    assert actions["timed_out"] == ["stale"]
+    assert queue.get_task_status("stale") == "timed_out"
 
 
 def test_later_dispatch_on_same_role_pane_expires_earlier_at_once(tmp_db, monkeypatch, caplog):

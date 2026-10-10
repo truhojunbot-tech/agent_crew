@@ -4256,7 +4256,10 @@ def create_app(
             later = next((candidate["task_id"] for candidate in
                           q().later_dispatcher_tasks_same_role(task_id)
                           if _resolve_pane_for_row(candidate) == pane_id), None) if pane_id else None
-            last_activity = row["last_activity_at"] or row.get("dispatched_at") or now
+            # Dispatcher output or process heartbeats extend the idle lease;
+            # last_activity_at alone is not refreshed for these claims.
+            last_activity = max(row["last_activity_at"], row.get("last_heartbeat_at") or 0.0,
+                                row.get("dispatched_at") or 0.0) or now
             idle_for = max(0.0, now - last_activity)
             effective_timeout = timeout_seconds
             if pane_id:
