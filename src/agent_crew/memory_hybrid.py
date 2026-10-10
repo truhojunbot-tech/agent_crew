@@ -33,8 +33,8 @@ MIDDLE_CANDIDATE_LIMIT = 96
 
 def _body_sql(alias: str) -> str:
     return (f"CASE WHEN {alias}.layer='authoritative' THEN "
-            f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || ' ' || "
-            f"COALESCE(json_extract({alias}.value,'$.gloss_en'),'') "
+            f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || "
+            f"COALESCE(' ' || json_extract({alias}.value,'$.gloss_en'),'') "
             f"ELSE {alias}.value END")
 
 

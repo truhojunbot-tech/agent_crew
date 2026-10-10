@@ -1,4 +1,5 @@
 """English gloss terms belong in authoritative FTS bodies only (#700)."""
+import hashlib
 import json
 import sqlite3
 
@@ -48,6 +49,27 @@ def test_missing_gloss_keeps_existing_authoritative_search(tmp_path):
                            MemoryScope(project="alfred")))
     assert "owner:plain" in _fts_keys(store.path, "규칙")
     assert "owner:plain" not in _fts_keys(store.path, "obligations")
+
+
+def test_missing_gloss_preserves_pre_gloss_body_and_content_sha(tmp_path):
+    store = HybridMemoryStorage(str(tmp_path / "memory.db"))
+    store.put(MemoryRecord("authoritative", "owner:plain", {"text": "기존 규칙"},
+                           MemoryScope(project="alfred")))
+    with sqlite3.connect(store.path) as db:
+        _install_old_triggers(db)
+        db.execute("UPDATE adr001_memory SET value=value WHERE key='owner:plain'")
+        db.commit()
+        old_body = db.execute(
+            "SELECT body FROM adr001_fts WHERE key='owner:plain'").fetchone()[0]
+        old_sha = hashlib.sha256(old_body.encode()).hexdigest()
+        assert old_body == "기존 규칙"
+        ensure_index_schema(db)
+        db.commit()
+        new_body = db.execute(
+            "SELECT body FROM adr001_fts WHERE key='owner:plain'").fetchone()[0]
+        new_sha = hashlib.sha256(new_body.encode()).hexdigest()
+    assert new_body == old_body
+    assert new_sha == old_sha
 
 
 def test_old_trigger_migration_rebuilds_once(tmp_path):
