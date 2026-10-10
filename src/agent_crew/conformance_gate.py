@@ -194,6 +194,7 @@ def _conformance_gate_allows_merge(queue, task_id: str, *, project: str,
                             _PRIVATE_HOME_LITERAL.search(added)):
                         private_files.add(path)
             if paths:
+                change["changed_paths"] = sorted(paths)
                 change["text"] += "\n" + "\n".join(sorted(paths)[:20])
             if change["evidence_source"]["capability_id"] == "derived":
                 cap_id = _registry_capability_for_paths(
