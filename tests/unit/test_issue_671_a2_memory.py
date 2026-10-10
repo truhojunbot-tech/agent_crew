@@ -251,6 +251,51 @@ def test_r9_render_head_is_stable(store):
     assert "owner_principle:one" in [r["key"] for r in first["records"]]
 
 
+def test_overflow_principles_compete_in_ranked_middle(tmp_path):
+    store = HybridMemoryStorage(str(tmp_path / "principles.db"))
+    for index in range(12):
+        put(store, f"owner_principle:{index:02d}", layer="procedural",
+            value={"text": "irrelevant " + "x" * 400})
+    put(store, "relevant:needle", value={"text": "needle"})
+
+    head = store.render_head("alfred")
+    head_keys = {row["key"] for row in head["records"]}
+    overflow_keys = {f"owner_principle:{index:02d}" for index in range(12)} - head_keys
+    assert overflow_keys
+    assert head["standing_overflow"] == []
+    assert head["standing_trimmed"] == 0
+
+    result = store.retrieve_ranked(MemoryScope(project="alfred"), "needle",
+                                   "implementer", 20, 20000)
+    middle_keys = [row["key"] for row in result["middle"]]
+    assert result["mode"] == "lexical_only"
+    assert middle_keys[0] == "relevant:needle"
+    assert overflow_keys <= set(middle_keys)
+    assert head_keys.isdisjoint(middle_keys)
+
+
+def test_standing_decision_overflow_keeps_forced_middle_slot(tmp_path):
+    store = HybridMemoryStorage(str(tmp_path / "standing.db"))
+    for index in range(8):
+        put(store, f"standing:{index:02d}", layer="decision",
+            value={"kind": "standing_decision", "verb": f"verb-{index:02d}",
+                   "text": "irrelevant " + "x" * 400})
+    put(store, "relevant:needle", value={"text": "needle"})
+
+    head = store.render_head("alfred")
+    overflow_keys = [row["key"] for row in head["standing_overflow"]]
+    assert overflow_keys
+    assert head["standing_trimmed"] == len(overflow_keys)
+
+    result = store.retrieve_ranked(MemoryScope(project="alfred"), "needle",
+                                   "implementer", 20, 20000)
+    middle_keys = [row["key"] for row in result["middle"]]
+    assert result["mode"] == "lexical_only"
+    assert middle_keys[:len(overflow_keys)] == overflow_keys
+    assert "relevant:needle" in middle_keys
+    assert result["standing_trimmed"] == len(overflow_keys)
+
+
 def test_fleet_principle_and_project_decision_share_deterministic_head(store):
     import subprocess
     import sys
