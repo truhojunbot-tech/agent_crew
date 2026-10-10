@@ -400,18 +400,17 @@ def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
     return bool(task_id) and _cea_lineage_root_task_id(task_id, ctx) != task_id
 
 
-def _is_implement_root(task: TaskRequest, ctx: dict, *,
-                       successor_provenance: object | None = None) -> bool:
-    """Only a new implement intent needs root risk metadata validation.
+def _is_root_task(task: TaskRequest, ctx: dict, *,
+                  successor_provenance: object | None = None) -> bool:
+    """A new intent needs root risk metadata validation, whatever its task type.
 
     Parent keys prove succession only when the in-process constructor supplied
     the private provenance token. In particular, HTTP callers may supply
     ``prev_task_id`` as ordinary context and must still be checked as roots.
     """
     trusted_successor = (successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
-    return (task.task_type == "implement"
-            and not (trusted_successor
-                     and (ctx.get("prev_task_id") or _cea_lineage_parent_from_ctx(ctx))))
+    return not (trusted_successor
+                and (ctx.get("prev_task_id") or _cea_lineage_parent_from_ctx(ctx)))
 
 
 def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ...]:
@@ -1361,7 +1360,28 @@ class DuplicateReviewError(Exception):
 
 
 class InvalidRiskTierError(ValueError):
-    """An implement root declared a tier outside integer 0-3."""
+    """An HTTP root declared no valid integer tier or explicit declaration."""
+
+
+def validate_http_root_risk(context: dict | None) -> None:
+    """Validate untrusted POST /tasks input before queue admission writes a row.
+
+    HTTP context cannot prove successor provenance, even when it names a
+    parent. Internal adapters and legacy successors retain their own ingress
+    contracts and continue through the common queue admission path.
+    """
+    context = context if isinstance(context, dict) else {}
+    if "risk_tier" in context and (
+            isinstance(context["risk_tier"], bool)
+            or not isinstance(context["risk_tier"], int)
+            or not 0 <= context["risk_tier"] <= 3):
+        raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
+    declaration = context.get("risk_declaration")
+    explicit = (isinstance(declaration, dict)
+                and any(isinstance(declaration.get(field), bool)
+                        for field in RISK_DECLARATION_FIELDS))
+    if "risk_tier" not in context and not explicit:
+        raise InvalidRiskTierError("root context.risk_tier must be an integer 0-3")
 
 
 def _is_issue_number(value) -> bool:
@@ -2420,6 +2440,14 @@ class TaskQueue:
         """
         context = self._enqueue_context(task)
         if successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+            inherited_tier = context.get("risk_tier")
+            if "risk_tier" in context and (
+                    isinstance(inherited_tier, bool)
+                    or not isinstance(inherited_tier, int)
+                    or not 0 <= inherited_tier <= 3):
+                context.pop("risk_tier")
+                logger.warning("cea: dropped invalid inherited risk_tier for %s",
+                               task.task_id)
             return context
 
         dropped = [key for key in _CEA_LINEAGE_PARENT_KEYS if key in context]
@@ -2821,12 +2849,12 @@ class TaskQueue:
         :class:`AdmissionRefused` without writing a task row.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
-        missing_root_risk = (_is_implement_root(
+        missing_root_risk = (_is_root_task(
                                  task, context,
                                  successor_provenance=_successor_provenance)
                              and "risk_tier" not in context
                              and "risk_declaration" not in context)
-        missing_root_issue = (_is_implement_root(
+        missing_root_issue = (task.task_type == "implement" and _is_root_task(
                                   task, context,
                                   successor_provenance=_successor_provenance)
                               and not _is_issue_number(context.get("issue")))
@@ -3515,14 +3543,6 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
-            if _is_implement_root(task, context,
-                                  successor_provenance=_successor_provenance):
-                if "risk_tier" in context and (
-                        isinstance(context["risk_tier"], bool)
-                        or not isinstance(context["risk_tier"], int)
-                        or not 0 <= context["risk_tier"] <= 3):
-                    raise InvalidRiskTierError(
-                        "implement root context.risk_tier must be an integer 0-3")
             if refusal is None and task.task_type == "implement":
                 cap = self._max_open_implement()
                 is_system_successor = (

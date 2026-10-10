@@ -26,6 +26,8 @@ question would drift, and the drift would be invisible until it published a
 wrong verdict.
 """
 
+from pathlib import Path
+
 import pytest
 
 from agent_crew.pipeline import (
@@ -253,13 +255,15 @@ def _submit_review(tmp_db, monkeypatch, head, *, unused_tcp_port):
     q.enqueue(TaskRequest(
         task_id="review-stale", task_type="review", description="Review PR #5652",
         branch="main", context={"pr_number": 5652, "repo": "owner/repo",
-                                "reviewed_sha": PINNED, "coordinator_managed": True}))
+                                "reviewed_sha": PINNED, "coordinator_managed": True,
+                                "risk_tier": 2}))
     with TestClient(_server(tmp_db, unused_tcp_port=unused_tcp_port)) as client:
         response = client.post("/tasks/review-stale/result", json={
             "task_id": "review-stale", "status": "completed",
             "summary": "Review found a blocker in the current PR changes", "verdict": "request_changes",
             "findings": ["code_quality: fix the blocking code path"],
-            "pr_number": 5652})
+            "pr_number": 5652},
+            headers={"X-Agent-Crew-Project": Path(tmp_db).parent.name})
         assert response.status_code == 200, response.text
     return posted, TaskQueue(tmp_db)
 
@@ -298,6 +302,8 @@ def test_a_stale_review_requeues_exactly_one_head_anchored_review(tmp_db, monkey
     assert requeued[0].task_type == "review"
     assert requeued[0].context.get("expected_head_sha") == MOVED_TO
     assert requeued[0].context.get("superseded_review") == "review-stale"
+    assert requeued[0].context.get("risk_tier") == 2
+    assert requeued[0].context.get("prev_task_id") == "review-stale"
 
 
 def test_the_result_itself_is_still_recorded(tmp_db, monkeypatch, *, unused_tcp_port):

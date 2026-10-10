@@ -38,7 +38,7 @@ def queue(tmp_path):
 
 def task(task_id, *, kind="review", pr=23, sha=SHA_A, project="owner/repo", branch="feature",
          allow_duplicate_review=False, prev_task_id=None):
-    context = {"allow_duplicate_review": allow_duplicate_review}
+    context = {"risk_tier": 1, "allow_duplicate_review": allow_duplicate_review}
     if prev_task_id is not None:
         context["prev_task_id"] = prev_task_id
     if pr is not None:
