@@ -285,8 +285,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 "ORDER BY json_extract(m.value,'$.verb'),json_extract(m.value,'$.subject'),"
                 "json_extract(m.value,'$.source_message_id')", params)]
         head, overflow, seen = [], [], set()
-        for group, cap in ((principles, HEAD_PRINCIPLE_BYTES),
-                           (standing, HEAD_STANDING_BYTES)):
+        for group, cap, force_overflow in ((principles, HEAD_PRINCIPLE_BYTES, False),
+                                           (standing, HEAD_STANDING_BYTES, True)):
             used = 0
             for record in group:
                 if record["rowid"] in seen:
@@ -295,7 +295,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 size = _bytes(record)
                 if used + size <= cap:
                     head.append(record); used += size
-                else:
+                elif force_overflow:
                     overflow.append(record)
         rendered = json.dumps(head, sort_keys=True, ensure_ascii=False).encode()
         return {"records": head, "standing_overflow": overflow,
