@@ -271,6 +271,8 @@ def test_claude_dispatch_persists_the_existing_transcript_byte_boundary(tmp_path
 
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    # This telemetry case deliberately resumes a seeded, unrelated session.
+    monkeypatch.setenv("AGENT_CREW_CLAUDE_CONTEXT_SCOPE", "worktree")
     monkeypatch.setattr(server, "_claude_home", lambda home=None: tmp_path)
     monkeypatch.setattr(server.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(server.subprocess, "run", lambda *a, **kw: subprocess.CompletedProcess(a, 0, "", ""))
