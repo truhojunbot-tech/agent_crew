@@ -167,7 +167,8 @@ def test_cancel_mints_no_successor_and_attributes_no_commit(tmp_db):
     app = create_app(tmp_db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app, raise_server_exceptions=False) as client:
         client.post("/tasks", json={"task_id": "impl-x", "task_type": "implement",
-                                    "description": "d", "branch": "main"})
+                                    "description": "d", "branch": "main",
+                                    "context": {"risk_tier": 1}})
         assert client.delete("/tasks/impl-x").status_code == 200
         late = client.post("/tasks/impl-x/result", json={
             "task_id": "impl-x", "status": "completed", "summary": "done",
@@ -198,7 +199,7 @@ def test_cancel_writes_a_parseable_timestamp_into_used_at(tmp_path):
 
     db = str(tmp_path / "cancel-ts.db")
     q = TaskQueue(db, cea_config=EngineConfig(mode="test"), cea_providers=dict(WIRED))
-    q.enqueue(task("ts-attempt", context=admitted()), ingress="http.tasks")
+    q.enqueue(task("ts-attempt", context={**admitted(), "risk_tier": 1}), ingress="http.tasks")
     assert q.dequeue(role="implementer", agent="claude")
     nonce = q.record_dispatch("ts-attempt", channel="claude_p", agent="claude", target="pid:7")
     q.cancel("ts-attempt")
@@ -247,7 +248,7 @@ def _dispatched_stale_task(db, task_id, *, idle_for=1200.0):
     from tests.unit.test_sev0_cea_s2c_writer_callsites import admitted, task as _task
 
     q = _cea_queue(db)
-    q.enqueue(_task(task_id, context=admitted()), ingress="http.tasks")
+    q.enqueue(_task(task_id, context={**admitted(), "risk_tier": 1}), ingress="http.tasks")
     assert q.dequeue(role="implementer", agent="claude") is not None
     nonce = q.record_dispatch(task_id, channel="claude_p", agent="claude",
                               target="pid:5151", lease_owner="claude:pending")
@@ -527,7 +528,7 @@ def _dispatched_task(db, task_id):
     from tests.unit.test_sev0_cea_s2c_writer_callsites import admitted, task as _task
 
     q = _cea_queue(db)
-    q.enqueue(_task(task_id, context=admitted()), ingress="http.tasks")
+    q.enqueue(_task(task_id, context={**admitted(), "risk_tier": 1}), ingress="http.tasks")
     assert q.dequeue(role="implementer", agent="claude") is not None
     nonce = q.record_dispatch(task_id, channel="claude_p", agent="claude",
                               target="pid:9090", lease_owner="claude:pid:9090")
@@ -593,7 +594,8 @@ def test_delete_on_a_pending_task_cancels_without_touching_a_worker(tmp_path):
     app = create_app(db, watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app, raise_server_exceptions=False) as client:
         client.post("/tasks", json={"task_id": "waiting", "task_type": "implement",
-                                    "description": "d", "branch": "main"})
+                                    "description": "d", "branch": "main",
+                                    "context": {"risk_tier": 1}})
         q = TaskQueue(db)
         if q.get_task_status("waiting") != "pending":       # a push may have claimed it
             with sqlite3.connect(db) as c:

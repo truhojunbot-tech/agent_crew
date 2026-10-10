@@ -100,6 +100,7 @@ def test_e_di01_basic_discussion(live_server, tmp_path):
 
     cli_t, holder = _start_cli([
         "discuss", "Should we adopt microservices?",
+        "--risk-tier", "1",
         "--db", db_path,
         "--agents", "analyst,critic",
         "--output", output,
@@ -131,6 +132,7 @@ def test_e_di02_two_rounds(live_server, tmp_path):
 
     cli_t, holder = _start_cli([
         "discuss", "Build vs buy?",
+        "--risk-tier", "1",
         "--db", db_path,
         "--agents", "analyst,critic",
         "--rounds", "2",
@@ -182,6 +184,7 @@ def test_e_di03_then_run(live_server, tmp_path):
 
     cli_t, holder = _start_cli([
         "discuss", "Adopt event sourcing",
+        "--risk-tier", "1",
         "--db", db_path,
         "--agents", "analyst",
         "--output", output,

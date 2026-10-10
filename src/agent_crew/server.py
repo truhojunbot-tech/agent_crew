@@ -6595,12 +6595,6 @@ def create_app(
             # them when they arrive in an admission context, while claim-time
             # verification excludes them (#578).
             retry_context.pop("risk_tier_shadow", None)
-            if (isinstance(retry_risk, dict)
-                    and retry_risk.get("declaration_source", "explicit") == "explicit"):
-                retry_risk = {
-                    **retry_risk,
-                    "inherited_from": retry_risk.get("inherited_from") or task_id,
-                }
             retry_context.pop(RESULT_BRANCH_CONTEXT_KEY, None)
             retry_context.pop(RESULT_COMMIT_CONTEXT_KEY, None)
             retry_context["retry_attempt"] = db_retry_attempt + 1
@@ -6629,9 +6623,7 @@ def create_app(
                 if isinstance(retry_risk, dict):
                     try:
                         q().patch_context(retry_req.task_id, {
-                            "risk_declaration": _risk_declaration(
-                                retry_req.description,
-                                {**retry_context, "risk_declaration": retry_risk}),
+                            "risk_declaration": retry_risk,
                         })
                     except Exception:
                         logger.exception("retry risk telemetry failed for %s", retry_req.task_id)

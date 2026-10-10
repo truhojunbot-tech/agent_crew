@@ -2489,7 +2489,9 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                 "AGENT_CREW_DEFAULT_RISK_TIER must be an integer from 0 to 3"
             )
         risk_tier = int(raw_tier)
-    risk_context = {"risk_tier": risk_tier} if risk_tier is not None else {}
+    if risk_tier is None:
+        raise click.UsageError("root task requires --risk-tier or AGENT_CREW_DEFAULT_RISK_TIER")
+    risk_context = {"risk_tier": risk_tier}
     issue_context = {"issue": issue} if issue is not None else {}
     artifact_context = {"artifact_kind": artifact_kind} if artifact_kind is not None else {}
 
@@ -3029,6 +3031,15 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             return
         click.echo(f"[{iteration}/{max_iter}] ✅ Implementation done ({impl_elapsed}s)")
 
+        # The queue records the declaration after admitting the root. Reuse
+        # that exact evidence for CLI-created review, test and fix successors.
+        try:
+            root_declaration = queue.get_task_context(impl_id).get("risk_declaration")
+            if isinstance(root_declaration, dict):
+                risk_context["risk_declaration"] = root_declaration
+        except (AttributeError, KeyError):
+            pass
+
         review_context = {**_CM, **risk_context}
         if reviewer:
             review_context["agent_override"] = reviewer
@@ -3258,6 +3269,8 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
                    "Assigned to agents by position; cycles if fewer than agents. "
                    "Defaults to analyst,critic,advocate,risk.")
 @click.option("--rounds", default=1, type=int, show_default=True, help="Number of discussion rounds")
+@click.option("--risk-tier", type=click.IntRange(0, 3), default=None,
+              help="Root risk tier 0-3 (or AGENT_CREW_DEFAULT_RISK_TIER)")
 @click.option("--then-run", is_flag=True, help="Trigger code-review loop after synthesis")
 @click.option("--db", default="", help="SQLite DB path (standalone)")
 @click.option("--project", default="", help="Project name (reads DB from state)")
@@ -3276,12 +3289,18 @@ def _post_gh_discussion_comment(node_id: str, body: str) -> str:
               help="Post the final synthesis as a comment on this GitHub issue "
                    "number once the discussion completes (#219). No effect with "
                    "--nowait, since there's no synthesis yet when that returns.")
-def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: bool,
+def discuss(topic: str, agents: str, perspectives: str, rounds: int, risk_tier: int | None,
+            then_run: bool,
             db: str, project: str, allow_cross_project: bool, base: str, output: str, branch: str,
             timeout: int, nowait: bool, github_discussion: str, post_to: int):
     """Start a panel discussion on TOPIC. TOPIC must not be empty."""
     if not topic.strip():
         raise click.UsageError("topic must not be empty")
+    if risk_tier is None:
+        raw_tier = os.getenv("AGENT_CREW_DEFAULT_RISK_TIER", "").strip()
+        if raw_tier not in {"0", "1", "2", "3"}:
+            raise click.UsageError("root task requires --risk-tier or AGENT_CREW_DEFAULT_RISK_TIER")
+        risk_tier = int(raw_tier)
 
     project_state = None
     if not db:
@@ -3399,7 +3418,7 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
 
     if nowait:
         # Fire-and-forget: enqueue round 1 only, emit task_ids, exit.
-        context: dict = {"round": 1}
+        context: dict = {"round": 1, "risk_tier": risk_tier}
         if github_discussion:
             context["github_discussion"] = github_discussion
         task_ids = enqueue_panel_tasks(
@@ -3438,7 +3457,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
     missing_by_round: dict = {}
 
     for round_num in range(1, rounds + 1):
-        context = {"round": round_num, "sync_landed_bases": _discuss_sync_bases if _discuss_worktrees else {}}
+        context = {"round": round_num, "risk_tier": risk_tier,
+                   "sync_landed_bases": _discuss_sync_bases if _discuss_worktrees else {}}
         if round_num > 1 and prior_synthesis:
             context["prior_synthesis"] = prior_synthesis
         if github_discussion:
@@ -3553,7 +3573,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
         )
 
         max_iter = DEFAULT_MAX_ITER
-        impl_id = enqueue_implement(queue, topic, branch, port=_run_port)
+        impl_id = enqueue_implement(queue, topic, branch,
+                                    context={"risk_tier": risk_tier}, port=_run_port)
         click.echo(f"Code-review loop started: {impl_id}")
 
         for iteration in range(1, max_iter + 1):
@@ -3571,7 +3592,8 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
             # the main loop above.
             _review_attempts = 0
             while True:
-                review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id, port=_run_port)
+                review_id = enqueue_review(queue, topic, branch, prev_task_id=impl_id,
+                                           context={"risk_tier": risk_tier}, port=_run_port)
                 review_result = None
                 deadline = time.time() + wait_timeout
                 while time.time() < deadline:
@@ -3618,7 +3640,9 @@ def discuss(topic: str, agents: str, perspectives: str, rounds: int, then_run: b
                 return
 
             feedback = build_feedback(review_result)
-            impl_id = enqueue_implement(queue, topic, branch, context={"feedback": feedback}, port=_run_port)
+            impl_id = enqueue_implement(queue, topic, branch,
+                                        context={"feedback": feedback, "risk_tier": risk_tier},
+                                        port=_run_port)
 
         click.echo(f"Max iterations ({max_iter}) reached without approval.")
 
@@ -3902,6 +3926,8 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
               help="PR number to attach to context (for review/test tasks)")
 @click.option("--artifact-kind", type=click.Choice(ARTIFACT_KINDS), default=None,
               help="Declare the task's completion artifact contract (for example, report).")
+@click.option("--risk-tier", type=click.IntRange(0, 3), default=None,
+              help="Root risk tier 0-3 (or AGENT_CREW_DEFAULT_RISK_TIER)")
 @click.option("--prev-task-id", default="",
               help="Task id this one depends on (typically the impl task id "
                    "for review, or the review id for test).")
@@ -3909,7 +3935,7 @@ def poll(repo: str, db: str, project: str, base: str, branch: str,
 @click.option("--task-id", default="",
               help="Override task_id (default: <type>-<random8hex>)")
 def enqueue(task_type: str, description: str, project: str, db: str, base: str,
-            branch: str, pr_number: int, artifact_kind: str | None,
+            branch: str, pr_number: int, artifact_kind: str | None, risk_tier: int | None,
             prev_task_id: str, priority: int,
             task_id: str):
     """Enqueue a single TASK_TYPE task without entering the loop.
@@ -3948,6 +3974,41 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
     context: dict = {}
     if prev_task_id:
         context["prev_task_id"] = prev_task_id
+        from agent_crew.queue import TaskQueue
+        lineage_queue = TaskQueue(db, read_only=True)
+        parent = lineage_queue.get_task(prev_task_id)
+        if parent is None:
+            raise click.UsageError(f"parent task {prev_task_id!r} not found")
+        seen = set()
+        while parent and parent.task_id not in seen:
+            seen.add(parent.task_id)
+            parent_ctx = parent.context if isinstance(parent.context, dict) else {}
+            previous = parent_ctx.get("prev_task_id")
+            if not isinstance(previous, str) or not previous:
+                break
+            ancestor = lineage_queue.get_task(previous)
+            if ancestor is None:
+                break
+            parent = ancestor
+        root_ctx = parent.context if isinstance(parent.context, dict) else {}
+        root_tier = root_ctx.get("risk_tier")
+        if isinstance(root_tier, bool) or not isinstance(root_tier, int) or not 0 <= root_tier <= 3:
+            raise click.UsageError(
+                f"parent lineage lacks --risk-tier; provide a declared root before enqueueing {task_type}")
+        if risk_tier is not None and risk_tier != root_tier:
+            raise click.UsageError("successor --risk-tier must equal the root risk tier")
+        risk_tier = root_tier
+        context["risk_tier"] = root_tier
+        if isinstance(root_ctx.get("risk_declaration"), dict):
+            context["risk_declaration"] = root_ctx["risk_declaration"]
+    else:
+        if risk_tier is None:
+            raw_tier = os.getenv("AGENT_CREW_DEFAULT_RISK_TIER", "").strip()
+            if raw_tier not in {"0", "1", "2", "3"}:
+                raise click.UsageError("root task requires --risk-tier or AGENT_CREW_DEFAULT_RISK_TIER")
+            risk_tier = int(raw_tier)
+    if risk_tier is not None:
+        context["risk_tier"] = risk_tier
     if pr_number:
         context["pr_number"] = pr_number
     if artifact_kind is not None:
