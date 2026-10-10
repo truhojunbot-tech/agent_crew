@@ -1545,6 +1545,8 @@ class TaskQueue:
         self._reconcile_stop_on_boot()
 
     def _connect(self) -> sqlite3.Connection:
+        # sqlite3's timeout parameter installs a 10,000 ms busy_timeout on
+        # every connection; #705 verifies it for dispatch and poll reads.
         conn = sqlite3.connect(self._db_path, timeout=10, check_same_thread=False,
                                factory=(_TimedConnection if request_sqlite_timing.get() is not None
                                         else sqlite3.Connection))
@@ -5296,6 +5298,12 @@ class TaskQueue:
             except Exception:
                 pass
             raise
+        except sqlite3.OperationalError as exc:
+            logger.exception("exec-state: dispatch record failed task_id=%s", task_id)
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            if "database is locked" in str(exc).lower():
+                raise
         except Exception:
             logger.exception("exec-state: dispatch record failed task_id=%s", task_id)
         finally:
@@ -5631,18 +5639,36 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def requeue_dispatcher_claim(self, task_id: str) -> bool:
-        """Recover only the in-progress claim made by the headless dispatcher."""
+    def requeue_dispatcher_claim(self, task_id: str, *,
+                                 unstarted_before: Optional[float] = None) -> bool:
+        """Recover a dispatcher claim; optionally require an old, unstarted attempt.
+
+        The optional check runs under the same write lock as the requeue so a
+        concurrent dispatch cannot gain a lease between selection and recovery.
+        """
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT status, claim_source FROM tasks WHERE task_id = ?",
+                "SELECT status, claim_source, last_activity_at, last_heartbeat_at, dispatched_at, "
+                "lease_owner, lease_expires_at FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
             if row is None or row["status"] != "in_progress" or row["claim_source"] != "dispatcher":
                 conn.execute("ROLLBACK")
                 return False
+            if unstarted_before is not None:
+                claimed_at = row["last_activity_at"] or 0.0
+                dispatched = conn.execute(
+                    "SELECT 1 FROM task_exec_events WHERE task_id=? AND event='dispatched' "
+                    "AND at>=? LIMIT 1", (task_id, claimed_at)).fetchone()
+                if (not claimed_at or claimed_at > unstarted_before or
+                        (row["last_heartbeat_at"] or 0.0) > unstarted_before or
+                        row["lease_owner"] is not None or
+                        row["lease_expires_at"] is not None or
+                        (row["dispatched_at"] or 0.0) >= claimed_at or dispatched):
+                    conn.execute("ROLLBACK")
+                    return False
             admitted, _gate = self.requeue_through_gate(
                 conn, task_id, path="queue.requeue_dispatcher_claim")
             if not admitted:
@@ -6448,7 +6474,7 @@ class TaskQueue:
         try:
             rows = conn.execute(
                 "SELECT task_id, task_type, context, last_activity_at, last_heartbeat_at, "
-                "push_at, project, claim_source, dispatched_at "
+                "push_at, project, claim_source, dispatched_at, lease_owner "
                 "FROM tasks WHERE status = 'in_progress'"
             ).fetchall()
             return [
@@ -6462,6 +6488,7 @@ class TaskQueue:
                     "project": r["project"] if r["project"] else "",
                     "claim_source": r["claim_source"] or "",
                     "dispatched_at": r["dispatched_at"] or 0.0,
+                    "lease_owner": r["lease_owner"],
                 }
                 for r in rows
             ]

@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import signal
+import sqlite3
 import socket
 import subprocess
 import sys
@@ -44,6 +45,20 @@ def _crew_log(proj_dir: str, msg: str) -> None:
             f.write(line)
     except OSError:
         pass
+
+
+def _retry_locked_queue_read(read, task_id: str):
+    """Retry transient SQLite writer contention while crew run polls."""
+    for attempt in range(4):
+        try:
+            return read(task_id)
+        except sqlite3.OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            if attempt == 3:
+                raise click.ClickException(
+                    f"database remained locked while polling task {task_id!r}") from exc
+            time.sleep(0.05 * (2 ** attempt))
 
 
 def _server_had_cea(state: dict | None) -> bool:
@@ -2611,7 +2626,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         pane_alive_notice_emitted = False
         last_progress_print = start_time
         while time.time() < deadline:
-            result = queue.get_result(task_id)
+            result = _retry_locked_queue_read(queue.get_result, task_id)
             if result is not None:
                 return result
             now = time.time()
@@ -2681,7 +2696,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
         # without auto-failing. The task stays in queue and will be dispatched
         # when an agent becomes free. This prevents a crew run that launched
         # while all agents were busy from permanently killing the queued task.
-        task_status_now = queue.get_task_status(task_id)
+        task_status_now = _retry_locked_queue_read(queue.get_task_status, task_id)
         if task_status_now == "pending":
             proj_hint = repr(project) if project else "(project)"
             click.echo(
@@ -2701,13 +2716,13 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             )
             last_progress_print = time.time()
             while True:
-                result = queue.get_result(task_id)
+                result = _retry_locked_queue_read(queue.get_result, task_id)
                 if result is not None:
                     return result
-                task_status_now = queue.get_task_status(task_id)
+                task_status_now = _retry_locked_queue_read(queue.get_task_status, task_id)
                 if task_status_now != "in_progress":
                     # A timeout or cancellation may have no TaskResult row.
-                    result = queue.get_result(task_id)
+                    result = _retry_locked_queue_read(queue.get_result, task_id)
                     if result is not None:
                         return result
                     raise click.ClickException(
@@ -2752,7 +2767,7 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                 f"(extension {extensions}/{max_extensions})."
             )
             while time.time() < deadline:
-                result = queue.get_result(task_id)
+                result = _retry_locked_queue_read(queue.get_result, task_id)
                 if result is not None:
                     return result
                 time.sleep(2.0)
