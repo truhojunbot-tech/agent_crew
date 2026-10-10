@@ -4835,6 +4835,8 @@ def create_app(
         #   task.context.context_reset sets it too (review-99ad8ad0).
         _ctx_over = False
         _ctx_cap_info = {}
+        # Keep lineage attribution separate from the byte/token cap cause.
+        _lineage_reset = False
         _codex_planned = ""      # the session a codex resume would use, if any
         _renew_previous_session = ""
         if agent == "gemini":
@@ -4869,6 +4871,19 @@ def create_app(
             # worktree since 2026-08-21, alpha_engine's at 290 MB. Sizing is
             # provider-specific; everything after this line is not.
             _ctx_over, _ctx_cap_info = claude_context_exceeds_cap(wt)
+            if os.getenv("AGENT_CREW_CLAUDE_CONTEXT_SCOPE", "lineage").strip().lower() != "worktree":
+                try:
+                    _previous_task_id = q().peek_context_last_task_id(_project, agent, wt)
+                    if _previous_task_id and _previous_task_id != task.task_id:
+                        _lineage_ids, _ = task_lineage(db_path, task.task_id)
+                        if _previous_task_id not in _lineage_ids:
+                            _force_context_reset = True
+                            _lineage_reset = True
+                except Exception:
+                    logger.exception(
+                        "dispatcher: Claude lineage lookup failed for task=%s; "
+                        "keeping worktree context policy", task.task_id,
+                    )
         if _ctx_over:
             _force_context_reset = True
             logger.warning(
@@ -4906,6 +4921,7 @@ def create_app(
                 context_generation=_ctx_info["context_generation"],
                 session_task_index=_ctx_info["session_task_index"],
                 previous_task_id=_ctx_info["previous_task_id"],
+                **({"tripped_by": "lineage"} if _lineage_reset else {}),
             )
             # A provider swap relative to the role's *configured default*
             # agent means retry/fallback routing redirected this dispatch —

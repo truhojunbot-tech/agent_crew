@@ -6921,6 +6921,20 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def peek_context_last_task_id(self, project: str, agent: str,
+                                  worktree_path: str) -> str:
+        """Read the previous task for a context without minting or advancing it."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT last_task_id FROM context_state "
+                "WHERE project=? AND agent=? AND worktree_path=?",
+                (project, agent, worktree_path),
+            ).fetchone()
+            return (row["last_task_id"] or "") if row else ""
+        finally:
+            conn.close()
+
     def update_context_provider_session_id(self, context_key: str, provider_session_id: str) -> None:
         """Record a provider-native session id observed for this context
         (#202) — e.g. parsed from claude's stream-json output. Best-effort;
