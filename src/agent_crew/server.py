@@ -3387,6 +3387,12 @@ def create_app(
             )
         except Exception:
             logger.exception("build provenance record failed — continuing")
+        # A result may have committed under STOP just before a swap. Drain its
+        # existing outbox on the first unpaused boot, before dispatch begins.
+        try:
+            await asyncio.to_thread(replay_suppressed)
+        except Exception:
+            logger.exception("outbox replay at startup failed — rows remain recoverable")
         background_tasks: list[asyncio.Task] = []
         if _dispatcher_enabled:
             _requeue_orphans()
@@ -6962,6 +6968,11 @@ def create_app(
         except Exception as exc:
             _risk_out = {"missing_root_count": None,
                          "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            _outbox_out = q().outbox_counts()
+        except Exception as exc:
+            _outbox_out = {"pending": None, "expired": None,
+                           "error": f"{type(exc).__name__}: {exc}"}
         return {
             "status": "ok",
             "project": ident["project"],
@@ -6970,6 +6981,7 @@ def create_app(
             "runtime_state": _runtime_state_out,
             "cea": _cea_out,
             "risk_declaration": _risk_out,
+            "outbox": _outbox_out,
             "dispatcher_tick_age_s": (
                 max(0.0, time.monotonic() - app.state.dispatcher_last_tick_monotonic)
                 if app.state.dispatcher_last_tick_monotonic is not None else None
@@ -7850,6 +7862,13 @@ def create_app(
         except Exception:
             return {"status": "skipped", "reason": "pause 판정불가(fail-closed)", "replayed": []}
         from agent_crew.protocol import TaskResult
+        try:
+            max_age = float(os.getenv("AGENT_CREW_OUTBOX_REPLAY_MAX_AGE_S", "86400"))
+            if not math.isfinite(max_age) or max_age <= 0:
+                raise ValueError("non-positive replay age")
+        except ValueError:
+            logger.warning("invalid AGENT_CREW_OUTBOX_REPLAY_MAX_AGE_S; using 86400")
+            max_age = 86400.0
         done = []
         for rec in q().outbox_pending(include_replaying=True):
             parent = rec.get("parent_task_id")
@@ -7859,17 +7878,66 @@ def create_app(
             claim = q().outbox_claim(parent, owner)      # lease CAS: pending/만료replaying만
             if not claim:
                 continue                                 # 다른 executor 처리중 or 이미 applied
+            try:
+                created = float(claim["created_at"])
+                if not math.isfinite(created) or created > time.time():
+                    disposition, reason = "pending", "invalid_created_at"
+                elif time.time() - created > max_age:
+                    disposition, reason = "expired", "age_limit"
+                else:
+                    task = q().get_task(parent)
+                    if task is None:
+                        disposition, reason = "pending", "parent_unavailable"
+                    else:
+                        ctx = task.context if isinstance(task.context, dict) else {}
+                        if (task.status == "cancelled" or
+                                q().has_superseding_review(parent)):
+                            disposition, reason = "expired", "parent_cancelled_or_superseded"
+                        else:
+                            rd = json.loads(claim["result_json"])
+                            pr = (rd.get("pr_number") or task.pr_number or
+                                  ctx.get("pr_number"))
+                            if pr:
+                                worktree = _any_worktree_path()
+                                repo = (ctx.get("repo") or
+                                        (get_repo(cwd=worktree) if worktree else "") or "")
+                                if not repo:
+                                    disposition, reason = "pending", "pr_repo_unavailable"
+                                else:
+                                    from agent_crew.github import pr_state
+                                    state = pr_state(int(pr), repo=repo, timeout=5.0)
+                                    if state in ("closed", "merged"):
+                                        disposition, reason = "expired", f"pr_{state}"
+                                    elif state != "open":
+                                        disposition, reason = "pending", "pr_state_unknown"
+                                    else:
+                                        disposition, reason = "replay", ""
+                            else:
+                                disposition, reason = "replay", ""
+            except Exception:
+                logger.exception("outbox replay safety check failed parent=%s", parent)
+                disposition, reason = "pending", "safety_check_failed"
+            if disposition != "replay":
+                q().outbox_finish_claim(parent, owner, state=disposition)
+                logger.warning("outbox replay %s parent=%s reason=%s", disposition,
+                               parent, reason)
+                continue
             # #314 §4 P0: replay 동안 _REPLAYING=True → submit_result가 durable cascade transition
             # (successor enqueue, stable id 멱등)만 재실행하고 non-idempotent side effect(PR comment/
             # escalation gate+telegram/queue push)는 skip. replay side-effect boundary 확립.
             _rtok = _REPLAYING.set(True)
             try:
                 rd = json.loads(claim.get("result_json") or "{}")
-                submit_result(parent, TaskResult(**rd))  # outbox 'replaying' → cascade transition만 재실행
+                response = submit_result(parent, TaskResult(**rd),
+                                         x_agent_crew_project=_server_identity()["project"])
+                if isinstance(response, dict) and response.get("suppressed_by_pause"):
+                    q().outbox_finish_claim(parent, owner, state="pending")
+                    continue
                 q().outbox_mark_applied(parent, owner)    # 성공분만 replaying→applied CAS
                 done.append(parent)
             except Exception:
                 logger.exception(f"replay-suppressed: {parent} 실패(lease 만료 후 reclaim)")
+                q().outbox_finish_claim(parent, owner, state="pending")
             finally:
                 _REPLAYING.reset(_rtok)
         return {"status": "ok", "replayed": done,
