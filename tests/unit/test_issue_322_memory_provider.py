@@ -197,6 +197,33 @@ def test_hybrid_dispatch_uses_ranked_memory_and_records_receipt(
     assert events[0]["superseded_served"] == 0
     assert {"owner_principle:fleet", "standing:project"} <= set(events[0]["result_ids"])
     assert context["shadow_memory"]["retrieval_mode"] == "lexical_only"
+    assert events[0]["fleet"] == "fleet"
+
+
+def test_hybrid_dispatch_without_fleet_env_records_unscoped_head(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+    from agent_crew.memory_runtime import MemoryRecord, MemoryScope
+
+    path = tmp_path / "ranked.db"
+    storage = HybridMemoryStorage(str(path))
+    storage.put(MemoryRecord(
+        "procedural", "owner_principle:fleet", {"text": "make a change"},
+        MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord(
+        "decision", "standing:project", {"kind": "standing_decision", "text": "make a change"},
+        MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    monkeypatch.delenv("AGENT_CREW_MEMORY_FLEET", raising=False)
+    _, context, events, _ = _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
+        shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
+    assert len(events) == 1
+    assert events[0]["fleet"] == ""
+    assert context["shadow_memory"]["fleet"] == ""
+    assert "standing:project" in events[0]["result_ids"]
+    assert "owner_principle:fleet" not in events[0]["result_ids"]
 
 
 def test_hybrid_dispatch_timeout_records_fallback_without_blocking(

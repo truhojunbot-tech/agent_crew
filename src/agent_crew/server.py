@@ -5439,6 +5439,10 @@ def create_app(
                 if _ranked_memory is not None:
                     from agent_crew.memory_runtime import MemoryScope
                     _fleet = str(_ctx.get("fleet") or os.getenv("AGENT_CREW_MEMORY_FLEET", ""))
+                    if not _fleet:
+                        logger.warning(
+                            "dispatcher: hybrid memory fleet unset for task=%s; "
+                            "fleet-scoped records will be omitted", task.task_id)
                     _ranked_scope = MemoryScope(
                         fleet=_fleet, project=_project,
                         issue=str(_ctx.get("issue", "")),
@@ -5485,7 +5489,8 @@ def create_app(
                     **shadow_telemetry(_shadow_result),
                     **({"retrieval_mode": _ranked_receipt["mode"],
                         "superseded_served": _ranked_receipt["superseded_served"],
-                        "head_bytes": _ranked_receipt["head_bytes"]}
+                        "head_bytes": _ranked_receipt["head_bytes"],
+                        "fleet": _ranked_scope.fleet}
                        if _ranked_receipt is not None else {}),
                     "task_id": task.task_id,
                     "project": _project,

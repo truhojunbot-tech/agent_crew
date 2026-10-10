@@ -2,6 +2,10 @@
 
 Run `scripts/runtime_swap.sh PROJECT FULL_SHA preflight`, then `go`, then `post` with `AGENT_CREW_SWAP_CEA_ENV_FILE` pointing to a private file of `AGENT_CREW_CEA_KEY=VALUE` lines. The script reads port and database paths from `~/.agent_crew/PROJECT/state.json`. Keep runtime STOP paused throughout. A healthy rollback uses the same three commands with the previous full SHA. Do not run this against a live dispatcher without the owner's operational approval.
 
+## Hybrid memory prerequisite
+
+Before a swap that sets `AGENT_CREW_MEMORY_BACKEND=hybrid`, set `AGENT_CREW_MEMORY_FLEET` to the fleet name used by fleet-scoped memory records (for the ADR-001 owner principles, `fleet`). Dispatch uses a task's `context.fleet` when supplied, otherwise this environment value. An unset fleet omits fleet-scoped records from the memory head; project-scoped records still apply. The `shadow_memory_retrieval` event and task context record the effective `fleet`, and dispatch logs a warning when it is empty. This setting enables the existing hybrid retrieval scope; the swap itself must follow the approval and pause procedure above.
+
 ## If `go` fails after SIGTERM
 
 A health timeout or build SHA mismatch means the swap is **not complete**. Keep STOP paused and do not send work to the listener. The script deliberately does not restart a process automatically after a failed provenance check; the operator must inspect the actual listener and decide whether a restart is safe. The preflight evidence is in `~/.sev0-evidence/crew-swap-PROJECT-SHA7/`.
