@@ -56,7 +56,7 @@ def test_finding1_watchdog_tick_calls_cloud_reconciliation(tmp_db, monkeypatch):
     calls = []
     import agent_crew.server as srv
 
-    def _spy(queue, *, repo=None):
+    def _spy(queue, *, repo=None, submit_review_result_fn=None):
         calls.append(queue)
         return []
     monkeypatch.setattr(srv._claude_cloud, "reconcile_all_cloud_tasks", _spy)
