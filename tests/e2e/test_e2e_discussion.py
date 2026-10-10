@@ -186,6 +186,7 @@ def test_e_di03_then_run(live_server, tmp_path):
         "--agents", "analyst",
         "--output", output,
         "--then-run",
+        "--risk-tier", "1",
     ])
 
     # Discussion phase: one panel agent responds

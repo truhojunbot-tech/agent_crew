@@ -195,6 +195,7 @@ def test_e_rc03_sqlite_persistence(tmp_path, e2e_project):
         "task_type": "implement",
         "description": "Persistent task",
         "branch": "main",
+        "context": {"risk_tier": 1},
     }, timeout=5.0)
     assert resp.status_code == 201
 

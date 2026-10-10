@@ -15,7 +15,7 @@ def test_explicit_risk_declaration_is_persisted_with_explicit_provenance(tmp_db)
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
         "risk-explicit", "implement", "change deployment", context={
-            "risk_declaration": {"safety_or_live_change": True},
+            "risk_tier": 1, "risk_declaration": {"safety_or_live_change": True},
         },
     ))
 
@@ -65,7 +65,7 @@ def test_low_risk_heuristic_never_fabricates_safety_false():
 def test_declaration_is_copied_to_attribution_when_dispatch_creates_that_row(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
-        "risk-attribution", "implement", "external mutation", context={"external_impact": True},
+        "risk-attribution", "implement", "external mutation", context={"risk_tier": 1, "external_impact": True},
     ))
     queue.record_attribution("risk-attribution")
 
@@ -80,7 +80,7 @@ def test_declaration_failure_cannot_veto_admission_or_completion(monkeypatch, tm
         lambda *_args: (_ for _ in ()).throw(RuntimeError("telemetry unavailable")),
     )
     queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest("risk-best-effort", "implement", "x"))
+    queue.enqueue(TaskRequest("risk-best-effort", "implement", "x", context={"risk_tier": 1}))
     queue.record_attribution("risk-best-effort")
     queue.submit_result("risk-best-effort", TaskResult("risk-best-effort", "completed", "done"))
 
@@ -104,7 +104,7 @@ def test_risk_declaration_uses_quota_core_da6779b_quality_evidence_fields(tmp_db
     assert all(f"    {field}: bool | None = None" in source for field in expected)
 
     queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest("risk-schema", "implement", "x"))
+    queue.enqueue(TaskRequest("risk-schema", "implement", "x", context={"risk_tier": 1}))
     evidence = json.loads(queue.get_tokenomics_shadow_receipt("risk-schema")["evidence_json"])
     assert expected <= set(evidence["risk_declaration"])
 
