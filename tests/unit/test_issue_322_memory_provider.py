@@ -171,6 +171,62 @@ class _CrossProjectProvider:
         ))
 
 
+def test_hybrid_dispatch_uses_ranked_memory_and_records_receipt(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+    from agent_crew.memory_runtime import MemoryRecord, MemoryScope
+
+    path = tmp_path / "ranked.db"
+    storage = HybridMemoryStorage(str(path))
+    storage.put(MemoryRecord(
+        "procedural", "owner_principle:fleet", {"text": "make a change"},
+        MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord(
+        "decision", "standing:project", {"kind": "standing_decision", "text": "make a change"},
+        MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_FLEET", "fleet")
+    _, context, events, _ = _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
+        shadow_memory_enabled=False,
+        unused_tcp_port=unused_tcp_port)
+    assert len(events) == 1
+    assert events[0]["retrieval_mode"] == "lexical_only"
+    assert events[0]["head_bytes"] > 2
+    assert events[0]["superseded_served"] == 0
+    assert {"owner_principle:fleet", "standing:project"} <= set(events[0]["result_ids"])
+    assert context["shadow_memory"]["retrieval_mode"] == "lexical_only"
+
+
+def test_hybrid_dispatch_timeout_records_fallback_without_blocking(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+    from agent_crew.memory_runtime import MemoryRecord, MemoryScope
+
+    path = tmp_path / "slow-ranked.db"
+    storage = HybridMemoryStorage(str(path))
+    storage.put(MemoryRecord("episodic", "slow", {"text": "make a change"},
+                             MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    original_rank = HybridMemoryStorage._rank_middle
+
+    def slow_rank(self, *args):
+        time.sleep(.45)
+        return original_rank(self, *args)
+
+    monkeypatch.setattr(HybridMemoryStorage, "_rank_middle", slow_rank)
+    _, context, events, elapsed = _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
+        unused_tcp_port=unused_tcp_port)
+    assert elapsed < .6  # includes dispatch setup outside the 300 ms lookup
+    assert events[0]["retrieval_mode"] == "fallback"
+    assert events[0]["latency_ms"] == 300.0
+    assert events[0]["superseded_served"] == 0
+    assert context["shadow_memory"]["retrieval_mode"] == "fallback"
+
+
 def test_shadow_memory_kill_switch_never_invokes_provider(tmp_path, monkeypatch, *, unused_tcp_port):
     _, context, events, _ = _dispatch_snapshot(
         tmp_path / "disabled", monkeypatch, _MustNotBeCalledProvider(), shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
