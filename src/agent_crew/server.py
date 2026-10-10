@@ -37,7 +37,7 @@ from agent_crew.memory import (
     shadow_retrieve_bounded,
     shadow_telemetry,
 )
-from agent_crew.memory_capture import capture_result_best_effort, task_lineage
+from agent_crew.memory_capture import capture_result_best_effort, capture_merge_best_effort, task_lineage
 from agent_crew.memory_runtime import (SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS,
                                        SHADOW_RETRIEVAL_MAX_ROWS)
 from agent_crew.context_identity import (
@@ -6712,6 +6712,7 @@ def create_app(
         st = pr_state(int(pr_number), repo=_merge_repo)
         if st == "merged":
             q().external_op_mark(op_key, "done")
+            capture_merge_best_effort(db_path, review_task_id)
             logger.info(f"_auto_merge_pr: PR #{pr_number} 이미 merged(재확인) → done 기록, 재merge 안 함")
             return
         if st == "closed":
@@ -6797,6 +6798,7 @@ def create_app(
         ok = merge_pr(int(pr_number), merge_method="squash", repo=_merge_repo)
         if ok:
             q().external_op_mark(op_key, "done")
+            capture_merge_best_effort(db_path, review_task_id)
             logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) → done(receipt) — #171/§5")
         else:
             fail("gh pr merge 실패")
