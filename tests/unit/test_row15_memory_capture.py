@@ -619,8 +619,11 @@ def test_result_capture_is_gated_and_never_changes_result(
         queue = TaskQueue(db)
         queue.enqueue(TaskRequest(task_id="capture-test", task_type="discuss",
                                   description="discussion", project="agent_crew"))
-        response = api.post("/tasks/capture-test/result", json={
-            "task_id": "capture-test", "status": status, "summary": "observed failure"})
+        response = api.post(
+            "/tasks/capture-test/result",
+            json={"task_id": "capture-test", "status": status,
+                  "summary": "observed failure"},
+            headers={"X-Agent-Crew-Project": "agent_crew"})
         assert response.status_code == 200, response.text
         assert queue.get_task_status("capture-test") == status
     with sqlite3.connect(memory_db) as db_conn:
