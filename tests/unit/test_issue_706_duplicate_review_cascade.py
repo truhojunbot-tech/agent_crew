@@ -1,4 +1,4 @@
-"""A review suppressed at dispatch must hand its lineage to the survivor."""
+"""A suppressed review must hand its lineage to the survivor."""
 
 import pytest
 from fastapi.testclient import TestClient
@@ -55,6 +55,56 @@ def _result(queue, verdict):
         task_id="review-survivor", status="completed", verdict=verdict,
         summary="reviewed", findings=[FINDING] if verdict == "request_changes" else [],
         pr_number=706))
+
+
+@pytest.mark.parametrize("verdict,successor_type", [
+    ("request_changes", "implement"), ("approve", "test")])
+def test_pending_survivor_adopts_enqueue_refusal_lineage(
+        queue, verdict, successor_type):
+    queue.enqueue(TaskRequest(
+        task_id="impl-706", task_type="implement", description="implement",
+        branch="main", project="agent_crew",
+        context={"risk_tier": 2, "fix_round": 1, "issue": 706,
+                 "repo": "owner/repo"}))
+    queue.enqueue(TaskRequest(
+        task_id="review-survivor", task_type="review", description="review PR",
+        branch="main", project="agent_crew",
+        context={"prev_task_id": "impl-706", "pr_number": 706,
+                 "coordinator_managed": True, "risk_tier": 1}))
+    result = TaskResult(task_id="impl-706", status="completed", summary="done",
+                        branch=BRANCH, commit=HEAD, pr_number=706)
+    assert pipeline.auto_enqueue_review(
+        queue, "impl-706", pr_number=706, result=result,
+        pr_state_fn=lambda _: "open") == "review-survivor"
+    assert queue.get_task_status("review-impl-706-r1") is None
+    survivor = queue.get_task("review-survivor")
+    assert survivor.status == "pending"
+    assert survivor.context["cascade_branch"] == BRANCH
+    assert survivor.context["duplicate_review_lineage_from"] == "review-impl-706-r1"
+    assert survivor.context["fix_round"] == 1
+    assert survivor.context["risk_tier"] == 2
+    assert survivor.context["issue"] == 706
+    assert queue.dequeue(role="reviewer").task_id == "review-survivor"
+    assert queue.record_prepared_review_base("review-survivor", {"reviewed_sha": HEAD})
+    _result(queue, verdict)
+
+    kwargs = {"pr_state_fn": lambda _: "open"}
+    if verdict == "request_changes":
+        successor = auto_enqueue_fix(queue, "review-survivor",
+                                     head_sha_fn=lambda _: HEAD, **kwargs)
+        assert auto_enqueue_fix(queue, "review-survivor",
+                                head_sha_fn=lambda _: HEAD, **kwargs) is None
+    else:
+        successor = auto_enqueue_test(queue, "review-survivor", **kwargs)
+        assert auto_enqueue_test(queue, "review-survivor", **kwargs) == successor
+    assert successor is not None
+    task = queue.get_task(successor)
+    assert task.task_type == successor_type
+    assert task.branch == BRANCH
+    assert task.context["prev_task_id"] == "review-survivor"
+    assert task.context["risk_tier"] == 2
+    assert task.context["fix_round"] == (2 if verdict == "request_changes" else 1)
+    assert len([item for item in queue.list_tasks() if item.task_id == successor]) == 1
 
 
 def test_request_changes_uses_pipeline_branch_lineage_and_tier_once(queue):

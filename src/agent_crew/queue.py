@@ -2908,6 +2908,14 @@ class TaskQueue:
                     # The refusal audit must not commit writes made earlier in
                     # the admission transaction. Record it on a clean one.
                     conn.rollback()
+                    conn.execute("BEGIN IMMEDIATE")
+                    if task.task_type == "review":
+                        # This review has no row to mark blocked: admission
+                        # refused it before the survivor's eventual verdict.
+                        # Preserve the same cascade route as a dispatch-time
+                        # duplicate before reporting the existing task id.
+                        self._adopt_blocked_review_lineage_in_txn(
+                            conn, duplicate_id, task, context)
                     self._append_exec_event_on(
                         conn, task.task_id, "duplicate_review_refused", time.time(),
                         existing_task_id=duplicate_id, code=DuplicateReviewError.code)

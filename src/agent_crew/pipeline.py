@@ -2157,6 +2157,13 @@ def auto_enqueue_review(
         }
         if enforce_risk_tier:
             review_context.update(risk)
+        # The duplicate-review survivor needs the parent's declared tier even
+        # when CEA admission is observing in shadow mode. The review may be
+        # refused before a blocked row exists, leaving only this context to
+        # hand its tier to the survivor.
+        parent_tier = impl_ctx.get("risk_tier")
+        if type(parent_tier) is int and 0 <= parent_tier <= 3:
+            review_context.setdefault("risk_tier", parent_tier)
         if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
             review_context["tier3_gate_approved"] = True
         if enforce_risk_tier and contract.review_mode:
