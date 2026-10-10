@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import time
@@ -9,7 +10,7 @@ from agent_crew.session import check_health, load_sessions, refresh_pane, save_s
 
 pytestmark = pytest.mark.integration
 
-_SESSION = "test_crew_session"
+_SESSION = f"test_crew_session_{os.getpid()}"
 
 requires_tmux = pytest.mark.skipif(
     not shutil.which("tmux"),
