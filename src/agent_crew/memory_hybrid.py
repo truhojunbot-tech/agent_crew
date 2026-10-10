@@ -98,9 +98,6 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
-    if triggers_changed:
-        db.execute("DROP TRIGGER IF EXISTS adr001_fts_ai")
-        db.execute("DROP TRIGGER IF EXISTS adr001_fts_au")
     db.executescript("""
       CREATE TRIGGER IF NOT EXISTS adr001_no_legacy_flags_bi
         BEFORE INSERT ON adr001_memory WHEN
@@ -122,13 +119,22 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         AFTER UPDATE OF superseded_by,invalidated_at ON adr001_memory BEGIN
         DELETE FROM adr001_vec WHERE rowid=new.rowid;
       END;
-    """ + _FTS_AI_SQL + "\n" + _FTS_AU_SQL)
+    """)
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
     indexed = db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
     if fresh or triggers_changed or count != indexed:
         db.execute("DELETE FROM adr001_fts")
         db.execute("INSERT INTO adr001_fts(rowid,layer,key,body) "
                    "SELECT m.rowid,m.layer,m.key," + _body_sql("m") + " FROM adr001_memory m")
+    if triggers_changed:
+        # executescript commits before it runs. Keep the old triggers until
+        # the rebuild starts, then swap them in that same transaction. A
+        # rollback leaves both the old body and old trigger definition, so
+        # the next initializer retries the rebuild.
+        db.execute("DROP TRIGGER IF EXISTS adr001_fts_ai")
+        db.execute("DROP TRIGGER IF EXISTS adr001_fts_au")
+        db.execute(_FTS_AI_SQL)
+        db.execute(_FTS_AU_SQL)
 
 
 def _effective_sql(alias: str = "m") -> str:
