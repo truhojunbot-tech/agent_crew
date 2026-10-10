@@ -2136,6 +2136,29 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
+        try:
+            prior_fix_round = int(impl_ctx.get("fix_round") or 0)
+        except (TypeError, ValueError):
+            prior_fix_round = 0
+        if impl_task_id.startswith("fix-") or prior_fix_round > 0:
+            prior_review = next((
+                task for candidate in (impl_ctx.get("prev_task_id"),
+                                       impl_ctx.get("review_task_id"))
+                if isinstance(candidate, str) and candidate
+                if (task := queue.get_task(candidate)) is not None
+                and task.task_type == "review"
+            ), None)
+            if prior_review is not None:
+                prior_result = queue.get_result(prior_review.task_id)
+                if prior_result is not None:
+                    round_no = max(1, prior_fix_round)
+                    review_context["prior_review_task_id"] = prior_review.task_id
+                    review_context["instructions"] += (
+                        f"\n\nPRIOR REVIEW FINDINGS (round {round_no}, from "
+                        f"{prior_review.task_id}) - verify each is resolved at the "
+                        "current head; state per finding resolved/unresolved:\n"
+                        + _findings_block(prior_result.findings or [], prior_review.task_id)
+                    )
         if enforce_risk_tier:
             review_context.update(risk)
         if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
