@@ -54,6 +54,21 @@ def test_review_prompt_contains_pinned_contract(queue):
     assert "PR_READY" not in prompt
 
 
+def test_review_prompt_names_observed_comment_channel_and_finding_rules(queue):
+    prompt = cloud.build_cloud_task_prompt(_review(queue), repo=REPO)
+    assert "gh pr comment" in prompt
+    assert "gh pr review" in prompt
+    assert "- " in prompt
+    assert "path:line" in prompt
+    assert "other '- ' lines" in prompt
+    assert "line number" in prompt
+    with pytest.raises(ValueError, match="finding is malformed"):
+        cloud.parse_cloud_review_comment(
+            _comment().replace("Summary:", "- Tests run: 35 passed\nSummary:"),
+            task_id="review-712", reviewed_sha=SHA, pr_number=PR,
+        )
+
+
 @pytest.mark.parametrize("verdict,findings", [
     ("approve", ""), ("request_changes", f"- {FINDING}\n"),
 ])
@@ -117,6 +132,50 @@ def test_stale_review_without_comment_uses_fallback(queue, monkeypatch):
         submit_review_result_fn=lambda *_: pytest.fail("stale review submitted"),
     )
     assert outcome.action == "failed"
+
+
+@pytest.mark.parametrize("failure", ["raises", "held"])
+def test_stale_review_with_unaccepted_result_uses_fallback(queue, monkeypatch, failure):
+    task = _review(queue)
+    monkeypatch.setenv(cloud._ENV_STALE_SECONDS, "1")
+    monkeypatch.setattr(queue, "get_dispatched_at", lambda _: time.time() - 99999)
+    fallback_calls = []
+    monkeypatch.setattr("agent_crew.pipeline.auto_fallback_failed_task",
+                        lambda *args, **kwargs: fallback_calls.append(args))
+
+    def submit(*_args):
+        if failure == "raises":
+            raise RuntimeError("result rejected")
+        return {"held": "no_artifact"}
+
+    outcome = cloud.reconcile_cloud_dispatch(
+        queue, task,
+        pr_comments_fn=lambda pr, repo=None: [{"body": _comment()}],
+        submit_review_result_fn=submit,
+    )
+    assert outcome.action == "failed"
+    assert queue.get_task(task.task_id).status == "failed"
+    assert len(fallback_calls) == 1
+
+
+@pytest.mark.parametrize("failure", ["raises", "held"])
+def test_recent_review_with_unaccepted_result_can_retry(queue, monkeypatch, failure):
+    task = _review(queue)
+    monkeypatch.setenv(cloud._ENV_STALE_SECONDS, "3600")
+    monkeypatch.setattr(queue, "get_dispatched_at", lambda _: time.time() - 5)
+
+    def submit(*_args):
+        if failure == "raises":
+            raise RuntimeError("temporary result error")
+        return {"held": "temporary_hold"}
+
+    outcome = cloud.reconcile_cloud_dispatch(
+        queue, task,
+        pr_comments_fn=lambda pr, repo=None: [{"body": _comment()}],
+        submit_review_result_fn=submit,
+    )
+    assert outcome.action == "still_dispatched"
+    assert queue.get_task(task.task_id).status == "in_progress"
 
 
 def test_cloud_is_disabled_by_default(monkeypatch):

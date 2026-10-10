@@ -274,11 +274,16 @@ def build_cloud_task_prompt(task: TaskRequest, *, repo: str = "") -> str:
             f"reviewed_sha {reviewed_sha}",
             "Description:", task.description,
             "Check out the exact reviewed_sha above, verify HEAD equals it, review the diff, "
-            "and run the relevant tests. Post exactly ONE PR comment whose first line is "
+            "and run the relevant tests. Post exactly ONE PR comment using "
+            "gh pr comment (not gh pr review --comment) whose first line is "
             "[agent_crew review] verdict: approve|request_changes (choose one).",
             f"Include a line: reviewed_sha {reviewed_sha}",
             "For request_changes, list actionable findings as "
-            "- HIGH|MED|LOW path:line - text. For approve, include no findings.",
+            "- HIGH|MED|LOW path:line - text. Every finding needs a verified "
+            "path and line number; do not invent one. If a blocker cannot be "
+            "anchored to a line, do not post a marked verdict; let local review "
+            "handle it. For approve, include no findings. Put test notes in "
+            "plain prose, with no other '- ' lines.",
             f"Include the exact marker line: <!-- agent_crew:cloud-review task={task.task_id} sha={reviewed_sha} -->",
             "No push, no merge, no GitHub review-state approval, and no file changes.",
         ])
@@ -578,6 +583,7 @@ def _reconcile_cloud_review(
     context = task.context if isinstance(task.context, dict) else {}
     pr_number = context.get("pr_number") or task.pr_number
     reviewed_sha = context.get("reviewed_sha") or ""
+    retry_detail = ""
     if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
             or not isinstance(reviewed_sha, str)
             or not re.fullmatch(r"[0-9a-fA-F]{40}", reviewed_sha)):
@@ -600,32 +606,31 @@ def _reconcile_cloud_review(
                 return CloudReconciliationOutcome(task.task_id, "failed", pr_number=pr_number,
                                                   detail=str(exc))
             if submit_review_result_fn is None:
-                return CloudReconciliationOutcome(task.task_id, "still_dispatched",
-                                                  pr_number=pr_number,
-                                                  detail="result handler unavailable")
-            # The server's normal result handler consumes this flag to avoid
-            # reposting the cloud session's already published review comment.
-            queue.patch_context(task.task_id, {"cloud_review_comment_confirmed": True})
-            try:
-                acknowledgement = submit_review_result_fn(task.task_id, result)
-            except Exception:
-                logger.exception("claude_cloud: review result handler failed for %s", task.task_id)
-                return CloudReconciliationOutcome(task.task_id, "still_dispatched",
-                                                  pr_number=pr_number,
-                                                  detail="result handler failed; will retry")
-            if isinstance(acknowledgement, dict) and acknowledgement.get("held"):
-                return CloudReconciliationOutcome(task.task_id, "still_dispatched",
-                                                  pr_number=pr_number,
-                                                  detail=f"result held: {acknowledgement['held']}")
-            return CloudReconciliationOutcome(task.task_id, "review_completed",
-                                              pr_number=pr_number)
+                retry_detail = "result handler unavailable"
+            else:
+                # The server's normal result handler consumes this flag to avoid
+                # reposting the cloud session's already published review comment.
+                queue.patch_context(task.task_id, {"cloud_review_comment_confirmed": True})
+                try:
+                    acknowledgement = submit_review_result_fn(task.task_id, result)
+                except Exception:
+                    logger.exception("claude_cloud: review result handler failed for %s", task.task_id)
+                    retry_detail = "result handler failed; will retry"
+                else:
+                    if isinstance(acknowledgement, dict) and acknowledgement.get("held"):
+                        retry_detail = f"result held: {acknowledgement['held']}"
+                    else:
+                        return CloudReconciliationOutcome(task.task_id, "review_completed",
+                                                          pr_number=pr_number)
     age = time.time() - queue.get_dispatched_at(task.task_id)
     if age > cloud_stale_seconds():
         _fail_closed_dispatch(queue, task, "review",
-                              f"cloud_review_stale: no marked comment after {int(age)}s")
+                              f"cloud_review_stale: {retry_detail or 'no marked comment'} "
+                              f"after {int(age)}s")
         return CloudReconciliationOutcome(task.task_id, "failed", pr_number=pr_number,
                                           detail="stale cloud review")
-    return CloudReconciliationOutcome(task.task_id, "still_dispatched", pr_number=pr_number)
+    return CloudReconciliationOutcome(task.task_id, "still_dispatched", pr_number=pr_number,
+                                      detail=retry_detail)
 
 
 def reconcile_cloud_dispatch(
