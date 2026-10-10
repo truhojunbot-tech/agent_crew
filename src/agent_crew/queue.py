@@ -4993,6 +4993,20 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def has_superseding_review(self, parent_task_id: str) -> bool:
+        """Whether a newer review supersedes this task's reviewed PR head."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE task_type='review' "
+                "AND CASE WHEN json_valid(context) "
+                "THEN json_extract(context, '$.superseded_review') END=? LIMIT 1",
+                (parent_task_id,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def outbox_claim(self, parent_task_id: str, owner: str,
                      ttl: Optional[float] = None) -> Optional[dict]:
         """lease CAS로 outbox 행을 claim. pending이거나 **만료된 replaying**(crash 회수)일 때만

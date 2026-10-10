@@ -7890,10 +7890,8 @@ def create_app(
                         disposition, reason = "pending", "parent_unavailable"
                     else:
                         ctx = task.context if isinstance(task.context, dict) else {}
-                        if (task.status in ("cancelled", "superseded") or
-                                ctx.get("superseded_by") or
-                                ctx.get("superseded_by_task_id") or
-                                ctx.get("superseded")):
+                        if (task.status == "cancelled" or
+                                q().has_superseding_review(parent)):
                             disposition, reason = "expired", "parent_cancelled_or_superseded"
                         else:
                             rd = json.loads(claim["result_json"])

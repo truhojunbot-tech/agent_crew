@@ -11,6 +11,7 @@ from agent_crew import cli, pause
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
+from agent_crew.pipeline import stale_review_task_id
 
 
 @pytest.fixture
@@ -117,13 +118,41 @@ def test_cancelled_parent_expires_without_replay(pending):
         assert queue.outbox_get("impl-709")["state"] == "expired"
 
 
-def test_superseded_parent_expires_without_replay(pending):
-    queue, _ = pending
-    queue.patch_context("impl-709", {"superseded_by": "impl-new"})
-    _resume(queue)
-    with TestClient(_app(queue)):
-        assert not _reviews(queue)
-        assert queue.outbox_get("impl-709")["state"] == "expired"
+def test_superseded_parent_expires_without_replay(tmp_path, monkeypatch):
+    """A stale review's real re-dispatch marker makes its outbox unsafe to replay."""
+    from agent_crew import github
+
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setattr(pause, "GLOBAL_PAUSE_FILE", str(tmp_path / "global-pause.json"))
+    old_head = "a" * 40
+    new_head = "b" * 40
+    monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: new_head)
+    monkeypatch.setattr(github, "post_review_comment", lambda **k: None)
+    monkeypatch.setattr(github, "pr_state", lambda *a, **k: "open")
+    project_dir = tmp_path / "testproj"
+    project_dir.mkdir()
+    queue = TaskQueue(str(project_dir / "tasks.db"))
+    queue.enqueue(TaskRequest(
+        task_id="review-stale", task_type="review", description="Review PR #5652",
+        branch="main", project="testproj",
+        context={"pr_number": 5652, "repo": "owner/repo", "reviewed_sha": old_head,
+                 "coordinator_managed": True, "risk_tier": 2},
+    ))
+    with TestClient(_app(queue)) as client:
+        response = client.post("/tasks/review-stale/result", json={
+            "task_id": "review-stale", "status": "completed",
+            "summary": "Review found a blocker in the current PR changes",
+            "verdict": "request_changes", "findings": ["fix the stale code"],
+            "pr_number": 5652,
+        }, headers={"X-Agent-Crew-Project": "testproj"})
+        assert response.status_code == 200, response.text
+        successor = queue.get_task(stale_review_task_id(5652, new_head))
+        assert successor is not None
+        assert successor.context["superseded_review"] == "review-stale"
+        assert queue.outbox_reopen("review-stale")
+        assert queue.outbox_get("review-stale")["state"] == "pending"
+        assert client.post("/admin/replay-suppressed").status_code == 200
+        assert queue.outbox_get("review-stale")["state"] == "expired"
 
 
 def test_unknown_pr_state_leaves_row_pending(pending, monkeypatch):
