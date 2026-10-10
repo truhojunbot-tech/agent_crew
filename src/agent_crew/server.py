@@ -29,8 +29,10 @@ from agent_crew import claude_transcript as _claude_transcript
 from agent_crew.anomaly import check_wrong_repo
 from agent_crew import context_pack as _cpack
 from agent_crew.memory import (
+    MemoryItem,
     MemoryProvider,
     MemoryRequest,
+    MemoryResult,
     NullMemoryProvider,
     shadow_retrieve_bounded,
     shadow_telemetry,
@@ -3040,6 +3042,23 @@ def create_app(
                 backup_daily(_ranked_memory.path)
             except (OSError, ValueError, sqlite3.Error) as exc:
                 logger.warning("hybrid memory unavailable: %s", exc)
+
+    def _ranked_timeout_response(scope, marker, response_state):
+        """Return only effective head rows when the ranked worker times out."""
+        _ranked_memory._record_fallback(marker)
+        try:
+            rows = _ranked_memory.effective_rows(
+                list((response_state.get("head") or {}).get("records", [])), scope)
+        except sqlite3.Error:
+            rows = []
+        rendered = json.dumps(rows, sort_keys=True, ensure_ascii=False).encode()
+        return {"head": rows, "middle": [], "mode": "fallback",
+                "pending_vectors": response_state.get("pending", 0),
+                "latency_ms": 300.0, "trimmed_bytes": 0,
+                "standing_trimmed": (response_state.get("head") or {}).get("standing_trimmed", 0),
+                "model_id": _ranked_memory.model_id,
+                "head_hash": hashlib.sha256(rendered).hexdigest(),
+                "head_bytes": len(rendered), "superseded_served": 0}
     if shadow_memory_enabled is None:
         shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
             "1", "true", "yes",
@@ -5382,12 +5401,13 @@ def create_app(
                 logger.exception(
                     "dispatcher: context pack shadow failed for %s", task.task_id)
 
-        # #322: Shadow-only optional durable-memory observation.  This sits
+        # #322/A2: Durable-memory observation. The legacy provider remains
+        # optional; the hybrid backend enables this seam when configured. It sits
         # after the baseline message (including any Context Pack) is complete,
         # and its result is deliberately never assigned to `message`, `task`,
         # routing, retry, or context-policy state.  A provider failure is
-        # converted to telemetry by `shadow_retrieve`, not an execution error.
-        if shadow_memory_enabled:
+        # converted to telemetry, not an execution error.
+        if shadow_memory_enabled or _ranked_memory is not None:
             try:
                 try:
                     _predecessors, _lineage_pr = await asyncio.to_thread(
@@ -5397,8 +5417,7 @@ def create_app(
                     _parent = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
                     _predecessors = (_parent,) if isinstance(_parent, str) and _parent else ()
                     _lineage_pr = task.pr_number or (_ctx.get("pr_number") if isinstance(_ctx, dict) else None)
-                _shadow_result = shadow_retrieve_bounded(
-                    _memory_provider, MemoryRequest(
+                _memory_request = MemoryRequest(
                         project=_project,
                         task_id=task.task_id,
                         issue=str(_ctx.get("issue", "")) if isinstance(_ctx, dict) else "",
@@ -5415,8 +5434,49 @@ def create_app(
                         predecessor_task_ids=_predecessors,
                         pr_number=_lineage_pr,
                         limit=min(SHADOW_RETRIEVAL_MAX_ROWS, max(10, len(_predecessors))),
-                    ), shadow_memory_timeout_seconds,
-                )
+                    )
+                _ranked_receipt = None
+                if _ranked_memory is not None:
+                    from agent_crew.memory_runtime import MemoryScope
+                    _fleet = str(_ctx.get("fleet") or os.getenv("AGENT_CREW_MEMORY_FLEET", ""))
+                    if not _fleet:
+                        logger.warning(
+                            "dispatcher: hybrid memory fleet unset for task=%s; "
+                            "fleet-scoped records will be omitted", task.task_id)
+                    _ranked_scope = MemoryScope(
+                        fleet=_fleet, project=_project,
+                        issue=str(_ctx.get("issue", "")),
+                        task_id=task.task_id,
+                        context_generation=_ctx_info["context_generation"])
+                    _marker, _state = threading.Event(), {}
+                    try:
+                        _ranked_receipt = await asyncio.wait_for(asyncio.to_thread(
+                            _ranked_memory.retrieve_ranked, _ranked_scope,
+                            task.description, role, _memory_request.limit, 16000,
+                            fallback_marker=_marker, response_state=_state), timeout=.300)
+                    except asyncio.TimeoutError:
+                        _ranked_receipt = _ranked_timeout_response(
+                            _ranked_scope, _marker, _state)
+                    except Exception as exc:
+                        logger.warning("dispatcher: ranked memory failed for %s: %s",
+                                       task.task_id, exc)
+                        _ranked_receipt = _ranked_timeout_response(
+                            _ranked_scope, _marker, {})
+                    _rows = [*_ranked_receipt["head"], *_ranked_receipt["middle"]]
+                    _shadow_result = MemoryResult(
+                        provider="memory_runtime", backend="hybrid",
+                        state="results" if _rows else "empty",
+                        latency_ms=_ranked_receipt["latency_ms"],
+                        items=tuple(MemoryItem(
+                            item_id=row["key"], project=_project,
+                            memory_type=row["layer"],
+                            source_ref=str(row["value"].get("source_ref") or row["key"]),
+                            excerpt=str(row["value"].get("text") or ""), rank=index,
+                        ) for index, row in enumerate(_rows, 1)),
+                    )
+                else:
+                    _shadow_result = shadow_retrieve_bounded(
+                        _memory_provider, _memory_request, shadow_memory_timeout_seconds)
                 try:
                     q().record_required_context_recalled(
                         task.task_id,
@@ -5427,6 +5487,11 @@ def create_app(
                                      task.task_id)
                 _shadow_event = {
                     **shadow_telemetry(_shadow_result),
+                    **({"retrieval_mode": _ranked_receipt["mode"],
+                        "superseded_served": _ranked_receipt["superseded_served"],
+                        "head_bytes": _ranked_receipt["head_bytes"],
+                        "fleet": _ranked_scope.fleet}
+                       if _ranked_receipt is not None else {}),
                     "task_id": task.task_id,
                     "project": _project,
                     "role": role,
@@ -6786,16 +6851,7 @@ def create_app(
                 fallback_marker=fallback_marker, response_state=response_state),
                 timeout=.300)
         except asyncio.TimeoutError:
-            _ranked_memory._record_fallback(fallback_marker)
-            head = response_state.get("head") or {
-                "records": [], "standing_trimmed": 0,
-                "head_hash": hashlib.sha256(b"[]").hexdigest(),
-            }
-            return {"head": head["records"], "middle": [], "mode": "fallback",
-                    "pending_vectors": response_state.get("pending", 0),
-                    "latency_ms": 300.0, "trimmed_bytes": 0,
-                    "standing_trimmed": head["standing_trimmed"],
-                    "model_id": _ranked_memory.model_id, "head_hash": head["head_hash"]}
+            return _ranked_timeout_response(scope, fallback_marker, response_state)
 
     @app.get("/health")
     def health():
