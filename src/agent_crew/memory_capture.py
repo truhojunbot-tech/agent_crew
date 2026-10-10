@@ -6,8 +6,11 @@ This module only writes observations. It does not promote procedures or enable
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
+import re
+import subprocess
 from contextlib import closing, nullcontext
 from pathlib import Path
 import sqlite3
@@ -318,6 +321,160 @@ def backfill_task_outcomes(storage: SQLiteMemoryStorage,
             for batch in batches.values():
                 if batch:
                     storage.put_many_shadow(batch)
+    return changed
+
+
+def _pointer_text(text: str, limit: int) -> str:
+    """Trim a UTF-8 field without splitting a multibyte character."""
+    return text.encode("utf-8")[:max(limit, 0)].decode("utf-8", errors="ignore")
+
+
+def capture_document_pointer(storage: SQLiteMemoryStorage, *, repo: str,
+                             project: str, path: str, commit: str,
+                             content: str, write: bool = True,
+                             source_state: str = "committed") -> MemoryRecord:
+    """Write a small decision-document pointer, not the source contents."""
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        raise ValueError("document repo must be an owner/repo slug")
+    if (not path or path.startswith("/") or ".." in Path(path).parts or
+            len(path.encode("utf-8")) > 300):
+        raise ValueError("document path must be a short repository-relative path")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("document commit must be a full Git SHA")
+    canonical = canonical_project(project, repo=repo)
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    heading = next((line.lstrip("# ").strip() for line in lines
+                    if line.startswith("#")), "")
+    title = _pointer_text(heading or Path(path).stem.replace("_", " "),
+                          min(100, 398 - len(path.encode("utf-8"))))
+    summary = next((line for line in lines if line != heading and not line.startswith("#")), "")
+    if path.endswith(".json"):
+        try:
+            document = json.loads(content)
+            summary = str(next((document[key] for key in ("summary", "decision", "verdict", "pass_if")
+                                if key in document), summary)) if isinstance(document, dict) else summary
+        except (TypeError, ValueError):
+            pass
+    summary = _pointer_text(" ".join(summary.split()), 200)
+    allowance = 400 - len(path.encode("utf-8")) - len(title.encode("utf-8")) - 2
+    body = f"{title}\n{_pointer_text(summary, allowance)}\n{path}"
+    value = {"kind": "doc_pointer", "project": canonical, "repo": repo,
+             "path": path, "commit": commit, "title": title,
+             "summary": _pointer_text(summary, allowance), "body": body,
+             "source_ref": f"{repo}:{path}@{commit}", "source_state": source_state,
+             "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+    record = MemoryRecord("episodic", f"doc:{repo}:{path}@{commit}", value,
+                          MemoryScope(project=canonical))
+    if write:
+        storage.put_many_shadow([record])
+    return record
+
+
+def _decision_document_path(path: str) -> bool:
+    """Select committed governance, ADR, spec, prereg, and verdict sources."""
+    return (path == "CLAUDE.md" or
+            (path.startswith(("governance/adr/", "docs/decisions/", "docs/specs/"))
+             and path.endswith(".md")) or
+            (path.startswith("docs/research/") and "prereg" in path.lower()
+             and path.endswith(".md")) or
+            (path.startswith("research/verdicts/") and path.endswith(".json")))
+
+
+def backfill_document_pointers(storage: SQLiteMemoryStorage,
+                               repos: list[tuple[str, str]],
+                               explicit_files: dict[str, set[str]] | None = None,
+                               historic_files: dict[str, list[tuple[str, str]]] | None = None) -> int:
+    """Idempotently scan explicit Git repositories and capture committed docs.
+
+    A later committed file revision gets its own key. Explicit untracked files
+    use the repo snapshot commit and are marked as working files; unchanged
+    content keeps its existing pointer across unrelated commits. Sources are
+    only read.
+    """
+    changed = 0
+    with closing(sqlite3.connect(storage.path)) as memory:
+        for repo, root in repos:
+            root_path = Path(root).expanduser().resolve()
+            def git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", "-C", str(root_path), *args], text=True,
+                    stderr=subprocess.DEVNULL).strip()
+
+            ref = next((candidate for candidate in ("HEAD", "origin/main")
+                        if subprocess.run(["git", "-C", str(root_path), "rev-parse",
+                                           "--verify", "--quiet", candidate],
+                                          capture_output=True).returncode == 0), None)
+            if ref is None:
+                raise ValueError(f"no committed Git ref in {root_path}")
+            project = canonical_project(repo.rsplit("/", 1)[-1], repo=repo)
+            tracked = set(git("ls-tree", "-r", "--name-only", ref).splitlines())
+            paths = sorted({path for path in tracked if _decision_document_path(path)} |
+                           (explicit_files or {}).get(repo, set()))
+            sources = [(path, ref) for path in paths]
+            sources.extend((path, revision) for path, revision in
+                           (historic_files or {}).get(repo, []))
+            batch: list[MemoryRecord] = []
+            for path, source_ref in sources:
+                if (not path or path.startswith("/") or ".." in Path(path).parts):
+                    raise ValueError(f"invalid explicit document path: {path!r}")
+                source_state = "committed" if source_ref != ref or path in tracked else "working_file"
+                if source_state == "committed":
+                    if source_ref == ref:
+                        commit = git("log", "-1", "--format=%H", ref, "--", path)
+                    else:
+                        commit = git("rev-parse", "--verify", f"{source_ref}^{{commit}}")
+                    if not commit:
+                        continue
+                    content = subprocess.check_output(
+                        ["git", "-C", str(root_path), "show", f"{source_ref}:{path}"],
+                        text=True, stderr=subprocess.DEVNULL)
+                else:
+                    # Explicit local verdicts can be untracked. Anchor the
+                    # pointer to the repo snapshot and record their content
+                    # digest; never pretend that HEAD contains the file.
+                    commit = git("rev-parse", ref)
+                    content = (root_path / path).read_text(encoding="utf-8")
+                record = capture_document_pointer(
+                    storage, repo=repo, project=project, path=path,
+                    commit=commit, content=content, write=False,
+                    source_state=source_state)
+                if source_state == "working_file":
+                    # HEAD is only an anchor for an untracked file. An
+                    # unrelated commit must not create another pointer to
+                    # identical bytes, and changed bytes replace the old
+                    # working-file pointer rather than accumulating forever.
+                    previous = memory.execute(
+                        "SELECT key,value FROM adr001_memory "
+                        "WHERE json_extract(value,'$.kind')='doc_pointer' "
+                        "AND json_extract(value,'$.source_state')='working_file' "
+                        "AND json_extract(value,'$.repo')=? "
+                        "AND json_extract(value,'$.path')=?",
+                        (repo, path)).fetchall()
+                    if any(json.loads(value).get("content_sha256") ==
+                           record.value["content_sha256"] for _, value in previous):
+                        continue
+                    storage.put_many_shadow([record])
+                    memory.execute(
+                        "DELETE FROM adr001_memory WHERE key<>? "
+                        "AND json_extract(value,'$.kind')='doc_pointer' "
+                        "AND json_extract(value,'$.source_state')='working_file' "
+                        "AND json_extract(value,'$.repo')=? "
+                        "AND json_extract(value,'$.path')=?",
+                        (record.key, repo, path))
+                    memory.commit()
+                    changed += 1
+                    continue
+                before = memory.execute("SELECT value FROM adr001_memory WHERE key=?",
+                                        (record.key,)).fetchone()
+                if before is not None and json.loads(before[0]) == record.value:
+                    continue
+                batch.append(record)
+                changed += 1
+                if len(batch) >= 100:
+                    storage.put_many_shadow(batch)
+                    batch.clear()
+            if batch:
+                storage.put_many_shadow(batch)
     return changed
 
 
