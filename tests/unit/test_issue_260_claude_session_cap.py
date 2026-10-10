@@ -173,6 +173,8 @@ def _dispatch_cmd(tmp_path, monkeypatch, agent, *, policy="resume", over=False, 
 
 
 def test_claude_resumes_when_the_policy_says_resume(tmp_path, monkeypatch, *, unused_tcp_port):
+    # This test exercises the original worktree-wide policy explicitly.
+    monkeypatch.setenv("AGENT_CREW_CLAUDE_CONTEXT_SCOPE", "worktree")
     cmd = _dispatch_cmd(tmp_path, monkeypatch, "claude", unused_tcp_port=unused_tcp_port)
 
     assert cmd[0] == "claude" and "--continue" in cmd
