@@ -3272,6 +3272,7 @@ def create_app(
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
+    watchdog_expiry_counts: dict[str, int] = {}
     #: G_DT: tmux pushes refused because the pane runs no agent, by verdict.
     delivery_guard_refusals: dict[str, int] = {}
 
@@ -3808,6 +3809,7 @@ def create_app(
     # Expose watchdog tick on app.state so tests can drive it deterministically
     # without the asyncio loop. Production code never reads this attribute.
     app.state.reminded_task_ids = reminded_task_ids
+    app.state.watchdog_expiry_counts = watchdog_expiry_counts
 
     def _panes_with_in_progress(exclude_task_id: str = "") -> set[str]:
         """지금 `in_progress` 인 task 들이 점유 중인 **pane 집합**.
@@ -4235,16 +4237,55 @@ def create_app(
                     _try_push_next(_TYPE_TO_ROLE.get(successor.task_type, "implementer"))
         except Exception:
             logger.exception("watchdog: owner approval re-admission failed")
-        if not pane_map:
-            return actions
-
         rows = q().list_in_progress_with_activity()
         in_progress_ids = {r["task_id"] for r in rows}
         # Drop completed/failed tasks from the reminder dedupe set so a recycled
         # task_id (or a re-enqueued retry) doesn't get its reminder suppressed.
         reminded_task_ids.intersection_update(in_progress_ids)
 
+        # Dispatcher claims own a subprocess rather than a tmux conversation.
+        # A busy pane belongs to whichever task runs there now; it must never
+        # refresh an older dispatcher row's activity. Expire a displaced row
+        # immediately, or an idle row after its live-process leash, even when
+        # no pane reminder was delivered.
         for row in rows:
+            if row.get("claim_source") != "dispatcher":
+                continue
+            task_id = row["task_id"]
+            pane_id = _resolve_pane_for_row(row)
+            later = next((candidate["task_id"] for candidate in
+                          q().later_dispatcher_tasks_same_role(task_id)
+                          if _resolve_pane_for_row(candidate) == pane_id), None) if pane_id else None
+            last_activity = row["last_activity_at"] or row.get("dispatched_at") or now
+            idle_for = max(0.0, now - last_activity)
+            effective_timeout = timeout_seconds
+            if pane_id:
+                try:
+                    if pane_liveness_fn(pane_id) == "alive":
+                        effective_timeout *= alive_timeout_multiplier
+                except Exception:
+                    logger.exception("watchdog: dispatcher pane liveness failed for %s", pane_id)
+            reason = ("dispatcher_superseded" if later else
+                      "dispatcher_idle" if idle_for >= effective_timeout else "")
+            if not reason:
+                continue
+            details = {"idle_seconds": round(idle_for, 1),
+                       "threshold_seconds": effective_timeout,
+                       "pane_id": pane_id, "later_task_id": later}
+            if _fail_if_active(task_id, f"watchdog_{reason}",
+                               status="timed_out", details=details):
+                actions["timed_out"].append(task_id)
+                watchdog_expiry_counts[reason] = watchdog_expiry_counts.get(reason, 0) + 1
+                logger.error("WATCHDOG TIMEOUT: task_id=%s reason=%s "
+                             "idle_for=%.0fs count=%d", task_id, reason,
+                             idle_for, watchdog_expiry_counts[reason])
+
+        if not pane_map:
+            return actions
+
+        for row in rows:
+            if row.get("claim_source") == "dispatcher":
+                continue
             task_id = row["task_id"]
             pane_id = _resolve_pane_for_row(row)
             if not pane_id:
