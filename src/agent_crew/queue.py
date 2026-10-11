@@ -635,6 +635,10 @@ _TYPE_TO_ROLE = {
     "discuss": "panel",
 }
 
+# Bump when tasks.db DDL or CLI write semantics change. The CLI and server
+# compare this protocol version before the CLI opens a served DB for writing.
+QUEUE_SCHEMA_VERSION = 1
+
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
     id         TEXT PRIMARY KEY,
