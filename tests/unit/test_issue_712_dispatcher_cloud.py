@@ -18,9 +18,9 @@ SHA = "a" * 40
 SESSION = "session_abc12345"
 
 
-def _state(tmp_path):
+def _state(tmp_path, reviewer_agent="claude_cloud"):
     roles = []
-    for role, agent in (("implementer", "codex"), ("reviewer", "claude_cloud"),
+    for role, agent in (("implementer", "codex"), ("reviewer", reviewer_agent),
                         ("tester", "gemini")):
         worktree = tmp_path / f"wt_{role}"
         worktree.mkdir()
@@ -28,7 +28,7 @@ def _state(tmp_path):
         roles.append({"role": role, "agent": agent, "worktree": str(worktree)})
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew", "role_agents": {
-        "implementer": "codex", "reviewer": "claude_cloud", "tester": "gemini"},
+        "implementer": "codex", "reviewer": reviewer_agent, "tester": "gemini"},
         "roles": roles}))
     return str(path)
 
@@ -281,6 +281,75 @@ def test_shadow_requeue_uses_one_paid_session(tmp_path, monkeypatch):
     assert agents[:3] == ["claude"] * 3
     assert len(launched) == 1
     assert queue.count_cloud_reviews_started_since(time.time() - 60) == 1
+
+
+@pytest.mark.parametrize("enabled,shadow,expected_launches", [
+    ("1", "1", 1),
+    ("0", "0", 0),
+])
+def test_local_reviewer_gets_one_shadow_across_requeues(
+        tmp_path, monkeypatch, enabled, shadow, expected_launches):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", enabled)
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", shadow)
+    monkeypatch.delenv("AGENT_CREW_CLOUD_MAX_PER_DAY", raising=False)
+    launches = []
+    local_dispatches = []
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        launches.append(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "session_id": SESSION, "url": f"https://claude.ai/code/{SESSION}"}))
+
+    def cooldown(_self, agent):
+        local_dispatches.append(agent)
+        return time.time() + 60 if agent == "claude" else None
+
+    monkeypatch.setattr(cloud, "_default_run", run)
+    monkeypatch.setattr("agent_crew.server.QuotaBudgetProvider.active_cooldown_until", cooldown)
+    monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_agent="claude"),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: len(local_dispatches) >= 3)
+    assert local_dispatches[:3] == ["claude"] * 3
+    assert len(launches) == expected_launches
+    assert bool(queue.get_task_context("review-cloud").get("cloud_shadow_session_id")) == bool(expected_launches)
+
+
+def test_shadow_launch_error_does_not_hold_local_reviewer_slot(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "1")
+    attempts = []
+    local_dispatches = []
+
+    def raising_launch(*_args):
+        attempts.append(True)
+        raise RuntimeError("shadow launch failed")
+
+    def cooldown(_self, agent):
+        local_dispatches.append(agent)
+        return time.time() + 60 if agent == "claude" else None
+
+    monkeypatch.setattr(cloud, "launch_shadow_review", raising_launch)
+    monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
+    monkeypatch.setattr("agent_crew.server.QuotaBudgetProvider.active_cooldown_until", cooldown)
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_agent="claude"),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: len(attempts) >= 2, timeout=1.0)
+        _wait_for(lambda: len(local_dispatches) >= 2, timeout=1.0)
+    # A second local dispatch requires the first attempt to release its slot.
+    assert local_dispatches[:2] == ["claude", "claude"]
 
 
 def test_cloud_selection_ignores_unclaimable_and_respects_priority(tmp_path):

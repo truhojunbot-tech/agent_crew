@@ -6304,9 +6304,14 @@ def create_app(
                         if _target_wt:
                             active_worktrees.add(_target_wt)
                         task_slots[task.task_id] = _slot
-                        if (_cloud_local_fallback and _claude_cloud.cloud_shadow_enabled()
-                                and role == "reviewer"):
-                            await asyncio.to_thread(_claude_cloud.launch_shadow_review, q(), task)
+                        if _claude_cloud.cloud_shadow_enabled() and role == "reviewer":
+                            try:
+                                await asyncio.to_thread(_claude_cloud.launch_shadow_review, q(), task)
+                            except Exception:
+                                logger.exception(
+                                    "dispatcher: cloud shadow launch failed task=%s",
+                                    task.task_id,
+                                )
 
                         async def _run(
                             t: TaskRequest = task, r: str = role, s: str = _slot,
