@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Backfill ADR-001 task outcomes and audit frozen task-reference coverage.
+"""Backfill ADR-001 task outcomes and document pointers, then audit coverage.
 
 Pass copies of crew databases when evaluating a live corpus. The command
 never writes a task DB or an eval set; only --memory-db is writable.
@@ -12,7 +12,7 @@ import re
 import sqlite3
 from pathlib import Path
 
-from agent_crew.memory_capture import backfill_task_outcomes
+from agent_crew.memory_capture import backfill_document_pointers, backfill_task_outcomes
 from agent_crew.memory_runtime import SQLiteMemoryStorage
 
 
@@ -46,6 +46,15 @@ def count_available_refs(memory_db: str, eval_set: str) -> tuple[int, int, list[
                             and value.get("task_id") in task_ids
                             and value.get("project") == case["project"]
                             for _, value in rows)
+            elif kind in ("adr_spec", "blackboard_result") or (
+                    kind == "owner_directive" and "CLAUDE.md" in ref):
+                revisions = re.findall(r"(?:commit|amendment)\s+([0-9a-f]{7,40})", ref, re.I)
+                found = any(value.get("kind") == "doc_pointer"
+                            and value.get("project") == case["project"]
+                            and value.get("path") in ref
+                            and (not revisions or any(str(value.get("commit") or "").startswith(rev)
+                                                      for rev in revisions))
+                            for _, value in rows)
             else:
                 # Non-task sources must exist by their own exact identity.
                 stored_key = ref.removeprefix("adr001:")
@@ -65,12 +74,39 @@ def main() -> None:
     parser.add_argument("--memory-db", required=True, help="writable ADR-001 DB (use a copy)")
     parser.add_argument("--tasks-db", action="append", default=[],
                         help="crew tasks DB to read; repeat for each project (use copies)")
+    parser.add_argument("--repo", action="append", default=[], metavar="OWNER/REPO=DIR",
+                        help="committed decision-document repository to read; repeat per repo")
+    parser.add_argument("--file", action="append", default=[], metavar="OWNER/REPO:PATH",
+                        help="additional repo-relative document path; explicit working files carry a content hash")
+    parser.add_argument("--historic", action="append", default=[], metavar="OWNER/REPO:PATH@REV",
+                        help="capture a document at an explicitly named historical Git commit")
     parser.add_argument("--eval-set", required=True, help="frozen eval JSON (read only)")
     args = parser.parse_args()
     storage = SQLiteMemoryStorage.existing(args.memory_db)
     changed = backfill_task_outcomes(storage, args.tasks_db) if args.tasks_db else 0
+    repos = []
+    for spec in args.repo:
+        slug, separator, root = spec.partition("=")
+        if not separator or not slug or not root:
+            parser.error("--repo requires OWNER/REPO=DIR")
+        repos.append((slug, root))
+    explicit_files: dict[str, set[str]] = {}
+    for spec in args.file:
+        slug, separator, path = spec.partition(":")
+        if not separator or not slug or not path or slug not in dict(repos):
+            parser.error("--file requires OWNER/REPO:PATH and a matching --repo")
+        explicit_files.setdefault(slug, set()).add(path)
+    historic_files: dict[str, list[tuple[str, str]]] = {}
+    for spec in args.historic:
+        slug, separator, rest = spec.partition(":")
+        path, at, revision = rest.rpartition("@")
+        if not separator or not at or not path or not revision or slug not in dict(repos):
+            parser.error("--historic requires OWNER/REPO:PATH@REV and a matching --repo")
+        historic_files.setdefault(slug, []).append((path, revision))
+    doc_changed = backfill_document_pointers(
+        storage, repos, explicit_files, historic_files) if repos else 0
     hits, total, missing = count_available_refs(args.memory_db, args.eval_set)
-    print(f"changed={changed} expected refs available={hits}/{total}")
+    print(f"task_changed={changed} doc_changed={doc_changed} expected refs available={hits}/{total}")
     for case_id, refs in missing:
         print(f"missing {case_id}: {refs}")
 
