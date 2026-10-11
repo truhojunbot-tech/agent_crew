@@ -218,6 +218,25 @@ def test_branch_standing_review_from_other_lineage_cannot_suppress(monkeypatch):
     assert decision.reason == "standing_review_other_lineage"
 
 
+@pytest.mark.parametrize("lookup,reason", [
+    (None, "standing_lineage_unverified"),
+    (lambda task_id: (_ for _ in ()).throw(RuntimeError("lineage unavailable")),
+     "standing_lineage_lookup_failed"),
+    (lambda task_id: "", "standing_review_other_lineage"),
+])
+def test_unverified_branch_lineage_always_dispatches(monkeypatch, lookup, reason):
+    monkeypatch.setenv(canary.CANARY_ENV, "project:quota_ops")
+    decision = canary.evaluate_review_dispatch(
+        _review("review-impl-2", parent="impl-2", sha=SHA_A,
+                pr=None, branch="main"),
+        reviewed_sha=SHA_A,
+        standing_lookup=_standing("request_changes", task_id="review-impl-1"),
+        lineage_root_lookup=lookup, project="quota_ops",
+    )
+    assert decision.applied is False
+    assert decision.reason == reason
+
+
 def test_same_lineage_fix_round_on_branch_respects_root_pin(monkeypatch):
     monkeypatch.setenv(canary.CANARY_ENV, "impl-root")
     decision = canary.evaluate_review_dispatch(
@@ -564,7 +583,12 @@ def test_branch_review_dispatches_for_distinct_lineage_at_shared_head(
     assert receipt["canary_reason"] == expected_reason
 
 
-def test_branch_fix_round_uses_lineage_root_pin_in_dispatch(tmp_db, monkeypatch):
+@pytest.mark.parametrize("root_kind,fix_kind,expected_applied", [
+    ("commit", None, True), ("report", None, False),
+    ("report", "commit", True), ("commit", "report", False),
+])
+def test_branch_fix_round_uses_root_artifact_and_pin_in_dispatch(
+        tmp_db, monkeypatch, root_kind, fix_kind, expected_applied):
     from fastapi.testclient import TestClient
     from agent_crew.server import create_app
 
@@ -572,7 +596,7 @@ def test_branch_fix_round_uses_lineage_root_pin_in_dispatch(tmp_db, monkeypatch)
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(task_id="impl-root", task_type="implement",
                               description="work", branch="feature",
-                              context={"artifact_kind": "commit"}))
+                              context={"artifact_kind": root_kind}))
     queue.submit_result("impl-root", TaskResult(
         task_id="impl-root", status="completed", summary="commit written"))
     queue.enqueue(_review("review-root", parent="impl-root", sha=SHA_A,
@@ -580,10 +604,11 @@ def test_branch_fix_round_uses_lineage_root_pin_in_dispatch(tmp_db, monkeypatch)
     queue.submit_result("review-root", TaskResult(
         task_id="review-root", status="completed", summary="reviewed",
         verdict="request_changes", findings=["standing finding"]))
+    fix_context = {"prev_task_id": "review-root", "fix_round": 1}
+    if fix_kind is not None:
+        fix_context["artifact_kind"] = fix_kind
     queue.enqueue(TaskRequest(task_id="fix-root", task_type="implement",
-                              description="fix", branch="feature", context={
-                                  "prev_task_id": "review-root", "fix_round": 1,
-                                  "artifact_kind": "commit"}))
+                              description="fix", branch="feature", context=fix_context))
     queue.submit_result("fix-root", TaskResult(
         task_id="fix-root", status="completed", summary="fix written"))
 
@@ -598,10 +623,16 @@ def test_branch_fix_round_uses_lineage_root_pin_in_dispatch(tmp_db, monkeypatch)
                         "allow_duplicate_review": True},
         }, headers={"X-Agent-Crew-Project": "demo"})
     assert response.status_code == 201, response.text
-    assert push.calls == []
+    assert len(push.calls) == (0 if expected_applied else 1)
     result = queue.get_result("review-fix")
-    assert result is not None and result.summary == canary.SUPPRESSED_REASON
-    assert queue.get_tokenomics_shadow_receipt("review-fix")["canary_applied"] == 1
+    if expected_applied:
+        assert result is not None and result.summary == canary.SUPPRESSED_REASON
+    else:
+        assert result is None
+    receipt = queue.get_tokenomics_shadow_receipt("review-fix")
+    assert receipt["canary_applied"] == int(expected_applied)
+    if not expected_applied:
+        assert receipt["canary_reason"] == "report_artifact_no_commit_identity"
 
 
 def test_armed_canary_does_not_push_the_identical_sha_rereview(monkeypatch, tmp_db):

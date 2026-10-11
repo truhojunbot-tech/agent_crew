@@ -3970,6 +3970,21 @@ def create_app(
             parent_id = context.get("prev_task_id")
             parent = q().get_task(parent_id) if isinstance(parent_id, str) and parent_id else None
 
+            def _reviewed_artifact_kind() -> Optional[str]:
+                current = parent
+                seen = set()
+                while current is not None and current.task_id not in seen:
+                    seen.add(current.task_id)
+                    if current.task_type == "implement":
+                        kind = declared_artifact_kind(current)
+                        if kind is not None:
+                            return kind
+                    current_context = current.context if isinstance(current.context, dict) else {}
+                    previous_id = current_context.get("prev_task_id")
+                    current = (q().get_task(previous_id) if isinstance(previous_id, str)
+                               and previous_id else None)
+                return None
+
             def _lineage_root_for(task_id: str) -> str:
                 tasks_by_id: dict[str, TaskRequest] = {}
                 current = task if task_id == task.task_id else q().get_task(task_id)
@@ -3986,7 +4001,7 @@ def create_app(
                 task, reviewed_sha=reviewed_sha or "",
                 standing_lookup=q().standing_request_changes_review,
                 project=_server_identity()["project"],
-                reviewed_artifact_kind=declared_artifact_kind(parent),
+                reviewed_artifact_kind=_reviewed_artifact_kind(),
                 lineage_root_lookup=_lineage_root_for,
             )
         except Exception:
