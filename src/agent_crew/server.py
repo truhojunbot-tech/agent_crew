@@ -1445,16 +1445,22 @@ def _detect_transient_error_in_log(
             try:
                 event = json.loads(line)
             except (TypeError, ValueError):
-                if not line.lstrip().startswith(("{", "[")):
+                if (line.lstrip().startswith("[codex error]")
+                        or not line.lstrip().startswith(("{", "["))):
                     filtered.append(line)
             else:
                 if isinstance(event, dict):
                     item = event.get("item")
-                    if event.get("type") == "error":
-                        filtered.append(json.dumps(event))
-                    elif (isinstance(item, dict)
-                          and item.get("type") in ("error", "error_message")):
-                        filtered.append(json.dumps(item))
+                    error_event = event.get("type") in ("error", "turn.failed")
+                    error_item = (isinstance(item, dict)
+                                  and item.get("type") in ("error", "error_message"))
+                    if error_event or error_item:
+                        source = event if error_event else item
+                        for value in (source.get("message"), source.get("error")):
+                            if isinstance(value, dict):
+                                value = value.get("message")
+                            if isinstance(value, str):
+                                filtered.append(value)
         tail = "\n".join(filtered)
     # Order matters: more specific markers first (QUOTA before RESOURCE since
     # QUOTA_EXHAUSTED responses also contain "RESOURCE_EXHAUSTED").

@@ -2,6 +2,7 @@
 
 import json
 import os
+import pytest
 import time
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -36,9 +37,26 @@ def _marker(queue, task_id):
     return queue.get_task(task_id).error_info["codex_quota_hold"]
 
 
+def _real_codex_quota_stream(reset="3:10 PM"):
+    message = "You" + "\u2019" + "ve hit your " + "usage " + f"limit. Try again at {reset}."
+    return "\n".join((
+        "[codex error] " + message,
+        json.dumps({"type": "error", "message": message}, ensure_ascii=False),
+        json.dumps({"type": "turn.failed", "error": {"message": message}},
+                   ensure_ascii=False),
+    )) + "\n"
+
+
+@pytest.mark.parametrize("line_index", range(3))
+def test_each_real_codex_stream_shape_is_classified(tmp_path, line_index):
+    log = tmp_path / "dispatch.log"
+    log.write_text(_real_codex_quota_stream().splitlines()[line_index] + "\n")
+    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
+
+
 def test_real_codex_message_is_classified_and_reset_parsed(tmp_path):
     log = tmp_path / "dispatch.log"
-    log.write_text("ERROR: You've hit your usage limit. Try again at 3:10 PM.\n")
+    log.write_text(_real_codex_quota_stream())
     assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
     # 2026-10-09 13:02 UTC -> 15:10 UTC on the same day.
     failed_at = 1791550920.0
@@ -47,7 +65,7 @@ def test_real_codex_message_is_classified_and_reset_parsed(tmp_path):
 
 def test_dated_codex_reset_line_uses_the_stated_calendar_day(tmp_path):
     log = tmp_path / "dated-dispatch.log"
-    log.write_text("ERROR: You've hit your usage limit. Try again at Sep 30th, 2026 4:48 PM.\n")
+    log.write_text(_real_codex_quota_stream("Sep 30th, 2026 4:48 PM"))
     failed_at = datetime(2026, 9, 24, 13, 2, tzinfo=timezone.utc).timestamp()
     reset_at = datetime(2026, 9, 30, 16, 48, tzinfo=timezone.utc).timestamp()
     assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
@@ -151,7 +169,7 @@ def test_dispatcher_parks_real_quota_failure_without_fallback(tmp_path, monkeypa
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
 
     async def fake_subprocess(*args, **kwargs):
-        kwargs["stdout"].write(b"ERROR: You've hit your usage limit. Try again at 3:10 PM.\n")
+        kwargs["stdout"].write(_real_codex_quota_stream().encode())
         kwargs["stdout"].flush()
         proc = MagicMock(returncode=1, pid=os.getpid())
         proc.wait = AsyncMock(return_value=1)
