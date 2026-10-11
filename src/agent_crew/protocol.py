@@ -135,6 +135,8 @@ class TaskResult:
     #:   dropped the nonce, which is how RESULT came to be a gate nobody could
     #:   pass (codex cross-repo review of 8993bdb, P1 #2).
     executor_binding: Optional[dict] = None
+    #: C1.a worker fencing token. Stripped before result persistence.
+    attempt_id: Optional[str] = None
 
     def take_executor_binding(self) -> tuple[Optional[str], Optional[str]]:
         """Pop ``(nonce, presenter)`` off the result, leaving nothing behind."""

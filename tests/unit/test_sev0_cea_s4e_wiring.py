@@ -59,7 +59,8 @@ def _canonical(body: dict) -> bytes:
 
 def write_snapshot(tmp_path: Path, *, signed=True, principals=("owner:hojun",),
                    build_commits=("b" * 40,), runtimes=("agent_crew",),
-                   produced_at=None) -> Path:
+                   produced_at=None, decision_id=DECISION_ID,
+                   project=PROJECT) -> Path:
     """A §5.3 snapshot file, HMAC-signed the way the reader's verifier checks."""
     when = produced_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     body = {
@@ -67,13 +68,13 @@ def write_snapshot(tmp_path: Path, *, signed=True, principals=("owner:hojun",),
         "produced_at": when,
         "tier": "T0",
         "decisions": [{
-            "decision_id": DECISION_ID,
+            "decision_id": decision_id,
             "body_hash": "sha256:" + "a" * 32,
             "supersedes": [],
             "principals": list(principals),
             "build_commits": list(build_commits),
             "runtimes": list(runtimes),
-            "scope": {"project": "agent_crew"},
+            "scope": {"project": project},
         }],
         "review_test_matrix": {},
         "human_gate_predicates": [],

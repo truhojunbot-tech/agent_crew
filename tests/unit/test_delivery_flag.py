@@ -153,8 +153,10 @@ def _review_task_payload(task_id="r1", no_tester=False):
     }
 
 
-def _approved_result(task_id):
+def _approved_result(task_id, client=None):
     return {
+        "attempt_id": ((client.get(f"/tasks/{task_id}").json().get("execution") or {})
+                       .get("attempt_id") if client is not None else None),
         "task_id": task_id,
         "status": "completed",
         "summary": "Reviewed the changes and approve this result for the next stage.",
@@ -179,7 +181,7 @@ class TestNoTesterFlag:
         from agent_crew.queue import TaskQueue
         with TestClient(app) as client:
             client.post("/tasks", json=_review_task_payload("r-skip", no_tester=True))
-            client.post(f"/tasks/r-skip/result", json=_approved_result("r-skip"))
+            client.post(f"/tasks/r-skip/result", json=_approved_result("r-skip", client))
             tasks = client.get("/tasks").json()
         test_tasks = [t for t in tasks if t["task_type"] == "test"]
         assert test_tasks == [], "no_tester=True must suppress test enqueue"
@@ -197,7 +199,7 @@ class TestNoTesterFlag:
         )
         with TestClient(app) as client:
             client.post("/tasks", json=_review_task_payload("r-test", no_tester=False))
-            client.post(f"/tasks/r-test/result", json=_approved_result("r-test"))
+            client.post(f"/tasks/r-test/result", json=_approved_result("r-test", client))
             tasks = client.get("/tasks").json()
         test_tasks = [t for t in tasks if t["task_type"] == "test"]
         assert len(test_tasks) == 1, "test task must be enqueued when no_tester is absent"
