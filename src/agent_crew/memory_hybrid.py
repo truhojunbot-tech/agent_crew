@@ -81,15 +81,27 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         SET superseded_by=json_extract(value,'$.superseded')
         WHERE superseded_by IS NULL AND json_type(value,'$.superseded')='text'
           AND json_extract(value,'$.superseded')<>''""").rowcount
-    linked = db.execute("""UPDATE adr001_memory AS old SET superseded_by = (
-        SELECT newer.key FROM adr001_memory AS newer
-        WHERE newer.layer=old.layer AND newer.scope=old.scope
-          AND json_extract(newer.value,'$.supersedes')=old.key
-        ORDER BY newer.created DESC,newer.rowid DESC LIMIT 1)
-        WHERE old.superseded_by IS NULL AND EXISTS (
-          SELECT 1 FROM adr001_memory AS newer
-          WHERE newer.layer=old.layer AND newer.scope=old.scope
-            AND json_extract(newer.value,'$.supersedes')=old.key)""").rowcount
+    # Materialize the sparse superseding rows once. The old correlated lookup
+    # extracted JSON from every row for every candidate at each startup.
+    db.execute("""CREATE TEMP TABLE adr001_supersedes_candidates AS
+        SELECT layer,scope,json_extract(value,'$.supersedes') AS supersedes,
+               key,created,rowid AS source_rowid FROM adr001_memory
+        WHERE json_extract(value,'$.supersedes') IS NOT NULL""")
+    try:
+        db.execute("""CREATE INDEX adr001_supersedes_candidates_lookup
+            ON adr001_supersedes_candidates
+            (layer,scope,supersedes,created DESC,source_rowid DESC)""")
+        linked = db.execute("""UPDATE adr001_memory AS old SET superseded_by = (
+            SELECT newer.key FROM adr001_supersedes_candidates AS newer
+            WHERE newer.layer=old.layer AND newer.scope=old.scope
+              AND newer.supersedes=old.key
+            ORDER BY newer.created DESC,newer.source_rowid DESC LIMIT 1)
+            WHERE old.superseded_by IS NULL AND EXISTS (
+              SELECT 1 FROM adr001_supersedes_candidates AS newer
+              WHERE newer.layer=old.layer AND newer.scope=old.scope
+                AND newer.supersedes=old.key)""").rowcount
+    finally:
+        db.execute("DROP TABLE adr001_supersedes_candidates")
     logger.info("memory hybrid legacy migration invalidated=%d superseded=%d",
                 invalidated, legacy_links + linked)
     fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone() is None
@@ -215,7 +227,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
     """Scope in SQLite first; rank only those rowids with FTS5 and cosine."""
 
     def __init__(self, path: str, *, embedder: Optional[Callable] = None):
-        super().__init__(path)
+        super().__init__(path, busy_timeout_seconds=30.0)
         self.backfill()
         self.embedder = embedder if embedder is not None else configured_embedder()
         self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
@@ -232,7 +244,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             self.fallback_count += 1
 
     def backfill(self) -> None:
-        with closing(sqlite3.connect(self.path)) as db:
+        with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
             ensure_index_schema(db)
             db.commit()
 
