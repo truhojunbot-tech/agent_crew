@@ -18,6 +18,14 @@ SHA = "a" * 40
 SESSION = "session_abc12345"
 
 
+@pytest.fixture(autouse=True)
+def _cloud_checkout_contract(monkeypatch):
+    # Headless scheduling tests use a fake .git directory. The git origin,
+    # published-branch, and cwd checks have dedicated real-git tests in #744.
+    monkeypatch.setattr(cloud, "_validated_cloud_checkout",
+                        lambda project, repo, state_path=None: ("/fixture/claude", repo))
+
+
 def _state(tmp_path, reviewer_agent="claude_cloud"):
     roles = []
     for role, agent in (("implementer", "codex"), ("reviewer", reviewer_agent),
@@ -240,7 +248,7 @@ def test_headless_shadow_branch_launches_comparison_before_local_run(tmp_path, m
     monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "1")
     launched = []
     monkeypatch.setattr(cloud, "launch_shadow_review",
-                        lambda _queue, task: launched.append(task.task_id) or True)
+                        lambda _queue, task, **_kwargs: launched.append(task.task_id) or True)
     monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
     app = create_app(queue._db_path, state_path=_state(tmp_path),
                      watchdog_disabled=True, anomaly_disabled=True)
@@ -332,7 +340,7 @@ def test_shadow_launch_error_does_not_hold_local_reviewer_slot(tmp_path, monkeyp
     attempts = []
     local_dispatches = []
 
-    def raising_launch(*_args):
+    def raising_launch(*_args, **_kwargs):
         attempts.append(True)
         raise RuntimeError("shadow launch failed")
 
