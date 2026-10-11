@@ -29,7 +29,7 @@ def _w(tmp_path, body: str) -> str:
 
 def test_b192_quota_exhausted_detected(tmp_path):
     log = _w(tmp_path, '"reason": "QUOTA_EXHAUSTED",\n')
-    tag = _detect_transient_error_in_log(log)
+    tag = _detect_transient_error_in_log(log, agent="gemini")
     assert tag == "gemini_quota_exhausted"
     assert tag in _TRANSIENT_NONRETRIABLE_TAGS
     assert tag not in _TRANSIENT_RETRIABLE_TAGS
@@ -37,14 +37,14 @@ def test_b192_quota_exhausted_detected(tmp_path):
 
 def test_b192_quota_reset_phrase_detected(tmp_path):
     log = _w(tmp_path, "Your quota will reset after 2h37m8s.\n")
-    assert _detect_transient_error_in_log(log) == "gemini_quota_exhausted"
+    assert _detect_transient_error_in_log(log, agent="gemini") == "gemini_quota_exhausted"
 
 
 def test_b192_ineligible_tier_detected(tmp_path):
     log = _w(tmp_path,
              "IneligibleTierError: This client is no longer supported "
              "for Gemini Code Assist for individuals.\n")
-    tag = _detect_transient_error_in_log(log)
+    tag = _detect_transient_error_in_log(log, agent="gemini")
     assert tag == "gemini_ineligible_tier"
     assert tag in _TRANSIENT_NONRETRIABLE_TAGS
 
@@ -55,7 +55,7 @@ def test_b192_quota_takes_priority_over_resource_exhausted(tmp_path):
     """
     log = _w(tmp_path,
              '"status": "RESOURCE_EXHAUSTED",\n"reason": "QUOTA_EXHAUSTED",\n')
-    assert _detect_transient_error_in_log(log) == "gemini_quota_exhausted"
+    assert _detect_transient_error_in_log(log, agent="gemini") == "gemini_quota_exhausted"
 
 
 def test_b192_capacity_still_classified_retriable(tmp_path):
@@ -63,7 +63,7 @@ def test_b192_capacity_still_classified_retriable(tmp_path):
     the existing gemini-capacity recovery path keeps working.
     """
     log = _w(tmp_path, '"reason": "MODEL_CAPACITY_EXHAUSTED",\n')
-    tag = _detect_transient_error_in_log(log)
+    tag = _detect_transient_error_in_log(log, agent="gemini")
     assert tag == "gemini_capacity"
     assert tag in _TRANSIENT_RETRIABLE_TAGS
 

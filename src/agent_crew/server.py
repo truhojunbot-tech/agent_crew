@@ -786,10 +786,33 @@ def _stash_dirty_worktree(worktree_path: str, task_id: str) -> Optional[str]:
             ["git", "-C", worktree_path, "rev-parse", "-q", "--verify", "refs/stash"],
             capture_output=True, text=True, timeout=15,
         ).stdout.strip()
-        if push.returncode != 0 or not after or after == before:
+        ignored_warning_only = ("ignored" in (push.stderr or "").lower()
+                                and not re.search(r"(?im)^\s*(?:fatal|error):", push.stderr or ""))
+        if not after or after == before or (push.returncode != 0 and not ignored_warning_only):
             logger.warning("stash of dirty worktree %s for task=%s failed: %s",
                            worktree_path, task_id, push.stderr.strip())
             return None
+        if push.returncode != 0:
+            # Git can save the stash before failing to remove an ignored path.
+            # Clear only paths that were included in the stash, then verify.
+            for command in (
+                ["git", "-C", worktree_path, "restore", "--source=HEAD",
+                 "--staged", "--worktree", *pathspec],
+                ["git", "-C", worktree_path, "clean", "-fd", *pathspec],
+            ):
+                cleanup = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                if cleanup.returncode != 0:
+                    logger.warning("could not clear stashed worktree %s for task=%s: %s",
+                                   worktree_path, task_id, cleanup.stderr.strip())
+                    return None
+            remaining = subprocess.run(
+                ["git", "-C", worktree_path, "status", "--porcelain", *pathspec],
+                capture_output=True, text=True, timeout=30,
+            )
+            if remaining.returncode != 0 or remaining.stdout.strip():
+                logger.warning("stashed worktree %s remains dirty for task=%s",
+                               worktree_path, task_id)
+                return None
         logger.warning("preserved uncommitted work of task=%s in %s as stash %s",
                        task_id, worktree_path, after)
         return after
@@ -1291,6 +1314,8 @@ def _detect_transient_error_in_log(
     log_path: str,
     tail_bytes: int = 16384,
     since_offset: int = 0,
+    *,
+    agent: str,
 ) -> Optional[str]:
     """Scan the tail of a dispatch log for upstream errors worth distinguishing.
 
@@ -1331,31 +1356,57 @@ def _detect_transient_error_in_log(
             f.seek(0, 2)
             size = f.tell()
             start = max(0, size - tail_bytes, since_offset)
+            starts_mid_line = False
+            if agent == "codex" and start > 0 and start < size:
+                f.seek(start - 1)
+                starts_mid_line = f.read(1) != b"\n"
             f.seek(min(start, size))
-            tail = f.read().decode("utf-8", errors="replace")
+            raw_tail = f.read()
+            if starts_mid_line:
+                raw_tail = raw_tail.partition(b"\n")[2]
+            tail = raw_tail.decode("utf-8", errors="replace")
     except OSError:
         return None
+    if agent == "codex":
+        # Stream JSON echoes commands and agent prose. Only error events are
+        # provider diagnostics; retain plain stderr lines as before.
+        filtered = []
+        for line in tail.splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError):
+                if not line.lstrip().startswith(("{", "[")):
+                    filtered.append(line)
+            else:
+                if isinstance(event, dict):
+                    item = event.get("item")
+                    if event.get("type") == "error":
+                        filtered.append(json.dumps(event))
+                    elif (isinstance(item, dict)
+                          and item.get("type") in ("error", "error_message")):
+                        filtered.append(json.dumps(item))
+        tail = "\n".join(filtered)
     # Order matters: more specific markers first (QUOTA before RESOURCE since
     # QUOTA_EXHAUSTED responses also contain "RESOURCE_EXHAUSTED").
-    if "QUOTA_EXHAUSTED" in tail or "Your quota will reset" in tail:
+    if agent == "gemini" and ("QUOTA_EXHAUSTED" in tail or "Your quota will reset" in tail):
         return "gemini_quota_exhausted"
-    if "IneligibleTierError" in tail:
+    if agent == "gemini" and ("IneligibleTierError" in tail):
         return "gemini_ineligible_tier"
-    if "Individual quota reached" in tail:
+    if agent in ("gemini", "agy") and ("Individual quota reached" in tail):
         return "agy_quota_exhausted"
-    if '"api_error_status":429' in tail:
+    if agent == "claude" and ('"api_error_status":429' in tail):
         return "claude_429"
-    if "Server is temporarily limiting requests" in tail:
+    if agent == "claude" and ("Server is temporarily limiting requests" in tail):
         return "claude_throttle"
-    if "MODEL_CAPACITY_EXHAUSTED" in tail:
+    if agent == "gemini" and ("MODEL_CAPACITY_EXHAUSTED" in tail):
         return "gemini_capacity"
-    if "RESOURCE_EXHAUSTED" in tail:
+    if agent == "gemini" and ("RESOURCE_EXHAUSTED" in tail):
         return "gemini_resource_exhausted"
-    if "Selected model is at capacity" in tail:
+    if agent == "codex" and ("Selected model is at capacity" in tail):
         return "codex_capacity"
-    if "Error: timeout waiting for response" in tail:
+    if agent in ("gemini", "agy") and ("Error: timeout waiting for response" in tail):
         return "agy_timeout"
-    if "subscriber fell behind updates" in tail:
+    if agent in ("gemini", "agy") and ("subscriber fell behind updates" in tail):
         return "agy_subscriber_lag"
     return None
 
@@ -5725,7 +5776,7 @@ def create_app(
             # api_error_status:429; gemini-cli often hangs on retry loops past
             # the 15-minute timeout. Both need the same routing decision.
             _transient = _detect_transient_error_in_log(
-                log_path, since_offset=_task_log_start_offset
+                log_path, since_offset=_task_log_start_offset, agent=agent
             )
             # #236: `subscriber fell behind updates` is usually a MASK. agy
             # hits 429, its internal retry stalls the agent_state pubsub
