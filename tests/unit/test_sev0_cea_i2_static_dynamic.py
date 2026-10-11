@@ -387,6 +387,38 @@ def test_dispatcher_claim_requeue_moves_receipt_before_pending(tmp_path):
     assert (after["state"], after["attempt"]) == ("HELD", 2)
 
 
+def test_cloud_prelaunch_requeue_keeps_cea_receipt_before_pending(tmp_path, monkeypatch):
+    """#759: an unverifiable fix PR head must return through the CEA requeue gate."""
+    from types import SimpleNamespace
+    from agent_crew import claude_cloud as cloud
+
+    q = queue_for(tmp_path, AuthorityState("active"), name="cloud-prelaunch.db",
+                  config=EngineConfig(mode="test", default_max_attempts=3,
+                                      role_agents={"implementer": "claude_cloud",
+                                                   "reviewer": "codex", "tester": "gemini"}))
+    q.enqueue(task("fix1", branch="agent/fix1", context={
+        "authority_decision_ids": ["T0-1234"], "repo": "owner/repo",
+        "pr_number": 759, "fix_round": 1,
+    }), ingress="http.tasks")
+    before = receipt_for_task(q, "fix1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setattr(cloud._github, "pr_head_sha", lambda *a, **kw: None)
+    monkeypatch.setattr(cloud._github, "branch_head_commit_message", lambda *a, **kw: None)
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        raise AssertionError("cloud session started without a baseline head")
+
+    outcome = cloud.dispatch_cloud_for_role(q, role="implementer", task_type="implement",
+                                           run_fn=run)
+    assert outcome.skipped_reason == "cloud_pr_head_unavailable"
+    assert q.get_task_status("fix1") == "pending"
+    after = receipt_for_task(q, "fix1")
+    assert after["receipt_id"] == before["receipt_id"]
+    assert (after["state"], after["attempt"]) == ("HELD", 2)
+
+
 def test_static_the_bound_parameter_pending_writer_is_inventoried():
     body = (SRC / "queue.py").read_text(encoding="utf-8")
     hits = re.findall(r'status\s*=\s*"in_progress"\s+if\s+[^\n]+else\s+"pending"', body)
@@ -401,7 +433,8 @@ def test_static_requeue_callers_are_inventoried():
                            r"|defer_provider_capacity)\(", body))
         if n and rel != "queue.py":
             calls[rel] = n
-    assert set(calls) == {"server.py", "cli.py"}, calls
+    # #759 requeues a cloud fix before launch when its existing PR head cannot be verified.
+    assert calls == {"claude_cloud.py": 2, "cli.py": 1, "server.py": 17}, calls
 
 
 def _claimed(tmp_path, name, mode, *, config=None):

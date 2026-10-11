@@ -104,9 +104,15 @@ site every other backend already goes through.
 |---|---|---|
 | `AGENT_CREW_CLOUD_ENABLED` | off | Opt-in kill switch. |
 | `AGENT_CREW_CLOUD_MAX_CONCURRENCY` | `3` | Max concurrent `claude_cloud` in-progress dispatches. |
+| `AGENT_CREW_CLOUD_MAX_PER_DAY` | unset | UTC-day launch count limit for cloud reviews and implementations, counted separately. |
+| `AGENT_CREW_CLOUD_CREDIT_FILE` | unset | Quota monitor JSON snapshot. `cloud_credit.used_dollars` is read before launch and after reconciliation; a missing or over-10-minute-old snapshot records unknown cost. |
+| `AGENT_CREW_CLOUD_MAX_USD_PER_DAY` | unset | UTC-day observed implement spend limit. Reaching it leaves new cloud implementations pending; an in-flight session reserves the remaining budget. |
 | `AGENT_CREW_CLOUD_CLI_PATH` | `claude` | Override the CLI binary path. |
 | `AGENT_CREW_CLOUD_STALE_SECONDS` | `14400` (4h) | How long a no-PR/no-commit-signal dispatch may sit `in_progress` before reconciliation resolves it to `needs_human` (PR #499 r0 HIGH fix). |
 
 An operator additionally opts a specific role in via
 `role_agents.<role> = "claude_cloud"` (role_mapping.py) — by default no role
 resolves to it, so existing local Claude/Codex/Gemini dispatch is unchanged.
+In headless dispatcher mode, mapping `implementer` to `claude_cloud` routes
+implement and fix-round tasks through the cloud adapter. Set concurrency to `1`
+when using credit deltas for per-task cost attribution.

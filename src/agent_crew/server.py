@@ -6589,6 +6589,23 @@ def create_app(
                             continue
                         _worker_roles = _AGENT_TO_ROLES.get(worker, [])
                         _cloud_local_fallback = False
+                        if (worker == _claude_cloud.CLOUD_PROVIDER_NAME and
+                                "implementer" in _worker_roles):
+                            # The adapter owns dequeue and admission.  A cap or
+                            # capacity skip must leave the task pending for this
+                            # mapped worker, never launch a local subprocess.
+                            _cloud_implement_outcome = await asyncio.to_thread(
+                                _claude_cloud.dispatch_cloud_for_role, q(),
+                                role="implementer", task_type="implement",
+                                state_path=state_path)
+                            if _cloud_implement_outcome.dispatched or _worker_roles == ["implementer"]:
+                                continue
+                            if "reviewer" in _worker_roles and _claude_cloud.cloud_dispatch_enabled():
+                                await asyncio.to_thread(
+                                    _claude_cloud.dispatch_cloud_for_role, q(),
+                                    role="reviewer", task_type="review",
+                                    state_path=state_path)
+                            continue
                         if (_worker_roles == ["reviewer"] and
                                 worker == _claude_cloud.CLOUD_PROVIDER_NAME and
                                 _claude_cloud.cloud_dispatch_enabled()):
