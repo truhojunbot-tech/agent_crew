@@ -5,6 +5,7 @@ import hashlib
 import re
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import QUEUE_SCHEMA_VERSION, TaskQueue
@@ -13,7 +14,7 @@ from agent_crew.server import create_app
 
 # Update this map only when bumping QUEUE_SCHEMA_VERSION. Previous entries stay
 # immutable so changing DDL under an existing version fails this test.
-SCHEMA_SIGNATURES = {1: "89abf1b377b2f33fa31a7a389c866b020b5b6be274acfb1fbd136259b89f0d81"}
+SCHEMA_SIGNATURES = {1: "5651630a8037b6c1af8b8a21af380f0501048a54b9e6df416047d26526c5b36f"}
 _SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
 _DDL_SOURCES = {
     "queue.py": _SOURCE_ROOT / "queue.py",
@@ -32,7 +33,8 @@ def _schema_signature(sources: dict[str, str]) -> str:
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 for target in targets:
                     if isinstance(target, ast.Name) and (
-                            target.id.startswith("_DDL") or target.id == "_EXEC_STATE_COLUMN_TYPES"):
+                            target.id.startswith("_DDL")
+                            or target.id in {"_EXEC_STATE_COLUMN_TYPES", "_COLUMN_TYPES"}):
                         statements.append((
                             name, target.id, ast.dump(node.value, include_attributes=False)))
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -85,6 +87,20 @@ def test_cea_store_ddl_change_without_bump_fails_guard(tmp_path):
     changed = sources["cea/store.py"].replace(
         "ALTER TABLE tasks ADD COLUMN receipt_id TEXT",
         "ALTER TABLE tasks ADD COLUMN receipt_id BLOB", 1)
+    assert changed != sources["cea/store.py"]
+    assert (_schema_signature({**sources, "cea/store.py": changed})
+            != SCHEMA_SIGNATURES[QUEUE_SCHEMA_VERSION])
+
+
+@pytest.mark.parametrize("replacement", [
+    '"parent_receipt_id": "BLOB",',
+    '"parent_receipt_id": "TEXT",\n    "brand_new_col": "TEXT",',
+])
+def test_generated_receipt_columns_require_version_bump(tmp_path, replacement):
+    TaskQueue(str(tmp_path / "tasks.db"))
+    sources = _ddl_sources()
+    changed = sources["cea/store.py"].replace(
+        '"parent_receipt_id": "TEXT",', replacement, 1)
     assert changed != sources["cea/store.py"]
     assert (_schema_signature({**sources, "cea/store.py": changed})
             != SCHEMA_SIGNATURES[QUEUE_SCHEMA_VERSION])
