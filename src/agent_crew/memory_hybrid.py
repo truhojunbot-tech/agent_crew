@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 from .memory_runtime import (
     MemoryRecord, MemoryScope, MemoryStorage, SQLiteMemoryStorage,
-    _scope_from_json, _retrieval_rank,
+    _logical_revision_key, _scope_from_json, _retrieval_rank,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,6 +58,8 @@ def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str
 
 def ensure_index_schema(db: sqlite3.Connection) -> None:
     """Install additive indexes and triggers, then backfill old rows idempotently."""
+    db.create_function("adr001_logical_key", 1, _logical_revision_key,
+                       deterministic=True)
     # Only HybridMemoryStorage calls this initializer. The default store keeps
     # its six-column schema until its producers have moved to named inserts.
     columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
@@ -94,12 +96,12 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         linked = db.execute("""UPDATE adr001_memory AS old SET superseded_by = (
             SELECT newer.key FROM adr001_supersedes_candidates AS newer
             WHERE newer.layer=old.layer AND newer.scope=old.scope
-              AND newer.supersedes=old.key
+              AND newer.supersedes=adr001_logical_key(old.key)
             ORDER BY newer.created DESC,newer.source_rowid DESC LIMIT 1)
             WHERE old.superseded_by IS NULL AND EXISTS (
               SELECT 1 FROM adr001_supersedes_candidates AS newer
               WHERE newer.layer=old.layer AND newer.scope=old.scope
-                AND newer.supersedes=old.key)""").rowcount
+                AND newer.supersedes=adr001_logical_key(old.key))""").rowcount
     finally:
         db.execute("DROP TABLE adr001_supersedes_candidates")
     logger.info("memory hybrid legacy migration invalidated=%d superseded=%d",
@@ -175,7 +177,7 @@ def _scope_sql(scope: MemoryScope) -> tuple[str, list]:
 def _row_record(row) -> dict:
     rowid, layer, key, value, scope, version, created = row
     body = json.loads(value)
-    return {"rowid": rowid, "layer": layer, "key": key, "value": body,
+    return {"rowid": rowid, "layer": layer, "key": _logical_revision_key(key), "value": body,
             "scope": asdict(_scope_from_json(scope)), "version": version,
             "created": created}
 
