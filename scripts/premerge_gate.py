@@ -28,6 +28,7 @@ MARKER = "[agent_crew premerge gate]"
 BLACKBOARD_MARKER = "[agent_crew premerge blackboard]"
 SHA = re.compile(r"\b[0-9a-f]{40}\b", re.I)
 SUMMARY = re.compile(r"^(?:=+\s*)?\d+ (?:passed|failed|error|skipped|xfailed|xpassed).*", re.I)
+TRUSTED_ASSOCIATIONS = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
 safe_rmtree = shutil.rmtree
 
 
@@ -75,8 +76,19 @@ def _api_list(endpoint):
         page += 1
 
 
+def same_repo_pr(pr):
+    return (pr.get("head", {}).get("repo") or {}).get("full_name", "").lower() == REPO.lower()
+
+
+def trusted_comments(comments):
+    return [c for c in comments if c.get("author_association") in TRUSTED_ASSOCIATIONS]
+
+
 def needs_gate(pr, comments):
     """Require the latest review verdict to approve this exact head."""
+    if not same_repo_pr(pr):
+        return False
+    comments = trusted_comments(comments)
     head = pr.get("head", {}).get("sha", "").lower()
     if not SHA.fullmatch(head):
         return False
@@ -98,6 +110,9 @@ def needs_gate(pr, comments):
 
 def unbound_approval(pr, comments):
     """An approval exists, but this script cannot safely tie it to the head."""
+    if not same_repo_pr(pr):
+        return False
+    comments = trusted_comments(comments)
     head = pr.get("head", {}).get("sha", "").lower()
     if gate_for_head(comments, head) or legacy_gate_for_head(comments, head):
         return False
@@ -106,23 +121,25 @@ def unbound_approval(pr, comments):
         return False
     latest = max(reviews, key=lambda c: (c.get("created_at", ""), c.get("id", 0)))
     first_line = (latest.get("body") or "").splitlines()[0]
-    return bool(re.fullmatch(r"\[agent_crew review\] verdict:\s*(?:✅\s*)?approve\s*",
-                             first_line) and not needs_gate(pr, comments))
+    approved = re.fullmatch(r"\[agent_crew review\] verdict:\s*(?:✅\s*)?approve\s*",
+                            first_line)
+    return bool(approved and not re.search(r"\bat\s+[0-9a-f]{7,40}\b",
+                                           (latest.get("body") or "").lower()))
 
 
 def gate_for_head(comments, head):
-    return next((c for c in comments if MARKER in (c.get("body") or "")
+    return next((c for c in trusted_comments(comments) if MARKER in (c.get("body") or "")
                  and f"HEAD {head}" in (c.get("body") or "")), None)
 
 
 def legacy_gate_for_head(comments, head):
     return any("Coordinator merge gate:" in (c.get("body") or "")
-               and head in (c.get("body") or "").lower() for c in comments)
+               and head in (c.get("body") or "").lower() for c in trusted_comments(comments))
 
 
 def blackboard_posted(comments, head):
     return any(BLACKBOARD_MARKER in (c.get("body") or "")
-               and f"HEAD {head}" in (c.get("body") or "") for c in comments)
+               and f"HEAD {head}" in (c.get("body") or "") for c in trusted_comments(comments))
 
 
 def gate_payload(number, body):
@@ -217,6 +234,8 @@ def main(argv=None):
             for pr in prs:
                 number = pr.get("number", "unknown")
                 try:
+                    if not same_repo_pr(pr):
+                        continue
                     head = pr["head"]["sha"]
                     comments = _api_list(f"repos/{REPO}/issues/{number}/comments?per_page=100")
                     prior_gate = gate_for_head(comments, head)

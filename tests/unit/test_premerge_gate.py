@@ -13,11 +13,58 @@ MAIN = "c" * 40
 
 
 def _comment(body, number):
-    return {"body": body, "id": number, "created_at": f"2026-01-01T00:00:{number:02d}Z"}
+    return {"body": body, "id": number, "created_at": f"2026-01-01T00:00:{number:02d}Z",
+            "author_association": "OWNER", "user": {"login": "truhojunbot-tech"}}
+
+
+def _pr(number, sha, repo=gate.REPO):
+    return {"number": number, "head": {"sha": sha, "repo": {"full_name": repo}}}
+
+
+def test_untrusted_comments_and_fork_heads_cannot_trigger_or_suppress_gate():
+    pr = _pr(7, HEAD)
+    approval = _approved(7, HEAD)
+    forged = dict(approval, author_association="NONE", user={"login": "stranger"})
+    assert not gate.needs_gate(pr, [forged])
+    assert gate.needs_gate(pr, [approval])
+    fake_gate = _comment(f"{gate.MARKER}\nHEAD {HEAD}\nMAIN {MAIN}\nEXIT 0", 2)
+    fake_gate.update(author_association="NONE", user={"login": "stranger"})
+    assert gate.needs_gate(pr, [approval, fake_gate])
+    assert gate.gate_for_head([fake_gate], HEAD) is None
+    fake_legacy = _comment(f"**Coordinator merge gate:** full suite green on PR head {HEAD}", 4)
+    fake_legacy.update(author_association="NONE", user={"login": "stranger"})
+    assert gate.needs_gate(pr, [approval, fake_legacy])
+    assert not gate.legacy_gate_for_head([fake_legacy], HEAD)
+    fake_ack = _comment(f"{gate.BLACKBOARD_MARKER}\nHEAD {HEAD}\nposted", 3)
+    fake_ack.update(author_association="NONE", user={"login": "stranger"})
+    assert not gate.blackboard_posted([fake_ack], HEAD)
+    assert not gate.needs_gate(_pr(7, HEAD, repo="stranger/fork"), [approval])
+
+
+def test_main_skips_fork_before_reading_comments_or_fetching_code(tmp_path, monkeypatch):
+    def api(endpoint):
+        if "/pulls?" in endpoint:
+            return [_pr(7, HEAD, repo="stranger/fork")]
+        pytest.fail("fork comments were fetched")
+    monkeypatch.setattr(gate, "_api_list", api)
+    monkeypatch.setattr(gate, "checked", lambda *_args, **_kwargs:
+                        pytest.fail("fork code was fetched"))
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 0
+
+
+def test_stale_approval_is_normal_skip(tmp_path, monkeypatch, capsys):
+    pr = _pr(7, HEAD)
+    comments = [_approved(7, OLD)]
+    assert not gate.needs_gate(pr, comments)
+    assert not gate.unbound_approval(pr, comments)
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint:
+                        [pr] if "/pulls?" in endpoint else comments)
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 0
+    assert not capsys.readouterr().err
 
 
 def test_selects_latest_approval_only_for_current_head():
-    pr = {"number": 7, "head": {"sha": HEAD}}
+    pr = _pr(7, HEAD)
     comments = [_comment(f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {OLD}: approve.", 1)]
     assert not gate.needs_gate(pr, comments)
     comments.append(_comment(f"[agent_crew review] verdict: 🔄 request_changes\n**Summary:** PR #7 at {HEAD}: request_changes.", 2))
@@ -29,7 +76,7 @@ def test_selects_latest_approval_only_for_current_head():
 
 
 def test_review_summary_short_sha_matches_current_head_only():
-    pr = {"number": 7, "head": {"sha": HEAD}}
+    pr = _pr(7, HEAD)
     assert gate.needs_gate(pr, [_comment(
         f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {HEAD[:7]}: approve.", 1)])
     assert not gate.needs_gate(pr, [_comment(
@@ -72,7 +119,7 @@ def test_run_gate_uses_temporary_worktree_and_cleans_up(tmp_path, monkeypatch):
     def fake_run(args, **kwargs):
         calls.append((args, kwargs))
         if args[:2] == ["gh", "api"] and args[2].startswith("repos/truhojunbot-tech/agent_crew/pulls?"):
-            return SimpleNamespace(returncode=0, stdout=json.dumps([{"number": 7, "head": {"sha": HEAD}}]), stderr="")
+            return SimpleNamespace(returncode=0, stdout=json.dumps([_pr(7, HEAD)]), stderr="")
         if args[:2] == ["gh", "api"] and args[2].startswith("repos/truhojunbot-tech/agent_crew/issues/7/comments?"):
             return SimpleNamespace(returncode=0, stdout=json.dumps([_comment(f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #7 at {HEAD}: approve.", 1)]), stderr="")
         if args == ["git", "rev-parse", "origin/main"]:
@@ -95,8 +142,7 @@ def _approved(number, sha):
 
 
 def test_one_pr_error_does_not_block_later_approved_pr(tmp_path, monkeypatch, capsys):
-    prs = [{"number": 7, "head": {"sha": HEAD}},
-           {"number": 8, "head": {"sha": OLD}}]
+    prs = [_pr(7, HEAD), _pr(8, OLD)]
     monkeypatch.setattr(gate, "_api_list", lambda endpoint: prs if "/pulls?" in endpoint else
                         [_approved(int(endpoint.split("/issues/")[1].split("/")[0]),
                                    HEAD if "/issues/7/" in endpoint else OLD)])
@@ -127,7 +173,7 @@ def test_one_pr_error_does_not_block_later_approved_pr(tmp_path, monkeypatch, ca
 
 def test_unbound_approved_review_is_logged(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(gate, "_api_list", lambda endpoint:
-                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else
+                        [_pr(7, HEAD)] if "/pulls?" in endpoint else
                         [_comment("[agent_crew review] verdict: ✅ approve\n"
                                   f"**Summary:** reviewed_sha {HEAD}", 1)])
     assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 1
@@ -138,14 +184,13 @@ def test_existing_coordinator_gate_is_not_reported_as_unbound(tmp_path, monkeypa
     comments = [_approved(7, HEAD),
                 _comment(f"**Coordinator merge gate:** full suite green on PR head {HEAD}", 2)]
     monkeypatch.setattr(gate, "_api_list", lambda endpoint:
-                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else comments)
+                        [_pr(7, HEAD)] if "/pulls?" in endpoint else comments)
     assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 0
     assert not capsys.readouterr().err
 
 
 def test_blackboard_failure_allows_next_pr_and_retries_without_retesting(tmp_path, monkeypatch):
-    prs = [{"number": 7, "head": {"sha": HEAD}},
-           {"number": 8, "head": {"sha": OLD}}]
+    prs = [_pr(7, HEAD), _pr(8, OLD)]
     comments = {7: [_approved(7, HEAD)], 8: [_approved(8, OLD)]}
     monkeypatch.setattr(gate, "_api_list", lambda endpoint: prs if "/pulls?" in endpoint else
                         comments[int(endpoint.split("/issues/")[1].split("/")[0])])
@@ -185,7 +230,7 @@ def test_blackboard_failure_allows_next_pr_and_retries_without_retesting(tmp_pat
 
 def test_head_moved_is_skipped_with_failure_status(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(gate, "_api_list", lambda endpoint:
-                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else
+                        [_pr(7, HEAD)] if "/pulls?" in endpoint else
                         [_approved(7, HEAD)])
     monkeypatch.setattr(gate, "checked", lambda args, **_kwargs:
                         MAIN if args == ["git", "rev-parse", "origin/main"] else OLD)
@@ -200,7 +245,7 @@ def test_head_moved_is_skipped_with_failure_status(tmp_path, monkeypatch, capsys
 ])
 def test_nonzero_gate_result_is_commented(tmp_path, monkeypatch, summary, exit_code):
     monkeypatch.setattr(gate, "_api_list", lambda endpoint:
-                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else
+                        [_pr(7, HEAD)] if "/pulls?" in endpoint else
                         [_approved(7, HEAD)])
     bodies = []
     def checked(args, **_kwargs):
