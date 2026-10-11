@@ -421,10 +421,24 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason)
 
 
+def _claimable_cloud_reviews(queue: TaskQueue) -> list[TaskRequest]:
+    now = time.time()
+
+    def claimable(task: TaskRequest) -> bool:
+        context = task.context if isinstance(task.context, dict) else {}
+        if task.task_type != "review" or context.get("agent_override") not in (None, CLOUD_PROVIDER_NAME):
+            return False
+        try:
+            return float(context.get("push_not_before") or 0) <= now
+        except (TypeError, ValueError):
+            return False
+
+    return [task for task in queue.list_tasks(status="pending") if claimable(task)]
+
+
 def cloud_review_skip_ids(queue: TaskQueue) -> set[str]:
-    """Let the existing atomic dequeue claim the largest pending review first."""
-    pending = [task for task in queue.list_tasks(status="pending")
-               if task.task_type == "review"]
+    """Prefer the largest claimable review within the highest priority."""
+    pending = _claimable_cloud_reviews(queue)
     if not pending:
         return set()
 
@@ -436,8 +450,13 @@ def cloud_review_skip_ids(queue: TaskQueue) -> set[str]:
         context_size = len(str(context.get("instructions") or "")) + len(task.description)
         return max(diff or 0, context_size)
 
-    largest = max(pending, key=size)
+    best_priority = min(task.priority for task in pending)
+    largest = max((task for task in pending if task.priority == best_priority), key=size)
     return {task.task_id for task in pending if task.task_id != largest.task_id}
+
+
+_DISPATCH_PROBE_CACHE: dict[tuple[RunFn, str], tuple[float, CloudCapability]] = {}
+_DISPATCH_PROBE_WARNING_AT: dict[str, float] = {}
 
 
 def dispatch_cloud_for_role(
@@ -456,6 +475,9 @@ def dispatch_cloud_for_role(
     if not cloud_dispatch_enabled():
         return CloudDispatchOutcome(False, skipped_reason="disabled")
 
+    if task_type == "review" and not _claimable_cloud_reviews(queue):
+        return CloudDispatchOutcome(False, skipped_reason="no_task")
+
     in_flight = queue.count_in_progress_by_dispatch_channel(DISPATCH_CHANNEL)
     if in_flight >= cloud_max_concurrency():
         logger.debug("claude_cloud: at capacity (%d/%d) — skipping role=%s",
@@ -471,12 +493,24 @@ def dispatch_cloud_for_role(
                 return CloudDispatchOutcome(False, skipped_reason="daily_cap")
 
     run = run_fn or _default_run
-    capability = probe_cloud_cli(run, cli_path=cli_path)
+    probe_key = (run, cli_path or cloud_cli_path())
+    cached = _DISPATCH_PROBE_CACHE.get(probe_key) if run_fn is None else None
+    if cached and time.monotonic() - cached[0] < 60:
+        capability = cached[1]
+    else:
+        capability = probe_cloud_cli(run, cli_path=cli_path)
+        if run_fn is None:
+            _DISPATCH_PROBE_CACHE[probe_key] = (time.monotonic(), capability)
     if not capability.supported:
-        logger.warning("claude_cloud: CLI capability probe failed — %s", capability.reason)
+        warning_key = f"{probe_key[1]}:{capability.reason}"
+        now = time.monotonic()
+        if now - _DISPATCH_PROBE_WARNING_AT.get(warning_key, float("-inf")) >= 60:
+            logger.warning("claude_cloud: CLI capability probe failed — %s", capability.reason)
+            _DISPATCH_PROBE_WARNING_AT[warning_key] = now
         return CloudDispatchOutcome(False, skipped_reason=f"cli_unsupported:{capability.reason}")
 
-    task = queue.dequeue(role=role, claimed_via="cloud_push", skip_deferred=True,
+    task = queue.dequeue(agent=CLOUD_PROVIDER_NAME, role=role,
+                         claimed_via="cloud_push", skip_deferred=True,
                          skip_task_ids=cloud_review_skip_ids(queue) if task_type == "review" else None)
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
@@ -555,6 +589,9 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
     """Launch a comparison review without claiming or completing the local task."""
     if not cloud_shadow_enabled() or task.task_type != "review":
         return False
+    current = queue.get_task_context(task.task_id)
+    if current.get("cloud_shadow_launch_reserved_at") or current.get("cloud_shadow_session_id"):
+        return False
     shadow_active = sum(1 for row in queue.list_tasks()
                         if (row.context or {}).get("cloud_shadow_session_id")
                         and not (row.context or {}).get("cloud_shadow_ended_at"))
@@ -575,13 +612,19 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
     repo = _resolve_task_repo(task, None)
     if not repo:
         return False
+    if not queue.reserve_cloud_shadow_launch(task.task_id):
+        return False
     try:
         proc = run(build_launch_argv(build_cloud_task_prompt(task, repo=repo)))
         launch = parse_cloud_launch_output(proc.stdout or "") if proc.returncode == 0 else None
     except Exception:
         logger.exception("claude_cloud: shadow launch failed for %s", task.task_id)
+        queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
+                                           "cloud_shadow_ended_at": time.time()})
         return False
     if not launch or not launch.dispatched:
+        queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
+                                           "cloud_shadow_ended_at": time.time()})
         return False
     queue.patch_context(task.task_id, {
         "cloud_shadow_session_id": launch.session_id,

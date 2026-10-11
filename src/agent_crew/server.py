@@ -6217,7 +6217,8 @@ def create_app(
                                 _cloud_outcome = await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="reviewer", task_type="review")
-                                if _cloud_outcome.skipped_reason != "daily_cap":
+                                _skip = _cloud_outcome.skipped_reason or ""
+                                if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
                                     continue
                                 _cloud_local_fallback = True
                         _default_role = _worker_roles[0] if _worker_roles else ""

@@ -5,6 +5,7 @@ import sqlite3
 import time
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew import claude_cloud as cloud
@@ -230,27 +231,6 @@ def test_headless_tick_reconciles_cloud_without_watchdog_loop(tmp_path, monkeypa
         _wait_for(lambda: bool(seen))
 
 
-def test_headless_daily_cap_checks_local_reviewer_queue(tmp_path, monkeypatch):
-    queue = TaskQueue(str(tmp_path / "tasks.db"))
-    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
-    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
-    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
-    seen = []
-    original_dequeue = TaskQueue.dequeue
-
-    def dequeue(self, *args, **kwargs):
-        seen.append((kwargs.get("agent"), kwargs.get("role")))
-        return original_dequeue(self, *args, **kwargs)
-
-    monkeypatch.setattr(TaskQueue, "dequeue", dequeue)
-    monkeypatch.setattr(cloud, "dispatch_cloud_for_role",
-                        lambda *_args, **_kwargs: SimpleNamespace(skipped_reason="daily_cap"))
-    app = create_app(queue._db_path, state_path=_state(tmp_path),
-                     watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app):
-        _wait_for(lambda: ("claude_cloud", "reviewer") in seen)
-
-
 def test_headless_shadow_branch_launches_comparison_before_local_run(tmp_path, monkeypatch):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     _enqueue_review(queue)
@@ -266,3 +246,120 @@ def test_headless_shadow_branch_launches_comparison_before_local_run(tmp_path, m
                      watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         _wait_for(lambda: launched == ["review-cloud"])
+
+
+def test_shadow_requeue_uses_one_paid_session(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_PER_DAY", "2")
+    launched = []
+    agents = []
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        launched.append(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "session_id": f"session_{len(launched):08d}",
+            "url": f"https://claude.ai/code/session_{len(launched):08d}"}))
+
+    def cooldown(_self, agent):
+        agents.append(agent)
+        return time.time() + 60 if agent == "claude" else None
+
+    monkeypatch.setattr(cloud, "_default_run", run)
+    monkeypatch.setattr("agent_crew.server.QuotaBudgetProvider.active_cooldown_until", cooldown)
+    monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
+    app = create_app(queue._db_path, state_path=_state(tmp_path),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: len(agents) >= 3)
+    assert agents[:3] == ["claude"] * 3
+    assert len(launched) == 1
+    assert queue.count_cloud_reviews_started_since(time.time() - 60) == 1
+
+
+def test_cloud_selection_ignores_unclaimable_and_respects_priority(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue, "review-small")
+    _enqueue_review(queue, "review-large")
+    queue.patch_context("review-large", {"instructions": "x" * 4000,
+                                         "agent_override": "gemini"})
+    assert "review-small" not in cloud.cloud_review_skip_ids(queue)
+    queue.patch_context("review-large", {"agent_override": None,
+                                         "push_not_before": time.time() + 60})
+    assert "review-small" not in cloud.cloud_review_skip_ids(queue)
+    queue.patch_context("review-large", {"push_not_before": 0})
+    queue.enqueue(TaskRequest(
+        task_id="review-priority", task_type="review", description="urgent review",
+        branch="agent/review-priority", project="agent_crew", priority=1,
+        context={"pr_number": 716, "reviewed_sha": SHA, "repo": "owner/repo",
+                 "risk_tier": 2, "instructions": "short"},
+    ))
+    assert "review-large" in cloud.cloud_review_skip_ids(queue)
+    assert "review-priority" not in cloud.cloud_review_skip_ids(queue)
+
+
+def test_no_cloud_probe_without_pending_review(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    outcome = cloud.dispatch_cloud_for_role(queue, role="reviewer", task_type="review",
+        run_fn=lambda *_args: (_ for _ in ()).throw(AssertionError("probed empty queue")))
+    assert outcome.skipped_reason == "no_task"
+
+
+def test_unsupported_cli_warning_is_rate_limited(tmp_path, monkeypatch, caplog):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    for _ in range(2):
+        outcome = cloud.dispatch_cloud_for_role(
+            queue, role="reviewer", task_type="review", cli_path="missing-test-cli",
+            run_fn=lambda *_args: SimpleNamespace(returncode=1, stdout=""))
+        assert outcome.skipped_reason.startswith("cli_unsupported:")
+    assert sum("CLI capability probe failed" in row.message for row in caplog.records) == 1
+
+
+def test_pending_review_reuses_recent_cli_probe(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    probes = []
+
+    def run(argv, **kwargs):
+        probes.append(argv)
+        return SimpleNamespace(returncode=1, stdout="")
+
+    monkeypatch.setattr(cloud, "_default_run", run)
+    for _ in range(2):
+        outcome = cloud.dispatch_cloud_for_role(
+            queue, role="reviewer", task_type="review", cli_path="cached-test-cli")
+        assert outcome.skipped_reason.startswith("cli_unsupported:")
+    assert len(probes) == 1
+
+
+@pytest.mark.parametrize("reason", ["daily_cap", "at_capacity", "cli_unsupported:probe failed"])
+def test_headless_cloud_skip_dispatches_local_reviewer(tmp_path, monkeypatch, reason):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    agents = []
+    monkeypatch.setattr(cloud, "dispatch_cloud_for_role",
+                        lambda *_args, **_kwargs: SimpleNamespace(skipped_reason=reason))
+
+    def cooldown(_self, agent):
+        agents.append(agent)
+        return time.time() + 60
+
+    monkeypatch.setattr("agent_crew.server.QuotaBudgetProvider.active_cooldown_until", cooldown)
+    app = create_app(queue._db_path, state_path=_state(tmp_path),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: bool(agents))
+    assert agents[0] == "claude"
