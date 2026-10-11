@@ -13,31 +13,41 @@ from agent_crew.server import create_app
 
 # Update this map only when bumping QUEUE_SCHEMA_VERSION. Previous entries stay
 # immutable so changing DDL under an existing version fails this test.
-SCHEMA_SIGNATURES = {1: "c73fdf2908a7fb880a39d6157052f776481c96b3eed0d269bb09d537825b3b26"}
-_QUEUE_SOURCE = Path(__file__).resolve().parents[2] / "src" / "agent_crew" / "queue.py"
+SCHEMA_SIGNATURES = {1: "89abf1b377b2f33fa31a7a389c866b020b5b6be274acfb1fbd136259b89f0d81"}
+_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
+_DDL_SOURCES = {
+    "queue.py": _SOURCE_ROOT / "queue.py",
+    "cea/store.py": _SOURCE_ROOT / "cea" / "store.py",
+}
 _DDL_START = re.compile(r"^\s*(?:CREATE|ALTER|DROP)\s+", re.IGNORECASE)
 
 
-def _schema_signature(source: str) -> str:
-    """Fingerprint queue DDL declarations and inline schema statements."""
-    tree = ast.parse(source)
+def _schema_signature(sources: dict[str, str]) -> str:
+    """Fingerprint DDL from both writers used by TaskQueue initialization."""
     statements = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Assign, ast.AnnAssign)):
-            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if isinstance(target, ast.Name) and (
-                        target.id.startswith("_DDL") or target.id == "_EXEC_STATE_COLUMN_TYPES"):
-                    statements.append((target.id, ast.dump(node.value, include_attributes=False)))
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if _DDL_START.match(node.value):
-                statements.append(("inline", node.value.strip()))
-        elif isinstance(node, ast.JoinedStr):
-            fragment = ast.get_source_segment(source, node) or ""
-            if re.search(r"\b(?:CREATE|ALTER|DROP)\s+", fragment, re.IGNORECASE):
-                statements.append(("inline", ast.dump(node, include_attributes=False)))
+    for name, source in sources.items():
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                for target in targets:
+                    if isinstance(target, ast.Name) and (
+                            target.id.startswith("_DDL") or target.id == "_EXEC_STATE_COLUMN_TYPES"):
+                        statements.append((
+                            name, target.id, ast.dump(node.value, include_attributes=False)))
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                if _DDL_START.match(node.value):
+                    statements.append((name, "inline", node.value.strip()))
+            elif isinstance(node, ast.JoinedStr):
+                fragment = ast.get_source_segment(source, node) or ""
+                if re.search(r"\b(?:CREATE|ALTER|DROP)\s+", fragment, re.IGNORECASE):
+                    statements.append((name, "inline", ast.dump(node, include_attributes=False)))
     payload = repr(sorted(statements)).encode()
     return hashlib.sha256(payload).hexdigest()
+
+
+def _ddl_sources() -> dict[str, str]:
+    return {name: path.read_text() for name, path in _DDL_SOURCES.items()}
 
 
 def test_health_exposes_queue_schema_version(tmp_path):
@@ -51,17 +61,30 @@ def test_health_exposes_queue_schema_version(tmp_path):
 
 
 def test_queue_ddl_requires_version_bump(tmp_path):
-    source = _QUEUE_SOURCE.read_text()
+    sources = _ddl_sources()
     db = str(tmp_path / "tasks.db")
     TaskQueue(db)
-    assert _schema_signature(source) == SCHEMA_SIGNATURES[QUEUE_SCHEMA_VERSION]
+    assert _schema_signature(sources) == SCHEMA_SIGNATURES[QUEUE_SCHEMA_VERSION]
 
 
 def test_ddl_change_without_bump_fails_guard(tmp_path):
-    source = _QUEUE_SOURCE.read_text()
+    sources = _ddl_sources()
     db = str(tmp_path / "tasks.db")
     TaskQueue(db)
-    changed = source.replace("CREATE TABLE IF NOT EXISTS gates (",
-                             "CREATE TABLE IF NOT EXISTS gates (\n    new_field TEXT,", 1)
-    assert changed != source
-    assert _schema_signature(changed) != SCHEMA_SIGNATURES[QUEUE_SCHEMA_VERSION]
+    changed = sources["queue.py"].replace(
+        "CREATE TABLE IF NOT EXISTS gates (",
+        "CREATE TABLE IF NOT EXISTS gates (\n    new_field TEXT,", 1)
+    assert changed != sources["queue.py"]
+    assert (_schema_signature({**sources, "queue.py": changed})
+            != SCHEMA_SIGNATURES[QUEUE_SCHEMA_VERSION])
+
+
+def test_cea_store_ddl_change_without_bump_fails_guard(tmp_path):
+    TaskQueue(str(tmp_path / "tasks.db"))
+    sources = _ddl_sources()
+    changed = sources["cea/store.py"].replace(
+        "ALTER TABLE tasks ADD COLUMN receipt_id TEXT",
+        "ALTER TABLE tasks ADD COLUMN receipt_id BLOB", 1)
+    assert changed != sources["cea/store.py"]
+    assert (_schema_signature({**sources, "cea/store.py": changed})
+            != SCHEMA_SIGNATURES[QUEUE_SCHEMA_VERSION])
