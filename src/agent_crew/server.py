@@ -6268,8 +6268,7 @@ def create_app(
                         if _target_wt:
                             active_worktrees.add(_target_wt)
                         task_slots[task.task_id] = _slot
-                        if (_cloud_local_fallback and _claude_cloud.cloud_shadow_enabled()
-                                and role == "reviewer"):
+                        if _claude_cloud.cloud_shadow_enabled() and role == "reviewer":
                             await asyncio.to_thread(_claude_cloud.launch_shadow_review, q(), task)
 
                         async def _run(
