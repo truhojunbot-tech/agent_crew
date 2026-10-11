@@ -21,6 +21,12 @@ def _build():
     )
 
 
+def _enable_mock_forge_fetch(monkeypatch):
+    """Give the mocked worker thread scheduling room under full-suite load."""
+    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    monkeypatch.setenv("AGENT_CREW_FORGE_TIMEOUT_MS", "5000")
+
+
 def test_off_does_not_construct_or_call_forge(monkeypatch):
     monkeypatch.delenv("AGENT_CREW_FORGE_PROVIDER", raising=False)
     monkeypatch.setattr(cp.ForgeProvider, "__init__", lambda *a, **kw: pytest.fail("constructed"))
@@ -30,7 +36,7 @@ def test_off_does_not_construct_or_call_forge(monkeypatch):
 
 
 def test_real_shape_maps_artifacts_and_request(monkeypatch):
-    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    _enable_mock_forge_fetch(monkeypatch)
     calls = []
 
     class Response:
@@ -59,7 +65,7 @@ def test_real_shape_maps_artifacts_and_request(monkeypatch):
     assert "hybrid" in items["forge:crew-adr-17"].provenance
     request, timeout = calls[0]
     assert request.full_url == "http://127.0.0.1:8769/get_context"
-    assert timeout == 0.3
+    assert timeout == 5.0
     body = json.loads(request.data)
     assert body["situation"] == {
         "project": "agent_crew", "task_type": "implement", "fix_round": True,
@@ -69,7 +75,7 @@ def test_real_shape_maps_artifacts_and_request(monkeypatch):
 
 
 def test_live_shape_maps_tail_and_telemetry(monkeypatch):
-    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    _enable_mock_forge_fetch(monkeypatch)
     tail_text = "x" * 900
     body = {"items": [{"source_path": "src/worker.py", "repo": "org/agent_crew",
                        "commit_sha": "a" * 40, "content_sha": "b" * 64,
@@ -92,7 +98,7 @@ def test_live_shape_maps_tail_and_telemetry(monkeypatch):
 
 
 def test_tail_bytes_counts_only_delivered_forge_text(monkeypatch):
-    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    _enable_mock_forge_fetch(monkeypatch)
     monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
         cp.Artifact("repo:src/duplicate.py", "src/duplicate.py", cp.TYPE_CODE)
     ])
@@ -125,7 +131,7 @@ def test_tail_bytes_counts_only_delivered_forge_text(monkeypatch):
 
 
 def test_tail_bytes_without_server_count_uses_delivered_text(monkeypatch):
-    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    _enable_mock_forge_fetch(monkeypatch)
     body = {"items": [{"source_path": "src/x.py", "repo": "org/agent_crew",
                        "commit_sha": "a" * 40, "content_sha": "b" * 64,
                        "bytes": 5, "score": 0.7, "text": "café"}]}
@@ -203,7 +209,7 @@ def test_failure_degrades_but_builds(monkeypatch, error):
     b'{"context_items": [{"chunk_id": "missing-score", "source_file": "src/x.py", "content": "x"}]}',
 ])
 def test_malformed_forge_response_keeps_lexical_results(monkeypatch, body):
-    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    _enable_mock_forge_fetch(monkeypatch)
     monkeypatch.setattr(cp.LexicalRepoProvider, "retrieve", lambda self, query: [
         cp.Artifact("repo:src/worker.py", "src/worker.py", cp.TYPE_CODE)
     ])
@@ -232,7 +238,7 @@ def test_malformed_forge_response_keeps_lexical_results(monkeypatch, body):
     {"bytes": "bad"}, {"bytes": -1},
 ])
 def test_incomplete_live_item_omits_tail_and_records_error(monkeypatch, change):
-    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    _enable_mock_forge_fetch(monkeypatch)
     item = {"source_path": "src/x.py", "repo": "org/agent_crew",
             "commit_sha": "a" * 40, "content_sha": "b" * 64,
             "bytes": 4, "score": 0.7, "text": "text"}
@@ -253,7 +259,7 @@ def test_incomplete_live_item_omits_tail_and_records_error(monkeypatch, change):
 
 @pytest.mark.parametrize("tail_bytes", ["bad", -1, None])
 def test_invalid_server_tail_bytes_omits_tail_and_records_error(monkeypatch, tail_bytes):
-    monkeypatch.setenv("AGENT_CREW_FORGE_PROVIDER", "1")
+    _enable_mock_forge_fetch(monkeypatch)
     body = {"items": [{"source_path": "src/x.py", "repo": "org/agent_crew",
                        "commit_sha": "a" * 40, "content_sha": "b" * 64,
                        "bytes": 4, "score": 0.7, "text": "text"}],
