@@ -3,9 +3,15 @@ from array import array
 import hashlib
 import json
 import sqlite3
+import time
 
-from agent_crew.memory_hybrid import HybridMemoryStorage
-from agent_crew.memory_runtime import MemoryScope
+from fastapi.testclient import TestClient
+
+from agent_crew.memory_hybrid import HybridMemoryStorage, MIDDLE_CANDIDATE_LIMIT
+from agent_crew.memory_runtime import MemoryRecord, MemoryScope, SQLiteMemoryStorage
+from agent_crew.memory import NullMemoryProvider
+from agent_crew.server import create_app
+from tests.unit.test_issue_322_memory_provider import _dispatch_snapshot
 
 
 class Embedder:
@@ -82,3 +88,57 @@ def test_invalid_fusion_settings_are_refused(tmp_path):
         assert "fusion weight" in str(exc)
     else:
         raise AssertionError("out-of-range fusion weight was accepted")
+
+
+def test_vector_arm_is_bounded_above_candidate_cap(tmp_path):
+    path = tmp_path / "memory.db"
+    store = HybridMemoryStorage(str(path), embedder=Embedder(),
+                                fusion_mode="union_vec_first")
+    with sqlite3.connect(path) as db:
+        db.executemany(
+            "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+            "VALUES (?,?,?,?,?,?)",
+            [("episodic", f"vec:{i}", json.dumps({"text": f"vector row {i}"}),
+              json.dumps({"project": "home"}), 1, float(i)) for i in range(400)],
+        )
+        rows = db.execute("SELECT rowid,body FROM adr001_fts").fetchall()
+        db.executemany(
+            "INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) VALUES (?,?,?,?)",
+            [(rowid, Embedder.model_id, hashlib.sha256(body.encode()).hexdigest(),
+              array("f", [1.0, 0.0]).tobytes()) for rowid, body in rows],
+        )
+        db.commit()
+        candidates = store._candidates(db, MemoryScope(project="home"), "needle")
+    assert len(candidates) <= MIDDLE_CANDIDATE_LIMIT + 256
+
+
+def test_server_receipt_keeps_nondefault_fusion_mode_and_timeout(tmp_path, monkeypatch,
+                                                                  unused_tcp_port):
+    path = tmp_path / "memory.db"
+    SQLiteMemoryStorage(str(path)).put(MemoryRecord(
+        "episodic", "signal", {"text": "signal"}, MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_FUSION_MODE", "weighted")
+    _, context, events, _ = _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, NullMemoryProvider(),
+        unused_tcp_port=unused_tcp_port)
+    assert events[-1]["fusion_mode"] == "weighted"
+    assert context["shadow_memory"]["fusion_mode"] == "weighted"
+
+    original_rank = HybridMemoryStorage._rank_middle
+
+    def slow_rank(self, *args):
+        time.sleep(.45)
+        return original_rank(self, *args)
+
+    monkeypatch.setattr(HybridMemoryStorage, "_rank_middle", slow_rank)
+    with TestClient(create_app(str(tmp_path / "http-tasks.db"), project="project-a",
+                               watchdog_disabled=True, anomaly_disabled=True)) as client:
+        response = client.post(
+            "/memory/retrieve_ranked", headers={"X-Agent-Crew-Project": "project-a"},
+            json={"scope": {"project": "project-a"}, "query": "signal",
+                  "role": "implementer", "k": 10, "byte_budget": 4000})
+    assert response.status_code == 200
+    assert response.json()["mode"] == "fallback"
+    assert response.json()["fusion_mode"] == "weighted"
