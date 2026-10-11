@@ -1,6 +1,10 @@
 """C1.a: coordinator and worker attempts are fenced by durable generations."""
 
 from dataclasses import asdict
+import io
+import json
+import urllib.error
+import urllib.request
 
 import pytest
 from fastapi.testclient import TestClient
@@ -46,6 +50,27 @@ def test_split_brain_generations_and_old_worker_attempt_are_fenced(tmp_path):
     assert queue.stale_attempt_count() == 1
     assert [r["event"] for r in queue.list_coordinator_receipts()].count(
         "stale_coordinator_generation") == 2
+
+
+def test_queue_rotates_real_dispatch_attempt_and_accepts_current_result(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(_task("rotated"))
+    queue.record_dispatch("rotated", channel="api")
+    first = queue.dispatch_binding("rotated")["attempt_id"]
+    queue.record_dispatch("rotated", channel="api")
+    second = queue.dispatch_binding("rotated")["attempt_id"]
+    assert first and second and first != second
+
+    with pytest.raises(StaleAttemptRejected, match="stale_attempt"):
+        queue.submit_result("rotated", TaskResult(
+            task_id="rotated", status="completed", summary="old result"),
+            attempt_id=first)
+    assert queue.get_task("rotated").status != "completed"
+    queue.submit_result("rotated", TaskResult(
+        task_id="rotated", status="completed", summary="current result"),
+        attempt_id=second)
+    assert queue.get_task("rotated").status == "completed"
+    assert queue.stale_attempt_count() == 1
 
 
 def test_handoff_requires_complete_checkpoint(tmp_path):
@@ -96,6 +121,82 @@ def test_http_rejects_stale_coordinator_writes_and_worker_result(tmp_path):
         assert refused.status_code == 409
         assert "stale_attempt" in refused.text
         assert queue.stale_attempt_count() == 1
+
+
+def test_http_rotates_real_dispatch_attempt_and_accepts_current_result(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True, project="demo", identity_required=False)
+    with TestClient(app, headers={"X-Agent-Crew-Project": "demo"}) as client:
+        assert client.post("/tasks", json=asdict(_task("http-rotated"))).status_code == 201
+        queue = TaskQueue(db)
+        queue.record_dispatch("http-rotated", channel="api")
+        first = queue.dispatch_binding("http-rotated")["attempt_id"]
+        queue.record_dispatch("http-rotated", channel="api")
+        second = queue.dispatch_binding("http-rotated")["attempt_id"]
+        assert first and second and first != second
+
+        stale = client.post("/tasks/http-rotated/result", json={
+            "task_id": "http-rotated", "status": "completed", "summary": "old result",
+            "attempt_id": first})
+        assert stale.status_code == 409
+        assert "stale_attempt" in stale.text
+        assert queue.get_task("http-rotated").status != "completed"
+        accepted = client.post("/tasks/http-rotated/result", json={
+            "task_id": "http-rotated", "status": "completed", "summary": "current result",
+            "attempt_id": second})
+        assert accepted.status_code == 200
+        assert queue.get_task("http-rotated").status == "completed"
+
+
+def test_crew_run_http_enqueue_sends_generation_and_refuses_old_claim(tmp_path, monkeypatch):
+    from agent_crew.loop import enqueue_implement
+
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True, project="demo", identity_required=False)
+    sent_headers = []
+    sent_task_ids = []
+
+    with TestClient(app) as client:
+        def urlopen(request, timeout):
+            headers = dict(request.header_items())
+            sent_headers.append(headers)
+            sent_task_ids.append(json.loads(request.data)["task_id"])
+            response = client.request(request.get_method(), request.full_url,
+                                      content=request.data, headers=headers)
+            if response.status_code >= 400:
+                raise urllib.error.HTTPError(request.full_url, response.status_code,
+                                             response.text, None, io.BytesIO(response.content))
+            return io.BytesIO(response.content)
+
+        monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+        assert client.post("/runtime/coordinator/handoff", json={
+            "coordinator_id": "crew-run:demo", "generation": 1}).status_code == 200
+        queue = TaskQueue(db)
+        current_id = enqueue_implement(
+            queue, "current run", "main",
+            context={"coordinator_generation": 1, "risk_tier": 2},
+            port=8105, project="demo")
+        assert queue.get_task(current_id) is not None
+        assert sent_headers[-1]["X-agent-crew-coordinator-generation"] == "1"
+        assert queue.cancel(current_id, coordinator_generation=1)
+
+        ready = queue.prepare_coordinator_handoff({
+            "objective": "new run", "open_task_ids": [current_id],
+            "last_receipt_hash": "prior", "generation": 1})
+        assert queue.advance_coordinator(coordinator_id="new", generation=2,
+                                         checkpoint_ref=ready["checkpoint_ref"])["accepted"]
+        with pytest.raises(urllib.error.HTTPError) as error:
+            enqueue_implement(queue, "old run", "main",
+                              context={"coordinator_generation": 1, "risk_tier": 2},
+                              port=8105, project="demo")
+        assert error.value.code == 409
+        assert "stale_coordinator_generation" in error.value.read().decode()
+        assert sent_headers[-1]["X-agent-crew-coordinator-generation"] == "1"
+        assert queue.get_task(sent_task_ids[-1]) is None
 
 
 def test_headerless_worker_enqueue_and_cancel_survive_first_handoff(tmp_path, monkeypatch):
