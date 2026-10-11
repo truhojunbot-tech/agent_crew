@@ -4713,11 +4713,14 @@ def create_app(
         wt = wt_override or worktree_map.get(role)
         return agent, wt
 
-    async def _dispatch_task(task: TaskRequest, role: str) -> None:
+    async def _dispatch_task(task: TaskRequest, role: str,
+                             dispatch_agent: Optional[str] = None) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         agent, wt = _resolve_dispatch_target(task, role)
+        if dispatch_agent is not None:
+            agent = dispatch_agent
         if _honor_provider_cooldown(task, agent):
             return
         if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
@@ -6132,6 +6135,19 @@ def create_app(
                         if worker in active_workers:
                             continue
                         _worker_roles = _AGENT_TO_ROLES.get(worker, [])
+                        _cloud_local_fallback = False
+                        if (_worker_roles == ["reviewer"] and
+                                worker == _claude_cloud.CLOUD_PROVIDER_NAME and
+                                _claude_cloud.cloud_dispatch_enabled()):
+                            # The cloud adapter owns dequeue, admission,
+                            # concurrency, launch and durable attribution.
+                            # Claiming here first would strand the review.
+                            _cloud_outcome = await asyncio.to_thread(
+                                _claude_cloud.dispatch_cloud_for_role, q(),
+                                role="reviewer", task_type="review")
+                            if _cloud_outcome.skipped_reason != "daily_cap":
+                                continue
+                            _cloud_local_fallback = True
                         _default_role = _worker_roles[0] if _worker_roles else ""
                         task = None
                         for _candidate_role in _worker_roles:
@@ -6148,6 +6164,10 @@ def create_app(
                         role = _TYPE_TO_ROLE.get(
                             task.task_type, _default_role or "implementer")
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        _dispatch_agent = None
+                        if (_cloud_local_fallback and role == "reviewer" and
+                                _target_agent == _claude_cloud.CLOUD_PROVIDER_NAME):
+                            _target_agent = _dispatch_agent = "claude"
                         _slot = _target_agent or worker
                         if _slot in active_workers:
                             # override 가 이미 바쁜 worker 를 가리켰다.
@@ -6173,9 +6193,10 @@ def create_app(
                         async def _run(
                             t: TaskRequest = task, r: str = role, s: str = _slot,
                             w: Optional[str] = _target_wt,
+                            a: Optional[str] = _dispatch_agent,
                         ) -> None:
                             try:
-                                await _dispatch_task(t, r)
+                                await _dispatch_task(t, r, dispatch_agent=a)
                             finally:
                                 _drop_unspawned_reservation(t.task_id)
                                 active_workers.discard(s)

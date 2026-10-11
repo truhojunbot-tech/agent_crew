@@ -6041,6 +6041,19 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def count_cloud_reviews_started_since(self, since: float) -> int:
+        """Count durable cloud review launches, including completed sessions."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_attribution "
+                "WHERE agent='claude_cloud' AND task_type='review' "
+                "AND provider_session_id<>'' AND started_at>=?", (since,)
+            ).fetchone()
+            return int(row["n"]) if row else 0
+        finally:
+            conn.close()
+
     def list_in_progress_by_dispatch_channel(self, channel: str) -> List[TaskRequest]:
         """#496: in_progress tasks dispatched over ``channel``, for a
         completion-reconciliation pass (there is no live callback channel

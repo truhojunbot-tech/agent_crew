@@ -60,6 +60,7 @@ DISPATCH_CHANNEL = "claude_cloud"
 
 _ENV_ENABLED = "AGENT_CREW_CLOUD_ENABLED"
 _ENV_MAX_CONCURRENCY = "AGENT_CREW_CLOUD_MAX_CONCURRENCY"
+_ENV_MAX_PER_DAY = "AGENT_CREW_CLOUD_MAX_PER_DAY"
 _ENV_CLI_PATH = "AGENT_CREW_CLOUD_CLI_PATH"
 DEFAULT_MAX_CONCURRENCY = 3
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -89,6 +90,22 @@ def cloud_max_concurrency() -> int:
         logger.warning("claude_cloud: %s=%d must be positive, using default %d",
                         _ENV_MAX_CONCURRENCY, value, DEFAULT_MAX_CONCURRENCY)
         return DEFAULT_MAX_CONCURRENCY
+    return value
+
+
+def cloud_max_per_day() -> Optional[int]:
+    """Optional UTC-day launch cap; unset means no daily cap."""
+    raw = (os.getenv(_ENV_MAX_PER_DAY) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        logger.warning("claude_cloud: invalid %s=%r, ignoring daily cap",
+                       _ENV_MAX_PER_DAY, raw)
+        return None
     return value
 
 
@@ -418,6 +435,14 @@ def dispatch_cloud_for_role(
                      in_flight, cloud_max_concurrency(), role)
         return CloudDispatchOutcome(False, skipped_reason="at_capacity")
 
+    if task_type == "review":
+        daily_cap = cloud_max_per_day()
+        if daily_cap is not None:
+            day_start = int(time.time() // 86400) * 86400
+            if queue.count_cloud_reviews_started_since(day_start) >= daily_cap:
+                logger.info("claude_cloud: daily review cap %d reached; local fallback", daily_cap)
+                return CloudDispatchOutcome(False, skipped_reason="daily_cap")
+
     run = run_fn or _default_run
     capability = probe_cloud_cli(run, cli_path=cli_path)
     if not capability.supported:
@@ -478,14 +503,17 @@ def dispatch_cloud_for_role(
     if isinstance(task.context, dict):
         prev = task.context.get("prev_task_id")
         prev_task_id = prev if isinstance(prev, str) else ""
+    launched_at = time.time()
     queue.record_attribution(
         task_id=task.task_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
         role=role, task_type=task.task_type, worktree_path="", git_branch=task.branch or "",
         status="in_progress", provider_session_id=launch.session_id or "",
-        previous_task_id=prev_task_id, started_at=time.time(),
+        previous_task_id=prev_task_id, started_at=launched_at,
     )
     queue.patch_context(task.task_id, {
         "cloud_session_url": launch.session_url,
+        "cloud_session_id": launch.session_id,
+        "cloud_launched_at": launched_at,
         "execution_policy": execution_policy,
     })
     queue.set_push_at(task.task_id, pane_id=f"cloud:{launch.session_id}")
