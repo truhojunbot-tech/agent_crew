@@ -1,0 +1,82 @@
+{
+  "byte_budget": 65536,
+  "chosen_model_id": null,
+  "corpus_available_cases": {
+    "owner_cases": 17,
+    "task_cases": 12
+  },
+  "eval_sha256": "0bdb218d0c8e6ba3da8202c19201fee52a9605664ebe3ea4fb1d5de92de4ac61",
+  "k": 10,
+  "rows": [
+    {
+      "fallback_count": 0,
+      "model_id": "lexical_only",
+      "model_size_bytes": 0,
+      "owner_hits": 10,
+      "p95_embed_ms": null,
+      "p95_retrieve_ms": 128.35383787751198,
+      "retrieval_modes": {
+        "lexical_only": 41
+      },
+      "task_hits": 4,
+      "vector_coverage": {
+        "embedded": 0,
+        "total": 10245
+      }
+    },
+    {
+      "fallback_count": 1,
+      "model_id": "all-MiniLM-L6-v2",
+      "model_size_bytes": 91099267,
+      "owner_hits": 12,
+      "p95_embed_ms": 35.03435105085373,
+      "p95_retrieve_ms": 208.6762897670269,
+      "retrieval_modes": {
+        "fallback": 1,
+        "hybrid": 39,
+        "lexical_only": 1
+      },
+      "task_hits": 4,
+      "vector_coverage": {
+        "embedded": 10245,
+        "total": 10245
+      }
+    },
+    {
+      "fallback_count": 0,
+      "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+      "model_size_bytes": 479383128,
+      "owner_hits": 11,
+      "p95_embed_ms": 52.74472013115883,
+      "p95_retrieve_ms": 214.38417211174965,
+      "retrieval_modes": {
+        "hybrid": 40,
+        "lexical_only": 1
+      },
+      "task_hits": 4,
+      "vector_coverage": {
+        "embedded": 10245,
+        "total": 10245
+      }
+    },
+    {
+      "fallback_count": 4,
+      "model_id": "intfloat/multilingual-e5-small",
+      "model_size_bytes": 487351240,
+      "owner_hits": 9,
+      "p95_embed_ms": 152.26406045258045,
+      "p95_retrieve_ms": 339.44204822182655,
+      "retrieval_modes": {
+        "fallback": 4,
+        "hybrid": 36,
+        "lexical_only": 1
+      },
+      "task_hits": 4,
+      "vector_coverage": {
+        "embedded": 10245,
+        "total": 10245
+      }
+    }
+  ],
+  "source_db": "/tmp/adr001-r5-20261011/source-snapshot.db"
+}
