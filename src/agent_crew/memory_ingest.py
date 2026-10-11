@@ -29,12 +29,33 @@ def ingest_lock(path: str):
 
 def load_config(path: str) -> dict:
     config = json.loads(Path(path).expanduser().read_text())
-    if not isinstance(config, dict) or not isinstance(config.get("memory_db"), str):
+    if (not isinstance(config, dict) or not isinstance(config.get("memory_db"), str)
+            or not config["memory_db"].strip()):
         raise ValueError("memory ingest config requires memory_db")
-    if not isinstance(config.get("task_dbs", []), list) or not isinstance(config.get("repos", {}), dict):
+    task_dbs = config.get("task_dbs", [])
+    repos = config.get("repos", {})
+    if (not isinstance(task_dbs, list) or
+            any(not isinstance(db, str) or not db.strip() for db in task_dbs) or
+            not isinstance(repos, dict) or
+            any(not isinstance(repo, str) or not repo.strip() or
+                not isinstance(root, str) or not root.strip()
+                for repo, root in repos.items())):
         raise ValueError("memory ingest config requires task_dbs list and repos object")
+    explicit = config.get("explicit_files", {})
+    historic = config.get("historic_files", {})
+    if (not isinstance(explicit, dict) or
+            any(not isinstance(repo, str) or not isinstance(paths, list) or
+                any(not isinstance(item, str) for item in paths)
+                for repo, paths in explicit.items()) or
+            not isinstance(historic, dict) or
+            any(not isinstance(repo, str) or not isinstance(items, list) or
+                any(not isinstance(item, (list, tuple)) or len(item) != 2 or
+                    any(not isinstance(part, str) for part in item) for item in items)
+                for repo, items in historic.items())):
+        raise ValueError("memory ingest explicit_files and historic_files must contain paths")
     interval = config.get("interval_seconds", 900)
-    if not isinstance(interval, (int, float)) or not 60 <= interval <= 3600:
+    if (isinstance(interval, bool) or not isinstance(interval, (int, float))
+            or not 60 <= interval <= 3600):
         raise ValueError("memory ingest interval_seconds must be between 60 and 3600")
     return config
 
@@ -43,27 +64,34 @@ def run_configured_ingest(path: str) -> tuple[int, int] | None:
     """Capture terminal tasks and the latest published docs; skip if another run owns the lock."""
     config = load_config(path)
     memory_db = str(Path(config["memory_db"]).expanduser())
-    Path(memory_db).parent.mkdir(parents=True, exist_ok=True)
+    storage = SQLiteMemoryStorage.existing(memory_db)
     try:
         with ingest_lock(memory_db + ".ingest.lock"):
-            storage = SQLiteMemoryStorage(memory_db, busy_timeout_seconds=5.0)
             task_changed = backfill_task_outcomes(
                 storage, [str(Path(db).expanduser()) for db in config.get("task_dbs", [])])
             repos = [(repo, str(Path(root).expanduser()))
                      for repo, root in config.get("repos", {}).items()]
-            for repo, root in repos:
-                # A dispatcher checkout can remain detached on an earlier task.
-                # Refresh remote refs before scanning the published default branch.
-                if subprocess.run(["git", "-C", root, "remote", "get-url", "origin"],
-                                  capture_output=True, timeout=5).returncode == 0:
-                    subprocess.run(["git", "-C", root, "fetch", "--quiet", "origin"],
-                                   capture_output=True, timeout=30, check=True)
             explicit = {repo: set(paths) for repo, paths in
                         config.get("explicit_files", {}).items()}
             historic = {repo: [tuple(item) for item in items] for repo, items in
                         config.get("historic_files", {}).items()}
-            doc_changed = backfill_document_pointers(storage, repos, explicit, historic)
-            logger.info("memory ingest: tasks=%s documents=%s", task_changed, doc_changed)
+            doc_changed = 0
+            failed_repos = []
+            for repo, root in repos:
+                try:
+                    # A dispatcher checkout can remain detached on an earlier task.
+                    # Refresh remote refs before scanning the published default branch.
+                    if subprocess.run(["git", "-C", root, "remote", "get-url", "origin"],
+                                      capture_output=True, timeout=5).returncode == 0:
+                        subprocess.run(["git", "-C", root, "fetch", "--quiet", "origin"],
+                                       capture_output=True, timeout=30, check=True)
+                    doc_changed += backfill_document_pointers(
+                        storage, [(repo, root)], explicit, historic)
+                except Exception:
+                    failed_repos.append(repo)
+                    logger.exception("memory ingest: repo %s failed", repo)
+            logger.info("memory ingest: tasks=%s documents=%s failed_repos=%s",
+                        task_changed, doc_changed, failed_repos)
             return task_changed, doc_changed
     except BlockingIOError:
         logger.info("memory ingest: another server owns the lock")
