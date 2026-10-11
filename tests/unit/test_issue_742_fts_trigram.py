@@ -1,6 +1,7 @@
 """#742: migrate the existing ADR-001 index for Korean substring search."""
 import json
 import sqlite3
+import time
 
 from agent_crew.memory_hybrid import HybridMemoryStorage, ensure_index_schema
 from agent_crew.memory_runtime import MemoryScope, SQLiteMemoryStorage
@@ -126,6 +127,51 @@ def test_mixed_query_bm25_hit_precedes_substring_only_short_match(tmp_path):
             db, MemoryScope(project="agent_crew"), "Review PR 751 trigram index")
     ranked, _ = store._rank_middle(candidates, "Review PR 751 trigram index")
     assert ranked[0]["key"] == "owner:target"
+
+
+def test_common_short_word_cannot_evict_rare_short_hit(tmp_path):
+    for query, noise_body in (("is PR", "this is a note about nothing"),
+                              ("a PR", "a note")):
+        path = tmp_path / f"{query.replace(' ', '-')}.db"
+        _seed_with_newer_noise(path, [("owner:target", "PR 751 merged after CI green")],
+                               noise_body=noise_body)
+        store = HybridMemoryStorage(str(path))
+        with sqlite3.connect(path) as db:
+            candidates = store._candidates(db, MemoryScope(project="agent_crew"), query)
+        assert candidates[0]["key"] == "owner:target", query
+        ranked, _ = store._rank_middle(candidates, query)
+        assert ranked[0]["key"] == "owner:target", query
+
+
+def test_two_selective_short_terms_beat_one_newer_match(tmp_path):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:target", "PR merged after CI green")],
+                           noise_body="CI check unrelated")
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        candidates = store._candidates(db, MemoryScope(project="agent_crew"), "CI PR")
+    assert candidates[0]["key"] == "owner:target"
+
+
+def test_short_term_scan_stays_within_retrieval_budget_at_20k_rows(tmp_path):
+    path = tmp_path / "memory.db"
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        db.executemany(
+            "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+            "VALUES (?,?,?,?,?,?)",
+            (("decision", f"noise:{index:05}", '{"text":"this is a note"}',
+              '{"project":"agent_crew"}', 1, float(index))
+             for index in range(20_000)),
+        )
+        db.commit()
+        scope = MemoryScope(project="agent_crew")
+        times = []
+        for _ in range(3):
+            start = time.perf_counter()
+            store._candidates(db, scope, "is a to of in on PR CI it be we do")
+            times.append(time.perf_counter() - start)
+    assert max(times) < 0.300, times
 
 
 def test_short_only_terms_rank_lexical_hit_ahead_of_recent_noise(tmp_path):
