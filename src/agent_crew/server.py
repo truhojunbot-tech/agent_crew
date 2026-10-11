@@ -4162,7 +4162,8 @@ def create_app(
                 return
             try:
                 _claude_cloud.dispatch_cloud_for_role(
-                    q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""))
+                    q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""),
+                    state_path=state_path)
             except Exception:
                 logger.exception(f"_try_push_next: claude_cloud dispatch failed for role={role}")
             return
@@ -6497,7 +6498,8 @@ def create_app(
                                 # The cloud adapter owns dequeue and admission.
                                 _cloud_outcome = await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
-                                    role="reviewer", task_type="review")
+                                    role="reviewer", task_type="review",
+                                    state_path=state_path)
                                 _skip = _cloud_outcome.skipped_reason or ""
                                 if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
                                     continue
@@ -6551,7 +6553,8 @@ def create_app(
                         task_slots[task.task_id] = _slot
                         if _claude_cloud.cloud_shadow_enabled() and role == "reviewer":
                             try:
-                                await asyncio.to_thread(_claude_cloud.launch_shadow_review, q(), task)
+                                await asyncio.to_thread(_claude_cloud.launch_shadow_review, q(), task,
+                                                        state_path=state_path)
                             except Exception:
                                 logger.exception(
                                     "dispatcher: cloud shadow launch failed task=%s",

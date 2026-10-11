@@ -75,6 +75,10 @@ def _cloud_env(monkeypatch):
     this override."""
     monkeypatch.setenv(cc._ENV_ENABLED, "1")
     monkeypatch.setenv(cc._ENV_MAX_CONCURRENCY, "3")
+    # These contract tests inject the CLI and do not create a git checkout;
+    # #744 validates the real cwd/remote preflight in its own fixture.
+    monkeypatch.setattr(cc, "_validated_cloud_checkout",
+                        lambda project, repo, state_path=None: ("/fixture/claude", repo))
 
 
 # ── AT1: CLI capability probe ───────────────────────────────────────────

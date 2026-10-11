@@ -35,6 +35,10 @@ def q(tmp_db):
 @pytest.fixture(autouse=True)
 def _cloud_enabled(monkeypatch):
     monkeypatch.setenv(cc._ENV_ENABLED, "1")
+    # This suite tests reconciliation/prompt behavior with an injected CLI.
+    # Checkout validation itself is exercised by test_issue_744_cloud_launch_cwd.
+    monkeypatch.setattr(cc, "_validated_cloud_checkout",
+                        lambda project, repo, state_path=None: ("/fixture/claude", repo))
 
 
 def _enqueue_implement(q, task_id=None, branch=None, context=None):
