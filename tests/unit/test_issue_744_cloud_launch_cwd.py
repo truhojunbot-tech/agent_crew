@@ -95,6 +95,48 @@ def test_detached_published_head_launches_from_checkout_with_explicit_ref(
     assert f"--ref {head}" in launches[0][0][2]
 
 
+def test_detached_published_non_tip_commit_launches_after_branch_advances(
+        tmp_path, monkeypatch):
+    checkout = _checkout(tmp_path)
+    reviewed_head = _git("rev-parse", "HEAD", cwd=checkout)
+    (checkout / "README.md").write_text("branch advanced\n")
+    _git("commit", "-am", "advance branch", cwd=checkout)
+    _git("push", "origin", "HEAD:refs/heads/main", cwd=checkout)
+    _git("checkout", "--detach", reviewed_head, cwd=checkout)
+    state_path = _state(tmp_path, checkout)
+    assert cloud._validated_cloud_checkout("project", "owner/repo", state_path) == (
+        str(checkout), "owner/repo")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _task(queue)
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    launches = []
+    outcome = cloud.dispatch_cloud_for_role(queue, role="reviewer", task_type="review",
+                                             state_path=state_path, run_fn=_run(launches))
+    assert outcome.dispatched
+    assert len(launches) == 1
+    assert f"--ref {reviewed_head}" in launches[0][0][2]
+
+
+def test_detached_non_tip_commit_validates_before_local_fetch(tmp_path):
+    checkout = _checkout(tmp_path)
+    old_head = _git("rev-parse", "HEAD", cwd=checkout)
+    _git("checkout", "--detach", old_head, cwd=checkout)
+    other = tmp_path / "other"
+    _git("clone", "-b", "main", str(tmp_path / "remote.git"), str(other))
+    _git("config", "user.email", "test@example.com", cwd=other)
+    _git("config", "user.name", "Test", cwd=other)
+    (other / "README.md").write_text("advanced elsewhere\n")
+    _git("commit", "-am", "external advance", cwd=other)
+    new_head = _git("rev-parse", "HEAD", cwd=other)
+    _git("push", "origin", "HEAD:refs/heads/main", cwd=other)
+    assert _git("cat-file", "-t", old_head, cwd=checkout) == "commit"
+    missing = subprocess.run(["git", "cat-file", "-e", new_head], cwd=checkout)
+    assert missing.returncode != 0
+    assert cloud._validated_cloud_checkout("project", "owner/repo",
+                                          _state(tmp_path, checkout)) == (
+        str(checkout), "owner/repo")
+
+
 def test_detached_unpublished_head_fails_closed(tmp_path, monkeypatch):
     checkout = _checkout(tmp_path)
     _git("checkout", "--detach", "HEAD", cwd=checkout)

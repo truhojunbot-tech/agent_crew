@@ -415,7 +415,7 @@ def _resolve_task_repo(task: TaskRequest, explicit_repo: Optional[str],
 
 def _validated_cloud_checkout(project: str, repo: str,
                               state_path: Optional[str] = None) -> tuple[str, str]:
-    """Resolve the configured Claude checkout and verify its published HEAD.
+    """Resolve the configured Claude checkout and verify HEAD is on a remote branch.
 
     The server cwd can be a different repository. Never let a cloud launch
     inherit it, or trust the prompt alone to select the repository.
@@ -462,7 +462,34 @@ def _validated_cloud_checkout(project: str, repo: str,
         branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
         published = (git("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}")
                      if branch else git("ls-remote", "--heads", "origin"))
-        if not any(line.split()[0] == head for line in published.splitlines() if line.split()):
+        tips = [line.split()[0] for line in published.splitlines()
+                if line.split() and re.fullmatch(r"[0-9a-f]{40}", line.split()[0])]
+        # A reviewer checkout is often left detached at an earlier published
+        # commit after its branch advances. Claude --ref can pin that commit;
+        # its being an ancestor of a current remote branch is sufficient.
+        def contains_head(tip: str) -> bool:
+            if tip == head:
+                return True
+            result = subprocess.run(["git", "merge-base", "--is-ancestor", head, tip],
+                                    cwd=checkout, capture_output=True, text=True,
+                                    timeout=10, env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            return result.returncode == 0
+
+        published_head = any(contains_head(tip) for tip in tips)
+        if not published_head and tips:
+            # Another checkout may have pushed the branch since this one last
+            # fetched it. Fetch once only when a remote tip is missing locally.
+            missing_tip = any(subprocess.run(
+                ["git", "cat-file", "-e", f"{tip}^{{commit}}"], cwd=checkout,
+                capture_output=True, timeout=10).returncode != 0 for tip in tips)
+            if missing_tip:
+                fetched = subprocess.run(["git", "fetch", "--no-tags", "--quiet", "origin"],
+                                         cwd=checkout, capture_output=True, text=True,
+                                         timeout=10, env={**os.environ,
+                                                          "GIT_TERMINAL_PROMPT": "0"})
+                published_head = fetched.returncode == 0 and any(
+                    contains_head(tip) for tip in tips)
+        if not published_head:
             return "", remote.casefold()
         return checkout, remote.casefold()
     except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
