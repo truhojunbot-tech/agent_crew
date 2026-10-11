@@ -256,6 +256,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
             ensure_index_schema(db)
             db.commit()
+        self._revision_columns = True
 
     def missing_vector_count(self) -> int:
         with closing(sqlite3.connect(self.path)) as db:
