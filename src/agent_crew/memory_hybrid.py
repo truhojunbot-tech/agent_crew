@@ -272,8 +272,13 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         super().__init__(path, busy_timeout_seconds=30.0)
         self.backfill()
         self.write_embedder = embedder if embedder is not None else configured_write_embedder()
-        self.embedder = self.write_embedder or configured_embedder()
-        self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
+        # The endpoint can wait 30 seconds; only local embedders may run in
+        # the 300 ms retrieval path. Explicit test embedders serve both paths.
+        self.embedder = embedder if embedder is not None else configured_embedder()
+        self.model_id = str(getattr(self.write_embedder or self.embedder,
+                                    "model_id", ""))
+        self.retrieval_model_id = str(getattr(self.embedder, "model_id", ""))
+        self.last_backfill_stats = {"failed": 0, "remaining": 0}
         self.fallback_count = 0
         self._fallback_lock = threading.Lock()
         self.last_retrieval_mode = "lexical_only"
@@ -353,6 +358,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             raise ValueError("batch_size must be positive and limit nonnegative")
         cursor = 0
         written = 0
+        failed = consecutive_failures = 0
         while limit is None or written < limit:
             with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
                 rows = db.execute("SELECT m.rowid,f.body,v.model_id,v.content_sha,v.vec "
@@ -368,9 +374,32 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                     continue
                 if self._embed_row(rowid, body):
                     written += 1
+                    consecutive_failures = 0
+                else:
+                    failed += 1
+                    consecutive_failures += 1
+                    if consecutive_failures >= 3:
+                        break
                 if limit is not None and written >= limit:
                     break
+            if consecutive_failures >= 3:
+                break
+        self.last_backfill_stats = {
+            "failed": failed,
+            "remaining": self.remaining_vector_count(),
+        }
         return written
+
+    def remaining_vector_count(self) -> int:
+        """Count effective rows without a current vector for the write model."""
+        with closing(sqlite3.connect(self.path)) as db:
+            rows = db.execute("SELECT f.body,v.model_id,v.content_sha,v.vec "
+                              "FROM adr001_memory m JOIN adr001_fts f ON f.rowid=m.rowid "
+                              "LEFT JOIN adr001_vec v ON v.rowid=m.rowid WHERE "
+                              + _effective_sql()).fetchall()
+        return sum(vector is None or model != self.model_id or
+                   digest != hashlib.sha256(body.encode()).hexdigest()
+                   for body, model, digest, vector in rows)
 
     def missing_vector_count(self) -> int:
         with closing(sqlite3.connect(self.path)) as db:
@@ -464,7 +493,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                               list(by_id)).fetchall() if by_id else []
             missing = [(rowid, body, hashlib.sha256(body.encode()).hexdigest())
                        for rowid, body, model, digest in rows
-                       if model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest()]
+                       if model != self.retrieval_model_id or
+                       digest != hashlib.sha256(body.encode()).hexdigest()]
         # Compute outside a write transaction; other producers share this DB.
         attempted = 0
         for rowid, body, digest in missing[:min(LAZY_EMBED_LIMIT, LAZY_EMBED_BATCH)]:
@@ -479,7 +509,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                     db.execute("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
                                "VALUES(?,?,?,?) ON CONFLICT(rowid) DO UPDATE SET "
                                "model_id=excluded.model_id,content_sha=excluded.content_sha,vec=excluded.vec",
-                               (rowid, self.model_id, digest, vector.tobytes()))
+                               (rowid, self.retrieval_model_id, digest, vector.tobytes()))
                     db.commit()
             except Exception as exc:
                 logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
@@ -512,7 +542,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             qnorm = math.sqrt(sum(v * v for v in q))
             for rowid, model, digest, blob in vectors:
                 body = bodies.get(rowid, "")
-                if model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest():
+                if model != self.retrieval_model_id or digest != hashlib.sha256(body.encode()).hexdigest():
                     continue
                 vector = array("f")
                 vector.frombytes(blob)

@@ -23,8 +23,11 @@ def main() -> int:
     if store.write_embedder is None:
         parser.error("set AGENT_CREW_MEMORY_EMBED_ENDPOINT and AGENT_CREW_MEMORY_MODEL_ID")
     written = store.backfill_vectors(limit=args.limit, batch_size=args.batch_size)
-    print(json.dumps({"model_id": store.model_id, "written": written}, sort_keys=True))
-    return 0
+    stats = store.last_backfill_stats
+    print(json.dumps({"model_id": store.model_id, "written": written,
+                      "failed": stats["failed"], "remaining": stats["remaining"]},
+                     sort_keys=True))
+    return 1 if stats["remaining"] else 0
 
 
 if __name__ == "__main__":
