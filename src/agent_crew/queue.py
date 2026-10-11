@@ -4159,6 +4159,23 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def reserve_cloud_shadow_launch(self, task_id: str) -> bool:
+        """Reserve one shadow launch per review before invoking a paid CLI."""
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE tasks SET context=json_set(context, "
+                "'$.cloud_shadow_launch_reserved_at', ?) "
+                "WHERE task_id=? AND task_type='review' "
+                "AND json_extract(context, '$.cloud_shadow_launch_reserved_at') IS NULL "
+                "AND json_extract(context, '$.cloud_shadow_session_id') IS NULL",
+                (time.time(), task_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
+        finally:
+            conn.close()
+
     def mark_needs_human(self, task_id: str, summary: str, extra: dict) -> bool:
         """Move a task to ``needs_human`` and merge ``extra`` into its context.
 
@@ -6038,6 +6055,27 @@ class TaskQueue:
                 (channel,),
             ).fetchone()
             return int(row["n"]) if row else 0
+        finally:
+            conn.close()
+
+    def count_cloud_reviews_started_since(self, since: float) -> int:
+        """Count durable cloud review launches, including shadow sessions."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_attribution "
+                "WHERE agent='claude_cloud' AND task_type='review' "
+                "AND provider_session_id<>'' AND started_at>=?", (since,)
+            ).fetchone()
+            shadow = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE task_type='review' "
+                "AND (json_extract(context, '$.cloud_shadow_launch_reserved_at') IS NOT NULL "
+                "OR json_extract(context, '$.cloud_shadow_session_id') IS NOT NULL) "
+                "AND CAST(COALESCE(json_extract(context, '$.cloud_shadow_launched_at'), "
+                "json_extract(context, '$.cloud_shadow_launch_reserved_at')) AS REAL)>=?",
+                (since,),
+            ).fetchone()
+            return (int(row["n"]) if row else 0) + (int(shadow["n"]) if shadow else 0)
         finally:
             conn.close()
 
