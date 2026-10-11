@@ -19,7 +19,8 @@ def _tier_legacy_task_posts(monkeypatch, request):
     must exercise the real 422 path. Production request handling is untouched.
     """
     if ("risk_tier" in request.node.path.name
-            or "risk_declaration" in request.node.path.name):
+            or "risk_declaration" in request.node.path.name
+            or "mandatory_risk" in request.node.path.name):
         return
     # Legacy CLI/watch fixtures use the documented default in place of a
     # per-call --risk-tier or issue label. Contract tests above keep it absent.

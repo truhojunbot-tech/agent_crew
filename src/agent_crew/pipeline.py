@@ -1027,13 +1027,14 @@ def _latest_lineage_implement(tasks_by_id: dict, task):
 
 
 def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
-    """Copy only a declared lineage risk; admission still classifies the child."""
-    if context.get("risk_declaration") is not None:
-        return
+    """Carry the root tier and explicit facts through every cascade stage."""
     root_id = _lineage_root_task_id(tasks_by_id, parent_task)
     root = tasks_by_id.get(root_id)
     root_context = root.context if root and isinstance(root.context, dict) else {}
     declaration = root_context.get("risk_declaration")
+    tier = root_context.get("risk_tier")
+    if isinstance(tier, int) and not isinstance(tier, bool) and 0 <= tier <= 3:
+        context["risk_tier"] = tier
     if (isinstance(declaration, dict)
             and declaration.get("declaration_source") == "explicit"
             and any(isinstance(declaration.get(field), bool) for field in (
@@ -1051,14 +1052,16 @@ def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
     """Keep inherited risk out of the broker payload, then record it (#578)."""
     inherited: dict = {}
     _inherit_root_risk(tasks_by_id, parent_task, inherited)
-    parent_context = parent_task.context if isinstance(parent_task.context, dict) else {}
-    if isinstance(task.context, dict) and "risk_tier" not in task.context:
+    if "risk_tier" in inherited:
+        task.context = {**task.context, "risk_tier": inherited["risk_tier"]}
+    elif isinstance(task.context, dict) and "risk_tier" not in task.context:
+        parent_context = parent_task.context if isinstance(parent_task.context, dict) else {}
         tier = parent_context.get("risk_tier")
         if isinstance(tier, int) and not isinstance(tier, bool) and 0 <= tier <= 3:
             task.context["risk_tier"] = tier
     queue.enqueue(task, ingress=ingress,
                   _successor_provenance=successor_provenance)
-    if inherited:
+    if "risk_declaration" in inherited:
         try:
             context = task.context if isinstance(task.context, dict) else {}
             queue.patch_context(task.task_id, {"risk_declaration": risk_declaration(

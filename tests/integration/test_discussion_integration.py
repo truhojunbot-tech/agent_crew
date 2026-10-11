@@ -30,7 +30,7 @@ class _HTTPQueueAdapter:
             "description": task.description,
             "branch": task.branch,
             "priority": task.priority,
-            "context": task.context,
+            "context": {**task.context, "risk_tier": 0},
         })
         assert resp.status_code == 201
         task_id = resp.json()["task_id"]

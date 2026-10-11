@@ -15,6 +15,8 @@ from click.testing import CliRunner
 
 import agent_crew.cli as cli
 import agent_crew.setup as setup_mod
+from agent_crew.protocol import TaskRequest
+from agent_crew.queue import TaskQueue
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +35,8 @@ def test_b187_enqueue_writes_review_task_type_via_http(tmp_path):
         "worktrees": {},
         "server_pid": 0,
     }))
+    TaskQueue(str(state_dir / "tasks.db")).enqueue(TaskRequest(
+        "impl-abc12345", "implement", "work", context={"risk_tier": 1}))
 
     captured = {}
 
@@ -76,6 +80,11 @@ def test_b187_enqueue_test_type(tmp_path):
         "port": 9999,
         "session": "x", "agents": ["claude"], "worktrees": {}, "server_pid": 0,
     }))
+    lineage = TaskQueue(str(state_dir / "tasks.db"))
+    lineage.enqueue(TaskRequest("impl-x", "implement", "work",
+                                context={"risk_tier": 1}))
+    lineage.enqueue(TaskRequest("review-x", "review", "review",
+                                context={"prev_task_id": "impl-x", "risk_tier": 1}))
 
     captured = {}
     def fake_urlopen(req, timeout=10):

@@ -24,7 +24,7 @@ def _review_payload(task_id: str, override_agent: str) -> dict:
         "description": "review PR #1",
         "branch": "main",
         "priority": 3,
-        "context": {"agent_override": override_agent},
+        "context": {"agent_override": override_agent, "risk_tier": 1},
         "project": "test_project",
     }
 
@@ -156,7 +156,7 @@ def test_u_b188_no_override_keeps_role_default(tmp_db, tmp_path, *, unused_tcp_p
                 )
                 with TestClient(app) as client:
                     payload = _review_payload("review-2", "")
-                    payload["context"] = {}  # no agent_override
+                    payload["context"] = {"risk_tier": 1}  # no agent_override
                     resp = client.post("/tasks", json=payload)
                     assert resp.status_code == 201
                     assert spawned.wait(5), "review task was never dispatched"

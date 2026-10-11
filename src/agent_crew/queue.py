@@ -1360,7 +1360,7 @@ class DuplicateReviewError(Exception):
 
 
 class InvalidRiskTierError(ValueError):
-    """An HTTP root declared no valid integer tier or explicit declaration."""
+    """An HTTP task declared no valid integer tier or mismatched its root."""
 
 
 def validate_http_root_risk(context: dict | None) -> None:
@@ -1376,11 +1376,7 @@ def validate_http_root_risk(context: dict | None) -> None:
             or not isinstance(context["risk_tier"], int)
             or not 0 <= context["risk_tier"] <= 3):
         raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
-    declaration = context.get("risk_declaration")
-    explicit = (isinstance(declaration, dict)
-                and any(isinstance(declaration.get(field), bool)
-                        for field in RISK_DECLARATION_FIELDS))
-    if "risk_tier" not in context and not explicit:
+    if "risk_tier" not in context:
         raise InvalidRiskTierError("root context.risk_tier must be an integer 0-3")
 
 
@@ -3621,6 +3617,31 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
+            # A verified HTTP parent can supply lineage metadata after the
+            # public boundary has validated this request's own risk fields.
+            # A claimed prev_task_id alone does not waive that boundary.
+            if ingress == "http.tasks":
+                parent_id = context.get("prev_task_id")
+                parent = self.get_task(parent_id) if isinstance(parent_id, str) and parent_id else None
+                if parent is not None and parent.task_id != task.task_id:
+                    seen = {task.task_id}
+                    while parent.task_id not in seen:
+                        seen.add(parent.task_id)
+                        previous = parent.context.get("prev_task_id") if isinstance(parent.context, dict) else None
+                        ancestor = self.get_task(previous) if isinstance(previous, str) and previous else None
+                        if ancestor is None:
+                            break
+                        parent = ancestor
+                    root_context = parent.context if isinstance(parent.context, dict) else {}
+                    root_tier = root_context.get("risk_tier")
+                    if (isinstance(root_tier, int) and not isinstance(root_tier, bool)
+                            and 0 <= root_tier <= 3):
+                        if context.get("risk_tier") != root_tier:
+                            raise InvalidRiskTierError(
+                                "successor context.risk_tier must equal the root risk tier")
+                        context["risk_tier"] = root_tier
+                    if isinstance(root_context.get("risk_declaration"), dict):
+                        context["risk_declaration"] = root_context["risk_declaration"]
             if refusal is None and task.task_type == "implement":
                 cap = self._max_open_implement()
                 is_system_successor = (
