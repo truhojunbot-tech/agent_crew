@@ -3399,6 +3399,10 @@ def create_app(
         if _dispatcher_enabled:
             _requeue_orphans()
             background_tasks.append(asyncio.create_task(_dispatcher_loop()))
+            # #705: #690's dispatcher reap was never scheduled in this mode;
+            # the old else branch ran it only for pane delivery.
+            if not watchdog_disabled:
+                background_tasks.append(asyncio.create_task(_watchdog_loop()))
         else:
             if not watchdog_disabled:
                 background_tasks.append(asyncio.create_task(_watchdog_loop()))
@@ -4244,6 +4248,7 @@ def create_app(
         - ``bumped``  — task_ids whose last_activity_at we refreshed
         - ``reminded`` — task_ids that received a nudge for the first time
         - ``timed_out`` — task_ids that we auto-failed
+        - ``recovered`` — unstarted dispatcher claims returned to pending
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
         # #499 r0 HIGH: claude_cloud dispatches have no pane and are
@@ -4268,6 +4273,41 @@ def create_app(
         except Exception:
             logger.exception("watchdog: owner approval re-admission failed")
         rows = q().list_in_progress_with_activity()
+        # A claim can commit before record_dispatch writes its lease. If that
+        # write fails, no worker exists and ordinary expiry would mark the task
+        # timed_out instead of making it runnable again.
+        try:
+            recover_after = float(os.getenv("AGENT_CREW_DISPATCH_CLAIM_RECOVER_SECONDS", "900"))
+            if not math.isfinite(recover_after) or recover_after <= 0:
+                raise ValueError("recovery interval must be positive")
+        except ValueError:
+            logger.warning("watchdog: invalid dispatcher claim recovery interval; using 900s")
+            recover_after = 900.0
+        active_dispatches = getattr(app.state, "dispatcher_active_tasks", {}) or {}
+        recovered = set()
+        for row in rows:
+            claimed_at = row["last_activity_at"]
+            if (row["claim_source"] != "dispatcher" or not claimed_at or
+                    now - claimed_at < recover_after or row["lease_owner"] or
+                    row["dispatched_at"] >= claimed_at or
+                    (row["last_heartbeat_at"] or 0.0) > now - recover_after or
+                    row["task_id"] in active_dispatches):
+                continue
+            try:
+                if q().requeue_dispatcher_claim(
+                        row["task_id"], unstarted_before=now - recover_after):
+                    recovered.add(row["task_id"])
+                    actions.setdefault("recovered", []).append(row["task_id"])
+                    reason = "dispatcher_unstarted"
+                    watchdog_expiry_counts[reason] = watchdog_expiry_counts.get(reason, 0) + 1
+                    logger.error("WATCHDOG RECOVER: task_id=%s reason=%s count=%d",
+                                 row["task_id"], reason, watchdog_expiry_counts[reason])
+                else:
+                    logger.warning("watchdog: unstarted claim recovery refused for %s",
+                                   row["task_id"])
+            except Exception:
+                logger.exception("watchdog: failed to recover unstarted claim %s", row["task_id"])
+        rows = [row for row in rows if row["task_id"] not in recovered]
         in_progress_ids = {r["task_id"] for r in rows}
         # Drop completed/failed tasks from the reminder dedupe set so a recycled
         # task_id (or a re-enqueued retry) doesn't get its reminder suppressed.
@@ -4714,6 +4754,41 @@ def create_app(
                 agent = _override
         wt = wt_override or worktree_map.get(role)
         return agent, wt
+
+    async def _retry_locked_dispatch_write(fn: Callable, *args, **kwargs):
+        for attempt in range(3):
+            try:
+                return fn(*args, **kwargs)
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower() or attempt == 2:
+                    raise
+                await asyncio.sleep(0.05 * (2 ** attempt))
+
+    async def _recover_unspawned_dispatch(task_id: str, reason: str) -> None:
+        for attempt in range(3):
+            try:
+                if q().requeue_dispatcher_claim(task_id):
+                    logger.error("dispatcher: recovered unspawned task=%s reason=%s",
+                                 task_id, reason)
+                else:
+                    logger.warning("dispatcher: unspawned claim recovery refused task=%s reason=%s",
+                                   task_id, reason)
+                return
+            except sqlite3.OperationalError as exc:
+                if "database is locked" not in str(exc).lower() or attempt == 2:
+                    logger.exception("dispatcher: requeue failed for %s", task_id)
+                    return
+                await asyncio.sleep(0.05 * (2 ** attempt))
+            except Exception:
+                logger.exception("dispatcher: requeue failed for %s", task_id)
+                return
+
+    async def _recover_dispatch_exception(task_id: str) -> None:
+        with _active_dispatch_lock:
+            entry = _active_dispatch_processes.get(task_id)
+            unspawned = entry is None or (isinstance(entry, _DispatchSlot) and entry.proc is None)
+        if unspawned:
+            await _recover_unspawned_dispatch(task_id, "dispatch_exception")
 
     async def _dispatch_task(task: TaskRequest, role: str) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
@@ -5246,14 +5321,20 @@ def create_app(
         timeout_secs = _dispatch_timeout_for_role(role, _ctx)
         _slot = _reserve_dispatch_slot(task.task_id)
         try:
-            _dispatch_nonce = q().record_dispatch(
+            _dispatch_nonce = await _retry_locked_dispatch_write(q().record_dispatch,
                 task.task_id, channel=_DISPATCH_CHANNEL.get(agent, f"{agent}_cli"),
                 agent=agent, target=f"{agent}:pending",
                 lease_owner=f"{agent}:pending",
-                lease_seconds=timeout_secs)
+                lease_seconds=timeout_secs, raise_on_locked=True)
         except AdmissionRefused as exc:
             logger.warning("dispatcher: dispatch refused for %s — %s", task.task_id, exc)
             _release_dispatch_slot(task.task_id, _slot)
+            return
+        except sqlite3.OperationalError:
+            logger.exception("dispatcher: record_dispatch locked for %s", task.task_id)
+            await _recover_unspawned_dispatch(task.task_id, "record_dispatch_locked")
+            _release_dispatch_slot(task.task_id, _slot)
+            _lock_stack.close()
             return
         message = _format_task_message(
             task, port, nonce=_dispatch_nonce, project=_server_identity()["project"])
@@ -5293,11 +5374,18 @@ def create_app(
                    if _summary else "")
             )
             message = _renew_block + "\n\n" + message
-            q().patch_context(task.task_id, {
-                "context_renewal": {"mode": _codex_mode, "seed": _seed,
-                                    "previous_session_id": _renew_previous_session,
-                                    "chain_root": _chain_root},
-            })
+            try:
+                await _retry_locked_dispatch_write(q().patch_context, task.task_id, {
+                    "context_renewal": {"mode": _codex_mode, "seed": _seed,
+                                        "previous_session_id": _renew_previous_session,
+                                        "chain_root": _chain_root},
+                })
+            except sqlite3.OperationalError:
+                logger.exception("dispatcher: context renewal locked for %s", task.task_id)
+                await _recover_unspawned_dispatch(task.task_id, "patch_context_locked")
+                _release_dispatch_slot(task.task_id, _slot)
+                _lock_stack.close()
+                return
         # #239: assemble a bounded, provenance-linked Context Pack from durable
         # project sources and prepend it. Opt-in (AGENT_CREW_CONTEXT_PACK) and
         # fail-soft: a retrieval failure yields a pack that SAYS it is degraded
@@ -6178,6 +6266,9 @@ def create_app(
                         ) -> None:
                             try:
                                 await _dispatch_task(t, r)
+                            except Exception:
+                                logger.exception("dispatcher: task %s raised", t.task_id)
+                                await _recover_dispatch_exception(t.task_id)
                             finally:
                                 _drop_unspawned_reservation(t.task_id)
                                 active_workers.discard(s)
@@ -6226,6 +6317,9 @@ def create_app(
                         ) -> None:
                             try:
                                 await _dispatch_task(t, r)
+                            except Exception:
+                                logger.exception("dispatcher: discuss task %s raised", t.task_id)
+                                await _recover_dispatch_exception(t.task_id)
                             finally:
                                 _drop_unspawned_reservation(t.task_id)
                                 active_workers.discard(s)
