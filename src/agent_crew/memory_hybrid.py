@@ -29,6 +29,7 @@ RRF_K = 60
 HEAD_PRINCIPLE_BYTES = 3600
 HEAD_STANDING_BYTES = 2000
 MIDDLE_CANDIDATE_LIMIT = 96
+PREDECESSOR_PIN_MAX_BYTES = 8000
 
 
 def _body_sql(alias: str) -> str:
@@ -299,8 +300,10 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                                   if isinstance(task_id, str) and task_id))[:50]
         if not ids:
             return []
-        keys = [key for task_id in ids for key in
-                (f"task:{task_id}:decision", f"task_outcome:{scope.project}:{task_id}")]
+        # Recall is measured over every predecessor decision. Outcomes are
+        # useful only after decisions have had their reserved slots.
+        keys = ([f"task:{task_id}:decision" for task_id in ids] +
+                [f"task_outcome:{scope.project}:{task_id}" for task_id in ids])
         clause, params = _pin_scope_sql(scope)
         with closing(sqlite3.connect(self.path, timeout=.05)) as db:
             rows = db.execute(
@@ -472,10 +475,25 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         candidates = []
         pins = []
         pending = 0
+        def bounded_pins(rows: list[dict]) -> list[dict]:
+            # Leave two slots for standing decisions and ranked rows on normal
+            # requests. The byte ceiling leaves at least half of the dispatch
+            # middle budget available when that budget is 16 KB.
+            slots = max(0, k) if k <= 2 else max(0, k - 2)
+            budget = min(max(0, byte_budget), PREDECESSOR_PIN_MAX_BYTES)
+            chosen, used = [], 0
+            for row in rows:
+                if len(chosen) >= slots:
+                    break
+                size = _bytes(row)
+                if used + size <= budget:
+                    chosen.append(row)
+                    used += size
+            return chosen
         try:
             if time.perf_counter() >= deadline:
                 raise TimeoutError("head exceeded retrieval budget")
-            pins = self._predecessor_pins(scope, predecessor_task_ids)
+            pins = bounded_pins(self._predecessor_pins(scope, predecessor_task_ids))
             with closing(sqlite3.connect(self.path)) as db:
                 candidates = self._candidates(db, scope, query)
             if time.perf_counter() >= deadline:
@@ -488,7 +506,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             if time.perf_counter() >= deadline:
                 raise TimeoutError("embedding exceeded retrieval budget")
             middle, vector_used = (self._rank_middle(middle, query, True)
-                                   if predecessor_task_ids else
+                                   if pins else
                                    self._rank_middle(middle, query))
             overflow_ids = {r["rowid"] for r in head["standing_overflow"]}
             middle = pins + head["standing_overflow"] + [r for r in middle
