@@ -112,6 +112,66 @@ def test_vector_arm_is_bounded_above_candidate_cap(tmp_path):
     assert len(candidates) <= MIDDLE_CANDIDATE_LIMIT + 256
 
 
+def test_weighted_vector_top96_finds_old_scoped_vector_beyond_recent_cap(tmp_path):
+    path = tmp_path / "memory.db"
+    store = HybridMemoryStorage(str(path), embedder=Embedder(),
+                                fusion_mode="weighted", fusion_weight=.6667)
+    with sqlite3.connect(path) as db:
+        rows = [("episodic", "old:target", json.dumps({"text": "unrelated target"}),
+                 json.dumps({"project": "home"}), 1, 0.0)]
+        rows += [("episodic", f"new:{i}", json.dumps({"text": f"unrelated {i}"}),
+                  json.dumps({"project": "home"}), 1, float(i + 1)) for i in range(320)]
+        rows += [("episodic", "foreign:target", json.dumps({"text": "target"}),
+                  json.dumps({"project": "other"}), 1, 500.0)]
+        rows += [("episodic", "stale:target", json.dumps({"text": "target"}),
+                  json.dumps({"project": "home"}), 1, 501.0)]
+        rows += [("episodic", "retired:target", json.dumps({"text": "target"}),
+                  json.dumps({"project": "home"}), 1, 502.0)]
+        db.executemany("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                       "VALUES (?,?,?,?,?,?)", rows)
+        vectors = db.execute("SELECT m.rowid,m.key,f.body FROM adr001_memory m "
+                             "JOIN adr001_fts f ON f.rowid=m.rowid").fetchall()
+        db.executemany("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
+                       "VALUES (?,?,?,?)", [
+            (rowid, Embedder.model_id, hashlib.sha256(body.encode()).hexdigest(),
+             array("f", [1.0, 0.0] if key.endswith("target") else [0.0, 1.0]).tobytes())
+            for rowid, key, body in vectors])
+        db.execute("UPDATE adr001_vec SET content_sha='stale' WHERE rowid=("
+                   "SELECT rowid FROM adr001_memory WHERE key='stale:target')")
+        db.execute("UPDATE adr001_memory SET invalidated_at=1 WHERE key='retired:target'")
+        db.commit()
+    vector_rows, _ = store._weighted_vector_top(MemoryScope(project="home"), "needle")
+    assert {"foreign:target", "stale:target", "retired:target"}.isdisjoint(
+        {row["key"] for row in vector_rows})
+    result = store.retrieve_ranked(MemoryScope(project="home"), "needle", "implementer", 5, 10000)
+    assert result["mode"] == "hybrid"
+    assert result["middle"][0]["key"] == "old:target"
+
+
+def test_weighted_vector_matmul_under_300ms_on_5000_scoped_rows(tmp_path):
+    path = tmp_path / "memory.db"
+    store = HybridMemoryStorage(str(path), embedder=Embedder(),
+                                fusion_mode="weighted", fusion_weight=.6667)
+    with sqlite3.connect(path) as db:
+        db.executemany("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                       "VALUES (?,?,?,?,?,?)", [
+            ("episodic", f"row:{i}", json.dumps({"text": f"unrelated {i}"}),
+             json.dumps({"project": "home"}), 1, float(i)) for i in range(5000)])
+        rows = db.execute("SELECT m.rowid,f.body FROM adr001_memory m JOIN adr001_fts f "
+                          "ON f.rowid=m.rowid").fetchall()
+        blob = array("f", [1.0, 0.0]).tobytes()
+        db.executemany("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
+                       "VALUES (?,?,?,?)", [
+            (rowid, Embedder.model_id, hashlib.sha256(body.encode()).hexdigest(), blob)
+            for rowid, body in rows])
+        db.commit()
+    started = time.perf_counter()
+    result = store.retrieve_ranked(MemoryScope(project="home"), "needle", "implementer", 10, 10000)
+    elapsed = (time.perf_counter() - started) * 1000
+    assert result["mode"] == "hybrid"
+    assert elapsed < 300, elapsed
+
+
 def test_server_receipt_keeps_nondefault_fusion_mode_and_timeout(tmp_path, monkeypatch,
                                                                   unused_tcp_port):
     path = tmp_path / "memory.db"
