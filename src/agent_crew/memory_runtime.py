@@ -27,6 +27,12 @@ SHADOW_PRUNE_BATCH_ROWS = 50
 SHADOW_RETRIEVAL_MAX_ROWS = 50
 SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS = 0.25
 SHADOW_MEMORY_CAPTURE_TIMEOUT_SECONDS = 0.05
+_REVISION_KEY_SUFFIX = re.compile(r"@v[0-9]+-[0-9a-f]{32}$")
+
+
+def _logical_revision_key(key: str) -> str:
+    """Expose the stable memory identity instead of its physical revision key."""
+    return _REVISION_KEY_SUFFIX.sub("", key)
 
 
 def shadow_sqlite_timeout_seconds(*, capture: bool = False) -> float:
@@ -339,7 +345,7 @@ class SQLiteMemoryStorage:
     @staticmethod
     def _revision_head(db: sqlite3.Connection, layer: str, key: str,
                        project: str, scope: str = "") -> Optional[tuple]:
-        """Follow physical keys without rewriting any version's source value."""
+        """Follow revisions of this key, stopping at a natural supersession."""
         if scope:
             row = db.execute("SELECT rowid,key,value,version,scope,superseded_by "
                              "FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
@@ -369,6 +375,8 @@ class SQLiteMemoryStorage:
                                    (layer, row[5], project)).fetchone()
             if successor is None:
                 raise ValueError("memory revision target missing")
+            if _logical_revision_key(successor[1]) != key:
+                return row
             row = successor
         return row
 
@@ -383,6 +391,10 @@ class SQLiteMemoryStorage:
             db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
                        "VALUES (?,?,?,?,?,?)",
                        (record.layer, record.key, value, scope, record.version, time.time()))
+            return
+        if head[5] and _logical_revision_key(head[5]) != record.key:
+            # A different natural key superseded this one. A later write to
+            # the retired identity must not retire or replace its successor.
             return
         if json.loads(head[2]) == record.value and head[4] == scope:
             return
@@ -496,8 +508,8 @@ class SQLiteMemoryStorage:
                 clauses.append("superseded_by IS NULL")
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE " + " AND ".join(clauses), params).fetchall()
         result = [
-            MemoryRecord(r[0], exact_key if exact_key and r[1].startswith(
-                exact_key + "@v") else r[1], json.loads(r[2]), _scope_from_json(r[3]), r[4])
+            MemoryRecord(r[0], _logical_revision_key(r[1]), json.loads(r[2]),
+                         _scope_from_json(r[3]), r[4])
             for r in rows
         ]
         result = [record for record in result
@@ -587,8 +599,9 @@ class SQLiteMemoryStorage:
         query_started = time.perf_counter()
         try:
             with closing(db_connection) as db:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
                 effective = (" AND superseded_by IS NULL AND invalidated_at IS NULL"
-                             if getattr(self, "_revision_columns", False) else "")
+                             if {"superseded_by", "invalidated_at"} <= columns else "")
                 base += effective
                 # One Python-visible SQLite row for all four reads avoids a GIL
                 # reacquisition for every candidate under CPU contention.
@@ -654,9 +667,9 @@ class SQLiteMemoryStorage:
         failure_rows = json.loads(project_failure_json) + json.loads(fleet_failure_json)
         lineage_rows = json.loads(lineage_json)
         pr_rows = json.loads(pr_json)
-        records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+        records = [MemoryRecord(layer, _logical_revision_key(key), json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
-        failures = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+        failures = [MemoryRecord(layer, _logical_revision_key(key), json.loads(value), _scope_from_json(record_scope),
                                  version) for layer, key, value, record_scope, version in failure_rows]
         # The SQL clause in `base` is a coarse prefilter; Python decides (#716).
         records = [r for r in records
@@ -672,14 +685,14 @@ class SQLiteMemoryStorage:
             root = next((candidate for candidate in predecessor_keys
                          if key == candidate or key.startswith(candidate + "@v")), None)
             if root is not None and (root not in lineage or version > lineage[root].version):
-                lineage[root] = MemoryRecord(layer, key, json.loads(value),
+                lineage[root] = MemoryRecord(layer, _logical_revision_key(key), json.loads(value),
                                              _scope_from_json(record_scope), version)
         pinned = [lineage[key] for key in predecessor_keys if key in lineage
                   and lineage[key].scope.fleet in ("", scope.fleet)
                   and not lineage[key].value.get("invalidated_at")
                   and not lineage[key].value.get("superseded_at")
                   and not lineage[key].value.get("superseded")]
-        same_pr = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+        same_pr = [MemoryRecord(layer, _logical_revision_key(key), json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in pr_rows]
         same_pr = [record for record in same_pr
                    if record.scope.fleet in ("", scope.fleet)

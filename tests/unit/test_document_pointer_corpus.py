@@ -62,8 +62,34 @@ def test_backfill_is_idempotent_and_refreshes_on_new_commit(tmp_path):
         rows = db.execute("SELECT key,value FROM adr001_memory WHERE key GLOB 'doc:*' ORDER BY key").fetchall()
     assert len(rows) == 2
     assert any(json.loads(value)["title"] == "Revised ruling" for _, value in rows)
+    assert backfill_document_pointers(memory, sources) == 0
+    assert backfill_document_pointers(memory, sources) == 0
     historic = {"truhojunbot-tech/agent_crew": [("docs/decisions/ruling.md", first_sha)]}
     assert backfill_document_pointers(memory, sources, historic_files=historic) == 0
+
+
+def test_committed_pointer_backfill_uses_effective_revision(tmp_path):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    decision = repo / "docs" / "decisions" / "ruling.md"
+    decision.parent.mkdir(parents=True)
+    decision.write_text("# Current ruling\n\nUse this rule.\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "decision")
+    memory = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    sources = [("truhojunbot-tech/agent_crew", str(repo))]
+    # A prior capture for this commit has stale metadata. The first backfill
+    # appends the correction; later runs must compare against that new head.
+    capture_document_pointer(
+        memory, repo="truhojunbot-tech/agent_crew", project="agent_crew",
+        path="docs/decisions/ruling.md", commit=_git(repo, "rev-parse", "HEAD"),
+        content="# Stale ruling\n\nOld summary.\n")
+    assert backfill_document_pointers(memory, sources) == 1
+    assert backfill_document_pointers(memory, sources) == 0
+    assert backfill_document_pointers(memory, sources) == 0
 
 
 def test_audit_counts_document_path_with_project_identity(tmp_path):

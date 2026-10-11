@@ -6,7 +6,9 @@ import sqlite3
 import pytest
 
 from agent_crew.memory_hybrid import HybridMemoryStorage
-from agent_crew.memory_runtime import MemoryRecord, MemoryScope, SQLiteMemoryStorage
+from agent_crew.memory_runtime import (
+    MemoryRecord, MemoryScope, SQLiteMemoryStorage, reconstruct_context,
+)
 
 
 @pytest.mark.parametrize("storage_type", [SQLiteMemoryStorage, HybridMemoryStorage])
@@ -111,3 +113,61 @@ def test_hybrid_migration_links_two_natural_supersessions_without_rewriting_text
     assert [row[2] for row in rows] == ["rule:two", "rule:three", None]
     assert [record.key for record in store.retrieve(MemoryScope(project="demo"))] == [
         "rule:three"]
+
+
+def test_long_lived_shadow_reader_sees_columns_added_by_another_writer(tmp_path):
+    path = str(tmp_path / "memory.db")
+    reader = SQLiteMemoryStorage(path)
+    writer = SQLiteMemoryStorage.existing(path)
+    scope = MemoryScope(project="demo")
+    for text in ("one", "two", "three"):
+        writer.put_many_shadow([MemoryRecord("failure_pattern", "task:one:failure_pattern",
+                                             {"text": text}, scope)])
+    rows, _ = reader.retrieve_shadow(scope, {"failure_pattern"}, 10)
+    assert [row.value["text"] for row in rows] == ["three"]
+
+
+def test_natural_supersession_stays_retired_when_old_key_is_written_again(tmp_path):
+    store = HybridMemoryStorage(str(tmp_path / "memory.db"))
+    scope = MemoryScope(project="demo")
+    store.put(MemoryRecord("procedural", "rule:one", {"text": "one"}, scope))
+    store.put(MemoryRecord("procedural", "rule:two", {"text": "two",
+                                                   "supersedes": "rule:one"}, scope))
+    store.backfill()
+    store.put(MemoryRecord("procedural", "rule:one", {"text": "resurrected"}, scope, 2))
+    assert [(row.key, row.value["text"]) for row in store.retrieve(scope)] == [
+        ("rule:two", "two")]
+
+
+def test_natural_supersession_retires_latest_revision(tmp_path):
+    store = HybridMemoryStorage(str(tmp_path / "memory.db"))
+    scope = MemoryScope(project="demo")
+    store.put(MemoryRecord("procedural", "rule:a", {"text": "one"}, scope))
+    store.put(MemoryRecord("procedural", "rule:a", {"text": "two"}, scope, 2))
+    store.put(MemoryRecord("procedural", "rule:b", {"text": "new",
+                                                 "supersedes": "rule:a"}, scope))
+    store.backfill()
+    assert [(row.key, row.value["text"]) for row in store.retrieve(scope)] == [
+        ("rule:b", "new")]
+
+
+@pytest.mark.parametrize("storage_type", [SQLiteMemoryStorage, HybridMemoryStorage])
+def test_effective_reads_use_logical_keys(tmp_path, storage_type, monkeypatch):
+    store = storage_type(str(tmp_path / "memory.db"))
+    scope = MemoryScope(project="demo")
+    for version, text in ((1, "one"), (2, "two")):
+        store.put(MemoryRecord("checkpoint", "checkpoint:one", {"text": text}, scope,
+                               version))
+        store.put_many_shadow([MemoryRecord("decision", "task:one:decision",
+                                            {"text": text}, scope)])
+    assert [row.key for row in store.retrieve(scope) if row.layer == "checkpoint"] == [
+        "checkpoint:one"]
+    rows, _ = store.retrieve_shadow(scope, {"decision"}, 10)
+    assert [row.key for row in rows] == ["task:one:decision"]
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    reconstructed = reconstruct_context(store, "reviewer", "one", scope)
+    assert [row["key"] for row in reconstructed["records"]
+            if row["layer"] == "checkpoint"] == ["checkpoint:one"]
+    if isinstance(store, HybridMemoryStorage):
+        ranked = store.retrieve_ranked(scope, "two", "implementer", 10, 10000)
+        assert all("@v" not in row["key"] for row in ranked["head"] + ranked["middle"])

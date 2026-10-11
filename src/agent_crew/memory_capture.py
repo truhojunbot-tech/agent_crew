@@ -482,8 +482,12 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
                     memory.commit()
                     changed += 1
                     continue
-                before = memory.execute("SELECT value FROM adr001_memory WHERE key=?",
-                                        (record.key,)).fetchone()
+                before = memory.execute(
+                    "SELECT value FROM adr001_memory WHERE layer=? "
+                    "AND (key=? OR (key>=? AND key<?)) "
+                    "AND superseded_by IS NULL ORDER BY version DESC LIMIT 1",
+                    (record.layer, record.key, record.key + "@v",
+                     record.key + "@v\uffff")).fetchone()
                 if before is not None and json.loads(before[0]) == record.value:
                     continue
                 batch.append(record)
