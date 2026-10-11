@@ -1,4 +1,5 @@
 """#750: accepted results emit the configured quota contract asynchronously."""
+import json
 import threading
 import time
 import subprocess
@@ -6,9 +7,9 @@ import subprocess
 from fastapi.testclient import TestClient
 
 from agent_crew import contract_emit
-from agent_crew.protocol import TaskRequest
+from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
-from agent_crew.server import create_app
+from agent_crew.server import create_app, _record_exit_response_telemetry
 
 
 def test_result_post_triggers_one_emit_for_project(tmp_path, monkeypatch):
@@ -28,6 +29,26 @@ def test_result_post_triggers_one_emit_for_project(tmp_path, monkeypatch):
     assert response.status_code == 200, response.text
     assert contract_emit.wait_idle("agent_crew", timeout=2)
     assert projects == ["agent_crew"]
+
+
+def test_exit_telemetry_reemits_after_post_result_receipt_refresh(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CONTRACT_EMIT_CMD", "emitter --project {project}")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("post-result", "implement", "work", project="agent_crew"))
+    queue.record_attribution("post-result", agent="claude")
+    queue.submit_result("post-result", TaskResult("post-result", "completed", "done"))
+    before = json.loads(queue.get_tokenomics_shadow_receipt("post-result")["economics_json"])
+    assert before.get("output_tokens") is None
+    emitted = []
+    def capture(_command, project):
+        receipt = queue.get_tokenomics_shadow_receipt("post-result")
+        emitted.append((project, json.loads(receipt["economics_json"])["output_tokens"]))
+    monkeypatch.setattr(contract_emit, "_emit", capture)
+    tail = json.dumps({"type": "result", "usage": {"output_tokens": 7}})
+    _record_exit_response_telemetry(queue, "post-result", "claude", tail,
+                                    project="agent_crew")
+    assert contract_emit.wait_idle("agent_crew", timeout=2)
+    assert emitted == [("agent_crew", 7)]
 
 
 def test_unset_command_does_nothing(monkeypatch):

@@ -1576,7 +1576,8 @@ async def _wait_for_dispatch_activity(
 
 
 def _record_exit_response_telemetry(queue: TaskQueue, task_id: str,
-                                    agent: str, task_log_tail: str) -> None:
+                                    agent: str, task_log_tail: str,
+                                    *, project: str = "") -> None:
     """Refresh usage after the child exits, preserving an earlier Codex receipt."""
     telemetry = response_log_telemetry(agent, task_log_tail)
     if agent == "codex":
@@ -1588,6 +1589,11 @@ def _record_exit_response_telemetry(queue: TaskQueue, task_id: str,
         queue.record_task_telemetry(task_id, telemetry, only_missing=True)
     else:
         queue.record_task_telemetry(task_id, telemetry)
+    if project:
+        try:
+            _contract_emit.schedule_emit(project)
+        except Exception:
+            logger.exception("quota contract emit scheduling failed for task=%s", task_id)
 
 
 #: Cap on the agy/Antigravity conversation the tester resumes with
@@ -6088,7 +6094,8 @@ def create_app(
             except Exception:
                 logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
             try:
-                _record_exit_response_telemetry(q(), task.task_id, agent, _task_log_tail)
+                _record_exit_response_telemetry(q(), task.task_id, agent, _task_log_tail,
+                                                project=_project)
                 _telemetry_attr = q().get_attribution(task.task_id)
                 if _telemetry_attr:
                     append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
