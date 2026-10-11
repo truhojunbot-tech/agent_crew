@@ -643,7 +643,8 @@ def dispatch_memory_block(storage: MemoryStorage, role: str, task_id: str,
     ``max_chars`` remains the public argument name for old callers. It now
     denotes bytes and cannot raise the ADR-001 injection ceiling.
     """
-    counts = {"authoritative": 0, "failure_pattern": 0}
+    counts = {"authoritative": 0, "failure_pattern": 0,
+              "authoritative_omitted": 0, "failure_pattern_omitted": 0}
     if not memory_enabled():
         return "", counts
     own_project = local_project or scope.project
@@ -661,7 +662,9 @@ def dispatch_memory_block(storage: MemoryStorage, role: str, task_id: str,
         prior = authoritative_by_key.get(record.key)
         if prior is None or _scope_specificity(record.scope) > _scope_specificity(prior.scope):
             authoritative_by_key[record.key] = record
-    authoritative = list(authoritative_by_key.values())
+    # Under the byte cap, keep the earliest lexical source keys first. The
+    # order is stable across runs and does not depend on task-query ranking.
+    authoritative = sorted(authoritative_by_key.values(), key=lambda record: record.key)
     pattern_rows = (authority_rows if own_project == scope.project else
                     storage.retrieve(MemoryScope(fleet=scope.fleet, project=own_project)))
     patterns_by_key: dict[str, MemoryRecord] = {}
@@ -674,40 +677,69 @@ def dispatch_memory_block(storage: MemoryStorage, role: str, task_id: str,
         if prior is None or _scope_specificity(record.scope) > _scope_specificity(prior.scope):
             patterns_by_key[record.key] = record
     patterns = list(patterns_by_key.values())
-    fleet = [record for record in patterns if not record.scope.project]
-    local = [record for record in patterns if record.scope.project]
+    fleet = sorted((record for record in patterns if not record.scope.project),
+                   key=lambda record: record.key)
+    local = sorted((record for record in patterns if record.scope.project),
+                   key=lambda record: record.key)
     selected = (fleet[:2] + local[:2]) or patterns[:4]
     header = "=== ADR-001 MEMORY (scoped, verify current sources) ==="
     footer = "=== END ADR-001 MEMORY ==="
     cap = min(8900, max(0, max_chars))
     used = len((header + "\n" + footer).encode("utf-8"))
     if used > cap:
+        counts["authoritative_omitted"] = len(authoritative)
+        counts["failure_pattern_omitted"] = len(patterns)
         return "", counts
 
     def line_cost(line: str) -> int:
         return len(("\n" + line).encode("utf-8"))
 
-    # Reserve the four failure-pattern key lines first so an alias cannot
-    # crowd out a crew's own operational patterns. Emit all keys before any
-    # excerpts; if keys alone exceed the cap, counts describe only served keys.
-    pattern_keys = [f"failure_pattern key={record.key}" for record in selected]
-    while pattern_keys and used + sum(map(line_cost, pattern_keys)) > cap:
-        pattern_keys.pop()
-    reserved = sum(map(line_cost, pattern_keys))
-    owner_keys, served_owners = [], []
-    for record in authoritative:
-        line = f"authoritative key={record.key}"
-        cost = line_cost(line)
-        if used + reserved + cost > cap:
-            break
-        owner_keys.append(line)
-        served_owners.append(record)
-        used += cost
-    used += reserved
-    served_patterns = selected[:len(pattern_keys)]
+    # Fleet keys, then local keys, get reserved before authoritative keys so
+    # the alias cannot crowd out local failure patterns. If all keys fit, use
+    # the full budget. Otherwise retry with room for an in-cap omission marker.
+    def choose_keys(marker_cost: int) -> tuple[list[str], list[MemoryRecord],
+                                                list[str], list[MemoryRecord], int]:
+        available = cap - used - marker_cost
+        pattern_keys = [f"failure_pattern key={record.key}" for record in selected]
+        pattern_cost = sum(map(line_cost, pattern_keys))
+        while pattern_keys and pattern_cost > available:
+            pattern_cost -= line_cost(pattern_keys.pop())
+        owner_keys, served_owners = [], []
+        owner_budget = available - pattern_cost
+        for record in authoritative:
+            line = f"authoritative key={record.key}"
+            cost = line_cost(line)
+            if cost > owner_budget:
+                break
+            owner_keys.append(line)
+            served_owners.append(record)
+            owner_budget -= cost
+        return owner_keys, served_owners, pattern_keys, selected[:len(pattern_keys)], owner_budget
+
+    owner_keys, served_owners, pattern_keys, served_patterns, _ = choose_keys(0)
+    if len(served_owners) < len(authoritative) or len(served_patterns) < len(patterns):
+        maximum_marker = (f"omitted authoritative={len(authoritative)} "
+                          f"failure_pattern={len(patterns)}; key_order=lexicographic")
+        owner_keys, served_owners, pattern_keys, served_patterns, _ = choose_keys(
+            line_cost(maximum_marker))
     counts["authoritative"] = len(served_owners)
     counts["failure_pattern"] = len(served_patterns)
+    counts["authoritative_omitted"] = len(authoritative) - len(served_owners)
+    counts["failure_pattern_omitted"] = len(patterns) - len(served_patterns)
     lines = [header, *owner_keys, *pattern_keys]
+    used += sum(map(line_cost, owner_keys)) + sum(map(line_cost, pattern_keys))
+    if counts["authoritative_omitted"] or counts["failure_pattern_omitted"]:
+        marker = (f"omitted authoritative={counts['authoritative_omitted']} "
+                  f"failure_pattern={counts['failure_pattern_omitted']}; "
+                  "key_order=lexicographic")
+        if used + line_cost(marker) > cap:
+            # Caller-supplied tiny budgets may not even fit the omission
+            # marker. Serve no misleading partial block in that case.
+            return "", {"authoritative": 0, "failure_pattern": 0,
+                        "authoritative_omitted": len(authoritative),
+                        "failure_pattern_omitted": len(patterns)}
+        lines.append(marker)
+        used += line_cost(marker)
 
     # Short excerpts are optional after the source keys and are never allowed
     # to displace a key. Tiny caller budgets stay key-only.
