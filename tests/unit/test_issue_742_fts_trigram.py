@@ -6,13 +6,14 @@ from agent_crew.memory_hybrid import HybridMemoryStorage, ensure_index_schema
 from agent_crew.memory_runtime import MemoryScope, SQLiteMemoryStorage
 
 
-def _seed_with_newer_noise(path, targets, noise=110, noise_body="unrelated"):
+def _seed_with_newer_noise(path, targets, noise=110, noise_body="unrelated",
+                           noise_layer="episodic"):
     SQLiteMemoryStorage(str(path))
     with sqlite3.connect(path) as db:
         rows = [("episodic", key, json.dumps({"text": body}),
                  json.dumps({"project": "agent_crew"}), 1, float(index))
                 for index, (key, body) in enumerate(targets, 1)]
-        rows += [("episodic", f"noise:{index:03}", json.dumps({"text": noise_body}),
+        rows += [(noise_layer, f"noise:{index:03}", json.dumps({"text": noise_body}),
                   json.dumps({"project": "agent_crew"}), 1, float(index + 100))
                  for index in range(noise)]
         db.executemany(
@@ -87,7 +88,8 @@ def test_mixed_query_reserves_long_term_lane_when_short_matches_fill_limit(tmp_p
 def test_short_queries_match_case_insensitive_body_and_key_before_recent_padding(tmp_path):
     path = tmp_path / "memory.db"
     _seed_with_newer_noise(path, [("owner:body", "PR 751 merged after CI green"),
-                                  ("PR-751:owner", "merged and green")])
+                                  ("PR-751:owner", "merged and green")],
+                           noise_layer="decision")
     store = HybridMemoryStorage(str(path))
     with sqlite3.connect(path) as db:
         scope = MemoryScope(project="agent_crew")
@@ -95,6 +97,35 @@ def test_short_queries_match_case_insensitive_body_and_key_before_recent_padding
         pr_keys = [row["key"] for row in store._candidates(db, scope, "pr")]
     assert "owner:body" in ci_keys
     assert "PR-751:owner" in pr_keys
+
+
+def test_short_terms_ignore_colliding_layer_names(tmp_path):
+    for term, layer, body, noise_body in (
+            ("ci", "decision", "CI gate passed", "decision unrelated"),
+            ("pr", "procedural", "PR 751 merged", "protect unrelated"),
+            ("is", "episodic", "it is done", "episodic unrelated")):
+        path = tmp_path / f"{term}.db"
+        _seed_with_newer_noise(path, [("owner:target", body)],
+                               noise_layer=layer, noise_body=noise_body)
+        store = HybridMemoryStorage(str(path))
+        with sqlite3.connect(path) as db:
+            keys = [row["key"] for row in store._candidates(
+                db, MemoryScope(project="agent_crew"), term)]
+        assert "owner:target" in keys, (term, layer)
+        assert keys[0] == "owner:target", (term, layer)
+
+
+def test_mixed_query_bm25_hit_precedes_substring_only_short_match(tmp_path):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(
+        path, [("owner:target", "Review 751 trigram index")], noise=1,
+        noise_body="protect unrelated", noise_layer="procedural")
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        candidates = store._candidates(
+            db, MemoryScope(project="agent_crew"), "Review PR 751 trigram index")
+    ranked, _ = store._rank_middle(candidates, "Review PR 751 trigram index")
+    assert ranked[0]["key"] == "owner:target"
 
 
 def test_short_only_terms_rank_lexical_hit_ahead_of_recent_noise(tmp_path):

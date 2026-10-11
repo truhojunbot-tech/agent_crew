@@ -31,6 +31,18 @@ HEAD_STANDING_BYTES = 2000
 MIDDLE_CANDIDATE_LIMIT = 96
 
 
+def _short_haystack(alias: str) -> str:
+    return f"lower({alias}.key || ' ' || {alias}.body)"
+
+
+def _ascii_boundary_haystack(alias: str) -> str:
+    """Treat common key/body separators as word boundaries for short ASCII terms."""
+    text = _short_haystack(alias)
+    for separator in "-_:/.(),[]":
+        text = f"replace({text}, '{separator}', ' ')"
+    return f"(' ' || {text} || ' ')"
+
+
 def _body_sql(alias: str) -> str:
     return (f"CASE WHEN {alias}.layer='authoritative' THEN "
             f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || "
@@ -295,16 +307,20 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             searchable = [term for term in terms if len(term) >= 3]
             short_terms = [term for term in terms if len(term) < 3]
             if short_terms:
-                # Trigram MATCH cannot see short terms. Include key and layer,
-                # as the former unicode61 index did, and fold English case.
-                haystack = "lower(adr001_fts.layer || ' ' || adr001_fts.key || ' ' || adr001_fts.body)"
+                # Trigram MATCH cannot see short terms. Search key and body;
+                # layer names are metadata and create thousands of false hits.
+                haystack = _short_haystack("adr001_fts")
                 short_match = " OR ".join(
                     f"instr({haystack}, lower(?)) > 0" for _ in short_terms)
+                ascii_terms = [term for term in short_terms if term.isascii()]
+                boundary = (" OR ".join(
+                    f"instr({_ascii_boundary_haystack('adr001_fts')}, ' ' || lower(?) || ' ') > 0"
+                    for _ in ascii_terms) or "0=1")
                 rows = db.execute(
                     prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
                     clause + " AND " + _effective_sql() + " AND (" + short_match + ") "
-                    "ORDER BY m.created DESC,m.rowid DESC LIMIT ?",
-                    [*params, *short_terms, MIDDLE_CANDIDATE_LIMIT],
+                    "ORDER BY (" + boundary + ") DESC,m.created DESC,m.rowid DESC LIMIT ?",
+                    [*params, *short_terms, *ascii_terms, MIDDLE_CANDIDATE_LIMIT],
                 ).fetchall()
             if searchable:
                 expression = " OR ".join('"' + term + '"' for term in searchable)
@@ -416,6 +432,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         terms = re.findall(r"[\w]+", query)[:12]
         bm25 = {}
         short_rank = {}
+        short_exact = set()
         with closing(sqlite3.connect(self.path)) as db:
             searchable = [term for term in terms if len(term) >= 3]
             if searchable:
@@ -427,7 +444,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         bm25[rowid] = len(bm25) + 1
             short_terms = [term for term in terms if len(term) < 3]
             if short_terms:
-                haystack = "lower(layer || ' ' || key || ' ' || body)"
+                haystack = _short_haystack("adr001_fts")
                 short_match = " OR ".join(
                     f"instr({haystack}, lower(?)) > 0" for _ in short_terms)
                 short_ids = {row[0] for row in db.execute(
@@ -441,6 +458,16 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             bodies = {rowid: body for rowid, body in db.execute(
                 "SELECT rowid,body FROM adr001_fts WHERE rowid IN (" +
                 ",".join("?" for _ in ids) + ")", list(ids))}
+        if short_rank:
+            for row in candidates:
+                if row["rowid"] not in short_rank:
+                    continue
+                source = row["key"] + " " + bodies.get(row["rowid"], "")
+                if any((re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)",
+                                  source, re.IGNORECASE) if term.isascii()
+                        else term.casefold() in source.casefold())
+                       for term in short_terms):
+                    short_exact.add(row["rowid"])
         semantic = []
         if self.embedder and vectors:
             q = array("f", self.embedder(query))
@@ -461,7 +488,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         lexical = {r["rowid"]: rank for rank, r in enumerate(candidates, 1)}
         candidates.sort(key=lambda row: (
             -(1 / (RRF_K + bm25[row["rowid"]]) if row["rowid"] in bm25 else 0)
-            - (1 / (RRF_K + short_rank[row["rowid"]])
+            - ((0.75 if row["rowid"] in short_exact else 0.25) /
+               (RRF_K + short_rank[row["rowid"]])
                if row["rowid"] in short_rank else 0)
             - (1 / (RRF_K + vector_rank[row["rowid"]]) if row["rowid"] in vector_rank else 0),
             lexical[row["rowid"]]))
