@@ -9,8 +9,11 @@ from agent_crew.memory_runtime import HybridMemoryStorage, MemoryRecord, MemoryS
 
 def _fts_keys(db_path, term):
     with sqlite3.connect(db_path) as db:
+        # Trigram MATCH cannot index fewer than three Unicode characters.
+        query = ("SELECT key FROM adr001_fts WHERE adr001_fts MATCH ?" if len(term) >= 3
+                 else "SELECT key FROM adr001_fts WHERE instr(body, ?) > 0")
         return {row[0] for row in db.execute(
-            "SELECT key FROM adr001_fts WHERE adr001_fts MATCH ?", (term,))}
+            query, (term,))}
 
 
 def _install_old_triggers(db):

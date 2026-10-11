@@ -38,7 +38,8 @@ def _body_sql(alias: str) -> str:
     return (f"CASE WHEN {alias}.layer='authoritative' THEN "
             f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || "
             f"COALESCE(' ' || json_extract({alias}.value,'$.gloss_en'),'') "
-            f"ELSE {alias}.value END")
+            f"ELSE COALESCE(json_extract({alias}.value,'$.text') || ' ', '') || "
+            f"{alias}.value END")
 
 
 def _vector_text(layer: str, raw_value: str, fts_body: str) -> tuple[str, str | None]:
@@ -71,6 +72,7 @@ _FTS_AU_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_au AFTER UPDATE OF value
                f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); "
                "DELETE FROM adr001_vec WHERE rowid=new.rowid; "
                "DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid; END;")
+_FTS_DDL = "CREATE VIRTUAL TABLE adr001_fts USING fts5(layer,key,body, tokenize='trigram')"
 
 
 def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str) -> bool:
@@ -131,10 +133,13 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         db.execute("DROP TABLE adr001_supersedes_candidates")
     logger.info("memory hybrid legacy migration invalidated=%d superseded=%d",
                 invalidated, legacy_links + linked)
-    fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone() is None
+    fts_row = db.execute("SELECT sql FROM sqlite_master WHERE name='adr001_fts'").fetchone()
+    fresh = fts_row is None
+    fts_changed = not fresh and "tokenize='trigram'" not in fts_row[0].lower()
     triggers_changed = any(_trigger_definition_changed(db, name, ddl) for name, ddl in (
         ("adr001_fts_ai", _FTS_AI_SQL), ("adr001_fts_au", _FTS_AU_SQL)))
-    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
+    if fresh:
+        db.execute(_FTS_DDL)
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec_gloss "
@@ -171,13 +176,26 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid;
       END;
     """)
+    if fts_changed:
+        # The script above ends the legacy-column transaction. Replacing the
+        # table and its triggers in one write transaction keeps concurrent
+        # writers from observing an unindexed row.
+        db.execute("BEGIN IMMEDIATE")
+        for name in ("adr001_fts_ai", "adr001_fts_au", "adr001_fts_ad"):
+            db.execute(f"DROP TRIGGER IF EXISTS {name}")
+        db.execute("DROP TABLE adr001_fts")
+        db.execute(_FTS_DDL)
+        db.execute("""CREATE TRIGGER adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN
+            DELETE FROM adr001_fts WHERE rowid=old.rowid;
+            DELETE FROM adr001_vec WHERE rowid=old.rowid;
+        END;""")
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
     indexed = db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
-    if fresh or triggers_changed or count != indexed:
+    if fresh or fts_changed or triggers_changed or count != indexed:
         db.execute("DELETE FROM adr001_fts")
         db.execute("INSERT INTO adr001_fts(rowid,layer,key,body) "
                    "SELECT m.rowid,m.layer,m.key," + _body_sql("m") + " FROM adr001_memory m")
-    if triggers_changed:
+    if fts_changed or triggers_changed:
         # executescript commits before it runs. Keep the old triggers until
         # the rebuild starts, then swap them in that same transaction. A
         # rollback leaves both the old body and old trigger definition, so
@@ -527,13 +545,25 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         terms = re.findall(r"[\w]+", query)[:12]
         rows = []
         if terms:
-            expression = " OR ".join('"' + term + '"' for term in terms)
-            rows = db.execute(
-                prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
-                clause + " AND " + _effective_sql() +
-                " AND adr001_fts MATCH ? ORDER BY bm25(adr001_fts) "
-                "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT],
-            ).fetchall()
+            searchable = [term for term in terms if len(term) >= 3]
+            if searchable:
+                expression = " OR ".join('"' + term + '"' for term in searchable)
+                rows = db.execute(
+                    prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
+                    clause + " AND " + _effective_sql() +
+                    " AND adr001_fts MATCH ? ORDER BY bm25(adr001_fts) "
+                    "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT],
+                ).fetchall()
+            else:
+                # FTS5 trigram cannot index a one- or two-character phrase.
+                # Preserve those queries through a bounded scope-filtered scan.
+                short_match = " OR ".join("instr(adr001_fts.body, ?) > 0" for _ in terms)
+                rows = db.execute(
+                    prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
+                    clause + " AND " + _effective_sql() + " AND (" + short_match + ") "
+                    "ORDER BY m.created DESC,m.rowid DESC LIMIT ?",
+                    [*params, *terms, MIDDLE_CANDIDATE_LIMIT],
+                ).fetchall()
         if len(rows) < MIDDLE_CANDIDATE_LIMIT:
             seen = {row[0] for row in rows}
             recent = db.execute(prefix + "WHERE " + clause + " AND " + _effective_sql() +
@@ -627,8 +657,9 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         terms = re.findall(r"[\w]+", query)
         bm25 = {}
         with closing(sqlite3.connect(self.path)) as db:
-            if terms:
-                expression = " OR ".join('"' + term.replace('"', '') + '"' for term in terms)
+            searchable = [term for term in terms if len(term) >= 3]
+            if searchable:
+                expression = " OR ".join('"' + term.replace('"', '') + '"' for term in searchable)
                 for rowid, score in db.execute(
                         "SELECT rowid,bm25(adr001_fts,0.2,10,1) FROM adr001_fts "
                         "WHERE adr001_fts MATCH ? ORDER BY 2", (expression,)):
