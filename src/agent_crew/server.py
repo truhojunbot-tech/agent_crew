@@ -39,6 +39,7 @@ from agent_crew.memory import (
     shadow_telemetry,
 )
 from agent_crew.memory_capture import capture_result_best_effort, capture_merge_best_effort, task_lineage
+from agent_crew import memory_ingest as _memory_ingest
 from agent_crew.memory_runtime import (SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS,
                                        SHADOW_RETRIEVAL_MAX_ROWS,
                                        SQLiteMemoryStorage, MemoryScope,
@@ -3556,6 +3557,14 @@ def create_app(
         except Exception:
             logger.exception("outbox replay at startup failed — rows remain recoverable")
         background_tasks: list[asyncio.Task] = []
+        _ingest_config = os.getenv("AGENT_CREW_MEMORY_INGEST_CONFIG", "").strip()
+        if _ingest_config:
+            try:
+                _interval = _memory_ingest.load_config(_ingest_config).get("interval_seconds", 900)
+                background_tasks.append(asyncio.create_task(
+                    _memory_ingest.periodic_ingest(_ingest_config, _interval)))
+            except Exception:
+                logger.exception("memory ingest schedule configuration invalid")
         if _dispatcher_enabled:
             _requeue_orphans()
             background_tasks.append(asyncio.create_task(_dispatcher_loop()))
@@ -7132,6 +7141,9 @@ def create_app(
         if st == "merged":
             q().external_op_mark(op_key, "done")
             capture_merge_best_effort(db_path, review_task_id)
+            _ingest_config = os.getenv("AGENT_CREW_MEMORY_INGEST_CONFIG", "").strip()
+            if _ingest_config:
+                _memory_ingest.launch_postmerge_ingest(_ingest_config)
             logger.info(f"_auto_merge_pr: PR #{pr_number} 이미 merged(재확인) → done 기록, 재merge 안 함")
             return
         if st == "closed":
@@ -7218,6 +7230,9 @@ def create_app(
         if ok:
             q().external_op_mark(op_key, "done")
             capture_merge_best_effort(db_path, review_task_id)
+            _ingest_config = os.getenv("AGENT_CREW_MEMORY_INGEST_CONFIG", "").strip()
+            if _ingest_config:
+                _memory_ingest.launch_postmerge_ingest(_ingest_config)
             logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) → done(receipt) — #171/§5")
         else:
             fail("gh pr merge 실패")
