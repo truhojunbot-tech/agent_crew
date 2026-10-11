@@ -154,6 +154,13 @@ def _effective_sql(alias: str = "m") -> str:
             f"AND {alias}.invalidated_at IS NULL")
 
 
+def _pin_scope_sql(scope: MemoryScope) -> tuple[str, list]:
+    """Predecessors may have their own task/issue scope, never another project."""
+    return ("COALESCE(json_extract(m.scope,'$.project'),'')=? AND "
+            "(COALESCE(json_extract(m.scope,'$.fleet'),'')='' OR "
+            "json_extract(m.scope,'$.fleet')=?)", [scope.project, scope.fleet])
+
+
 def _scope_sql(scope: MemoryScope) -> tuple[str, list]:
     """A fleet ancestor and a project's fleet-less rows both apply (R27)."""
     project = ("(COALESCE(json_extract(m.scope,'$.project'),'')=? OR "
@@ -266,6 +273,38 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 " AND " + _effective_sql(), [*ids, *params])}
         return [row for row in rows if row["rowid"] in effective]
 
+    def _effective_pins(self, rows: list[dict], scope: MemoryScope) -> set[int]:
+        if not rows:
+            return set()
+        clause, params = _pin_scope_sql(scope)
+        ids = [row["rowid"] for row in rows]
+        with closing(sqlite3.connect(self.path, timeout=.05)) as db:
+            return {row[0] for row in db.execute(
+                "SELECT m.rowid FROM adr001_memory m WHERE m.rowid IN (" +
+                ",".join("?" for _ in ids) + ") AND " + clause +
+                " AND " + _effective_sql(), [*ids, *params])}
+
+    def _predecessor_pins(self, scope: MemoryScope,
+                          predecessor_task_ids: tuple[str, ...]) -> list[dict]:
+        ids = tuple(dict.fromkeys(task_id for task_id in predecessor_task_ids
+                                  if isinstance(task_id, str) and task_id))[:50]
+        if not ids:
+            return []
+        keys = [key for task_id in ids for key in
+                (f"task:{task_id}:decision", f"task_outcome:{scope.project}:{task_id}")]
+        clause, params = _pin_scope_sql(scope)
+        with closing(sqlite3.connect(self.path, timeout=.05)) as db:
+            rows = db.execute(
+                "SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created "
+                "FROM adr001_memory m WHERE m.key IN (" +
+                ",".join("?" for _ in keys) + ") AND " + clause +
+                " AND " + _effective_sql() +
+                " ORDER BY m.created DESC,m.rowid DESC", [*keys, *params]).fetchall()
+        by_key = {}
+        for row in rows:
+            by_key.setdefault(row[2], _row_record(row))
+        return [by_key[key] for key in keys if key in by_key]
+
     def _candidates(self, db: sqlite3.Connection, scope: MemoryScope,
                     query: str = "") -> list[dict]:
         clause, params = _scope_sql(scope)
@@ -361,16 +400,21 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
         return max(0, len(missing) - attempted)
 
-    def _rank_middle(self, candidates: list[dict], query: str) -> tuple[list[dict], bool]:
+    def _rank_middle(self, candidates: list[dict], query: str,
+                     fast_lexical: bool = False) -> tuple[list[dict], bool]:
         import re
 
         ids = {r["rowid"] for r in candidates}
         if not ids:
             return [], False
         terms = re.findall(r"[\w]+", query)
-        bm25 = {}
+        # The predecessor lane already changes this retrieval. Its candidates
+        # arrive in FTS/recent order, so avoid a second global FTS rank over
+        # every matching row in the corpus (which can exceed 300 ms by itself).
+        bm25 = ({row["rowid"]: rank for rank, row in enumerate(candidates, 1)}
+                if fast_lexical else {})
         with closing(sqlite3.connect(self.path)) as db:
-            if terms:
+            if terms and not fast_lexical:
                 expression = " OR ".join('"' + term.replace('"', '') + '"' for term in terms)
                 for rowid, score in db.execute(
                         "SELECT rowid,bm25(adr001_fts,0.2,10,1) FROM adr001_fts "
@@ -408,6 +452,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
 
     def retrieve_ranked(self, scope: MemoryScope, query: str, role: str,
                         k: int, byte_budget: int, *,
+                        predecessor_task_ids: tuple[str, ...] = (),
                         fallback_marker: Optional[threading.Event] = None,
                         response_state: Optional[dict] = None) -> dict:
         started = time.perf_counter()
@@ -416,10 +461,12 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         if response_state is not None:
             response_state["head"] = head
         candidates = []
+        pins = []
         pending = 0
         try:
             if time.perf_counter() >= deadline:
                 raise TimeoutError("head exceeded retrieval budget")
+            pins = self._predecessor_pins(scope, predecessor_task_ids)
             with closing(sqlite3.connect(self.path)) as db:
                 candidates = self._candidates(db, scope, query)
             if time.perf_counter() >= deadline:
@@ -431,10 +478,12 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 response_state["pending"] = pending
             if time.perf_counter() >= deadline:
                 raise TimeoutError("embedding exceeded retrieval budget")
-            middle, vector_used = self._rank_middle(middle, query)
+            middle, vector_used = (self._rank_middle(middle, query, True)
+                                   if predecessor_task_ids else
+                                   self._rank_middle(middle, query))
             overflow_ids = {r["rowid"] for r in head["standing_overflow"]}
-            middle = head["standing_overflow"] + [r for r in middle
-                                                    if r["rowid"] not in overflow_ids]
+            middle = pins + head["standing_overflow"] + [r for r in middle
+                                                           if r["rowid"] not in overflow_ids]
             selected, used, trimmed = [], 0, 0
             emitted_keys = {r["key"] for r in head["records"]}
             for row in middle:
@@ -446,16 +495,6 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                     selected.append(row); used += size; emitted_keys.add(row["key"])
                 else:
                     trimmed += size
-            # Refresh effectiveness at the point of rendering, after ranking.
-            with closing(sqlite3.connect(self.path)) as db:
-                clause, params = _scope_sql(scope)
-                ids = [r["rowid"] for r in selected]
-                fresh = {row[0] for row in db.execute(
-                    "SELECT m.rowid FROM adr001_memory m WHERE m.rowid IN (" +
-                    ",".join("?" for _ in ids) + ") AND " + clause +
-                    " AND " + _effective_sql(), [*ids, *params],
-                )} if ids else set()
-            selected = [r for r in selected if r["rowid"] in fresh]
             elapsed = (time.perf_counter() - started) * 1000
             if elapsed > LATENCY_BUDGET_SECONDS * 1000:
                 raise TimeoutError("retrieval exceeded 300 ms")
@@ -464,18 +503,21 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             logger.warning("memory retrieval fallback: %s: %s", type(exc).__name__, exc)
             self._record_fallback(fallback_marker)
             terms = set(query.lower().replace("-", " ").split())
-            selected = [r for r in candidates
+            selected = pins + [r for r in candidates
                         if r["rowid"] not in {h["rowid"] for h in head["records"]}]
-            selected.sort(key=lambda r: _retrieval_rank(
+            selected[len(pins):] = sorted(selected[len(pins):], key=lambda r: _retrieval_rank(
                 MemoryRecord(r["layer"], r["key"], r["value"], MemoryScope(**r["scope"])), terms))
-            bounded, used = [], 0
+            bounded, used, seen_keys = [], 0, set()
             for row in selected:
                 if len(bounded) >= max(0, k):
                     break
+                if row["key"] in seen_keys:
+                    continue
                 size = _bytes(row)
                 if used + size <= max(0, byte_budget):
                     bounded.append(row)
                     used += size
+                    seen_keys.add(row["key"])
             selected = bounded
             trimmed = 0
             mode = "fallback"
@@ -484,7 +526,13 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         # second writer may have superseded one while this call was ranking.
         try:
             head["records"] = self.effective_rows(head["records"], scope)
-            selected = self.effective_rows(selected, scope)
+            pin_ids = {row["rowid"] for row in pins}
+            pin_fresh = self._effective_pins(
+                [row for row in selected if row["rowid"] in pin_ids], scope)
+            normal_rows = [row for row in selected if row["rowid"] not in pin_ids]
+            normal_fresh = {row["rowid"] for row in self.effective_rows(normal_rows, scope)}
+            selected = [row for row in selected
+                        if row["rowid"] in pin_fresh or row["rowid"] in normal_fresh]
         except sqlite3.Error as exc:
             logger.warning("memory render-time effectiveness check failed: %s", exc)
             self._record_fallback(fallback_marker)

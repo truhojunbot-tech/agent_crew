@@ -5813,6 +5813,7 @@ def create_app(
                         _ranked_receipt = await asyncio.wait_for(asyncio.to_thread(
                             _ranked_memory.retrieve_ranked, _ranked_scope,
                             task.description, role, _memory_request.limit, 16000,
+                            predecessor_task_ids=_predecessors,
                             fallback_marker=_marker, response_state=_state), timeout=.300)
                     except asyncio.TimeoutError:
                         _ranked_receipt = _ranked_timeout_response(
@@ -7273,6 +7274,10 @@ def create_app(
             role = str(payload.get("role") or "implementer")
             k = int(payload.get("k", 20))
             byte_budget = int(payload.get("byte_budget", 16000))
+            predecessors, _ = (
+                await asyncio.to_thread(task_lineage, db_path, scope.task_id)
+                if scope.task_id else ((), None)
+            )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         try:
@@ -7280,6 +7285,7 @@ def create_app(
             response_state = {}
             return await asyncio.wait_for(asyncio.to_thread(
                 _ranked_memory.retrieve_ranked, scope, query, role, k, byte_budget,
+                predecessor_task_ids=predecessors,
                 fallback_marker=fallback_marker, response_state=response_state),
                 timeout=.300)
         except asyncio.TimeoutError:
