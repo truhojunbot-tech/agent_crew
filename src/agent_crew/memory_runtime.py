@@ -126,9 +126,9 @@ class MemoryStorage(Protocol):
 
 class SQLiteMemoryStorage:
     """Local-first POC; callers depend only on :class:`MemoryStorage`."""
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, busy_timeout_seconds: float = 5.0):
         self.path = path
-        with closing(sqlite3.connect(path)) as db:
+        with closing(sqlite3.connect(path, timeout=busy_timeout_seconds)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))")
             db.execute("CREATE INDEX IF NOT EXISTS idx_adr001_shadow_project_created "
                        "ON adr001_memory(COALESCE(json_extract(scope,'$.project'),''), created DESC)")

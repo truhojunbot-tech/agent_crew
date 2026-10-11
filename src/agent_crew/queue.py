@@ -400,18 +400,17 @@ def _cea_is_lineage_successor(task: TaskRequest, ctx: dict) -> bool:
     return bool(task_id) and _cea_lineage_root_task_id(task_id, ctx) != task_id
 
 
-def _is_implement_root(task: TaskRequest, ctx: dict, *,
-                       successor_provenance: object | None = None) -> bool:
-    """Only a new implement intent needs root risk metadata validation.
+def _is_root_task(task: TaskRequest, ctx: dict, *,
+                  successor_provenance: object | None = None) -> bool:
+    """A new intent needs root risk metadata validation, whatever its task type.
 
     Parent keys prove succession only when the in-process constructor supplied
     the private provenance token. In particular, HTTP callers may supply
     ``prev_task_id`` as ordinary context and must still be checked as roots.
     """
     trusted_successor = (successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
-    return (task.task_type == "implement"
-            and not (trusted_successor
-                     and (ctx.get("prev_task_id") or _cea_lineage_parent_from_ctx(ctx))))
+    return not (trusted_successor
+                and (ctx.get("prev_task_id") or _cea_lineage_parent_from_ctx(ctx)))
 
 
 def _cea_scope_anchors(task: TaskRequest, ctx: dict, repo: str) -> tuple[str, ...]:
@@ -1361,7 +1360,28 @@ class DuplicateReviewError(Exception):
 
 
 class InvalidRiskTierError(ValueError):
-    """An implement root declared a tier outside integer 0-3."""
+    """An HTTP root declared no valid integer tier or explicit declaration."""
+
+
+def validate_http_root_risk(context: dict | None) -> None:
+    """Validate untrusted POST /tasks input before queue admission writes a row.
+
+    HTTP context cannot prove successor provenance, even when it names a
+    parent. Internal adapters and legacy successors retain their own ingress
+    contracts and continue through the common queue admission path.
+    """
+    context = context if isinstance(context, dict) else {}
+    if "risk_tier" in context and (
+            isinstance(context["risk_tier"], bool)
+            or not isinstance(context["risk_tier"], int)
+            or not 0 <= context["risk_tier"] <= 3):
+        raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
+    declaration = context.get("risk_declaration")
+    explicit = (isinstance(declaration, dict)
+                and any(isinstance(declaration.get(field), bool)
+                        for field in RISK_DECLARATION_FIELDS))
+    if "risk_tier" not in context and not explicit:
+        raise InvalidRiskTierError("root context.risk_tier must be an integer 0-3")
 
 
 def _is_issue_number(value) -> bool:
@@ -2420,6 +2440,14 @@ class TaskQueue:
         """
         context = self._enqueue_context(task)
         if successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE:
+            inherited_tier = context.get("risk_tier")
+            if "risk_tier" in context and (
+                    isinstance(inherited_tier, bool)
+                    or not isinstance(inherited_tier, int)
+                    or not 0 <= inherited_tier <= 3):
+                context.pop("risk_tier")
+                logger.warning("cea: dropped invalid inherited risk_tier for %s",
+                               task.task_id)
             return context
 
         dropped = [key for key in _CEA_LINEAGE_PARENT_KEYS if key in context]
@@ -2821,12 +2849,12 @@ class TaskQueue:
         :class:`AdmissionRefused` without writing a task row.
         """
         context = dict(self._enqueue_context(task) if context is None else context)
-        missing_root_risk = (_is_implement_root(
+        missing_root_risk = (_is_root_task(
                                  task, context,
                                  successor_provenance=_successor_provenance)
                              and "risk_tier" not in context
                              and "risk_declaration" not in context)
-        missing_root_issue = (_is_implement_root(
+        missing_root_issue = (task.task_type == "implement" and _is_root_task(
                                   task, context,
                                   successor_provenance=_successor_provenance)
                               and not _is_issue_number(context.get("issue")))
@@ -3400,7 +3428,10 @@ class TaskQueue:
             if pr is not None:
                 if old_pr != pr:
                     continue
-            elif old_pr is not None or row["branch"] != task.branch:
+            # PR-less reports can share a branch and head without reviewing
+            # the same implement task.
+            elif (old_pr is not None or row["branch"] != task.branch
+                  or old.get("prev_task_id") != context.get("prev_task_id")):
                 continue
             old_sha = (old.get("reviewed_sha") if dispatch else
                        old.get("reviewed_sha") or old.get("expected_head_sha")
@@ -3512,14 +3543,6 @@ class TaskQueue:
             task, refusal = self._project_from_queue_identity(task)
             context = self._trusted_enqueue_context(
                 task, successor_provenance=_successor_provenance)
-            if _is_implement_root(task, context,
-                                  successor_provenance=_successor_provenance):
-                if "risk_tier" in context and (
-                        isinstance(context["risk_tier"], bool)
-                        or not isinstance(context["risk_tier"], int)
-                        or not 0 <= context["risk_tier"] <= 3):
-                    raise InvalidRiskTierError(
-                        "implement root context.risk_tier must be an integer 0-3")
             if refusal is None and task.task_type == "implement":
                 cap = self._max_open_implement()
                 is_system_successor = (
@@ -4133,6 +4156,23 @@ class TaskQueue:
                 (json.dumps(merged), task_id),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def reserve_cloud_shadow_launch(self, task_id: str) -> bool:
+        """Reserve one shadow launch per review before invoking a paid CLI."""
+        conn = self._connect()
+        try:
+            cursor = conn.execute(
+                "UPDATE tasks SET context=json_set(context, "
+                "'$.cloud_shadow_launch_reserved_at', ?) "
+                "WHERE task_id=? AND task_type='review' "
+                "AND json_extract(context, '$.cloud_shadow_launch_reserved_at') IS NULL "
+                "AND json_extract(context, '$.cloud_shadow_session_id') IS NULL",
+                (time.time(), task_id),
+            )
+            conn.commit()
+            return cursor.rowcount == 1
         finally:
             conn.close()
 
@@ -4970,6 +5010,20 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def has_superseding_review(self, parent_task_id: str) -> bool:
+        """Whether a newer review supersedes this task's reviewed PR head."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM tasks WHERE task_type='review' "
+                "AND CASE WHEN json_valid(context) "
+                "THEN json_extract(context, '$.superseded_review') END=? LIMIT 1",
+                (parent_task_id,),
+            ).fetchone()
+            return row is not None
+        finally:
+            conn.close()
+
     def outbox_claim(self, parent_task_id: str, owner: str,
                      ttl: Optional[float] = None) -> Optional[dict]:
         """lease CAS로 outbox 행을 claim. pending이거나 **만료된 replaying**(crash 회수)일 때만
@@ -5014,6 +5068,41 @@ class TaskQueue:
                 (time.time(), parent_task_id, owner))
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def outbox_finish_claim(self, parent_task_id: str, owner: str, *,
+                            state: str) -> bool:
+        """Resolve a replay lease without creating a successor.
+
+        ``expired`` is a known stale continuation; ``pending`` retains one
+        whose safety check could not be completed. Both require our lease so a
+        concurrent reclaimer cannot have its decision overwritten.
+        """
+        if state not in ("expired", "pending"):
+            raise ValueError("outbox claim may only become expired or pending")
+        conn = self._connect()
+        try:
+            cur = conn.execute(
+                "UPDATE cascade_outbox SET state=?, lease_owner=NULL, attempt_id=NULL, "
+                "lease_expires_at=NULL, updated_at=? WHERE parent_task_id=? "
+                "AND lease_owner=? AND state='replaying'",
+                (state, time.time(), parent_task_id, owner))
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+
+    def outbox_counts(self) -> dict:
+        """Counts reported by /health for pending and expired continuations."""
+        conn = self._connect()
+        try:
+            counts = {"pending": 0, "expired": 0}
+            for state, count in conn.execute(
+                    "SELECT state, count(*) FROM cascade_outbox "
+                    "WHERE state IN ('pending','expired') GROUP BY state"):
+                counts[state] = count
+            return counts
         finally:
             conn.close()
 
@@ -5969,6 +6058,27 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def count_cloud_reviews_started_since(self, since: float) -> int:
+        """Count durable cloud review launches, including shadow sessions."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_attribution "
+                "WHERE agent='claude_cloud' AND task_type='review' "
+                "AND provider_session_id<>'' AND started_at>=?", (since,)
+            ).fetchone()
+            shadow = conn.execute(
+                "SELECT COUNT(*) AS n FROM tasks WHERE task_type='review' "
+                "AND (json_extract(context, '$.cloud_shadow_launch_reserved_at') IS NOT NULL "
+                "OR json_extract(context, '$.cloud_shadow_session_id') IS NOT NULL) "
+                "AND CAST(COALESCE(json_extract(context, '$.cloud_shadow_launched_at'), "
+                "json_extract(context, '$.cloud_shadow_launch_reserved_at')) AS REAL)>=?",
+                (since,),
+            ).fetchone()
+            return (int(row["n"]) if row else 0) + (int(shadow["n"]) if shadow else 0)
+        finally:
+            conn.close()
+
     def list_in_progress_by_dispatch_channel(self, channel: str) -> List[TaskRequest]:
         """#496: in_progress tasks dispatched over ``channel``, for a
         completion-reconciliation pass (there is no live callback channel
@@ -6440,11 +6550,12 @@ class TaskQueue:
 
     def list_in_progress_with_activity(self) -> List[dict]:
         """Return dicts with the fields the watchdog needs to make timeout
-        decisions: task_id, task_type, context, last_activity_at, push_at, project."""
+        decisions, including dispatcher claim provenance."""
         conn = self._connect()
         try:
             rows = conn.execute(
-                "SELECT task_id, task_type, context, last_activity_at, push_at, project "
+                "SELECT task_id, task_type, context, last_activity_at, last_heartbeat_at, "
+                "push_at, project, claim_source, dispatched_at "
                 "FROM tasks WHERE status = 'in_progress'"
             ).fetchall()
             return [
@@ -6453,11 +6564,37 @@ class TaskQueue:
                     "task_type": r["task_type"],
                     "context": json.loads(r["context"]) if r["context"] else {},
                     "last_activity_at": r["last_activity_at"] or 0.0,
+                    "last_heartbeat_at": r["last_heartbeat_at"] or 0.0,
                     "push_at": r["push_at"] or 0.0,
                     "project": r["project"] if r["project"] else "",
+                    "claim_source": r["claim_source"] or "",
+                    "dispatched_at": r["dispatched_at"] or 0.0,
                 }
                 for r in rows
             ]
+        finally:
+            conn.close()
+
+    def later_dispatcher_tasks_same_role(self, task_id: str) -> List[dict]:
+        """List launched successors on the same dispatcher role and agent."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "SELECT newer.task_id, newer.task_type, newer.context "
+                "FROM tasks AS older JOIN tasks AS newer "
+                "ON newer.task_type=older.task_type "
+                "AND newer.dispatch_agent=older.dispatch_agent "
+                "WHERE older.task_id=? AND older.claim_source='dispatcher' "
+                "AND older.dispatch_agent IS NOT NULL "
+                "AND newer.claim_source='dispatcher' "
+                "AND newer.dispatched_at>COALESCE(NULLIF(older.dispatched_at,0), "
+                "older.last_activity_at, 0) "
+                "AND newer.dispatch_target LIKE 'pid:%' "
+                "ORDER BY newer.dispatched_at ASC", (task_id,)
+            ).fetchall()
+            return [{"task_id": row["task_id"], "task_type": row["task_type"],
+                     "context": json.loads(row["context"] or "{}")}
+                    for row in rows]
         finally:
             conn.close()
 
@@ -6819,6 +6956,20 @@ class TaskQueue:
             return (row["provider_session_id"] or "") if row else ""
         except Exception:  # noqa: BLE001 — a peek never breaks a dispatch
             return ""
+        finally:
+            conn.close()
+
+    def peek_context_last_task_id(self, project: str, agent: str,
+                                  worktree_path: str) -> str:
+        """Read the previous task for a context without minting or advancing it."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT last_task_id FROM context_state "
+                "WHERE project=? AND agent=? AND worktree_path=?",
+                (project, agent, worktree_path),
+            ).fetchone()
+            return (row["last_task_id"] or "") if row else ""
         finally:
             conn.close()
 

@@ -33,8 +33,27 @@ MIDDLE_CANDIDATE_LIMIT = 96
 
 def _body_sql(alias: str) -> str:
     return (f"CASE WHEN {alias}.layer='authoritative' THEN "
-            f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) "
+            f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || "
+            f"COALESCE(' ' || json_extract({alias}.value,'$.gloss_en'),'') "
             f"ELSE {alias}.value END")
+
+
+_FTS_AI_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_ai AFTER INSERT ON "
+               "adr001_memory BEGIN INSERT INTO adr001_fts(rowid,layer,key,body) "
+               f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); END;")
+_FTS_AU_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_au AFTER UPDATE OF value "
+               "ON adr001_memory BEGIN DELETE FROM adr001_fts WHERE rowid=old.rowid; "
+               "INSERT INTO adr001_fts(rowid,layer,key,body) "
+               f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); "
+               "DELETE FROM adr001_vec WHERE rowid=new.rowid; END;")
+
+
+def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str) -> bool:
+    row = db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
+                     (name,)).fetchone()
+    normalized = lambda sql: " ".join(sql.strip().rstrip(";").replace(
+        "IF NOT EXISTS ", "").split()).casefold()
+    return row is None or normalized(row[0]) != normalized(expected)
 
 
 def ensure_index_schema(db: sqlite3.Connection) -> None:
@@ -62,18 +81,32 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         SET superseded_by=json_extract(value,'$.superseded')
         WHERE superseded_by IS NULL AND json_type(value,'$.superseded')='text'
           AND json_extract(value,'$.superseded')<>''""").rowcount
-    linked = db.execute("""UPDATE adr001_memory AS old SET superseded_by = (
-        SELECT newer.key FROM adr001_memory AS newer
-        WHERE newer.layer=old.layer AND newer.scope=old.scope
-          AND json_extract(newer.value,'$.supersedes')=old.key
-        ORDER BY newer.created DESC,newer.rowid DESC LIMIT 1)
-        WHERE old.superseded_by IS NULL AND EXISTS (
-          SELECT 1 FROM adr001_memory AS newer
-          WHERE newer.layer=old.layer AND newer.scope=old.scope
-            AND json_extract(newer.value,'$.supersedes')=old.key)""").rowcount
+    # Materialize the sparse superseding rows once. The old correlated lookup
+    # extracted JSON from every row for every candidate at each startup.
+    db.execute("""CREATE TEMP TABLE adr001_supersedes_candidates AS
+        SELECT layer,scope,json_extract(value,'$.supersedes') AS supersedes,
+               key,created,rowid AS source_rowid FROM adr001_memory
+        WHERE json_extract(value,'$.supersedes') IS NOT NULL""")
+    try:
+        db.execute("""CREATE INDEX adr001_supersedes_candidates_lookup
+            ON adr001_supersedes_candidates
+            (layer,scope,supersedes,created DESC,source_rowid DESC)""")
+        linked = db.execute("""UPDATE adr001_memory AS old SET superseded_by = (
+            SELECT newer.key FROM adr001_supersedes_candidates AS newer
+            WHERE newer.layer=old.layer AND newer.scope=old.scope
+              AND newer.supersedes=old.key
+            ORDER BY newer.created DESC,newer.source_rowid DESC LIMIT 1)
+            WHERE old.superseded_by IS NULL AND EXISTS (
+              SELECT 1 FROM adr001_supersedes_candidates AS newer
+              WHERE newer.layer=old.layer AND newer.scope=old.scope
+                AND newer.supersedes=old.key)""").rowcount
+    finally:
+        db.execute("DROP TABLE adr001_supersedes_candidates")
     logger.info("memory hybrid legacy migration invalidated=%d superseded=%d",
                 invalidated, legacy_links + linked)
     fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone() is None
+    triggers_changed = any(_trigger_definition_changed(db, name, ddl) for name, ddl in (
+        ("adr001_fts_ai", _FTS_AI_SQL), ("adr001_fts_au", _FTS_AU_SQL)))
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
@@ -90,23 +123,6 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
           json_type(new.value,'$.superseded') IS NOT NULL OR
           json_type(new.value,'$.invalidated_at') IS NOT NULL
         BEGIN SELECT RAISE(ABORT,'legacy memory flags forbidden'); END;
-      CREATE TRIGGER IF NOT EXISTS adr001_fts_ai AFTER INSERT ON adr001_memory BEGIN
-        INSERT INTO adr001_fts(rowid,layer,key,body)
-          VALUES(new.rowid,new.layer,new.key,
-            CASE WHEN new.layer='authoritative' THEN
-              COALESCE(json_extract(new.value,'$.text'),new.value)
-            ELSE new.value END);
-      END;
-      CREATE TRIGGER IF NOT EXISTS adr001_fts_au
-        AFTER UPDATE OF value ON adr001_memory BEGIN
-        DELETE FROM adr001_fts WHERE rowid=old.rowid;
-        INSERT INTO adr001_fts(rowid,layer,key,body)
-          VALUES(new.rowid,new.layer,new.key,
-            CASE WHEN new.layer='authoritative' THEN
-              COALESCE(json_extract(new.value,'$.text'),new.value)
-            ELSE new.value END);
-        DELETE FROM adr001_vec WHERE rowid=new.rowid;
-      END;
       CREATE TRIGGER IF NOT EXISTS adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN
         DELETE FROM adr001_fts WHERE rowid=old.rowid;
         DELETE FROM adr001_vec WHERE rowid=old.rowid;
@@ -118,10 +134,19 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
     """)
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
     indexed = db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
-    if fresh or count != indexed:
+    if fresh or triggers_changed or count != indexed:
         db.execute("DELETE FROM adr001_fts")
         db.execute("INSERT INTO adr001_fts(rowid,layer,key,body) "
                    "SELECT m.rowid,m.layer,m.key," + _body_sql("m") + " FROM adr001_memory m")
+    if triggers_changed:
+        # executescript commits before it runs. Keep the old triggers until
+        # the rebuild starts, then swap them in that same transaction. A
+        # rollback leaves both the old body and old trigger definition, so
+        # the next initializer retries the rebuild.
+        db.execute("DROP TRIGGER IF EXISTS adr001_fts_ai")
+        db.execute("DROP TRIGGER IF EXISTS adr001_fts_au")
+        db.execute(_FTS_AI_SQL)
+        db.execute(_FTS_AU_SQL)
 
 
 def _effective_sql(alias: str = "m") -> str:
@@ -202,7 +227,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
     """Scope in SQLite first; rank only those rowids with FTS5 and cosine."""
 
     def __init__(self, path: str, *, embedder: Optional[Callable] = None):
-        super().__init__(path)
+        super().__init__(path, busy_timeout_seconds=30.0)
         self.backfill()
         self.embedder = embedder if embedder is not None else configured_embedder()
         self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
@@ -219,7 +244,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             self.fallback_count += 1
 
     def backfill(self) -> None:
-        with closing(sqlite3.connect(self.path)) as db:
+        with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
             ensure_index_schema(db)
             db.commit()
 
@@ -227,6 +252,19 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         with closing(sqlite3.connect(self.path)) as db:
             return db.execute("SELECT count(*) FROM adr001_memory m LEFT JOIN adr001_vec v "
                               "ON v.rowid=m.rowid WHERE v.rowid IS NULL OR v.vec IS NULL").fetchone()[0]
+
+    def effective_rows(self, rows: list[dict], scope: MemoryScope) -> list[dict]:
+        """Rejoin selected rowids immediately before rendering a response."""
+        if not rows:
+            return []
+        clause, params = _scope_sql(scope)
+        ids = [row["rowid"] for row in rows]
+        with closing(sqlite3.connect(self.path, timeout=.05)) as db:
+            effective = {row[0] for row in db.execute(
+                "SELECT m.rowid FROM adr001_memory m WHERE m.rowid IN (" +
+                ",".join("?" for _ in ids) + ") AND " + clause +
+                " AND " + _effective_sql(), [*ids, *params])}
+        return [row for row in rows if row["rowid"] in effective]
 
     def _candidates(self, db: sqlite3.Connection, scope: MemoryScope,
                     query: str = "") -> list[dict]:
@@ -257,9 +295,9 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 hashlib.sha256(json.dumps(row["value"], sort_keys=True).encode()).hexdigest()
                 not in decisions]
 
-    def render_head(self, project: str) -> dict:
+    def render_head(self, project: str, fleet: str = "") -> dict:
         """Deterministic SQL view used by both dispatch and the HTTP hook."""
-        clause, params = _scope_sql(MemoryScope(project=project))
+        clause, params = _scope_sql(MemoryScope(project=project, fleet=fleet))
         prefix = ("SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created "
                   "FROM adr001_memory m WHERE " + clause + " AND " + _effective_sql())
         with closing(sqlite3.connect(self.path)) as db:
@@ -272,8 +310,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 "ORDER BY json_extract(m.value,'$.verb'),json_extract(m.value,'$.subject'),"
                 "json_extract(m.value,'$.source_message_id')", params)]
         head, overflow, seen = [], [], set()
-        for group, cap in ((principles, HEAD_PRINCIPLE_BYTES),
-                           (standing, HEAD_STANDING_BYTES)):
+        for group, cap, force_overflow in ((principles, HEAD_PRINCIPLE_BYTES, False),
+                                           (standing, HEAD_STANDING_BYTES, True)):
             used = 0
             for record in group:
                 if record["rowid"] in seen:
@@ -282,7 +320,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 size = _bytes(record)
                 if used + size <= cap:
                     head.append(record); used += size
-                else:
+                elif force_overflow:
                     overflow.append(record)
         rendered = json.dumps(head, sort_keys=True, ensure_ascii=False).encode()
         return {"records": head, "standing_overflow": overflow,
@@ -374,7 +412,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         response_state: Optional[dict] = None) -> dict:
         started = time.perf_counter()
         deadline = started + LATENCY_BUDGET_SECONDS
-        head = self.render_head(scope.project)
+        head = self.render_head(scope.project, scope.fleet)
         if response_state is not None:
             response_state["head"] = head
         candidates = []
@@ -442,11 +480,30 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             trimmed = 0
             mode = "fallback"
             elapsed = (time.perf_counter() - started) * 1000
+        # Rejoin every rendered row after ranking, including head rows. A
+        # second writer may have superseded one while this call was ranking.
+        try:
+            head["records"] = self.effective_rows(head["records"], scope)
+            selected = self.effective_rows(selected, scope)
+        except sqlite3.Error as exc:
+            logger.warning("memory render-time effectiveness check failed: %s", exc)
+            self._record_fallback(fallback_marker)
+            head["records"] = []
+            selected = []
+            mode = "fallback"
+        rendered_head = json.dumps(head["records"], sort_keys=True, ensure_ascii=False).encode()
+        head["head_hash"] = hashlib.sha256(rendered_head).hexdigest()
+        elapsed = (time.perf_counter() - started) * 1000
+        if elapsed > LATENCY_BUDGET_SECONDS * 1000 and mode != "fallback":
+            self._record_fallback(fallback_marker)
+            mode = "fallback"
+            selected = []
         self.last_retrieval_mode = mode
         return {"head": head["records"], "middle": selected, "mode": mode,
                 "pending_vectors": pending, "latency_ms": elapsed,
                 "trimmed_bytes": trimmed, "standing_trimmed": head["standing_trimmed"],
-                "model_id": self.model_id, "head_hash": head["head_hash"]}
+                "model_id": self.model_id, "head_hash": head["head_hash"],
+                "head_bytes": len(rendered_head), "superseded_served": 0}
 
 
 def memory_storage_from_env(path: str, *, embedder=None) -> MemoryStorage:

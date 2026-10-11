@@ -292,6 +292,27 @@ def pr_has_comment_containing(pr_number: int, needle: str,
     return any(needle in (c.get("body") or "") for c in comments)
 
 
+def pr_comments(pr_number: int, repo: Optional[str] = None,
+                timeout: float = 20.0) -> Optional[list]:
+    """Read PR issue comments; ``None`` means the GitHub read was unavailable."""
+    if not pr_number or not check_gh_installed():
+        return None
+    slug = _repo_slug(repo or get_repo())
+    if not slug:
+        return None
+    try:
+        result = subprocess.run(
+            ["gh", "api", "--paginate", f"repos/{slug}/issues/{pr_number}/comments",
+             "--jq", ".[] | {body: .body}"],
+            capture_output=True, text=True, timeout=timeout)
+        if result.returncode != 0:
+            _log_gh_failure("pr_comments", slug, pr_number, result)
+            return None
+        return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
+    except Exception:
+        return None
+
+
 def post_pr_comment(pr_number: int, body: str, repo: Optional[str] = None) -> bool:
     """Post an arbitrary comment on a PR. Returns True on success.
 

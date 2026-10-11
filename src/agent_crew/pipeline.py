@@ -1034,6 +1034,11 @@ def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
     """Keep inherited risk out of the broker payload, then record it (#578)."""
     inherited: dict = {}
     _inherit_root_risk(tasks_by_id, parent_task, inherited)
+    parent_context = parent_task.context if isinstance(parent_task.context, dict) else {}
+    if isinstance(task.context, dict) and "risk_tier" not in task.context:
+        tier = parent_context.get("risk_tier")
+        if isinstance(tier, int) and not isinstance(tier, bool) and 0 <= tier <= 3:
+            task.context["risk_tier"] = tier
     queue.enqueue(task, ingress=ingress,
                   _successor_provenance=successor_provenance)
     if inherited:
@@ -2131,6 +2136,29 @@ def auto_enqueue_review(
             "prev_task_id": impl_task_id,
             "pr_number": pr_number,
         }
+        try:
+            prior_fix_round = int(impl_ctx.get("fix_round") or 0)
+        except (TypeError, ValueError):
+            prior_fix_round = 0
+        if impl_task_id.startswith("fix-") or prior_fix_round > 0:
+            prior_review = next((
+                task for candidate in (impl_ctx.get("prev_task_id"),
+                                       impl_ctx.get("review_task_id"))
+                if isinstance(candidate, str) and candidate
+                if (task := queue.get_task(candidate)) is not None
+                and task.task_type == "review"
+            ), None)
+            if prior_review is not None:
+                prior_result = queue.get_result(prior_review.task_id)
+                if prior_result is not None:
+                    round_no = max(1, prior_fix_round)
+                    review_context["prior_review_task_id"] = prior_review.task_id
+                    review_context["instructions"] += (
+                        f"\n\nPRIOR REVIEW FINDINGS (round {round_no}, from "
+                        f"{prior_review.task_id}) - verify each is resolved at the "
+                        "current head; state per finding resolved/unresolved:\n"
+                        + _findings_block(prior_result.findings or [], prior_review.task_id)
+                    )
         if enforce_risk_tier:
             review_context.update(risk)
         if enforce_risk_tier and impl_ctx.get("tier3_gate_approved"):
@@ -2185,7 +2213,8 @@ def auto_enqueue_review(
         try:
             _enqueue_with_inherited_risk(
                 queue, review_req, {t.task_id: t for t in queue.list_tasks()},
-                impl_task, ingress="cascade.review")
+                impl_task, ingress="cascade.review",
+                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         except TaskAlreadyExistsError:
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
@@ -2360,7 +2389,8 @@ def auto_enqueue_test(
         try:
             _enqueue_with_inherited_risk(
                 queue, test_req, tasks_by_id, review_task,
-                ingress="cascade.test")
+                ingress="cascade.test",
+                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         except TaskAlreadyExistsError:
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
         except DuplicateReviewError as exc:
