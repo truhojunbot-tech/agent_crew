@@ -10,6 +10,7 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.request
 from array import array
 from contextlib import closing
 from dataclasses import asdict
@@ -18,7 +19,8 @@ from typing import Callable, Optional
 
 from .memory_runtime import (
     MemoryRecord, MemoryScope, MemoryStorage, SQLiteMemoryStorage,
-    _logical_revision_key, _scope_from_json, _retrieval_rank,
+    _canonical_scope_json, _logical_revision_key, _scope_from_json,
+    _retrieval_rank,
     procedural_row_servable, procedural_servable_sql,
 )
 
@@ -235,13 +237,42 @@ def configured_embedder():
         return None
 
 
+class EndpointEmbedder:
+    """Embed through an explicitly configured serving endpoint."""
+
+    def __init__(self, endpoint: str, model_id: str):
+        self.endpoint = endpoint
+        self.model_id = model_id
+
+    def __call__(self, text: str):
+        payload = json.dumps({"model": self.model_id, "input": text}).encode()
+        request = urllib.request.Request(self.endpoint, data=payload,
+                                         headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=30) as response:
+            result = json.load(response)
+        vectors = result.get("embeddings")
+        return vectors[0] if vectors else result["embedding"]
+
+
+def configured_write_embedder():
+    endpoint = os.getenv("AGENT_CREW_MEMORY_EMBED_ENDPOINT", "").strip()
+    model_id = os.getenv("AGENT_CREW_MEMORY_MODEL_ID", "").strip()
+    if not endpoint or not model_id:
+        return None
+    if not endpoint.startswith(("http://", "https://")):
+        logger.warning("memory embed endpoint must be an HTTP URL")
+        return None
+    return EndpointEmbedder(endpoint, model_id)
+
+
 class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
     """Scope in SQLite first; rank only those rowids with FTS5 and cosine."""
 
     def __init__(self, path: str, *, embedder: Optional[Callable] = None):
         super().__init__(path, busy_timeout_seconds=30.0)
         self.backfill()
-        self.embedder = embedder if embedder is not None else configured_embedder()
+        self.write_embedder = embedder if embedder is not None else configured_write_embedder()
+        self.embedder = self.write_embedder or configured_embedder()
         self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
         self.fallback_count = 0
         self._fallback_lock = threading.Lock()
@@ -260,6 +291,86 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             ensure_index_schema(db)
             db.commit()
         self._revision_columns = True
+
+    def put(self, record: MemoryRecord) -> None:
+        super().put(record)
+        if self.write_embedder is not None:
+            self._embed_written_record(record)
+
+    def put_many_shadow(self, records: list[MemoryRecord], **kwargs) -> None:
+        super().put_many_shadow(records, **kwargs)
+        if self.write_embedder is not None:
+            for record in records:
+                self._embed_written_record(record)
+
+    def _embed_written_record(self, record: MemoryRecord) -> None:
+        try:
+            with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
+                row = db.execute("SELECT m.rowid,f.body,v.model_id,v.content_sha,v.vec "
+                                 "FROM adr001_memory m "
+                                 "JOIN adr001_fts f ON f.rowid=m.rowid "
+                                 "LEFT JOIN adr001_vec v ON v.rowid=m.rowid WHERE "
+                                 "m.layer=? AND m.key=? AND m.scope=? AND " + _effective_sql(),
+                                 (record.layer, record.key,
+                                  _canonical_scope_json(record.scope))).fetchone()
+            if row:
+                rowid, body, model, digest, vector = row
+                if vector is None or model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest():
+                    self._embed_row(rowid, body)
+        except Exception as exc:
+            logger.warning("memory write embed failed key=%s: %s", record.key, exc)
+
+    def _embed_row(self, rowid: int, body: str) -> bool:
+        digest = hashlib.sha256(body.encode()).hexdigest()
+        try:
+            vector = array("f", self.write_embedder(body))
+            if not vector or not all(math.isfinite(value) for value in vector):
+                raise ValueError("empty or non-finite embedding")
+            with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
+                # Another writer may have changed or retired this row while the
+                # endpoint was computing its vector.
+                db.execute("BEGIN IMMEDIATE")
+                current = db.execute("SELECT f.body FROM adr001_memory m "
+                                     "JOIN adr001_fts f ON f.rowid=m.rowid "
+                                     "WHERE m.rowid=? AND " + _effective_sql(), (rowid,)).fetchone()
+                if not current or hashlib.sha256(current[0].encode()).hexdigest() != digest:
+                    return False
+                db.execute("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
+                           "VALUES(?,?,?,?) ON CONFLICT(rowid) DO UPDATE SET "
+                           "model_id=excluded.model_id,content_sha=excluded.content_sha,vec=excluded.vec",
+                           (rowid, self.model_id, digest, vector.tobytes()))
+                db.commit()
+            return True
+        except Exception as exc:
+            logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
+            return False
+
+    def backfill_vectors(self, *, limit: Optional[int] = None, batch_size: int = 128) -> int:
+        """Fill effective stale vectors; committed rows survive interrupted runs."""
+        if self.write_embedder is None:
+            return 0
+        if batch_size < 1 or (limit is not None and limit < 0):
+            raise ValueError("batch_size must be positive and limit nonnegative")
+        cursor = 0
+        written = 0
+        while limit is None or written < limit:
+            with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
+                rows = db.execute("SELECT m.rowid,f.body,v.model_id,v.content_sha,v.vec "
+                                  "FROM adr001_memory m JOIN adr001_fts f ON f.rowid=m.rowid "
+                                  "LEFT JOIN adr001_vec v ON v.rowid=m.rowid "
+                                  "WHERE m.rowid>? AND " + _effective_sql() +
+                                  " ORDER BY m.rowid LIMIT ?", (cursor, batch_size)).fetchall()
+            if not rows:
+                break
+            for rowid, body, model, digest, vector in rows:
+                cursor = rowid
+                if vector is not None and model == self.model_id and digest == hashlib.sha256(body.encode()).hexdigest():
+                    continue
+                if self._embed_row(rowid, body):
+                    written += 1
+                if limit is not None and written >= limit:
+                    break
+        return written
 
     def missing_vector_count(self) -> int:
         with closing(sqlite3.connect(self.path)) as db:
