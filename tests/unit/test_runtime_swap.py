@@ -1,8 +1,10 @@
 """Runtime swap gates run against disposable files, never live listeners."""
 import json
+import hashlib
 import os
 import socket
 import subprocess
+import sys
 import threading
 import urllib.error
 from io import BytesIO
@@ -36,18 +38,37 @@ esac
 ''')
     precheck.chmod(0o755)
     fake_python = bin_dir / 'python3'
-    fake_python.write_text('#!/usr/bin/env bash\nprintf "called\\n" > "$SWAP_RUNTIME_MARKER"\n')
+    fake_python.write_text('''#!/usr/bin/env bash
+if [[ $1 == *swap_precheck_receipt.py ]]; then exec "$SWAP_REAL_PYTHON" "$@"; fi
+printf "called\\n" > "$SWAP_RUNTIME_MARKER"
+''')
     fake_python.chmod(0o755)
     precheck_marker = tmp_path / 'precheck.called'
     runtime_marker = tmp_path / 'runtime.called'
     env = {**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
            'AGENT_CREW_SWAP_PRECHECK': f'{precheck} --project',
+           'AGENT_CREW_SWAP_RECEIPT_DIR': str(tmp_path / 'receipts'),
+           'AGENT_CREW_SWAP_ACTOR': 'test-owner', 'SWAP_REAL_PYTHON': sys.executable,
            'SWAP_PRECHECK_MARKER': str(precheck_marker),
            'SWAP_RUNTIME_MARKER': str(runtime_marker)}
     script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
     result = subprocess.run(['bash', str(script), project, 'a' * 40, 'go'],
                             env=env, text=True, capture_output=True)
     assert precheck_marker.read_text().strip() == project
+    receipts = list((tmp_path / 'receipts').glob('*.json'))
+    assert len(receipts) == 1
+    receipt = json.loads(receipts[0].read_text())
+    assert receipt['project'] == project
+    assert receipt['target_sha'] == 'a' * 40
+    assert receipt['step'] == 'go'
+    assert receipt['actor'] == 'test-owner'
+    assert receipt['precheck_command'] == f'{precheck} --project {project}'
+    assert receipt['rc'] == (9 if hold_message else 0)
+    output = f'owner HOLD {hold_message}' if hold_message else 'owner FREE'
+    if project == 'ht-8004':
+        output = 'owner HOLD 13020/13619'
+    assert receipt['output_sha256'] == hashlib.sha256((output + '\n').encode()).hexdigest()
+    assert receipt['timestamp_utc'].endswith('Z')
     if hold_message:
         assert result.returncode != 0
         assert hold_message in result.stdout + result.stderr
@@ -62,10 +83,15 @@ def test_shell_precheck_requires_explicit_configuration(tmp_path, precheck, allo
     bin_dir = tmp_path / 'bin'
     bin_dir.mkdir()
     fake_python = bin_dir / 'python3'
-    fake_python.write_text('#!/usr/bin/env bash\nprintf "called\\n" > "$SWAP_RUNTIME_MARKER"\n')
+    fake_python.write_text('''#!/usr/bin/env bash
+if [[ $1 == *swap_precheck_receipt.py ]]; then exec "$SWAP_REAL_PYTHON" "$@"; fi
+printf "called\\n" > "$SWAP_RUNTIME_MARKER"
+''')
     fake_python.chmod(0o755)
     runtime_marker = tmp_path / 'runtime.called'
     env = {**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+           'AGENT_CREW_SWAP_RECEIPT_DIR': str(tmp_path / 'receipts'),
+           'SWAP_REAL_PYTHON': sys.executable,
            'SWAP_RUNTIME_MARKER': str(runtime_marker)}
     env.pop('AGENT_CREW_SWAP_PRECHECK', None)
     if precheck is not None:
@@ -77,6 +103,126 @@ def test_shell_precheck_requires_explicit_configuration(tmp_path, precheck, allo
     assert runtime_marker.exists() is allowed
     if not allowed:
         assert 'AGENT_CREW_SWAP_PRECHECK' in result.stdout + result.stderr
+        assert not (tmp_path / 'receipts').exists()
+    else:
+        receipt = json.loads(next((tmp_path / 'receipts').glob('*.json')).read_text())
+        assert receipt['precheck_command'] == 'none'
+        assert receipt['rc'] == 0
+        assert receipt['output_sha256'] == hashlib.sha256(b'').hexdigest()
+
+
+def test_shell_precheck_rc3_receipted_and_unwritable_receipt_refuses(tmp_path):
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    precheck = tmp_path / 'precheck'
+    precheck.write_text('#!/usr/bin/env bash\necho "owner HOLD"; exit 3\n')
+    precheck.chmod(0o755)
+    fake_python = tmp_path / 'python3'
+    fake_python.write_text('''#!/usr/bin/env bash
+if [[ $1 == *swap_precheck_receipt.py ]]; then exec "$SWAP_REAL_PYTHON" "$@"; fi
+printf called > "$SWAP_RUNTIME_MARKER"
+''')
+    fake_python.chmod(0o755)
+    marker = tmp_path / 'runtime.called'
+    env = {**os.environ, 'PATH': f'{tmp_path}:{os.environ["PATH"]}',
+           'AGENT_CREW_SWAP_PRECHECK': str(precheck),
+           'AGENT_CREW_SWAP_RECEIPT_DIR': str(tmp_path / 'receipts'),
+           'SWAP_REAL_PYTHON': sys.executable, 'SWAP_RUNTIME_MARKER': str(marker)}
+    args = ['bash', str(script), 'agent_crew', 'a' * 40, 'go']
+    result = subprocess.run(args, env=env, text=True, capture_output=True)
+    assert result.returncode == 3
+    assert 'owner HOLD' in result.stderr
+    receipt = json.loads(next((tmp_path / 'receipts').glob('*.json')).read_text())
+    assert receipt['rc'] == 3
+    assert receipt['output_sha256'] == hashlib.sha256(b'owner HOLD\n').hexdigest()
+    assert not marker.exists()
+
+    blocked = tmp_path / 'not-a-directory'
+    blocked.write_text('cannot create receipts here')
+    env['AGENT_CREW_SWAP_RECEIPT_DIR'] = str(blocked)
+    env['AGENT_CREW_SWAP_PRECHECK'] = 'none'
+    result = subprocess.run(args, env=env, text=True, capture_output=True)
+    assert result.returncode != 0
+    assert 'receipt' in result.stderr.lower()
+    assert not marker.exists()
+
+
+def test_shell_preserves_owner_hold_when_receipt_write_fails(tmp_path):
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    precheck = tmp_path / 'precheck'
+    precheck.write_text('#!/usr/bin/env bash\necho "owner HOLD 13024"; exit 9\n')
+    precheck.chmod(0o755)
+    blocked = tmp_path / 'not-a-directory'
+    blocked.write_text('cannot create receipts here')
+    result = subprocess.run(
+        ['bash', str(script), 'agent_crew', 'a' * 40, 'go'],
+        env={**os.environ, 'AGENT_CREW_SWAP_PRECHECK': str(precheck),
+             'AGENT_CREW_SWAP_RECEIPT_DIR': str(blocked)},
+        text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert 'owner HOLD 13024' in result.stderr
+    assert 'swap precheck refused agent_crew (rc=9)' in result.stderr
+    assert 'receipt could not be written' in result.stderr
+
+
+def test_shell_removes_precheck_output_before_successful_exec(tmp_path):
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake_python = bin_dir / 'python3'
+    fake_python.write_text('''#!/usr/bin/env bash
+if [[ $1 == *swap_precheck_receipt.py ]]; then exec "$SWAP_REAL_PYTHON" "$@"; fi
+exit 0
+''')
+    fake_python.chmod(0o755)
+    temp_dir = tmp_path / 'temporary'
+    temp_dir.mkdir()
+    result = subprocess.run(
+        ['bash', str(script), 'agent_crew', 'a' * 40, 'preflight'],
+        env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+             'TMPDIR': str(temp_dir), 'AGENT_CREW_SWAP_PRECHECK': 'none',
+             'AGENT_CREW_SWAP_RECEIPT_DIR': str(tmp_path / 'receipts'),
+             'SWAP_REAL_PYTHON': sys.executable},
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(temp_dir.iterdir()) == []
+
+
+def test_default_actor_records_only_parent_executable(monkeypatch):
+    import scripts.swap_precheck_receipt as receipt
+
+    monkeypatch.delenv('AGENT_CREW_SWAP_ACTOR', raising=False)
+    monkeypatch.setattr(receipt.getpass, 'getuser', lambda: 'worker')
+    monkeypatch.setattr(receipt.socket, 'gethostname', lambda: 'host')
+    monkeypatch.setattr(receipt.Path, 'read_bytes',
+                        lambda path: b'/usr/bin/bash\0-c\0secret=do-not-store\0')
+    assert receipt._actor(1234) == 'worker@host:1234 bash'
+
+
+def test_shell_precheck_default_receipt_dir_and_actor(tmp_path):
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    fake_python = tmp_path / 'python3'
+    fake_python.write_text('''#!/usr/bin/env bash
+if [[ $1 == *swap_precheck_receipt.py ]]; then exec "$SWAP_REAL_PYTHON" "$@"; fi
+printf called > "$SWAP_RUNTIME_MARKER"
+''')
+    fake_python.chmod(0o755)
+    marker = tmp_path / 'runtime.called'
+    env = {**os.environ, 'HOME': str(tmp_path),
+           'PATH': f'{tmp_path}:{os.environ["PATH"]}',
+           'AGENT_CREW_SWAP_PRECHECK': 'none',
+           'SWAP_REAL_PYTHON': sys.executable, 'SWAP_RUNTIME_MARKER': str(marker)}
+    env.pop('AGENT_CREW_SWAP_RECEIPT_DIR', None)
+    env.pop('AGENT_CREW_SWAP_ACTOR', None)
+    result = subprocess.run(['bash', str(script), 'agent_crew', 'a' * 40, 'preflight'],
+                            env=env, text=True, capture_output=True)
+    assert result.returncode == 0
+    assert marker.exists()
+    directory = tmp_path / '.agent_crew' / 'agent_crew' / 'swap-precheck-receipts'
+    receipt = json.loads(next(directory.glob('*.json')).read_text())
+    assert receipt['step'] == 'preflight'
+    assert '@' in receipt['actor'] and ':' in receipt['actor']
 
 
 def test_argument_parsing_rejects_short_sha_and_unknown_step():
