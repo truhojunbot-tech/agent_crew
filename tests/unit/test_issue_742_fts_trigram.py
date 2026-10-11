@@ -6,6 +6,21 @@ from agent_crew.memory_hybrid import HybridMemoryStorage, ensure_index_schema
 from agent_crew.memory_runtime import MemoryScope, SQLiteMemoryStorage
 
 
+def _seed_with_newer_noise(path, targets, noise=110, noise_body="unrelated"):
+    SQLiteMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        rows = [("episodic", key, json.dumps({"text": body}),
+                 json.dumps({"project": "agent_crew"}), 1, float(index))
+                for index, (key, body) in enumerate(targets, 1)]
+        rows += [("episodic", f"noise:{index:03}", json.dumps({"text": noise_body}),
+                  json.dumps({"project": "agent_crew"}), 1, float(index + 100))
+                 for index in range(noise)]
+        db.executemany(
+            "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+            "VALUES (?,?,?,?,?,?)", rows)
+        db.commit()
+
+
 def test_old_fts_rebuild_finds_korean_substring_and_keeps_short_and_id_queries(tmp_path):
     path = tmp_path / "memory.db"
     SQLiteMemoryStorage(str(path))
@@ -32,11 +47,64 @@ def test_old_fts_rebuild_finds_korean_substring_and_keeps_short_and_id_queries(t
         assert "owner:english:abc-2154" in {row[0] for row in db.execute(
             "SELECT key FROM adr001_fts WHERE adr001_fts MATCH 'english'")}
         store = HybridMemoryStorage(str(path))
+        ensure_index_schema(db)
+        assert db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0] == 2
+        # Recent-row padding alone must not make these assertions pass.
+        db.executemany(
+            "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+            "VALUES (?,?,?,?,?,?)",
+            [("episodic", f"noise:{index:03}", json.dumps({"text": "unrelated"}),
+              json.dumps({"project": "agent_crew"}), 1, float(index + 100))
+             for index in range(110)],
+        )
+        db.commit()
         scope = MemoryScope(project="agent_crew")
         assert "owner:quota:abc-2154" in {row["key"] for row in store._candidates(db, scope, "측정")}
         assert "owner:english:abc-2154" in {row["key"] for row in store._candidates(db, scope, "abc-2154")}
-        ensure_index_schema(db)
-        assert db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0] == 2
+
+
+def test_mixed_query_keeps_short_korean_terms_in_candidates(tmp_path):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:short", "토큰 한도 보호가 우선")])
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        keys = [row["key"] for row in store._candidates(
+            db, MemoryScope(project="agent_crew"), "토큰 한도 claude")]
+    assert "owner:short" in keys
+
+
+def test_mixed_query_reserves_long_term_lane_when_short_matches_fill_limit(tmp_path):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:long", "claude pipeline")],
+                           noise_body="토큰")
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        keys = [row["key"] for row in store._candidates(
+            db, MemoryScope(project="agent_crew"), "토큰 claude")]
+    assert "owner:long" in keys
+
+
+def test_short_queries_match_case_insensitive_body_and_key_before_recent_padding(tmp_path):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:body", "PR 751 merged after CI green"),
+                                  ("PR-751:owner", "merged and green")])
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        scope = MemoryScope(project="agent_crew")
+        ci_keys = [row["key"] for row in store._candidates(db, scope, "ci")]
+        pr_keys = [row["key"] for row in store._candidates(db, scope, "pr")]
+    assert "owner:body" in ci_keys
+    assert "PR-751:owner" in pr_keys
+
+
+def test_short_only_terms_rank_lexical_hit_ahead_of_recent_noise(tmp_path):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:short", "PR 751 merged after CI green")], noise=1)
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        candidates = store._candidates(db, MemoryScope(project="agent_crew"))
+    ranked, _ = store._rank_middle(candidates, "ci")
+    assert ranked[0]["key"] == "owner:short"
 
 
 def test_fts_definition_rebuild_rolls_back_as_one_unit(tmp_path):
