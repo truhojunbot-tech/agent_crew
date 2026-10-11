@@ -1,6 +1,27 @@
 {
   "byte_budget": 65536,
   "chosen_model_id": null,
+  "selection": {
+    "rerun_rule": "improve both owner and task recall over lexical_only and retrieve p95 <= 300 ms",
+    "rerun_choice": null,
+    "issue_676_literal_rule": "best eligible multilingual model with retrieve p95 <= 300 ms",
+    "issue_676_literal_choice_among_measured": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+    "english_only_control_excluded": "all-MiniLM-L6-v2",
+    "limitation": "BAAI/bge-m3 was not measured on the 2026-10-11 corpus"
+  },
+  "not_rerun_candidates": [
+    {
+      "model_id": "BAAI/bge-m3",
+      "reason": "2026-10-09 warm retrieve p95 exceeded the 300 ms gate; 2.3 GB model not warmed on the expanded 2026-10-11 corpus",
+      "historical_measurement_date": "2026-10-09",
+      "historical_corpus_rows": 4271,
+      "historical_owner_hits": 9,
+      "historical_task_hits": 0,
+      "historical_p95_embed_ms": 590.6,
+      "historical_p95_retrieve_ms": 685.6,
+      "historical_model_size_mb": 2284.6
+    }
+  ],
   "corpus_available_cases": {
     "owner_cases": 17,
     "task_cases": 12
