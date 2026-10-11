@@ -12,6 +12,8 @@ SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
 PUBLIC_IMPORT_ROOTS = {
     "agent_crew", "click", "cryptography", "fastapi", "httpx",
     "jsonschema", "mcp", "pydantic",
+    # Optional memory-hybrid extra: lazy imports; absent dependencies use lexical fallback.
+    "numpy", "onnxruntime", "tokenizers",
 }
 
 # Existing literals only. Keys are source file:line and the private marker;

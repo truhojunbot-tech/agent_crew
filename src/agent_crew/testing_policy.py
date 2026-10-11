@@ -224,6 +224,22 @@ def render_scope(scope: dict) -> str:
     return "\n".join(lines)
 
 
+def render_implementer_scope(scope: dict) -> str:
+    """Tell implementers how to report a pushed artifact under TARGETED scope."""
+    if scope["full_suite"]:
+        return ""
+    return (
+        "### Implementer test scope: TARGETED\n\n"
+        "Run the targeted tests for your change and report the targeted counts. "
+        "A full-suite acceptance criterion in the issue is verified by the "
+        "coordinator/CI at pre-merge, not by the implementer in this turn. "
+        "If targeted tests pass and the work is pushed, post status=completed "
+        "and include this exact line in the summary: "
+        "full suite: not run here (coordinator/CI verifies pre-merge). "
+        "Never post failed solely because the full suite was not verified here.\n"
+    )
+
+
 # ── the lock ──────────────────────────────────────────────────────────
 
 

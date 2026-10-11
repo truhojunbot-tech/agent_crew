@@ -1,6 +1,20 @@
+import json
+import re
+
 import pytest
 
 from agent_crew.instructions import ROLE_FILES, generate
+from agent_crew.queue import validate_http_root_risk
+
+
+@pytest.mark.parametrize("role", ["implementer", "reviewer"])
+def test_delegation_template_declares_valid_http_root_risk(role):
+    content = generate(role, "myproject", 8123, delivery="dispatcher")
+    contexts = re.findall(r'"context": (\{[^\n]*\})', content)
+    assert contexts
+    context = json.loads(contexts[-1].replace("<n>", "684"))
+    validate_http_root_risk(context)
+    assert "X-Agent-Crew-Project: myproject" in content
 
 
 @pytest.mark.parametrize("delivery", ["dispatcher", "mcp", "push", "both"])

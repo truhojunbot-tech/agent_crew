@@ -78,7 +78,8 @@ def migrate(path: Path, *, apply: bool = False) -> dict:
                 # rewrite preserves verified text/text_sha256 and only changes
                 # project scopes, owner keys, and supersedes links atomically.
                 db.execute("DELETE FROM adr001_memory WHERE layer='authoritative'")
-                db.executemany("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)", planned)
+                db.executemany("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                               "VALUES (?,?,?,?,?,?)", planned)
                 db.commit()
                 committed = True
             except Exception:

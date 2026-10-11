@@ -53,6 +53,15 @@ def test_every_mutating_github_function_is_covered():
     )
 
 
+def test_closure_actor_events_get_is_read_only_but_api_writes_stay_blocked():
+    from tests.conftest import _gh_write_argv
+
+    read = ["gh", "api", "--paginate", "repos/owner/repo/issues/123/events",
+            "--jq", '.[] | select(.event=="closed") | .actor.login']
+    assert not _gh_write_argv(read)
+    assert _gh_write_argv(["gh", "api", "-X", "POST", "repos/owner/repo/issues/123/events"])
+
+
 @pytest.mark.parametrize("fn_name", GITHUB_WRITE_FUNCTIONS)
 def test_calling_a_write_function_from_a_test_raises(fn_name, github_writes_recorder):
     """★The guard itself: each blocked function refuses and names itself.

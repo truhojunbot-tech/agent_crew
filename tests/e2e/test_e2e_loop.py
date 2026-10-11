@@ -104,6 +104,8 @@ def _wait_for_pending_stage(db_path: str, task_type: str, *, prev_task_id: str =
 
 def _start_cli(args: list[str]):
     """Invoke CLI in a daemon thread. Returns (thread, result_holder)."""
+    if args and args[0] == "run":
+        args = [*args, "--risk-tier", "1"]
     runner = CliRunner()
     holder: list = [None]
 

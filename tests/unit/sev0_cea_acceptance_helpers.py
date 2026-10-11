@@ -109,7 +109,8 @@ def queue_for(tmp_path, state: AuthorityState, *, name: str, mode: str = "test",
 def task(task_id="t1", *, task_type="implement", context=None, project="agent_crew",
          description="add a --json flag", branch="main") -> TaskRequest:
     return TaskRequest(task_id=task_id, task_type=task_type, description=description,
-                       branch=branch, priority=3, context=dict(context or {}), project=project)
+                       branch=branch, priority=3,
+                       context={"risk_tier": 1, **(context or {})}, project=project)
 
 
 def receipt_by_id(q: TaskQueue, receipt_id: str) -> Optional[dict]:

@@ -60,6 +60,8 @@ DISPATCH_CHANNEL = "claude_cloud"
 
 _ENV_ENABLED = "AGENT_CREW_CLOUD_ENABLED"
 _ENV_MAX_CONCURRENCY = "AGENT_CREW_CLOUD_MAX_CONCURRENCY"
+_ENV_MAX_PER_DAY = "AGENT_CREW_CLOUD_MAX_PER_DAY"
+_ENV_SHADOW = "AGENT_CREW_CLOUD_SHADOW"
 _ENV_CLI_PATH = "AGENT_CREW_CLOUD_CLI_PATH"
 DEFAULT_MAX_CONCURRENCY = 3
 _TRUE_VALUES = {"1", "true", "yes", "on"}
@@ -70,6 +72,10 @@ def cloud_dispatch_enabled() -> bool:
     ``risk_tier.risk_tier_enforcement_enabled`` (read at call time, never
     cached at import time, so a live config flip takes effect immediately)."""
     return (os.getenv(_ENV_ENABLED, "") or "").strip().lower() in _TRUE_VALUES
+
+
+def cloud_shadow_enabled() -> bool:
+    return cloud_dispatch_enabled() and (os.getenv(_ENV_SHADOW, "") or "").strip().lower() in _TRUE_VALUES
 
 
 def cloud_max_concurrency() -> int:
@@ -89,6 +95,22 @@ def cloud_max_concurrency() -> int:
         logger.warning("claude_cloud: %s=%d must be positive, using default %d",
                         _ENV_MAX_CONCURRENCY, value, DEFAULT_MAX_CONCURRENCY)
         return DEFAULT_MAX_CONCURRENCY
+    return value
+
+
+def cloud_max_per_day() -> Optional[int]:
+    """Optional UTC-day launch cap; unset means no daily cap."""
+    raw = (os.getenv(_ENV_MAX_PER_DAY) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        logger.warning("claude_cloud: invalid %s=%r, ignoring daily cap",
+                       _ENV_MAX_PER_DAY, raw)
+        return None
     return value
 
 
@@ -263,6 +285,30 @@ def build_cloud_task_prompt(task: TaskRequest, *, repo: str = "") -> str:
     GitHub (``reconcile_cloud_dispatch``), never by the session calling back
     in.
     """
+    if task.task_type == "review":
+        context = task.context if isinstance(task.context, dict) else {}
+        pr_number = context.get("pr_number") or task.pr_number
+        reviewed_sha = context.get("reviewed_sha") or ""
+        return "\n".join([
+            f"Review Agent Crew task {task.task_id}.",
+            f"Repository: {repo}",
+            f"PR: #{pr_number}",
+            f"reviewed_sha {reviewed_sha}",
+            "Description:", task.description,
+            "Check out the exact reviewed_sha above, verify HEAD equals it, review the diff, "
+            "and run the relevant tests. Post exactly ONE PR comment using "
+            "gh pr comment (not gh pr review --comment) whose first line is "
+            "[agent_crew review] verdict: approve|request_changes (choose one).",
+            f"Include a line: reviewed_sha {reviewed_sha}",
+            "For request_changes, list actionable findings as "
+            "- HIGH|MED|LOW path:line - text. Every finding needs a verified "
+            "path and line number; do not invent one. If a blocker cannot be "
+            "anchored to a line, do not post a marked verdict; let local review "
+            "handle it. For approve, include no findings. Put test notes in "
+            "plain prose, with no other '- ' lines.",
+            f"Include the exact marker line: <!-- agent_crew:cloud-review task={task.task_id} sha={reviewed_sha} -->",
+            "No push, no merge, no GitHub review-state approval, and no file changes.",
+        ])
     lines = [f"Implement Agent Crew task {task.task_id} ({task.task_type})."]
     if repo:
         lines.append(f"Repository: {repo}. Work only inside this repository.")
@@ -362,6 +408,9 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     gets a chance to reroute it — never a new fallback policy (acceptance
     test 8)."""
     logger.warning("claude_cloud: dispatch failed closed for %s — %s", task.task_id, reason)
+    if (task.context or {}).get("cloud_session_id") or queue.get_task_context(task.task_id).get("cloud_session_id"):
+        queue.patch_context(task.task_id, {"cloud_ended_at": time.time(),
+                                           "cloud_terminal_error": reason})
     queue.force_fail(task.task_id, reason)
     result = TaskResult(task_id=task.task_id, status="failed", summary=reason[:2000])
     try:
@@ -370,6 +419,44 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     except Exception:
         logger.exception("claude_cloud: fallback failed for %s", task.task_id)
     return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason)
+
+
+def _claimable_cloud_reviews(queue: TaskQueue) -> list[TaskRequest]:
+    now = time.time()
+
+    def claimable(task: TaskRequest) -> bool:
+        context = task.context if isinstance(task.context, dict) else {}
+        if task.task_type != "review" or context.get("agent_override") not in (None, CLOUD_PROVIDER_NAME):
+            return False
+        try:
+            return float(context.get("push_not_before") or 0) <= now
+        except (TypeError, ValueError):
+            return False
+
+    return [task for task in queue.list_tasks(status="pending") if claimable(task)]
+
+
+def cloud_review_skip_ids(queue: TaskQueue) -> set[str]:
+    """Prefer the largest claimable review within the highest priority."""
+    pending = _claimable_cloud_reviews(queue)
+    if not pending:
+        return set()
+
+    def size(task: TaskRequest) -> int:
+        context = task.context if isinstance(task.context, dict) else {}
+        diff = next((context.get(key) for key in
+                     ("diff_bytes", "review_diff_bytes", "diff_size")
+                     if isinstance(context.get(key), int) and context.get(key) >= 0), None)
+        context_size = len(str(context.get("instructions") or "")) + len(task.description)
+        return max(diff or 0, context_size)
+
+    best_priority = min(task.priority for task in pending)
+    largest = max((task for task in pending if task.priority == best_priority), key=size)
+    return {task.task_id for task in pending if task.task_id != largest.task_id}
+
+
+_DISPATCH_PROBE_CACHE: dict[tuple[RunFn, str], tuple[float, CloudCapability]] = {}
+_DISPATCH_PROBE_WARNING_AT: dict[str, float] = {}
 
 
 def dispatch_cloud_for_role(
@@ -388,19 +475,43 @@ def dispatch_cloud_for_role(
     if not cloud_dispatch_enabled():
         return CloudDispatchOutcome(False, skipped_reason="disabled")
 
+    if task_type == "review" and not _claimable_cloud_reviews(queue):
+        return CloudDispatchOutcome(False, skipped_reason="no_task")
+
     in_flight = queue.count_in_progress_by_dispatch_channel(DISPATCH_CHANNEL)
     if in_flight >= cloud_max_concurrency():
         logger.debug("claude_cloud: at capacity (%d/%d) — skipping role=%s",
                      in_flight, cloud_max_concurrency(), role)
         return CloudDispatchOutcome(False, skipped_reason="at_capacity")
 
+    if task_type == "review":
+        daily_cap = cloud_max_per_day()
+        if daily_cap is not None:
+            day_start = int(time.time() // 86400) * 86400
+            if queue.count_cloud_reviews_started_since(day_start) >= daily_cap:
+                logger.info("claude_cloud: daily review cap %d reached; local fallback", daily_cap)
+                return CloudDispatchOutcome(False, skipped_reason="daily_cap")
+
     run = run_fn or _default_run
-    capability = probe_cloud_cli(run, cli_path=cli_path)
+    probe_key = (run, cli_path or cloud_cli_path())
+    cached = _DISPATCH_PROBE_CACHE.get(probe_key) if run_fn is None else None
+    if cached and time.monotonic() - cached[0] < 60:
+        capability = cached[1]
+    else:
+        capability = probe_cloud_cli(run, cli_path=cli_path)
+        if run_fn is None:
+            _DISPATCH_PROBE_CACHE[probe_key] = (time.monotonic(), capability)
     if not capability.supported:
-        logger.warning("claude_cloud: CLI capability probe failed — %s", capability.reason)
+        warning_key = f"{probe_key[1]}:{capability.reason}"
+        now = time.monotonic()
+        if now - _DISPATCH_PROBE_WARNING_AT.get(warning_key, float("-inf")) >= 60:
+            logger.warning("claude_cloud: CLI capability probe failed — %s", capability.reason)
+            _DISPATCH_PROBE_WARNING_AT[warning_key] = now
         return CloudDispatchOutcome(False, skipped_reason=f"cli_unsupported:{capability.reason}")
 
-    task = queue.dequeue(role=role, claimed_via="cloud_push", skip_deferred=True)
+    task = queue.dequeue(agent=CLOUD_PROVIDER_NAME, role=role,
+                         claimed_via="cloud_push", skip_deferred=True,
+                         skip_task_ids=cloud_review_skip_ids(queue) if task_type == "review" else None)
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
 
@@ -413,8 +524,20 @@ def dispatch_cloud_for_role(
         logger.warning("claude_cloud: dispatch refused for %s — %s", task.task_id, exc)
         return CloudDispatchOutcome(False, task_id=task.task_id, skipped_reason="admission_refused")
 
+    if task.task_type == "review":
+        context = task.context if isinstance(task.context, dict) else {}
+        sha = context.get("reviewed_sha")
+        pr = context.get("pr_number") or task.pr_number
+        if (not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", sha)
+                or not isinstance(pr, int) or isinstance(pr, bool) or pr <= 0):
+            return _fail_closed_dispatch(queue, task, task_type,
+                                         "cloud_review_missing_pinned_pr_or_sha")
+
     resume_session_id = _resolve_resume_session_id(queue, task)
     effective_repo = _resolve_task_repo(task, repo)
+    if task.task_type == "review" and not effective_repo:
+        return _fail_closed_dispatch(queue, task, task_type,
+                                     "cloud_review_repo_unresolved")
     prompt = build_cloud_task_prompt(task, repo=effective_repo)
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(prompt, cli_path=cli_path))
@@ -442,14 +565,17 @@ def dispatch_cloud_for_role(
     if isinstance(task.context, dict):
         prev = task.context.get("prev_task_id")
         prev_task_id = prev if isinstance(prev, str) else ""
+    launched_at = time.time()
     queue.record_attribution(
         task_id=task.task_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
         role=role, task_type=task.task_type, worktree_path="", git_branch=task.branch or "",
         status="in_progress", provider_session_id=launch.session_id or "",
-        previous_task_id=prev_task_id, started_at=time.time(),
+        previous_task_id=prev_task_id, started_at=launched_at,
     )
     queue.patch_context(task.task_id, {
         "cloud_session_url": launch.session_url,
+        "cloud_session_id": launch.session_id,
+        "cloud_launched_at": launched_at,
         "execution_policy": execution_policy,
     })
     queue.set_push_at(task.task_id, pane_id=f"cloud:{launch.session_id}")
@@ -457,6 +583,100 @@ def dispatch_cloud_for_role(
                 task.task_id, launch.session_id, launch.session_url)
     return CloudDispatchOutcome(True, task_id=task.task_id, session_id=launch.session_id,
                                 session_url=launch.session_url)
+
+
+def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optional[RunFn] = None) -> bool:
+    """Launch a comparison review without claiming or completing the local task."""
+    if not cloud_shadow_enabled() or task.task_type != "review":
+        return False
+    current = queue.get_task_context(task.task_id)
+    if current.get("cloud_shadow_launch_reserved_at") or current.get("cloud_shadow_session_id"):
+        return False
+    shadow_active = sum(1 for row in queue.list_tasks()
+                        if (row.context or {}).get("cloud_shadow_session_id")
+                        and not (row.context or {}).get("cloud_shadow_ended_at"))
+    if shadow_active + queue.count_in_progress_by_dispatch_channel(DISPATCH_CHANNEL) >= cloud_max_concurrency():
+        return False
+    daily_cap = cloud_max_per_day()
+    if daily_cap is not None:
+        day_start = int(time.time() // 86400) * 86400
+        if queue.count_cloud_reviews_started_since(day_start) >= daily_cap:
+            return False
+    context = task.context if isinstance(task.context, dict) else {}
+    if not isinstance(context.get("pr_number") or task.pr_number, int) or not re.fullmatch(
+            r"[0-9a-fA-F]{40}", str(context.get("reviewed_sha") or "")):
+        return False
+    run = run_fn or _default_run
+    if not probe_cloud_cli(run).supported:
+        return False
+    repo = _resolve_task_repo(task, None)
+    if not repo:
+        return False
+    if not queue.reserve_cloud_shadow_launch(task.task_id):
+        return False
+    try:
+        proc = run(build_launch_argv(build_cloud_task_prompt(task, repo=repo)))
+        launch = parse_cloud_launch_output(proc.stdout or "") if proc.returncode == 0 else None
+    except Exception:
+        logger.exception("claude_cloud: shadow launch failed for %s", task.task_id)
+        queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
+                                           "cloud_shadow_ended_at": time.time()})
+        return False
+    if not launch or not launch.dispatched:
+        queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
+                                           "cloud_shadow_ended_at": time.time()})
+        return False
+    queue.patch_context(task.task_id, {
+        "cloud_shadow_session_id": launch.session_id,
+        "cloud_shadow_session_url": launch.session_url,
+        "cloud_shadow_launched_at": time.time(),
+        "cloud_shadow_status": "in_progress",
+    })
+    return True
+
+
+def reconcile_shadow_reviews(queue: TaskQueue, *, pr_comments_fn=None) -> None:
+    """Record comparison verdicts in task context; never submit a result."""
+    comments_for_pr = pr_comments_fn or _github.pr_comments
+    for task in queue.list_tasks():
+        context = task.context if isinstance(task.context, dict) else {}
+        if not context.get("cloud_shadow_session_id"):
+            continue
+        result = queue.get_result(task.task_id)
+        if result and result.verdict and not context.get("cloud_shadow_local_verdict"):
+            queue.patch_context(task.task_id, {"cloud_shadow_local_verdict": result.verdict})
+        if context.get("cloud_shadow_ended_at"):
+            continue
+        pr = context.get("pr_number") or task.pr_number
+        sha = context.get("reviewed_sha") or ""
+        try:
+            comments = comments_for_pr(pr, repo=_resolve_task_repo(task, None)) or []
+            marker = f"<!-- agent_crew:cloud-review task={task.task_id} "
+            matches = [str(row.get("body") or "") for row in comments
+                       if isinstance(row, dict) and marker in str(row.get("body") or "")]
+            if matches:
+                if len(matches) != 1:
+                    raise ValueError("multiple marked comments")
+                review = parse_cloud_review_comment(matches[0], task_id=task.task_id,
+                                                    reviewed_sha=sha, pr_number=pr)
+                queue.patch_context(task.task_id, {
+                    "cloud_shadow_status": "completed",
+                    "cloud_shadow_verdict": review.verdict,
+                    "cloud_shadow_findings": review.findings,
+                    "cloud_shadow_ended_at": time.time(),
+                })
+                continue
+        except ValueError as exc:
+            queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
+                                              "cloud_shadow_error": str(exc),
+                                              "cloud_shadow_ended_at": time.time()})
+            continue
+        except Exception:
+            logger.exception("claude_cloud: shadow reconciliation failed for %s", task.task_id)
+        if time.time() - float(context.get("cloud_shadow_launched_at") or 0) > cloud_stale_seconds():
+            queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
+                                              "cloud_shadow_error": "stale: no marked review",
+                                              "cloud_shadow_ended_at": time.time()})
 
 
 # ---------------------------------------------------------------------------
@@ -502,10 +722,110 @@ class CloudReconciliationOutcome:
     detail: str = ""
 
 
+_REVIEW_MARKER_RE = re.compile(
+    r"<!-- agent_crew:cloud-review task=([^\s>]+) sha=([^\s>]+) -->")
+_REVIEW_VERDICT_RE = re.compile(
+    r"\A\[agent_crew review\] verdict: (approve|request_changes)\s*$")
+_REVIEW_FINDING_RE = re.compile(
+    r"^- (HIGH|MED|LOW) ([^\s:]+):(\d+) - (.+)$")
+
+
+def parse_cloud_review_comment(body: str, *, task_id: str, reviewed_sha: str,
+                               pr_number: int) -> TaskResult:
+    """Accept one pinned, actionable cloud review comment or raise ValueError."""
+    markers = _REVIEW_MARKER_RE.findall(body)
+    if markers != [(task_id, reviewed_sha)]:
+        raise ValueError("cloud review marker task/SHA mismatch or ambiguity")
+    lines = body.splitlines()
+    if not lines:
+        raise ValueError("cloud review comment is empty")
+    verdict_match = _REVIEW_VERDICT_RE.fullmatch(lines[0])
+    if verdict_match is None:
+        raise ValueError("cloud review verdict line is malformed")
+    sha_lines = [line for line in lines if line.startswith("reviewed_sha ")]
+    if sha_lines != [f"reviewed_sha {reviewed_sha}"]:
+        raise ValueError("cloud review reviewed_sha line does not match")
+    findings = []
+    for line in lines[1:]:
+        if line.startswith("- "):
+            if _REVIEW_FINDING_RE.fullmatch(line) is None:
+                raise ValueError("cloud review finding is malformed")
+            findings.append(line[2:])
+    verdict = verdict_match.group(1)
+    if (verdict == "approve" and findings) or (verdict == "request_changes" and not findings):
+        raise ValueError("cloud review verdict/findings disagree")
+    return TaskResult(task_id=task_id, status="completed", verdict=verdict,
+                      summary=f"Cloud review of PR #{pr_number} at {reviewed_sha}: " +
+                              "\n".join(line for line in lines[1:] if not line.startswith("<!--"))[:3500],
+                      findings=findings, pr_number=pr_number)
+
+
+def _reconcile_cloud_review(
+    queue: TaskQueue, task: TaskRequest, *, repo: str,
+    pr_comments_fn, submit_review_result_fn,
+) -> CloudReconciliationOutcome:
+    context = task.context if isinstance(task.context, dict) else {}
+    pr_number = context.get("pr_number") or task.pr_number
+    reviewed_sha = context.get("reviewed_sha") or ""
+    retry_detail = ""
+    if (not isinstance(pr_number, int) or isinstance(pr_number, bool) or pr_number <= 0
+            or not isinstance(reviewed_sha, str)
+            or not re.fullmatch(r"[0-9a-fA-F]{40}", reviewed_sha)):
+        _fail_closed_dispatch(queue, task, "review", "cloud_review_missing_pinned_pr_or_sha")
+        return CloudReconciliationOutcome(task.task_id, "failed", detail="missing pinned PR/SHA")
+    comments = pr_comments_fn(pr_number, repo=repo)
+    if comments is not None:
+        prefix = f"<!-- agent_crew:cloud-review task={task.task_id} "
+        matches = [c.get("body", "") for c in comments if isinstance(c, dict)
+                   and prefix in str(c.get("body") or "")]
+        if matches:
+            try:
+                if len(matches) != 1:
+                    raise ValueError("multiple cloud review comments for task")
+                result = parse_cloud_review_comment(
+                    matches[0], task_id=task.task_id, reviewed_sha=reviewed_sha,
+                    pr_number=pr_number)
+            except ValueError as exc:
+                _fail_closed_dispatch(queue, task, "review", f"cloud_review_invalid_comment: {exc}")
+                return CloudReconciliationOutcome(task.task_id, "failed", pr_number=pr_number,
+                                                  detail=str(exc))
+            if submit_review_result_fn is None:
+                retry_detail = "result handler unavailable"
+            else:
+                # The server's normal result handler consumes this flag to avoid
+                # reposting the cloud session's already published review comment.
+                queue.patch_context(task.task_id, {"cloud_review_comment_confirmed": True})
+                try:
+                    acknowledgement = submit_review_result_fn(task.task_id, result)
+                except Exception:
+                    logger.exception("claude_cloud: review result handler failed for %s", task.task_id)
+                    retry_detail = "result handler failed; will retry"
+                else:
+                    if isinstance(acknowledgement, dict) and acknowledgement.get("held"):
+                        retry_detail = f"result held: {acknowledgement['held']}"
+                    else:
+                        queue.patch_context(task.task_id, {
+                            "cloud_ended_at": time.time(),
+                            "cloud_review_verdict": result.verdict,
+                            "cloud_review_findings": result.findings,
+                        })
+                        return CloudReconciliationOutcome(task.task_id, "review_completed",
+                                                          pr_number=pr_number)
+    age = time.time() - queue.get_dispatched_at(task.task_id)
+    if age > cloud_stale_seconds():
+        _fail_closed_dispatch(queue, task, "review",
+                              f"cloud_review_stale: {retry_detail or 'no marked comment'} "
+                              f"after {int(age)}s")
+        return CloudReconciliationOutcome(task.task_id, "failed", pr_number=pr_number,
+                                          detail="stale cloud review")
+    return CloudReconciliationOutcome(task.task_id, "still_dispatched", pr_number=pr_number,
+                                      detail=retry_detail)
+
+
 def reconcile_cloud_dispatch(
     queue: TaskQueue, task: TaskRequest, *, repo: Optional[str] = None,
     pr_number_for_branch_fn=None, pr_head_sha_fn=None, commit_message_fn=None,
-    pr_state_fn=None,
+    pr_state_fn=None, pr_comments_fn=None, submit_review_result_fn=None,
 ) -> CloudReconciliationOutcome:
     """GitHub-only completion detection for one dispatched cloud task.
 
@@ -549,10 +869,6 @@ def reconcile_cloud_dispatch(
     commit_message_fn = commit_message_fn or _github.branch_head_commit_message
     pr_state_fn = pr_state_fn or _github.pr_state
 
-    branch = task.branch or ""
-    if not branch:
-        return CloudReconciliationOutcome(task.task_id, "unknown_outcome", detail="no branch on task")
-
     # #499 r1 HIGH: resolve THIS task's own repo (context["repo"], the same
     # key dispatch already reads via `_resolve_task_repo`) before any GitHub
     # lookup. `reconcile_all_cloud_tasks` reconciles a batch of tasks that
@@ -561,6 +877,17 @@ def reconcile_cloud_dispatch(
     # which can name a different repository than the task's — silently
     # missing the real PR or matching one in the wrong repo entirely.
     effective_repo = _resolve_task_repo(task, repo)
+
+    if task.task_type == "review":
+        return _reconcile_cloud_review(
+            queue, task, repo=effective_repo,
+            pr_comments_fn=pr_comments_fn or _github.pr_comments,
+            submit_review_result_fn=submit_review_result_fn,
+        )
+
+    branch = task.branch or ""
+    if not branch:
+        return CloudReconciliationOutcome(task.task_id, "unknown_outcome", detail="no branch on task")
 
     pr_number = pr_number_for_branch_fn(branch, repo=effective_repo)
     if pr_number:
@@ -631,7 +958,8 @@ def reconcile_cloud_dispatch(
     return CloudReconciliationOutcome(task.task_id, action, detail=detail)
 
 
-def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None
+def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None,
+                              submit_review_result_fn=None,
                               ) -> List[CloudReconciliationOutcome]:
     """Reconcile every currently in_progress ``claude_cloud`` dispatch.
 
@@ -646,4 +974,6 @@ def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None
     would silently apply the dispatcher's own cwd to every task instead.
     """
     tasks = queue.list_in_progress_by_dispatch_channel(DISPATCH_CHANNEL)
-    return [reconcile_cloud_dispatch(queue, t, repo=repo) for t in tasks]
+    return [reconcile_cloud_dispatch(queue, t, repo=repo,
+                                     submit_review_result_fn=submit_review_result_fn)
+            for t in tasks]

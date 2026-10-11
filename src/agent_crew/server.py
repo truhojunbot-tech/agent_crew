@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import hashlib
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -28,13 +29,15 @@ from agent_crew import claude_transcript as _claude_transcript
 from agent_crew.anomaly import check_wrong_repo
 from agent_crew import context_pack as _cpack
 from agent_crew.memory import (
+    MemoryItem,
     MemoryProvider,
     MemoryRequest,
+    MemoryResult,
     NullMemoryProvider,
     shadow_retrieve_bounded,
     shadow_telemetry,
 )
-from agent_crew.memory_capture import capture_result_best_effort, task_lineage
+from agent_crew.memory_capture import capture_result_best_effort, capture_merge_best_effort, task_lineage
 from agent_crew.memory_runtime import (SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS,
                                        SHADOW_RETRIEVAL_MAX_ROWS,
                                        SQLiteMemoryStorage, MemoryScope,
@@ -78,6 +81,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               LateResultRejected,
                               TaskAlreadyExistsError,
                               TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              validate_http_root_risk,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
                               RequestSqliteTiming, request_sqlite_timing)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -784,10 +788,33 @@ def _stash_dirty_worktree(worktree_path: str, task_id: str) -> Optional[str]:
             ["git", "-C", worktree_path, "rev-parse", "-q", "--verify", "refs/stash"],
             capture_output=True, text=True, timeout=15,
         ).stdout.strip()
-        if push.returncode != 0 or not after or after == before:
+        ignored_warning_only = ("ignored" in (push.stderr or "").lower()
+                                and not re.search(r"(?im)^\s*(?:fatal|error):", push.stderr or ""))
+        if not after or after == before or (push.returncode != 0 and not ignored_warning_only):
             logger.warning("stash of dirty worktree %s for task=%s failed: %s",
                            worktree_path, task_id, push.stderr.strip())
             return None
+        if push.returncode != 0:
+            # Git can save the stash before failing to remove an ignored path.
+            # Clear only paths that were included in the stash, then verify.
+            for command in (
+                ["git", "-C", worktree_path, "restore", "--source=HEAD",
+                 "--staged", "--worktree", *pathspec],
+                ["git", "-C", worktree_path, "clean", "-fd", *pathspec],
+            ):
+                cleanup = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                if cleanup.returncode != 0:
+                    logger.warning("could not clear stashed worktree %s for task=%s: %s",
+                                   worktree_path, task_id, cleanup.stderr.strip())
+                    return None
+            remaining = subprocess.run(
+                ["git", "-C", worktree_path, "status", "--porcelain", *pathspec],
+                capture_output=True, text=True, timeout=30,
+            )
+            if remaining.returncode != 0 or remaining.stdout.strip():
+                logger.warning("stashed worktree %s remains dirty for task=%s",
+                               worktree_path, task_id)
+                return None
         logger.warning("preserved uncommitted work of task=%s in %s as stash %s",
                        task_id, worktree_path, after)
         return after
@@ -1289,6 +1316,8 @@ def _detect_transient_error_in_log(
     log_path: str,
     tail_bytes: int = 16384,
     since_offset: int = 0,
+    *,
+    agent: str,
 ) -> Optional[str]:
     """Scan the tail of a dispatch log for upstream errors worth distinguishing.
 
@@ -1329,31 +1358,57 @@ def _detect_transient_error_in_log(
             f.seek(0, 2)
             size = f.tell()
             start = max(0, size - tail_bytes, since_offset)
+            starts_mid_line = False
+            if agent == "codex" and start > 0 and start < size:
+                f.seek(start - 1)
+                starts_mid_line = f.read(1) != b"\n"
             f.seek(min(start, size))
-            tail = f.read().decode("utf-8", errors="replace")
+            raw_tail = f.read()
+            if starts_mid_line:
+                raw_tail = raw_tail.partition(b"\n")[2]
+            tail = raw_tail.decode("utf-8", errors="replace")
     except OSError:
         return None
+    if agent == "codex":
+        # Stream JSON echoes commands and agent prose. Only error events are
+        # provider diagnostics; retain plain stderr lines as before.
+        filtered = []
+        for line in tail.splitlines():
+            try:
+                event = json.loads(line)
+            except (TypeError, ValueError):
+                if not line.lstrip().startswith(("{", "[")):
+                    filtered.append(line)
+            else:
+                if isinstance(event, dict):
+                    item = event.get("item")
+                    if event.get("type") == "error":
+                        filtered.append(json.dumps(event))
+                    elif (isinstance(item, dict)
+                          and item.get("type") in ("error", "error_message")):
+                        filtered.append(json.dumps(item))
+        tail = "\n".join(filtered)
     # Order matters: more specific markers first (QUOTA before RESOURCE since
     # QUOTA_EXHAUSTED responses also contain "RESOURCE_EXHAUSTED").
-    if "QUOTA_EXHAUSTED" in tail or "Your quota will reset" in tail:
+    if agent == "gemini" and ("QUOTA_EXHAUSTED" in tail or "Your quota will reset" in tail):
         return "gemini_quota_exhausted"
-    if "IneligibleTierError" in tail:
+    if agent == "gemini" and ("IneligibleTierError" in tail):
         return "gemini_ineligible_tier"
-    if "Individual quota reached" in tail:
+    if agent in ("gemini", "agy") and ("Individual quota reached" in tail):
         return "agy_quota_exhausted"
-    if '"api_error_status":429' in tail:
+    if agent == "claude" and ('"api_error_status":429' in tail):
         return "claude_429"
-    if "Server is temporarily limiting requests" in tail:
+    if agent == "claude" and ("Server is temporarily limiting requests" in tail):
         return "claude_throttle"
-    if "MODEL_CAPACITY_EXHAUSTED" in tail:
+    if agent == "gemini" and ("MODEL_CAPACITY_EXHAUSTED" in tail):
         return "gemini_capacity"
-    if "RESOURCE_EXHAUSTED" in tail:
+    if agent == "gemini" and ("RESOURCE_EXHAUSTED" in tail):
         return "gemini_resource_exhausted"
-    if "Selected model is at capacity" in tail:
+    if agent == "codex" and ("Selected model is at capacity" in tail):
         return "codex_capacity"
-    if "Error: timeout waiting for response" in tail:
+    if agent in ("gemini", "agy") and ("Error: timeout waiting for response" in tail):
         return "agy_timeout"
-    if "subscriber fell behind updates" in tail:
+    if agent in ("gemini", "agy") and ("subscriber fell behind updates" in tail):
         return "agy_subscriber_lag"
     return None
 
@@ -3058,6 +3113,36 @@ def create_app(
             if shadow_db:
                 logger.warning("AGENT_CREW_SHADOW_MEMORY_DB does not name an existing file: %s", shadow_db)
             _memory_provider = NullMemoryProvider()
+    _ranked_memory = None
+    _ranked_startup_fallback_count = 0
+    if os.getenv("AGENT_CREW_MEMORY_BACKEND", "").strip().lower() == "hybrid":
+        from agent_crew.memory_hybrid import HybridMemoryStorage, backup_daily
+        ranked_db = (os.getenv("AGENT_CREW_MEMORY_DB") or
+                     os.getenv("AGENT_CREW_SHADOW_MEMORY_DB") or "").strip()
+        if ranked_db and os.path.isfile(os.path.expanduser(ranked_db)):
+            try:
+                _ranked_memory = HybridMemoryStorage(os.path.expanduser(ranked_db))
+                backup_daily(_ranked_memory.path)
+            except (OSError, ValueError, sqlite3.Error) as exc:
+                logger.warning("hybrid memory unavailable: %s", exc)
+                _ranked_startup_fallback_count += 1
+
+    def _ranked_timeout_response(scope, marker, response_state):
+        """Return only effective head rows when the ranked worker times out."""
+        _ranked_memory._record_fallback(marker)
+        try:
+            rows = _ranked_memory.effective_rows(
+                list((response_state.get("head") or {}).get("records", [])), scope)
+        except sqlite3.Error:
+            rows = []
+        rendered = json.dumps(rows, sort_keys=True, ensure_ascii=False).encode()
+        return {"head": rows, "middle": [], "mode": "fallback",
+                "pending_vectors": response_state.get("pending", 0),
+                "latency_ms": 300.0, "trimmed_bytes": 0,
+                "standing_trimmed": (response_state.get("head") or {}).get("standing_trimmed", 0),
+                "model_id": _ranked_memory.model_id,
+                "head_hash": hashlib.sha256(rendered).hexdigest(),
+                "head_bytes": len(rendered), "superseded_served": 0}
     if shadow_memory_enabled is None:
         shadow_memory_enabled = os.getenv("AGENT_CREW_SHADOW_MEMORY_ENABLED", "").lower() in (
             "1", "true", "yes",
@@ -3290,6 +3375,7 @@ def create_app(
 
     state: dict = {}
     reminded_task_ids: set[str] = set()
+    watchdog_expiry_counts: dict[str, int] = {}
     #: G_DT: tmux pushes refused because the pane runs no agent, by verdict.
     delivery_guard_refusals: dict[str, int] = {}
 
@@ -3384,6 +3470,12 @@ def create_app(
             )
         except Exception:
             logger.exception("build provenance record failed — continuing")
+        # A result may have committed under STOP just before a swap. Drain its
+        # existing outbox on the first unpaused boot, before dispatch begins.
+        try:
+            await asyncio.to_thread(replay_suppressed)
+        except Exception:
+            logger.exception("outbox replay at startup failed — rows remain recoverable")
         background_tasks: list[asyncio.Task] = []
         if _dispatcher_enabled:
             _requeue_orphans()
@@ -3629,6 +3721,38 @@ def create_app(
     app.state.guard_tmx_push = _guard_tmx_push
     app.state.delivery_guard_refusals = delivery_guard_refusals
 
+    def _cascade_completed_duplicate_survivor(blocked_id: str) -> None:
+        """Close the race where the standing verdict predates the handoff."""
+        blocked_ctx = q().get_task_context(blocked_id) or {}
+        survivor_id = blocked_ctx.get("duplicate_review_survivor")
+        if not isinstance(survivor_id, str):
+            return
+        survivor = q().get_task(survivor_id)
+        if (survivor is None or survivor.status != "completed"
+                or survivor.task_type != "review"):
+            return
+        ctx = survivor.context if isinstance(survivor.context, dict) else {}
+        if ctx.get("duplicate_review_lineage_from") != blocked_id:
+            return
+        result = q().get_result(survivor_id)
+        if result is None or result.status != "completed":
+            return
+        pr = result.pr_number or ctx.get("pr_number")
+        repo = str(ctx.get("repo") or "")
+        if pr and not review_publication_decision(
+                ctx, pr, repo=repo, repo_cwd=_any_worktree_path()).publish:
+            return
+        verdict = _resolve_verdict(result)
+        if verdict == "request_changes" and _review_result_is_actionable(result):
+            _auto_enqueue_fix(survivor_id, repo=repo)
+        elif verdict == "approve":
+            if ctx.get("no_tester"):
+                if pr:
+                    _auto_merge_pr(int(pr), repo=repo, repo_cwd=_any_worktree_path(),
+                                   review_task_id=survivor_id)
+            else:
+                _auto_enqueue_test(survivor_id, repo=repo)
+
     def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
                               caller: str) -> bool:
         """Persist the exact prepared base, including an explicit unknown (#358)."""
@@ -3652,6 +3776,8 @@ def create_app(
                     })
             if role in ("reviewer", "tester"):
                 if not q().record_prepared_review_base(task.task_id, base_context):
+                    if role == "reviewer":
+                        _cascade_completed_duplicate_survivor(task.task_id)
                     return False
             else:
                 q().patch_context(task.task_id, base_context)
@@ -3660,6 +3786,8 @@ def create_app(
         except Exception:
             logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
             return role == "implementer"  # Preserve the implementer path's prior behavior.
+
+    app.state.record_prepared_base = _record_prepared_base
 
     def _complete_suppressed_review(task: TaskRequest, decision) -> bool:
         """End a suppressed review as a COMPLETED review carrying the standing verdict.
@@ -3826,6 +3954,7 @@ def create_app(
     # Expose watchdog tick on app.state so tests can drive it deterministically
     # without the asyncio loop. Production code never reads this attribute.
     app.state.reminded_task_ids = reminded_task_ids
+    app.state.watchdog_expiry_counts = watchdog_expiry_counts
 
     def _panes_with_in_progress(exclude_task_id: str = "") -> set[str]:
         """지금 `in_progress` 인 task 들이 점유 중인 **pane 집합**.
@@ -3884,6 +4013,9 @@ def create_app(
         # into claude_cloud (role_mapping.py); by default no role resolves to
         # it, so existing local dispatch is unchanged.
         if _DISPATCH_ROLE_TO_AGENT.get(role, "") == _claude_cloud.CLOUD_PROVIDER_NAME:
+            if _dispatcher_enabled:
+                # The headless loop owns cloud selection and shadow launches.
+                return
             try:
                 _claude_cloud.dispatch_cloud_for_role(
                     q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""))
@@ -4243,7 +4375,11 @@ def create_app(
         # Independent of pane_map so a cloud-only deployment (no tmux panes
         # configured at all) still reconciles.
         try:
-            _claude_cloud.reconcile_all_cloud_tasks(q())
+            _claude_cloud.reconcile_all_cloud_tasks(
+                q(), submit_review_result_fn=lambda task_id, result: submit_result(
+                    task_id, result, x_agent_crew_project=_server_identity()["project"]))
+            if _claude_cloud.cloud_shadow_enabled():
+                _claude_cloud.reconcile_shadow_reviews(q())
         except Exception:
             logger.exception("watchdog: claude_cloud reconciliation failed")
         try:
@@ -4253,16 +4389,58 @@ def create_app(
                     _try_push_next(_TYPE_TO_ROLE.get(successor.task_type, "implementer"))
         except Exception:
             logger.exception("watchdog: owner approval re-admission failed")
-        if not pane_map:
-            return actions
-
         rows = q().list_in_progress_with_activity()
         in_progress_ids = {r["task_id"] for r in rows}
         # Drop completed/failed tasks from the reminder dedupe set so a recycled
         # task_id (or a re-enqueued retry) doesn't get its reminder suppressed.
         reminded_task_ids.intersection_update(in_progress_ids)
 
+        # Dispatcher claims own a subprocess rather than a tmux conversation.
+        # A busy pane belongs to whichever task runs there now; it must never
+        # refresh an older dispatcher row's activity. Expire a displaced row
+        # immediately, or an idle row after its live-process leash, even when
+        # no pane reminder was delivered.
         for row in rows:
+            if row.get("claim_source") != "dispatcher":
+                continue
+            task_id = row["task_id"]
+            pane_id = _resolve_pane_for_row(row)
+            later = next((candidate["task_id"] for candidate in
+                          q().later_dispatcher_tasks_same_role(task_id)
+                          if _resolve_pane_for_row(candidate) == pane_id), None) if pane_id else None
+            # Dispatcher output or process heartbeats extend the idle lease;
+            # last_activity_at alone is not refreshed for these claims.
+            last_activity = max(row["last_activity_at"], row.get("last_heartbeat_at") or 0.0,
+                                row.get("dispatched_at") or 0.0) or now
+            idle_for = max(0.0, now - last_activity)
+            effective_timeout = timeout_seconds
+            if pane_id:
+                try:
+                    if pane_liveness_fn(pane_id) == "alive":
+                        effective_timeout *= alive_timeout_multiplier
+                except Exception:
+                    logger.exception("watchdog: dispatcher pane liveness failed for %s", pane_id)
+            reason = ("dispatcher_superseded" if later else
+                      "dispatcher_idle" if idle_for >= effective_timeout else "")
+            if not reason:
+                continue
+            details = {"idle_seconds": round(idle_for, 1),
+                       "threshold_seconds": effective_timeout,
+                       "pane_id": pane_id, "later_task_id": later}
+            if _fail_if_active(task_id, f"watchdog_{reason}",
+                               status="timed_out", details=details):
+                actions["timed_out"].append(task_id)
+                watchdog_expiry_counts[reason] = watchdog_expiry_counts.get(reason, 0) + 1
+                logger.error("WATCHDOG TIMEOUT: task_id=%s reason=%s "
+                             "idle_for=%.0fs count=%d", task_id, reason,
+                             idle_for, watchdog_expiry_counts[reason])
+
+        if not pane_map:
+            return actions
+
+        for row in rows:
+            if row.get("claim_source") == "dispatcher":
+                continue
             task_id = row["task_id"]
             pane_id = _resolve_pane_for_row(row)
             if not pane_id:
@@ -4659,11 +4837,14 @@ def create_app(
         wt = wt_override or worktree_map.get(role)
         return agent, wt
 
-    async def _dispatch_task(task: TaskRequest, role: str) -> None:
+    async def _dispatch_task(task: TaskRequest, role: str,
+                             dispatch_agent: Optional[str] = None) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         agent, wt = _resolve_dispatch_target(task, role)
+        if dispatch_agent is not None:
+            agent = dispatch_agent
         if _honor_provider_cooldown(task, agent):
             return
         if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
@@ -4781,6 +4962,8 @@ def create_app(
         #   task.context.context_reset sets it too (review-99ad8ad0).
         _ctx_over = False
         _ctx_cap_info = {}
+        # Keep lineage attribution separate from the byte/token cap cause.
+        _lineage_reset = False
         _codex_planned = ""      # the session a codex resume would use, if any
         _renew_previous_session = ""
         if agent == "gemini":
@@ -4815,6 +4998,19 @@ def create_app(
             # worktree since 2026-08-21, alpha_engine's at 290 MB. Sizing is
             # provider-specific; everything after this line is not.
             _ctx_over, _ctx_cap_info = claude_context_exceeds_cap(wt)
+            if os.getenv("AGENT_CREW_CLAUDE_CONTEXT_SCOPE", "lineage").strip().lower() != "worktree":
+                try:
+                    _previous_task_id = q().peek_context_last_task_id(_project, agent, wt)
+                    if _previous_task_id and _previous_task_id != task.task_id:
+                        _lineage_ids, _ = task_lineage(db_path, task.task_id)
+                        if _previous_task_id not in _lineage_ids:
+                            _force_context_reset = True
+                            _lineage_reset = True
+                except Exception:
+                    logger.exception(
+                        "dispatcher: Claude lineage lookup failed for task=%s; "
+                        "keeping worktree context policy", task.task_id,
+                    )
         if _ctx_over:
             _force_context_reset = True
             logger.warning(
@@ -4852,6 +5048,7 @@ def create_app(
                 context_generation=_ctx_info["context_generation"],
                 session_task_index=_ctx_info["session_task_index"],
                 previous_task_id=_ctx_info["previous_task_id"],
+                **({"tripped_by": "lineage"} if _lineage_reset else {}),
             )
             # A provider swap relative to the role's *configured default*
             # agent means retry/fallback routing redirected this dispatch —
@@ -5454,12 +5651,13 @@ def create_app(
                 logger.exception(
                     "dispatcher: context pack shadow failed for %s", task.task_id)
 
-        # #322: Shadow-only optional durable-memory observation.  This sits
+        # #322/A2: Durable-memory observation. The legacy provider remains
+        # optional; the hybrid backend enables this seam when configured. It sits
         # after the baseline message (including any Context Pack) is complete,
         # and its result is deliberately never assigned to `message`, `task`,
         # routing, retry, or context-policy state.  A provider failure is
         # converted to telemetry by `shadow_retrieve`, not an execution error.
-        if shadow_memory_enabled and not memory_enabled():
+        if (shadow_memory_enabled and not memory_enabled()) or _ranked_memory is not None:
             try:
                 try:
                     _predecessors, _lineage_pr = await asyncio.to_thread(
@@ -5469,8 +5667,7 @@ def create_app(
                     _parent = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
                     _predecessors = (_parent,) if isinstance(_parent, str) and _parent else ()
                     _lineage_pr = task.pr_number or (_ctx.get("pr_number") if isinstance(_ctx, dict) else None)
-                _shadow_result = shadow_retrieve_bounded(
-                    _memory_provider, MemoryRequest(
+                _memory_request = MemoryRequest(
                         project=_project,
                         task_id=task.task_id,
                         issue=str(_ctx.get("issue", "")) if isinstance(_ctx, dict) else "",
@@ -5487,8 +5684,48 @@ def create_app(
                         predecessor_task_ids=_predecessors,
                         pr_number=_lineage_pr,
                         limit=min(SHADOW_RETRIEVAL_MAX_ROWS, max(10, len(_predecessors))),
-                    ), shadow_memory_timeout_seconds,
-                )
+                    )
+                _ranked_receipt = None
+                if _ranked_memory is not None:
+                    _fleet = str(_ctx.get("fleet") or os.getenv("AGENT_CREW_MEMORY_FLEET", ""))
+                    if not _fleet:
+                        logger.warning(
+                            "dispatcher: hybrid memory fleet unset for task=%s; "
+                            "fleet-scoped records will be omitted", task.task_id)
+                    _ranked_scope = MemoryScope(
+                        fleet=_fleet, project=_project,
+                        issue=str(_ctx.get("issue", "")),
+                        task_id=task.task_id,
+                        context_generation=_ctx_info["context_generation"])
+                    _marker, _state = threading.Event(), {}
+                    try:
+                        _ranked_receipt = await asyncio.wait_for(asyncio.to_thread(
+                            _ranked_memory.retrieve_ranked, _ranked_scope,
+                            task.description, role, _memory_request.limit, 16000,
+                            fallback_marker=_marker, response_state=_state), timeout=.300)
+                    except asyncio.TimeoutError:
+                        _ranked_receipt = _ranked_timeout_response(
+                            _ranked_scope, _marker, _state)
+                    except Exception as exc:
+                        logger.warning("dispatcher: ranked memory failed for %s: %s",
+                                       task.task_id, exc)
+                        _ranked_receipt = _ranked_timeout_response(
+                            _ranked_scope, _marker, {})
+                    _rows = [*_ranked_receipt["head"], *_ranked_receipt["middle"]]
+                    _shadow_result = MemoryResult(
+                        provider="memory_runtime", backend="hybrid",
+                        state="results" if _rows else "empty",
+                        latency_ms=_ranked_receipt["latency_ms"],
+                        items=tuple(MemoryItem(
+                            item_id=row["key"], project=_project,
+                            memory_type=row["layer"],
+                            source_ref=str(row["value"].get("source_ref") or row["key"]),
+                            excerpt=str(row["value"].get("text") or ""), rank=index,
+                        ) for index, row in enumerate(_rows, 1)),
+                    )
+                else:
+                    _shadow_result = shadow_retrieve_bounded(
+                        _memory_provider, _memory_request, shadow_memory_timeout_seconds)
                 try:
                     q().record_required_context_recalled(
                         task.task_id,
@@ -5499,6 +5736,11 @@ def create_app(
                                      task.task_id)
                 _shadow_event = {
                     **shadow_telemetry(_shadow_result),
+                    **({"retrieval_mode": _ranked_receipt["mode"],
+                        "superseded_served": _ranked_receipt["superseded_served"],
+                        "head_bytes": _ranked_receipt["head_bytes"],
+                        "fleet": _ranked_scope.fleet}
+                       if _ranked_receipt is not None else {}),
                     "task_id": task.task_id,
                     "project": _project,
                     "role": role,
@@ -5661,7 +5903,7 @@ def create_app(
             # api_error_status:429; gemini-cli often hangs on retry loops past
             # the 15-minute timeout. Both need the same routing decision.
             _transient = _detect_transient_error_in_log(
-                log_path, since_offset=_task_log_start_offset
+                log_path, since_offset=_task_log_start_offset, agent=agent
             )
             # #236: `subscriber fell behind updates` is usually a MASK. agy
             # hits 429, its internal retry stalls the agent_state pubsub
@@ -5968,6 +6210,7 @@ def create_app(
         ci_rechecks: set[int] = set()
         refresh_tasks: dict[str, asyncio.Task] = {}
         refresh_skips_logged: set[str] = set()
+        cloud_refresh_after = 0.0
 
         def _start_refresh(name: str, fn: Callable, *args, **kwargs) -> None:
             previous = refresh_tasks.get(name)
@@ -6053,6 +6296,18 @@ def create_app(
                         "rounds-cap", _pipeline_reresolve_pending_rounds_caps, q(),
                         pane_map=pane_map, on_fix_enqueued=_try_push_next)
                     _start_refresh("owner approval", q().readmit_parked_owner_conflicts)
+                    if (_claude_cloud.cloud_dispatch_enabled()
+                            and time.monotonic() >= cloud_refresh_after):
+                        cloud_refresh_after = time.monotonic() + max(
+                            interval, min(10.0, _claude_cloud.cloud_stale_seconds() / 4))
+                        _start_refresh(
+                            "cloud reviews", _claude_cloud.reconcile_all_cloud_tasks, q(),
+                            submit_review_result_fn=lambda task_id, result: submit_result(
+                                task_id, result,
+                                x_agent_crew_project=_server_identity()["project"]),
+                        )
+                        if _claude_cloud.cloud_shadow_enabled():
+                            _start_refresh("shadow reviews", _claude_cloud.reconcile_shadow_reviews, q())
                     logger.debug(
                         f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} "
                         f"active_workers={sorted(active_workers)} "
@@ -6070,13 +6325,34 @@ def create_app(
                         if worker in active_workers:
                             continue
                         _worker_roles = _AGENT_TO_ROLES.get(worker, [])
+                        _cloud_local_fallback = False
+                        if (_worker_roles == ["reviewer"] and
+                                worker == _claude_cloud.CLOUD_PROVIDER_NAME and
+                                _claude_cloud.cloud_dispatch_enabled()):
+                            if _claude_cloud.cloud_shadow_enabled():
+                                _cloud_local_fallback = True
+                            else:
+                                # The cloud adapter owns dequeue and admission.
+                                _cloud_outcome = await asyncio.to_thread(
+                                    _claude_cloud.dispatch_cloud_for_role, q(),
+                                    role="reviewer", task_type="review")
+                                _skip = _cloud_outcome.skipped_reason or ""
+                                if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
+                                    continue
+                                _cloud_local_fallback = True
                         _default_role = _worker_roles[0] if _worker_roles else ""
                         task = None
                         for _candidate_role in _worker_roles:
                             # Stage 1 checks overrides independent of task type;
                             # Stage 2 checks each role this worker owns.
+                            _shadow_skip_ids = None
+                            if (_candidate_role == "reviewer" and
+                                    _claude_cloud.cloud_shadow_enabled() and
+                                    _claude_cloud.cloud_max_per_day() != 0):
+                                _shadow_skip_ids = _claude_cloud.cloud_review_skip_ids(q())
                             task = q().dequeue(agent=worker, role=_candidate_role, claimed_via="dispatcher",
-                                               claim_source="dispatcher")
+                                               claim_source="dispatcher",
+                                               skip_task_ids=_shadow_skip_ids)
                             if task is not None:
                                 break
                         if task is None:
@@ -6086,6 +6362,10 @@ def create_app(
                         role = _TYPE_TO_ROLE.get(
                             task.task_type, _default_role or "implementer")
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        _dispatch_agent = None
+                        if (_cloud_local_fallback and role == "reviewer" and
+                                _target_agent == _claude_cloud.CLOUD_PROVIDER_NAME):
+                            _target_agent = _dispatch_agent = "claude"
                         _slot = _target_agent or worker
                         if _slot in active_workers:
                             # override 가 이미 바쁜 worker 를 가리켰다.
@@ -6107,13 +6387,22 @@ def create_app(
                         if _target_wt:
                             active_worktrees.add(_target_wt)
                         task_slots[task.task_id] = _slot
+                        if _claude_cloud.cloud_shadow_enabled() and role == "reviewer":
+                            try:
+                                await asyncio.to_thread(_claude_cloud.launch_shadow_review, q(), task)
+                            except Exception:
+                                logger.exception(
+                                    "dispatcher: cloud shadow launch failed task=%s",
+                                    task.task_id,
+                                )
 
                         async def _run(
                             t: TaskRequest = task, r: str = role, s: str = _slot,
                             w: Optional[str] = _target_wt,
+                            a: Optional[str] = _dispatch_agent,
                         ) -> None:
                             try:
-                                await _dispatch_task(t, r)
+                                await _dispatch_task(t, r, dispatch_agent=a)
                             finally:
                                 _drop_unspawned_reservation(t.task_id)
                                 active_workers.discard(s)
@@ -6314,7 +6603,11 @@ def create_app(
                             "coordinator_managed", "checklist_layers",
                             "findings_only")}
         context.update({"pr_number": int(pr_number), "superseded_review": review_task_id,
-                        "expected_head_sha": head})
+                        "expected_head_sha": head, "prev_task_id": review_task_id})
+        inherited_tier = base.get("risk_tier")
+        if (isinstance(inherited_tier, int) and not isinstance(inherited_tier, bool)
+                and 0 <= inherited_tier <= 3):
+            context["risk_tier"] = inherited_tier
         try:
             q().enqueue(TaskRequest(
                 task_id=new_id,
@@ -6331,7 +6624,8 @@ def create_app(
                 # already reports this dispatcher under (#248).
                 project=_successor_project_for(review_task_id, base),
             ),
-                        ingress="watchdog.stale_review")
+                        ingress="watchdog.stale_review",
+                        _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
             logger.info(
                 f"_requeue_review_at_head: enqueued {new_id} for PR #{pr_number} at "
                 f"{head[:12]}, superseding {review_task_id} (#304)")
@@ -6442,6 +6736,37 @@ def create_app(
             original_task = q().get_task(task_id)
             if original_task is None:
                 return
+            # A reported commit at the pushed PR/branch head is already work
+            # for the coordinator to assess. Repeating the implement on that
+            # same head spends an agent invocation without changing the artifact.
+            if task_type == "implement" and result.commit:
+                from agent_crew.github import _repo_slug, branch_head_sha, get_repo, pr_head_sha
+                task_ctx = original_task.context if isinstance(original_task.context, dict) else {}
+                head = ""
+                try:
+                    repo = _repo_slug(str(task_ctx.get("repo") or ""))
+                    if not repo:
+                        attribution = q().get_attribution(task_id) or {}
+                        worktree = attribution.get("worktree_path") or _any_worktree_path()
+                        repo = _repo_slug(get_repo(cwd=worktree) if worktree else "")
+                    pr_number = result.pr_number or task_ctx.get("pr_number")
+                    branch = result.branch or original_task.branch
+                    if repo and isinstance(pr_number, int) and not isinstance(pr_number, bool):
+                        head = pr_head_sha(pr_number, repo=repo)
+                    if not head and repo and branch:
+                        head = branch_head_sha(branch, repo)
+                except Exception:
+                    # A read failure cannot be evidence that work was pushed.
+                    logger.exception("_auto_retry_failed_task: head lookup failed for %s", task_id)
+                if head and head.lower() == result.commit.lower():
+                    q().patch_context(task_id, {
+                        "retry_skipped_reason": "work_pushed_or_unchanged_head",
+                    })
+                    logger.info(
+                        "_auto_retry_failed_task: skipping %s; reported commit %s is pushed head",
+                        task_id, result.commit,
+                    )
+                    return
             # Opt-in for projects where repeating an agent-reported implement
             # failure has proved wasteful. Read per call so the default retry
             # behavior remains unchanged when the flag is unset.
@@ -6644,6 +6969,7 @@ def create_app(
         st = pr_state(int(pr_number), repo=_merge_repo)
         if st == "merged":
             q().external_op_mark(op_key, "done")
+            capture_merge_best_effort(db_path, review_task_id)
             logger.info(f"_auto_merge_pr: PR #{pr_number} 이미 merged(재확인) → done 기록, 재merge 안 함")
             return
         if st == "closed":
@@ -6729,6 +7055,7 @@ def create_app(
         ok = merge_pr(int(pr_number), merge_method="squash", repo=_merge_repo)
         if ok:
             q().external_op_mark(op_key, "done")
+            capture_merge_best_effort(db_path, review_task_id)
             logger.info(f"_auto_merge_pr: merged PR #{pr_number} (squash) → done(receipt) — #171/§5")
         else:
             fail("gh pr merge 실패")
@@ -6797,6 +7124,38 @@ def create_app(
             f"project identity mismatch: expected project={client_project!r}, "
             f"server project={server_project!r}"))
 
+    @app.post("/memory/retrieve_ranked")
+    async def memory_retrieve_ranked(
+            payload: dict = Body(...),
+            x_agent_crew_project: Optional[str] = Header(None)):
+        """Serve the A2 middle to coordinator hooks under a 300 ms bound."""
+        _require_project_identity(x_agent_crew_project)
+        if _ranked_memory is None:
+            raise HTTPException(status_code=503, detail="hybrid memory is not configured")
+        from agent_crew.memory_runtime import MemoryScope
+        fields = payload.get("scope") or {}
+        if not isinstance(fields, dict):
+            raise HTTPException(status_code=422, detail="scope must be an object")
+        try:
+            scope = MemoryScope(**fields)
+            if scope.project != project:
+                raise HTTPException(status_code=409, detail="memory project mismatch")
+            query = str(payload.get("query") or "")
+            role = str(payload.get("role") or "implementer")
+            k = int(payload.get("k", 20))
+            byte_budget = int(payload.get("byte_budget", 16000))
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        try:
+            fallback_marker = threading.Event()
+            response_state = {}
+            return await asyncio.wait_for(asyncio.to_thread(
+                _ranked_memory.retrieve_ranked, scope, query, role, k, byte_budget,
+                fallback_marker=fallback_marker, response_state=response_state),
+                timeout=.300)
+        except asyncio.TimeoutError:
+            return _ranked_timeout_response(scope, fallback_marker, response_state)
+
     @app.get("/health")
     def health():
         """Liveness plus the build this process is actually running (#248).
@@ -6856,6 +7215,11 @@ def create_app(
         except Exception as exc:
             _risk_out = {"missing_root_count": None,
                          "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            _outbox_out = q().outbox_counts()
+        except Exception as exc:
+            _outbox_out = {"pending": None, "expired": None,
+                           "error": f"{type(exc).__name__}: {exc}"}
         return {
             "status": "ok",
             "project": ident["project"],
@@ -6864,6 +7228,9 @@ def create_app(
             "runtime_state": _runtime_state_out,
             "cea": _cea_out,
             "risk_declaration": _risk_out,
+            "outbox": _outbox_out,
+            "hybrid_memory": {"available": _ranked_memory is not None,
+                              "startup_fallback_count": _ranked_startup_fallback_count},
             "dispatcher_tick_age_s": (
                 max(0.0, time.monotonic() - app.state.dispatcher_last_tick_monotonic)
                 if app.state.dispatcher_last_tick_monotonic is not None else None
@@ -6989,6 +7356,7 @@ def create_app(
         _require_project_identity(x_agent_crew_project)
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
+            validate_http_root_risk(task.context)
             task_id = q().enqueue(task, ingress="http.tasks")
         except InvalidRiskTierError as e:
             raise HTTPException(status_code=422, detail=str(e))
@@ -7585,7 +7953,12 @@ def create_app(
                     if _pub.requeue_head:
                         _requeue_review_at_head(task_id, _review_pr, _pub.requeue_head, ctx)
                     _review_pr = None
-                if _review_pr and _REPLAYING.get():
+                if _review_pr and ctx.get("cloud_review_comment_confirmed"):
+                    # #712: the cloud reviewer has already posted its one
+                    # marked PR comment. Reuse every result/cascade gate, but
+                    # do not publish a second copy of the same verdict.
+                    logger.info("POST /tasks/%s/result: cloud review comment already posted", task_id)
+                elif _review_pr and _REPLAYING.get():
                     # #314 §4 P0: replay 중 PR review comment 재게시 금지(gh comment는 receipt 없음
                     # → 게시 후 ACK 전 crash 시 중복). 라이브 경로에서만 게시. verdict 소비(test/merge)는
                     # 아래에서 계속되며 stable id/receipt로 멱등.
@@ -7743,6 +8116,13 @@ def create_app(
         except Exception:
             return {"status": "skipped", "reason": "pause 판정불가(fail-closed)", "replayed": []}
         from agent_crew.protocol import TaskResult
+        try:
+            max_age = float(os.getenv("AGENT_CREW_OUTBOX_REPLAY_MAX_AGE_S", "86400"))
+            if not math.isfinite(max_age) or max_age <= 0:
+                raise ValueError("non-positive replay age")
+        except ValueError:
+            logger.warning("invalid AGENT_CREW_OUTBOX_REPLAY_MAX_AGE_S; using 86400")
+            max_age = 86400.0
         done = []
         for rec in q().outbox_pending(include_replaying=True):
             parent = rec.get("parent_task_id")
@@ -7752,17 +8132,66 @@ def create_app(
             claim = q().outbox_claim(parent, owner)      # lease CAS: pending/만료replaying만
             if not claim:
                 continue                                 # 다른 executor 처리중 or 이미 applied
+            try:
+                created = float(claim["created_at"])
+                if not math.isfinite(created) or created > time.time():
+                    disposition, reason = "pending", "invalid_created_at"
+                elif time.time() - created > max_age:
+                    disposition, reason = "expired", "age_limit"
+                else:
+                    task = q().get_task(parent)
+                    if task is None:
+                        disposition, reason = "pending", "parent_unavailable"
+                    else:
+                        ctx = task.context if isinstance(task.context, dict) else {}
+                        if (task.status == "cancelled" or
+                                q().has_superseding_review(parent)):
+                            disposition, reason = "expired", "parent_cancelled_or_superseded"
+                        else:
+                            rd = json.loads(claim["result_json"])
+                            pr = (rd.get("pr_number") or task.pr_number or
+                                  ctx.get("pr_number"))
+                            if pr:
+                                worktree = _any_worktree_path()
+                                repo = (ctx.get("repo") or
+                                        (get_repo(cwd=worktree) if worktree else "") or "")
+                                if not repo:
+                                    disposition, reason = "pending", "pr_repo_unavailable"
+                                else:
+                                    from agent_crew.github import pr_state
+                                    state = pr_state(int(pr), repo=repo, timeout=5.0)
+                                    if state in ("closed", "merged"):
+                                        disposition, reason = "expired", f"pr_{state}"
+                                    elif state != "open":
+                                        disposition, reason = "pending", "pr_state_unknown"
+                                    else:
+                                        disposition, reason = "replay", ""
+                            else:
+                                disposition, reason = "replay", ""
+            except Exception:
+                logger.exception("outbox replay safety check failed parent=%s", parent)
+                disposition, reason = "pending", "safety_check_failed"
+            if disposition != "replay":
+                q().outbox_finish_claim(parent, owner, state=disposition)
+                logger.warning("outbox replay %s parent=%s reason=%s", disposition,
+                               parent, reason)
+                continue
             # #314 §4 P0: replay 동안 _REPLAYING=True → submit_result가 durable cascade transition
             # (successor enqueue, stable id 멱등)만 재실행하고 non-idempotent side effect(PR comment/
             # escalation gate+telegram/queue push)는 skip. replay side-effect boundary 확립.
             _rtok = _REPLAYING.set(True)
             try:
                 rd = json.loads(claim.get("result_json") or "{}")
-                submit_result(parent, TaskResult(**rd))  # outbox 'replaying' → cascade transition만 재실행
+                response = submit_result(parent, TaskResult(**rd),
+                                         x_agent_crew_project=_server_identity()["project"])
+                if isinstance(response, dict) and response.get("suppressed_by_pause"):
+                    q().outbox_finish_claim(parent, owner, state="pending")
+                    continue
                 q().outbox_mark_applied(parent, owner)    # 성공분만 replaying→applied CAS
                 done.append(parent)
             except Exception:
                 logger.exception(f"replay-suppressed: {parent} 실패(lease 만료 후 reclaim)")
+                q().outbox_finish_claim(parent, owner, state="pending")
             finally:
                 _REPLAYING.reset(_rtok)
         return {"status": "ok", "replayed": done,
