@@ -370,9 +370,11 @@ def capture_document_pointer(storage: SQLiteMemoryStorage, *, repo: str,
     return record
 
 
-def _decision_document_path(path: str) -> bool:
+def _decision_document_path(path: str, repo: str = "") -> bool:
     """Select committed governance, ADR, spec, prereg, and verdict sources."""
     return (path == "CLAUDE.md" or
+            (repo.rsplit("/", 1)[-1] in {"quota-core", "quota-ops"}
+             and path.startswith("docs/") and path.endswith(".md")) or
             (path.startswith(("governance/adr/", "docs/decisions/", "docs/specs/"))
              and path.endswith(".md")) or
             (path.startswith("docs/research/") and "prereg" in path.lower()
@@ -400,7 +402,7 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
                     ["git", "-C", str(root_path), *args], text=True,
                     stderr=subprocess.DEVNULL).strip()
 
-            ref = next((candidate for candidate in ("HEAD", "origin/main")
+            ref = next((candidate for candidate in ("origin/HEAD", "origin/main", "HEAD")
                         if subprocess.run(["git", "-C", str(root_path), "rev-parse",
                                            "--verify", "--quiet", candidate],
                                           capture_output=True).returncode == 0), None)
@@ -408,7 +410,7 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
                 raise ValueError(f"no committed Git ref in {root_path}")
             project = canonical_project(repo.rsplit("/", 1)[-1], repo=repo)
             tracked = set(git("ls-tree", "-r", "--name-only", ref).splitlines())
-            paths = sorted({path for path in tracked if _decision_document_path(path)} |
+            paths = sorted({path for path in tracked if _decision_document_path(path, repo)} |
                            (explicit_files or {}).get(repo, set()))
             sources = [(path, ref) for path in paths]
             sources.extend((path, revision) for path, revision in
