@@ -465,18 +465,31 @@ class SQLiteMemoryStorage:
                     db.execute("UPDATE adr001_memory SET invalidated_at=? "
                                "WHERE rowid=? AND invalidated_at IS NULL",
                                (time.time(), head[0]))
-            # Revisions must not consume the retention budget of effective
-            # evidence. Keep a separate, bounded history for diagnosis.
-            for status in ("superseded_by IS NULL AND invalidated_at IS NULL",
-                           "superseded_by IS NOT NULL OR invalidated_at IS NOT NULL"):
-                db.execute(f"""DELETE FROM adr001_memory WHERE rowid IN (
-                    SELECT rowid FROM adr001_memory
-                    WHERE layer IN ('episodic','decision','failure_pattern')
-                      AND json_extract(scope, '$.project')=?
-                      AND (key GLOB 'task:*' OR key GLOB 'episode:*')
-                      AND ({status})
-                    ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
-                    (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
+            # Count effective evidence separately from history. When an
+            # effective head ages out, remove its entire revision family so
+            # no retained predecessor points to a deleted head.
+            evicted = db.execute("""SELECT layer,key FROM adr001_memory
+                WHERE layer IN ('episodic','decision','failure_pattern')
+                  AND json_extract(scope, '$.project')=?
+                  AND (key GLOB 'task:*' OR key GLOB 'episode:*')
+                  AND superseded_by IS NULL AND invalidated_at IS NULL
+                ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?""",
+                (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project)).fetchall()
+            for layer, key in evicted:
+                logical_key = _logical_revision_key(key)
+                db.execute("""DELETE FROM adr001_memory WHERE layer=?
+                    AND json_extract(scope, '$.project')=?
+                    AND (key=? OR (key>=? AND key<?))""",
+                    (layer, project, logical_key, logical_key + "@v",
+                     logical_key + "@v\uffff"))
+            db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
+                SELECT rowid FROM adr001_memory
+                WHERE layer IN ('episodic','decision','failure_pattern')
+                  AND json_extract(scope, '$.project')=?
+                  AND (key GLOB 'task:*' OR key GLOB 'episode:*')
+                  AND (superseded_by IS NOT NULL OR invalidated_at IS NOT NULL)
+                ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
+                (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
             db.commit()
             self._revision_columns = True
 

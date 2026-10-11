@@ -194,3 +194,29 @@ def test_retention_caps_effective_rows_and_history_separately(tmp_path, storage_
         history = db.execute("SELECT count(*) FROM adr001_memory "
                              "WHERE layer='decision' AND superseded_by IS NOT NULL").fetchone()[0]
     assert history <= 6
+
+
+@pytest.mark.parametrize("storage_type", [SQLiteMemoryStorage, HybridMemoryStorage])
+def test_retention_evicts_head_with_history_and_allows_later_write(tmp_path, storage_type):
+    store = storage_type(str(tmp_path / "memory.db"))
+    scope = MemoryScope(project="demo")
+
+    def write(key, text):
+        store.put_many_shadow([MemoryRecord("decision", f"task:{key}:decision",
+                                            {"text": text}, scope)],
+                              max_rows_per_project=6)
+
+    write("x", "x0")
+    write("x", "x1")
+    for index in range(7):
+        write(f"other{index}", f"other{index}")
+    assert "task:x:decision" not in {row.key for row in store.retrieve(scope)}
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT count(*) FROM adr001_memory "
+                          "WHERE layer='decision' AND "
+                          "(key='task:x:decision' OR key GLOB 'task:x:decision@v*')"
+                          ).fetchone()[0] == 0
+    write("x", "x2")
+    write("x", "x3")
+    assert [(row.key, row.value["text"]) for row in store.retrieve(scope)
+            if row.key == "task:x:decision"] == [("task:x:decision", "x3")]
