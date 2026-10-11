@@ -15,16 +15,18 @@ from tests.unit.test_sev0_cea_s4e_wiring import DECISION_ID, write_key, write_sn
 
 
 @pytest.mark.parametrize(
-    ("source", "decision_id", "snapshot_configured", "allowed"),
+    ("source", "decision_id", "snapshot_configured", "project_verifier_env", "allowed"),
     [
-        ("hojun", DECISION_ID, True, True),
-        ("hojun", "T0-UNKNOWN", True, False),
-        ("alfred", DECISION_ID, True, False),
-        ("hojun", DECISION_ID, False, False),
+        ("hojun", DECISION_ID, True, True, True),
+        ("hojun", "T0-UNKNOWN", True, True, False),
+        ("alfred", DECISION_ID, True, True, False),
+        ("hojun", DECISION_ID, False, False, False),
+        pytest.param("hojun", DECISION_ID, True, False, False,
+                     id="shell-only-verifier-refused"),
     ],
 )
 def test_project_resume_checks_signed_t0_in_fresh_cli_process(
-    tmp_path, source, decision_id, snapshot_configured, allowed,
+    tmp_path, source, decision_id, snapshot_configured, project_verifier_env, allowed,
 ):
     project = "agent_crew"
     state_dir = tmp_path / project
@@ -51,9 +53,14 @@ def test_project_resume_checks_signed_t0_in_fresh_cli_process(
     if snapshot_configured:
         running_build = provenance.build()["commit"]
         assert running_build
-        env["AGENT_CREW_CEA_SNAPSHOT_PATH"] = str(
-            write_snapshot(tmp_path, build_commits=(running_build,)))
-        env["AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"] = str(write_key(tmp_path))
+        snapshot = write_snapshot(tmp_path, build_commits=(running_build,))
+        key = write_key(tmp_path)
+        env["AGENT_CREW_CEA_SNAPSHOT_PATH"] = str(snapshot)
+        env["AGENT_CREW_CEA_SNAPSHOT_KEY_FILE"] = str(key)
+        if project_verifier_env:
+            (state_dir / "cea.env").write_text(
+                f"AGENT_CREW_CEA_SNAPSHOT_PATH={snapshot}\n"
+                f"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE={key}\n")
 
     command = [sys.executable, "-c", "from agent_crew.cli import crew; crew()",
                "resume", project, "--base", str(tmp_path),
@@ -63,6 +70,12 @@ def test_project_resume_checks_signed_t0_in_fresh_cli_process(
     assert result.stdout, f"fresh CLI produced no stdout; stderr={result.stderr!r}"
     payload = json.loads(result.stdout)
     assert payload["resumed"] is allowed, result.stdout + result.stderr
+    if snapshot_configured and project_verifier_env and decision_id != DECISION_ID:
+        assert f"decision {decision_id} not in snapshot gen" in payload["reason"]
+    if snapshot_configured and project_verifier_env and source != "hojun":
+        assert f"principal owner:{source} absent" in payload["reason"]
+    if snapshot_configured and not project_verifier_env:
+        assert "no verifier env" in payload["reason"]
     assert result.returncode == (0 if allowed else 1), result.stdout + result.stderr
     assert TaskQueue(str(db_path)).get_runtime_state()["state"] == (
         "ACTIVE" if allowed else "STOPPED")

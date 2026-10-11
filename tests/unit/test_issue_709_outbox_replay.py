@@ -62,7 +62,17 @@ def test_startup_replays_pending_result_once(pending):
 
 
 def test_resume_notifies_replay_and_creates_successor(pending, tmp_path, monkeypatch):
-    queue, _ = pending
+    from agent_crew import provenance
+    from tests.unit.test_sev0_cea_s4e_wiring import write_key, write_snapshot
+
+    queue, project_dir = pending
+    snapshot = write_snapshot(tmp_path, decision_id="D-51-9", project="testproj",
+                              runtimes=("testproj",),
+                              build_commits=(provenance.build()["commit"],))
+    key = write_key(tmp_path)
+    (project_dir / "cea.env").write_text(
+        f"AGENT_CREW_CEA_SNAPSHOT_PATH={snapshot}\n"
+        f"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE={key}\n")
     monkeypatch.setattr(cli, "_writable_queue", lambda *a, **k: queue)
     with TestClient(_app(queue)) as client:
         calls = []
@@ -74,6 +84,7 @@ def test_resume_notifies_replay_and_creates_successor(pending, tmp_path, monkeyp
         monkeypatch.setattr(cli, "_replay_outbox_on_server", replay, raising=False)
         result = CliRunner().invoke(cli.crew, [
             "resume", "testproj", "--base", str(tmp_path),
+            "--source", "hojun",
             "--generation", str(queue.get_stop_epoch()["epoch"] + 1),
             "--decision-id", "D-51-9"])
         assert result.exit_code == 0, result.output

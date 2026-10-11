@@ -178,8 +178,12 @@ class TestReconcileIncidentFix(Base):
         # 실제 CLI resume(project scope) — cli.py의 mirror 경로를 구동
         snapshot = write_snapshot(Path(base), build_commits=(provenance.build()["commit"],))
         key = write_key(Path(base))
-        with patch.dict(os.environ, {"AGENT_CREW_CEA_SNAPSHOT_PATH": str(snapshot),
-                                    "AGENT_CREW_CEA_SNAPSHOT_KEY_FILE": str(key)}):
+        Path(sd, "cea.env").write_text(
+            f"AGENT_CREW_CEA_SNAPSHOT_PATH={snapshot}\n"
+            f"AGENT_CREW_CEA_SNAPSHOT_KEY_FILE={key}\n")
+        # A clean-shell rehearsal: only the project-local cea.env supplies CEA.
+        with patch.dict(os.environ, {"PATH": os.environ.get("PATH", ""),
+                                    "HOME": os.environ.get("HOME", "")}, clear=True):
             r = CliRunner().invoke(crew_cli, ["resume", proj, "--generation", "2",
                                               "--base", base, "--source", "hojun",
                                               "--decision-id", DECISION_ID])

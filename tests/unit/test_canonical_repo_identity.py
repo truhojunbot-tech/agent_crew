@@ -57,11 +57,13 @@ def _post_task(client, task_id, task_type, context, pr_number=91001):
 
 
 def _submit_result(client, task_id, task_type, pr_number=91001):
+    execution = client.get(f"/tasks/{task_id}").json().get("execution") or {}
     return client.post(f"/tasks/{task_id}/result", json={
         "task_id": task_id, "status": "completed",
         "summary": "Reviewed the canonical repository identity and found no blocking issues.",
         "verdict": "approve" if task_type == "review" else None,
         "findings": [], "pr_number": pr_number,
+        "attempt_id": execution.get("attempt_id"),
     })
 
 
