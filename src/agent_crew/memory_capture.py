@@ -37,10 +37,16 @@ _WARNED_UNKNOWN_PROJECTS: set[str] = set()
 def _capture_storage(path: str) -> SQLiteMemoryStorage:
     """Use the provisioned hybrid writer only when embedding is configured."""
     if os.getenv("AGENT_CREW_MEMORY_BACKEND", "").strip().lower() == "hybrid":
-        from agent_crew.memory_hybrid import HybridMemoryStorage, configured_write_embedder
+        from agent_crew.memory_hybrid import (
+            EndpointEmbedder, HybridMemoryStorage, configured_write_embedder,
+        )
 
         embedder = configured_write_embedder()
         if embedder is not None:
+            if isinstance(embedder, EndpointEmbedder):
+                # Result capture runs on request and watchdog threads. Leave
+                # slow vectors for the resumable backfill instead of blocking.
+                embedder.timeout_seconds = 0.5
             storage = HybridMemoryStorage.existing(path)
             storage.write_embedder = embedder
             storage.model_id = str(embedder.model_id)

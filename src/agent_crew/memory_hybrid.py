@@ -240,15 +240,16 @@ def configured_embedder():
 class EndpointEmbedder:
     """Embed through an explicitly configured serving endpoint."""
 
-    def __init__(self, endpoint: str, model_id: str):
+    def __init__(self, endpoint: str, model_id: str, timeout_seconds: float = 30.0):
         self.endpoint = endpoint
         self.model_id = model_id
+        self.timeout_seconds = timeout_seconds
 
     def __call__(self, text: str):
         payload = json.dumps({"model": self.model_id, "input": text}).encode()
         request = urllib.request.Request(self.endpoint, data=payload,
                                          headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
             result = json.load(response)
         vectors = result.get("embeddings")
         return vectors[0] if vectors else result["embedding"]
@@ -306,9 +307,10 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         super().put_many_shadow(records, **kwargs)
         if self.write_embedder is not None:
             for record in records:
-                self._embed_written_record(record)
+                if not self._embed_written_record(record):
+                    break
 
-    def _embed_written_record(self, record: MemoryRecord) -> None:
+    def _embed_written_record(self, record: MemoryRecord) -> bool:
         try:
             with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
                 row = db.execute("SELECT m.rowid,f.body,v.model_id,v.content_sha,v.vec "
@@ -321,9 +323,11 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             if row:
                 rowid, body, model, digest, vector = row
                 if vector is None or model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest():
-                    self._embed_row(rowid, body)
+                    return self._embed_row(rowid, body)
+            return True
         except Exception as exc:
             logger.warning("memory write embed failed key=%s: %s", record.key, exc)
+            return False
 
     def _embed_row(self, rowid: int, body: str) -> bool:
         digest = hashlib.sha256(body.encode()).hexdigest()
