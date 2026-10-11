@@ -122,8 +122,28 @@ def test_allow_merges_and_records_receipt(tmp_path, monkeypatch, gate, comments)
     assert change["owner_evidence"] == {"project": "proj", "ref": "issue#588"}
     assert change["text"].startswith("add widget")
     assert change["change_type"] == "modify"
+    assert "changed_paths" not in change
     assert comments == []
     assert q.get_task_status("impl-1") == "pending"
+
+
+def test_pr_diff_paths_are_sorted_in_written_change(tmp_path, monkeypatch, gate, comments):
+    monkeypatch.setenv("FAKE_GATE_MODE", "ALLOW")
+    original_run = cli_module.subprocess.run
+
+    def run(cmd, *args, **kwargs):
+        if cmd[:3] == ["gh", "pr", "diff"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, "diff --git a/z.py b/z.py\n+++ b/z.py\n"
+                        "diff --git a/a.py b/a.py\n+++ b/a.py\n", "")
+        return original_run(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(cli_module.subprocess, "run", run)
+    q = _queue(tmp_path, {"capability_id": "cap.widget"})
+
+    assert _gate(q, tmp_path) is True
+    change_path = tmp_path / "receipts" / "impl-1-pr42.change.json"
+    assert json.loads(change_path.read_text())["changed_paths"] == ["a.py", "z.py"]
 
 
 def test_declared_change_evidence_reaches_gate_contract(tmp_path, monkeypatch, gate, comments):

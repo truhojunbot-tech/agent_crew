@@ -55,7 +55,7 @@ def _events(db, task_id, name):
 def test_u_581_codex_capacity_is_provider_capacity_not_transient(tmp_path):
     log = tmp_path / "log"
     log.write_bytes(_CAPACITY_LOG)
-    tag = _detect_transient_error_in_log(str(log))
+    tag = _detect_transient_error_in_log(str(log), agent="codex")
     assert tag in _PROVIDER_CAPACITY_TAGS
     assert tag not in _TRANSIENT_RETRIABLE_TAGS   # cannot reach the transient budget
 
@@ -107,7 +107,7 @@ def _run(tmp_db, tmp_path, port, *, env: dict, succeed_on: int, task_id: str,
                                  watchdog_disabled=True, anomaly_disabled=True)
                 with TestClient(app) as client:
                     resp = client.post("/tasks", json={
-                        "task_id": task_id, "task_type": "test",
+                        "task_id": task_id, "task_type": "implement",
                         "description": "Test PR #1", "branch": "main",
                         "priority": 3, "context": {}, "project": "test_project"})
                     assert resp.status_code == 201

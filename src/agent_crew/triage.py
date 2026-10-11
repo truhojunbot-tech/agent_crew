@@ -309,7 +309,8 @@ def enqueue_task(queue, triage_result: dict, *, project: str = "") -> str:
         task_type="implement",
         description=parsed["description"],
         branch=branch,
-        context={"issue": parsed["issue"]},
+        context={"issue": parsed["issue"], **({"risk_tier": parsed["risk_tier"]}
+                   if "risk_tier" in parsed else {})},
         project=(str(project or "").strip()
                  or str(triage_result.get("project") or "").strip()
                  or getattr(queue, "project_identity", "") or ""),

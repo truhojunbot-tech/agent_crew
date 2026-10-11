@@ -121,7 +121,7 @@ def _run_dispatcher(tmp_db, tmp_path, payloads, preenqueue: bool = False):
 
 
 def _payload(task_id: str, override: str = "", task_type: str = "implement") -> dict:
-    ctx: dict = {}
+    ctx: dict = {"risk_tier": 1}
     if override:
         ctx["agent_override"] = override
     return {

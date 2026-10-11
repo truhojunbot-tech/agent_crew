@@ -6,9 +6,12 @@ This module only writes observations. It does not promote procedures or enable
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
-from contextlib import closing
+import re
+import subprocess
+from contextlib import closing, nullcontext
 from pathlib import Path
 import sqlite3
 from time import perf_counter
@@ -25,10 +28,12 @@ logger = logging.getLogger(__name__)
 
 CANONICAL_PROJECTS = frozenset({
     "alfred", "agent_crew", "quota-ops", "quota-core", "alpha_engine", "halla",
+    "btc-quant-engine",
     "agent_council", "apify-forge", "claude_autonomous_trader", "ht-8004",
 })
 _WARNED_UNKNOWN_PROJECTS: set[str] = set()
 _ALIASES = {"agent-crew": "agent_crew", "agent crew": "agent_crew",
+            "truhojunbot-tech/agent_crew": "agent_crew",
             "alpha-engine": "alpha_engine", "alpha engine": "alpha_engine",
             "quota_ops": "quota-ops", "quota ops": "quota-ops",
             "quota_core": "quota-core", "quota core": "quota-core"}
@@ -195,6 +200,284 @@ def task_lineage(db_path: str, task_id: str) -> tuple[tuple[str, ...], int | Non
         return tuple(predecessors), pr_number
 
 
+def capture_task_outcome_record(storage: SQLiteMemoryStorage, db_path: str,
+                                task_id: str, *, write: bool = True,
+                                source_db: sqlite3.Connection | None = None) -> MemoryRecord | None:
+    """Store one terminal crew outcome as project-wide, retrievable evidence.
+
+    The task database is read only here. The key identifies the observation,
+    so replaying a backfill cannot create duplicate memory rows.
+    """
+    uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+    connection = (nullcontext(source_db) if source_db is not None else
+                  closing(sqlite3.connect(uri, uri=True,
+                                          timeout=shadow_sqlite_timeout_seconds())))
+    with connection as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute(
+            "SELECT task_id,task_type,description,context,status,project,summary,"
+            "verdict,findings,pr_number FROM tasks WHERE task_id=?", (task_id,),
+        ).fetchone()
+        if row is None or row["status"] not in {
+                "completed", "failed", "needs_human", "timed_out"}:
+            return None
+        context = _task_context(row["context"])
+        lineage = [row]
+        seen = {task_id}
+        parent = context.get("prev_task_id")
+        while isinstance(parent, str) and parent and parent not in seen:
+            seen.add(parent)
+            previous = db.execute(
+                "SELECT task_id,task_type,description,context,status,project,summary,"
+                "verdict,findings,pr_number FROM tasks WHERE task_id=?", (parent,),
+            ).fetchone()
+            if previous is None or canonical_project(
+                    previous["project"] or Path(db_path).parent.name) != canonical_project(
+                    row["project"] or Path(db_path).parent.name):
+                break
+            lineage.append(previous)
+            parent = _task_context(previous["context"]).get("prev_task_id")
+        root = lineage[-1]
+        root_context = _task_context(root["context"])
+        issue = _optional_issue(context.get("issue") or root_context.get("issue")
+                                or context.get("issue_number") or root_context.get("issue_number"))
+        pr_number = row["pr_number"] or context.get("pr_number") or root["pr_number"]
+        try:
+            pr_number = int(pr_number) if pr_number else None
+        except (TypeError, ValueError):
+            pr_number = None
+        merge_state = ""
+        if pr_number:
+            try:
+                merged = db.execute(
+                    "SELECT state FROM external_op WHERE op_key=?",
+                    (f"merge:pr:{pr_number}",),
+                ).fetchone()
+                if merged and merged["state"] == "done":
+                    merge_state = "merged"
+            except sqlite3.OperationalError:
+                pass  # Older crew databases have no merge receipts.
+        if row["task_type"] != "review" and merge_state != "merged":
+            return None
+    project = canonical_project(row["project"] or Path(db_path).parent.name,
+                                repo=str(context.get("repo") or ""))
+    try:
+        findings = json.loads(row["findings"] or "[]")
+    except (TypeError, ValueError):
+        findings = row["findings"] or []
+    value = {
+        "kind": "task_outcome", "task_id": task_id, "task_type": row["task_type"],
+        "status": row["status"], "description": row["description"],
+        "summary": row["summary"] or "", "verdict": row["verdict"] or "",
+        "findings": findings, "project": project,
+        "lineage_root_task_id": root["task_id"], "issue": issue,
+        "pr_number": pr_number, "merge_state": merge_state,
+        "pr_title": str(context.get("pr_title") or root_context.get("pr_title") or ""),
+        "source_refs": ([f"{project} issue #{issue}"] if issue else []) +
+                       ([f"{project} PR #{pr_number}"] if pr_number else []),
+        "source_ref": f"crew-task:{project}:{task_id}",
+    }
+    record = MemoryRecord("episodic", f"task_outcome:{project}:{task_id}", value,
+                          MemoryScope(project=project))
+    if write:
+        storage.put_many_shadow([record])
+    return record
+
+
+def backfill_task_outcomes(storage: SQLiteMemoryStorage,
+                           task_dbs: list[str]) -> int:
+    """Replay terminal tasks from explicit crew DB paths; return changed rows."""
+    changed = 0
+    for db_path in task_dbs:
+        uri = Path(db_path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(uri, uri=True)) as db, closing(
+                sqlite3.connect(storage.path)) as memory:
+            db.row_factory = sqlite3.Row
+            task_ids = [row[0] for row in db.execute(
+                "SELECT task_id FROM tasks WHERE status IN "
+                "('completed','failed','needs_human','timed_out') ORDER BY rowid")]
+            batches: dict[str, list[MemoryRecord]] = {}
+            for task_id in task_ids:
+                try:
+                    source_project = db.execute(
+                        "SELECT project FROM tasks WHERE task_id=?", (task_id,),
+                    ).fetchone()[0]
+                    project = canonical_project(source_project or Path(db_path).parent.name)
+                    before = memory.execute(
+                        "SELECT value FROM adr001_memory WHERE key=?",
+                        (f"task_outcome:{project}:{task_id}",)).fetchone()
+                    record = capture_task_outcome_record(storage, db_path, task_id,
+                                                         write=False, source_db=db)
+                except ValueError as exc:
+                    logger.warning("task outcome backfill skipped %s: %s", task_id, exc)
+                    continue
+                if record is not None and (before is None or json.loads(before[0]) != record.value):
+                    changed += 1
+                    batch = batches.setdefault(record.scope.project, [])
+                    batch.append(record)
+                    if len(batch) >= 100:
+                        storage.put_many_shadow(batch)
+                        batch.clear()
+            for batch in batches.values():
+                if batch:
+                    storage.put_many_shadow(batch)
+    return changed
+
+
+def _pointer_text(text: str, limit: int) -> str:
+    """Trim a UTF-8 field without splitting a multibyte character."""
+    return text.encode("utf-8")[:max(limit, 0)].decode("utf-8", errors="ignore")
+
+
+def capture_document_pointer(storage: SQLiteMemoryStorage, *, repo: str,
+                             project: str, path: str, commit: str,
+                             content: str, write: bool = True,
+                             source_state: str = "committed") -> MemoryRecord:
+    """Write a small decision-document pointer, not the source contents."""
+    if not re.fullmatch(r"[\w.-]+/[\w.-]+", repo):
+        raise ValueError("document repo must be an owner/repo slug")
+    if (not path or path.startswith("/") or ".." in Path(path).parts or
+            len(path.encode("utf-8")) > 300):
+        raise ValueError("document path must be a short repository-relative path")
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise ValueError("document commit must be a full Git SHA")
+    canonical = canonical_project(project, repo=repo)
+    lines = [line.strip() for line in content.splitlines() if line.strip()]
+    heading = next((line.lstrip("# ").strip() for line in lines
+                    if line.startswith("#")), "")
+    title = _pointer_text(heading or Path(path).stem.replace("_", " "),
+                          min(100, 398 - len(path.encode("utf-8"))))
+    summary = next((line for line in lines if line != heading and not line.startswith("#")), "")
+    if path.endswith(".json"):
+        try:
+            document = json.loads(content)
+            summary = str(next((document[key] for key in ("summary", "decision", "verdict", "pass_if")
+                                if key in document), summary)) if isinstance(document, dict) else summary
+        except (TypeError, ValueError):
+            pass
+    summary = _pointer_text(" ".join(summary.split()), 200)
+    allowance = 400 - len(path.encode("utf-8")) - len(title.encode("utf-8")) - 2
+    body = f"{title}\n{_pointer_text(summary, allowance)}\n{path}"
+    value = {"kind": "doc_pointer", "project": canonical, "repo": repo,
+             "path": path, "commit": commit, "title": title,
+             "summary": _pointer_text(summary, allowance), "body": body,
+             "source_ref": f"{repo}:{path}@{commit}", "source_state": source_state,
+             "content_sha256": hashlib.sha256(content.encode("utf-8")).hexdigest()}
+    record = MemoryRecord("episodic", f"doc:{repo}:{path}@{commit}", value,
+                          MemoryScope(project=canonical))
+    if write:
+        storage.put_many_shadow([record])
+    return record
+
+
+def _decision_document_path(path: str) -> bool:
+    """Select committed governance, ADR, spec, prereg, and verdict sources."""
+    return (path == "CLAUDE.md" or
+            (path.startswith(("governance/adr/", "docs/decisions/", "docs/specs/"))
+             and path.endswith(".md")) or
+            (path.startswith("docs/research/") and "prereg" in path.lower()
+             and path.endswith(".md")) or
+            (path.startswith("research/verdicts/") and path.endswith(".json")))
+
+
+def backfill_document_pointers(storage: SQLiteMemoryStorage,
+                               repos: list[tuple[str, str]],
+                               explicit_files: dict[str, set[str]] | None = None,
+                               historic_files: dict[str, list[tuple[str, str]]] | None = None) -> int:
+    """Idempotently scan explicit Git repositories and capture committed docs.
+
+    A later committed file revision gets its own key. Explicit untracked files
+    use the repo snapshot commit and are marked as working files; unchanged
+    content keeps its existing pointer across unrelated commits. Sources are
+    only read.
+    """
+    changed = 0
+    with closing(sqlite3.connect(storage.path)) as memory:
+        for repo, root in repos:
+            root_path = Path(root).expanduser().resolve()
+            def git(*args: str) -> str:
+                return subprocess.check_output(
+                    ["git", "-C", str(root_path), *args], text=True,
+                    stderr=subprocess.DEVNULL).strip()
+
+            ref = next((candidate for candidate in ("HEAD", "origin/main")
+                        if subprocess.run(["git", "-C", str(root_path), "rev-parse",
+                                           "--verify", "--quiet", candidate],
+                                          capture_output=True).returncode == 0), None)
+            if ref is None:
+                raise ValueError(f"no committed Git ref in {root_path}")
+            project = canonical_project(repo.rsplit("/", 1)[-1], repo=repo)
+            tracked = set(git("ls-tree", "-r", "--name-only", ref).splitlines())
+            paths = sorted({path for path in tracked if _decision_document_path(path)} |
+                           (explicit_files or {}).get(repo, set()))
+            sources = [(path, ref) for path in paths]
+            sources.extend((path, revision) for path, revision in
+                           (historic_files or {}).get(repo, []))
+            batch: list[MemoryRecord] = []
+            for path, source_ref in sources:
+                if (not path or path.startswith("/") or ".." in Path(path).parts):
+                    raise ValueError(f"invalid explicit document path: {path!r}")
+                source_state = "committed" if source_ref != ref or path in tracked else "working_file"
+                if source_state == "committed":
+                    if source_ref == ref:
+                        commit = git("log", "-1", "--format=%H", ref, "--", path)
+                    else:
+                        commit = git("rev-parse", "--verify", f"{source_ref}^{{commit}}")
+                    if not commit:
+                        continue
+                    content = subprocess.check_output(
+                        ["git", "-C", str(root_path), "show", f"{source_ref}:{path}"],
+                        text=True, stderr=subprocess.DEVNULL)
+                else:
+                    # Explicit local verdicts can be untracked. Anchor the
+                    # pointer to the repo snapshot and record their content
+                    # digest; never pretend that HEAD contains the file.
+                    commit = git("rev-parse", ref)
+                    content = (root_path / path).read_text(encoding="utf-8")
+                record = capture_document_pointer(
+                    storage, repo=repo, project=project, path=path,
+                    commit=commit, content=content, write=False,
+                    source_state=source_state)
+                if source_state == "working_file":
+                    # HEAD is only an anchor for an untracked file. An
+                    # unrelated commit must not create another pointer to
+                    # identical bytes, and changed bytes replace the old
+                    # working-file pointer rather than accumulating forever.
+                    previous = memory.execute(
+                        "SELECT key,value FROM adr001_memory "
+                        "WHERE json_extract(value,'$.kind')='doc_pointer' "
+                        "AND json_extract(value,'$.source_state')='working_file' "
+                        "AND json_extract(value,'$.repo')=? "
+                        "AND json_extract(value,'$.path')=?",
+                        (repo, path)).fetchall()
+                    if any(json.loads(value).get("content_sha256") ==
+                           record.value["content_sha256"] for _, value in previous):
+                        continue
+                    storage.put_many_shadow([record])
+                    memory.execute(
+                        "DELETE FROM adr001_memory WHERE key<>? "
+                        "AND json_extract(value,'$.kind')='doc_pointer' "
+                        "AND json_extract(value,'$.source_state')='working_file' "
+                        "AND json_extract(value,'$.repo')=? "
+                        "AND json_extract(value,'$.path')=?",
+                        (record.key, repo, path))
+                    memory.commit()
+                    changed += 1
+                    continue
+                before = memory.execute("SELECT value FROM adr001_memory WHERE key=?",
+                                        (record.key,)).fetchone()
+                if before is not None and json.loads(before[0]) == record.value:
+                    continue
+                batch.append(record)
+                changed += 1
+                if len(batch) >= 100:
+                    storage.put_many_shadow(batch)
+                    batch.clear()
+            if batch:
+                storage.put_many_shadow(batch)
+    return changed
+
+
 def capture_blackboard_result(storage: SQLiteMemoryStorage, frontmatter: dict) -> MemoryRecord:
     """Map the Blackboard bot name, then use the existing ingest function."""
     source = str(frontmatter.get("repo") or frontmatter.get("link") or "")
@@ -275,6 +558,10 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
             provider_session=attribution[1] if attribution else "",
             context_generation=attribution[2] if attribution else None,
         )
+        # A project-wide outcome can be recalled by later tasks. The older
+        # task-scoped rows above remain for compatibility and attribution.
+        capture_task_outcome_record(SQLiteMemoryStorage.existing(str(path)),
+                                    db_path, task_id)
         record_context_event(events_path, "shadow_memory_capture",
                              task_id=task_id, outcome="stored",
                              layers=[record.layer for record in records],
@@ -295,3 +582,18 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
                                      latency_ms=round((perf_counter() - started) * 1000, 3))
         except Exception:
             logger.exception("shadow memory capture telemetry failed for %s", task_id)
+
+
+def capture_merge_best_effort(db_path: str, review_task_id: str) -> None:
+    """Refresh a review outcome after its merge receipt is committed."""
+    if not review_task_id:
+        return
+    try:
+        shadow_db = os.getenv("AGENT_CREW_SHADOW_MEMORY_DB", "").strip()
+        if (not shadow_db or os.getenv("AGENT_CREW_SHADOW_MEMORY_CAPTURE_ENABLED", "1").lower()
+                in {"0", "false", "no", "off"}):
+            return
+        capture_task_outcome_record(SQLiteMemoryStorage.existing(str(Path(shadow_db).expanduser())),
+                                    db_path, review_task_id)
+    except Exception:
+        logger.exception("shadow merge outcome capture failed for %s", review_task_id)

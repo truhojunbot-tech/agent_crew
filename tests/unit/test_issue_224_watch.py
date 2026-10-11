@@ -31,6 +31,11 @@ from agent_crew.watch import (
 REPO = "org/repo"
 
 
+@pytest.fixture(autouse=True)
+def configured_risk_tier(monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_DEFAULT_RISK_TIER", "1")
+
+
 def make_issue(number=1, title="Fix bug", labels=None, body="details"):
     return {
         "number": number,
@@ -107,9 +112,28 @@ def test_actionable_issue_is_discovered_and_enqueued_once(queue, ledger):
     # Issue metadata must survive into the task so the PR can link back (req 4).
     assert tasks[0].context["issue"] == 7
     assert tasks[0].context["repo"] == REPO
+    assert tasks[0].context["risk_tier"] == 1
     assert "Fix crash on startup" in tasks[0].description
     # The claim is GitHub-visible (req 2).
     assert (7, CLAIM_LABEL) in gh.added
+
+
+def test_issue_risk_label_overrides_default(queue, ledger):
+    gh = FakeGitHub([make_issue(8, labels=["bug", "risk-tier:3"])])
+    assert run_cycle(queue=queue, ledger=ledger, repo=REPO, gh=gh)["enqueued"] == [8]
+    assert queue.list_tasks()[0].context["risk_tier"] == 3
+
+
+def test_missing_risk_tier_leaves_issue_unclaimed(queue, ledger, monkeypatch, caplog):
+    monkeypatch.delenv("AGENT_CREW_DEFAULT_RISK_TIER")
+    gh = FakeGitHub([make_issue(8, labels=["bug", "risk-tier:4"])])
+    result = run_cycle(queue=queue, ledger=ledger, repo=REPO, gh=gh)
+    assert result["enqueued"] == []
+    assert result["skipped"] == [8]
+    assert "without risk-tier" in caplog.text
+    assert ledger.get(REPO, 8) is None
+    assert gh.added == []
+    assert queue.list_tasks() == []
 
 
 def test_second_cycle_does_not_re_enqueue_the_same_issue(queue, ledger):
@@ -153,7 +177,8 @@ def test_issue_with_active_task_in_queue_is_skipped(queue, ledger):
 
     queue.enqueue(TaskRequest(
         task_id="impl-existing", task_type="implement",
-        description="already working on it", context={"issue": 13, "repo": REPO},
+        description="already working on it", context={"issue": 13, "repo": REPO,
+                                               "risk_tier": 1},
     ))
     gh = FakeGitHub([make_issue(13, "Being worked on", ["bug"])])
 

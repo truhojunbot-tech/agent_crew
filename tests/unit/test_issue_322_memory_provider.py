@@ -4,6 +4,7 @@ import inspect
 import json
 import os
 import subprocess
+import threading
 import time
 import uuid
 
@@ -79,7 +80,8 @@ class _TimeoutProvider:
 
 
 def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled=True,
-                       shadow_memory_timeout_seconds=None, unused_tcp_port):
+                       shadow_memory_timeout_seconds=None, unused_tcp_port,
+                       on_dispatch_return=None):
     """Run the production dispatch seam and return its actual provider prompt."""
     tmp_path.mkdir()
     wt = tmp_path / "claude"
@@ -135,7 +137,12 @@ def _dispatch_snapshot(tmp_path, monkeypatch, provider, *, shadow_memory_enabled
         task = queue.dequeue(role="implementer")
         assert task is not None
         dispatch_started = time.perf_counter()
-        asyncio.run(app.state.dispatch_task(task, "implementer"))
+        async def dispatch():
+            await app.state.dispatch_task(task, "implementer")
+            if on_dispatch_return is not None:
+                on_dispatch_return()
+
+        asyncio.run(dispatch())
         dispatch_seconds = time.perf_counter() - dispatch_started
 
     events = [json.loads(line) for line in open(os.path.join(tmp_path, "context_events.jsonl"))]
@@ -155,9 +162,18 @@ class _SlowProvider:
     name = "slow"
     backend = "test"
 
+    def __init__(self, started, release, finished):
+        self.started = started
+        self.release = release
+        self.finished = finished
+
     def retrieve(self, request):
-        time.sleep(2)
-        return MemoryResult(provider=self.name, backend=self.backend, state="empty")
+        self.started.set()
+        try:
+            self.release.wait(timeout=5)
+            return MemoryResult(provider=self.name, backend=self.backend, state="empty")
+        finally:
+            self.finished.set()
 
 
 class _CrossProjectProvider:
@@ -169,6 +185,104 @@ class _CrossProjectProvider:
             _item("project-a", "project-a"), _item("project-b", "project-b"),
             _item("project-less", ""),
         ))
+
+
+def test_hybrid_dispatch_uses_ranked_memory_and_records_receipt(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+    from agent_crew.memory_runtime import MemoryRecord, MemoryScope
+
+    path = tmp_path / "ranked.db"
+    storage = HybridMemoryStorage(str(path))
+    storage.put(MemoryRecord(
+        "procedural", "owner_principle:fleet", {"text": "make a change"},
+        MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord(
+        "decision", "standing:project", {"kind": "standing_decision", "text": "make a change"},
+        MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_FLEET", "fleet")
+    _, context, events, _ = _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
+        shadow_memory_enabled=False,
+        unused_tcp_port=unused_tcp_port)
+    assert len(events) == 1
+    assert events[0]["retrieval_mode"] == "lexical_only"
+    assert events[0]["head_bytes"] > 2
+    assert events[0]["superseded_served"] == 0
+    assert {"owner_principle:fleet", "standing:project"} <= set(events[0]["result_ids"])
+    assert context["shadow_memory"]["retrieval_mode"] == "lexical_only"
+    assert events[0]["fleet"] == "fleet"
+
+
+def test_hybrid_dispatch_without_fleet_env_records_unscoped_head(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+    from agent_crew.memory_runtime import MemoryRecord, MemoryScope
+
+    path = tmp_path / "ranked.db"
+    storage = HybridMemoryStorage(str(path))
+    storage.put(MemoryRecord(
+        "procedural", "owner_principle:fleet", {"text": "make a change"},
+        MemoryScope(fleet="fleet")))
+    storage.put(MemoryRecord(
+        "decision", "standing:project", {"kind": "standing_decision", "text": "make a change"},
+        MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    monkeypatch.delenv("AGENT_CREW_MEMORY_FLEET", raising=False)
+    _, context, events, _ = _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
+        shadow_memory_enabled=False, unused_tcp_port=unused_tcp_port)
+    assert len(events) == 1
+    assert events[0]["fleet"] == ""
+    assert context["shadow_memory"]["fleet"] == ""
+    assert "standing:project" in events[0]["result_ids"]
+    assert "owner_principle:fleet" not in events[0]["result_ids"]
+
+
+def test_hybrid_dispatch_timeout_records_fallback_without_blocking(
+        tmp_path, monkeypatch, *, unused_tcp_port):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+    from agent_crew.memory_runtime import MemoryRecord, MemoryScope
+
+    path = tmp_path / "slow-ranked.db"
+    storage = HybridMemoryStorage(str(path))
+    storage.put(MemoryRecord("episodic", "slow", {"text": "make a change"},
+                             MemoryScope(project="project-a")))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    original_rank = HybridMemoryStorage._rank_middle
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def slow_rank(self, *args):
+        started.set()
+        try:
+            release.wait(timeout=5)
+            return original_rank(self, *args)
+        finally:
+            finished.set()
+
+    def assert_dispatch_returned_while_rank_blocked():
+        try:
+            assert started.is_set()
+            assert not finished.is_set()
+        finally:
+            release.set()
+
+    monkeypatch.setattr(HybridMemoryStorage, "_rank_middle", slow_rank)
+    try:
+        _, context, events, _ = _dispatch_snapshot(
+            tmp_path / "dispatch", monkeypatch, _MustNotBeCalledProvider(),
+            unused_tcp_port=unused_tcp_port,
+            on_dispatch_return=assert_dispatch_returned_while_rank_blocked)
+    finally:
+        release.set()
+    assert events[0]["retrieval_mode"] == "fallback"
+    assert events[0]["latency_ms"] == 300.0
+    assert events[0]["superseded_served"] == 0
+    assert context["shadow_memory"]["retrieval_mode"] == "fallback"
 
 
 def test_shadow_memory_kill_switch_never_invokes_provider(tmp_path, monkeypatch, *, unused_tcp_port):
@@ -249,11 +363,25 @@ def test_runtime_shadow_flag_off_makes_no_retrieval_and_keeps_message_identical(
 
 
 def test_slow_shadow_provider_cannot_hold_baseline_dispatch(tmp_path, monkeypatch, *, unused_tcp_port):
-    _, _, events, dispatch_seconds = _dispatch_snapshot(
-        tmp_path / "slow", monkeypatch, _SlowProvider(), shadow_memory_timeout_seconds=0.05, unused_tcp_port=unused_tcp_port)
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
 
-    assert dispatch_seconds < 0.5
+    def assert_dispatch_returned_while_provider_blocked():
+        try:
+            assert started.is_set()
+            assert not finished.is_set()
+        finally:
+            release.set()
+
+    try:
+        _, _, events, _ = _dispatch_snapshot(
+            tmp_path / "slow", monkeypatch, _SlowProvider(started, release, finished),
+            shadow_memory_timeout_seconds=0.05, unused_tcp_port=unused_tcp_port,
+            on_dispatch_return=assert_dispatch_returned_while_provider_blocked)
+    finally:
+        release.set()
+
     assert events[0]["state"] == "timeout"
+    assert events[0]["latency_ms"] > 0
 
 
 def test_shadow_dispatch_uses_250ms_default_timeout(tmp_path, monkeypatch, *, unused_tcp_port):

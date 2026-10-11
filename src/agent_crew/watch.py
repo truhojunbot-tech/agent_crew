@@ -775,6 +775,9 @@ def build_task(issue: dict, repo: str, branch: str, project: str = "",
     title = issue.get("title") or f"issue #{number}"
     url = issue.get("url") or f"https://github.com/{repo}/issues/{number}"
     body, body_truncated = cap_issue_body(issue.get("body") or "", url=url)
+    tier = risk_tier_for_issue(issue)
+    if tier is None:
+        raise ValueError("issue has no risk-tier:0-3 label or AGENT_CREW_DEFAULT_RISK_TIER")
     return TaskRequest(
         task_id=f"impl-watch-{uuid.uuid4().hex[:8]}",
         task_type="implement",
@@ -783,6 +786,7 @@ def build_task(issue: dict, repo: str, branch: str, project: str = "",
         priority=priority_for(issue.get("labels") or [], rules),
         project=project,
         context={
+            "risk_tier": tier,
             "issue": number,
             "issue_title": title,
             # #239 review: persist the body we ALREADY fetched at discovery.
@@ -800,6 +804,16 @@ def build_task(issue: dict, repo: str, branch: str, project: str = "",
             "source": "watch",
         },
     )
+
+
+def risk_tier_for_issue(issue: dict) -> int | None:
+    """Use a valid issue label, then the configured watch default."""
+    for label in issue.get("labels") or []:
+        name = label.get("name", "") if isinstance(label, dict) else label
+        if isinstance(name, str) and re.fullmatch(r"risk-tier:[0-3]", name):
+            return int(name[-1])
+    raw = os.getenv("AGENT_CREW_DEFAULT_RISK_TIER", "").strip()
+    return int(raw) if raw in {"0", "1", "2", "3"} else None
 
 
 def run_cycle(
@@ -872,6 +886,14 @@ def run_cycle(
         if len(out["enqueued"]) >= max_claims:
             break
         number = issue["number"]
+
+        # Check before claiming: absent metadata is an operator input gap,
+        # not an enqueue attempt to charge against the issue's retry budget.
+        if risk_tier_for_issue(issue) is None:
+            logger.warning("watch: skipping %s#%s without risk-tier:0-3 label or "
+                           "AGENT_CREW_DEFAULT_RISK_TIER", repo, number)
+            out["skipped"].append(number)
+            continue
 
         # An open PR means the work exists already. Checked last of the
         # filters because it is the only per-issue network call.

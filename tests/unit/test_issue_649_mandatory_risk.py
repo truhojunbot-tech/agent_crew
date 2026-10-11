@@ -24,7 +24,7 @@ def test_http_root_requires_risk_tier(tmp_path, task_type):
             "description": "work", "context": {}},
             headers={"X-Agent-Crew-Project": "agent_crew"})
     assert response.status_code == 422
-    assert "--risk-tier" in response.text
+    assert "context.risk_tier" in response.text
     assert TaskQueue(db).get_task(f"root-{task_type}") is None
 
 
@@ -57,10 +57,11 @@ def test_cascade_chain_keeps_root_tier_and_declaration(tmp_path):
             successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
         previous = queue.get_task(task_id)
         assert previous.context["risk_tier"] == 2
-        assert previous.context["risk_declaration"] == declaration
+        assert previous.context["risk_declaration"] == {
+            **declaration, "inherited_from": "impl-root"}
 
 
-def test_http_successor_inherits_root_risk(tmp_path):
+def test_http_successor_with_declared_tier_inherits_root_risk(tmp_path):
     db = str(tmp_path / "tasks.db")
     app = create_app(db, pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
@@ -71,13 +72,18 @@ def test_http_successor_inherits_root_risk(tmp_path):
             "task_id": "impl-root", "task_type": "implement", "description": "work",
             "context": {"risk_tier": 2}}, headers=headers)
         assert root.status_code == 201, root.text
+        tierless = client.post("/tasks", json={
+            "task_id": "review-tierless", "task_type": "review", "description": "review",
+            "context": {"prev_task_id": "impl-root"}}, headers=headers)
+        assert tierless.status_code == 422
         child = client.post("/tasks", json={
             "task_id": "review-root", "task_type": "review", "description": "review",
-            "context": {"prev_task_id": "impl-root"}}, headers=headers)
+            "context": {"prev_task_id": "impl-root", "risk_tier": 2}}, headers=headers)
     assert child.status_code == 201, child.text
     queue = TaskQueue(db)
     root_context = queue.get_task_context("impl-root")
     child_context = queue.get_task_context("review-root")
+    assert queue.get_task("review-tierless") is None
     assert child_context["risk_tier"] == 2
     assert child_context["risk_declaration"] == root_context["risk_declaration"]
 

@@ -30,6 +30,7 @@ another provider, with no change to the dispatcher contract.
 """
 
 import hashlib
+import math
 import json
 import logging
 import os
@@ -48,6 +49,8 @@ logger = logging.getLogger(__name__)
 # read. Keep at most one such daemon worker alive instead of accumulating one
 # per dispatch while the optional provider is unhealthy.
 _FORGE_HTTP_SLOT = threading.BoundedSemaphore(1)
+_FORGE_LOGGED_URLS: set[str] = set()
+_FORGE_DEFAULT_URL = "http://127.0.0.1:8769"
 
 #: Bump only for breaking changes to the pack/artifact field contract.
 CONTEXT_PACK_SCHEMA_VERSION = 1
@@ -169,6 +172,9 @@ class ContextPack:
     degraded: bool = False
     degraded_reason: str = ""
     provider_errors: list = field(default_factory=list)
+    tail_bytes: int = 0
+    forge_timeout: int = 0
+    forge_error: str = ""
 
     @property
     def selected_count(self) -> int:
@@ -218,6 +224,9 @@ class ContextPack:
             "candidate_count": self.candidate_count,
             "selected_count": self.selected_count,
             "forge_items": sum(a.artifact_id.startswith("forge:") for a in self.items),
+            "tail_bytes": self.tail_bytes,
+            "forge_timeout": self.forge_timeout,
+            "forge_error": self.forge_error,
             "total_tokens": self.total_tokens,
             "tokens_by_category": self.tokens_by_category(),
             "stale_count": self.stale_count,
@@ -465,15 +474,43 @@ class ForgeProvider(RetrievalProvider):
     version = 1
     mode = MODE_HYBRID
 
-    def __init__(self, forge_url: str = "http://127.0.0.1:9002", timeout_s: float = 5.0):
-        self._url = forge_url.rstrip("/")
+    def __init__(self, forge_url: Optional[str] = None,
+                 timeout_s: Optional[float] = None):
+        self._url = (forge_url or os.getenv("AGENT_CREW_FORGE_URL") or
+                     _FORGE_DEFAULT_URL).rstrip("/")
+        if timeout_s is None:
+            raw = os.getenv("AGENT_CREW_FORGE_TIMEOUT_MS", "300")
+            try:
+                timeout_s = float(raw) / 1000
+                if not math.isfinite(timeout_s) or timeout_s <= 0:
+                    raise ValueError(raw)
+            except ValueError:
+                logger.warning("context_pack: invalid Forge timeout %r; using 300 ms", raw)
+                timeout_s = 0.3
         self._timeout = timeout_s
         self.last_error = ""
+        self.last_timeout = False
+        self.last_tail_bytes = 0
+        self.last_mode = ""
+        self.last_model_id = ""
+        if self._url not in _FORGE_LOGGED_URLS:
+            _FORGE_LOGGED_URLS.add(self._url)
+            logger.info("context_pack: Forge URL=%s", self._url)
 
     def retrieve(self, query: RetrievalQuery) -> list:
         self.last_error = ""
+        self.last_timeout = False
+        self.last_tail_bytes = 0
+        self.last_mode = ""
+        self.last_model_id = ""
         payload = {
-            "query": f"{query.issue_title} {' '.join(query.keywords[:4])}".strip(),
+            "query": f"{query.issue_title} {' '.join(query.keywords[:4])}".strip()
+                     or "task context",
+            "repo": query.repo or "unknown/unknown",
+            "project": query.repo.split("/")[-1] if query.repo else "unknown",
+            "role": query.role or "implementer",
+            "issue": query.issue_number,
+            "byte_budget": 8000,
             "situation": {
                 "project": query.repo.split("/")[-1] if query.repo else "*",
                 "task_type": query.task_type or "implement",
@@ -495,18 +532,39 @@ class ForgeProvider(RetrievalProvider):
                     headers={"Content-Type": "application/json"}, method="POST")
                 with urllib.request.urlopen(request, timeout=self._timeout) as response:
                     body = json.load(response)
-                if not isinstance(body, dict) or not isinstance(body.get("context_items"), list):
-                    raise ValueError("Forge response has no context_items list")
-                items = body["context_items"]
-                if any(not isinstance(item, dict) or
-                       not isinstance(item.get("chunk_id"), str) or not item["chunk_id"] or
-                       not isinstance(item.get("source_file"), str) or not item["source_file"] or
-                       not isinstance(item.get("content"), str) or "score" not in item
-                       for item in items):
-                    raise ValueError("Forge response contains an incomplete context item")
-                result["items"] = [self._to_artifact(item) for item in items]
+                if not isinstance(body, dict):
+                    raise ValueError("Forge response is not an object")
+                if isinstance(body.get("items"), list):
+                    items = body["items"]
+                    if any(not isinstance(item, dict) or
+                           not all(isinstance(item.get(key), str) and item[key]
+                                   for key in ("source_path", "repo", "commit_sha",
+                                               "content_sha", "text")) or
+                           not isinstance(item.get("bytes"), int) or item["bytes"] < 0 or
+                           not isinstance(item.get("score"), (int, float))
+                           for item in items):
+                        raise ValueError("Forge response contains an incomplete item")
+                    result["items"] = [self._to_live_artifact(item) for item in items]
+                elif isinstance(body.get("context_items"), list):
+                    items = body["context_items"]
+                    if any(not isinstance(item, dict) or
+                           not isinstance(item.get("chunk_id"), str) or not item["chunk_id"] or
+                           not isinstance(item.get("source_file"), str) or not item["source_file"] or
+                           not isinstance(item.get("content"), str) or "score" not in item
+                           for item in items):
+                        raise ValueError("Forge response contains an incomplete context item")
+                    result["items"] = [self._to_artifact(item) for item in items]
+                else:
+                    raise ValueError("Forge response has no items list")
+                size = body.get("tail_bytes", 0)
+                if not isinstance(size, int) or size < 0:
+                    raise ValueError("Forge response has invalid tail_bytes")
+                result["tail_bytes"] = size
+                result["mode"] = str(body.get("mode") or "")
+                result["model_id"] = str(body.get("model_id") or "")
             except Exception as exc:  # noqa: BLE001 — optional provider degrades
                 result["error"] = f"{type(exc).__name__}: {exc}"
+                result["timed_out"] = isinstance(exc, TimeoutError)
             finally:
                 _FORGE_HTTP_SLOT.release()
                 done.set()
@@ -519,12 +577,29 @@ class ForgeProvider(RetrievalProvider):
             done.set()
         if not done.wait(self._timeout):
             self.last_error = f"Forge request timeout after {self._timeout}s"
+            self.last_timeout = True
         else:
             self.last_error = result.get("error", "")
+            self.last_timeout = bool(result.get("timed_out"))
         if self.last_error:
             logger.warning("context_pack: Forge retrieval failed: %s", self.last_error)
             return []
+        self.last_tail_bytes = result.get("tail_bytes", 0)
+        self.last_mode = result.get("mode", "")
+        self.last_model_id = result.get("model_id", "")
         return result.get("items", [])
+
+    @staticmethod
+    def _to_live_artifact(item: dict) -> Artifact:
+        identity = "\0".join((item["repo"], item["source_path"], item["content_sha"]))
+        return Artifact(
+            artifact_id=f"forge:{hashlib.sha256(identity.encode()).hexdigest()[:16]}",
+            uri=item["source_path"], artifact_type=TYPE_EVIDENCE,
+            revision=item["commit_sha"], score=float(item["score"]),
+            score_components={"forge_score": float(item["score"])},
+            provenance=f"Context Forge {item['repo']} at {item['commit_sha']}",
+            freshness=FRESH, excerpt=item["text"],
+        )
 
     @staticmethod
     def _to_artifact(item: dict) -> Artifact:
@@ -726,6 +801,8 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
             elif isinstance(p, ForgeProvider):
                 retrieved = [a for a in retrieved if not any(
                     key in lexical_paths for key in _artifact_path_keys(a.uri, query.repo_path))]
+                pack.forge_timeout += int(p.last_timeout)
+                pack.forge_error = p.last_error
                 if p.last_error:
                     pack.degraded = True
                     pack.provider_errors.append(f"{p.name}: {p.last_error}")
@@ -766,6 +843,8 @@ def plan_pack(query: RetrievalQuery, providers: list, *,
         per_type[a.artifact_type] = per_type.get(a.artifact_type, 0) + 1
 
     pack.items = selected
+    pack.tail_bytes = sum(len(a.excerpt.encode("utf-8")) for a in selected
+                          if a.artifact_id.startswith("forge:"))
     # Hybrid attribution describes what reached the pack, not which optional
     # provider was queried. Keep failed Forge attempts in degraded telemetry.
     if (mode == MODE_HYBRID and any(isinstance(p, ForgeProvider) for p in providers)
@@ -1131,7 +1210,7 @@ def build_pack_for_task(task_context: dict, *, task_id: str, task_type: str,
     )
     providers = [IssueProvider(), LexicalRepoProvider()]
     if forge_enabled():
-        providers.append(ForgeProvider(os.getenv("AGENT_CREW_FORGE_URL", "http://127.0.0.1:9002")))
+        providers.append(ForgeProvider())
     episodes = load_episodes(episodes_path) if episodes_path else []
     if episodes_path:
         providers.append(EpisodicProvider(episodes))
