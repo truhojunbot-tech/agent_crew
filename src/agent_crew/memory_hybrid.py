@@ -238,7 +238,10 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             raise ValueError(f"invalid memory fusion mode: {self.fusion_mode}")
         self._np = None
         if self.fusion_mode == "weighted":
-            import numpy as np
+            try:
+                import numpy as np
+            except ImportError as exc:
+                raise ValueError("weighted memory fusion requires numpy") from exc
             self._np = np
         self.fusion_weight = float(fusion_weight if fusion_weight is not None else
                                    os.getenv("AGENT_CREW_MEMORY_FUSION_WEIGHT", "0.5"))
@@ -321,7 +324,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 hashlib.sha256(json.dumps(row["value"], sort_keys=True).encode()).hexdigest()
                 not in decisions]
 
-    def _weighted_vector_top(self, scope: MemoryScope, query: str) -> tuple[list[dict], dict[int, int]]:
+    def _weighted_vector_top(self, scope: MemoryScope, query: str,
+                             deadline: Optional[float] = None) -> tuple[list[dict], dict[int, int]]:
         """Rank every current in-scope vector, then materialize only the top 96."""
         if self.embedder is None:
             return [], {}
@@ -333,35 +337,66 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         if not qnorm:
             return [], {}
         clause, params = _scope_sql(scope)
-        with closing(sqlite3.connect(self.path)) as db:
-            rows = db.execute(
-                "SELECT m.rowid,f.body,v.content_sha,v.vec FROM adr001_memory m "
+        with closing(sqlite3.connect(self.path, timeout=.05)) as db:
+            if deadline is not None:
+                db.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)
+            cursor = db.execute(
+                "SELECT m.rowid,v.vec FROM adr001_memory m "
                 "JOIN adr001_vec v ON v.rowid=m.rowid "
-                "JOIN adr001_fts f ON f.rowid=m.rowid WHERE " + clause + " AND " +
+                "WHERE " + clause + " AND " +
                 _effective_sql() + " AND v.model_id=? AND v.vec IS NOT NULL",
                 [*params, self.model_id],
-            ).fetchall()
-            valid = [(rowid, blob) for rowid, body, digest, blob in rows
-                     if len(blob) == q.size * 4 and
-                     digest == hashlib.sha256(body.encode()).hexdigest()]
+            )
+            valid = []
+            while rows := cursor.fetchmany(512):
+                valid.extend((rowid, blob) for rowid, blob in rows
+                             if len(blob) == q.size * 4)
+                if deadline is not None and time.perf_counter() >= deadline:
+                    raise TimeoutError("scoped vector scan exceeded retrieval budget")
             if not valid:
                 return [], {}
             matrix = np.frombuffer(b"".join(blob for _, blob in valid), dtype=np.float32)
             matrix = matrix.reshape(len(valid), q.size)
-            norms = np.linalg.norm(matrix, axis=1)
+            norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix))
             scores = matrix @ q  # one BLAS matmul for the whole scoped vector arm
             scores = np.divide(scores, norms * qnorm, out=np.full_like(scores, -np.inf),
                                where=norms > 0)
-            top = [valid[int(index)][0] for index in np.argsort(-scores, kind="stable")
-                   if np.isfinite(scores[index])][:MIDDLE_CANDIDATE_LIMIT]
-            if not top:
-                return [], {}
-            records = db.execute(
-                "SELECT rowid,layer,key,value,scope,version,created FROM adr001_memory "
-                "WHERE rowid IN (" + ",".join("?" for _ in top) + ")", top,
-            ).fetchall()
-        by_id = {row[0]: _row_record(row) for row in records}
-        return [by_id[rowid] for rowid in top if rowid in by_id], {
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError("scoped vector score exceeded retrieval budget")
+            # Fetch and hash only rows that can enter the top list. The DB
+            # triggers clear vectors on value changes; this check also catches
+            # stale vectors imported from older stores.
+            ranked = (valid[int(index)][0] for index in np.argsort(-scores, kind="stable")
+                      if np.isfinite(scores[index]))
+            top, by_id = [], {}
+            while len(top) < MIDDLE_CANDIDATE_LIMIT:
+                batch = []
+                for _ in range(128):
+                    rowid = next(ranked, None)
+                    if rowid is None:
+                        break
+                    batch.append(rowid)
+                if not batch:
+                    break
+                records = db.execute(
+                    "SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created,"
+                    "f.body,v.content_sha FROM adr001_memory m "
+                    "JOIN adr001_fts f ON f.rowid=m.rowid "
+                    "JOIN adr001_vec v ON v.rowid=m.rowid WHERE m.rowid IN (" +
+                    ",".join("?" for _ in batch) + ") AND " + _effective_sql() +
+                    " AND v.model_id=?", [*batch, self.model_id],
+                ).fetchall()
+                current = {row[0]: row for row in records
+                           if row[8] == hashlib.sha256(row[7].encode()).hexdigest()}
+                for rowid in batch:
+                    if rowid in current:
+                        top.append(rowid)
+                        by_id[rowid] = _row_record(current[rowid][:7])
+                        if len(top) == MIDDLE_CANDIDATE_LIMIT:
+                            break
+                if deadline is not None and time.perf_counter() >= deadline:
+                    raise TimeoutError("scoped vector validation exceeded retrieval budget")
+        return [by_id[rowid] for rowid in top], {
             rowid: rank for rank, rowid in enumerate(top, 1)}
 
     def render_head(self, project: str, fleet: str = "") -> dict:
@@ -530,7 +565,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 raise TimeoutError("candidate lookup exceeded retrieval budget")
             vector_rank = None
             if self.fusion_mode == "weighted":
-                vector_rows, vector_rank = self._weighted_vector_top(scope, query)
+                vector_rows, vector_rank = self._weighted_vector_top(scope, query, deadline)
                 seen = {row["rowid"] for row in candidates}
                 candidates.extend(row for row in vector_rows if row["rowid"] not in seen)
                 if time.perf_counter() >= deadline:

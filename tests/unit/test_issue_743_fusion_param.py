@@ -1,9 +1,10 @@
 """#743: scoped vector and FTS arms with configurable fusion."""
-from array import array
+import builtins
 import hashlib
 import json
 import sqlite3
 import time
+from array import array
 
 from fastapi.testclient import TestClient
 
@@ -90,6 +91,28 @@ def test_invalid_fusion_settings_are_refused(tmp_path):
         raise AssertionError("out-of-range fusion weight was accepted")
 
 
+def test_weighted_mode_without_numpy_uses_startup_fallback(tmp_path, monkeypatch):
+    path = tmp_path / "memory.db"
+    SQLiteMemoryStorage(str(path))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_DB", str(path))
+    monkeypatch.setenv("AGENT_CREW_MEMORY_FUSION_MODE", "weighted")
+    original_import = builtins.__import__
+
+    def missing_numpy(name, *args, **kwargs):
+        if name == "numpy":
+            raise ModuleNotFoundError("No module named 'numpy'")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing_numpy)
+    with TestClient(create_app(str(tmp_path / "tasks.db"), project="home",
+                               watchdog_disabled=True, anomaly_disabled=True)) as client:
+        response = client.get("/health", headers={"X-Agent-Crew-Project": "home"})
+    assert response.status_code == 200
+    assert response.json()["hybrid_memory"] == {"available": False,
+                                                 "startup_fallback_count": 1}
+
+
 def test_vector_arm_is_bounded_above_candidate_cap(tmp_path):
     path = tmp_path / "memory.db"
     store = HybridMemoryStorage(str(path), embedder=Embedder(),
@@ -148,7 +171,7 @@ def test_weighted_vector_top96_finds_old_scoped_vector_beyond_recent_cap(tmp_pat
     assert result["middle"][0]["key"] == "old:target"
 
 
-def test_weighted_vector_matmul_under_300ms_on_5000_scoped_rows(tmp_path):
+def test_weighted_vector_matmul_under_300ms_on_live_sized_scoped_rows(tmp_path):
     path = tmp_path / "memory.db"
     store = HybridMemoryStorage(str(path), embedder=Embedder(),
                                 fusion_mode="weighted", fusion_weight=.6667)
@@ -156,20 +179,28 @@ def test_weighted_vector_matmul_under_300ms_on_5000_scoped_rows(tmp_path):
         db.executemany("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
                        "VALUES (?,?,?,?,?,?)", [
             ("episodic", f"row:{i}", json.dumps({"text": f"unrelated {i}"}),
-             json.dumps({"project": "home"}), 1, float(i)) for i in range(5000)])
+             json.dumps({"project": "home"}), 1, float(i)) for i in range(20000)])
         rows = db.execute("SELECT m.rowid,f.body FROM adr001_memory m JOIN adr001_fts f "
                           "ON f.rowid=m.rowid").fetchall()
-        blob = array("f", [1.0, 0.0]).tobytes()
+        blob = array("f", [1.0] + [0.0] * 383).tobytes()
         db.executemany("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
                        "VALUES (?,?,?,?)", [
             (rowid, Embedder.model_id, hashlib.sha256(body.encode()).hexdigest(), blob)
             for rowid, body in rows])
         db.commit()
-    started = time.perf_counter()
-    result = store.retrieve_ranked(MemoryScope(project="home"), "needle", "implementer", 10, 10000)
-    elapsed = (time.perf_counter() - started) * 1000
-    assert result["mode"] == "hybrid"
-    assert elapsed < 300, elapsed
+    class WideEmbedder:
+        model_id = Embedder.model_id
+
+        def __call__(self, text):
+            return [1.0] + [0.0] * 383
+
+    store.embedder = WideEmbedder()
+    for _ in range(3):
+        result = store.retrieve_ranked(MemoryScope(project="home"), "needle",
+                                       "implementer", 10, 10000)
+        assert result["mode"] == "hybrid", result["latency_ms"]
+        assert result["latency_ms"] < 300
+    assert store.fallback_count == 0
 
 
 def test_server_receipt_keeps_nondefault_fusion_mode_and_timeout(tmp_path, monkeypatch,
