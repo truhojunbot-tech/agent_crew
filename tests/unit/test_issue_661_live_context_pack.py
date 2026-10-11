@@ -209,8 +209,80 @@ def test_dispatch_memory_budget_counts_only_rendered_rows(tmp_path, monkeypatch)
     assert len(block) <= 1600
     assert counts["authoritative"] == block.count("authoritative key=")
     assert counts["failure_pattern"] == block.count("failure_pattern key=")
-    assert counts["authoritative"] < 30
+    assert counts["authoritative"] == 30
     assert "long excerpt" not in block
+
+
+def test_dispatch_memory_caps_utf8_bytes_after_all_authoritative_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    for number in range(300):
+        storage.put(MemoryRecord("authoritative", f"fact:{number:03d}",
+                                 {"text": "한글 " * 100},
+                                 MemoryScope(project="agent_crew")))
+    storage.put(MemoryRecord("failure_pattern", "wc1:budget",
+                             {"text": "warning"}, MemoryScope(fleet="fleet")))
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-738", MemoryScope(project="agent_crew"))
+    assert len(block.encode("utf-8")) <= 8900
+    assert counts == {"authoritative": 300, "failure_pattern": 1}
+    assert all(f"authoritative key=fact:{number:03d}" in block for number in range(300))
+    assert "failure_pattern key=wc1:budget" in block
+    if "authoritative excerpt=" in block:
+        assert block.index("authoritative key=fact:299") < block.index("authoritative excerpt=")
+
+
+def test_dispatch_memory_uses_scope_only_rows_and_alias_preserves_local_patterns(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    for layer, key, scope in (
+        ("authoritative", "owner:Quota:telegram:6419236710:2154", MemoryScope(project="Quota")),
+        ("failure_pattern", "wc1:fleet", MemoryScope(fleet="fleet")),
+        ("failure_pattern", "local:quota-ops", MemoryScope(project="quota-ops")),
+        ("failure_pattern", "foreign:Quota", MemoryScope(project="Quota")),
+        ("episodic", "episode:ranked", MemoryScope(project="Quota")),
+        ("decision", "decision:ranked", MemoryScope(project="Quota")),
+    ):
+        value = {"text": key}
+        if layer == "authoritative":
+            value.update(kind="owner_statement", chat_id="6419236710", message_id="2154",
+                         verification_status="VERIFIED", supersedes=[],
+                         text_sha256=hashlib.sha256(key.encode()).hexdigest())
+        storage.put(MemoryRecord(layer, key, value, scope))
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-738", MemoryScope(project="Quota"),
+        local_project="quota-ops")
+    assert "owner:Quota:telegram:6419236710:2154" in block
+    assert "wc1:fleet" in block
+    assert "local:quota-ops" in block
+    assert "foreign:Quota" not in block
+    assert "episode:ranked" not in block
+    assert "decision:ranked" not in block
+    assert counts == {"authoritative": 1, "failure_pattern": 2}
+
+
+def test_dispatch_alias_keeps_the_crews_own_failure_pattern(
+        tmp_path, monkeypatch, unused_tcp_port):
+    from tests.unit.test_context_pack_inject_gate import _dispatch
+
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    storage.put(MemoryRecord("authoritative", "quota:policy", {"text": "Quota owner rule"},
+                             MemoryScope(project="Quota")))
+    storage.put(MemoryRecord("failure_pattern", "local:quota-ops",
+                             {"text": "Quota Ops local warning"},
+                             MemoryScope(project="quota-ops")))
+    storage.put(MemoryRecord("failure_pattern", "foreign:Quota",
+                             {"text": "wrong local warning"},
+                             MemoryScope(project="Quota")))
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", storage.path)
+    monkeypatch.setenv("AGENT_CREW_MEMORY_PROJECT_ALIASES", json.dumps({"quota-ops": "Quota"}))
+    result = _dispatch(tmp_path / "dispatch", monkeypatch, unused_tcp_port,
+                       task_project="quota-ops")
+    assert "quota:policy" in result["message"]
+    assert "local:quota-ops" in result["message"]
+    assert "foreign:Quota" not in result["message"]
 
 
 @pytest.mark.parametrize("failure", ["missing", "exception", "timeout"])

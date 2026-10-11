@@ -5552,7 +5552,8 @@ def create_app(
                     _memory_block, _served = await asyncio.wait_for(
                         asyncio.to_thread(
                             dispatch_memory_block, _storage, role, task.task_id,
-                            MemoryScope(project=_adr001_project(_project))),
+                            MemoryScope(project=_adr001_project(_project)),
+                            local_project=_project),
                         timeout=2.0,
                     )
                     if _served["authoritative"] or _served["failure_pattern"]:
