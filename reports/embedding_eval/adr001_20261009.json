@@ -1,0 +1,98 @@
+{
+  "byte_budget": 65536,
+  "chosen_model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "corpus_available_cases": {
+    "owner_cases": 17,
+    "task_cases": 0
+  },
+  "eval_sha256": "0bdb218d0c8e6ba3da8202c19201fee52a9605664ebe3ea4fb1d5de92de4ac61",
+  "k": 10,
+  "rows": [
+    {
+      "fallback_count": 0,
+      "model_id": "intfloat/multilingual-e5-small",
+      "model_size_bytes": 487351240,
+      "owner_hits": 6,
+      "p95_embed_ms": 80.13549633324146,
+      "p95_retrieve_ms": 122.70458228886127,
+      "retrieval_modes": {
+        "hybrid": 36,
+        "lexical_only": 5
+      },
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
+    },
+    {
+      "fallback_count": 0,
+      "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+      "model_size_bytes": 479383128,
+      "owner_hits": 6,
+      "p95_embed_ms": 61.40422262251377,
+      "p95_retrieve_ms": 101.19110904633999,
+      "retrieval_modes": {
+        "hybrid": 36,
+        "lexical_only": 5
+      },
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
+    },
+    {
+      "fallback_count": 21,
+      "model_id": "BAAI/bge-m3",
+      "model_size_bytes": 2284643639,
+      "owner_hits": 9,
+      "p95_embed_ms": 590.583024546504,
+      "p95_retrieve_ms": 685.5728011578321,
+      "retrieval_modes": {
+        "fallback": 21,
+        "hybrid": 15,
+        "lexical_only": 5
+      },
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
+    },
+    {
+      "fallback_count": 0,
+      "model_id": "all-MiniLM-L6-v2",
+      "model_size_bytes": 91099267,
+      "owner_hits": 8,
+      "p95_embed_ms": 18.50867085158825,
+      "p95_retrieve_ms": 55.587297305464745,
+      "retrieval_modes": {
+        "hybrid": 36,
+        "lexical_only": 5
+      },
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 4271,
+        "total": 4271
+      }
+    },
+    {
+      "fallback_count": 0,
+      "model_id": "lexical_only",
+      "model_size_bytes": 0,
+      "owner_hits": 8,
+      "p95_embed_ms": null,
+      "p95_retrieve_ms": 36.79559379816055,
+      "retrieval_modes": {
+        "lexical_only": 41
+      },
+      "task_hits": 0,
+      "vector_coverage": {
+        "embedded": 0,
+        "total": 4271
+      }
+    }
+  ],
+  "source_db": "/home/truhojun/.agent_crew/memory/adr001_memory.db"
+}
