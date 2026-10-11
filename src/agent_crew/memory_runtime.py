@@ -437,7 +437,8 @@ class SQLiteMemoryStorage:
         query_started = time.perf_counter()
         try:
             with closing(db_connection) as db:
-                columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
+                columns = {row[1] for row in db.execute(
+                    "PRAGMA table_info(adr001_memory)").fetchall()}
                 effective = (" AND superseded_by IS NULL AND invalidated_at IS NULL"
                              if {"superseded_by", "invalidated_at"} <= columns else "")
                 base += effective
