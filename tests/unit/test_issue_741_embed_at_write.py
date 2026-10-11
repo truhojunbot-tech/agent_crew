@@ -2,11 +2,17 @@
 import hashlib
 import json
 import sqlite3
+import sys
+import time
 from io import BytesIO
 from unittest.mock import patch
 
 from agent_crew.memory_hybrid import EndpointEmbedder, HybridMemoryStorage, configured_write_embedder
 from agent_crew.memory_runtime import MemoryRecord, MemoryScope, SQLiteMemoryStorage
+from agent_crew.memory_capture import capture_result_best_effort
+from agent_crew.protocol import TaskRequest
+from agent_crew.queue import TaskQueue
+from scripts import backfill_memory_vectors
 
 
 class StubEmbedder:
@@ -135,3 +141,82 @@ def test_backfill_covers_all_effective_rows_on_db_copy(tmp_path):
                              "ON m.rowid=v.rowid WHERE m.invalidated_at IS NULL "
                              "AND m.superseded_by IS NULL").fetchone()[0]
     assert covered == 10
+
+
+def test_live_result_capture_embeds_with_configured_hybrid_backend(tmp_path, monkeypatch):
+    path = str(tmp_path / "memory.db")
+    HybridMemoryStorage(path)
+    task_db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(task_db)
+    queue.enqueue(TaskRequest(task_id="live-result", task_type="implement",
+                              description="capture", project="agent_crew", context={}))
+    embedder = StubEmbedder()
+    monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", path)
+    monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_EMBED_ENDPOINT", "http://127.0.0.1:9999/embed")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_MODEL_ID", embedder.model_id)
+    monkeypatch.setattr("agent_crew.memory_hybrid.configured_write_embedder",
+                        lambda: embedder)
+    result = type("Result", (), {"status": "completed", "summary": "done",
+                                  "verdict": None, "pr_number": None})()
+    capture_result_best_effort(task_db, "live-result", result)
+    with sqlite3.connect(path) as db:
+        covered = db.execute("SELECT count(*) FROM adr001_memory m JOIN adr001_vec v "
+                             "ON m.rowid=v.rowid WHERE v.model_id=?",
+                             (embedder.model_id,)).fetchone()[0]
+    assert covered >= 2
+    assert len(embedder.calls) >= 2
+
+
+def test_endpoint_is_not_called_on_retrieval_path(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_MEMORY_EMBED_ENDPOINT", "http://127.0.0.1:9999/embed")
+    monkeypatch.setenv("AGENT_CREW_MEMORY_MODEL_ID", "slow-endpoint")
+    path = str(tmp_path / "memory.db")
+    store = HybridMemoryStorage(path)
+    SQLiteMemoryStorage.existing(path).put(MemoryRecord(
+        "episodic", "slow:one", {"text": "slow query"}, MemoryScope(project="test")))
+    calls = []
+
+    def slow_open(*args, **kwargs):
+        calls.append(1)
+        time.sleep(.35)
+        raise TimeoutError("slow endpoint")
+
+    with patch("agent_crew.memory_hybrid.urllib.request.urlopen", side_effect=slow_open):
+        started = time.perf_counter()
+        store.retrieve_ranked(MemoryScope(project="test"), "slow query",
+                              "implementer", 10, 10000)
+    assert not calls
+    assert time.perf_counter() - started < .3
+
+
+def test_backfill_cli_reports_uncovered_rows_and_stops_after_failures(
+        tmp_path, monkeypatch, capsys):
+    path = str(tmp_path / "memory.db")
+    store = HybridMemoryStorage(path)
+    for index in range(6):
+        _put(store, f"backfill:{index}", f"body {index}")
+    embedder = StubEmbedder(fail=True)
+    monkeypatch.setattr("agent_crew.memory_hybrid.configured_write_embedder",
+                        lambda: embedder)
+    monkeypatch.setattr(sys, "argv", ["backfill_memory_vectors.py", "--db", path])
+    assert backfill_memory_vectors.main() != 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["written"] == 0
+    assert output["failed"] >= 3
+    assert output["remaining"] == 6
+    assert len(embedder.calls) == 3
+
+
+def test_backfill_cli_reports_complete_coverage(tmp_path, monkeypatch, capsys):
+    path = str(tmp_path / "memory.db")
+    store = HybridMemoryStorage(path)
+    for index in range(2):
+        _put(store, f"complete:{index}", f"body {index}")
+    embedder = StubEmbedder()
+    monkeypatch.setattr("agent_crew.memory_hybrid.configured_write_embedder",
+                        lambda: embedder)
+    monkeypatch.setattr(sys, "argv", ["backfill_memory_vectors.py", "--db", path])
+    assert backfill_memory_vectors.main() == 0
+    output = json.loads(capsys.readouterr().out)
+    assert (output["written"], output["failed"], output["remaining"]) == (2, 0, 0)
