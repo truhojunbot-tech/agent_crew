@@ -322,6 +322,36 @@ def test_local_reviewer_gets_one_shadow_across_requeues(
     assert bool(queue.get_task_context("review-cloud").get("cloud_shadow_session_id")) == bool(expected_launches)
 
 
+def test_shadow_launch_error_does_not_hold_local_reviewer_slot(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "1")
+    attempts = []
+    local_dispatches = []
+
+    def raising_launch(*_args):
+        attempts.append(True)
+        raise RuntimeError("shadow launch failed")
+
+    def cooldown(_self, agent):
+        local_dispatches.append(agent)
+        return time.time() + 60 if agent == "claude" else None
+
+    monkeypatch.setattr(cloud, "launch_shadow_review", raising_launch)
+    monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
+    monkeypatch.setattr("agent_crew.server.QuotaBudgetProvider.active_cooldown_until", cooldown)
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_agent="claude"),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: len(attempts) >= 2, timeout=1.0)
+        _wait_for(lambda: len(local_dispatches) >= 2, timeout=1.0)
+    # A second local dispatch requires the first attempt to release its slot.
+    assert local_dispatches[:2] == ["claude", "claude"]
+
+
 def test_cloud_selection_ignores_unclaimable_and_respects_priority(tmp_path):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     _enqueue_review(queue, "review-small")
