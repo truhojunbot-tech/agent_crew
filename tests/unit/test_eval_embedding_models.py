@@ -8,7 +8,7 @@ import pytest
 
 from scripts.eval_embedding_models import (
     EvalOnnxEmbedder, choose_model, copy_database, count_available_keys,
-    download_model, load_eval_set, score_hit, score_model,
+    download_model, load_eval_set, resolve_expected_keys, score_hit, score_model,
 )
 from agent_crew.memory_hybrid import HybridMemoryStorage
 from agent_crew.memory_runtime import MemoryRecord, MemoryScope
@@ -45,6 +45,26 @@ def test_score_hit_counts_a_case_once_and_requires_exact_key():
     assert score_hit([{"ref": "second"}], response) is True
 
 
+def test_task_refs_resolve_to_stored_outcome_keys(tmp_path):
+    db_path = tmp_path / "memory.db"
+    storage = HybridMemoryStorage(str(db_path), embedder=None)
+    storage.put(MemoryRecord("episodic", "task_outcome:agent_crew:review-abc", {
+        "kind": "task_outcome", "project": "agent_crew", "task_id": "review-abc",
+        "pr_number": 419, "issue": 418,
+    }, MemoryScope(project="agent_crew")))
+    cases = [
+        {"case_id": "pr", "project": "agent_crew", "expected": [
+            {"source_kind": "issue_or_pr", "ref": "agent_crew PR #419"}]},
+        {"case_id": "issue", "project": "agent_crew", "expected": [
+            {"source_kind": "issue_or_pr", "ref": "agent_crew issue #418"}]},
+        {"case_id": "review", "project": "agent_crew", "expected": [
+            {"source_kind": "lineage_finding", "ref": "review-abc finding"}]},
+    ]
+    assert [resolve_expected_keys(db_path, case) for case in cases] == [
+        ["task_outcome:agent_crew:review-abc"]] * 3
+    assert count_available_keys(db_path, cases) == 3
+
+
 def test_choose_model_enforces_retrieve_budget_and_uses_recall():
     rows = [
         {"model_id": "slow", "owner_hits": 17, "task_hits": 24,
@@ -53,12 +73,27 @@ def test_choose_model_enforces_retrieve_budget_and_uses_recall():
          "p95_retrieve_ms": 250, "model_size_bytes": 2},
         {"model_id": "better", "owner_hits": 11, "task_hits": 5,
          "p95_retrieve_ms": 299, "model_size_bytes": 3},
-        {"model_id": "all-MiniLM-L6-v2", "owner_hits": 17, "task_hits": 24,
+        {"model_id": "all-MiniLM-L6-v2", "owner_hits": 9, "task_hits": 5,
          "p95_retrieve_ms": 100, "model_size_bytes": 1},
-        {"model_id": "lexical_only", "owner_hits": 17, "task_hits": 24,
+        {"model_id": "lexical_only", "owner_hits": 8, "task_hits": 4,
          "p95_retrieve_ms": 1, "model_size_bytes": 0},
     ]
     assert choose_model(rows)["model_id"] == "better"
+
+
+def test_choose_model_requires_improvement_in_both_case_groups():
+    rows = [
+        {"model_id": "lexical_only", "owner_hits": 8, "task_hits": 13,
+         "p95_retrieve_ms": 30, "model_size_bytes": 0},
+        {"model_id": "owner_only", "owner_hits": 9, "task_hits": 13,
+         "p95_retrieve_ms": 100, "model_size_bytes": 1},
+        {"model_id": "task_only", "owner_hits": 8, "task_hits": 14,
+         "p95_retrieve_ms": 100, "model_size_bytes": 1},
+    ]
+    assert choose_model(rows) is None
+    rows.append({"model_id": "both", "owner_hits": 9, "task_hits": 14,
+                 "p95_retrieve_ms": 100, "model_size_bytes": 1})
+    assert choose_model(rows)["model_id"] == "both"
 
 
 def test_english_control_downloads_to_external_cache_when_chroma_copy_absent(

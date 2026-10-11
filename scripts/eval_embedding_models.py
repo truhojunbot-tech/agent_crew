@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import sys
 import tempfile
@@ -80,9 +81,14 @@ def p95(values: list[float]) -> float:
 
 
 def choose_model(rows: list[dict]) -> dict | None:
+    lexical = next((r for r in rows if r["model_id"] == "lexical_only"), None)
+    if lexical is None:
+        return None
     eligible = [r for r in rows if r.get("p95_retrieve_ms") is not None
                 and r["p95_retrieve_ms"] <= 300
-                and r["model_id"] not in {"all-MiniLM-L6-v2", "lexical_only"}]
+                and r["owner_hits"] > lexical["owner_hits"]
+                and r["task_hits"] > lexical["task_hits"]
+                and r["model_id"] != "lexical_only"]
     if not eligible:
         return None
     return max(eligible, key=lambda r: (
@@ -193,12 +199,45 @@ def download_model(model_id: str, cache_dir: Path, query_texts: set[str]):
 
 def count_available_keys(source: Path, cases: list[dict]) -> int:
     """Report corpus coverage separately from retrieval recall."""
+    return sum(bool(resolve_expected_keys(source, case)) for case in cases)
+
+
+def resolve_expected_keys(source: Path, case: dict) -> list[str]:
+    """Map frozen source references to actual ADR-001 keys (as in the corpus audit)."""
     with sqlite3.connect(f"file:{source}?mode=ro", uri=True) as db:
-        keys = {row[0] for row in db.execute("SELECT key FROM adr001_memory")}
-    return sum(bool(keys.intersection(expected_keys(case))) for case in cases)
+        rows = [(key, json.loads(value)) for key, value in db.execute(
+            "SELECT key,value FROM adr001_memory")]
+    keys = set()
+    for expected in case["expected"]:
+        ref = expected["ref"] if isinstance(expected, dict) else expected
+        kind = expected.get("source_kind") if isinstance(expected, dict) else None
+        direct = ref.removeprefix("adr001:")
+        keys.update(key for key, value in rows
+                    if key == direct or value.get("source_ref") == ref)
+        if kind == "issue_or_pr":
+            project_match = re.search(
+                r"(?:github\.com/[^/]+/([^/]+)/(?:issues|pull)/|^([\w-]+) )", ref)
+            project = ((project_match.group(1) or project_match.group(2))
+                       if project_match else case["project"])
+            number_match = re.search(r"(?:issue(?:s)?|PR|pull)/?\s*#?(\d+)",
+                                     ref, re.I)
+            if number_match:
+                field = ("pr_number" if re.search(r"\bPR\b|/pull/", ref, re.I)
+                         else "issue")
+                keys.update(key for key, value in rows
+                            if value.get("kind") == "task_outcome"
+                            and value.get("project") == project
+                            and str(value.get(field) or "") == number_match.group(1))
+        elif kind == "lineage_finding":
+            task_ids = set(re.findall(r"\b(?:review|impl|fix-review)-[\w-]+", ref))
+            keys.update(key for key, value in rows
+                        if value.get("kind") == "task_outcome"
+                        and value.get("project") == case["project"]
+                        and value.get("task_id") in task_ids)
+    return sorted(keys)
 
 
-def preembed_vectors(db_path: Path, embedder, model_id: str, batch_size: int = 32) -> dict:
+def preembed_vectors(db_path: Path, embedder, model_id: str, batch_size: int = 128) -> dict:
     """Populate every copied row before scoring; no retrieval deadline applies."""
     with sqlite3.connect(db_path) as db:
         rows = db.execute("SELECT m.rowid, f.body, v.model_id, v.content_sha "
@@ -250,6 +289,8 @@ def score_model(source: Path, workdir: Path, model_id: str, data: dict,
     storage = HybridMemoryStorage(str(db_path), embedder=embedder)
     coverage = preembed_vectors(db_path, embedder, storage.model_id)
     hits = {"owner_cases": 0, "task_cases": 0}
+    expected_by_case = {id(case): resolve_expected_keys(db_path, case)
+                        for case in cases}
     latencies: list[float] = []
     modes: dict[str, int] = {}
     for group in ("owner_cases", "task_cases"):
@@ -257,7 +298,7 @@ def score_model(source: Path, workdir: Path, model_id: str, data: dict,
             response = storage.retrieve_ranked(
                 MemoryScope(project=case["project"]), case["query"],
                 "eval", k, byte_budget)
-            hits[group] += int(score_hit(case["expected"], response))
+            hits[group] += int(score_hit(expected_by_case[id(case)], response))
             latencies.append(response["latency_ms"])
             modes[response["mode"]] = modes.get(response["mode"], 0) + 1
     return {"model_id": model_id, "owner_hits": hits["owner_cases"],
