@@ -146,7 +146,7 @@ def test_hybrid_drop_restores_positional_writer_without_resurrection(tmp_path):
     with sqlite3.connect(path) as db:
         assert len(db.execute("PRAGMA table_info(adr001_memory)").fetchall()) == 6
         assert db.execute("SELECT count(*) FROM sqlite_master WHERE name IN "
-                          "('adr001_fts','adr001_vec')").fetchone()[0] == 0
+                          "('adr001_fts','adr001_short_fts','adr001_vec')").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM sqlite_master WHERE type='trigger' "
                           "AND name LIKE 'adr001_%'").fetchone()[0] == 0
         db.execute("INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)",
