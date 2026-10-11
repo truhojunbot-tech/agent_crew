@@ -220,4 +220,6 @@ def test_shadow_query_fetch_count_is_constant_with_3000_rows(tmp_path, monkeypat
         pr_number=602, timing=timing)
     assert len(records) == 10 and dropped == 0
     assert timing["query_ms"] >= 0
-    assert calls == {"execute": 1, "fetchone": 1, "fetchall": 0}
+    # The fixed-size schema probe adds one fetchall; the 3000 data rows still
+    # come back through one packed SQL row and one fetchone.
+    assert calls == {"execute": 2, "fetchone": 1, "fetchall": 1}

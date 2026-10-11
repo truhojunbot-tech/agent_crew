@@ -8,6 +8,7 @@ import os
 import sqlite3
 import time
 import re
+import uuid
 from contextlib import closing
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -20,6 +21,12 @@ SHADOW_PRUNE_BATCH_ROWS = 50
 SHADOW_RETRIEVAL_MAX_ROWS = 50
 SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS = 0.25
 SHADOW_MEMORY_CAPTURE_TIMEOUT_SECONDS = 0.05
+_REVISION_KEY_SUFFIX = re.compile(r"@v[0-9]+-[0-9a-f]{32}$")
+
+
+def _logical_revision_key(key: str) -> str:
+    """Expose the stable memory identity instead of its physical revision key."""
+    return _REVISION_KEY_SUFFIX.sub("", key)
 
 
 def shadow_sqlite_timeout_seconds(*, capture: bool = False) -> float:
@@ -139,6 +146,8 @@ class SQLiteMemoryStorage:
                        "ON adr001_memory(COALESCE(json_extract(scope,'$.project'),''), "
                        "json_extract(value,'$.pr_number'), created DESC)")
             self._migrate_legacy_generation_zero(db)
+            self._revision_columns = {"superseded_by", "invalidated_at"} <= {
+                row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
             db.commit()
 
     @classmethod
@@ -148,6 +157,9 @@ class SQLiteMemoryStorage:
             raise FileNotFoundError(path)
         instance = cls.__new__(cls)
         instance.path = path
+        with closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as db:
+            instance._revision_columns = {"superseded_by", "invalidated_at"} <= {
+                row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
         return instance
 
     @staticmethod
@@ -175,28 +187,118 @@ class SQLiteMemoryStorage:
                     (layer, key, legacy_scope),
                 )
 
+    @staticmethod
+    def _ensure_revision_columns(db: sqlite3.Connection) -> None:
+        """Add the hybrid effectiveness columns only when a writer needs them."""
+        columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
+        if "superseded_by" not in columns:
+            db.execute("ALTER TABLE adr001_memory ADD COLUMN superseded_by TEXT NULL")
+        if "invalidated_at" not in columns:
+            db.execute("ALTER TABLE adr001_memory ADD COLUMN invalidated_at REAL NULL")
+
+    @staticmethod
+    def _revision_head(db: sqlite3.Connection, layer: str, key: str,
+                       project: str, scope: str = "") -> Optional[tuple]:
+        """Follow revisions of this key, stopping at a natural supersession."""
+        if scope:
+            row = db.execute("SELECT rowid,key,value,version,scope,superseded_by "
+                             "FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
+                             (layer, key, scope)).fetchone()
+        else:
+            row = db.execute("SELECT rowid,key,value,version,scope,superseded_by "
+                             "FROM adr001_memory WHERE layer=? "
+                             "AND (key=? OR (key>=? AND key<?)) "
+                             "AND json_extract(scope,'$.project')=? "
+                             "AND superseded_by IS NULL "
+                             "ORDER BY version DESC,created DESC LIMIT 1",
+                             (layer, key, key + "@v", key + "@v\uffff", project)).fetchone()
+            if row is None:
+                row = db.execute("SELECT rowid,key,value,version,scope,superseded_by "
+                                 "FROM adr001_memory WHERE layer=? AND key=? "
+                                 "AND json_extract(scope,'$.project')=? "
+                                 "ORDER BY version DESC,created DESC LIMIT 1",
+                                 (layer, key, project)).fetchone()
+        seen = set()
+        while row and row[5]:
+            if row[1] in seen:
+                raise ValueError("memory revision cycle")
+            seen.add(row[1])
+            successor = db.execute("SELECT rowid,key,value,version,scope,superseded_by "
+                                   "FROM adr001_memory WHERE layer=? AND key=? "
+                                   "AND json_extract(scope,'$.project')=?",
+                                   (layer, row[5], project)).fetchone()
+            if successor is None:
+                raise ValueError("memory revision target missing")
+            if _logical_revision_key(successor[1]) != key:
+                return row
+            row = successor
+        return row
+
+    @staticmethod
+    def _append_revision(db: sqlite3.Connection, record: MemoryRecord,
+                         scope: str, *, project_wide: bool = False,
+                         allow_natural_revival: bool = False) -> None:
+        head = SQLiteMemoryStorage._revision_head(
+            db, record.layer, record.key, record.scope.project,
+            "" if project_wide else scope)
+        value = json.dumps(record.value)
+        if head is None:
+            db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                       "VALUES (?,?,?,?,?,?)",
+                       (record.layer, record.key, value, scope, record.version, time.time()))
+            return
+        naturally_retired = bool(head[5] and _logical_revision_key(head[5]) != record.key)
+        if naturally_retired and not allow_natural_revival:
+            # A different natural key superseded this one. A later write to
+            # the retired identity must not retire or replace its successor.
+            return
+        if not naturally_retired and json.loads(head[2]) == record.value and head[4] == scope:
+            return
+        if not project_wide and record.version <= head[3]:
+            return
+        version = max(record.version, head[3] + 1)
+        new_key = f"{record.key}@v{version}-{uuid.uuid4().hex}"
+        db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                   "VALUES (?,?,?,?,?,?)",
+                   (record.layer, new_key, value, scope, version, time.time()))
+        if project_wide:
+            updated = db.execute(
+                "UPDATE adr001_memory SET superseded_by=? WHERE layer=? "
+                "AND (key=? OR (key>=? AND key<?)) AND key<>? "
+                "AND json_extract(scope,'$.project')=? AND superseded_by IS NULL",
+                (new_key, record.layer, record.key, record.key + "@v",
+                 record.key + "@v\uffff", new_key, record.scope.project)).rowcount
+        else:
+            updated = db.execute("UPDATE adr001_memory SET superseded_by=? "
+                                 "WHERE rowid=? AND superseded_by IS NULL",
+                                 (new_key, head[0])).rowcount
+        if updated < 1 and not (naturally_retired and allow_natural_revival):
+            raise ValueError("memory revision changed concurrently")
+
     def put(self, record: MemoryRecord) -> None:
         if record.layer not in LAYERS: raise ValueError("unknown memory layer")
         with closing(sqlite3.connect(self.path)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            self._ensure_revision_columns(db)
+            scope = _canonical_scope_json(record.scope)
             if record.layer == "authoritative" and record.key.startswith("owner:"):
                 # Owner source records are immutable even when a caller supplies
                 # a higher version. A correction has its own message identity.
-                db.execute("BEGIN IMMEDIATE")
                 previous = db.execute(
                     "SELECT value FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
-                    (record.layer, record.key, _canonical_scope_json(record.scope)),
+                    (record.layer, record.key, scope),
                 ).fetchone()
                 if previous:
                     if json.loads(previous[0]) != record.value:
                         raise ValueError("owner statement is immutable")
                     return
-            db.execute("""INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)
-                ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
-                WHERE excluded.version > adr001_memory.version""",
-                (record.layer, record.key, json.dumps(record.value), _canonical_scope_json(record.scope), record.version, time.time())); db.commit()
+            self._append_revision(db, record, scope)
+            db.commit()
+            self._revision_columns = True
 
     def put_many_shadow(self, records: list[MemoryRecord], *, retire_keys: tuple[str, ...] = (),
-                        max_rows_per_project: int = SHADOW_RETENTION_ROWS_PER_PROJECT) -> None:
+                        max_rows_per_project: int = SHADOW_RETENTION_ROWS_PER_PROJECT,
+                        allow_natural_revival: bool = False) -> None:
         """Batch derived evidence in one bounded transaction, pruning old captures."""
         if not records:
             return
@@ -206,56 +308,44 @@ class SQLiteMemoryStorage:
             raise ValueError("shadow batch requires one project and derived layers")
         with closing(sqlite3.connect(self.path, timeout=shadow_sqlite_timeout_seconds(capture=True))) as db:
             db.execute("BEGIN IMMEDIATE")
+            self._ensure_revision_columns(db)
             for record in records:
                 scope = _canonical_scope_json(record.scope)
-                old_version = db.execute(
-                    "SELECT MAX(version) FROM adr001_memory WHERE layer=? AND key=? "
-                    "AND json_extract(scope,'$.project')=?",
-                    (record.layer, record.key, project)).fetchone()[0] or 0
-                # A later result may know more scope fields than the first
-                # capture. These task/episode keys identify one observation;
-                # keep its newest scope without leaving an older duplicate.
-                db.execute("DELETE FROM adr001_memory WHERE layer=? AND key=? "
-                           "AND json_extract(scope,'$.project')=? AND scope<>?",
-                           (record.layer, record.key, project, scope))
-                prior = db.execute("SELECT value,version FROM adr001_memory WHERE layer=? AND key=? AND scope=?",
-                                   (record.layer, record.key, scope)).fetchone()
-                if prior and json.loads(prior[0]) == record.value:
-                    continue
-                version = old_version + 1
-                db.execute("""INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)
-                    ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,
-                    version=excluded.version,created=excluded.created""",
-                    (record.layer, record.key, json.dumps(record.value), scope,
-                     version, time.time()))
+                self._append_revision(db, record, scope, project_wide=True,
+                                      allow_natural_revival=allow_natural_revival)
             for key in retire_keys:
-                # Preserve the failed observation for audit. Both retrieval
-                # paths exclude it; the ordinary retention prune still ages it out.
-                if any(row[1] == "invalidated_at" for row in db.execute("PRAGMA table_info(adr001_memory)")):
+                head = self._revision_head(db, "failure_pattern", key, project)
+                if head:
                     db.execute("UPDATE adr001_memory SET invalidated_at=? "
-                               "WHERE layer='failure_pattern' AND key=? "
-                               "AND json_extract(scope,'$.project')=? AND invalidated_at IS NULL",
-                               (time.time(), key, project))
-                else:
-                    # The default backend deliberately keeps the legacy schema.
-                    rows = db.execute("SELECT rowid,value FROM adr001_memory "
-                                      "WHERE layer='failure_pattern' AND key=? "
-                                      "AND json_extract(scope,'$.project')=?",
-                                      (key, project)).fetchall()
-                    for rowid, raw in rows:
-                        value = json.loads(raw)
-                        if "superseded_at" not in value:
-                            value["superseded_at"] = time.time()
-                            db.execute("UPDATE adr001_memory SET value=? WHERE rowid=?",
-                                       (json.dumps(value), rowid))
+                               "WHERE rowid=? AND invalidated_at IS NULL",
+                               (time.time(), head[0]))
+            # Count effective evidence separately from history. When an
+            # effective head ages out, remove its entire revision family so
+            # no retained predecessor points to a deleted head.
+            evicted = db.execute("""SELECT layer,key FROM adr001_memory
+                WHERE layer IN ('episodic','decision','failure_pattern')
+                  AND json_extract(scope, '$.project')=?
+                  AND (key GLOB 'task:*' OR key GLOB 'episode:*')
+                  AND superseded_by IS NULL AND invalidated_at IS NULL
+                ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?""",
+                (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project)).fetchall()
+            for layer, key in evicted:
+                logical_key = _logical_revision_key(key)
+                db.execute("""DELETE FROM adr001_memory WHERE layer=?
+                    AND json_extract(scope, '$.project')=?
+                    AND (key=? OR (key>=? AND key<?))""",
+                    (layer, project, logical_key, logical_key + "@v",
+                     logical_key + "@v\uffff"))
             db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
                 SELECT rowid FROM adr001_memory
                 WHERE layer IN ('episodic','decision','failure_pattern')
                   AND json_extract(scope, '$.project')=?
                   AND (key GLOB 'task:*' OR key GLOB 'episode:*')
+                  AND (superseded_by IS NOT NULL OR invalidated_at IS NOT NULL)
                 ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
                 (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
             db.commit()
+            self._revision_columns = True
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
         fields = asdict(scope)
         clauses, params = [], []
@@ -275,7 +365,9 @@ class SQLiteMemoryStorage:
                 clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' OR json_extract(scope, ?) = ?)")
                 params.extend((path, path, path, value))
         if exact_key:
-            clauses.append("key=?"); params.append(exact_key)
+            revision_prefix = exact_key + "@v"
+            clauses.append("(key=? OR (key>=? AND key<?))")
+            params.extend((exact_key, revision_prefix, revision_prefix + "\uffff"))
         with closing(sqlite3.connect(self.path)) as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
             if "invalidated_at" in columns:
@@ -284,7 +376,8 @@ class SQLiteMemoryStorage:
                 clauses.append("superseded_by IS NULL")
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE " + " AND ".join(clauses), params).fetchall()
         result = [
-            MemoryRecord(r[0], r[1], json.loads(r[2]), _scope_from_json(r[3]), r[4])
+            MemoryRecord(r[0], _logical_revision_key(r[1]), json.loads(r[2]),
+                         _scope_from_json(r[3]), r[4])
             for r in rows
         ]
         result = [record for record in result
@@ -344,6 +437,11 @@ class SQLiteMemoryStorage:
         query_started = time.perf_counter()
         try:
             with closing(db_connection) as db:
+                columns = {row[1] for row in db.execute(
+                    "PRAGMA table_info(adr001_memory)").fetchall()}
+                effective = (" AND superseded_by IS NULL AND invalidated_at IS NULL"
+                             if {"superseded_by", "invalidated_at"} <= columns else "")
+                base += effective
                 # One Python-visible SQLite row for all four reads avoids a GIL
                 # reacquisition for every candidate under CPU contention.
                 def packed_rows(sql: str) -> str:
@@ -370,24 +468,29 @@ class SQLiteMemoryStorage:
                         + fleet_ancestor + " ORDER BY created DESC LIMIT 1")
                 predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
                                     if "decision" in layers else [])
+                revision_prefixes = [key + "@v" for key in predecessor_keys]
                 lineage_sql = packed_rows(
                     "SELECT layer,key,value,scope,version FROM adr001_memory "
-                    "WHERE layer='decision' AND key IN (" + ",".join("?" for _ in predecessor_keys)
-                    + ") AND COALESCE(json_extract(scope,'$.project'),'')=?") if predecessor_keys else "'[]'"
+                    "WHERE layer='decision' AND (key IN (" + ",".join("?" for _ in predecessor_keys)
+                    + ") OR " + " OR ".join("(key>=? AND key<?)" for _ in revision_prefixes)
+                    + ") AND COALESCE(json_extract(scope,'$.project'),'')=?"
+                    + effective) if predecessor_keys else "'[]'"
                 pr_sql = packed_rows(
                     "SELECT layer,key,value,scope,version FROM adr001_memory "
                     "WHERE layer='decision' "
                     "AND COALESCE(json_extract(scope,'$.project'),'')=? "
                     "AND json_extract(value,'$.pr_number')=? "
                     "AND json_extract(value,'$.task_id')<>? "
-                    "ORDER BY created DESC LIMIT ?") if pr_number and "decision" in layers else "'[]'"
+                    + effective + " ORDER BY created DESC LIMIT ?") if pr_number and "decision" in layers else "'[]'"
                 parameters = [*args, *args, scope.project,
                               SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
                               else min(limit, SHADOW_RETRIEVAL_MAX_ROWS)]
                 if "failure_pattern" in layers:
                     parameters.extend([*args, scope.project, *args])
                 if predecessor_keys:
-                    parameters.extend([*predecessor_keys, scope.project])
+                    parameters.extend([*predecessor_keys,
+                                       *(item for prefix in revision_prefixes
+                                         for item in (prefix, prefix + "\uffff")), scope.project])
                 if pr_number and "decision" in layers:
                     parameters.extend([scope.project, pr_number, scope.task_id,
                                        SHADOW_RETRIEVAL_MAX_ROWS])
@@ -403,23 +506,27 @@ class SQLiteMemoryStorage:
         failure_rows = json.loads(project_failure_json) + json.loads(fleet_failure_json)
         lineage_rows = json.loads(lineage_json)
         pr_rows = json.loads(pr_json)
-        records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+        records = [MemoryRecord(layer, _logical_revision_key(key), json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
-        failures = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+        failures = [MemoryRecord(layer, _logical_revision_key(key), json.loads(value), _scope_from_json(record_scope),
                                  version) for layer, key, value, record_scope, version in failure_rows]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
         if query.strip():
             terms = set(query.lower().replace('-', ' ').split())
             scoped.sort(key=lambda record: _retrieval_rank(record, terms))
-        lineage = {key: MemoryRecord(layer, key, json.loads(value),
-                                    _scope_from_json(record_scope), version)
-                   for layer, key, value, record_scope, version in lineage_rows}
+        lineage = {}
+        for layer, key, value, record_scope, version in lineage_rows:
+            root = next((candidate for candidate in predecessor_keys
+                         if key == candidate or key.startswith(candidate + "@v")), None)
+            if root is not None and (root not in lineage or version > lineage[root].version):
+                lineage[root] = MemoryRecord(layer, _logical_revision_key(key), json.loads(value),
+                                             _scope_from_json(record_scope), version)
         pinned = [lineage[key] for key in predecessor_keys if key in lineage
                   and lineage[key].scope.fleet in ("", scope.fleet)
                   and not lineage[key].value.get("invalidated_at")
                   and not lineage[key].value.get("superseded_at")
                   and not lineage[key].value.get("superseded")]
-        same_pr = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+        same_pr = [MemoryRecord(layer, _logical_revision_key(key), json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in pr_rows]
         same_pr = [record for record in same_pr
                    if record.scope.fleet in ("", scope.fleet)

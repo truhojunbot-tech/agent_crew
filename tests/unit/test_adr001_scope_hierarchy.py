@@ -22,7 +22,8 @@ def test_unset_context_generation_inherits_into_a_specific_generation(tmp_path):
     }
     with sqlite3.connect(store.path) as db:
         db.execute(
-            "INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)",
+            "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+            "VALUES (?,?,?,?,?,?)",
             ("procedural", "legacy-rule", "{}", json.dumps(legacy_scope), 1, time.time()),
         )
 
