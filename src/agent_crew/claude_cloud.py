@@ -242,7 +242,8 @@ def parse_cloud_launch_output(stdout: str) -> CloudLaunchResult:
     return CloudLaunchResult(False, raw_output=text, error="unrecognized_cli_output")
 
 
-def build_launch_argv(prompt: str, *, cli_path: Optional[str] = None) -> List[str]:
+def build_launch_argv(prompt: str, *, cli_path: Optional[str] = None,
+                      base_ref: str = "") -> List[str]:
     """Wrap in ``script`` for a pty.
 
     #496 launch receipt: the installed CLI refuses ``--cloud`` without an
@@ -253,7 +254,8 @@ def build_launch_argv(prompt: str, *, cli_path: Optional[str] = None) -> List[st
     a bare non-interactive subprocess call.
     """
     path = cli_path or cloud_cli_path()
-    inner = f"{path} --cloud {shlex.quote(prompt)} --output-format json"
+    ref_arg = f" --ref {shlex.quote(base_ref)}" if base_ref else ""
+    inner = f"{path} --cloud {shlex.quote(prompt)}{ref_arg} --output-format json"
     return ["script", "-qefc", inner, "/dev/null"]
 
 
@@ -277,7 +279,7 @@ def build_cloud_task_prompt(task: TaskRequest, *, repo: str = "") -> str:
     """The bounded task contract handed to a fresh cloud session (required
     behavior #2).
 
-    A cloud session clones the validated launch checkout's published branch.
+    A cloud session clones the validated checkout's published ref.
     It has no network path back to this dispatcher's HTTP endpoint (#496
     comment 5880333100: no headless status read exists), so task instructions
     still need to be stated in the prompt. Completion is later observed via
@@ -454,17 +456,32 @@ def _validated_cloud_checkout(project: str, repo: str,
         expected = _github._repo_slug(repo)
         if not remote or not expected or remote.casefold() != expected.casefold():
             return "", remote.casefold()
-        branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
         head = git("rev-parse", "HEAD")
-        if not branch or not re.fullmatch(r"[0-9a-f]{40}", head):
+        if not re.fullmatch(r"[0-9a-f]{40}", head):
             return "", remote.casefold()
-        published = git("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}")
-        if not published or published.split()[0] != head:
+        branch = git("symbolic-ref", "--quiet", "--short", "HEAD")
+        published = (git("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}")
+                     if branch else git("ls-remote", "--heads", "origin"))
+        if not any(line.split()[0] == head for line in published.splitlines() if line.split()):
             return "", remote.casefold()
         return checkout, remote.casefold()
     except (OSError, ValueError, TypeError, subprocess.TimeoutExpired):
         logger.exception("claude_cloud: checkout validation failed for project=%s", project)
         return "", ""
+
+
+def _detached_cloud_ref(checkout: str) -> str:
+    """Pin a fresh cloud session to the published detached commit."""
+    if not os.path.isdir(checkout):
+        return ""  # Test transports may provide a synthetic validated cwd.
+    result = subprocess.run(["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+                            cwd=checkout, capture_output=True, text=True, timeout=10)
+    if result.returncode == 0:
+        return ""
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=checkout,
+                          capture_output=True, text=True, timeout=10)
+    return head.stdout.strip() if head.returncode == 0 and re.fullmatch(
+        r"[0-9a-f]{40}", head.stdout.strip()) else ""
 
 
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
@@ -611,7 +628,8 @@ def dispatch_cloud_for_role(
                                      "cloud_review_cwd_repo_mismatch")
     prompt = build_cloud_task_prompt(task, repo=effective_repo)
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
-            if resume_session_id else build_launch_argv(prompt, cli_path=cli_path))
+            if resume_session_id else build_launch_argv(
+                prompt, cli_path=cli_path, base_ref=_detached_cloud_ref(cwd)))
 
     try:
         proc = run(argv, cwd=cwd)
@@ -695,7 +713,8 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
     if not queue.reserve_cloud_shadow_launch(task.task_id):
         return False
     try:
-        proc = run(build_launch_argv(build_cloud_task_prompt(task, repo=repo)), cwd=cwd)
+        proc = run(build_launch_argv(build_cloud_task_prompt(task, repo=repo),
+                                     base_ref=_detached_cloud_ref(cwd)), cwd=cwd)
         launch = parse_cloud_launch_output(proc.stdout or "") if proc.returncode == 0 else None
     except Exception:
         logger.exception("claude_cloud: shadow launch failed for %s", task.task_id)
