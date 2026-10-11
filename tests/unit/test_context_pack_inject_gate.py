@@ -106,7 +106,8 @@ def test_builder_marks_no_ac_only_for_complete_issue(monkeypatch):
     assert [s.split(" ", 1)[0] for s in cpack.is_sufficient(missing).missing_signals] == ["issue", "AC"]
 
 
-def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=False, live=False):
+def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=False,
+              live=False, task_project=None):
     from fastapi.testclient import TestClient
     from agent_crew.protocol import TaskRequest
     from agent_crew.queue import TaskQueue
@@ -162,7 +163,8 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
     with TestClient(app):
         q = TaskQueue(db)
         q.enqueue(TaskRequest(task_id="gate-t", task_type="implement", description="do it",
-                              branch="main", context={"issue": 1, "issue_title": "A",
+                              branch="main", project=task_project,
+                              context={"issue": 1, "issue_title": "A",
                                                        "issue_body": "Body without AC"}))
         task = q.dequeue(role="implementer")
         asyncio.run(app.state.dispatch_task(task, "implementer"))
@@ -171,6 +173,7 @@ def _dispatch(tmp_path, monkeypatch, port, *, gate=False, cap=False, broken=Fals
     result = {"message": commands[0][commands[0].index("-p") + 1],
               "events": [e for e in all_events if e["event_type"] == "inject_gate"],
               "built": [e for e in all_events if e["event_type"] == "context_pack_built"],
+              "memory": [e for e in all_events if e["event_type"] == "memory_served_live"],
               "resets": [e for e in all_events if e["event_type"] == "provider_context_capped"],
               "patches": patches, "row_context": row_context}
     monkeypatch.undo()
