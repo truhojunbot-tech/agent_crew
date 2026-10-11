@@ -353,10 +353,11 @@ class _RecordingPush:
 
 
 def _post_review_result(client, review_id, **kw):
+    execution = client.get(f"/tasks/{review_id}").json().get("execution") or {}
     payload = {"task_id": review_id, "status": "completed",
                "summary": "Request changes because the cap drops the acceptance criteria.",
                "verdict": "request_changes", "findings": [FINDING],
-               "pr_number": None}
+               "pr_number": None, "attempt_id": execution.get("attempt_id")}
     payload.update(kw)
     return client.post(f"/tasks/{review_id}/result", json=payload)
 

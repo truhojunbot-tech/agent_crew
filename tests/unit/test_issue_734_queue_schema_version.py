@@ -14,7 +14,10 @@ from agent_crew.server import create_app
 
 # Update this map only when bumping QUEUE_SCHEMA_VERSION. Previous entries stay
 # immutable so changing DDL under an existing version fails this test.
-SCHEMA_SIGNATURES = {1: "5651630a8037b6c1af8b8a21af380f0501048a54b9e6df416047d26526c5b36f"}
+SCHEMA_SIGNATURES = {
+    1: "5651630a8037b6c1af8b8a21af380f0501048a54b9e6df416047d26526c5b36f",
+    2: "56e26dc15adae0f03a2c7e9f844bf471e7fea4301adc40fb4fa774578c9d43c7",
+}
 _SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
 _DDL_SOURCES = {
     "queue.py": _SOURCE_ROOT / "queue.py",

@@ -1,6 +1,7 @@
 """The server's test-result merge path must use the ADR-004 gate (#615)."""
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -21,6 +22,13 @@ DIFF = ("diff --git a/src/agent_crew/x.py b/src/agent_crew/x.py\n"
         "+++ b/src/agent_crew/x.py\n+new code\n")
 
 
+@pytest.fixture(autouse=True)
+def isolated_crew_environment(monkeypatch):
+    for name in list(os.environ):
+        if name.startswith("AGENT_CREW_"):
+            monkeypatch.delenv(name)
+
+
 @pytest.fixture
 def checker(tmp_path, monkeypatch):
     if not CHECKER.exists() or not REGISTRY.exists():
@@ -37,7 +45,7 @@ def checker(tmp_path, monkeypatch):
 
 def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
                  change_type="create", gate_failure="", status_details=None,
-                 ci_state=None):
+                 ci_state=None, advance_out_of_process=False):
     if not gate_enabled:
         monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -93,7 +101,12 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
     app = create_app(db, pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app) as client:
+    with TestClient(app, headers={"X-Agent-Crew-Project": "agent_crew"}) as client:
+        if advance_out_of_process:
+            assert app.state.coordinator_generation == 0
+            assert TaskQueue(db).advance_coordinator(
+                coordinator_id="crew-run:agent_crew", generation=1)["accepted"]
+            assert app.state.coordinator_generation == 0
         response = client.post("/tasks/test-615/result", json={
             "task_id": "test-615", "status": "completed", "summary": "tests passed",
             "pr_number": 615})
@@ -120,6 +133,16 @@ def test_server_review_comments_and_merges(tmp_path, monkeypatch, checker):
     assert record["verdict"] == "REVIEW"
     assert Path(record["receipt_path"]).parent == tmp_path / "conformance_receipts"
     assert json.loads(Path(record["receipt_path"]).read_text())["verdict"] == "REVIEW"
+
+
+def test_auto_merge_survives_out_of_process_coordinator_advance(
+        tmp_path, monkeypatch, checker):
+    monkeypatch.delenv("AGENT_CREW_AUTO_MERGE", raising=False)
+    queue, calls = _submit_test(
+        tmp_path, monkeypatch, title="add widget", change_type="modify",
+        advance_out_of_process=True)
+    assert calls == ["comment", "status", "merge"]
+    assert queue.external_op_get("merge:pr:615")["state"] == "done"
 
 
 def test_server_gate_unset_refuses_merge(tmp_path, monkeypatch):
@@ -185,7 +208,7 @@ def _post_followup_test(tmp_path, queue, task_id, review_id):
     app = create_app(str(tmp_path / "tasks.db"), pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app) as client:
+    with TestClient(app, headers={"X-Agent-Crew-Project": "agent_crew"}) as client:
         response = client.post(f"/tasks/{task_id}/result", json={
             "task_id": task_id, "status": "completed", "summary": "tests passed",
             "pr_number": 615})
@@ -266,7 +289,7 @@ def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
     app = create_app(str(tmp_path / "tasks.db"), pane_map={}, project="agent_crew",
                      push_fn=lambda *a, **k: None,
                      watchdog_disabled=True, anomaly_disabled=True)
-    with TestClient(app) as client:
+    with TestClient(app, headers={"X-Agent-Crew-Project": "agent_crew"}) as client:
         response = client.post("/tasks/test-615-r1/result", json={
             "task_id": "test-615-r1", "status": "completed",
             "summary": "tests passed", "pr_number": 615})
@@ -282,7 +305,7 @@ def test_opt_out_publishes_each_approved_head(tmp_path, monkeypatch, checker):
         task_id="test-615-r1-retry", task_type="test", branch="fix/615",
         description="test new head again", context={"prev_task_id": "review-615-r1",
             "pr_number": 615, "repo": "owner/repo", "allow_duplicate_review": True}))
-    with TestClient(app) as client:
+    with TestClient(app, headers={"X-Agent-Crew-Project": "agent_crew"}) as client:
         response = client.post("/tasks/test-615-r1-retry/result", json={
             "task_id": "test-615-r1-retry", "status": "completed",
             "summary": "tests passed", "pr_number": 615})

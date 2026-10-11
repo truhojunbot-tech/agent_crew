@@ -59,7 +59,8 @@ def poll_task():
     return None
 
 
-def submit_result(task_id):
+def submit_result(task):
+    task_id = task["task_id"]
     result = {
         "task_id": task_id,
         "status": STATUS,
@@ -70,6 +71,7 @@ def submit_result(task_id):
         "verdict": VERDICT,
         "findings": (["The implementation needs changes before approval."]
                      if ROLE == "reviewer" and VERDICT == "request_changes" else []),
+        "attempt_id": task.get("attempt_id") or (task.get("execution") or {}).get("attempt_id"),
     }
     body = json.dumps(result).encode()
     url = f"{BASE_URL}/tasks/{task_id}/result"
@@ -85,5 +87,5 @@ if task is None:
     print(f"stub {ROLE}: no task found within {TIMEOUT}s", file=sys.stderr)
     sys.exit(1)
 
-submit_result(task["task_id"])
+submit_result(task)
 print(f"stub {ROLE}: submitted result for {task['task_id']}")

@@ -145,6 +145,11 @@ def run_e2e():
         server_env = dict(env, AGENT_CREW_CEA_BROKER_SOCKET=str(home / "sock" / "broker.sock"),
                           AGENT_CREW_CEA_BROKER_DEGRADED="1",
                           AGENT_CREW_CEA_RECEIPT_PUBKEY_FILE=str(receipt_public_path))
+        # crew resume deliberately reloads project-local verifier settings in
+        # its own process; the sandbox must exercise that same launch contract.
+        (project_dir / "cea.env").write_text("".join(
+            f"{key}={value}\n" for key, value in sorted(server_env.items())
+            if key.startswith("AGENT_CREW_CEA_")))
         evidence = {"build_sha": build, "mode": "sandbox_http_e2e", "project": "alfred",
                     "broker_socket": str(home / "sock" / "broker.sock"),
                     "enforced_codes": ["RUNTIME_STATE_FORBIDS"], "pass": False}
