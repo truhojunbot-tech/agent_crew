@@ -32,30 +32,15 @@ RRF_K = 60
 HEAD_PRINCIPLE_BYTES = 3600
 HEAD_STANDING_BYTES = 2000
 MIDDLE_CANDIDATE_LIMIT = 96
-SHORT_SCAN_LIMIT = 4
-COMMON_SHORT_TERMS = frozenset({
-    "a", "an", "as", "at", "be", "by", "do", "in", "is", "it", "of", "on", "or",
-    "to", "we",
-})
 
 
 def _short_scan_terms(terms: list[str]) -> list[str]:
-    """Search selective short terms first; common words are a last resort."""
-    unique = list(dict.fromkeys(term for term in terms if len(term) < 3))
-    selective = [term for term in unique if term.casefold() not in COMMON_SHORT_TERMS]
-    return selective[:SHORT_SCAN_LIMIT] if selective else unique[:2]
+    """Keep every distinct short term in the bounded query, including Korean."""
+    return list(dict.fromkeys(term.casefold() for term in terms if len(term) < 3))
 
 
 def _short_haystack(alias: str) -> str:
     return f"lower({alias}.key || ' ' || {alias}.body)"
-
-
-def _ascii_boundary_haystack(alias: str) -> str:
-    """Treat key separators as word boundaries with a bounded SQL expression."""
-    text = _short_haystack(alias)
-    for separator in "-_:":
-        text = f"replace({text}, '{separator}', ' ')"
-    return f"(' ' || {text} || ' ')"
 
 
 def _body_sql(alias: str) -> str:
@@ -572,37 +557,41 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             searchable = [term for term in terms if len(term) >= 3]
             short_terms = _short_scan_terms(terms)
             def short_rows_for(scan_terms: list[str]) -> list[tuple]:
-                # Trigram MATCH cannot see short terms. Search key and body;
-                # layer names are metadata and create thousands of false hits.
-                haystack = _short_haystack("adr001_fts")
-                short_match = " OR ".join(
-                    f"instr({haystack}, lower(?)) > 0" for _ in scan_terms)
-                boundary_haystack = _ascii_boundary_haystack("adr001_fts")
-                scores, score_params = [], []
-                for term in scan_terms:
-                    if term.isascii():
-                        scores.append(
-                            f"(CASE WHEN instr({boundary_haystack}, ' ' || lower(?) || ' ') > 0 "
-                            f"THEN 2 WHEN instr({haystack}, lower(?)) > 0 THEN 1 ELSE 0 END)")
-                        score_params.extend((term, term))
-                    else:
-                        scores.append(f"(CASE WHEN instr({haystack}, lower(?)) > 0 "
-                                      "THEN 2 ELSE 0 END)")
-                        score_params.append(term)
-                return db.execute(
-                    prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
-                    clause + " AND " + _effective_sql() + " AND (" + short_match + ") "
-                    "ORDER BY (" + " + ".join(scores) +
-                    ") DESC,m.created DESC,m.rowid DESC LIMIT ?",
-                    [*params, *scan_terms, *score_params, MIDDLE_CANDIDATE_LIMIT],
-                ).fetchall()
+                # Trigram MATCH cannot see short terms. Read the scoped index
+                # once, then score each term by its frequency in that scope.
+                # This keeps an unlisted common word from crowding out a rare
+                # term and avoids repeated SQL replace() scans per term.
+                patterns = [re.compile(r"(?<!\w)" + re.escape(term) + r"(?!\w)")
+                            if term.isascii() else None for term in scan_terms]
+                frequencies = [0] * len(scan_terms)
+                hits = []
+                for rowid, created, key, body in db.execute(
+                        "SELECT m.rowid,m.created,adr001_fts.key,adr001_fts.body "
+                        "FROM adr001_memory m JOIN adr001_fts ON adr001_fts.rowid=m.rowid "
+                        "WHERE " + clause + " AND " + _effective_sql(), params):
+                    source = (key + " " + body).casefold()
+                    matched = []
+                    for index, term in enumerate(scan_terms):
+                        if term not in source:
+                            continue
+                        frequencies[index] += 1
+                        matched.append((index, patterns[index] is None or
+                                        bool(patterns[index].search(source))))
+                    if matched:
+                        hits.append((rowid, created, matched))
+                hits.sort(key=lambda hit: (
+                    -sum((2 if boundary else 0.25) / frequencies[index]
+                         for index, boundary in hit[2]),
+                    -hit[1], -hit[0]))
+                selected = [hit[0] for hit in hits[:MIDDLE_CANDIDATE_LIMIT]]
+                if not selected:
+                    return []
+                fetched = {row[0]: row for row in db.execute(
+                    prefix + "WHERE m.rowid IN (" + ",".join("?" for _ in selected) + ")",
+                    selected)}
+                return [fetched[rowid] for rowid in selected]
             if short_terms:
                 rows = short_rows_for(short_terms)
-                if not rows:
-                    common = [term for term in dict.fromkeys(terms) if len(term) < 3
-                              and term.casefold() in COMMON_SHORT_TERMS]
-                    if common and common[:2] != short_terms:
-                        rows = short_rows_for(common[:2])
             if searchable:
                 expression = " OR ".join('"' + term + '"' for term in searchable)
                 long_rows = db.execute(
