@@ -3,8 +3,10 @@
 import asyncio
 import json
 import sqlite3
+import threading
 import time
 
+import click
 from fastapi.testclient import TestClient
 import pytest
 
@@ -203,6 +205,25 @@ def test_crew_run_retries_locked_result_and_status_reads(monkeypatch):
         assert calls == 3
 
 
+def test_crew_run_locked_read_exhaustion_and_other_sqlite_error(monkeypatch):
+    monkeypatch.setattr(cli_module.time, "sleep", lambda _: None)
+    calls = []
+
+    def locked(task_id):
+        calls.append(task_id)
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(click.ClickException, match="database remained locked"):
+        cli_module._retry_locked_queue_read(locked, "task")
+    assert calls == ["task"] * 4
+
+    def other(task_id):
+        raise sqlite3.OperationalError("no such table: tasks")
+
+    with pytest.raises(sqlite3.OperationalError, match="no such table"):
+        cli_module._retry_locked_queue_read(other, "task")
+
+
 @pytest.mark.parametrize("write", ["record_dispatch", "patch_context"])
 def test_locked_write_after_claim_requeues_without_spawning(
         tmp_db, tmp_path, monkeypatch, write):
@@ -271,3 +292,104 @@ def test_dispatcher_run_boundary_fails_unexpected_pre_spawn_error_and_proceeds(
     assert queue.get_task_status("next") == "failed"
     assert "dispatcher: task unexpected raised" in caplog.text
     assert "Task exception was never retrieved" not in caplog.text
+
+
+def test_reclaimed_active_dispatch_is_not_reaped_as_superseded(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    app = create_app(tmp_db, pane_map={"implementer": "%2915"},
+                     pane_busy_fn=lambda _: True, pane_liveness_fn=lambda _: "alive",
+                     watchdog_disabled=True, anomaly_disabled=True,
+                     timeout_seconds=900)
+    with TestClient(app):
+        for task_id in ("A", "B"):
+            queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                                      description=f"work {task_id}", branch="main"))
+        assert queue.dequeue(role="implementer", agent="codex", claimed_via="dispatcher",
+                             claim_source="dispatcher").task_id == "A"
+        queue.record_dispatch("A", channel="codex_exec", agent="codex", target="pid:100")
+        assert queue.requeue_dispatcher_claim("A")
+        assert queue.dequeue(role="implementer", agent="codex", claimed_via="dispatcher",
+                             claim_source="dispatcher", skip_task_ids={"A"}).task_id == "B"
+        queue.record_dispatch("B", channel="codex_exec", agent="codex", target="pid:101")
+        assert queue.dequeue(role="implementer", agent="codex", claimed_via="dispatcher",
+                             claim_source="dispatcher").task_id == "A"
+        app.state.dispatcher_active_tasks = {"A": object()}
+        actions = app.state.watchdog_tick(time.time())
+    assert actions["timed_out"] == []
+    assert queue.get_task_status("A") == "in_progress"
+
+
+def test_dispatcher_run_boundary_requeues_locked_pre_spawn_error(tmp_db, tmp_path,
+                                                                 monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", "0.2")
+    monkeypatch.setattr(server_module, "codex_session_for_cwd",
+                        lambda *_: (_ for _ in ()).throw(
+                            sqlite3.OperationalError("database is locked")))
+    recovered = threading.Event()
+    real_requeue = TaskQueue.requeue_dispatcher_claim
+
+    def requeue(self, task_id, **kwargs):
+        result = real_requeue(self, task_id, **kwargs)
+        if result and task_id == "boundary-locked":
+            recovered.set()
+        return result
+
+    monkeypatch.setattr(TaskQueue, "requeue_dispatcher_claim", requeue)
+    queue = TaskQueue(tmp_db)
+    app = create_app(tmp_db, pane_map={},
+                     worktree_map={"implementer": str(tmp_path)},
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        queue.enqueue(TaskRequest(task_id="boundary-locked", task_type="implement",
+                                  description="work", branch="main"))
+        assert recovered.wait(3), "the _run exception boundary did not requeue"
+        assert queue.get_task_status("boundary-locked") == "pending"
+
+
+@pytest.mark.parametrize("failure", ["locked", "refused"])
+def test_requeue_failure_is_recovered_by_watchdog_backstop(tmp_db, tmp_path,
+                                                          monkeypatch, failure):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    monkeypatch.setattr(server_module, "_WORKTREE_SYNC_DISABLED", True)
+    monkeypatch.setattr(server_module, "_ensure_role_protocol", lambda *a, **k: True)
+    monkeypatch.setattr(server_module, "codex_session_for_cwd", lambda *a: "")
+    monkeypatch.setattr(server_module, "codex_context_exceeds_cap", lambda *a, **k: (False, {}))
+    monkeypatch.setattr(TaskQueue, "record_dispatch",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            sqlite3.OperationalError("database is locked")))
+    real_requeue = TaskQueue.requeue_dispatcher_claim
+    calls = 0
+
+    def refused_requeue(self, task_id, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls <= (3 if failure == "locked" else 1):
+            if failure == "locked":
+                raise sqlite3.OperationalError("database is locked")
+            return False
+        return real_requeue(self, task_id, **kwargs)
+
+    monkeypatch.setattr(TaskQueue, "requeue_dispatcher_claim", refused_requeue)
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id=f"backstop-{failure}", task_type="implement",
+                              description="work", branch="main"))
+    claim = queue.dequeue(role="implementer", agent="codex",
+                          claimed_via="dispatcher", claim_source="dispatcher")
+    app = create_app(tmp_db, pane_map={},
+                     worktree_map={"implementer": str(tmp_path)},
+                     watchdog_disabled=True, anomaly_disabled=True,
+                     timeout_seconds=10000)
+    with TestClient(app):
+        asyncio.run(app.state.dispatch_task(claim, "implementer"))
+        assert queue.get_task_status(claim.task_id) == "in_progress"
+        with sqlite3.connect(tmp_db) as db:
+            db.execute("UPDATE tasks SET last_activity_at=?,dispatched_at=NULL "
+                       "WHERE task_id=?", (time.time() - 1000, claim.task_id))
+            db.commit()
+        actions = app.state.watchdog_tick(time.time())
+    assert actions["recovered"] == [claim.task_id]
+    assert queue.get_task_status(claim.task_id) == "pending"

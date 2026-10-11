@@ -6833,8 +6833,11 @@ class TaskQueue:
                 "WHERE older.task_id=? AND older.claim_source='dispatcher' "
                 "AND older.dispatch_agent IS NOT NULL "
                 "AND newer.claim_source='dispatcher' "
-                "AND newer.dispatched_at>COALESCE(NULLIF(older.dispatched_at,0), "
-                "older.last_activity_at, 0) "
+                # A re-claimed row retains its previous dispatched_at. Compare
+                # against the current claim too, so an intervening dispatch
+                # cannot supersede an active retry before record_dispatch.
+                "AND newer.dispatched_at>MAX(COALESCE(older.dispatched_at,0), "
+                "COALESCE(older.last_activity_at,0)) "
                 "AND newer.dispatch_target LIKE 'pid:%' "
                 "ORDER BY newer.dispatched_at ASC", (task_id,)
             ).fetchall()
