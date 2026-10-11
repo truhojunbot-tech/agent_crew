@@ -81,7 +81,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               DuplicateReviewResult, InvalidReviewResult, InvalidRiskTierError,
                               LateResultRejected,
                               TaskAlreadyExistsError,
-                              TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              TaskQueue, QUEUE_SCHEMA_VERSION, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               validate_http_root_risk,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
                               RequestSqliteTiming, request_sqlite_timing)
@@ -7351,6 +7351,7 @@ def create_app(
                            "error": f"{type(exc).__name__}: {exc}"}
         return {
             "status": "ok",
+            "schema_version": QUEUE_SCHEMA_VERSION,
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,

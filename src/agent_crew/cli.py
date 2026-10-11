@@ -198,7 +198,7 @@ def _read_state(base: str, project: str) -> dict | None:
 
 
 def _writable_queue(db: str, *, base: str = "", project: str = ""):
-    """Open a project DB only when its live server runs this CLI's build."""
+    """Open a project DB only when its live server uses this queue schema."""
     import urllib.error
     import urllib.request
 
@@ -227,15 +227,16 @@ def _writable_queue(db: str, *, base: str = "", project: str = ""):
                 logger.warning("Cannot read /health for %s: %s", state_path, exc)
                 health = None
             if health is not None:
-                from agent_crew.provenance import build
+                from agent_crew.queue import QUEUE_SCHEMA_VERSION
 
-                server_commit = str((health.get("build") or {}).get("commit") or "") if isinstance(health, dict) else ""
-                cli_commit = str(build().get("commit") or "")
-                if not server_commit or not cli_commit or server_commit != cli_commit:
+                server_schema = health.get("schema_version") if isinstance(health, dict) else None
+                if type(server_schema) is not int or server_schema != QUEUE_SCHEMA_VERSION:
                     raise click.ClickException(
-                        f"Refusing writable tasks.db access: server build {server_commit or 'unknown'} "
-                        f"differs from CLI build {cli_commit or 'unknown'}. "
-                        f"Use the server's HTTP API at http://127.0.0.1:{port} or run a matching CLI build."
+                        f"Refusing writable tasks.db access: server schema "
+                        f"{server_schema if type(server_schema) is int else 'unknown'} "
+                        f"differs from CLI schema {QUEUE_SCHEMA_VERSION}. "
+                        f"Use the server's HTTP API at http://127.0.0.1:{port} "
+                        f"or run a matching CLI schema version."
                     )
     from agent_crew.queue import TaskQueue
 
