@@ -29,6 +29,7 @@ RRF_K = 60
 HEAD_PRINCIPLE_BYTES = 3600
 HEAD_STANDING_BYTES = 2000
 MIDDLE_CANDIDATE_LIMIT = 96
+VECTOR_CANDIDATE_LIMIT = 256
 
 
 def _body_sql(alias: str) -> str:
@@ -226,11 +227,26 @@ def configured_embedder():
 class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
     """Scope in SQLite first; rank only those rowids with FTS5 and cosine."""
 
-    def __init__(self, path: str, *, embedder: Optional[Callable] = None):
+    def __init__(self, path: str, *, embedder: Optional[Callable] = None,
+                 fusion_mode: Optional[str] = None, fusion_weight: Optional[float] = None):
         super().__init__(path, busy_timeout_seconds=30.0)
         self.backfill()
         self.embedder = embedder if embedder is not None else configured_embedder()
         self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
+        self.fusion_mode = (fusion_mode or os.getenv("AGENT_CREW_MEMORY_FUSION_MODE", "rrf")).strip().lower()
+        if self.fusion_mode not in {"rrf", "union_vec_first", "weighted"}:
+            raise ValueError(f"invalid memory fusion mode: {self.fusion_mode}")
+        self._np = None
+        if self.fusion_mode == "weighted":
+            try:
+                import numpy as np
+            except ImportError as exc:
+                raise ValueError("weighted memory fusion requires numpy") from exc
+            self._np = np
+        self.fusion_weight = float(fusion_weight if fusion_weight is not None else
+                                   os.getenv("AGENT_CREW_MEMORY_FUSION_WEIGHT", "0.5"))
+        if not math.isfinite(self.fusion_weight) or not 0 <= self.fusion_weight <= 1:
+            raise ValueError("memory fusion weight must be between 0 and 1")
         self.fallback_count = 0
         self._fallback_lock = threading.Lock()
         self.last_retrieval_mode = "lexical_only"
@@ -288,12 +304,100 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                                 [*params, MIDDLE_CANDIDATE_LIMIT]).fetchall()
             rows.extend(row for row in recent if row[0] not in seen)
             rows = rows[:MIDDLE_CANDIDATE_LIMIT]
+        if self.fusion_mode == "union_vec_first" and self.embedder is not None:
+            # The FTS/recent cap can exclude a vector-only hit. Admit a bounded
+            # set of recent vectors from this scope and active model so cosine
+            # scoring cannot overrun the retrieval deadline on large corpora.
+            seen = {row[0] for row in rows}
+            vectors = db.execute(
+                prefix + "JOIN adr001_vec v ON v.rowid=m.rowid WHERE " +
+                clause + " AND " + _effective_sql() +
+                " AND v.model_id=? AND v.vec IS NOT NULL "
+                "ORDER BY m.created DESC,m.rowid DESC LIMIT ?",
+                [*params, self.model_id, VECTOR_CANDIDATE_LIMIT],
+            ).fetchall()
+            rows.extend(row for row in vectors if row[0] not in seen)
         result = [_row_record(row) for row in rows]
         decisions = {hashlib.sha256(json.dumps(row["value"], sort_keys=True).encode()).hexdigest()
                      for row in result if row["layer"] == "decision"}
         return [row for row in result if row["layer"] != "episodic" or
                 hashlib.sha256(json.dumps(row["value"], sort_keys=True).encode()).hexdigest()
                 not in decisions]
+
+    def _weighted_vector_top(self, scope: MemoryScope, query: str,
+                             deadline: Optional[float] = None) -> tuple[list[dict], dict[int, int]]:
+        """Rank every current in-scope vector, then materialize only the top 96."""
+        if self.embedder is None:
+            return [], {}
+        np = self._np
+        q = np.asarray(self.embedder(query), dtype=np.float32)
+        if q.ndim != 1 or not q.size or not np.all(np.isfinite(q)):
+            return [], {}
+        qnorm = float(np.linalg.norm(q))
+        if not qnorm:
+            return [], {}
+        clause, params = _scope_sql(scope)
+        with closing(sqlite3.connect(self.path, timeout=.05)) as db:
+            if deadline is not None:
+                db.set_progress_handler(lambda: int(time.perf_counter() >= deadline), 1000)
+            cursor = db.execute(
+                "SELECT m.rowid,v.vec FROM adr001_memory m "
+                "JOIN adr001_vec v ON v.rowid=m.rowid "
+                "WHERE " + clause + " AND " +
+                _effective_sql() + " AND v.model_id=? AND v.vec IS NOT NULL",
+                [*params, self.model_id],
+            )
+            valid = []
+            while rows := cursor.fetchmany(512):
+                valid.extend((rowid, blob) for rowid, blob in rows
+                             if len(blob) == q.size * 4)
+                if deadline is not None and time.perf_counter() >= deadline:
+                    raise TimeoutError("scoped vector scan exceeded retrieval budget")
+            if not valid:
+                return [], {}
+            matrix = np.frombuffer(b"".join(blob for _, blob in valid), dtype=np.float32)
+            matrix = matrix.reshape(len(valid), q.size)
+            norms = np.sqrt(np.einsum("ij,ij->i", matrix, matrix))
+            scores = matrix @ q  # one BLAS matmul for the whole scoped vector arm
+            scores = np.divide(scores, norms * qnorm, out=np.full_like(scores, -np.inf),
+                               where=norms > 0)
+            if deadline is not None and time.perf_counter() >= deadline:
+                raise TimeoutError("scoped vector score exceeded retrieval budget")
+            # Fetch and hash only rows that can enter the top list. The DB
+            # triggers clear vectors on value changes; this check also catches
+            # stale vectors imported from older stores.
+            ranked = (valid[int(index)][0] for index in np.argsort(-scores, kind="stable")
+                      if np.isfinite(scores[index]))
+            top, by_id = [], {}
+            while len(top) < MIDDLE_CANDIDATE_LIMIT:
+                batch = []
+                for _ in range(128):
+                    rowid = next(ranked, None)
+                    if rowid is None:
+                        break
+                    batch.append(rowid)
+                if not batch:
+                    break
+                records = db.execute(
+                    "SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created,"
+                    "f.body,v.content_sha FROM adr001_memory m "
+                    "JOIN adr001_fts f ON f.rowid=m.rowid "
+                    "JOIN adr001_vec v ON v.rowid=m.rowid WHERE m.rowid IN (" +
+                    ",".join("?" for _ in batch) + ") AND " + _effective_sql() +
+                    " AND v.model_id=?", [*batch, self.model_id],
+                ).fetchall()
+                current = {row[0]: row for row in records
+                           if row[8] == hashlib.sha256(row[7].encode()).hexdigest()}
+                for rowid in batch:
+                    if rowid in current:
+                        top.append(rowid)
+                        by_id[rowid] = _row_record(current[rowid][:7])
+                        if len(top) == MIDDLE_CANDIDATE_LIMIT:
+                            break
+                if deadline is not None and time.perf_counter() >= deadline:
+                    raise TimeoutError("scoped vector validation exceeded retrieval budget")
+        return [by_id[rowid] for rowid in top], {
+            rowid: rank for rank, rowid in enumerate(top, 1)}
 
     def render_head(self, project: str, fleet: str = "") -> dict:
         """Deterministic SQL view used by both dispatch and the HTTP hook."""
@@ -361,7 +465,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
         return max(0, len(missing) - attempted)
 
-    def _rank_middle(self, candidates: list[dict], query: str) -> tuple[list[dict], bool]:
+    def _rank_middle(self, candidates: list[dict], query: str,
+                     vector_rank_override: Optional[dict[int, int]] = None) -> tuple[list[dict], bool]:
         import re
 
         ids = {r["rowid"] for r in candidates}
@@ -372,18 +477,35 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         with closing(sqlite3.connect(self.path)) as db:
             if terms:
                 expression = " OR ".join('"' + term.replace('"', '') + '"' for term in terms)
-                for rowid, score in db.execute(
-                        "SELECT rowid,bm25(adr001_fts,0.2,10,1) FROM adr001_fts "
-                        "WHERE adr001_fts MATCH ? ORDER BY 2", (expression,)):
-                    if rowid in ids:
-                        bm25[rowid] = len(bm25) + 1
-            vectors = db.execute("SELECT rowid,model_id,content_sha,vec FROM adr001_vec WHERE "
-                                 "rowid IN (" + ",".join("?" for _ in ids) + ")", list(ids)).fetchall()
-            bodies = {rowid: body for rowid, body in db.execute(
-                "SELECT rowid,body FROM adr001_fts WHERE rowid IN (" +
-                ",".join("?" for _ in ids) + ")", list(ids))}
+                if self.fusion_mode == "rrf":
+                    # Preserve the old ranking exactly for the default mode.
+                    for rowid, score in db.execute(
+                            "SELECT rowid,bm25(adr001_fts,0.2,10,1) FROM adr001_fts "
+                            "WHERE adr001_fts MATCH ? ORDER BY 2", (expression,)):
+                        if rowid in ids:
+                            bm25[rowid] = len(bm25) + 1
+                else:
+                    # FTS5 repeats the full MATCH evaluation for every rowid
+                    # constrained by IN. Scan once, then retain only the
+                    # scoped candidate IDs in score order.
+                    for rowid, _ in db.execute(
+                            "SELECT rowid,bm25(adr001_fts,0.2,10,1) FROM adr001_fts "
+                            "WHERE adr001_fts MATCH ? ORDER BY 2,rowid", (expression,)):
+                        if rowid in ids:
+                            bm25[rowid] = len(bm25) + 1
+            vectors, bodies = [], {}
+            ordered_ids = list(ids)
+            for offset in range(0, len(ordered_ids), 500):
+                batch = ordered_ids[offset:offset + 500]
+                placeholders = ",".join("?" for _ in batch)
+                vectors.extend(db.execute(
+                    "SELECT rowid,model_id,content_sha,vec FROM adr001_vec WHERE rowid IN (" +
+                    placeholders + ")", batch).fetchall())
+                bodies.update(db.execute(
+                    "SELECT rowid,body FROM adr001_fts WHERE rowid IN (" +
+                    placeholders + ")", batch).fetchall())
         semantic = []
-        if self.embedder and vectors:
+        if vector_rank_override is None and self.embedder and vectors:
             q = array("f", self.embedder(query))
             qnorm = math.sqrt(sum(v * v for v in q))
             for rowid, model, digest, blob in vectors:
@@ -398,12 +520,26 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 if denom:
                     semantic.append((rowid, sum(a * b for a, b in zip(q, vector)) / denom))
         semantic.sort(key=lambda item: (-item[1], item[0]))
-        vector_rank = {rowid: rank for rank, (rowid, _) in enumerate(semantic, 1)}
+        vector_rank = (vector_rank_override if vector_rank_override is not None else
+                       {rowid: rank for rank, (rowid, _) in enumerate(semantic, 1)})
         lexical = {r["rowid"]: rank for rank, r in enumerate(candidates, 1)}
-        candidates.sort(key=lambda row: (
-            -(1 / (RRF_K + bm25[row["rowid"]]) if row["rowid"] in bm25 else 0)
-            - (1 / (RRF_K + vector_rank[row["rowid"]]) if row["rowid"] in vector_rank else 0),
-            lexical[row["rowid"]]))
+        if self.fusion_mode == "union_vec_first":
+            candidates.sort(key=lambda row: (
+                row["rowid"] not in vector_rank,
+                vector_rank.get(row["rowid"], bm25.get(row["rowid"], lexical[row["rowid"]])),
+                lexical[row["rowid"]]))
+        elif self.fusion_mode == "weighted":
+            candidates.sort(key=lambda row: (
+                -(self.fusion_weight / (RRF_K + vector_rank[row["rowid"]])
+                  if row["rowid"] in vector_rank else 0)
+                - ((1 - self.fusion_weight) / (RRF_K + bm25[row["rowid"]])
+                   if row["rowid"] in bm25 else 0),
+                lexical[row["rowid"]]))
+        else:
+            candidates.sort(key=lambda row: (
+                -(1 / (RRF_K + bm25[row["rowid"]]) if row["rowid"] in bm25 else 0)
+                - (1 / (RRF_K + vector_rank[row["rowid"]]) if row["rowid"] in vector_rank else 0),
+                lexical[row["rowid"]]))
         return candidates, bool(vector_rank)
 
     def retrieve_ranked(self, scope: MemoryScope, query: str, role: str,
@@ -424,14 +560,26 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 candidates = self._candidates(db, scope, query)
             if time.perf_counter() >= deadline:
                 raise TimeoutError("candidate lookup exceeded retrieval budget")
+            vector_rank = None
+            if self.fusion_mode == "weighted":
+                vector_rows, vector_rank = self._weighted_vector_top(scope, query, deadline)
+                seen = {row["rowid"] for row in candidates}
+                candidates.extend(row for row in vector_rows if row["rowid"] not in seen)
+                if time.perf_counter() >= deadline:
+                    raise TimeoutError("scoped vector lookup exceeded retrieval budget")
             head_ids = {r["rowid"] for r in head["records"]}
             middle = [r for r in candidates if r["rowid"] not in head_ids]
-            pending = self._lazy_embed(middle, deadline)
+            pending = self._lazy_embed(
+                middle if self.fusion_mode == "rrf" else middle[:MIDDLE_CANDIDATE_LIMIT],
+                deadline)
             if response_state is not None:
                 response_state["pending"] = pending
             if time.perf_counter() >= deadline:
                 raise TimeoutError("embedding exceeded retrieval budget")
-            middle, vector_used = self._rank_middle(middle, query)
+            if vector_rank is None:
+                middle, vector_used = self._rank_middle(middle, query)
+            else:
+                middle, vector_used = self._rank_middle(middle, query, vector_rank)
             overflow_ids = {r["rowid"] for r in head["standing_overflow"]}
             middle = head["standing_overflow"] + [r for r in middle
                                                     if r["rowid"] not in overflow_ids]
@@ -500,6 +648,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             selected = []
         self.last_retrieval_mode = mode
         return {"head": head["records"], "middle": selected, "mode": mode,
+                "fusion_mode": self.fusion_mode,
                 "pending_vectors": pending, "latency_ms": elapsed,
                 "trimmed_bytes": trimmed, "standing_trimmed": head["standing_trimmed"],
                 "model_id": self.model_id, "head_hash": head["head_hash"],

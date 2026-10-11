@@ -6,6 +6,8 @@ Run `scripts/runtime_swap.sh PROJECT FULL_SHA preflight`, then `go`, then `post`
 
 Before a swap that sets `AGENT_CREW_MEMORY_BACKEND=hybrid`, set `AGENT_CREW_MEMORY_FLEET` to the fleet name used by fleet-scoped memory records (for the ADR-001 owner principles, `fleet`). Dispatch uses a task's `context.fleet` when supplied, otherwise this environment value. An unset fleet omits fleet-scoped records from the memory head; project-scoped records still apply. The `shadow_memory_retrieval` event and task context record the effective `fleet`, and dispatch logs a warning when it is empty. This setting enables the existing hybrid retrieval scope; the swap itself must follow the approval and pause procedure above.
 
+Weighted hybrid retrieval is opt-in with `AGENT_CREW_MEMORY_FUSION_MODE=weighted`. Its independent vector arm scores every effective scoped row with a current vector for the active model, keeps the top 96 by cosine, and joins them with the lexical candidates. `AGENT_CREW_MEMORY_FUSION_WEIGHT` is the vector share of reciprocal-rank fusion; the Quota-tested lexical 1 : vector 2 setting is `0.6667`. The default mode remains `rrf`.
+
 ## If `go` fails after SIGTERM
 
 A health timeout or build SHA mismatch means the swap is **not complete**. Keep STOP paused and do not send work to the listener. The script deliberately does not restart a process automatically after a failed provenance check; the operator must inspect the actual listener and decide whether a restart is safe. The preflight evidence is in `~/.sev0-evidence/crew-swap-PROJECT-SHA7/`.
