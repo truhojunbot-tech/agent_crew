@@ -792,6 +792,27 @@ def _stash_dirty_worktree(worktree_path: str, task_id: str) -> Optional[str]:
             logger.warning("stash of dirty worktree %s for task=%s failed: %s",
                            worktree_path, task_id, push.stderr.strip())
             return None
+        if push.returncode != 0:
+            # Git can save the stash before failing to remove an ignored path.
+            # Clear only paths that were included in the stash, then verify.
+            for command in (
+                ["git", "-C", worktree_path, "restore", "--source=HEAD",
+                 "--staged", "--worktree", *pathspec],
+                ["git", "-C", worktree_path, "clean", "-fd", *pathspec],
+            ):
+                cleanup = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                if cleanup.returncode != 0:
+                    logger.warning("could not clear stashed worktree %s for task=%s: %s",
+                                   worktree_path, task_id, cleanup.stderr.strip())
+                    return None
+            remaining = subprocess.run(
+                ["git", "-C", worktree_path, "status", "--porcelain", *pathspec],
+                capture_output=True, text=True, timeout=30,
+            )
+            if remaining.returncode != 0 or remaining.stdout.strip():
+                logger.warning("stashed worktree %s remains dirty for task=%s",
+                               worktree_path, task_id)
+                return None
         logger.warning("preserved uncommitted work of task=%s in %s as stash %s",
                        task_id, worktree_path, after)
         return after
@@ -1335,30 +1356,35 @@ def _detect_transient_error_in_log(
             f.seek(0, 2)
             size = f.tell()
             start = max(0, size - tail_bytes, since_offset)
+            starts_mid_line = False
+            if agent == "codex" and start > 0 and start < size:
+                f.seek(start - 1)
+                starts_mid_line = f.read(1) != b"\n"
             f.seek(min(start, size))
-            tail = f.read().decode("utf-8", errors="replace")
+            raw_tail = f.read()
+            if starts_mid_line:
+                raw_tail = raw_tail.partition(b"\n")[2]
+            tail = raw_tail.decode("utf-8", errors="replace")
     except OSError:
         return None
     if agent == "codex":
-        # Codex stream-json echoes tool stdout under command_execution. Those
-        # bytes are the repository or command output, not provider diagnostics.
-        def without_command_output(value):
-            if isinstance(value, dict):
-                return {key: without_command_output(item) for key, item in value.items()
-                        if not (value.get("type") == "command_execution"
-                                and key == "aggregated_output")}
-            if isinstance(value, list):
-                return [without_command_output(item) for item in value]
-            return value
-
+        # Stream JSON echoes commands and agent prose. Only error events are
+        # provider diagnostics; retain plain stderr lines as before.
         filtered = []
         for line in tail.splitlines():
             try:
                 event = json.loads(line)
             except (TypeError, ValueError):
-                filtered.append(line)
+                if not line.lstrip().startswith(("{", "[")):
+                    filtered.append(line)
             else:
-                filtered.append(json.dumps(without_command_output(event)))
+                if isinstance(event, dict):
+                    item = event.get("item")
+                    if event.get("type") == "error":
+                        filtered.append(json.dumps(event))
+                    elif (isinstance(item, dict)
+                          and item.get("type") in ("error", "error_message")):
+                        filtered.append(json.dumps(item))
         tail = "\n".join(filtered)
     # Order matters: more specific markers first (QUOTA before RESOURCE since
     # QUOTA_EXHAUSTED responses also contain "RESOURCE_EXHAUSTED").

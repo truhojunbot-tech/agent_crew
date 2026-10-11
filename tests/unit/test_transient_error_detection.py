@@ -154,6 +154,31 @@ def test_codex_command_output_does_not_classify_provider_markers(tmp_path, marke
     assert _detect_transient_error_in_log(log, agent="codex") is None
 
 
+@pytest.mark.parametrize("item_type,field", [
+    ("command_execution", "command"),
+    ("agent_message", "text"),
+])
+def test_codex_non_error_events_do_not_classify_capacity(tmp_path, item_type, field):
+    marker = "Selected model is at capacity"
+    event = {"type": "item.completed", "item": {"type": item_type, field: marker}}
+    log = _write(tmp_path, json.dumps(event) + "\n")
+    assert _detect_transient_error_in_log(log, agent="codex") is None
+
+
+def test_codex_partial_command_output_line_is_discarded(tmp_path):
+    marker = "Selected model is at capacity"
+    event = {"type": "item.completed", "item": {
+        "type": "command_execution", "aggregated_output": "x" * 20000 + marker}}
+    log = _write(tmp_path, json.dumps(event) + "\n")
+    assert _detect_transient_error_in_log(log, tail_bytes=16384, agent="codex") is None
+
+
+def test_codex_error_event_still_classifies_capacity(tmp_path):
+    event = {"type": "error", "message": "Selected model is at capacity"}
+    log = _write(tmp_path, json.dumps(event) + "\n")
+    assert _detect_transient_error_in_log(log, agent="codex") == "codex_capacity"
+
+
 def test_provider_markers_only_apply_to_their_provider(tmp_path):
     log = _write(tmp_path, "Ineligible" + "TierError")
     assert _detect_transient_error_in_log(log, agent="codex") is None

@@ -77,25 +77,22 @@ def test_dirty_worktree_is_stashed_with_the_task_id(tmp_path):
     assert (wt / "test_shadow.py").exists()
 
 
-def test_stash_ref_wins_over_ignored_path_warning(tmp_path, monkeypatch):
+def test_stash_ref_wins_over_ignored_path_warning(tmp_path):
     wt = _repo(tmp_path / "wt_warning")
+    (wt / ".gitignore").write_text(".claude/\n")
+    _git(wt, "add", ".gitignore")
+    _git(wt, "commit", "-m", "ignore protocol directory")
     _dirty(wt)
     ignored = wt / ".claude"
     ignored.mkdir()
     (ignored / "CLAUDE.md").write_text("protocol")
-    real_run = subprocess.run
-
-    def warning_after_stash(argv, **kwargs):
-        result = real_run(argv, **kwargs)
-        if argv[3:5] == ["stash", "push"]:
-            result.returncode = 1
-            result.stderr = "warning: ignored protocol path"
-        return result
-
-    monkeypatch.setattr("agent_crew.server.subprocess.run", warning_after_stash)
     ref = _stash_dirty_worktree(str(wt), "task-warning")
     assert ref and ref == _git(wt, "rev-parse", "refs/stash").strip()
     assert _is_clean(wt)
+    assert (ignored / "CLAUDE.md").read_text() == "protocol"
+    _git(wt, "stash", "apply", "--index", ref)
+    assert (wt / "app.py").read_text() == "x = 2  # shadow_enabled\n"
+    assert (wt / "test_shadow.py").exists()
 
 
 def test_clean_worktree_creates_no_stash(tmp_path):
