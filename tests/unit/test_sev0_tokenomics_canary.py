@@ -183,6 +183,54 @@ def test_a_standing_approve_is_not_a_standing_request_changes(monkeypatch):
     assert decision.reason == "standing_verdict_is_approve"
 
 
+def test_report_parent_on_shared_branch_has_no_commit_identity(monkeypatch):
+    monkeypatch.setenv(canary.CANARY_ENV, "project:quota_ops")
+    decision = canary.evaluate_review_dispatch(
+        _review("review-report-2", parent="impl-report-2", sha=SHA_A,
+                pr=None, branch="main"),
+        reviewed_sha=SHA_A,
+        standing_lookup=_standing("request_changes", task_id="review-report-1"),
+        reviewed_artifact_kind="report",
+        lineage_root_lookup=lambda task_id: {
+            "review-report-2": "impl-report-2",
+            "review-report-1": "impl-report-1",
+        }[task_id],
+        project="quota_ops",
+    )
+    assert decision.applied is False
+    assert decision.reason == "report_artifact_no_commit_identity"
+
+
+def test_branch_standing_review_from_other_lineage_cannot_suppress(monkeypatch):
+    monkeypatch.setenv(canary.CANARY_ENV, "project:quota_ops")
+    decision = canary.evaluate_review_dispatch(
+        _review("review-impl-2", parent="impl-2", sha=SHA_A,
+                pr=None, branch="main"),
+        reviewed_sha=SHA_A,
+        standing_lookup=_standing("request_changes", task_id="review-impl-1"),
+        lineage_root_lookup=lambda task_id: {
+            "review-impl-2": "impl-2",
+            "review-impl-1": "impl-1",
+        }[task_id],
+        project="quota_ops",
+    )
+    assert decision.applied is False
+    assert decision.reason == "standing_review_other_lineage"
+
+
+def test_same_lineage_fix_round_on_branch_respects_root_pin(monkeypatch):
+    monkeypatch.setenv(canary.CANARY_ENV, "impl-root")
+    decision = canary.evaluate_review_dispatch(
+        _review("review-fix-r1", parent="fix-review-r1", sha=SHA_A,
+                pr=None, branch="main"),
+        reviewed_sha=SHA_A,
+        standing_lookup=_standing("request_changes", task_id="review-impl-r0"),
+        lineage_root_lookup=lambda task_id: "impl-root",
+    )
+    assert decision.applied is True
+    assert decision.standing_review_task_id == "review-impl-r0"
+
+
 def test_a_lookup_that_raises_dispatches_rather_than_suppressing(monkeypatch):
     monkeypatch.setenv(canary.CANARY_ENV, "impl-1")
 
@@ -471,6 +519,89 @@ def _post_rereview(client, *, pr=7, sha=SHA_A):
                     "allow_duplicate_review": True},
         "project": "",
     })
+
+
+@pytest.mark.parametrize("artifact_kind,expected_reason", [
+    ("report", "report_artifact_no_commit_identity"),
+    ("commit", "standing_review_other_lineage"),
+])
+def test_branch_review_dispatches_for_distinct_lineage_at_shared_head(
+        tmp_db, monkeypatch, artifact_kind, expected_reason):
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    monkeypatch.setenv(canary.CANARY_ENV, "project:demo")
+    queue = TaskQueue(tmp_db)
+    for task_id in ("impl-first", "impl-second"):
+        queue.enqueue(TaskRequest(
+            task_id=task_id, task_type="implement", description="work",
+            branch="main", context={"artifact_kind": artifact_kind}))
+        queue.submit_result(task_id, TaskResult(
+            task_id=task_id, status="completed", summary="artifact written"))
+    queue.enqueue(_review("review-first", parent="impl-first", sha=SHA_A,
+                          pr=None, branch="main"))
+    queue.submit_result("review-first", TaskResult(
+        task_id="review-first", status="completed", summary="reviewed",
+        verdict="request_changes", findings=["first artifact finding"]))
+
+    push = _RecordingPush()
+    app = create_app(db_path=tmp_db, project="demo", pane_map={"reviewer": "%200"},
+                     push_fn=push, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "task_id": "review-second", "task_type": "review",
+            "description": "Review second artifact", "branch": "main",
+            "project": "demo", "context": {
+                "prev_task_id": "impl-second", "reviewed_sha": SHA_A,
+                "allow_duplicate_review": True,
+            },
+        }, headers={"X-Agent-Crew-Project": "demo"})
+    assert response.status_code == 201, response.text
+    assert len(push.calls) == 1
+    assert queue.get_result("review-second") is None
+    receipt = queue.get_tokenomics_shadow_receipt("review-second")
+    assert receipt["canary_applied"] == 0
+    assert receipt["canary_reason"] == expected_reason
+
+
+def test_branch_fix_round_uses_lineage_root_pin_in_dispatch(tmp_db, monkeypatch):
+    from fastapi.testclient import TestClient
+    from agent_crew.server import create_app
+
+    monkeypatch.setenv(canary.CANARY_ENV, "impl-root")
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="impl-root", task_type="implement",
+                              description="work", branch="feature",
+                              context={"artifact_kind": "commit"}))
+    queue.submit_result("impl-root", TaskResult(
+        task_id="impl-root", status="completed", summary="commit written"))
+    queue.enqueue(_review("review-root", parent="impl-root", sha=SHA_A,
+                          pr=None, branch="feature"))
+    queue.submit_result("review-root", TaskResult(
+        task_id="review-root", status="completed", summary="reviewed",
+        verdict="request_changes", findings=["standing finding"]))
+    queue.enqueue(TaskRequest(task_id="fix-root", task_type="implement",
+                              description="fix", branch="feature", context={
+                                  "prev_task_id": "review-root", "fix_round": 1,
+                                  "artifact_kind": "commit"}))
+    queue.submit_result("fix-root", TaskResult(
+        task_id="fix-root", status="completed", summary="fix written"))
+
+    push = _RecordingPush()
+    app = create_app(db_path=tmp_db, project="demo", pane_map={"reviewer": "%200"},
+                     push_fn=push, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "task_id": "review-fix", "task_type": "review",
+            "description": "Review fix", "branch": "feature", "project": "demo",
+            "context": {"prev_task_id": "fix-root", "reviewed_sha": SHA_A,
+                        "allow_duplicate_review": True},
+        }, headers={"X-Agent-Crew-Project": "demo"})
+    assert response.status_code == 201, response.text
+    assert push.calls == []
+    result = queue.get_result("review-fix")
+    assert result is not None and result.summary == canary.SUPPRESSED_REASON
+    assert queue.get_tokenomics_shadow_receipt("review-fix")["canary_applied"] == 1
 
 
 def test_armed_canary_does_not_push_the_identical_sha_rereview(monkeypatch, tmp_db):

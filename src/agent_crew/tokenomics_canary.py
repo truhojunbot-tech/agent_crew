@@ -200,6 +200,8 @@ def evaluate_review_dispatch(
     standing_lookup: Callable[..., Optional[dict]],
     pin: Optional[str] = None,
     project: Optional[str] = None,
+    reviewed_artifact_kind: Optional[str] = None,
+    lineage_root_lookup: Optional[Callable[[str], str]] = None,
 ) -> CanaryDecision:
     """Decide whether THIS review dispatch is the one to suppress.
 
@@ -224,6 +226,10 @@ def evaluate_review_dispatch(
 
     if (getattr(task, "task_type", "") or "") != "review":
         return CanaryDecision(applied=False, reason="not_a_review_task", **base)
+    if reviewed_artifact_kind == "report":
+        # A report can leave the branch head unchanged while changing the
+        # artifact under review. Git SHA equality proves nothing about it.
+        return CanaryDecision(applied=False, reason="report_artifact_no_commit_identity", **base)
     if not _OBJECT_ID_RE.match(reviewed_sha or ""):
         # No pin on the commit means "identical sha" cannot be established.
         # #253's rule applies: when the target's state cannot be verified,
@@ -248,6 +254,22 @@ def evaluate_review_dispatch(
         return CanaryDecision(applied=False, reason="no_prior_verdict_on_this_sha", **base)
     verdict = (standing.get("verdict") or "").strip()
     standing_id = standing.get("task_id") or ""
+    lineage_root = None
+    if pr_number is None:
+        if lineage_root_lookup is None:
+            return CanaryDecision(applied=False, reason="standing_lineage_unverified",
+                                  standing_review_task_id=standing_id, **base)
+        try:
+            lineage_root = lineage_root_lookup(task.task_id)
+            standing_root = lineage_root_lookup(standing_id)
+        except Exception:
+            logger.exception("tokenomics canary: lineage lookup failed for %s — dispatching",
+                             task.task_id)
+            return CanaryDecision(applied=False, reason="standing_lineage_lookup_failed",
+                                  standing_review_task_id=standing_id, **base)
+        if not lineage_root or lineage_root != standing_root:
+            return CanaryDecision(applied=False, reason="standing_review_other_lineage",
+                                  standing_review_task_id=standing_id, **base)
     if verdict != "request_changes":
         # An ``approve`` on the identical commit means the request_changes no
         # longer stands. Suppressing here would hide a real state change.
@@ -266,7 +288,7 @@ def evaluate_review_dispatch(
             applied=False, reason="condition_holds_canary_unarmed",
             standing_review_task_id=standing_id, counterfactual=counterfactual,
             extra=extra, **base)
-    if not _is_pinned(task, pin, project):
+    if not _is_pinned(task, pin, project, lineage_root=lineage_root):
         return CanaryDecision(
             applied=False, reason="condition_holds_not_the_pinned_task",
             standing_review_task_id=standing_id, counterfactual=counterfactual,
