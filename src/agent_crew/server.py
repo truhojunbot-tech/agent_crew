@@ -5794,7 +5794,7 @@ def create_app(
                             "procedural", "episodic", "decision", "failure_pattern", "evidence"),
                         predecessor_task_ids=_predecessors,
                         pr_number=_lineage_pr,
-                        limit=min(SHADOW_RETRIEVAL_MAX_ROWS, max(10, len(_predecessors))),
+                        limit=min(SHADOW_RETRIEVAL_MAX_ROWS, max(10, len(_predecessors) + 2)),
                     )
                 _ranked_receipt = None
                 if _ranked_memory is not None:
@@ -7274,20 +7274,24 @@ def create_app(
             role = str(payload.get("role") or "implementer")
             k = int(payload.get("k", 20))
             byte_budget = int(payload.get("byte_budget", 16000))
-            predecessors, _ = (
-                await asyncio.to_thread(task_lineage, db_path, scope.task_id)
-                if scope.task_id else ((), None)
-            )
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        try:
-            fallback_marker = threading.Event()
-            response_state = {}
-            return await asyncio.wait_for(asyncio.to_thread(
+        fallback_marker = threading.Event()
+        response_state = {}
+        async def lookup_and_retrieve():
+            predecessors = ()
+            if scope.task_id:
+                try:
+                    predecessors, _ = await asyncio.to_thread(task_lineage, db_path, scope.task_id)
+                except Exception as exc:
+                    logger.warning("ranked memory lineage lookup failed for %s: %s",
+                                   scope.task_id, exc)
+            return await asyncio.to_thread(
                 _ranked_memory.retrieve_ranked, scope, query, role, k, byte_budget,
                 predecessor_task_ids=predecessors,
-                fallback_marker=fallback_marker, response_state=response_state),
-                timeout=.300)
+                fallback_marker=fallback_marker, response_state=response_state)
+        try:
+            return await asyncio.wait_for(lookup_and_retrieve(), timeout=.300)
         except asyncio.TimeoutError:
             return _ranked_timeout_response(scope, fallback_marker, response_state)
 
