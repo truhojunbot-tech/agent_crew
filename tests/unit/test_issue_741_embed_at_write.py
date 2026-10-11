@@ -3,7 +3,9 @@ import hashlib
 import json
 import sqlite3
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from unittest.mock import patch
 
@@ -166,6 +168,60 @@ def test_live_result_capture_embeds_with_configured_hybrid_backend(tmp_path, mon
                              (embedder.model_id,)).fetchone()[0]
     assert covered >= 2
     assert len(embedder.calls) >= 2
+
+
+def test_live_result_capture_bounds_slow_endpoint_and_keeps_rows(tmp_path, monkeypatch):
+    class SlowHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            time.sleep(2)
+            try:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"embeddings": [[1.0, 0.5]]}')
+            except BrokenPipeError:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), SlowHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        path = str(tmp_path / "memory.db")
+        HybridMemoryStorage(path)
+        task_db = str(tmp_path / "tasks.db")
+        queue = TaskQueue(task_db)
+        queue.enqueue(TaskRequest(task_id="slow-result", task_type="implement",
+                                  description="capture", project="agent_crew", context={}))
+        monkeypatch.setenv("AGENT_CREW_SHADOW_MEMORY_DB", path)
+        monkeypatch.setenv("AGENT_CREW_MEMORY_BACKEND", "hybrid")
+        monkeypatch.setenv("AGENT_CREW_MEMORY_EMBED_ENDPOINT",
+                           f"http://127.0.0.1:{server.server_port}/embed")
+        monkeypatch.setenv("AGENT_CREW_MEMORY_MODEL_ID", "slow-test")
+        result = type("Result", (), {"status": "completed", "summary": "done",
+                                      "verdict": None, "pr_number": None})()
+        started = time.perf_counter()
+        capture_result_best_effort(task_db, "slow-result", result)
+        elapsed = time.perf_counter() - started
+        assert elapsed < 1.5
+        with sqlite3.connect(path) as db:
+            assert db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0] >= 2
+            assert db.execute("SELECT count(*) FROM adr001_vec").fetchone()[0] == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_shadow_batch_stops_embedding_after_first_failure(tmp_path):
+    embedder = StubEmbedder(fail=True)
+    store = HybridMemoryStorage(str(tmp_path / "memory.db"), embedder=embedder)
+    records = [MemoryRecord("episodic", f"task:{i}", {"text": f"body {i}"},
+                            MemoryScope(project="test")) for i in range(3)]
+    store.put_many_shadow(records)
+    assert len(embedder.calls) == 1
+    assert len(_vectors(store.path)) == 3
 
 
 def test_endpoint_is_not_called_on_retrieval_path(tmp_path, monkeypatch):
