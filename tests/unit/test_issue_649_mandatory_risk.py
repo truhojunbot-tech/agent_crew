@@ -28,6 +28,21 @@ def test_http_root_requires_risk_tier(tmp_path, task_type):
     assert TaskQueue(db).get_task(f"root-{task_type}") is None
 
 
+def test_http_root_declaration_does_not_replace_tier(tmp_path):
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db, pane_map={}, project="agent_crew",
+                     push_fn=lambda *a, **k: None,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "task_id": "root-declared", "task_type": "implement",
+            "description": "work", "context": {
+                "risk_declaration": {"bounded_routine_fix": True}}},
+            headers={"X-Agent-Crew-Project": "agent_crew"})
+    assert response.status_code == 422
+    assert TaskQueue(db).get_task("root-declared") is None
+
+
 def test_run_without_risk_tier_fails_before_enqueue(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_CREW_DEFAULT_RISK_TIER", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -86,6 +101,43 @@ def test_http_successor_with_declared_tier_inherits_root_risk(tmp_path):
     assert queue.get_task("review-tierless") is None
     assert child_context["risk_tier"] == 2
     assert child_context["risk_declaration"] == root_context["risk_declaration"]
+
+
+def test_http_successor_rejects_tier_mismatch(tmp_path):
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db, pane_map={}, project="agent_crew",
+                     push_fn=lambda *a, **k: None,
+                     watchdog_disabled=True, anomaly_disabled=True)
+    headers = {"X-Agent-Crew-Project": "agent_crew"}
+    with TestClient(app) as client:
+        root = client.post("/tasks", json={
+            "task_id": "impl-root", "task_type": "implement", "description": "work",
+            "context": {"risk_tier": 0}}, headers=headers)
+        assert root.status_code == 201, root.text
+        child = client.post("/tasks", json={
+            "task_id": "review-mismatch", "task_type": "review", "description": "review",
+            "context": {"prev_task_id": "impl-root", "risk_tier": 3}}, headers=headers)
+    assert child.status_code == 422
+    assert TaskQueue(db).get_task("review-mismatch") is None
+
+
+@pytest.mark.parametrize("default_tier", [None, "1"])
+def test_enqueue_successor_inherits_root_without_flag(tmp_path, monkeypatch, default_tier):
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest("impl-root", "implement", "work",
+                              context={"risk_tier": 2}), ingress="loop.implement")
+    if default_tier is None:
+        monkeypatch.delenv("AGENT_CREW_DEFAULT_RISK_TIER", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_CREW_DEFAULT_RISK_TIER", default_tier)
+    result = CliRunner().invoke(crew, ["enqueue", "review", "review work",
+                                      "--db", db, "--prev-task-id", "impl-root",
+                                      "--task-id", "review-root"])
+    assert result.exit_code == 0, result.output
+    child = queue.get_task("review-root")
+    assert child.context["risk_tier"] == 2
+    assert child.context["risk_declaration"] == queue.get_task("impl-root").context["risk_declaration"]
 
 
 @pytest.mark.parametrize("command", [

@@ -1360,7 +1360,7 @@ class DuplicateReviewError(Exception):
 
 
 class InvalidRiskTierError(ValueError):
-    """An HTTP root declared no valid integer tier or explicit declaration."""
+    """An HTTP task declared no valid integer tier or mismatched its root."""
 
 
 def validate_http_root_risk(context: dict | None) -> None:
@@ -1376,11 +1376,7 @@ def validate_http_root_risk(context: dict | None) -> None:
             or not isinstance(context["risk_tier"], int)
             or not 0 <= context["risk_tier"] <= 3):
         raise InvalidRiskTierError("context.risk_tier must be an integer 0-3")
-    declaration = context.get("risk_declaration")
-    explicit = (isinstance(declaration, dict)
-                and any(isinstance(declaration.get(field), bool)
-                        for field in RISK_DECLARATION_FIELDS))
-    if "risk_tier" not in context and not explicit:
+    if "risk_tier" not in context:
         raise InvalidRiskTierError("root context.risk_tier must be an integer 0-3")
 
 
@@ -3640,6 +3636,9 @@ class TaskQueue:
                     root_tier = root_context.get("risk_tier")
                     if (isinstance(root_tier, int) and not isinstance(root_tier, bool)
                             and 0 <= root_tier <= 3):
+                        if context.get("risk_tier") != root_tier:
+                            raise InvalidRiskTierError(
+                                "successor context.risk_tier must equal the root risk tier")
                         context["risk_tier"] = root_tier
                     if isinstance(root_context.get("risk_declaration"), dict):
                         context["risk_declaration"] = root_context["risk_declaration"]

@@ -3985,16 +3985,6 @@ def enqueue(task_type: str, description: str, project: str, db: str, base: str,
     import uuid as _uuid
     import urllib.request as _urllib_req
 
-    if risk_tier is None and "AGENT_CREW_DEFAULT_RISK_TIER" in os.environ:
-        raw_tier = os.environ["AGENT_CREW_DEFAULT_RISK_TIER"].strip()
-        if raw_tier not in {"0", "1", "2", "3"}:
-            raise click.UsageError(
-                "AGENT_CREW_DEFAULT_RISK_TIER must be an integer 0-3; pass --risk-tier 0-3")
-        risk_tier = int(raw_tier)
-    if risk_tier is None:
-        raise click.UsageError(
-            "pass --risk-tier 0-3 or set AGENT_CREW_DEFAULT_RISK_TIER")
-
     if not db:
         if not project:
             raise click.ClickException("--db or --project is required")
