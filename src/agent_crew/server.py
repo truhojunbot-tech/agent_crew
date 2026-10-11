@@ -88,6 +88,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
 from agent_crew import claude_cloud as _claude_cloud
+from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
@@ -1575,7 +1576,8 @@ async def _wait_for_dispatch_activity(
 
 
 def _record_exit_response_telemetry(queue: TaskQueue, task_id: str,
-                                    agent: str, task_log_tail: str) -> None:
+                                    agent: str, task_log_tail: str,
+                                    *, project: str = "") -> None:
     """Refresh usage after the child exits, preserving an earlier Codex receipt."""
     telemetry = response_log_telemetry(agent, task_log_tail)
     if agent == "codex":
@@ -1587,6 +1589,11 @@ def _record_exit_response_telemetry(queue: TaskQueue, task_id: str,
         queue.record_task_telemetry(task_id, telemetry, only_missing=True)
     else:
         queue.record_task_telemetry(task_id, telemetry)
+    if project:
+        try:
+            _contract_emit.schedule_emit(project)
+        except Exception:
+            logger.exception("quota contract emit scheduling failed for task=%s", task_id)
 
 
 #: Cap on the agy/Antigravity conversation the tester resumes with
@@ -6121,7 +6128,8 @@ def create_app(
             except Exception:
                 logger.exception(f"dispatcher: context observation failed for task={task.task_id}")
             try:
-                _record_exit_response_telemetry(q(), task.task_id, agent, _task_log_tail)
+                _record_exit_response_telemetry(q(), task.task_id, agent, _task_log_tail,
+                                                project=_project)
                 _telemetry_attr = q().get_attribution(task.task_id)
                 if _telemetry_attr:
                     append_attribution_jsonl(_attr_jsonl_path, _telemetry_attr)
@@ -7870,6 +7878,12 @@ def create_app(
                                           validate_review=not _REPLAYING.get(),
                                           adopted_fallback_task_id=_adopted_fallback_id)
             capture_result_best_effort(db_path, task_id, result)
+            # #750: quota-core's configured atomic publisher runs off-thread.
+            # A failed or slow emitter cannot change result admission or latency.
+            try:
+                _contract_emit.schedule_emit(_server_identity()["project"])
+            except Exception:
+                logger.exception("quota contract emit scheduling failed for task=%s", task_id)
             # #348: coordinator-managed loops consume the persisted result,
             # not this handler's in-memory object. Keep this deliberately
             # outside submit_result's STOP-atomic transaction: a telemetry-like
