@@ -76,7 +76,8 @@ def test_enriching_capture_scope_replaces_same_task_key(tmp_path):
                          status="completed", summary="done", issue="423",
                          provider_session="known-session")
     with sqlite3.connect(storage.path) as db:
-        rows = db.execute("SELECT scope FROM adr001_memory WHERE key LIKE 'task:scope-task:%'").fetchall()
+        rows = db.execute("SELECT scope FROM adr001_memory WHERE key LIKE 'task:scope-task:%' "
+                          "AND superseded_by IS NULL").fetchall()
     assert len(rows) == 2
     assert all(json.loads(row[0])["provider_session"] == "known-session" for row in rows)
 
@@ -90,7 +91,8 @@ def test_scope_enrichment_preserves_version_lineage(tmp_path):
     capture_task_outcome(storage, project="agent_crew", repo="", task_id="scope-task",
                          status="failed", summary="corrected", issue="423")
     with sqlite3.connect(storage.path) as db:
-        versions = db.execute("SELECT version FROM adr001_memory WHERE key LIKE 'task:scope-task:%'").fetchall()
+        versions = db.execute("SELECT version FROM adr001_memory WHERE key LIKE 'task:scope-task:%' "
+                              "AND superseded_by IS NULL").fetchall()
     assert len(versions) == 3
     assert {row[0] for row in versions} == {3}
 
@@ -408,11 +410,12 @@ def test_revised_outcome_replaces_first_capture(tmp_path):
                          task_id="reused", status="completed", summary="corrected")
     with sqlite3.connect(storage.path) as db:
         retired = db.execute(
-            "SELECT value FROM adr001_memory WHERE layer='failure_pattern' "
+            "SELECT value,invalidated_at FROM adr001_memory WHERE layer='failure_pattern' "
             "AND key='task:reused:failure_pattern'").fetchone()
     assert retired is not None
     assert json.loads(retired[0])["status"] == "failed"
-    assert json.loads(retired[0])["superseded_at"] > 0
+    assert "superseded_at" not in json.loads(retired[0])
+    assert retired[1] > 0
     assert storage.retrieve_shadow(scope, {"failure_pattern"}, 10)[0] == []
     records = storage.retrieve(scope)
     assert {r.value["status"] for r in records} == {"completed"}
@@ -427,10 +430,11 @@ def test_completed_episode_supersedes_failed_pattern_without_deleting_it(tmp_pat
                     project="agent_crew")
     with sqlite3.connect(storage.path) as db:
         retired = db.execute(
-            "SELECT value FROM adr001_memory WHERE layer='failure_pattern' "
+            "SELECT value,invalidated_at FROM adr001_memory WHERE layer='failure_pattern' "
             "AND key='episode:episode-1:failure_pattern'").fetchone()
     assert retired is not None
-    assert json.loads(retired[0])["superseded_at"] > 0
+    assert "superseded_at" not in json.loads(retired[0])
+    assert retired[1] > 0
     assert storage.retrieve_shadow(MemoryScope(project="agent_crew"),
                                    {"failure_pattern"}, 10)[0] == []
 

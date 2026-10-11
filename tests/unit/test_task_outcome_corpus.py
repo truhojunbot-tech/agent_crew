@@ -99,3 +99,10 @@ def test_live_review_capture_refreshes_after_merge(tmp_path, monkeypatch):
     rows = memory.retrieve(MemoryScope(project="agent_crew"), exact_key=key)
     assert len(rows) == 1
     assert rows[0].value["merge_state"] == "merged"
+    assert backfill_task_outcomes(memory, [str(task_db)]) == 0
+    with sqlite3.connect(memory.path) as db:
+        history = db.execute("SELECT value,superseded_by FROM adr001_memory "
+                             "WHERE key LIKE ? ORDER BY version", (key + "%",)).fetchall()
+    assert len(history) == 2
+    assert json.loads(history[0][0])["merge_state"] == ""
+    assert history[0][1] is not None

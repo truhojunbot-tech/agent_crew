@@ -106,11 +106,14 @@ def test_explicit_working_verdict_is_honestly_versioned_and_refreshes(tmp_path):
     verdict.write_text('{"pass_if":"drawdown improves"}')
     assert backfill_document_pointers(memory, sources, explicit) == 1
     with sqlite3.connect(memory.path) as db:
-        rows = db.execute("SELECT key,value,version FROM adr001_memory WHERE key GLOB 'doc:*'").fetchall()
-    assert len(rows) == 1
+        rows = db.execute("SELECT key,value,version,superseded_by FROM adr001_memory "
+                          "WHERE key GLOB 'doc:*' ORDER BY version").fetchall()
+    assert len(rows) == 2
     assert rows[0][0].endswith("@" + _git(repo, "rev-parse", "HEAD"))
-    assert json.loads(rows[0][1])["source_state"] == "working_file"
-    assert rows[0][2] == 2
+    assert json.loads(rows[0][1])["summary"] == "profit improves"
+    assert rows[0][3] == rows[1][0]
+    assert json.loads(rows[1][1])["source_state"] == "working_file"
+    assert rows[1][2:] == (2, None)
 
 
 def test_unchanged_working_file_survives_unrelated_head_commit_without_duplicate(tmp_path):
@@ -139,10 +142,14 @@ def test_unchanged_working_file_survives_unrelated_head_commit_without_duplicate
     verdict.write_text('{"verdict":"change"}')
     assert backfill_document_pointers(memory, sources, explicit) == 1
     with sqlite3.connect(memory.path) as db:
-        rows = db.execute("SELECT key,value FROM adr001_memory WHERE key GLOB 'doc:*'").fetchall()
-    assert len(rows) == 1
-    assert rows[0][0].endswith("@" + _git(repo, "rev-parse", "HEAD"))
-    assert json.loads(rows[0][1])["summary"] == "change"
+        rows = db.execute("SELECT key,value,superseded_by FROM adr001_memory "
+                          "WHERE key GLOB 'doc:*' ORDER BY created").fetchall()
+    assert len(rows) == 2
+    assert rows[0][0].endswith("@" + first_head)
+    assert json.loads(rows[0][1])["summary"] == "keep"
+    assert rows[0][2] == rows[1][0]
+    assert rows[1][0].endswith("@" + _git(repo, "rev-parse", "HEAD"))
+    assert json.loads(rows[1][1])["summary"] == "change"
 
 
 def test_historic_capture_reads_old_commit_and_audit_matches_pinned_ref(tmp_path):

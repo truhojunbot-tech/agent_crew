@@ -292,6 +292,9 @@ def backfill_task_outcomes(storage: SQLiteMemoryStorage,
         uri = Path(db_path).resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(uri, uri=True)) as db, closing(
                 sqlite3.connect(storage.path)) as memory:
+            storage._ensure_revision_columns(memory)
+            storage._revision_columns = True
+            memory.commit()
             db.row_factory = sqlite3.Row
             task_ids = [row[0] for row in db.execute(
                 "SELECT task_id FROM tasks WHERE status IN "
@@ -303,9 +306,12 @@ def backfill_task_outcomes(storage: SQLiteMemoryStorage,
                         "SELECT project FROM tasks WHERE task_id=?", (task_id,),
                     ).fetchone()[0]
                     project = canonical_project(source_project or Path(db_path).parent.name)
+                    key = f"task_outcome:{project}:{task_id}"
                     before = memory.execute(
-                        "SELECT value FROM adr001_memory WHERE key=?",
-                        (f"task_outcome:{project}:{task_id}",)).fetchone()
+                        "SELECT value FROM adr001_memory WHERE layer='episodic' "
+                        "AND (key=? OR (key>=? AND key<?)) "
+                        "AND superseded_by IS NULL ORDER BY version DESC LIMIT 1",
+                        (key, key + "@v", key + "@v\uffff")).fetchone()
                     record = capture_task_outcome_record(storage, db_path, task_id,
                                                          write=False, source_db=db)
                 except ValueError as exc:
@@ -393,6 +399,9 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
     """
     changed = 0
     with closing(sqlite3.connect(storage.path)) as memory:
+        storage._ensure_revision_columns(memory)
+        storage._revision_columns = True
+        memory.commit()
         for repo, root in repos:
             root_path = Path(root).expanduser().resolve()
             def git(*args: str) -> str:
@@ -448,19 +457,27 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
                         "WHERE json_extract(value,'$.kind')='doc_pointer' "
                         "AND json_extract(value,'$.source_state')='working_file' "
                         "AND json_extract(value,'$.repo')=? "
-                        "AND json_extract(value,'$.path')=?",
+                        "AND json_extract(value,'$.path')=? "
+                        "AND superseded_by IS NULL",
                         (repo, path)).fetchall()
                     if any(json.loads(value).get("content_sha256") ==
                            record.value["content_sha256"] for _, value in previous):
                         continue
                     storage.put_many_shadow([record])
+                    head = memory.execute(
+                        "SELECT key FROM adr001_memory WHERE layer=? "
+                        "AND (key=? OR (key>=? AND key<?)) "
+                        "AND superseded_by IS NULL ORDER BY version DESC LIMIT 1",
+                        (record.layer, record.key, record.key + "@v",
+                         record.key + "@v\uffff")).fetchone()[0]
                     memory.execute(
-                        "DELETE FROM adr001_memory WHERE key<>? "
+                        "UPDATE adr001_memory SET superseded_by=? WHERE key<>? "
+                        "AND superseded_by IS NULL "
                         "AND json_extract(value,'$.kind')='doc_pointer' "
                         "AND json_extract(value,'$.source_state')='working_file' "
                         "AND json_extract(value,'$.repo')=? "
                         "AND json_extract(value,'$.path')=?",
-                        (record.key, repo, path))
+                        (head, head, repo, path))
                     memory.commit()
                     changed += 1
                     continue
