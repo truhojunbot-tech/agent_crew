@@ -277,6 +277,11 @@ class SQLiteMemoryStorage:
         if exact_key:
             clauses.append("key=?"); params.append(exact_key)
         with closing(sqlite3.connect(self.path)) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
+            if "invalidated_at" in columns:
+                clauses.append("invalidated_at IS NULL")
+            if "superseded_by" in columns:
+                clauses.append("superseded_by IS NULL")
             rows = db.execute("SELECT layer,key,value,scope,version FROM adr001_memory WHERE " + " AND ".join(clauses), params).fetchall()
         result = [
             MemoryRecord(r[0], r[1], json.loads(r[2]), _scope_from_json(r[3]), r[4])

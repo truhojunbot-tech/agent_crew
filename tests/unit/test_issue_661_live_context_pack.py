@@ -5,6 +5,7 @@ from agent_crew.memory_runtime import (MemoryRecord, MemoryScope, SQLiteMemorySt
                                        dispatch_memory_block)
 import hashlib
 import json
+import sqlite3
 import time
 
 import pytest
@@ -155,6 +156,42 @@ def test_dispatch_memory_uses_only_effective_project_owner_statements(tmp_path, 
     assert old not in block
     assert foreign not in block
     assert counts == {"authoritative": 1, "failure_pattern": 0}
+
+
+def test_migrated_column_retirements_stay_out_of_live_readers(tmp_path, monkeypatch):
+    from agent_crew.memory_hybrid import HybridMemoryStorage
+
+    monkeypatch.setenv("AGENT_CREW_ADR001_MEMORY_ENABLED", "1")
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    scope = MemoryScope(project="agent_crew")
+    for layer, key in (
+        ("failure_pattern", "retired-failure"),
+        ("failure_pattern", "replaced-failure"),
+        ("failure_pattern", "current-failure"),
+        ("authoritative", "retired-truth"),
+        ("authoritative", "current-truth"),
+    ):
+        storage.put(MemoryRecord(layer, key, {"text": key}, scope))
+    HybridMemoryStorage(storage.path)
+    with sqlite3.connect(storage.path) as db:
+        db.execute("UPDATE adr001_memory SET invalidated_at=? WHERE key=?",
+                   (time.time(), "retired-failure"))
+        db.execute("UPDATE adr001_memory SET superseded_by=? WHERE key=?",
+                   ("current-truth", "retired-truth"))
+        db.execute("UPDATE adr001_memory SET superseded_by=? WHERE key=?",
+                   ("current-failure", "replaced-failure"))
+
+    block, counts = dispatch_memory_block(
+        storage, "implementer", "impl-661", scope)
+    artifacts = pack.FailurePatternProvider(storage.path).retrieve(
+        pack.RetrievalQuery(project="agent_crew"))
+    assert "retired-failure" not in block
+    assert "replaced-failure" not in block
+    assert "retired-truth" not in block
+    assert "current-failure" in block
+    assert "current-truth" in block
+    assert counts == {"authoritative": 1, "failure_pattern": 1}
+    assert {item.artifact_id for item in artifacts} == {"memory:current-failure"}
 
 
 def test_dispatch_memory_budget_counts_only_rendered_rows(tmp_path, monkeypatch):
