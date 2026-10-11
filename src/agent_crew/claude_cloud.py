@@ -822,6 +822,12 @@ def dispatch_cloud_for_role(
                                 session_url=launch.session_url)
 
 
+def _log_shadow_skip(task: TaskRequest, reason: str) -> bool:
+    """One info line per shadow skip (#761); ``reason`` is a stable token."""
+    logger.info("claude_cloud: shadow skip task=%s reason=%s", task.task_id, reason)
+    return False
+
+
 def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optional[RunFn] = None,
                          state_path: Optional[str] = None) -> bool:
     """Launch a comparison review without claiming or completing the local task."""
@@ -829,34 +835,34 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
         return False
     current = queue.get_task_context(task.task_id)
     if current.get("cloud_shadow_launch_reserved_at") or current.get("cloud_shadow_session_id"):
-        return False
+        return _log_shadow_skip(task, "already_reserved")
     shadow_active = sum(1 for row in queue.list_tasks()
                         if (row.context or {}).get("cloud_shadow_session_id")
                         and not (row.context or {}).get("cloud_shadow_ended_at"))
     if shadow_active + queue.count_in_progress_by_dispatch_channel(DISPATCH_CHANNEL) >= cloud_max_concurrency():
-        return False
+        return _log_shadow_skip(task, "concurrency")
     daily_cap = cloud_max_per_day()
     if daily_cap is not None:
         day_start = int(time.time() // 86400) * 86400
         if queue.count_cloud_reviews_started_since(day_start) >= daily_cap:
-            return False
+            return _log_shadow_skip(task, "daily_cap")
     context = task.context if isinstance(task.context, dict) else {}
     if not isinstance(context.get("pr_number") or task.pr_number, int) or not re.fullmatch(
             r"[0-9a-fA-F]{40}", str(context.get("reviewed_sha") or "")):
-        return False
+        return _log_shadow_skip(task, "no_pr_sha")
     run = run_fn or _default_run
     if not probe_cloud_cli(run).supported:
-        return False
+        return _log_shadow_skip(task, "probe_unsupported")
     repo = _resolve_task_repo(task, None, state_path)
     if not repo:
-        return False
+        return _log_shadow_skip(task, "no_repo")
     cwd, cwd_remote = _validated_cloud_checkout(task.project or "", repo, state_path)
     if not cwd:
         queue.patch_context(task.task_id, {"cloud_shadow_terminal_error":
                                            "cloud_review_cwd_repo_mismatch"})
-        return False
+        return _log_shadow_skip(task, "cwd_mismatch")
     if not queue.reserve_cloud_shadow_launch(task.task_id):
-        return False
+        return _log_shadow_skip(task, "already_reserved")
     try:
         proc = run(build_launch_argv(build_cloud_task_prompt(task, repo=repo),
                                      base_ref=_detached_cloud_ref(cwd)), cwd=cwd)
