@@ -31,11 +31,17 @@ HEAD_STANDING_BYTES = 2000
 MIDDLE_CANDIDATE_LIMIT = 96
 
 
+def _short_scan_terms(terms: list[str]) -> list[str]:
+    """Keep every distinct short term in the bounded query, including Korean."""
+    return list(dict.fromkeys(term.casefold() for term in terms if len(term) < 3))
+
+
 def _body_sql(alias: str) -> str:
     return (f"CASE WHEN {alias}.layer='authoritative' THEN "
             f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || "
             f"COALESCE(' ' || json_extract({alias}.value,'$.gloss_en'),'') "
-            f"ELSE {alias}.value END")
+            f"ELSE COALESCE(json_extract({alias}.value,'$.text') || ' ', '') || "
+            f"{alias}.value END")
 
 
 _FTS_AI_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_ai AFTER INSERT ON "
@@ -46,6 +52,9 @@ _FTS_AU_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_au AFTER UPDATE OF value
                "INSERT INTO adr001_fts(rowid,layer,key,body) "
                f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); "
                "DELETE FROM adr001_vec WHERE rowid=new.rowid; END;")
+_FTS_DDL = "CREATE VIRTUAL TABLE adr001_fts USING fts5(layer,key,body, tokenize='trigram')"
+_SHORT_FTS_DDL = ("CREATE VIRTUAL TABLE adr001_short_fts USING "
+                  "fts5(key,body, tokenize='unicode61')")
 
 
 def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str) -> bool:
@@ -104,10 +113,13 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         db.execute("DROP TABLE adr001_supersedes_candidates")
     logger.info("memory hybrid legacy migration invalidated=%d superseded=%d",
                 invalidated, legacy_links + linked)
-    fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone() is None
+    fts_row = db.execute("SELECT sql FROM sqlite_master WHERE name='adr001_fts'").fetchone()
+    fresh = fts_row is None
+    fts_changed = not fresh and "tokenize='trigram'" not in fts_row[0].lower()
     triggers_changed = any(_trigger_definition_changed(db, name, ddl) for name, ddl in (
         ("adr001_fts_ai", _FTS_AI_SQL), ("adr001_fts_au", _FTS_AU_SQL)))
-    db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
+    if fresh:
+        db.execute(_FTS_DDL)
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
     db.executescript("""
@@ -132,13 +144,51 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         DELETE FROM adr001_vec WHERE rowid=new.rowid;
       END;
     """)
+    # Build the short-token companion in its own transaction. The trigram
+    # replacement below has its own rollback boundary and must not hold one
+    # write lock for both full-index backfills.
+    short_fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_short_fts'").fetchone() is None
+    if short_fresh:
+        db.execute(_SHORT_FTS_DDL)
+    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_ai "
+               "AFTER INSERT ON adr001_memory BEGIN "
+               "INSERT INTO adr001_short_fts(rowid,key,body) "
+               f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
+    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_au "
+               "AFTER UPDATE OF value ON adr001_memory BEGIN "
+               "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; "
+               "INSERT INTO adr001_short_fts(rowid,key,body) "
+               f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
+    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_ad "
+               "AFTER DELETE ON adr001_memory BEGIN "
+               "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; END")
+    short_count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
+    if (short_fresh or
+            db.execute("SELECT count(*) FROM adr001_short_fts").fetchone()[0] != short_count):
+        db.execute("DELETE FROM adr001_short_fts")
+        db.execute("INSERT INTO adr001_short_fts(rowid,key,body) "
+                   "SELECT m.rowid,m.key," + _body_sql("m") + " FROM adr001_memory m")
+    db.commit()
+    if fts_changed:
+        # The script above ends the legacy-column transaction. Replacing the
+        # table and its triggers in one write transaction keeps concurrent
+        # writers from observing an unindexed row.
+        db.execute("BEGIN IMMEDIATE")
+        for name in ("adr001_fts_ai", "adr001_fts_au", "adr001_fts_ad"):
+            db.execute(f"DROP TRIGGER IF EXISTS {name}")
+        db.execute("DROP TABLE adr001_fts")
+        db.execute(_FTS_DDL)
+        db.execute("""CREATE TRIGGER adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN
+            DELETE FROM adr001_fts WHERE rowid=old.rowid;
+            DELETE FROM adr001_vec WHERE rowid=old.rowid;
+        END;""")
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
     indexed = db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
-    if fresh or triggers_changed or count != indexed:
+    if fresh or fts_changed or triggers_changed or count != indexed:
         db.execute("DELETE FROM adr001_fts")
         db.execute("INSERT INTO adr001_fts(rowid,layer,key,body) "
                    "SELECT m.rowid,m.layer,m.key," + _body_sql("m") + " FROM adr001_memory m")
-    if triggers_changed:
+    if fts_changed or triggers_changed:
         # executescript commits before it runs. Keep the old triggers until
         # the rebuild starts, then swap them in that same transaction. A
         # rollback leaves both the old body and old trigger definition, so
@@ -274,13 +324,50 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         terms = re.findall(r"[\w]+", query)[:12]
         rows = []
         if terms:
-            expression = " OR ".join('"' + term + '"' for term in terms)
-            rows = db.execute(
-                prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
-                clause + " AND " + _effective_sql() +
-                " AND adr001_fts MATCH ? ORDER BY bm25(adr001_fts) "
-                "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT],
-            ).fetchall()
+            searchable = [term for term in terms if len(term) >= 3]
+            short_terms = _short_scan_terms(terms)
+            def short_rows_for(scan_terms: list[str]) -> list[tuple]:
+                expression = " OR ".join('"' + term + '"' for term in scan_terms)
+                return db.execute(
+                    prefix + "JOIN adr001_short_fts ON adr001_short_fts.rowid=m.rowid "
+                    "WHERE " + clause + " AND " + _effective_sql() +
+                    " AND adr001_short_fts MATCH ? ORDER BY bm25(adr001_short_fts) "
+                    "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT]).fetchall()
+            if short_terms:
+                rows = short_rows_for(short_terms)
+                if not rows:
+                    # unicode61 indexes whole words. Preserve the old short
+                    # substring behavior for a query inside a longer Korean
+                    # word, with filtering in SQLite and only 96 rows copied.
+                    substring = " OR ".join(
+                        "instr(lower(adr001_fts.key || ' ' || adr001_fts.body), lower(?))>0"
+                        for _ in short_terms)
+                    rows = db.execute(
+                        prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid "
+                        "WHERE " + clause + " AND " + _effective_sql() +
+                        " AND (" + substring + ") ORDER BY m.created DESC "
+                        "LIMIT ?", [*params, *short_terms, MIDDLE_CANDIDATE_LIMIT]).fetchall()
+            if searchable:
+                expression = " OR ".join('"' + term + '"' for term in searchable)
+                long_rows = db.execute(
+                    prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
+                    clause + " AND " + _effective_sql() +
+                    " AND adr001_fts MATCH ? ORDER BY bm25(adr001_fts) "
+                    "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT],
+                ).fetchall()
+                if rows:
+                    # Both lexical lanes get room before recent-row padding.
+                    short_rows, rows, seen = rows, [], set()
+                    for index in range(MIDDLE_CANDIDATE_LIMIT):
+                        for lane in (short_rows, long_rows):
+                            if index < len(lane) and lane[index][0] not in seen:
+                                rows.append(lane[index]); seen.add(lane[index][0])
+                                if len(rows) == MIDDLE_CANDIDATE_LIMIT:
+                                    break
+                        if len(rows) == MIDDLE_CANDIDATE_LIMIT:
+                            break
+                else:
+                    rows = long_rows
         if len(rows) < MIDDLE_CANDIDATE_LIMIT:
             seen = {row[0] for row in rows}
             recent = db.execute(prefix + "WHERE " + clause + " AND " + _effective_sql() +
@@ -367,21 +454,43 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         ids = {r["rowid"] for r in candidates}
         if not ids:
             return [], False
-        terms = re.findall(r"[\w]+", query)
+        terms = re.findall(r"[\w]+", query)[:12]
         bm25 = {}
+        short_rank = {}
+        short_exact = set()
         with closing(sqlite3.connect(self.path)) as db:
-            if terms:
-                expression = " OR ".join('"' + term.replace('"', '') + '"' for term in terms)
+            searchable = [term for term in terms if len(term) >= 3]
+            if searchable:
+                expression = " OR ".join('"' + term.replace('"', '') + '"' for term in searchable)
                 for rowid, score in db.execute(
                         "SELECT rowid,bm25(adr001_fts,0.2,10,1) FROM adr001_fts "
                         "WHERE adr001_fts MATCH ? ORDER BY 2", (expression,)):
                     if rowid in ids:
                         bm25[rowid] = len(bm25) + 1
+            short_terms = [term for term in terms if len(term) < 3]
+            if short_terms:
+                expression = " OR ".join('"' + term + '"' for term in short_terms)
+                short_ids = {row[0] for row in db.execute(
+                    "SELECT rowid FROM adr001_short_fts WHERE adr001_short_fts MATCH ? "
+                    "AND rowid IN (" + ",".join("?" for _ in ids) + ")",
+                    [expression, *ids])}
+                short_rank = {row["rowid"]: rank for rank, row in enumerate(
+                    (row for row in candidates if row["rowid"] in short_ids), 1)}
             vectors = db.execute("SELECT rowid,model_id,content_sha,vec FROM adr001_vec WHERE "
                                  "rowid IN (" + ",".join("?" for _ in ids) + ")", list(ids)).fetchall()
             bodies = {rowid: body for rowid, body in db.execute(
                 "SELECT rowid,body FROM adr001_fts WHERE rowid IN (" +
                 ",".join("?" for _ in ids) + ")", list(ids))}
+        if short_rank:
+            for row in candidates:
+                if row["rowid"] not in short_rank:
+                    continue
+                source = row["key"] + " " + bodies.get(row["rowid"], "")
+                if any((re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)",
+                                  source, re.IGNORECASE) if term.isascii()
+                        else term.casefold() in source.casefold())
+                       for term in short_terms):
+                    short_exact.add(row["rowid"])
         semantic = []
         if self.embedder and vectors:
             q = array("f", self.embedder(query))
@@ -402,6 +511,9 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         lexical = {r["rowid"]: rank for rank, r in enumerate(candidates, 1)}
         candidates.sort(key=lambda row: (
             -(1 / (RRF_K + bm25[row["rowid"]]) if row["rowid"] in bm25 else 0)
+            - ((0.75 if row["rowid"] in short_exact else 0.25) /
+               (RRF_K + short_rank[row["rowid"]])
+               if row["rowid"] in short_rank else 0)
             - (1 / (RRF_K + vector_rank[row["rowid"]]) if row["rowid"] in vector_rank else 0),
             lexical[row["rowid"]]))
         return candidates, bool(vector_rank)
