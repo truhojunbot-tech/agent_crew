@@ -1,4 +1,5 @@
 import json
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -87,3 +88,183 @@ def test_run_gate_uses_temporary_worktree_and_cleans_up(tmp_path, monkeypatch):
     assert any(args[:4] == ["git", "worktree", "add", "--detach"] for args, _ in calls)
     assert any(args[:3] == ["git", "worktree", "remove"] for args, _ in calls)
     assert any(args[:3] == ["gh", "pr", "comment"] and "EXIT 0" in args[args.index("--body") + 1] for args, _ in calls)
+
+
+def _approved(number, sha):
+    return _comment(f"[agent_crew review] verdict: ✅ approve\n**Summary:** PR #{number} at {sha[:7]}: approve.", 1)
+
+
+def test_one_pr_error_does_not_block_later_approved_pr(tmp_path, monkeypatch, capsys):
+    prs = [{"number": 7, "head": {"sha": HEAD}},
+           {"number": 8, "head": {"sha": OLD}}]
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint: prs if "/pulls?" in endpoint else
+                        [_approved(int(endpoint.split("/issues/")[1].split("/")[0]),
+                                   HEAD if "/issues/7/" in endpoint else OLD)])
+    posted = []
+    fetched = []
+    def checked(args, **_kwargs):
+        if args[:4] == ["git", "fetch", "origin", "pull/7/head"]:
+            fetched.append(HEAD)
+        if args[:4] == ["git", "fetch", "origin", "pull/8/head"]:
+            fetched.append(OLD)
+        if args[:3] == ["git", "rev-parse", "origin/main"]:
+            return MAIN
+        if args[:3] == ["git", "rev-parse", "FETCH_HEAD"]:
+            return fetched[-1]
+        if args[:3] == ["gh", "pr", "comment"]:
+            posted.append(int(args[3]))
+        return ""
+    monkeypatch.setattr(gate, "checked", checked)
+    def test_pr(number, *_args):
+        if number == 7:
+            raise RuntimeError("worktree add failed")
+        return "1 passed in 1s", 0
+    monkeypatch.setattr(gate, "test_pr", test_pr)
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 1
+    assert posted == [8]
+    assert "PR #7" in capsys.readouterr().err
+
+
+def test_unbound_approved_review_is_logged(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint:
+                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else
+                        [_comment("[agent_crew review] verdict: ✅ approve\n"
+                                  f"**Summary:** reviewed_sha {HEAD}", 1)])
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 1
+    assert "PR #7" in capsys.readouterr().err
+
+
+def test_existing_coordinator_gate_is_not_reported_as_unbound(tmp_path, monkeypatch, capsys):
+    comments = [_approved(7, HEAD),
+                _comment(f"**Coordinator merge gate:** full suite green on PR head {HEAD}", 2)]
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint:
+                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else comments)
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 0
+    assert not capsys.readouterr().err
+
+
+def test_blackboard_failure_allows_next_pr_and_retries_without_retesting(tmp_path, monkeypatch):
+    prs = [{"number": 7, "head": {"sha": HEAD}},
+           {"number": 8, "head": {"sha": OLD}}]
+    comments = {7: [_approved(7, HEAD)], 8: [_approved(8, OLD)]}
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint: prs if "/pulls?" in endpoint else
+                        comments[int(endpoint.split("/issues/")[1].split("/")[0])])
+    fetched = []
+    def checked(args, **_kwargs):
+        if args[:3] == ["git", "fetch", "origin"] and args[3].startswith("pull/"):
+            fetched.append(HEAD if args[3] == "pull/7/head" else OLD)
+        if args == ["git", "rev-parse", "origin/main"]:
+            return MAIN
+        if args == ["git", "rev-parse", "FETCH_HEAD"]:
+            return fetched[-1]
+        if args[:3] == ["gh", "pr", "comment"]:
+            number = int(args[3])
+            comments[number].append(_comment(args[args.index("--body") + 1], len(comments[number]) + 1))
+        return ""
+    monkeypatch.setattr(gate, "checked", checked)
+    tested = []
+    monkeypatch.setattr(gate, "test_pr", lambda number, *_args:
+                        (tested.append(number) or "1 passed in 1s", 0))
+    posted = []
+    def blackboard(_command, payload):
+        posted.append(payload["pr_number"])
+        if posted == [7]:
+            raise RuntimeError("blackboard unavailable")
+    monkeypatch.setattr(gate, "post_blackboard", blackboard)
+    opts = ["--lock-file", str(tmp_path / "lock"), "--blackboard-command", "bb post"]
+    assert gate.main(opts) == 1
+    assert tested == [7, 8]
+    assert any(gate.MARKER in c["body"] for c in comments[7])
+    assert not any(gate.BLACKBOARD_MARKER in c["body"] for c in comments[7])
+    assert any(gate.BLACKBOARD_MARKER in c["body"] for c in comments[8])
+    assert gate.main(opts) == 0
+    assert tested == [7, 8]
+    assert posted == [7, 8, 7]
+    assert any(gate.BLACKBOARD_MARKER in c["body"] for c in comments[7])
+
+
+def test_head_moved_is_skipped_with_failure_status(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint:
+                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else
+                        [_approved(7, HEAD)])
+    monkeypatch.setattr(gate, "checked", lambda args, **_kwargs:
+                        MAIN if args == ["git", "rev-parse", "origin/main"] else OLD)
+    monkeypatch.setattr(gate, "test_pr", lambda *_args: pytest.fail("moved head was tested"))
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 1
+    assert "head changed" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("summary,exit_code", [
+    ("1 failed, 2 passed in 1s", 1),
+    ("pytest not run: squash conflict", 1),
+])
+def test_nonzero_gate_result_is_commented(tmp_path, monkeypatch, summary, exit_code):
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint:
+                        [{"number": 7, "head": {"sha": HEAD}}] if "/pulls?" in endpoint else
+                        [_approved(7, HEAD)])
+    bodies = []
+    def checked(args, **_kwargs):
+        if args == ["git", "rev-parse", "origin/main"]:
+            return MAIN
+        if args == ["git", "rev-parse", "FETCH_HEAD"]:
+            return HEAD
+        if args[:3] == ["gh", "pr", "comment"]:
+            bodies.append(args[args.index("--body") + 1])
+        return ""
+    monkeypatch.setattr(gate, "checked", checked)
+    monkeypatch.setattr(gate, "test_pr", lambda *_args: (summary, exit_code))
+    assert gate.main(["--lock-file", str(tmp_path / "lock")]) == 0
+    assert len(bodies) == 1
+    assert f"pytest: {summary}" in bodies[0]
+    assert f"EXIT {exit_code}" in bodies[0]
+
+
+def test_main_exits_cleanly_if_lock_is_held(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "_api_list", lambda *_args: pytest.fail("lock did not hold"))
+    lock = tmp_path / "lock"
+    with gate.single_run_lock(lock):
+        assert gate.main(["--lock-file", str(lock)]) == 0
+
+
+@pytest.mark.parametrize("outcome,expected_summary,expected_exit", [
+    ("failed", "1 failed, 2 passed in 1s", 1),
+    ("conflict", "pytest not run: squash conflict", 1),
+    ("timeout", "pytest timed out after 7200s", 124),
+    ("error", None, None),
+])
+def test_pr_cleans_worktree_and_basetemp_on_all_outcomes(
+        tmp_path, monkeypatch, outcome, expected_summary, expected_exit):
+    monkeypatch.setattr(gate, "BASETEMP_ROOT", tmp_path)
+    basetemp = tmp_path / "ac_gate_777"
+    basetemp.mkdir()
+    (basetemp / "stale").write_text("old")
+    commands = []
+    def fake_run(args, **_kwargs):
+        commands.append(args)
+        if args[:2] == ["git", "worktree"] and args[2] == "add":
+            assert not basetemp.exists()
+        if "--squash" in args and outcome == "conflict":
+            return SimpleNamespace(returncode=1, stdout="", stderr="conflict")
+        if "pytest" in args:
+            basetemp.mkdir()
+            (basetemp / "created").write_text("new")
+            if outcome == "timeout":
+                raise subprocess.TimeoutExpired(args, 7300)
+            if outcome == "error":
+                raise RuntimeError("pytest launcher error")
+            return SimpleNamespace(returncode=1, stdout="1 failed, 2 passed in 1s\n", stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(gate, "run", fake_run)
+    if outcome == "error":
+        with pytest.raises(RuntimeError, match="pytest launcher error"):
+            gate.test_pr(777, HEAD, MAIN, tmp_path)
+    else:
+        assert gate.test_pr(777, HEAD, MAIN, tmp_path) == (expected_summary, expected_exit)
+    assert not basetemp.exists()
+    assert any(args[:3] == ["git", "worktree", "remove"] for args in commands)
+    assert not list(tmp_path.glob("ac_gate_777_*/"))
+
+
+def test_pytest_summary_extracts_decorated_line():
+    assert gate.pytest_summary("failures above\n=== 2 failed, 3 passed, 1 skipped in 9s ===\n") == \
+           "2 failed, 3 passed, 1 skipped in 9s"

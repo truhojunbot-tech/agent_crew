@@ -22,8 +22,10 @@ import tempfile
 
 REPO = "truhojunbot-tech/agent_crew"
 ROOT = Path(__file__).resolve().parent.parent
+BASETEMP_ROOT = Path("/dev/shm")
 REVIEW = "[agent_crew review] verdict:"
 MARKER = "[agent_crew premerge gate]"
+BLACKBOARD_MARKER = "[agent_crew premerge blackboard]"
 SHA = re.compile(r"\b[0-9a-f]{40}\b", re.I)
 SUMMARY = re.compile(r"^(?:=+\s*)?\d+ (?:passed|failed|error|skipped|xfailed|xpassed).*", re.I)
 safe_rmtree = shutil.rmtree
@@ -94,6 +96,58 @@ def needs_gate(pr, comments):
     return bool(reviewed and head.startswith(reviewed.group(1)))
 
 
+def unbound_approval(pr, comments):
+    """An approval exists, but this script cannot safely tie it to the head."""
+    head = pr.get("head", {}).get("sha", "").lower()
+    if gate_for_head(comments, head) or legacy_gate_for_head(comments, head):
+        return False
+    reviews = [c for c in comments if (c.get("body") or "").startswith(REVIEW)]
+    if not reviews:
+        return False
+    latest = max(reviews, key=lambda c: (c.get("created_at", ""), c.get("id", 0)))
+    first_line = (latest.get("body") or "").splitlines()[0]
+    return bool(re.fullmatch(r"\[agent_crew review\] verdict:\s*(?:✅\s*)?approve\s*",
+                             first_line) and not needs_gate(pr, comments))
+
+
+def gate_for_head(comments, head):
+    return next((c for c in comments if MARKER in (c.get("body") or "")
+                 and f"HEAD {head}" in (c.get("body") or "")), None)
+
+
+def legacy_gate_for_head(comments, head):
+    return any("Coordinator merge gate:" in (c.get("body") or "")
+               and head in (c.get("body") or "").lower() for c in comments)
+
+
+def blackboard_posted(comments, head):
+    return any(BLACKBOARD_MARKER in (c.get("body") or "")
+               and f"HEAD {head}" in (c.get("body") or "") for c in comments)
+
+
+def gate_payload(number, body):
+    fields = {}
+    for line in body.splitlines():
+        if line.startswith("HEAD "):
+            fields["head_sha"] = line[5:]
+        elif line.startswith("MAIN "):
+            fields["main_sha"] = line[5:]
+        elif line.startswith("pytest: "):
+            fields["summary"] = line[8:]
+        elif line.startswith("EXIT "):
+            fields["exit_code"] = int(line[5:])
+    return {"repo": REPO, "pr_number": number, **fields}
+
+
+def deliver_blackboard(command, number, gate_body):
+    if not command:
+        return
+    payload = gate_payload(number, gate_body)
+    post_blackboard(command, payload)
+    checked(["gh", "pr", "comment", str(number), "--repo", REPO,
+             "--body", f"{BLACKBOARD_MARKER}\nHEAD {payload['head_sha']}\nposted\n"], cwd=ROOT)
+
+
 def pytest_summary(output):
     for line in reversed(output.splitlines()):
         stripped = line.strip().strip("= ")
@@ -111,7 +165,7 @@ def gate_comment(head, main, summary, exit_code):
 def test_pr(number, head, main, work_dir):
     scratch = Path(tempfile.mkdtemp(prefix=f"ac_gate_{number}_", dir=work_dir))
     worktree = scratch / "worktree"
-    basetemp = Path("/dev/shm") / f"ac_gate_{number}"
+    basetemp = BASETEMP_ROOT / f"ac_gate_{number}"
     added = False
     try:
         # A crashed previous run can leave the pytest basetemp behind.
@@ -125,14 +179,21 @@ def test_pr(number, head, main, work_dir):
         cmd = ["timeout", "7200", "python3", "-m", "pytest", "-q", "--timeout=180",
                "-p", "no:cacheprovider", f"--basetemp={basetemp}", "-rf", "tests"]
         env = dict(os.environ, PYTHONPATH="src")
-        result = run(cmd, cwd=worktree, env=env, timeout=7300)
+        try:
+            result = run(cmd, cwd=worktree, env=env, timeout=7300)
+        except subprocess.TimeoutExpired:
+            return "pytest timed out after 7200s", 124
         return pytest_summary(result.stdout + "\n" + result.stderr), result.returncode
     finally:
-        if added:
-            checked(["git", "worktree", "remove", "--force", str(worktree)], cwd=ROOT)
-        if basetemp.exists():
-            safe_rmtree(basetemp)
-        safe_rmtree(scratch)
+        try:
+            if added:
+                checked(["git", "worktree", "remove", "--force", str(worktree)], cwd=ROOT)
+        finally:
+            try:
+                if basetemp.exists():
+                    safe_rmtree(basetemp)
+            finally:
+                safe_rmtree(scratch)
 
 
 def post_blackboard(command, payload):
@@ -152,29 +213,40 @@ def main(argv=None):
         with single_run_lock(args.lock_file):
             prs = _api_list(f"repos/{REPO}/pulls?state=open&per_page=100")
             main = None
+            errors = False
             for pr in prs:
-                number = pr["number"]
-                head = pr["head"]["sha"]
-                comments = _api_list(f"repos/{REPO}/issues/{number}/comments?per_page=100")
-                if not needs_gate(pr, comments):
-                    continue
-                if main is None:
-                    checked(["git", "fetch", "origin", "main"], cwd=ROOT)
-                    main = checked(["git", "rev-parse", "origin/main"], cwd=ROOT).strip()
-                checked(["git", "fetch", "origin", f"pull/{number}/head"], cwd=ROOT)
-                fetched = checked(["git", "rev-parse", "FETCH_HEAD"], cwd=ROOT).strip()
-                if fetched != head:
-                    print(f"PR #{number}: head changed during selection; skipping", file=sys.stderr)
-                    continue
-                summary, exit_code = test_pr(number, head, main, args.work_dir)
-                body = gate_comment(head, main, summary, exit_code)
-                checked(["gh", "pr", "comment", str(number), "--repo", REPO,
-                         "--body", body], cwd=ROOT)
-                post_blackboard(args.blackboard_command, {
-                    "repo": REPO, "pr_number": number, "head_sha": head,
-                    "main_sha": main, "summary": summary, "exit_code": exit_code,
-                })
-                print(f"PR #{number}: {summary}; EXIT {exit_code}")
+                number = pr.get("number", "unknown")
+                try:
+                    head = pr["head"]["sha"]
+                    comments = _api_list(f"repos/{REPO}/issues/{number}/comments?per_page=100")
+                    prior_gate = gate_for_head(comments, head)
+                    if prior_gate:
+                        if args.blackboard_command and not blackboard_posted(comments, head):
+                            deliver_blackboard(args.blackboard_command, number, prior_gate["body"])
+                        continue
+                    if legacy_gate_for_head(comments, head):
+                        continue
+                    if not needs_gate(pr, comments):
+                        if unbound_approval(pr, comments):
+                            raise ValueError("latest approval cannot be bound to current head SHA")
+                        continue
+                    if main is None:
+                        checked(["git", "fetch", "origin", "main"], cwd=ROOT)
+                        main = checked(["git", "rev-parse", "origin/main"], cwd=ROOT).strip()
+                    checked(["git", "fetch", "origin", f"pull/{number}/head"], cwd=ROOT)
+                    fetched = checked(["git", "rev-parse", "FETCH_HEAD"], cwd=ROOT).strip()
+                    if fetched != head:
+                        raise RuntimeError("head changed during selection; skipping")
+                    summary, exit_code = test_pr(number, head, main, args.work_dir)
+                    body = gate_comment(head, main, summary, exit_code)
+                    checked(["gh", "pr", "comment", str(number), "--repo", REPO,
+                             "--body", body], cwd=ROOT)
+                    deliver_blackboard(args.blackboard_command, number, body)
+                    print(f"PR #{number}: {summary}; EXIT {exit_code}")
+                except Exception as exc:
+                    errors = True
+                    print(f"PR #{number}: {exc}", file=sys.stderr)
+            return 1 if errors else 0
     except AlreadyRunning:
         print("premerge gate already running", file=sys.stderr)
         return 0
