@@ -21,7 +21,7 @@ ROUTINE = {
 def _root(queue, *, declared=True):
     queue.enqueue(TaskRequest(
         "risk-root", "implement", "implement the task", branch="feature/risk",
-        context={"risk_declaration": ROUTINE} if declared else {},
+        context={"risk_tier": 1, **({"risk_declaration": ROUTINE} if declared else {})},
     ))
     queue.submit_result("risk-root", TaskResult(
         "risk-root", "completed", "done", pr_number=51))
@@ -98,13 +98,12 @@ def test_test_task_inherits_explicit_root_declaration(tmp_db):
     assert queue.get_task_context(test_id)["risk_declaration"]["inherited_from"] == "risk-root"
 
 
-def test_root_without_explicit_declaration_does_not_inherit(tmp_db):
+def test_root_with_tier_only_generates_explicit_declaration(tmp_db):
     queue = TaskQueue(tmp_db)
     _root(queue, declared=False)
     review_id = _review(queue)
     attribution = _attribution(queue, review_id)
-    assert attribution["risk_declaration_source"] == "unknown"
-    assert attribution["bounded_routine_fix"] is None
+    assert attribution["risk_declaration_source"] == "explicit"
 
     queue.submit_result(review_id, TaskResult(
         review_id, "completed", "fix the missing test",
@@ -112,7 +111,7 @@ def test_root_without_explicit_declaration_does_not_inherit(tmp_db):
     fix_id = auto_enqueue_fix(queue, review_id, pr_state_fn=lambda _: "open",
                               repo="owner/repo")
     assert fix_id
-    assert _attribution(queue, fix_id)["risk_declaration_source"] != "explicit"
+    assert _attribution(queue, fix_id)["risk_declaration_source"] == "explicit"
 
 
 def test_retry_successor_preserves_root_explicit_declaration(tmp_db):
@@ -136,7 +135,7 @@ def test_server_same_role_retry_marks_root_declaration_inherited(tmp_db, monkeyp
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
         "risk-root", "implement", "implement the task", branch="feature/risk",
-        context={"risk_declaration": ROUTINE},
+        context={"risk_tier": 1, "risk_declaration": ROUTINE},
     ))
     app = create_app(tmp_db, pane_map={}, watchdog_disabled=True,
                      anomaly_disabled=True)
@@ -176,7 +175,7 @@ def test_rate_limit_does_not_create_cross_provider_successor(tmp_db):
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(
         "risk-root", "implement", "implement the task", branch="feature/risk",
-        context={"risk_declaration": ROUTINE},
+        context={"risk_tier": 1, "risk_declaration": ROUTINE},
     ))
     handled = auto_fallback_failed_task(
         queue, "risk-root", TaskResult("risk-root", "failed", "usage limit hit"),

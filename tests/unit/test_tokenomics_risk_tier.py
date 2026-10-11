@@ -51,7 +51,7 @@ def test_default_shadow_mode_preserves_full_cascade_and_records_counterfactual(
 
     queue.enqueue(TaskRequest(
         "doc", "implement", "docs/README.md only", branch="b",
-        context={"changed_paths": ["docs/README.md"]},
+        context={"risk_tier": 0, "changed_paths": ["docs/README.md"]},
     ))
     review_id = auto_enqueue_review(queue, "doc", pr_number=1, pr_state_fn=_open)
     assert review_id == "review-doc-r0"
@@ -62,10 +62,10 @@ def test_default_shadow_mode_preserves_full_cascade_and_records_counterfactual(
     assert shadow["actual_action"] == "review_enqueued"
 
     queue.enqueue(TaskRequest("internal", "implement", "internal helper with unit tests",
-                              branch="b", context={"issue": 39}))
+                              branch="b", context={"risk_tier": 1, "issue": 39}))
     internal_review_id = auto_enqueue_review(queue, "internal", pr_number=2, pr_state_fn=_open)
     internal_review = _task(queue, internal_review_id)
-    assert "risk_tier" not in internal_review.context
+    assert internal_review.context["risk_tier"] == 1
     queue.submit_result(internal_review_id, TaskResult(
         task_id=internal_review_id, status="completed", summary="ok", verdict="approve",
     ))
@@ -77,14 +77,14 @@ def test_low_tiers_keep_safety_gates_without_deriving_a_fix_budget(tmp_db, monke
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("doc", "implement", "docs/README.md only", branch="b",
-                              context={"changed_paths": ["docs/README.md"]}))
+                              context={"risk_tier": 0, "changed_paths": ["docs/README.md"]}))
     doc_review_id = auto_enqueue_review(queue, "doc", pr_number=1, pr_state_fn=_open)
     assert doc_review_id == "review-doc-r0"
     queue.submit_result(doc_review_id, TaskResult(
         task_id=doc_review_id, status="completed", summary="ok", verdict="approve"))
     assert auto_enqueue_test(queue, doc_review_id, pr_state_fn=_open) == "test-review-doc-r0"
     queue.enqueue(TaskRequest("internal", "implement", "internal helper with unit tests",
-                              branch="b", context={"issue": 39}))
+                              branch="b", context={"risk_tier": 1, "issue": 39}))
     review_id = auto_enqueue_review(queue, "internal", pr_number=2, pr_state_fn=_open)
     review = _task(queue, review_id)
     assert review.context["risk_tier"] == 1
@@ -99,7 +99,7 @@ def test_legacy_low_tier_contract_cannot_skip_independent_gates(tmp_db, monkeypa
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("legacy", "implement", "docs/README.md only", branch="b",
-                              context={"changed_paths": ["docs/README.md"]}))
+                              context={"risk_tier": 0, "changed_paths": ["docs/README.md"]}))
     contract = _task(queue, "legacy").context["cea_cascade"]
     queue.patch_context("legacy", {"cea_cascade": {
         **contract, "needs_reviewer": False, "needs_tester": False,
@@ -122,10 +122,10 @@ def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(
 ):
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest("core", "implement", "change src/agent_crew/queue.py", branch="b"))
+    queue.enqueue(TaskRequest("core", "implement", "change src/agent_crew/queue.py", branch="b", context={"risk_tier": 2}))
     review_id = auto_enqueue_review(queue, "core", pr_number=3, pr_state_fn=_open)
     assert _task(queue, review_id).context["review_mode"] == "adversarial"
-    queue.enqueue(TaskRequest("deploy", "implement", "deploy release", branch="b"))
+    queue.enqueue(TaskRequest("deploy", "implement", "deploy release", branch="b", context={"risk_tier": 3}))
     assert auto_enqueue_review(queue, "deploy", pr_number=4, pr_state_fn=_open) is None
     gates = queue.list_gates(status="pending")
     assert len(gates) == 1
@@ -141,7 +141,7 @@ def test_tier_three_gate_approval_via_http_enqueues_review(
     """The production gate endpoint, not only the helper, resumes Tier 3 work."""
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest("endpoint-deploy", "implement", "deploy release", branch="b"))
+    queue.enqueue(TaskRequest("endpoint-deploy", "implement", "deploy release", branch="b", context={"risk_tier": 3}))
     assert auto_enqueue_review(queue, "endpoint-deploy", pr_number=4, pr_state_fn=_open) is None
 
     response = test_client.post(
@@ -176,11 +176,11 @@ def test_tier_three_test_gate_approval_via_http_resumes_test_once(
 
 def test_cost_summary_preserves_unknowns_and_groups_by_issue(tmp_db):
     queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest("known", "implement", "internal", context={"issue": 39}))
-    queue.enqueue(TaskRequest("unknown", "implement", "internal", context={"issue": 39}))
+    queue.enqueue(TaskRequest("known", "implement", "internal", context={"risk_tier": 1, "issue": 39}))
+    queue.enqueue(TaskRequest("unknown", "implement", "internal", context={"risk_tier": 1, "issue": 39}))
     # A task can legitimately have no attribution row yet (for example before
     # it is claimed). It is unknown, not absent from the cost denominator.
-    queue.enqueue(TaskRequest("missing", "implement", "internal", context={"issue": 39}))
+    queue.enqueue(TaskRequest("missing", "implement", "internal", context={"risk_tier": 1, "issue": 39}))
     queue.record_attribution("known")
     queue.record_attribution("unknown")
     queue.record_task_telemetry("known", TaskTelemetry(

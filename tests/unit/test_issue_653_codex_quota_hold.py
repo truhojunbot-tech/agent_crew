@@ -39,7 +39,7 @@ def _marker(queue, task_id):
 def test_real_codex_message_is_classified_and_reset_parsed(tmp_path):
     log = tmp_path / "dispatch.log"
     log.write_text("ERROR: You've hit your usage limit. Try again at 3:10 PM.\n")
-    assert _detect_transient_error_in_log(str(log)) == "codex_quota_exhausted"
+    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
     # 2026-10-09 13:02 UTC -> 15:10 UTC on the same day.
     failed_at = 1791550920.0
     assert _codex_quota_reset_at(str(log), failed_at=failed_at) == 1791558600.0
@@ -50,7 +50,7 @@ def test_dated_codex_reset_line_uses_the_stated_calendar_day(tmp_path):
     log.write_text("ERROR: You've hit your usage limit. Try again at Sep 30th, 2026 4:48 PM.\n")
     failed_at = datetime(2026, 9, 24, 13, 2, tzinfo=timezone.utc).timestamp()
     reset_at = datetime(2026, 9, 30, 16, 48, tzinfo=timezone.utc).timestamp()
-    assert _detect_transient_error_in_log(str(log)) == "codex_quota_exhausted"
+    assert _detect_transient_error_in_log(str(log), agent="codex") == "codex_quota_exhausted"
     assert _codex_quota_reset_at(str(log), failed_at=failed_at) == reset_at
 
 

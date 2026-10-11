@@ -21,7 +21,7 @@ def _task_payload(task_id="t1", task_type="implement", description="do work", pr
         "description": description,
         "branch": "main",
         "priority": priority,
-        "context": {},
+        "context": {"risk_tier": 1},
         "project": project,
     }
 
@@ -63,7 +63,7 @@ def test_busy_queue_head_does_not_block_free_override_pane(tmp_db, monkeypatch):
     with TestClient(app) as client:
         assert client.post("/tasks", json=_task_payload("older_default")).status_code == 201
         override = _task_payload("younger_override")
-        override["context"] = {"agent_override": "codex"}
+        override["context"] = {"risk_tier": 1, "agent_override": "codex"}
         assert client.post("/tasks", json=override).status_code == 201
         assert client.get("/tasks/younger_override").json()["status"] == "in_progress"
     assert len(push.calls) == 1
@@ -186,7 +186,7 @@ def _discuss_payload(task_id, agent, topic="some topic", priority=3):
         "description": f"Discuss: {topic}",
         "branch": "main",
         "priority": priority,
-        "context": {"agent": agent, "round": 1},
+        "context": {"risk_tier": 1, "agent": agent, "round": 1},
     }
 
 
@@ -305,7 +305,7 @@ def test_u_sp12_discuss_missing_agent_no_push(tmp_db):
         push_fn=push,
     )
     payload = _discuss_payload("d-noagent", "claude")
-    payload["context"] = {}  # no agent key
+    payload["context"] = {"risk_tier": 1}  # no agent key
     with TestClient(app) as client:
         resp = client.post("/tasks", json=payload)
         assert resp.status_code == 201

@@ -1,7 +1,7 @@
 import os
 
 from agent_crew.prompts.task_loop import build_task_loop_prompt
-from agent_crew.testing_policy import load_scope, render_scope
+from agent_crew.testing_policy import load_scope, render_scope, render_implementer_scope
 from agent_crew.port_validation import require_project_port
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 
@@ -450,6 +450,8 @@ You write production code following TDD where practical:
 3. Refactor, commit (with tests + impl together), and open a PR if the task
    requests one.
 
+<implementer_test_scope>
+
 ### ⛔You may start on a DETACHED HEAD — check before you push
 
 Your worktree shares `refs/heads/*` with the caller's clone and with every
@@ -512,18 +514,21 @@ task sits unrouted and the reviewer goes idle.
 
 **Correct pattern**: POST directly to the server with the explicit task_type:
 
+Set `risk_tier` to the current task's tier (integer 0-3), or choose and
+declare a tier for this new root. Replace the example value below.
+
 ```bash
 TASK_ID="review-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
 curl -sS -X POST http://127.0.0.1:<port>/tasks \\
   -H "Content-Type: application/json" \\
   -d '{
     "task_id": "'"$TASK_ID"'",
-    "task_type": "review",          // or "test" for tester
+    "task_type": "review",
     "description": "Review PR #<n> — <one-line context>",
     "branch": "<PR head branch>",
     "priority": 3,
     "project": "<your project name>",
-    "context": {"pr_number": <n>}
+    "context": {"pr_number": <n>, "risk_tier": 1}
   }'
 ```
 
@@ -627,6 +632,9 @@ forces `task_type=implement` and the tester pane only picks `task_type=test`.
 
 POST directly with the explicit type:
 
+Set `risk_tier` to the reviewed task's tier (integer 0-3), or choose and
+declare a tier for this new root. Replace the example value below.
+
 ```bash
 TASK_ID="test-$(python3 -c 'import secrets; print(secrets.token_hex(4))')"
 curl -sS -X POST http://127.0.0.1:<port>/tasks \\
@@ -638,7 +646,7 @@ curl -sS -X POST http://127.0.0.1:<port>/tasks \\
     "branch": "<PR head branch>",
     "priority": 3,
     "project": "<your project name>",
-    "context": {"pr_number": <n>}
+    "context": {"pr_number": <n>, "risk_tier": 1}
   }'
 ```
 """,
@@ -907,6 +915,10 @@ def generate(role: str, project: str, port: int, agent: str = "",
         body = body.replace(
             "<test_scope>",
             render_scope(load_scope(worktree_path, project)))
+    if "<implementer_test_scope>" in body:
+        body = body.replace(
+            "<implementer_test_scope>",
+            render_implementer_scope(load_scope(worktree_path, project)))
     content = body.replace("<project>", project).replace("<port>", str(port))
     content = content.replace(
         '-H "Content-Type: application/json"',

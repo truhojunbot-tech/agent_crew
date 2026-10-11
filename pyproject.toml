@@ -13,6 +13,9 @@ dependencies = [
   "click",
 ]
 
+[project.optional-dependencies]
+memory-hybrid = ["numpy", "onnxruntime", "tokenizers"]
+
 [project.scripts]
 crew = "agent_crew.cli:crew"
 crew-log-viewer = "agent_crew.log_viewer:main"

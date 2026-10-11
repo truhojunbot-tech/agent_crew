@@ -12,6 +12,35 @@ from agent_crew.server import create_app
 
 
 @pytest.fixture(autouse=True)
+def _tier_legacy_task_posts(monkeypatch, request):
+    """Give pre-risk-contract HTTP fixtures an explicit tier at the client boundary.
+
+    The risk-contract tests intentionally submit missing or invalid metadata and
+    must exercise the real 422 path. Production request handling is untouched.
+    """
+    if ("risk_tier" in request.node.path.name
+            or "risk_declaration" in request.node.path.name):
+        return
+    # Legacy CLI/watch fixtures use the documented default in place of a
+    # per-call --risk-tier or issue label. Contract tests above keep it absent.
+    monkeypatch.setenv("AGENT_CREW_DEFAULT_RISK_TIER", "1")
+    original_post = TestClient.post
+
+    def post(client, url, *args, **kwargs):
+        payload = kwargs.get("json")
+        if (url == "/tasks" and isinstance(payload, dict)
+                and isinstance(payload.get("task_type"), str)):
+            context = payload.get("context")
+            if (context is None or isinstance(context, dict)):
+                context = context or {}
+                if "risk_tier" not in context and "risk_declaration" not in context:
+                    kwargs["json"] = {**payload, "context": {**context, "risk_tier": 1}}
+        return original_post(client, url, *args, **kwargs)
+
+    monkeypatch.setattr(TestClient, "post", post)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_shadow_memory_environment(monkeypatch, tmp_path):
     """Keep inherited server memory flags and HOME paths out of every test.
 
@@ -116,6 +145,10 @@ def _gh_write_argv(argv) -> bool:
     if (len(parts) == 3 and parts[1] == "api" and
             re.fullmatch(r"repos/[^/]+/[^/]+/commits/[0-9a-fA-F]{40}/status", parts[2])):
         return False                     # Exact combined-status REST read.
+    if (len(parts) == 6 and parts[1:3] == ["api", "--paginate"] and
+            re.fullmatch(r"repos/[^/]+/[^/]+/issues/\d+/events", parts[3]) and
+            parts[4:] == ["--jq", '.[] | select(.event=="closed") | .actor.login']):
+        return False                     # Exact PR-closure actor REST read.
     return command not in GH_READ_ONLY_COMMANDS
 
 

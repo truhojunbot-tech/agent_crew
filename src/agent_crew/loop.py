@@ -1,6 +1,7 @@
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 
@@ -8,6 +9,9 @@ from agent_crew.protocol import GateRequest, TaskRequest, TaskResult
 from agent_crew.tokenomics_canary import REUSED_FROM_KEY, SUPPRESSED_REASON
 
 DEFAULT_MAX_ITER: int = 5
+_TASK_POST_TIMEOUT_S = 30
+_TASK_POST_RETRY_TIMEOUT_S = 60
+_TASK_CONFIRM_TIMEOUT_S = 10
 
 
 def _post_task_http(port: int, req: TaskRequest) -> str:
@@ -36,8 +40,42 @@ def _post_task_http(port: int, req: TaskRequest) -> str:
                  "X-Agent-Crew-Project": req.project},
         method="POST",
     )
-    with urllib.request.urlopen(http_req, timeout=5) as resp:
-        return json.loads(resp.read())["task_id"]
+    def confirmed() -> bool:
+        check = urllib.request.Request(
+            f"http://127.0.0.1:{port}/tasks/{urllib.parse.quote(req.task_id, safe='')}",
+            headers={"X-Agent-Crew-Project": req.project}, method="GET")
+        try:
+            with urllib.request.urlopen(check, timeout=_TASK_CONFIRM_TIMEOUT_S) as resp:
+                return json.loads(resp.read()).get("task_id") == req.task_id
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, ValueError):
+            return False
+
+    try:
+        with urllib.request.urlopen(http_req, timeout=_TASK_POST_TIMEOUT_S) as resp:
+            return json.loads(resp.read())["task_id"]
+    except (TimeoutError, urllib.error.URLError) as exc:
+        # urllib wraps some socket timeouts in URLError. Leave every other
+        # transport failure to the caller; a retry is only for an ambiguous
+        # timeout after the server may already have committed this task id.
+        if not (isinstance(exc, TimeoutError)
+                or isinstance(getattr(exc, "reason", None), TimeoutError)):
+            raise
+    if confirmed():
+        return req.task_id
+    try:
+        with urllib.request.urlopen(http_req, timeout=_TASK_POST_RETRY_TIMEOUT_S) as resp:
+            return json.loads(resp.read())["task_id"]
+    except urllib.error.HTTPError as exc:
+        # Preserve successor-target 409s for enqueue_review/test's existing
+        # adoption path. Only this same task id proves the retry succeeded.
+        if exc.code == 409 and confirmed():
+            return req.task_id
+        raise
+    except (TimeoutError, urllib.error.URLError) as exc:
+        if (isinstance(exc, TimeoutError)
+                or isinstance(getattr(exc, "reason", None), TimeoutError)) and confirmed():
+            return req.task_id
+        raise
 
 _TDD_CONTEXT = {
     "tdd": True,

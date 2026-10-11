@@ -10,7 +10,8 @@ from agent_crew.queue import TaskQueue
 def test_direct_enqueue_without_issue_warns_but_admits(tmp_path, caplog):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     with caplog.at_level(logging.WARNING, logger="agent_crew.queue"):
-        task_id = queue.enqueue(TaskRequest("impl-no-issue", "implement", "work"))
+        task_id = queue.enqueue(TaskRequest("impl-no-issue", "implement", "work",
+                                            context={"risk_tier": 1}))
     assert task_id == "impl-no-issue"
     assert queue.get_task(task_id).status == "pending"
     assert "without issue_number" in caplog.text
@@ -21,7 +22,7 @@ def test_direct_enqueue_issue_number_is_queryable(tmp_path, caplog):
     queue = TaskQueue(db)
     with caplog.at_level(logging.WARNING, logger="agent_crew.queue"):
         queue.enqueue(TaskRequest("impl-with-issue", "implement", "work",
-                                  context={"issue_number": 654}))
+                                  context={"issue_number": 654, "risk_tier": 1}))
     context = queue.get_task_context("impl-with-issue")
     assert context["issue"] == 654
     assert context["issue_number"] == 654

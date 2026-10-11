@@ -366,5 +366,5 @@ def test_the_feedback_enqueue_is_guarded_where_production_actually_calls_it():
     # the helper still exists and still builds vacuous feedback; that is fine,
     # because nothing in production reaches it with a failed review.
     assert callable(loop.enqueue_implement_with_feedback)
-    assert inspect.getsource(cli).count('context={"feedback": feedback}') == 1, \
+    assert inspect.getsource(cli).count('context={"feedback": feedback, "risk_tier": risk_tier}') == 1, \
         "a second unguarded feedback enqueue appeared"

@@ -79,10 +79,11 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
     """Return whether a stored scope applies to a query under ADR-001 order."""
     if not strict:
         # Shadow comparisons can use evidence from a prior task when the
-        # request omits a dimension. A named fleet remains an exact boundary.
-        if record_scope.project != query_scope.project:
-            return False
-        if record_scope.fleet != query_scope.fleet:
+        # request omits a dimension. Fleet-only records are shared ancestors;
+        # project records still keep their exact fleet boundary.
+        fleet_ancestor = not record_scope.project and bool(record_scope.fleet)
+        if not fleet_ancestor and (record_scope.project != query_scope.project
+                                   or record_scope.fleet != query_scope.fleet):
             return False
         for name in ("worktree", "issue", "task_id", "context_generation",
                      "provider_session"):
@@ -125,9 +126,9 @@ class MemoryStorage(Protocol):
 
 class SQLiteMemoryStorage:
     """Local-first POC; callers depend only on :class:`MemoryStorage`."""
-    def __init__(self, path: str):
+    def __init__(self, path: str, *, busy_timeout_seconds: float = 5.0):
         self.path = path
-        with closing(sqlite3.connect(path)) as db:
+        with closing(sqlite3.connect(path, timeout=busy_timeout_seconds)) as db:
             db.execute("CREATE TABLE IF NOT EXISTS adr001_memory (layer TEXT,key TEXT,value TEXT,scope TEXT,version INTEGER,created REAL, PRIMARY KEY(layer,key,scope))")
             db.execute("CREATE INDEX IF NOT EXISTS idx_adr001_shadow_project_created "
                        "ON adr001_memory(COALESCE(json_extract(scope,'$.project'),''), created DESC)")
@@ -186,7 +187,7 @@ class SQLiteMemoryStorage:
                     if json.loads(previous[0]) != record.value:
                         raise ValueError("owner statement is immutable")
                     return
-            db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
+            db.execute("""INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)
                 ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,version=excluded.version,created=excluded.created
                 WHERE excluded.version > adr001_memory.version""",
                 (record.layer, record.key, json.dumps(record.value), _canonical_scope_json(record.scope), record.version, time.time())); db.commit()
@@ -219,20 +220,31 @@ class SQLiteMemoryStorage:
                 if prior and json.loads(prior[0]) == record.value:
                     continue
                 version = old_version + 1
-                db.execute("""INSERT INTO adr001_memory VALUES (?,?,?,?,?,?)
+                db.execute("""INSERT INTO adr001_memory(layer,key,value,scope,version,created) VALUES (?,?,?,?,?,?)
                     ON CONFLICT(layer,key,scope) DO UPDATE SET value=excluded.value,
                     version=excluded.version,created=excluded.created""",
                     (record.layer, record.key, json.dumps(record.value), scope,
                      version, time.time()))
             for key in retire_keys:
                 # Preserve the failed observation for audit. Both retrieval
-                # paths already exclude values with a superseded_at timestamp;
-                # the ordinary retention prune still ages this row out.
-                db.execute("UPDATE adr001_memory SET value=json_set(value,'$.superseded_at',?) "
-                           "WHERE layer='failure_pattern' AND key=? "
-                           "AND json_extract(scope,'$.project')=? "
-                           "AND json_extract(value,'$.superseded_at') IS NULL",
-                           (time.time(), key, project))
+                # paths exclude it; the ordinary retention prune still ages it out.
+                if any(row[1] == "invalidated_at" for row in db.execute("PRAGMA table_info(adr001_memory)")):
+                    db.execute("UPDATE adr001_memory SET invalidated_at=? "
+                               "WHERE layer='failure_pattern' AND key=? "
+                               "AND json_extract(scope,'$.project')=? AND invalidated_at IS NULL",
+                               (time.time(), key, project))
+                else:
+                    # The default backend deliberately keeps the legacy schema.
+                    rows = db.execute("SELECT rowid,value FROM adr001_memory "
+                                      "WHERE layer='failure_pattern' AND key=? "
+                                      "AND json_extract(scope,'$.project')=?",
+                                      (key, project)).fetchall()
+                    for rowid, raw in rows:
+                        value = json.loads(raw)
+                        if "superseded_at" not in value:
+                            value["superseded_at"] = time.time()
+                            db.execute("UPDATE adr001_memory SET value=? WHERE rowid=?",
+                                       (json.dumps(value), rowid))
             db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
                 SELECT rowid FROM adr001_memory
                 WHERE layer IN ('episodic','decision','failure_pattern')
@@ -278,6 +290,8 @@ class SQLiteMemoryStorage:
         if not scope.project or not layers or limit <= 0:
             return [], 0
         clauses, params = [], []
+        fleet_ancestor = ("(COALESCE(json_extract(scope,'$.project'),'')='' "
+                          "AND COALESCE(json_extract(scope,'$.fleet'),'')<>'')")
         for name, value in asdict(scope).items():
             if name == "project":
                 continue
@@ -288,7 +302,8 @@ class SQLiteMemoryStorage:
                 continue
             path = f"$.{name}"
             if name == "fleet":
-                clauses.append("COALESCE(json_extract(scope, ?),'') = ?")
+                clauses.append("(COALESCE(json_extract(scope, ?),'') = ? OR "
+                               + fleet_ancestor + ")")
                 params.extend((path, value))
             elif name == "context_generation":
                 clauses.append("(json_extract(scope, ?) IS NULL OR json_extract(scope, ?) = '' "
@@ -322,10 +337,23 @@ class SQLiteMemoryStorage:
                             "FROM (" + sql + ")")
 
                 dropped_sql = ("SELECT count(*) FROM adr001_memory WHERE " + base +
-                               " AND COALESCE(json_extract(scope,'$.project'),'')=''")
+                               " AND COALESCE(json_extract(scope,'$.project'),'')=''"
+                               " AND COALESCE(json_extract(scope,'$.fleet'),'')=''")
                 scoped_sql = packed_rows("SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
-                    + base + " AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                    + base + " AND (COALESCE(json_extract(scope,'$.project'),'')=? OR "
+                    + fleet_ancestor + ") "
                     "ORDER BY created DESC LIMIT ?")
+                project_failure_sql = fleet_failure_sql = "'[]'"
+                if "failure_pattern" in layers:
+                    project_failure_sql = packed_rows(
+                        "SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
+                        + base + " AND layer='failure_pattern' "
+                        "AND COALESCE(json_extract(scope,'$.project'),'')=? "
+                        "ORDER BY created DESC LIMIT 1")
+                    fleet_failure_sql = packed_rows(
+                        "SELECT layer,key,value,scope,version FROM adr001_memory WHERE "
+                        + base + " AND layer='failure_pattern' AND "
+                        + fleet_ancestor + " ORDER BY created DESC LIMIT 1")
                 predecessor_keys = ([f"task:{task_id}:decision" for task_id in predecessor_task_ids]
                                     if "decision" in layers else [])
                 lineage_sql = packed_rows(
@@ -342,23 +370,29 @@ class SQLiteMemoryStorage:
                 parameters = [*args, *args, scope.project,
                               SHADOW_RETRIEVAL_MAX_ROWS if query.strip()
                               else min(limit, SHADOW_RETRIEVAL_MAX_ROWS)]
+                if "failure_pattern" in layers:
+                    parameters.extend([*args, scope.project, *args])
                 if predecessor_keys:
                     parameters.extend([*predecessor_keys, scope.project])
                 if pr_number and "decision" in layers:
                     parameters.extend([scope.project, pr_number, scope.task_id,
                                        SHADOW_RETRIEVAL_MAX_ROWS])
-                dropped, rows_json, lineage_json, pr_json = db.execute(
+                dropped, rows_json, project_failure_json, fleet_failure_json, lineage_json, pr_json = db.execute(
                     "SELECT (" + dropped_sql + "), (" + scoped_sql + "), (" +
+                    project_failure_sql + "), (" + fleet_failure_sql + "), (" +
                     lineage_sql + "), (" + pr_sql + ")", parameters,
                 ).fetchone()
         finally:
             if timing is not None:
                 timing["query_ms"] = (time.perf_counter() - query_started) * 1000
         rows = json.loads(rows_json)
+        failure_rows = json.loads(project_failure_json) + json.loads(fleet_failure_json)
         lineage_rows = json.loads(lineage_json)
         pr_rows = json.loads(pr_json)
         records = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                 version) for layer, key, value, record_scope, version in rows]
+        failures = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
+                                 version) for layer, key, value, record_scope, version in failure_rows]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
         if query.strip():
             terms = set(query.lower().replace('-', ' ').split())
@@ -381,7 +415,10 @@ class SQLiteMemoryStorage:
         pinned_keys = {record.key for record in pinned}
         selected = pinned + [record for record in same_pr if record.key not in pinned_keys]
         selected_keys = {record.key for record in selected}
-        return (selected + [record for record in scoped if record.key not in selected_keys])[
+        floor = [record for record in failures if record.key not in selected_keys]
+        floor_keys = {record.key for record in floor}
+        return (selected + floor + [record for record in scoped
+                                    if record.key not in selected_keys | floor_keys])[
             :min(limit, SHADOW_RETRIEVAL_MAX_ROWS)], dropped
 
 
@@ -547,7 +584,10 @@ class RuntimeMemoryProvider:
             dropped = len(records) - len(scoped)
         items = tuple(MemoryItem(
             item_id=record.key,
-            project=record.scope.project,
+            # MemoryItem.project is the consumer boundary checked by the
+            # shadow wrapper. Fleet-only ancestors have no source project.
+            project=request.project if record.scope.fleet and not record.scope.project
+                    else record.scope.project,
             memory_type=record.layer,
             source_ref=str(record.value.get("link") or record.value.get("source_ref") or record.key),
             excerpt=str(record.value.get("topic") or record.value.get("text") or ""),
@@ -576,3 +616,10 @@ def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: 
             unique[identity] = record
     return {"enabled": True, "role": role, "task_id": task_id,
             "records": [asdict(r) for r in unique.values()]}
+
+
+def __getattr__(name: str):
+    if name in {"HybridMemoryStorage", "memory_storage_from_env"}:
+        from . import memory_hybrid
+        return getattr(memory_hybrid, name)
+    raise AttributeError(name)
