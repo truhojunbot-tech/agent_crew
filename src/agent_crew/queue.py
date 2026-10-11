@@ -3672,22 +3672,35 @@ class TaskQueue:
             else:
                 auth = self._refuse_admission(task, context=context, provenance=provenance,
                                               code=refusal[0], text=refusal[1])
-            # ADR-004 row 5.3 observes the same project ingress as CEA. Alfred's
-            # existing writer hashes the work text; observation cannot gate work.
-            try:
-                _shadow_decision_log.record_ingress_decision(task.description, task.project)
-            except Exception:
-                logging.getLogger(__name__).warning("ADR-004 shadow logger failed", exc_info=True)
             capacity_predecessor = ""
             if (_successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE
                     and ingress == "retry.failed_task"
                     and context.get("push_refusal_reason") == "codex_capacity"
                     and context.get("provider_capacity_root")):
                 capacity_predecessor = str(context.get("original_task_id") or "")
-            return self.enqueue_with_receipt(
+            admitted_id = self.enqueue_with_receipt(
                 task, auth.receipt, context=context,
                 _capacity_predecessor=capacity_predecessor,
                 _successor_provenance=_successor_provenance)
+            # The promotion denominator is natural, admitted project ingress.
+            # Cascades/retries, lineage children, and even shadow-admitted
+            # project refusals must not count toward that floor.
+            natural_ingress = (
+                refusal is None and _successor_provenance is None
+                and not context.get("prev_task_id")
+                and not context.get("original_task_id")
+                and provenance not in {
+                    _CeaProvenance.CASCADE, _CeaProvenance.RETRY,
+                    _CeaProvenance.WATCHDOG,
+                }
+            )
+            if natural_ingress:
+                try:
+                    _shadow_decision_log.record_ingress_decision(task.description, task.project)
+                except Exception:
+                    logging.getLogger(__name__).warning(
+                        "ADR-004 shadow logger failed", exc_info=True)
+            return admitted_id
 
     def _refuse_admission(self, task: TaskRequest, *, context: Optional[dict],
                           provenance: "_CeaProvenance", code: str, text: str):
