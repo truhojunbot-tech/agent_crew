@@ -463,7 +463,7 @@ def backfill_document_pointers(storage: SQLiteMemoryStorage,
                     if any(json.loads(value).get("content_sha256") ==
                            record.value["content_sha256"] for _, value in previous):
                         continue
-                    storage.put_many_shadow([record])
+                    storage.put_many_shadow([record], allow_natural_revival=True)
                     head = memory.execute(
                         "SELECT key FROM adr001_memory WHERE layer=? "
                         "AND (key=? OR (key>=? AND key<?)) "

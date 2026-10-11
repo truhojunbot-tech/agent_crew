@@ -171,3 +171,26 @@ def test_effective_reads_use_logical_keys(tmp_path, storage_type, monkeypatch):
     if isinstance(store, HybridMemoryStorage):
         ranked = store.retrieve_ranked(scope, "two", "implementer", 10, 10000)
         assert all("@v" not in row["key"] for row in ranked["head"] + ranked["middle"])
+
+
+@pytest.mark.parametrize("storage_type", [SQLiteMemoryStorage, HybridMemoryStorage])
+def test_retention_caps_effective_rows_and_history_separately(tmp_path, storage_type):
+    store = storage_type(str(tmp_path / "memory.db"))
+    scope = MemoryScope(project="demo")
+    for index in range(5):
+        store.put_many_shadow([MemoryRecord("decision", f"task:k{index}:decision",
+                                            {"text": f"k{index}"}, scope)],
+                              max_rows_per_project=6)
+    for index in range(8):
+        store.put_many_shadow([MemoryRecord("decision", "task:hot:decision",
+                                            {"text": f"h{index}"}, scope)],
+                              max_rows_per_project=6)
+    effective = store.retrieve(scope)
+    assert {row.key for row in effective} == {
+        "task:hot:decision", *(f"task:k{index}:decision" for index in range(5))}
+    assert next(row.value["text"] for row in effective
+                if row.key == "task:hot:decision") == "h7"
+    with sqlite3.connect(store.path) as db:
+        history = db.execute("SELECT count(*) FROM adr001_memory "
+                             "WHERE layer='decision' AND superseded_by IS NOT NULL").fetchone()[0]
+    assert history <= 6
