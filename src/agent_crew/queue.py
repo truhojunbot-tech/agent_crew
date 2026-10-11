@@ -5436,7 +5436,8 @@ class TaskQueue:
                         target: Optional[str] = None, lease_owner: Optional[str] = None,
                         lease_seconds: Optional[float] = None,
                         ts: Optional[float] = None,
-                        raise_on_locked: bool = False) -> Optional[str]:
+                        raise_on_locked: bool = False,
+                        context_patch: Optional[dict] = None) -> Optional[str]:
         """Record that a claimed task was handed to a worker — the P2 DISPATCH point.
 
         ``channel`` uses D6's vocabulary: ``tmux_pane``, ``claude_p``,
@@ -5444,6 +5445,8 @@ class TaskQueue:
         ``pid:<n>``. ``lease_seconds`` is the bound the handing path enforces
         (the dispatcher's kill timeout); None where there is no fixed bound —
         a tmux pane task is reaped on idleness (#231), not on a deadline.
+        ``context_patch`` is committed with the dispatch channel so a
+        reconciler cannot observe a cloud fix dispatch without its launch head.
 
         Returns the **single-use dispatch nonce** minted for this attempt, or
         ``None`` when none was minted (no receipt, or the gate refused). The
@@ -5498,6 +5501,14 @@ class TaskQueue:
                 (at, channel, agent, target, lease_owner, expires, task_id),
             )
             if cur.rowcount:
+                if context_patch:
+                    row = conn.execute(
+                        "SELECT context FROM tasks WHERE task_id = ?", (task_id,)
+                    ).fetchone()
+                    task_context = json.loads(row["context"] or "{}")
+                    task_context.update(context_patch)
+                    conn.execute("UPDATE tasks SET context = ? WHERE task_id = ?",
+                                 (json.dumps(task_context), task_id))
                 attempt = conn.execute(
                     "SELECT dispatch_attempt FROM tasks WHERE task_id = ?", (task_id,)
                 ).fetchone()[0]

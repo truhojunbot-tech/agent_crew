@@ -162,3 +162,123 @@ def test_existing_daily_launch_cap_applies_to_cloud_implement(tmp_path, monkeypa
         run_fn=lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not launch")))
     assert outcome.skipped_reason == "daily_cap"
     assert queue.get_task("later").status == "pending"
+
+
+def test_cloud_fix_waits_for_new_pr_head_before_re_review(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    old_head = "a" * 40
+    new_head = "b" * 40
+    head = [old_head]
+    queue.enqueue(TaskRequest(
+        task_id="fix-review-impl-r0-r1", task_type="implement",
+        description="Fix PR #759 on the same branch", branch="agent/existing-pr",
+        project="agent_crew", context={"repo": "owner/repo", "pr_number": 759,
+                                       "fix_round": 1, "prev_task_id": "review-impl-r0"},
+    ))
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_CONCURRENCY", "1")
+    monkeypatch.setattr(cloud, "_validated_cloud_checkout",
+                        lambda project, repo, state_path=None: ("/fixture/claude", repo))
+    monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: 759)
+    monkeypatch.setattr(cloud._github, "pr_head_sha", lambda *a, **kw: head[0])
+    monkeypatch.setattr(cloud._github, "pr_state", lambda *a, **kw: "open")
+    monkeypatch.setattr(cloud._github, "branch_head_commit_message", lambda *a, **kw: None)
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "session_id": "session_fix1234", "url": "https://claude.ai/code/session_fix1234"}))
+
+    assert cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                         run_fn=run).dispatched
+    first = cloud.reconcile_all_cloud_tasks(queue)
+    assert first[0].action == "still_dispatched"
+    assert queue.get_task_context("fix-review-impl-r0-r1")["cloud_pr_head_at_launch"] == old_head
+    assert queue.get_task("fix-review-impl-r0-r1").status == "in_progress"
+    assert not [t for t in queue.list_tasks() if t.task_type == "review"]
+    assert queue.get_task_context("fix-review-impl-r0-r1")["cloud_usd"] is None
+
+    head[0] = ""  # A transient GitHub read must not turn into a new head.
+    unavailable = cloud.reconcile_all_cloud_tasks(queue)
+    assert unavailable[0].action == "still_dispatched"
+    assert queue.get_task("fix-review-impl-r0-r1").status == "in_progress"
+
+    head[0] = new_head
+    second = cloud.reconcile_all_cloud_tasks(queue)
+    assert second[0].action == "pr_ready"
+    assert queue.get_task("fix-review-impl-r0-r1").status == "completed"
+    reviews = [t for t in queue.list_tasks() if t.task_type == "review"]
+    assert len(reviews) == 1
+    assert reviews[0].context["reviewed_sha"] == new_head
+
+
+def test_cloud_usd_cap_reserves_in_flight_implement(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    for task_id in ("first", "second"):
+        queue.enqueue(TaskRequest(task_id=task_id, task_type="implement",
+                                  description="Implement", branch=f"agent/{task_id}",
+                                  project="agent_crew", context={"repo": "owner/repo"}))
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_CONCURRENCY", "2")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_USD_PER_DAY", "10")
+    monkeypatch.setattr(cloud, "_validated_cloud_checkout",
+                        lambda project, repo, state_path=None: ("/fixture/claude", repo))
+    launches = []
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        launches.append(argv)
+        return SimpleNamespace(returncode=0, stdout=json.dumps({
+            "session_id": "session_first123", "url": "https://claude.ai/code/session_first123"}))
+
+    assert cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                         run_fn=run).dispatched
+    blocked = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                            run_fn=run)
+    assert blocked.skipped_reason == "usd_cap_reserved"
+    assert queue.get_task("second").status == "pending"
+    assert len(launches) == 1
+
+
+def test_cloud_fix_accepts_new_terminal_signal_with_unchanged_pr_head(tmp_path):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="fix-terminal", task_type="implement",
+                              description="Fix", branch="agent/existing-pr",
+                              project="agent_crew", context={"repo": "owner/repo"}))
+    queue.dequeue(role="implementer")
+    queue.record_dispatch("fix-terminal", channel="claude_cloud", agent="claude_cloud",
+                          target="pending")
+    queue.patch_context("fix-terminal", {"cloud_pr_head_at_launch": "a" * 40,
+                                         "cloud_branch_message_at_launch": "old commit"})
+    task = queue.list_in_progress_by_dispatch_channel("claude_cloud")[0]
+    outcome = cloud.reconcile_cloud_dispatch(
+        queue, task, pr_number_for_branch_fn=lambda *a, **kw: 759,
+        pr_head_sha_fn=lambda *a, **kw: "a" * 40,
+        commit_message_fn=lambda *a, **kw: "ALREADY_FIXED verified without changes",
+    )
+    assert outcome.action == "already_fixed"
+    assert queue.get_task("fix-terminal").status == "completed"
+
+
+def test_cloud_fix_defers_when_launch_head_cannot_be_verified(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="fix-unavailable", task_type="implement",
+                              description="Fix", branch="agent/existing-pr",
+                              project="agent_crew", context={"repo": "owner/repo",
+                                                             "pr_number": 759, "fix_round": 1}))
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setattr(cloud._github, "pr_head_sha", lambda *a, **kw: None)
+    monkeypatch.setattr(cloud._github, "branch_head_commit_message", lambda *a, **kw: None)
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        raise AssertionError("cloud session started without a baseline head")
+
+    outcome = cloud.dispatch_cloud_for_role(queue, role="implementer",
+                                            task_type="implement", run_fn=run)
+    assert outcome.skipped_reason == "cloud_pr_head_unavailable"
+    assert queue.get_task("fix-unavailable").status == "pending"
+    assert queue.get_task_context("fix-unavailable")["push_not_before"] > time.time()

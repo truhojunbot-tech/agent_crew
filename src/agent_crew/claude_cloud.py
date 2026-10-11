@@ -698,15 +698,55 @@ def dispatch_cloud_for_role(
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
 
+    # A fix round reuses the existing PR branch. Snapshot its head before the
+    # dispatch channel becomes visible to reconciliation, otherwise the first
+    # reconcile tick can mistake the previous round's PR for this session's
+    # result. The pipeline normally carries pr_number on fix tasks.
+    context = task.context if isinstance(task.context, dict) else {}
+    existing_pr = context.get("pr_number") or task.pr_number
+    fix_round = context.get("fix_round")
+    prior_pr_head = None
+    prior_branch_message = None
+    if role == "implementer" and (existing_pr or fix_round):
+        task_repo = _resolve_task_repo(task, repo, state_path)
+        try:
+            if not existing_pr:
+                existing_pr = _github.pr_number_for_branch(task.branch or "", repo=task_repo)
+            if existing_pr:
+                prior_pr_head = _github.pr_head_sha(existing_pr, repo=task_repo)
+                prior_branch_message = _github.branch_head_commit_message(
+                    task.branch or "", repo=task_repo)
+        except Exception:
+            logger.exception("claude_cloud: could not read pre-launch PR head for %s", task.task_id)
+        if (not isinstance(existing_pr, int) or isinstance(existing_pr, bool)
+                or not re.fullmatch(r"[0-9a-fA-F]{40}", str(prior_pr_head or ""))):
+            logger.warning("claude_cloud: pre-launch PR head unavailable for %s; leaving pending",
+                           task.task_id)
+            queue.patch_context(task.task_id, {"push_not_before": time.time() + 30})
+            queue.requeue(task.task_id)
+            return CloudDispatchOutcome(False, task_id=task.task_id,
+                                        skipped_reason="cloud_pr_head_unavailable")
     try:
+        launch_context = ({
+            "cloud_pr_number_at_launch": existing_pr,
+            "cloud_pr_head_at_launch": prior_pr_head,
+            "cloud_branch_message_at_launch": prior_branch_message,
+        } if prior_pr_head else None)
         queue.record_dispatch(
             task.task_id, channel=DISPATCH_CHANNEL, agent=CLOUD_PROVIDER_NAME,
             target="pending", lease_owner=f"cloud:{task.task_id}",
+            context_patch=launch_context,
         )
     except AdmissionRefused as exc:
         logger.warning("claude_cloud: dispatch refused for %s — %s", task.task_id, exc)
         return CloudDispatchOutcome(False, task_id=task.task_id, skipped_reason="admission_refused")
-
+    if prior_pr_head and queue.get_task_context(task.task_id).get(
+            "cloud_pr_head_at_launch") != prior_pr_head:
+        logger.warning("claude_cloud: launch head was not persisted for %s; leaving pending",
+                       task.task_id)
+        queue.requeue(task.task_id)
+        return CloudDispatchOutcome(False, task_id=task.task_id,
+                                    skipped_reason="cloud_pr_head_unavailable")
     if task.task_type == "review":
         context = task.context if isinstance(task.context, dict) else {}
         sha = context.get("reviewed_sha")
@@ -1097,39 +1137,51 @@ def reconcile_cloud_dispatch(
         return CloudReconciliationOutcome(task.task_id, "unknown_outcome", detail="no branch on task")
 
     pr_number = pr_number_for_branch_fn(branch, repo=effective_repo)
+    launch_head = (task.context or {}).get("cloud_pr_head_at_launch")
+    held_existing_head = bool(launch_head)
     if pr_number:
         head_sha = pr_head_sha_fn(pr_number, repo=effective_repo) or ""
-        result = TaskResult(
-            task_id=task.task_id, status="completed",
-            summary=f"claude_cloud: PR #{pr_number} discovered for branch {branch}",
-            pr_number=pr_number, branch=branch, commit=head_sha,
-        )
-        try:
-            from agent_crew.pipeline import auto_enqueue_review
-            review_id = auto_enqueue_review(queue, task.task_id, pr_number,
-                                            pr_state_fn=pr_state_fn, result=result)
-        except Exception:
-            logger.exception("claude_cloud: auto_enqueue_review raised for %s", task.task_id)
-            review_id = None
-        if review_id is None:
-            logger.warning(
-                "claude_cloud: auto_enqueue_review did not confirm a review for %s "
-                "(pr=%s) — leaving in_progress to retry on the next pass",
-                task.task_id, pr_number)
-            return CloudReconciliationOutcome(
-                task.task_id, "still_dispatched", pr_number=pr_number,
-                detail="review not yet confirmed for discovered PR; will retry")
-        queue.submit_result(task.task_id, result)
-        return CloudReconciliationOutcome(task.task_id, "pr_ready", pr_number=pr_number)
+        held_existing_head = bool(launch_head and (
+            head_sha == launch_head or not re.fullmatch(r"[0-9a-fA-F]{40}", head_sha)))
+        if not held_existing_head:
+            result = TaskResult(
+                task_id=task.task_id, status="completed",
+                summary=f"claude_cloud: PR #{pr_number} discovered for branch {branch}",
+                pr_number=pr_number, branch=branch, commit=head_sha,
+            )
+            try:
+                from agent_crew.pipeline import auto_enqueue_review
+                review_id = auto_enqueue_review(queue, task.task_id, pr_number,
+                                                pr_state_fn=pr_state_fn, result=result)
+            except Exception:
+                logger.exception("claude_cloud: auto_enqueue_review raised for %s", task.task_id)
+                review_id = None
+            if review_id is None:
+                logger.warning(
+                    "claude_cloud: auto_enqueue_review did not confirm a review for %s "
+                    "(pr=%s) — leaving in_progress to retry on the next pass",
+                    task.task_id, pr_number)
+                return CloudReconciliationOutcome(
+                    task.task_id, "still_dispatched", pr_number=pr_number,
+                    detail="review not yet confirmed for discovered PR; will retry")
+            queue.submit_result(task.task_id, result)
+            return CloudReconciliationOutcome(task.task_id, "pr_ready", pr_number=pr_number)
 
     message = commit_message_fn(branch, repo=effective_repo)
     outcome = parse_terminal_outcome(message) if message else None
+    launch_message = (task.context or {}).get("cloud_branch_message_at_launch")
+    if held_existing_head and (not isinstance(launch_message, str)
+                               or message == launch_message or outcome is None
+                               or outcome[0] == "PR_READY"):
+        outcome = None
     if outcome is None:
         age = time.time() - queue.get_dispatched_at(task.task_id)
         if age > cloud_stale_seconds():
+            stale_detail = ("the existing PR head did not advance" if held_existing_head
+                            else "no PR and no recognized outcome")
             stale_result = TaskResult(
                 task_id=task.task_id, status="needs_human",
-                summary=(f"claude_cloud: no PR and no recognized outcome for branch "
+                summary=(f"claude_cloud: {stale_detail} for branch "
                         f"{branch} after {int(age)}s (budget {int(cloud_stale_seconds())}s) — "
                         f"unobservable via GitHub, needs manual investigation")[:4000],
                 branch=branch,
@@ -1137,8 +1189,10 @@ def reconcile_cloud_dispatch(
             queue.submit_result(task.task_id, stale_result)
             return CloudReconciliationOutcome(task.task_id, "needs_decision",
                                               detail="stale: no observable outcome")
-        return CloudReconciliationOutcome(task.task_id, "still_dispatched",
-                                          detail=f"no PR yet for branch {branch}")
+        return CloudReconciliationOutcome(
+            task.task_id, "still_dispatched", pr_number=pr_number,
+            detail=("existing PR head unchanged since cloud launch" if held_existing_head
+                    else f"no PR yet for branch {branch}"))
 
     token, detail = outcome
     if token == "PR_READY":
