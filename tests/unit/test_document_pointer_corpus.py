@@ -10,7 +10,7 @@ import pytest
 from agent_crew.memory_capture import (
     _decision_document_path, backfill_document_pointers, capture_document_pointer,
 )
-from agent_crew.memory_runtime import SQLiteMemoryStorage
+from agent_crew.memory_runtime import MemoryScope, SQLiteMemoryStorage
 from scripts import backfill_task_outcomes as backfill_cli
 from scripts.backfill_task_outcomes import count_available_refs
 
@@ -176,6 +176,36 @@ def test_unchanged_working_file_survives_unrelated_head_commit_without_duplicate
     assert rows[0][2] == rows[1][0]
     assert rows[1][0].endswith("@" + _git(repo, "rev-parse", "HEAD"))
     assert json.loads(rows[1][1])["summary"] == "change"
+
+
+def test_working_file_refreshes_when_head_returns_to_earlier_commit(tmp_path):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "README.md").write_text("first\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-qm", "A")
+    first_sha = _git(repo, "rev-parse", "HEAD")
+    verdict = repo / "research" / "verdicts" / "v.json"
+    verdict.parent.mkdir(parents=True)
+    memory = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    sources = [("truhojunbot-tech/agent_crew", str(repo))]
+    explicit = {"truhojunbot-tech/agent_crew": {"research/verdicts/v.json"}}
+    verdict.write_text('{"verdict":"first"}')
+    assert backfill_document_pointers(memory, sources, explicit) == 1
+    (repo / "README.md").write_text("second\n")
+    _git(repo, "commit", "-qam", "B")
+    verdict.write_text('{"verdict":"second"}')
+    assert backfill_document_pointers(memory, sources, explicit) == 1
+    _git(repo, "checkout", "--detach", first_sha)
+    verdict.write_text('{"verdict":"third"}')
+    assert backfill_document_pointers(memory, sources, explicit) == 1
+    effective = memory.retrieve(MemoryScope(project="agent_crew"))
+    assert [(row.value["summary"], row.value["commit"]) for row in effective] == [
+        ("third", first_sha)]
+    assert backfill_document_pointers(memory, sources, explicit) == 0
 
 
 def test_historic_capture_reads_old_commit_and_audit_matches_pinned_ref(tmp_path):

@@ -382,7 +382,8 @@ class SQLiteMemoryStorage:
 
     @staticmethod
     def _append_revision(db: sqlite3.Connection, record: MemoryRecord,
-                         scope: str, *, project_wide: bool = False) -> None:
+                         scope: str, *, project_wide: bool = False,
+                         allow_natural_revival: bool = False) -> None:
         head = SQLiteMemoryStorage._revision_head(
             db, record.layer, record.key, record.scope.project,
             "" if project_wide else scope)
@@ -392,11 +393,12 @@ class SQLiteMemoryStorage:
                        "VALUES (?,?,?,?,?,?)",
                        (record.layer, record.key, value, scope, record.version, time.time()))
             return
-        if head[5] and _logical_revision_key(head[5]) != record.key:
+        naturally_retired = bool(head[5] and _logical_revision_key(head[5]) != record.key)
+        if naturally_retired and not allow_natural_revival:
             # A different natural key superseded this one. A later write to
             # the retired identity must not retire or replace its successor.
             return
-        if json.loads(head[2]) == record.value and head[4] == scope:
+        if not naturally_retired and json.loads(head[2]) == record.value and head[4] == scope:
             return
         if not project_wide and record.version <= head[3]:
             return
@@ -416,7 +418,7 @@ class SQLiteMemoryStorage:
             updated = db.execute("UPDATE adr001_memory SET superseded_by=? "
                                  "WHERE rowid=? AND superseded_by IS NULL",
                                  (new_key, head[0])).rowcount
-        if updated < 1:
+        if updated < 1 and not (naturally_retired and allow_natural_revival):
             raise ValueError("memory revision changed concurrently")
 
     def put(self, record: MemoryRecord) -> None:
@@ -441,7 +443,8 @@ class SQLiteMemoryStorage:
             self._revision_columns = True
 
     def put_many_shadow(self, records: list[MemoryRecord], *, retire_keys: tuple[str, ...] = (),
-                        max_rows_per_project: int = SHADOW_RETENTION_ROWS_PER_PROJECT) -> None:
+                        max_rows_per_project: int = SHADOW_RETENTION_ROWS_PER_PROJECT,
+                        allow_natural_revival: bool = False) -> None:
         """Batch derived evidence in one bounded transaction, pruning old captures."""
         if not records:
             return
@@ -454,20 +457,26 @@ class SQLiteMemoryStorage:
             self._ensure_revision_columns(db)
             for record in records:
                 scope = _canonical_scope_json(record.scope)
-                self._append_revision(db, record, scope, project_wide=True)
+                self._append_revision(db, record, scope, project_wide=True,
+                                      allow_natural_revival=allow_natural_revival)
             for key in retire_keys:
                 head = self._revision_head(db, "failure_pattern", key, project)
                 if head:
                     db.execute("UPDATE adr001_memory SET invalidated_at=? "
                                "WHERE rowid=? AND invalidated_at IS NULL",
                                (time.time(), head[0]))
-            db.execute("""DELETE FROM adr001_memory WHERE rowid IN (
-                SELECT rowid FROM adr001_memory
-                WHERE layer IN ('episodic','decision','failure_pattern')
-                  AND json_extract(scope, '$.project')=?
-                  AND (key GLOB 'task:*' OR key GLOB 'episode:*')
-                ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
-                (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
+            # Revisions must not consume the retention budget of effective
+            # evidence. Keep a separate, bounded history for diagnosis.
+            for status in ("superseded_by IS NULL AND invalidated_at IS NULL",
+                           "superseded_by IS NOT NULL OR invalidated_at IS NOT NULL"):
+                db.execute(f"""DELETE FROM adr001_memory WHERE rowid IN (
+                    SELECT rowid FROM adr001_memory
+                    WHERE layer IN ('episodic','decision','failure_pattern')
+                      AND json_extract(scope, '$.project')=?
+                      AND (key GLOB 'task:*' OR key GLOB 'episode:*')
+                      AND ({status})
+                    ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
+                    (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
             db.commit()
             self._revision_columns = True
 
