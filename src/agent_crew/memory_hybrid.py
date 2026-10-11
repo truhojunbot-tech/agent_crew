@@ -29,6 +29,7 @@ RRF_K = 60
 HEAD_PRINCIPLE_BYTES = 3600
 HEAD_STANDING_BYTES = 2000
 MIDDLE_CANDIDATE_LIMIT = 96
+VECTOR_CANDIDATE_LIMIT = 256
 
 
 def _body_sql(alias: str) -> str:
@@ -306,13 +307,16 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             rows.extend(row for row in recent if row[0] not in seen)
             rows = rows[:MIDDLE_CANDIDATE_LIMIT]
         if self.fusion_mode != "rrf" and self.embedder is not None:
-            # The FTS/recent cap can exclude a vector-only hit. Read every
-            # effective vector in SQL scope before scoring the kNN arm.
+            # The FTS/recent cap can exclude a vector-only hit. Admit a bounded
+            # set of recent vectors from this scope and active model so cosine
+            # scoring cannot overrun the retrieval deadline on large corpora.
             seen = {row[0] for row in rows}
             vectors = db.execute(
                 prefix + "JOIN adr001_vec v ON v.rowid=m.rowid WHERE " +
-                clause + " AND " + _effective_sql() + " AND v.vec IS NOT NULL",
-                params,
+                clause + " AND " + _effective_sql() +
+                " AND v.model_id=? AND v.vec IS NOT NULL "
+                "ORDER BY m.created DESC,m.rowid DESC LIMIT ?",
+                [*params, self.model_id, VECTOR_CANDIDATE_LIMIT],
             ).fetchall()
             rows.extend(row for row in vectors if row[0] not in seen)
         result = _servable([_row_record(row) for row in rows])
