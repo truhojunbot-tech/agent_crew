@@ -485,17 +485,14 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         if rowid in ids:
                             bm25[rowid] = len(bm25) + 1
                 else:
-                    scored = []
-                    ordered_ids = list(ids)
-                    for offset in range(0, len(ordered_ids), 500):
-                        batch = ordered_ids[offset:offset + 500]
-                        scored.extend(db.execute(
+                    # FTS5 repeats the full MATCH evaluation for every rowid
+                    # constrained by IN. Scan once, then retain only the
+                    # scoped candidate IDs in score order.
+                    for rowid, _ in db.execute(
                             "SELECT rowid,bm25(adr001_fts,0.2,10,1) FROM adr001_fts "
-                            "WHERE adr001_fts MATCH ? AND rowid IN (" +
-                            ",".join("?" for _ in batch) + ")",
-                            [expression, *batch]).fetchall())
-                    bm25 = {rowid: rank for rank, (rowid, _) in enumerate(
-                        sorted(scored, key=lambda item: (item[1], item[0])), 1)}
+                            "WHERE adr001_fts MATCH ? ORDER BY 2,rowid", (expression,)):
+                        if rowid in ids:
+                            bm25[rowid] = len(bm25) + 1
             vectors, bodies = [], {}
             ordered_ids = list(ids)
             for offset in range(0, len(ordered_ids), 500):

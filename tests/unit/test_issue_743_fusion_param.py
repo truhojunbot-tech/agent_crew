@@ -6,6 +6,7 @@ import sqlite3
 import time
 from array import array
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.memory_hybrid import HybridMemoryStorage, MIDDLE_CANDIDATE_LIMIT
@@ -200,6 +201,37 @@ def test_weighted_vector_matmul_under_300ms_on_live_sized_scoped_rows(tmp_path):
                                        "implementer", 10, 10000)
         assert result["mode"] == "hybrid", result["latency_ms"]
         assert result["latency_ms"] < 300
+    assert store.fallback_count == 0
+
+
+@pytest.mark.parametrize("fusion_mode", ["weighted", "union_vec_first"])
+def test_broad_fts_match_stays_hybrid_at_live_row_count(tmp_path, fusion_mode):
+    path = tmp_path / "memory.db"
+    store = HybridMemoryStorage(str(path), embedder=Embedder(), fusion_mode=fusion_mode)
+    with sqlite3.connect(path) as db:
+        db.executemany("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                       "VALUES (?,?,?,?,?,?)", [
+            ("episodic", f"row:{i}", json.dumps({"text": f"common term shared broad match {i}"}),
+             json.dumps({"project": "home"}), 1, float(i)) for i in range(12000)])
+        rows = db.execute("SELECT m.rowid,f.body FROM adr001_memory m JOIN adr001_fts f "
+                          "ON f.rowid=m.rowid").fetchall()
+        blob = array("f", [1.0] + [0.0] * 383).tobytes()
+        db.executemany("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
+                       "VALUES (?,?,?,?)", [
+            (rowid, Embedder.model_id, hashlib.sha256(body.encode()).hexdigest(), blob)
+            for rowid, body in rows])
+        db.commit()
+
+    class WideEmbedder:
+        model_id = Embedder.model_id
+
+        def __call__(self, text):
+            return [1.0] + [0.0] * 383
+
+    store.embedder = WideEmbedder()
+    result = store.retrieve_ranked(MemoryScope(project="home"), "common term shared broad match",
+                                   "implementer", 5, 10000)
+    assert result["mode"] == "hybrid", result["latency_ms"]
     assert store.fallback_count == 0
 
 
