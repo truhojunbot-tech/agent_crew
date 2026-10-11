@@ -19,6 +19,25 @@ def _git(repo, *args):
     return subprocess.check_output(["git", "-C", str(repo), *args], text=True).strip()
 
 
+def test_quota_policy_documents_are_selected(tmp_path):
+    for project, filename in (("quota-core", "context-economics.md"),
+                              ("quota-ops", "tokenomics-completion-plan.md")):
+        repo = tmp_path / project
+        repo.mkdir()
+        _git(repo, "init", "-q")
+        _git(repo, "config", "user.email", "test@example.com")
+        _git(repo, "config", "user.name", "Test")
+        document = repo / "docs" / filename
+        document.parent.mkdir()
+        document.write_text("# Policy\n\nKeep this decision.\n")
+        _git(repo, "add", ".")
+        _git(repo, "commit", "-qm", "policy")
+        memory = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+        assert backfill_document_pointers(
+            memory, [(f"truhojunbot-tech/{project}", str(repo))]) == 1
+    assert not _decision_document_path("docs/notes.md")
+
+
 def test_pointer_key_and_body_cap(tmp_path):
     memory = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
     record = capture_document_pointer(
