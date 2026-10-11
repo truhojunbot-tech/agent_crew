@@ -23,6 +23,10 @@ else
         rc=$?
     fi
 fi
+if (( rc != 0 )); then
+    cat "$precheck_output_file" >&2
+    printf 'FAIL: swap precheck refused %s (rc=%d)\n' "$project" "$rc" >&2
+fi
 if [[ $precheck == none ]]; then
     python3 "$(dirname "$0")/swap_precheck_receipt.py" \
         "$project" "$target_sha" "$step" "$rc" "$precheck_output_file" "$PPID" none || exit 2
@@ -32,9 +36,8 @@ else
         "${precheck_command[@]}" "$project" || exit 2
 fi
 if (( rc != 0 )); then
-    cat "$precheck_output_file" >&2
-    printf 'FAIL: swap precheck refused %s (rc=%d)\n' "$project" "$rc" >&2
     exit "$rc"
 fi
 cat "$precheck_output_file"
+rm -f "$precheck_output_file"
 exec python3 "$(dirname "$0")/runtime_swap.py" "$@"

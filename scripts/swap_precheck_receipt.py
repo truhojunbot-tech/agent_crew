@@ -21,7 +21,7 @@ def _actor(caller_pid: int) -> str:
         return configured
     try:
         raw = Path(f"/proc/{caller_pid}/cmdline").read_bytes()
-        command = shlex.join([part.decode(errors="replace") for part in raw.split(b"\0") if part])
+        command = Path(raw.split(b"\0", 1)[0].decode(errors="replace")).name or "unknown"
     except OSError:
         command = "unknown"
     return f"{getpass.getuser()}@{socket.gethostname()}:{caller_pid} {command}"

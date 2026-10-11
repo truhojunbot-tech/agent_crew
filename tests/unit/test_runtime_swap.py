@@ -146,6 +146,60 @@ printf called > "$SWAP_RUNTIME_MARKER"
     assert not marker.exists()
 
 
+def test_shell_preserves_owner_hold_when_receipt_write_fails(tmp_path):
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    precheck = tmp_path / 'precheck'
+    precheck.write_text('#!/usr/bin/env bash\necho "owner HOLD 13024"; exit 9\n')
+    precheck.chmod(0o755)
+    blocked = tmp_path / 'not-a-directory'
+    blocked.write_text('cannot create receipts here')
+    result = subprocess.run(
+        ['bash', str(script), 'agent_crew', 'a' * 40, 'go'],
+        env={**os.environ, 'AGENT_CREW_SWAP_PRECHECK': str(precheck),
+             'AGENT_CREW_SWAP_RECEIPT_DIR': str(blocked)},
+        text=True, capture_output=True,
+    )
+    assert result.returncode != 0
+    assert 'owner HOLD 13024' in result.stderr
+    assert 'swap precheck refused agent_crew (rc=9)' in result.stderr
+    assert 'receipt could not be written' in result.stderr
+
+
+def test_shell_removes_precheck_output_before_successful_exec(tmp_path):
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake_python = bin_dir / 'python3'
+    fake_python.write_text('''#!/usr/bin/env bash
+if [[ $1 == *swap_precheck_receipt.py ]]; then exec "$SWAP_REAL_PYTHON" "$@"; fi
+exit 0
+''')
+    fake_python.chmod(0o755)
+    temp_dir = tmp_path / 'temporary'
+    temp_dir.mkdir()
+    result = subprocess.run(
+        ['bash', str(script), 'agent_crew', 'a' * 40, 'preflight'],
+        env={**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+             'TMPDIR': str(temp_dir), 'AGENT_CREW_SWAP_PRECHECK': 'none',
+             'AGENT_CREW_SWAP_RECEIPT_DIR': str(tmp_path / 'receipts'),
+             'SWAP_REAL_PYTHON': sys.executable},
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert list(temp_dir.iterdir()) == []
+
+
+def test_default_actor_records_only_parent_executable(monkeypatch):
+    import scripts.swap_precheck_receipt as receipt
+
+    monkeypatch.delenv('AGENT_CREW_SWAP_ACTOR', raising=False)
+    monkeypatch.setattr(receipt.getpass, 'getuser', lambda: 'worker')
+    monkeypatch.setattr(receipt.socket, 'gethostname', lambda: 'host')
+    monkeypatch.setattr(receipt.Path, 'read_bytes',
+                        lambda path: b'/usr/bin/bash\0-c\0secret=do-not-store\0')
+    assert receipt._actor(1234) == 'worker@host:1234 bash'
+
+
 def test_shell_precheck_default_receipt_dir_and_actor(tmp_path):
     script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
     fake_python = tmp_path / 'python3'
