@@ -3640,6 +3640,38 @@ def create_app(
     app.state.guard_tmx_push = _guard_tmx_push
     app.state.delivery_guard_refusals = delivery_guard_refusals
 
+    def _cascade_completed_duplicate_survivor(blocked_id: str) -> None:
+        """Close the race where the standing verdict predates the handoff."""
+        blocked_ctx = q().get_task_context(blocked_id) or {}
+        survivor_id = blocked_ctx.get("duplicate_review_survivor")
+        if not isinstance(survivor_id, str):
+            return
+        survivor = q().get_task(survivor_id)
+        if (survivor is None or survivor.status != "completed"
+                or survivor.task_type != "review"):
+            return
+        ctx = survivor.context if isinstance(survivor.context, dict) else {}
+        if ctx.get("duplicate_review_lineage_from") != blocked_id:
+            return
+        result = q().get_result(survivor_id)
+        if result is None or result.status != "completed":
+            return
+        pr = result.pr_number or ctx.get("pr_number")
+        repo = str(ctx.get("repo") or "")
+        if pr and not review_publication_decision(
+                ctx, pr, repo=repo, repo_cwd=_any_worktree_path()).publish:
+            return
+        verdict = _resolve_verdict(result)
+        if verdict == "request_changes" and _review_result_is_actionable(result):
+            _auto_enqueue_fix(survivor_id, repo=repo)
+        elif verdict == "approve":
+            if ctx.get("no_tester"):
+                if pr:
+                    _auto_merge_pr(int(pr), repo=repo, repo_cwd=_any_worktree_path(),
+                                   review_task_id=survivor_id)
+            else:
+                _auto_enqueue_test(survivor_id, repo=repo)
+
     def _record_prepared_base(task: TaskRequest, role: str, prepared_sha: str,
                               caller: str) -> bool:
         """Persist the exact prepared base, including an explicit unknown (#358)."""
@@ -3663,6 +3695,8 @@ def create_app(
                     })
             if role in ("reviewer", "tester"):
                 if not q().record_prepared_review_base(task.task_id, base_context):
+                    if role == "reviewer":
+                        _cascade_completed_duplicate_survivor(task.task_id)
                     return False
             else:
                 q().patch_context(task.task_id, base_context)
@@ -3671,6 +3705,8 @@ def create_app(
         except Exception:
             logger.exception("%s: could not record prepared base for %s", caller, task.task_id)
             return role == "implementer"  # Preserve the implementer path's prior behavior.
+
+    app.state.record_prepared_base = _record_prepared_base
 
     def _complete_suppressed_review(task: TaskRequest, decision) -> bool:
         """End a suppressed review as a COMPLETED review carrying the standing verdict.

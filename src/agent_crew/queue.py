@@ -2936,6 +2936,14 @@ class TaskQueue:
                     # The refusal audit must not commit writes made earlier in
                     # the admission transaction. Record it on a clean one.
                     conn.rollback()
+                    conn.execute("BEGIN IMMEDIATE")
+                    if task.task_type == "review":
+                        # This review has no row to mark blocked: admission
+                        # refused it before the survivor's eventual verdict.
+                        # Preserve the same cascade route as a dispatch-time
+                        # duplicate before reporting the existing task id.
+                        self._adopt_blocked_review_lineage_in_txn(
+                            conn, duplicate_id, task, context)
                     self._append_exec_event_on(
                         conn, task.task_id, "duplicate_review_refused", time.time(),
                         existing_task_id=duplicate_id, code=DuplicateReviewError.code)
@@ -3478,7 +3486,11 @@ class TaskQueue:
             )
             existing = self._duplicate_review_in_txn(conn, request, context, dispatch=True)
             if existing and context.get("allow_duplicate_review") is not True:
+                if row["task_type"] == "review":
+                    self._adopt_blocked_review_lineage_in_txn(
+                        conn, existing, request, context)
                 summary = f"DUPLICATE_REVIEW: existing task {existing} reviews this head"
+                context["duplicate_review_survivor"] = existing
                 conn.execute(
                     "UPDATE tasks SET status='blocked', summary=?, context=? "
                     "WHERE task_id=?",
@@ -3505,6 +3517,72 @@ class TaskQueue:
             raise
         finally:
             conn.close()
+
+    @staticmethod
+    def _adopt_blocked_review_lineage_in_txn(
+            conn, survivor_id: str, blocked: TaskRequest, blocked_ctx: dict) -> None:
+        """Give the review that actually runs the suppressed pipeline's route.
+
+        The duplicate check already proved PR and reviewed head match. Keep
+        the admission receipt on the survivor; only the branch and lineage
+        metadata used by the existing result cascade are amended here.
+        """
+        parent = blocked_ctx.get("prev_task_id")
+        if not isinstance(parent, str) or not parent:
+            return
+        survivor = conn.execute(
+            "SELECT task_type, status, branch, context FROM tasks WHERE task_id=?",
+            (survivor_id,),
+        ).fetchone()
+        if survivor is None or survivor["task_type"] != "review":
+            return
+        try:
+            context = json.loads(survivor["context"] or "{}")
+        except (TypeError, ValueError):
+            return
+        if not isinstance(context, dict):
+            return
+        adopted_from = context.get("duplicate_review_lineage_from")
+        if adopted_from and adopted_from != blocked.task_id:
+            return
+        if survivor["status"] == "completed" and conn.execute(
+            "SELECT 1 FROM tasks WHERE task_type IN ('implement', 'test') "
+            "AND CASE WHEN json_valid(context) "
+            "THEN json_extract(context, '$.prev_task_id') END=? LIMIT 1",
+            (survivor_id,),
+        ).fetchone():
+            return
+        if context.get("prev_task_id") not in (None, "", parent):
+            return
+        old_repo, new_repo = context.get("repo"), blocked_ctx.get("repo")
+        if old_repo and new_repo and old_repo != new_repo:
+            return
+        for key in ("prev_task_id", "fix_round", "issue", "issue_number",
+                    "issue_title", "issue_body", "issue_url", "repo",
+                    "implementer_agent", "no_tester", "base_branch",
+                    "risk_declaration", "risk_tier_source"):
+            if key == "no_tester" and survivor["status"] == "completed":
+                continue  # A completed approval may already have started a tester.
+            if context.get(key) is None and blocked_ctx.get(key) is not None:
+                context[key] = blocked_ctx[key]
+        rounds = [round_ for round_ in (context.get("fix_round"),
+                                         blocked_ctx.get("fix_round"))
+                  if type(round_) is int and round_ >= 0]
+        if rounds:
+            context["fix_round"] = max(rounds)
+        tiers = [tier for tier in (context.get("risk_tier"), blocked_ctx.get("risk_tier"))
+                 if type(tier) is int and 0 <= tier <= 3]
+        if tiers:
+            context["risk_tier"] = max(tiers)
+        context["duplicate_review_lineage_from"] = blocked.task_id
+        branch = survivor["branch"]
+        base = context.get("base_branch") or os.getenv("AGENT_CREW_MAIN_BRANCH") or "main"
+        if blocked.branch and (not branch or branch == base):
+            context["cascade_branch"] = blocked.branch
+        conn.execute(
+            "UPDATE tasks SET context=? WHERE task_id=?",
+            (json.dumps(context), survivor_id),
+        )
 
     def enqueue(self, task: TaskRequest, *, ingress: Optional[str] = None,
                 provenance: Optional["_CeaProvenance"] = None,
