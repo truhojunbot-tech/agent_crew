@@ -24,6 +24,7 @@ from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import cascade_contract as _cea_cascade
 from agent_crew.cea import store as _cea_store
 from agent_crew.cea import signed_receipt as _signed_receipt
+from agent_crew.cea import shadow_decision_log as _shadow_decision_log
 from agent_crew.cea import validator as _cea_validator
 from agent_crew.cea.auth import in_process_caller as _cea_in_process_caller
 from agent_crew.cea.engine import EngineConfig as _CeaEngineConfig, get_engine as _cea_get_engine
@@ -3671,6 +3672,12 @@ class TaskQueue:
             else:
                 auth = self._refuse_admission(task, context=context, provenance=provenance,
                                               code=refusal[0], text=refusal[1])
+            # ADR-004 row 5.3 observes the same project ingress as CEA. Alfred's
+            # existing writer hashes the work text; observation cannot gate work.
+            try:
+                _shadow_decision_log.record_ingress_decision(task.description, task.project)
+            except Exception:
+                logging.getLogger(__name__).warning("ADR-004 shadow logger failed", exc_info=True)
             capacity_predecessor = ""
             if (_successor_provenance is _CEA_SYSTEM_SUCCESSOR_PROVENANCE
                     and ingress == "retry.failed_task"
