@@ -41,6 +41,8 @@ import re
 import shlex
 import subprocess
 import time
+import math
+from datetime import datetime
 from dataclasses import dataclass
 from typing import Callable, List, Optional
 
@@ -63,6 +65,9 @@ _ENV_MAX_CONCURRENCY = "AGENT_CREW_CLOUD_MAX_CONCURRENCY"
 _ENV_MAX_PER_DAY = "AGENT_CREW_CLOUD_MAX_PER_DAY"
 _ENV_SHADOW = "AGENT_CREW_CLOUD_SHADOW"
 _ENV_CLI_PATH = "AGENT_CREW_CLOUD_CLI_PATH"
+_ENV_CREDIT_FILE = "AGENT_CREW_CLOUD_CREDIT_FILE"
+_ENV_MAX_USD_PER_DAY = "AGENT_CREW_CLOUD_MAX_USD_PER_DAY"
+_CREDIT_MAX_AGE_SECONDS = 600
 DEFAULT_MAX_CONCURRENCY = 3
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -116,6 +121,55 @@ def cloud_max_per_day() -> Optional[int]:
 
 def cloud_cli_path() -> str:
     return (os.getenv(_ENV_CLI_PATH) or "claude").strip() or "claude"
+
+
+def read_cloud_credit_used() -> Optional[float]:
+    """Read a recent Quota monitor snapshot; absence never blocks dispatch."""
+    path = (os.getenv(_ENV_CREDIT_FILE) or "").strip()
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as stream:
+            payload = json.load(stream)
+        fetched = payload["fetched_at"]
+        if isinstance(fetched, str):
+            stamp = datetime.fromisoformat(fetched.replace("Z", "+00:00"))
+            if stamp.tzinfo is None:
+                return None
+            fetched_at = stamp.timestamp()
+        else:
+            fetched_at = float(fetched)
+        if not 0 <= time.time() - fetched_at <= _CREDIT_MAX_AGE_SECONDS:
+            return None
+        used = float(payload["cloud_credit"]["used_dollars"])
+        return used if math.isfinite(used) and used >= 0 else None
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+
+
+def cloud_max_usd_per_day() -> Optional[float]:
+    raw = (os.getenv(_ENV_MAX_USD_PER_DAY) or "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        value = -1
+    if not math.isfinite(value) or value < 0:
+        logger.warning("claude_cloud: invalid %s=%r, ignoring USD cap", _ENV_MAX_USD_PER_DAY, raw)
+        return None
+    return value
+
+
+def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
+    if task.task_type == "review":
+        return
+    before = (task.context or {}).get("cloud_credit_used_before")
+    after = read_cloud_credit_used()
+    usd = (round(max(0.0, after - before), 6)
+           if isinstance(before, (int, float)) and after is not None and after >= before else None)
+    queue.patch_context(task.task_id, {"cloud_credit_used_after": after, "cloud_usd": usd})
+    queue.record_cloud_cost(task.task_id, before, after, usd)
 
 
 _ENV_STALE_SECONDS = "AGENT_CREW_CLOUD_STALE_SECONDS"
@@ -602,6 +656,24 @@ def dispatch_cloud_for_role(
             if queue.count_cloud_reviews_started_since(day_start) >= daily_cap:
                 logger.info("claude_cloud: daily review cap %d reached; local fallback", daily_cap)
                 return CloudDispatchOutcome(False, skipped_reason="daily_cap")
+    elif role == "implementer":
+        day_start = int(time.time() // 86400) * 86400
+        daily_cap = cloud_max_per_day()
+        if daily_cap is not None and queue.count_cloud_implements_started_since(day_start) >= daily_cap:
+            logger.info("claude_cloud: daily implement launch cap %d reached; leaving task pending",
+                        daily_cap)
+            return CloudDispatchOutcome(False, skipped_reason="daily_cap")
+        usd_cap = cloud_max_usd_per_day()
+        if usd_cap is not None:
+            spent = queue.cloud_implement_usd_since(day_start)
+            if spent >= usd_cap:
+                logger.info("claude_cloud: daily implement USD cap %.2f reached (spent %.2f); "
+                            "leaving task pending", usd_cap, spent)
+                return CloudDispatchOutcome(False, skipped_reason="usd_cap")
+            # An active session has no final credit delta. Reserve the remaining
+            # daily budget until reconciliation records its observed cost.
+            if in_flight:
+                return CloudDispatchOutcome(False, skipped_reason="usd_cap_reserved")
 
     run = run_fn or _default_run
     probe_key = (run, cli_path or cloud_cli_path())
@@ -657,6 +729,7 @@ def dispatch_cloud_for_role(
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
                 prompt, cli_path=cli_path, base_ref=_detached_cloud_ref(cwd)))
+    credit_before = read_cloud_credit_used() if role == "implementer" else None
 
     try:
         proc = run(argv, cwd=cwd)
@@ -692,11 +765,16 @@ def dispatch_cloud_for_role(
         "cloud_session_url": launch.session_url,
         "cloud_session_id": launch.session_id,
         "cloud_launched_at": launched_at,
+        **({"cloud_credit_used_before": credit_before,
+            "cloud_credit_used_after": None, "cloud_usd": None}
+           if role == "implementer" else {}),
         "execution_policy": execution_policy,
         "cloud_dispatch_receipt": {"cwd_remote": cwd_remote,
                                    "repo": _github._repo_slug(effective_repo).casefold(),
                                    "cwd": cwd},
     })
+    if role == "implementer":
+        queue.record_cloud_cost(task.task_id, credit_before, None, None)
     queue.set_push_at(task.task_id, pane_id=f"cloud:{launch.session_id}")
     logger.info("claude_cloud: dispatched %s session_id=%s url=%s",
                 task.task_id, launch.session_id, launch.session_url)
@@ -1103,6 +1181,11 @@ def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None,
     would silently apply the dispatcher's own cwd to every task instead.
     """
     tasks = queue.list_in_progress_by_dispatch_channel(DISPATCH_CHANNEL)
-    return [reconcile_cloud_dispatch(queue, t, repo=repo,
-                                     submit_review_result_fn=submit_review_result_fn)
-            for t in tasks]
+    outcomes = []
+    for task in tasks:
+        outcome = reconcile_cloud_dispatch(queue, task, repo=repo,
+                                           submit_review_result_fn=submit_review_result_fn)
+        if outcome.action not in ("still_dispatched", "unknown_outcome"):
+            _record_reconciled_cloud_cost(queue, task)
+        outcomes.append(outcome)
+    return outcomes

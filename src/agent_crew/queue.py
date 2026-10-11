@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 1
+QUEUE_SCHEMA_VERSION = 2
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -918,6 +918,12 @@ _DDL_MIGRATE_ATTR_RISK_DECLARATION_SOURCE = (
     "ALTER TABLE task_attribution ADD COLUMN risk_declaration_source TEXT DEFAULT NULL")
 _DDL_MIGRATE_ATTR_RISK_DECLARATION_CONFIDENCE = (
     "ALTER TABLE task_attribution ADD COLUMN risk_declaration_confidence TEXT DEFAULT NULL")
+_DDL_MIGRATE_ATTR_CLOUD_CREDIT_BEFORE = (
+    "ALTER TABLE task_attribution ADD COLUMN cloud_credit_used_before REAL DEFAULT NULL")
+_DDL_MIGRATE_ATTR_CLOUD_CREDIT_AFTER = (
+    "ALTER TABLE task_attribution ADD COLUMN cloud_credit_used_after REAL DEFAULT NULL")
+_DDL_MIGRATE_ATTR_CLOUD_USD = (
+    "ALTER TABLE task_attribution ADD COLUMN cloud_usd REAL DEFAULT NULL")
 
 _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
@@ -960,6 +966,9 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_HUMAN_GATE_REQUIRED,
     _DDL_MIGRATE_ATTR_RISK_DECLARATION_SOURCE,
     _DDL_MIGRATE_ATTR_RISK_DECLARATION_CONFIDENCE,
+    _DDL_MIGRATE_ATTR_CLOUD_CREDIT_BEFORE,
+    _DDL_MIGRATE_ATTR_CLOUD_CREDIT_AFTER,
+    _DDL_MIGRATE_ATTR_CLOUD_USD,
 )
 
 _DDL_CHECKPOINTS = """
@@ -6345,6 +6354,44 @@ class TaskQueue:
                 (since,),
             ).fetchone()
             return (int(row["n"]) if row else 0) + (int(shadow["n"]) if shadow else 0)
+        finally:
+            conn.close()
+
+    def cloud_implement_usd_since(self, since: float) -> float:
+        """Observed cloud implement spend in a UTC day; unknown costs stay NULL."""
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(cloud_usd), 0) AS usd FROM task_attribution "
+                "WHERE agent='claude_cloud' AND role='implementer' AND started_at>=?",
+                (since,),
+            ).fetchone()
+            return float(row["usd"])
+        finally:
+            conn.close()
+
+    def count_cloud_implements_started_since(self, since: float) -> int:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_attribution "
+                "WHERE agent='claude_cloud' AND role='implementer' "
+                "AND provider_session_id<>'' AND started_at>=?", (since,),
+            ).fetchone()
+            return int(row["n"])
+        finally:
+            conn.close()
+
+    def record_cloud_cost(self, task_id: str, before: Optional[float],
+                          after: Optional[float], usd: Optional[float]) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                "UPDATE task_attribution SET cloud_credit_used_before=?, "
+                "cloud_credit_used_after=?, cloud_usd=?, updated_at=? WHERE task_id=?",
+                (before, after, usd, time.time(), task_id),
+            )
+            conn.commit()
         finally:
             conn.close()
 
