@@ -3947,6 +3947,9 @@ def create_app(
         # into claude_cloud (role_mapping.py); by default no role resolves to
         # it, so existing local dispatch is unchanged.
         if _DISPATCH_ROLE_TO_AGENT.get(role, "") == _claude_cloud.CLOUD_PROVIDER_NAME:
+            if _dispatcher_enabled:
+                # The headless loop owns cloud selection and shadow launches.
+                return
             try:
                 _claude_cloud.dispatch_cloud_for_role(
                     q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""))
@@ -4309,6 +4312,8 @@ def create_app(
             _claude_cloud.reconcile_all_cloud_tasks(
                 q(), submit_review_result_fn=lambda task_id, result: submit_result(
                     task_id, result, x_agent_crew_project=_server_identity()["project"]))
+            if _claude_cloud.cloud_shadow_enabled():
+                _claude_cloud.reconcile_shadow_reviews(q())
         except Exception:
             logger.exception("watchdog: claude_cloud reconciliation failed")
         try:
@@ -4766,11 +4771,14 @@ def create_app(
         wt = wt_override or worktree_map.get(role)
         return agent, wt
 
-    async def _dispatch_task(task: TaskRequest, role: str) -> None:
+    async def _dispatch_task(task: TaskRequest, role: str,
+                             dispatch_agent: Optional[str] = None) -> None:
         """Spawn a headless agent subprocess for one task and await its exit."""
         _ctx = task.context if isinstance(task.context, dict) else {}
         _override = (_ctx.get("agent_override") or "").strip().lower() if isinstance(_ctx, dict) else ""
         agent, wt = _resolve_dispatch_target(task, role)
+        if dispatch_agent is not None:
+            agent = dispatch_agent
         if _honor_provider_cooldown(task, agent):
             return
         if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
@@ -6083,6 +6091,7 @@ def create_app(
         ci_rechecks: set[int] = set()
         refresh_tasks: dict[str, asyncio.Task] = {}
         refresh_skips_logged: set[str] = set()
+        cloud_refresh_after = 0.0
 
         def _start_refresh(name: str, fn: Callable, *args, **kwargs) -> None:
             previous = refresh_tasks.get(name)
@@ -6168,6 +6177,18 @@ def create_app(
                         "rounds-cap", _pipeline_reresolve_pending_rounds_caps, q(),
                         pane_map=pane_map, on_fix_enqueued=_try_push_next)
                     _start_refresh("owner approval", q().readmit_parked_owner_conflicts)
+                    if (_claude_cloud.cloud_dispatch_enabled()
+                            and time.monotonic() >= cloud_refresh_after):
+                        cloud_refresh_after = time.monotonic() + max(
+                            interval, min(10.0, _claude_cloud.cloud_stale_seconds() / 4))
+                        _start_refresh(
+                            "cloud reviews", _claude_cloud.reconcile_all_cloud_tasks, q(),
+                            submit_review_result_fn=lambda task_id, result: submit_result(
+                                task_id, result,
+                                x_agent_crew_project=_server_identity()["project"]),
+                        )
+                        if _claude_cloud.cloud_shadow_enabled():
+                            _start_refresh("shadow reviews", _claude_cloud.reconcile_shadow_reviews, q())
                     logger.debug(
                         f"dispatcher: loop tick worktree_map_keys={list(worktree_map.keys())} "
                         f"active_workers={sorted(active_workers)} "
@@ -6185,13 +6206,33 @@ def create_app(
                         if worker in active_workers:
                             continue
                         _worker_roles = _AGENT_TO_ROLES.get(worker, [])
+                        _cloud_local_fallback = False
+                        if (_worker_roles == ["reviewer"] and
+                                worker == _claude_cloud.CLOUD_PROVIDER_NAME and
+                                _claude_cloud.cloud_dispatch_enabled()):
+                            if _claude_cloud.cloud_shadow_enabled():
+                                _cloud_local_fallback = True
+                            else:
+                                # The cloud adapter owns dequeue and admission.
+                                _cloud_outcome = await asyncio.to_thread(
+                                    _claude_cloud.dispatch_cloud_for_role, q(),
+                                    role="reviewer", task_type="review")
+                                if _cloud_outcome.skipped_reason != "daily_cap":
+                                    continue
+                                _cloud_local_fallback = True
                         _default_role = _worker_roles[0] if _worker_roles else ""
                         task = None
                         for _candidate_role in _worker_roles:
                             # Stage 1 checks overrides independent of task type;
                             # Stage 2 checks each role this worker owns.
+                            _shadow_skip_ids = None
+                            if (_candidate_role == "reviewer" and
+                                    _claude_cloud.cloud_shadow_enabled() and
+                                    _claude_cloud.cloud_max_per_day() != 0):
+                                _shadow_skip_ids = _claude_cloud.cloud_review_skip_ids(q())
                             task = q().dequeue(agent=worker, role=_candidate_role, claimed_via="dispatcher",
-                                               claim_source="dispatcher")
+                                               claim_source="dispatcher",
+                                               skip_task_ids=_shadow_skip_ids)
                             if task is not None:
                                 break
                         if task is None:
@@ -6201,6 +6242,10 @@ def create_app(
                         role = _TYPE_TO_ROLE.get(
                             task.task_type, _default_role or "implementer")
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
+                        _dispatch_agent = None
+                        if (_cloud_local_fallback and role == "reviewer" and
+                                _target_agent == _claude_cloud.CLOUD_PROVIDER_NAME):
+                            _target_agent = _dispatch_agent = "claude"
                         _slot = _target_agent or worker
                         if _slot in active_workers:
                             # override 가 이미 바쁜 worker 를 가리켰다.
@@ -6222,13 +6267,17 @@ def create_app(
                         if _target_wt:
                             active_worktrees.add(_target_wt)
                         task_slots[task.task_id] = _slot
+                        if (_cloud_local_fallback and _claude_cloud.cloud_shadow_enabled()
+                                and role == "reviewer"):
+                            await asyncio.to_thread(_claude_cloud.launch_shadow_review, q(), task)
 
                         async def _run(
                             t: TaskRequest = task, r: str = role, s: str = _slot,
                             w: Optional[str] = _target_wt,
+                            a: Optional[str] = _dispatch_agent,
                         ) -> None:
                             try:
-                                await _dispatch_task(t, r)
+                                await _dispatch_task(t, r, dispatch_agent=a)
                             finally:
                                 _drop_unspawned_reservation(t.task_id)
                                 active_workers.discard(s)
