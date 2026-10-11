@@ -76,6 +76,16 @@ def test_mixed_query_keeps_short_korean_terms_in_candidates(tmp_path):
     assert "owner:short" in keys
 
 
+def test_two_character_korean_substring_inside_long_word_survives(tmp_path):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:embedded", "토큰노믹스 게이트")])
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        keys = [row["key"] for row in store._candidates(
+            db, MemoryScope(project="agent_crew"), "노믹")]
+    assert "owner:embedded" in keys
+
+
 def test_mixed_query_reserves_long_term_lane_when_short_matches_fill_limit(tmp_path):
     path = tmp_path / "memory.db"
     _seed_with_newer_noise(path, [("owner:long", "claude pipeline")],
@@ -196,10 +206,17 @@ def test_later_short_term_is_searched(tmp_path, query, target):
     assert candidates[0]["key"] == "owner:target"
 
 
-def test_short_term_scan_stays_within_retrieval_budget_at_20k_rows(tmp_path):
+@pytest.mark.parametrize("query", ["토큰 한도", "PR CI"])
+def test_short_term_retrieval_stays_within_budget_at_20k_rows(tmp_path, query):
     path = tmp_path / "memory.db"
     store = HybridMemoryStorage(str(path))
     with sqlite3.connect(path) as db:
+        db.execute(
+            "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+            "VALUES (?,?,?,?,?,?)",
+            ("decision", "owner:old-target", json.dumps({"text": "토큰 한도: PR CI checks passed"}),
+             '{"project":"agent_crew"}', 1, -1.0),
+        )
         db.executemany(
             "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
             "VALUES (?,?,?,?,?,?)",
@@ -210,13 +227,32 @@ def test_short_term_scan_stays_within_retrieval_budget_at_20k_rows(tmp_path):
              for index in range(20_000)),
         )
         db.commit()
-        scope = MemoryScope(project="agent_crew")
-        times = []
-        for _ in range(3):
-            start = time.perf_counter()
-            store._candidates(db, scope, "PR CI QA DB")
-            times.append(time.perf_counter() - start)
-    assert max(times) < 0.300, times
+    scope = MemoryScope(project="agent_crew")
+    results = [store.retrieve_ranked(scope, query, "implementer", 10, 16000)
+               for _ in range(3)]
+    assert all(result["mode"] == "lexical_only" for result in results), results
+    assert all("owner:old-target" in {row["key"] for row in result["middle"]}
+               for result in results), results
+    assert max(result["latency_ms"] for result in results) < 300, results
+
+
+def test_short_token_index_tracks_value_updates_and_deletes(tmp_path):
+    path = tmp_path / "memory.db"
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                   "VALUES (?,?,?,?,?,?)", ("decision", "owner:updated",
+                   json.dumps({"text": "PR check"}), '{"project":"agent_crew"}', 1, 1.0))
+        db.commit()
+        assert db.execute("SELECT key FROM adr001_short_fts WHERE adr001_short_fts MATCH 'PR'").fetchone()[0] == "owner:updated"
+        db.execute("UPDATE adr001_memory SET value=? WHERE key='owner:updated'",
+                   (json.dumps({"text": "CI check"}),))
+        db.commit()
+        assert not db.execute("SELECT 1 FROM adr001_short_fts WHERE adr001_short_fts MATCH 'PR'").fetchone()
+        assert db.execute("SELECT key FROM adr001_short_fts WHERE adr001_short_fts MATCH 'CI'").fetchone()[0] == "owner:updated"
+        db.execute("DELETE FROM adr001_memory WHERE key='owner:updated'")
+        db.commit()
+        assert not db.execute("SELECT 1 FROM adr001_short_fts WHERE key='owner:updated'").fetchone()
 
 
 def test_short_only_terms_rank_lexical_hit_ahead_of_recent_noise(tmp_path):

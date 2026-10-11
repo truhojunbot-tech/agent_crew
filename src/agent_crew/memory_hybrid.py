@@ -39,10 +39,6 @@ def _short_scan_terms(terms: list[str]) -> list[str]:
     return list(dict.fromkeys(term.casefold() for term in terms if len(term) < 3))
 
 
-def _short_haystack(alias: str) -> str:
-    return f"lower({alias}.key || ' ' || {alias}.body)"
-
-
 def _body_sql(alias: str) -> str:
     return (f"CASE WHEN {alias}.layer='authoritative' THEN "
             f"COALESCE(json_extract({alias}.value,'$.text'),{alias}.value) || "
@@ -82,6 +78,8 @@ _FTS_AU_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_au AFTER UPDATE OF value
                "DELETE FROM adr001_vec WHERE rowid=new.rowid; "
                "DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid; END;")
 _FTS_DDL = "CREATE VIRTUAL TABLE adr001_fts USING fts5(layer,key,body, tokenize='trigram')"
+_SHORT_FTS_DDL = ("CREATE VIRTUAL TABLE adr001_short_fts USING "
+                  "fts5(key,body, tokenize='unicode61')")
 
 
 def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str) -> bool:
@@ -185,6 +183,31 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid;
       END;
     """)
+    # Build the short-token companion in its own transaction. The trigram
+    # replacement below has its own rollback boundary and must not hold one
+    # write lock for both full-index backfills.
+    short_fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_short_fts'").fetchone() is None
+    if short_fresh:
+        db.execute(_SHORT_FTS_DDL)
+    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_ai "
+               "AFTER INSERT ON adr001_memory BEGIN "
+               "INSERT INTO adr001_short_fts(rowid,key,body) "
+               f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
+    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_au "
+               "AFTER UPDATE OF value ON adr001_memory BEGIN "
+               "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; "
+               "INSERT INTO adr001_short_fts(rowid,key,body) "
+               f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
+    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_ad "
+               "AFTER DELETE ON adr001_memory BEGIN "
+               "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; END")
+    short_count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
+    if (short_fresh or
+            db.execute("SELECT count(*) FROM adr001_short_fts").fetchone()[0] != short_count):
+        db.execute("DELETE FROM adr001_short_fts")
+        db.execute("INSERT INTO adr001_short_fts(rowid,key,body) "
+                   "SELECT m.rowid,m.key," + _body_sql("m") + " FROM adr001_memory m")
+    db.commit()
     if fts_changed:
         # The script above ends the legacy-column transaction. Replacing the
         # table and its triggers in one write transaction keeps concurrent
@@ -557,41 +580,26 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             searchable = [term for term in terms if len(term) >= 3]
             short_terms = _short_scan_terms(terms)
             def short_rows_for(scan_terms: list[str]) -> list[tuple]:
-                # Trigram MATCH cannot see short terms. Read the scoped index
-                # once, then score each term by its frequency in that scope.
-                # This keeps an unlisted common word from crowding out a rare
-                # term and avoids repeated SQL replace() scans per term.
-                patterns = [re.compile(r"(?<!\w)" + re.escape(term) + r"(?!\w)")
-                            if term.isascii() else None for term in scan_terms]
-                frequencies = [0] * len(scan_terms)
-                hits = []
-                for rowid, created, key, body in db.execute(
-                        "SELECT m.rowid,m.created,adr001_fts.key,adr001_fts.body "
-                        "FROM adr001_memory m JOIN adr001_fts ON adr001_fts.rowid=m.rowid "
-                        "WHERE " + clause + " AND " + _effective_sql(), params):
-                    source = (key + " " + body).casefold()
-                    matched = []
-                    for index, term in enumerate(scan_terms):
-                        if term not in source:
-                            continue
-                        frequencies[index] += 1
-                        matched.append((index, patterns[index] is None or
-                                        bool(patterns[index].search(source))))
-                    if matched:
-                        hits.append((rowid, created, matched))
-                hits.sort(key=lambda hit: (
-                    -sum((2 if boundary else 0.25) / frequencies[index]
-                         for index, boundary in hit[2]),
-                    -hit[1], -hit[0]))
-                selected = [hit[0] for hit in hits[:MIDDLE_CANDIDATE_LIMIT]]
-                if not selected:
-                    return []
-                fetched = {row[0]: row for row in db.execute(
-                    prefix + "WHERE m.rowid IN (" + ",".join("?" for _ in selected) + ")",
-                    selected)}
-                return [fetched[rowid] for rowid in selected]
+                expression = " OR ".join('"' + term + '"' for term in scan_terms)
+                return db.execute(
+                    prefix + "JOIN adr001_short_fts ON adr001_short_fts.rowid=m.rowid "
+                    "WHERE " + clause + " AND " + _effective_sql() +
+                    " AND adr001_short_fts MATCH ? ORDER BY bm25(adr001_short_fts) "
+                    "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT]).fetchall()
             if short_terms:
                 rows = short_rows_for(short_terms)
+                if not rows:
+                    # unicode61 indexes whole words. Preserve the old short
+                    # substring behavior for a query inside a longer Korean
+                    # word, with filtering in SQLite and only 96 rows copied.
+                    substring = " OR ".join(
+                        "instr(lower(adr001_fts.key || ' ' || adr001_fts.body), lower(?))>0"
+                        for _ in short_terms)
+                    rows = db.execute(
+                        prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid "
+                        "WHERE " + clause + " AND " + _effective_sql() +
+                        " AND (" + substring + ") ORDER BY m.created DESC "
+                        "LIMIT ?", [*params, *short_terms, MIDDLE_CANDIDATE_LIMIT]).fetchall()
             if searchable:
                 expression = " OR ".join('"' + term + '"' for term in searchable)
                 long_rows = db.execute(
@@ -718,13 +726,11 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         bm25[rowid] = len(bm25) + 1
             short_terms = [term for term in terms if len(term) < 3]
             if short_terms:
-                haystack = _short_haystack("adr001_fts")
-                short_match = " OR ".join(
-                    f"instr({haystack}, lower(?)) > 0" for _ in short_terms)
+                expression = " OR ".join('"' + term + '"' for term in short_terms)
                 short_ids = {row[0] for row in db.execute(
-                    "SELECT rowid FROM adr001_fts WHERE rowid IN (" +
-                    ",".join("?" for _ in ids) + ") AND (" + short_match + ")",
-                    [*ids, *short_terms])}
+                    "SELECT rowid FROM adr001_short_fts WHERE adr001_short_fts MATCH ? "
+                    "AND rowid IN (" + ",".join("?" for _ in ids) + ")",
+                    [expression, *ids])}
                 short_rank = {row["rowid"]: rank for rank, row in enumerate(
                     (row for row in candidates if row["rowid"] in short_ids), 1)}
             vectors = db.execute("SELECT rowid,model_id,content_sha,vec FROM adr001_vec WHERE "
