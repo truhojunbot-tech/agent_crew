@@ -222,7 +222,7 @@ def test_lag_without_correlation_stays_lag(tmp_path):
     log = _dispatch_log(tmp_path,
         "Error: the connection to the agent was interrupted before the "
         "response finished: subscriber fell behind updates, stalled for 6s")
-    assert _detect_transient_error_in_log(log) == "agy_subscriber_lag"
+    assert _detect_transient_error_in_log(log, agent="gemini") == "agy_subscriber_lag"
 
 
 def test_surfaced_quota_still_wins_over_lag(tmp_path):
@@ -231,7 +231,7 @@ def test_surfaced_quota_still_wins_over_lag(tmp_path):
     log = _dispatch_log(tmp_path,
         "Error: Individual quota reached. Please upgrade your subscription.\n"
         "subscriber fell behind updates, stalled for 6s")
-    assert _detect_transient_error_in_log(log) == "agy_quota_exhausted"
+    assert _detect_transient_error_in_log(log, agent="gemini") == "agy_quota_exhausted"
 
 
 # ── 5. the cap event must mean the cap tripped (review-99ad8ad0) ──────
