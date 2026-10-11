@@ -6,6 +6,7 @@ import subprocess
 import threading
 import urllib.error
 from io import BytesIO
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -13,6 +14,69 @@ from fastapi.testclient import TestClient
 from agent_crew.server import create_app
 from scripts.runtime_swap import (api, parse_args, parse_env_file, check_checkout,
                                   complete_environ, require_no_running_work)
+
+
+@pytest.mark.parametrize(('project', 'hold_message'), [
+    ('digital-seller', '13024'),
+    ('smart-money-alpha', '13024'),
+    ('ht-8004', '13020'),
+    ('agent_crew', None),
+])
+def test_shell_precheck_runs_before_swap(tmp_path, project, hold_message):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    precheck = bin_dir / 'owner-state'
+    precheck.write_text('''#!/usr/bin/env bash
+printf '%s\\n' "$2" > "$SWAP_PRECHECK_MARKER"
+case "$2" in
+  digital-seller|smart-money-alpha) echo 'owner HOLD 13024'; exit 9 ;;
+  ht-8004) echo 'owner HOLD 13020/13619'; exit 9 ;;
+  *) echo 'owner FREE'; exit 0 ;;
+esac
+''')
+    precheck.chmod(0o755)
+    fake_python = bin_dir / 'python3'
+    fake_python.write_text('#!/usr/bin/env bash\nprintf "called\\n" > "$SWAP_RUNTIME_MARKER"\n')
+    fake_python.chmod(0o755)
+    precheck_marker = tmp_path / 'precheck.called'
+    runtime_marker = tmp_path / 'runtime.called'
+    env = {**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+           'AGENT_CREW_SWAP_PRECHECK': f'{precheck} --project',
+           'SWAP_PRECHECK_MARKER': str(precheck_marker),
+           'SWAP_RUNTIME_MARKER': str(runtime_marker)}
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    result = subprocess.run(['bash', str(script), project, 'a' * 40, 'go'],
+                            env=env, text=True, capture_output=True)
+    assert precheck_marker.read_text().strip() == project
+    if hold_message:
+        assert result.returncode != 0
+        assert hold_message in result.stdout + result.stderr
+        assert not runtime_marker.exists()
+    else:
+        assert result.returncode == 0
+        assert runtime_marker.exists()
+
+
+@pytest.mark.parametrize(('precheck', 'allowed'), [(None, False), ('none', True)])
+def test_shell_precheck_requires_explicit_configuration(tmp_path, precheck, allowed):
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    fake_python = bin_dir / 'python3'
+    fake_python.write_text('#!/usr/bin/env bash\nprintf "called\\n" > "$SWAP_RUNTIME_MARKER"\n')
+    fake_python.chmod(0o755)
+    runtime_marker = tmp_path / 'runtime.called'
+    env = {**os.environ, 'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+           'SWAP_RUNTIME_MARKER': str(runtime_marker)}
+    env.pop('AGENT_CREW_SWAP_PRECHECK', None)
+    if precheck is not None:
+        env['AGENT_CREW_SWAP_PRECHECK'] = precheck
+    script = Path(__file__).resolve().parents[2] / 'scripts/runtime_swap.sh'
+    result = subprocess.run(['bash', str(script), 'agent_crew', 'a' * 40, 'go'],
+                            env=env, text=True, capture_output=True)
+    assert (result.returncode == 0) is allowed
+    assert runtime_marker.exists() is allowed
+    if not allowed:
+        assert 'AGENT_CREW_SWAP_PRECHECK' in result.stdout + result.stderr
 
 
 def test_argument_parsing_rejects_short_sha_and_unknown_step():
