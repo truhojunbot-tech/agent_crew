@@ -2,6 +2,7 @@
 import json
 import sqlite3
 import time
+import pytest
 
 from agent_crew.memory_hybrid import HybridMemoryStorage, ensure_index_schema
 from agent_crew.memory_runtime import MemoryScope, SQLiteMemoryStorage
@@ -153,6 +154,48 @@ def test_two_selective_short_terms_beat_one_newer_match(tmp_path):
     assert candidates[0]["key"] == "owner:target"
 
 
+@pytest.mark.parametrize("query,noise", [
+    ("no PR", "no note here"), ("my PR", "my note"),
+    ("PR 배포", "배포 메모"),
+])
+def test_rare_short_term_beats_unlisted_common_noise(tmp_path, query, noise):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:target", "PR 751 merged after CI green")],
+                           noise_body=noise)
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        candidates = store._candidates(db, MemoryScope(project="agent_crew"), query)
+    assert candidates[0]["key"] == "owner:target"
+
+
+@pytest.mark.parametrize("term,target,noise", [
+    ("PR", "fix landed in PR.", "protect unrelated"),
+    ("PR", "merged (PR) today", "protect unrelated"),
+    ("PR", "see PR/751 for detail", "protect unrelated"),
+    ("CI", "green on CI, shipped", "decision unrelated"),
+])
+def test_punctuation_delimits_short_ascii_terms(tmp_path, term, target, noise):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:target", target)], noise_body=noise)
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        candidates = store._candidates(db, MemoryScope(project="agent_crew"), term)
+    assert candidates[0]["key"] == "owner:target"
+
+
+@pytest.mark.parametrize("query,target", [
+    ("v2 PR CI QA DB UI", "UI polish shipped"),
+    ("토큰 한도 보호 우선 측정 배포", "배포 완료"),
+])
+def test_later_short_term_is_searched(tmp_path, query, target):
+    path = tmp_path / "memory.db"
+    _seed_with_newer_noise(path, [("owner:target", target)])
+    store = HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        candidates = store._candidates(db, MemoryScope(project="agent_crew"), query)
+    assert candidates[0]["key"] == "owner:target"
+
+
 def test_short_term_scan_stays_within_retrieval_budget_at_20k_rows(tmp_path):
     path = tmp_path / "memory.db"
     store = HybridMemoryStorage(str(path))
@@ -160,7 +203,9 @@ def test_short_term_scan_stays_within_retrieval_budget_at_20k_rows(tmp_path):
         db.executemany(
             "INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
             "VALUES (?,?,?,?,?,?)",
-            (("decision", f"noise:{index:05}", '{"text":"this is a note"}',
+            (("decision", f"noise:{index:05}", json.dumps({"text":
+              "This is a realistic task outcome with a longer description of work, "
+              "review state, implementation detail, and verification evidence. " * 5}),
               '{"project":"agent_crew"}', 1, float(index))
              for index in range(20_000)),
         )
@@ -169,7 +214,7 @@ def test_short_term_scan_stays_within_retrieval_budget_at_20k_rows(tmp_path):
         times = []
         for _ in range(3):
             start = time.perf_counter()
-            store._candidates(db, scope, "is a to of in on PR CI it be we do")
+            store._candidates(db, scope, "PR CI QA DB")
             times.append(time.perf_counter() - start)
     assert max(times) < 0.300, times
 
