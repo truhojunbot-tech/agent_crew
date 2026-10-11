@@ -293,24 +293,40 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         rows = []
         if terms:
             searchable = [term for term in terms if len(term) >= 3]
+            short_terms = [term for term in terms if len(term) < 3]
+            if short_terms:
+                # Trigram MATCH cannot see short terms. Include key and layer,
+                # as the former unicode61 index did, and fold English case.
+                haystack = "lower(adr001_fts.layer || ' ' || adr001_fts.key || ' ' || adr001_fts.body)"
+                short_match = " OR ".join(
+                    f"instr({haystack}, lower(?)) > 0" for _ in short_terms)
+                rows = db.execute(
+                    prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
+                    clause + " AND " + _effective_sql() + " AND (" + short_match + ") "
+                    "ORDER BY m.created DESC,m.rowid DESC LIMIT ?",
+                    [*params, *short_terms, MIDDLE_CANDIDATE_LIMIT],
+                ).fetchall()
             if searchable:
                 expression = " OR ".join('"' + term + '"' for term in searchable)
-                rows = db.execute(
+                long_rows = db.execute(
                     prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
                     clause + " AND " + _effective_sql() +
                     " AND adr001_fts MATCH ? ORDER BY bm25(adr001_fts) "
                     "LIMIT ?", [*params, expression, MIDDLE_CANDIDATE_LIMIT],
                 ).fetchall()
-            else:
-                # FTS5 trigram cannot index a one- or two-character phrase.
-                # Preserve those queries through a bounded scope-filtered scan.
-                short_match = " OR ".join("instr(adr001_fts.body, ?) > 0" for _ in terms)
-                rows = db.execute(
-                    prefix + "JOIN adr001_fts ON adr001_fts.rowid=m.rowid WHERE " +
-                    clause + " AND " + _effective_sql() + " AND (" + short_match + ") "
-                    "ORDER BY m.created DESC,m.rowid DESC LIMIT ?",
-                    [*params, *terms, MIDDLE_CANDIDATE_LIMIT],
-                ).fetchall()
+                if rows:
+                    # Both lexical lanes get room before recent-row padding.
+                    short_rows, rows, seen = rows, [], set()
+                    for index in range(MIDDLE_CANDIDATE_LIMIT):
+                        for lane in (short_rows, long_rows):
+                            if index < len(lane) and lane[index][0] not in seen:
+                                rows.append(lane[index]); seen.add(lane[index][0])
+                                if len(rows) == MIDDLE_CANDIDATE_LIMIT:
+                                    break
+                        if len(rows) == MIDDLE_CANDIDATE_LIMIT:
+                            break
+                else:
+                    rows = long_rows
         if len(rows) < MIDDLE_CANDIDATE_LIMIT:
             seen = {row[0] for row in rows}
             recent = db.execute(prefix + "WHERE " + clause + " AND " + _effective_sql() +
@@ -397,8 +413,9 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         ids = {r["rowid"] for r in candidates}
         if not ids:
             return [], False
-        terms = re.findall(r"[\w]+", query)
+        terms = re.findall(r"[\w]+", query)[:12]
         bm25 = {}
+        short_rank = {}
         with closing(sqlite3.connect(self.path)) as db:
             searchable = [term for term in terms if len(term) >= 3]
             if searchable:
@@ -408,6 +425,17 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         "WHERE adr001_fts MATCH ? ORDER BY 2", (expression,)):
                     if rowid in ids:
                         bm25[rowid] = len(bm25) + 1
+            short_terms = [term for term in terms if len(term) < 3]
+            if short_terms:
+                haystack = "lower(layer || ' ' || key || ' ' || body)"
+                short_match = " OR ".join(
+                    f"instr({haystack}, lower(?)) > 0" for _ in short_terms)
+                short_ids = {row[0] for row in db.execute(
+                    "SELECT rowid FROM adr001_fts WHERE rowid IN (" +
+                    ",".join("?" for _ in ids) + ") AND (" + short_match + ")",
+                    [*ids, *short_terms])}
+                short_rank = {row["rowid"]: rank for rank, row in enumerate(
+                    (row for row in candidates if row["rowid"] in short_ids), 1)}
             vectors = db.execute("SELECT rowid,model_id,content_sha,vec FROM adr001_vec WHERE "
                                  "rowid IN (" + ",".join("?" for _ in ids) + ")", list(ids)).fetchall()
             bodies = {rowid: body for rowid, body in db.execute(
@@ -433,6 +461,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         lexical = {r["rowid"]: rank for rank, r in enumerate(candidates, 1)}
         candidates.sort(key=lambda row: (
             -(1 / (RRF_K + bm25[row["rowid"]]) if row["rowid"] in bm25 else 0)
+            - (1 / (RRF_K + short_rank[row["rowid"]])
+               if row["rowid"] in short_rank else 0)
             - (1 / (RRF_K + vector_rank[row["rowid"]]) if row["rowid"] in vector_rank else 0),
             lexical[row["rowid"]]))
         return candidates, bool(vector_rank)
