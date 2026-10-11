@@ -2250,6 +2250,39 @@ def auto_enqueue_review(
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
         except DuplicateReviewError as exc:
+            # Admission can refuse a review after its same-head survivor has
+            # already posted a verdict. No blocked row exists for the server's
+            # dispatch-time handoff hook, so replay that verdict here after
+            # enqueue() has committed the inherited lineage. The normal fix
+            # and test helpers supply their own once-only transition keys.
+            try:
+                survivor = queue.get_task(exc.existing_task_id)
+                survivor_ctx = (survivor.context if survivor is not None
+                                and isinstance(survivor.context, dict) else {})
+                if (survivor is not None and survivor.status == "completed"
+                        and survivor.task_type == "review"
+                        and survivor_ctx.get("duplicate_review_lineage_from") == review_id):
+                    standing = queue.get_result(survivor.task_id)
+                    if standing is not None and standing.status == "completed":
+                        repo = str(survivor_ctx.get("repo") or "")
+                        pr = standing.pr_number or survivor_ctx.get("pr_number")
+                        if not pr or review_publication_decision(
+                                survivor_ctx, pr, repo=repo,
+                                repo_cwd=repo_cwd).publish:
+                            verdict = _resolve_verdict(standing)
+                            if verdict == "request_changes" and standing.findings:
+                                auto_enqueue_fix(
+                                    queue, survivor.task_id, pane_map=pane_map,
+                                    server_project=server_project, pr_state_fn=pr_state_fn,
+                                    repo=repo, repo_cwd=repo_cwd)
+                            elif verdict == "approve" and not survivor_ctx.get("no_tester"):
+                                auto_enqueue_test(
+                                    queue, survivor.task_id, pane_map=pane_map,
+                                    server_project=server_project, pr_state_fn=pr_state_fn,
+                                    repo=repo, repo_cwd=repo_cwd)
+            except Exception:
+                logger.exception("auto_enqueue_review: completed duplicate cascade failed for %s",
+                                 exc.existing_task_id)
             return exc.existing_task_id
         return review_id
     except PausedError:

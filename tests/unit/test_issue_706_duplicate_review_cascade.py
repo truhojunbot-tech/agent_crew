@@ -107,6 +107,48 @@ def test_pending_survivor_adopts_enqueue_refusal_lineage(
     assert len([item for item in queue.list_tasks() if item.task_id == successor]) == 1
 
 
+@pytest.mark.parametrize("verdict,successor_type", [
+    ("request_changes", "implement"), ("approve", "test")])
+def test_completed_survivor_admission_handoff_cascades_once(
+        queue, monkeypatch, verdict, successor_type):
+    queue.enqueue(TaskRequest(
+        task_id="impl-706", task_type="implement", description="implement",
+        branch="main", project="agent_crew",
+        context={"risk_tier": 2, "fix_round": 1, "issue": 706,
+                 "repo": "owner/repo"}))
+    queue.enqueue(TaskRequest(
+        task_id="review-survivor", task_type="review", description="review PR",
+        branch="main", project="agent_crew",
+        context={"prev_task_id": "impl-706", "pr_number": 706,
+                 "coordinator_managed": True, "risk_tier": 1,
+                 "reviewed_sha": HEAD}))
+    assert queue.dequeue(role="reviewer").task_id == "review-survivor"
+    _result(queue, verdict)
+    if verdict == "request_changes":
+        assert auto_enqueue_fix(queue, "review-survivor",
+                                pr_state_fn=lambda _: "open",
+                                head_sha_fn=lambda _: HEAD) is None
+    monkeypatch.setattr(pipeline, "review_is_current",
+                        lambda *a, **k: (True, "same head"))
+    monkeypatch.setattr(pipeline, "review_publication_decision",
+                        lambda *a, **k: pipeline.ReviewPublication(
+                            True, "current", "same head"))
+    result = TaskResult(task_id="impl-706", status="completed", summary="done",
+                        branch=BRANCH, commit=HEAD, pr_number=706)
+    for _ in range(2):
+        assert pipeline.auto_enqueue_review(
+            queue, "impl-706", pr_number=706, result=result,
+            pr_state_fn=lambda _: "open") == "review-survivor"
+    successors = [task for task in queue.list_tasks()
+                  if task.task_type == successor_type
+                  and task.context.get("prev_task_id") == "review-survivor"]
+    assert len(successors) == 1
+    assert successors[0].branch == BRANCH
+    assert successors[0].context["prev_task_id"] == "review-survivor"
+    assert successors[0].context["risk_tier"] == 2
+    assert successors[0].context["fix_round"] == (2 if verdict == "request_changes" else 1)
+
+
 def test_request_changes_uses_pipeline_branch_lineage_and_tier_once(queue):
     _paired_reviews(queue)
     survivor = queue.get_task("review-survivor")
