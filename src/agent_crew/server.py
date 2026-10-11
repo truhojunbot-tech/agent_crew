@@ -3216,6 +3216,7 @@ def create_app(
             rows = []
         rendered = json.dumps(rows, sort_keys=True, ensure_ascii=False).encode()
         return {"head": rows, "middle": [], "mode": "fallback",
+                "fusion_mode": _ranked_memory.fusion_mode,
                 "pending_vectors": response_state.get("pending", 0),
                 "latency_ms": 300.0, "trimmed_bytes": 0,
                 "standing_trimmed": (response_state.get("head") or {}).get("standing_trimmed", 0),
@@ -5848,6 +5849,7 @@ def create_app(
                 _shadow_event = {
                     **shadow_telemetry(_shadow_result),
                     **({"retrieval_mode": _ranked_receipt["mode"],
+                        "fusion_mode": _ranked_receipt.get("fusion_mode", "rrf"),
                         "superseded_served": _ranked_receipt["superseded_served"],
                         "head_bytes": _ranked_receipt["head_bytes"],
                         "fleet": _ranked_scope.fleet}
