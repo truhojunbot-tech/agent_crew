@@ -5,6 +5,7 @@ import sqlite3
 import pytest
 
 from agent_crew import procedural_lifecycle as pl
+from agent_crew import memory_runtime as mr
 from agent_crew import procedural_memory as pm
 from agent_crew.memory import MemoryRequest
 from agent_crew.memory_runtime import (
@@ -279,6 +280,66 @@ def test_expired_active_procedure_is_not_served(store):
                          approver=COORD, now=1.0)  # 180-day TTL ended long ago
     assert out.key not in served_keys(store)
     assert pl.active_procedures(store, project="proj-a") == []
+
+
+def _malformed_active_rows(template: dict) -> dict:
+    """Variants of a really promoted row that claim to be active but are not servable."""
+    def variant(mutate):
+        value = json.loads(json.dumps(template))
+        mutate(value["lifecycle"])
+        return value
+
+    def set_expiry(expiry):
+        return lambda lc: lc["procedure"].__setitem__("expires_at", expiry)
+
+    return {
+        "procedure:bad-no-procedure": variant(lambda lc: lc.pop("procedure")),
+        "procedure:bad-null-procedure": variant(lambda lc: lc.__setitem__("procedure", None)),
+        "procedure:bad-string-procedure": variant(lambda lc: lc.__setitem__("procedure", "x")),
+        "procedure:bad-no-id": variant(lambda lc: lc["procedure"].pop("procedure_id")),
+        "procedure:bad-pending-state": variant(
+            lambda lc: lc["procedure"].__setitem__("state", pm.CANDIDATE)),
+        "procedure:bad-expiry-text": variant(set_expiry("not-a-time")),
+        "procedure:bad-expiry-missing": variant(lambda lc: lc["procedure"].pop("expires_at")),
+        "procedure:bad-expiry-zero": variant(set_expiry(0)),
+        "procedure:bad-expiry-null": variant(set_expiry(None)),
+        "procedure:bad-expiry-bool": variant(set_expiry(True)),
+        "procedure:bad-expiry-infinite": variant(set_expiry(float("inf"))),
+        "procedure:bad-lifecycle-list": {**template, "lifecycle": []},
+    }
+
+
+def test_active_status_without_a_valid_procedure_or_expiry_fails_closed(store, monkeypatch):
+    """Review finding on PR #771: Python, SQL and hybrid readers agree and never raise."""
+    out = create(store, scope={"repos": ["r"]})
+    assert pl.promote_candidate(store, project="proj-a", candidate_id=out.candidate_id,
+                                approver=COORD).ok
+    template = pl._load(store, "proj-a", "", out.candidate_id).value
+    scope = MemoryScope(project="proj-a")
+    bad = _malformed_active_rows(template)
+    for key, value in bad.items():
+        store.put(MemoryRecord("procedural", key, value, scope))
+    store.put(MemoryRecord("procedural", "owner_principle:null-lifecycle",
+                           {"text": "precondition principle", "lifecycle": None}, scope))
+
+    for s in (store, reopen(store)):
+        served = served_keys(s)  # retrieve, retrieve_shadow, provider, hybrid head/render
+        assert out.key in served, "the well-formed active row stays served"
+        assert "owner_principle:null-lifecycle" in served
+        assert not set(bad) & served
+        assert not set(bad) & live_keys(s, monkeypatch)
+        assert [p.procedure_id for p in pl.active_procedures(s, project="proj-a")] == \
+            [template["lifecycle"]["procedure"]["procedure_id"]]
+
+    # The Python predicate and its SQL form decide every row identically.
+    with sqlite3.connect(store.path) as db:
+        sql_ok = {k for (k,) in db.execute(
+            "SELECT key FROM adr001_memory WHERE " + mr.procedural_servable_sql())}
+        python_ok = {k for k, layer, v in db.execute(
+            "SELECT key, layer, value FROM adr001_memory")
+            if mr.procedural_row_servable(layer, json.loads(v))}
+    assert sql_ok == python_ok
+    assert out.key in sql_ok and not set(bad) & sql_ok
 
 
 def test_concurrent_transition_loses_cleanly(store):

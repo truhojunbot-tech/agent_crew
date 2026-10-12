@@ -15,7 +15,7 @@ from typing import Optional, Protocol
 
 from .procedural_memory import ACTIVE as _PROCEDURE_ACTIVE
 
-LAYERS =frozenset({"authoritative", "checkpoint", "procedural", "episodic",
+LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
                     "decision", "failure_pattern"})
 SHADOW_RETENTION_ROWS_PER_PROJECT = 900
 SHADOW_PRUNE_BATCH_ROWS = 50
@@ -57,10 +57,13 @@ def procedural_row_servable(layer: str, value: dict,
     """Whether an active reader may serve this row (#716).
 
     A procedural row that carries the lifecycle contract is served only while
-    its status is active and it has not expired. Pending, held, rejected,
-    superseded and malformed lifecycle rows never reach a reader. Procedural
-    rows written before the contract (no ``lifecycle`` and no candidate kind,
-    e.g. ``owner_principle:*``) keep their existing behaviour.
+    its status is active, it holds the validated procedure (an object with a
+    ``procedure_id``, ``state`` active and a numeric ``expires_at``) and that
+    expiry is still ahead. Anything else -- pending, held, rejected,
+    superseded or malformed -- fails closed: not served, never raises.
+    Procedural rows written before the contract (no ``lifecycle`` and no
+    candidate kind, e.g. ``owner_principle:*``) keep their existing behaviour.
+    Must agree with :func:`procedural_servable_sql`.
     """
     if layer != "procedural" or not isinstance(value, dict):
         return True
@@ -70,20 +73,40 @@ def procedural_row_servable(layer: str, value: dict,
     if not isinstance(lifecycle, dict) or lifecycle.get("status") != _PROCEDURE_ACTIVE:
         return False
     procedure = lifecycle.get("procedure")
-    expires = procedure.get("expires_at") if isinstance(procedure, dict) else 0
-    return not expires or (now or time.time()) < float(expires)
+    if not isinstance(procedure, dict) or procedure.get("state") != _PROCEDURE_ACTIVE:
+        return False
+    procedure_id = procedure.get("procedure_id")
+    if not isinstance(procedure_id, str) or not procedure_id:
+        return False
+    expires = procedure.get("expires_at")
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return False
+    return (now or time.time()) < expires < _PROCEDURE_MAX_EXPIRES
+
+
+#: Upper bound on a servable expiry. It keeps non-finite values (``Infinity``
+#: parsed by either JSON reader) out of both the Python and SQL paths alike.
+_PROCEDURE_MAX_EXPIRES = 1e308
 
 
 def procedural_servable_sql(alias: str = "") -> str:
     """SQL form of :func:`procedural_row_servable` for the SQL read paths."""
     a = f"{alias}." if alias else ""
+    v = f"{a}value"
     return (f"NOT ({a}layer='procedural' AND ("
-            f"COALESCE(json_extract({a}value,'$.kind'),'')='{PROCEDURE_CANDIDATE_KIND}' "
-            f"OR json_type({a}value,'$.lifecycle') IS NOT NULL) AND ("
-            f"COALESCE(json_extract({a}value,'$.lifecycle.status'),'')<>'{_PROCEDURE_ACTIVE}' "
-            f"OR (COALESCE(json_extract({a}value,'$.lifecycle.procedure.expires_at'),0) > 0 "
-            f"AND json_extract({a}value,'$.lifecycle.procedure.expires_at') "
-            f"<= (julianday('now') - 2440587.5) * 86400.0)))")
+            f"COALESCE(json_extract({v},'$.kind'),'')='{PROCEDURE_CANDIDATE_KIND}' "
+            f"OR COALESCE(json_type({v},'$.lifecycle'),'null')<>'null') AND NOT ("
+            f"json_type({v},'$.lifecycle') IS 'object' "
+            f"AND json_extract({v},'$.lifecycle.status') IS '{_PROCEDURE_ACTIVE}' "
+            f"AND json_type({v},'$.lifecycle.procedure') IS 'object' "
+            f"AND json_extract({v},'$.lifecycle.procedure.state') IS '{_PROCEDURE_ACTIVE}' "
+            f"AND json_type({v},'$.lifecycle.procedure.procedure_id') IS 'text' "
+            f"AND json_extract({v},'$.lifecycle.procedure.procedure_id') <> '' "
+            f"AND json_type({v},'$.lifecycle.procedure.expires_at') IN ('integer','real') "
+            f"AND json_extract({v},'$.lifecycle.procedure.expires_at') "
+            f"> (julianday('now') - 2440587.5) * 86400.0 "
+            f"AND json_extract({v},'$.lifecycle.procedure.expires_at') "
+            f"< {_PROCEDURE_MAX_EXPIRES!r}))")
 
 
 def _scope_from_json(scope: str) -> MemoryScope:
