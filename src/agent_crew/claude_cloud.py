@@ -34,6 +34,7 @@ Genuinely missing seams (documented, not invented — see the PR body):
 """
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
@@ -1143,7 +1144,6 @@ def reconcile_cloud_dispatch(
     pr_number_for_branch_fn = pr_number_for_branch_fn or _github.pr_number_for_branch
     pr_head_sha_fn = pr_head_sha_fn or _github.pr_head_sha
     commit_message_fn = commit_message_fn or _github.branch_head_commit_message
-    pr_state_fn = pr_state_fn or _github.pr_state
 
     # #499 r1 HIGH: resolve THIS task's own repo (context["repo"], the same
     # key dispatch already reads via `_resolve_task_repo`) before any GitHub
@@ -1153,6 +1153,13 @@ def reconcile_cloud_dispatch(
     # which can name a different repository than the task's — silently
     # missing the real PR or matching one in the wrong repo entirely.
     effective_repo = _resolve_task_repo(task, repo)
+    # #762 r1 HIGH: `pr_is_actionable` calls the callback with ONLY the PR
+    # number, so an unbound `_github.pr_state` read the dispatcher's cwd and
+    # answered "unknown" for the task's real repo. Bind the default lookup to
+    # this task's repo; with no repo, pass no callback so the pipeline's own
+    # no-repo-identity guard applies instead of guessing from cwd.
+    if pr_state_fn is None and effective_repo:
+        pr_state_fn = functools.partial(_github.pr_state, repo=effective_repo)
 
     if task.task_type == "review":
         return _reconcile_cloud_review(

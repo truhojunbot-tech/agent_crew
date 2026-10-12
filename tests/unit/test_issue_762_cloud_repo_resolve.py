@@ -114,3 +114,34 @@ def test_cloud_implement_without_context_repo_reconciles_and_enqueues_review(
     assert queue.get_task("impl-762").status == "completed"
     reviews = [t for t in queue.list_tasks() if t.task_type == "review"]
     assert len(reviews) == 1
+
+
+def test_default_pr_state_lookup_is_bound_to_context_repo(tmp_path, monkeypatch):
+    """#762 r1 HIGH: no injected pr_state_fn — the DEFAULT lookup must get the repo."""
+    from agent_crew import github
+
+    server_cwd = _git_repo(tmp_path / "server", "https://github.com/owner/wrong.git")
+    monkeypatch.chdir(server_cwd)
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(_implement(context={"repo": "owner/right"}))
+    queue.dequeue("implementer")
+
+    seen = []
+
+    def fake_pr_state(pr_number, repo=None, timeout=20.0, cwd=None):
+        seen.append((pr_number, repo))
+        return "open" if repo == "owner/right" else "unknown"
+
+    monkeypatch.setattr(github, "pr_state", fake_pr_state)
+
+    outcome = cloud.reconcile_cloud_dispatch(
+        queue, queue.get_task("impl-762"),
+        pr_number_for_branch_fn=lambda branch, repo=None: 763,
+        pr_head_sha_fn=lambda *a, **kw: "a" * 40,
+        commit_message_fn=lambda *a, **kw: None)
+
+    assert seen and all(repo == "owner/right" for _, repo in seen), seen
+    assert outcome.action == "pr_ready"
+    assert queue.get_task("impl-762").status == "completed"
+    reviews = [t for t in queue.list_tasks() if t.task_type == "review"]
+    assert len(reviews) == 1

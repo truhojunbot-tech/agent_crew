@@ -89,8 +89,11 @@ def test_finding1_end_to_end_pr_appears_and_review_gets_enqueued(q, monkeypatch)
     """Full reproduction with the actual reconciliation function (not a spy):
     a dispatched cloud task whose branch now has a PR must, via
     reconcile_all_cloud_tasks alone (the thing the watchdog now calls),
-    complete AND enqueue a review — with no server.py/tmux involved at all."""
-    task_id, branch = _enqueue_implement(q)
+    complete AND enqueue a review — with no server.py/tmux involved at all.
+
+    #762 r1: a real cloud dispatch records context.repo; the default
+    pr_state lookup is bound to it (no repo -> no cwd guess -> unknown)."""
+    task_id, branch = _enqueue_implement(q, context={"repo": "owner/agent_crew"})
     q.dequeue(role="implementer")
     q.record_dispatch(task_id, channel=cc.DISPATCH_CHANNEL, agent=cc.CLOUD_PROVIDER_NAME,
                       target="pending")
