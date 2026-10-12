@@ -439,9 +439,13 @@ def _resolve_task_repo(task: TaskRequest, explicit_repo: Optional[str],
     Precedence: an explicitly passed ``repo`` (caller override) > the task's
     OWN ``context["repo"]`` (the registered repo it was created against —
     the same key ``pipeline.auto_enqueue_review``/``_auto_enqueue_fix``
-    already read) > the registered ``repo_path`` in state > the legacy
-    dispatcher-cwd fallback. The checkout preflight rejects a mismatched
-    fallback before any cloud launch.
+    already read) > the registered ``repo_path`` in state > the origin of the
+    state's Claude checkout > the legacy dispatcher-cwd fallback. The checkout
+    preflight rejects a mismatched fallback before any cloud launch.
+
+    #762: implement (and fix) tasks never use the dispatcher-cwd fallback —
+    the server cwd is a different repository. They resolve to ``""`` so the
+    dispatch fails closed with ``cloud_repo_unresolved``.
     """
     if explicit_repo:
         return explicit_repo
@@ -454,17 +458,39 @@ def _resolve_task_repo(task: TaskRequest, explicit_repo: Optional[str],
         try:
             with open(path, encoding="utf-8") as state_file:
                 state = json.load(state_file)
-            if isinstance(state, dict) and state.get("project") == task.project and state.get("repo_path"):
-                registered = _github.get_repo(cwd=state["repo_path"])
-                if registered:
-                    return registered
+            if isinstance(state, dict) and state.get("project") == task.project:
+                if state.get("repo_path"):
+                    registered = _github.get_repo(cwd=state["repo_path"])
+                    if registered:
+                        return registered
+                checkout = _claude_checkout_path(state, path, task.project or "")
+                if os.path.isdir(checkout):
+                    registered = _github.get_repo(cwd=checkout)
+                    if registered:
+                        return registered
         except (OSError, ValueError, TypeError):
             logger.warning("claude_cloud: could not read registered repo for %s", task.project)
+    if task.task_type == "implement":
+        return ""
     try:
         return _github.get_repo() or ""
     except Exception:
         logger.exception("claude_cloud: get_repo() failed while resolving prompt repo")
         return ""
+
+
+def _claude_checkout_path(state: dict, state_path: str, project: str) -> str:
+    """The configured Claude checkout for ``state`` (realpath; may not exist)."""
+    worktrees = state.get("worktrees") or {}
+    checkout = worktrees.get("claude") if isinstance(worktrees, dict) else ""
+    if not checkout:
+        checkout = next((row.get("worktree") for row in state.get("roles", [])
+                         if isinstance(row, dict) and row.get("agent") == "claude"), "")
+    if not checkout:
+        # setup.create_worktrees stores checkouts beneath the state base.
+        base = os.path.dirname(os.path.dirname(os.path.abspath(state_path)))
+        checkout = os.path.join(base, "worktrees", project, "claude")
+    return os.path.realpath(checkout)
 
 
 def _validated_cloud_checkout(project: str, repo: str,
@@ -482,16 +508,7 @@ def _validated_cloud_checkout(project: str, repo: str,
             state = json.load(state_file)
         if not isinstance(state, dict) or state.get("project") != project:
             return "", ""
-        worktrees = state.get("worktrees") or {}
-        checkout = worktrees.get("claude") if isinstance(worktrees, dict) else ""
-        if not checkout:
-            checkout = next((row.get("worktree") for row in state.get("roles", [])
-                             if isinstance(row, dict) and row.get("agent") == "claude"), "")
-        if not checkout:
-            # setup.create_worktrees stores checkouts beneath the state base.
-            base = os.path.dirname(os.path.dirname(os.path.abspath(path)))
-            checkout = os.path.join(base, "worktrees", project, "claude")
-        checkout = os.path.realpath(checkout)
+        checkout = _claude_checkout_path(state, path, project)
         if not os.path.isdir(checkout):
             return "", ""
 
@@ -709,6 +726,8 @@ def dispatch_cloud_for_role(
     prior_branch_message = None
     if role == "implementer" and (existing_pr or fix_round):
         task_repo = _resolve_task_repo(task, repo, state_path)
+        if not task_repo:
+            return _fail_closed_dispatch(queue, task, task_type, "cloud_repo_unresolved")
         try:
             if not existing_pr:
                 existing_pr = _github.pr_number_for_branch(task.branch or "", repo=task_repo)
@@ -758,9 +777,10 @@ def dispatch_cloud_for_role(
 
     resume_session_id = _resolve_resume_session_id(queue, task)
     effective_repo = _resolve_task_repo(task, repo, state_path)
-    if task.task_type == "review" and not effective_repo:
+    if not effective_repo:
         return _fail_closed_dispatch(queue, task, task_type,
-                                     "cloud_review_repo_unresolved")
+                                     "cloud_review_repo_unresolved" if task.task_type == "review"
+                                     else "cloud_repo_unresolved")
     cwd, cwd_remote = _validated_cloud_checkout(task.project or "", effective_repo, state_path)
     if not cwd:
         return _fail_closed_dispatch(queue, task, task_type,
@@ -809,6 +829,9 @@ def dispatch_cloud_for_role(
             "cloud_credit_used_after": None, "cloud_usd": None}
            if role == "implementer" else {}),
         "execution_policy": execution_policy,
+        # #762: reconcile/pr_state/auto_enqueue_review read context.repo; the
+        # dispatcher cwd is another repository.
+        **({} if (task.context or {}).get("repo") else {"repo": effective_repo}),
         "cloud_dispatch_receipt": {"cwd_remote": cwd_remote,
                                    "repo": _github._repo_slug(effective_repo).casefold(),
                                    "cwd": cwd},

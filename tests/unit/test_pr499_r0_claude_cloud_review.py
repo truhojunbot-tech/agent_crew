@@ -146,25 +146,25 @@ def test_finding2_dispatch_resolves_repo_from_task_context(q):
         "task's own context, not an empty string")
 
 
-def test_finding2_dispatch_falls_back_to_get_repo_when_context_has_none(q, monkeypatch):
-    """When the task's context carries no repo (e.g. a bare-bones enqueue),
-    fall back to `github.get_repo()` — the same cwd-based resolution every
-    other call site in this codebase already uses — rather than silently
-    omitting the repo line."""
+def test_finding2_implement_dispatch_never_falls_back_to_server_cwd(q, monkeypatch):
+    """#762: an implement task whose context carries no repo must NOT inherit
+    `github.get_repo()` of the server cwd — that is a different repository.
+    With no registered checkout to resolve, the dispatch fails closed."""
     task_id, branch = _enqueue_implement(q, context={})
     import agent_crew.claude_cloud as cc_module
+    monkeypatch.delenv("AGENT_CREW_STATE", raising=False)
     monkeypatch.setattr(cc_module._github, "get_repo", lambda *a, **kw: "fallback/repo")
-
-    seen_argv = {}
+    launched = []
 
     def run(argv, **_kw):
         if "--help" in argv:
             return _HelpProc()
-        seen_argv["argv"] = argv
+        launched.append(argv)
         return _LaunchProc()
 
-    cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
-    assert "fallback/repo" in " ".join(seen_argv["argv"])
+    outcome = cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
+    assert outcome.launch_error == "cloud_repo_unresolved"
+    assert launched == []
 
 
 # ── Finding 3: no-PR terminal outcomes with no pushed commit hang forever ──
