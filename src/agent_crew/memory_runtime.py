@@ -13,7 +13,9 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, Protocol
 
-LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
+from .procedural_memory import ACTIVE as _PROCEDURE_ACTIVE
+
+LAYERS =frozenset({"authoritative", "checkpoint", "procedural", "episodic",
                     "decision", "failure_pattern"})
 SHADOW_RETENTION_ROWS_PER_PROJECT = 900
 SHADOW_PRUNE_BATCH_ROWS = 50
@@ -43,6 +45,45 @@ class MemoryScope:
 @dataclass(frozen=True)
 class MemoryRecord:
     layer: str; key: str; value: dict; scope: MemoryScope; version: int = 1
+
+
+#: #716 lifecycle rows on the procedural layer. See
+#: docs/procedural_lifecycle_contract.md and procedural_lifecycle.py.
+PROCEDURE_CANDIDATE_KIND = "procedure_candidate"
+
+
+def procedural_row_servable(layer: str, value: dict,
+                            now: Optional[float] = None) -> bool:
+    """Whether an active reader may serve this row (#716).
+
+    A procedural row that carries the lifecycle contract is served only while
+    its status is active and it has not expired. Pending, held, rejected,
+    superseded and malformed lifecycle rows never reach a reader. Procedural
+    rows written before the contract (no ``lifecycle`` and no candidate kind,
+    e.g. ``owner_principle:*``) keep their existing behaviour.
+    """
+    if layer != "procedural" or not isinstance(value, dict):
+        return True
+    lifecycle = value.get("lifecycle")
+    if value.get("kind") != PROCEDURE_CANDIDATE_KIND and lifecycle is None:
+        return True
+    if not isinstance(lifecycle, dict) or lifecycle.get("status") != _PROCEDURE_ACTIVE:
+        return False
+    procedure = lifecycle.get("procedure")
+    expires = procedure.get("expires_at") if isinstance(procedure, dict) else 0
+    return not expires or (now or time.time()) < float(expires)
+
+
+def procedural_servable_sql(alias: str = "") -> str:
+    """SQL form of :func:`procedural_row_servable` for the SQL read paths."""
+    a = f"{alias}." if alias else ""
+    return (f"NOT ({a}layer='procedural' AND ("
+            f"COALESCE(json_extract({a}value,'$.kind'),'')='{PROCEDURE_CANDIDATE_KIND}' "
+            f"OR json_type({a}value,'$.lifecycle') IS NOT NULL) AND ("
+            f"COALESCE(json_extract({a}value,'$.lifecycle.status'),'')<>'{_PROCEDURE_ACTIVE}' "
+            f"OR (COALESCE(json_extract({a}value,'$.lifecycle.procedure.expires_at'),0) > 0 "
+            f"AND json_extract({a}value,'$.lifecycle.procedure.expires_at') "
+            f"<= (julianday('now') - 2440587.5) * 86400.0)))")
 
 
 def _scope_from_json(scope: str) -> MemoryScope:
@@ -256,7 +297,14 @@ class SQLiteMemoryStorage:
                 ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
                 (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
             db.commit()
-    def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
+    def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "", *,
+                 include_inactive_procedures: bool = False) -> list[MemoryRecord]:
+        """Scoped effective rows.
+
+        ``include_inactive_procedures`` is for the #716 lifecycle API only:
+        reviewers read pending rows through it. Every active reader keeps the
+        default, which drops procedural rows that are not servable.
+        """
         fields = asdict(scope)
         clauses, params = [], []
         for name, value in fields.items():
@@ -291,9 +339,37 @@ class SQLiteMemoryStorage:
                   if _scope_applies(record.scope, scope)
                   and not record.value.get("invalidated_at")
                   and not record.value.get("superseded_at")
-                  and not record.value.get("superseded")]
+                  and not record.value.get("superseded")
+                  and (include_inactive_procedures
+                       or procedural_row_servable(record.layer, record.value))]
         terms = set(query.lower().replace('-', ' ').split())
         return sorted(result, key=lambda record: _retrieval_rank(record, terms))
+
+    def compare_and_set(self, writes: list[tuple[MemoryRecord, int]]) -> bool:
+        """Replace each record only if its stored version still equals the expected one.
+
+        All writes commit in one transaction or none do, so a transition that
+        touches two rows (supersession) cannot leave half of itself behind. A
+        concurrent writer that got there first makes this return False.
+        """
+        if not writes:
+            return True
+        with closing(sqlite3.connect(self.path, timeout=5.0)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            for record, expected in writes:
+                if record.layer not in LAYERS:
+                    raise ValueError("unknown memory layer")
+                changed = db.execute(
+                    "UPDATE adr001_memory SET value=?,version=?,created=? "
+                    "WHERE layer=? AND key=? AND scope=? AND version=?",
+                    (json.dumps(record.value), record.version, time.time(),
+                     record.layer, record.key, _canonical_scope_json(record.scope),
+                     expected)).rowcount
+                if changed != 1:
+                    db.rollback()
+                    return False
+            db.commit()
+        return True
 
     def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int,
                         query: str = "", predecessor_task_ids: tuple[str, ...] = (),
@@ -331,7 +407,8 @@ class SQLiteMemoryStorage:
                 + " AND ".join(clauses)
                 + " AND json_extract(value,'$.invalidated_at') IS NULL"
                 + " AND json_extract(value,'$.superseded_at') IS NULL"
-                + " AND COALESCE(json_extract(value,'$.superseded'),0)=0")
+                + " AND COALESCE(json_extract(value,'$.superseded'),0)=0"
+                + " AND " + procedural_servable_sql())
         args = [*sorted(layers), *params]
         uri = Path(self.path).resolve().as_uri() + "?mode=ro"
         connect_started = time.perf_counter()

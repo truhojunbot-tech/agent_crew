@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 from .memory_runtime import (
     MemoryRecord, MemoryScope, MemoryStorage, SQLiteMemoryStorage,
-    _scope_from_json, _retrieval_rank,
+    _scope_from_json, _retrieval_rank, procedural_servable_sql,
 )
 
 logger = logging.getLogger(__name__)
@@ -150,8 +150,11 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
 
 
 def _effective_sql(alias: str = "m") -> str:
+    # Every hybrid reader (head, candidates, render-time rejoin) goes through
+    # this clause, so lifecycle rows that are not active never render (#716).
     return (f"{alias}.superseded_by IS NULL "
-            f"AND {alias}.invalidated_at IS NULL")
+            f"AND {alias}.invalidated_at IS NULL "
+            f"AND {procedural_servable_sql(alias)}")
 
 
 def _scope_sql(scope: MemoryScope) -> tuple[str, list]:
