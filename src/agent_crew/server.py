@@ -88,10 +88,13 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
 from agent_crew import claude_cloud as _claude_cloud
+from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
-from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
+from agent_crew.role_mapping import (
+    DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, effective_role_mapping,
+)
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
@@ -1253,7 +1256,7 @@ def _review_result_is_actionable(result) -> bool:
 
 
 _DEFAULT_ROLE_TO_AGENT = dict(DEFAULT_ROLE_TO_AGENT)
-_DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
+_DEFAULT_AGENT_TO_ROLE = dict(LEGACY_AGENT_TO_ROLE)
 
 
 # Tags that mean "retryable in the next few minutes" (server-side load-shed).
@@ -4151,6 +4154,15 @@ def create_app(
             logger.debug(f"_try_push_next: replay 중 — push skip (role={role})")
             return
         logger.debug(f"_try_push_next: role={role}")
+        # #772: a script tester has no pane and needs no delivery channel. The
+        # headless dispatcher runs it through `_dispatch_task` instead.
+        if role == "tester" and _script_tester_active():
+            if not _dispatcher_enabled:
+                worker = threading.Thread(target=_drain_script_tests, daemon=True,
+                                          name="agent-crew-script-test")
+                app.state.script_test_thread = worker
+                worker.start()
+            return
         if not _push_enabled:
             logger.warning(
                 f"_try_push_next: AGENT_CREW_DELIVERY={_delivery_raw!r} — tmux push disabled. "
@@ -4920,6 +4932,69 @@ def create_app(
     # agent serve multiple roles (e.g. claude implementer + claude reviewer).
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
 
+    # #772: the test stage is a deterministic script, not a provider call.
+    # One run at a time per server: suites share the repo's object store and
+    # the base-result cache.
+    _script_test_lock = threading.Lock()
+
+    def _script_tester_active() -> bool:
+        return _DISPATCH_ROLE_TO_AGENT.get("tester") == _script_tester.SCRIPT_TESTER
+
+    def _run_script_test_task(task: TaskRequest) -> None:
+        """Run one claimed test task by script and submit it like any result."""
+        state = {}
+        if state_path and os.path.exists(state_path):
+            try:
+                with open(state_path) as f:
+                    state = json.load(f)
+            except (OSError, ValueError):
+                logger.exception("script test: could not read %s", state_path)
+        # Same P2 DISPATCH → EXECUTE_START → RESULT receipts as a pane or a
+        # subprocess; the executor is this server, not a provider.
+        try:
+            nonce = q().record_dispatch(task.task_id, channel="api",
+                                        agent=_script_tester.SCRIPT_TESTER,
+                                        target="script_tester")
+        except AdmissionRefused as exc:
+            logger.warning("script test: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        if nonce:
+            started = q().start_execution(task.task_id, nonce,
+                                          presenter=_script_tester.SCRIPT_TESTER)
+            if isinstance(started, dict) and started.get("go") is False:
+                logger.warning("script test: start refused for %s — %s", task.task_id,
+                               started.get("reason"))
+                return
+        result = _script_tester.execute_test_task(
+            task, repo=_any_worktree_path(), state=state,
+            cache_dir=os.path.join(os.path.dirname(db_path), "script_test_cache"))
+        q().patch_context(task.task_id, {"script_test": result.error_info["script_test"]})
+        logger.info("script test: task=%s status=%s %s", task.task_id, result.status,
+                    result.summary)
+        if nonce:
+            result.executor_binding = {"nonce": nonce, "presenter": _script_tester.SCRIPT_TESTER}
+        submit_result(task.task_id, result,
+                      x_agent_crew_project=_server_identity()["project"])
+
+    def _drain_script_tests() -> None:
+        if not _script_test_lock.acquire(blocking=False):
+            return
+        try:
+            while True:
+                task = q().dequeue(agent=_script_tester.SCRIPT_TESTER, role="tester", claimed_via="script_tester",
+                                   claim_source="script_tester")
+                if task is None:
+                    return
+                try:
+                    _run_script_test_task(task)
+                except Exception:
+                    logger.exception("script test: task %s raised", task.task_id)
+                    _fail_if_active(task.task_id, "script_test_exception")
+        finally:
+            _script_test_lock.release()
+
+    app.state.drain_script_tests = _drain_script_tests
+
     # task_id → transient retry count, used to decide whether an upstream
     # 429 (claude throttle / gemini capacity-exhausted) gets requeued or
     # finally failed. In-memory; resets on server restart.
@@ -5076,6 +5151,13 @@ def create_app(
         agent, wt = _resolve_dispatch_target(task, role)
         if dispatch_agent is not None:
             agent = dispatch_agent
+        if task.task_type == "test" and agent == _script_tester.SCRIPT_TESTER:
+            # #772: before any provider cooldown or spawn — no provider runs here.
+            def _locked_script_test() -> None:
+                with _script_test_lock:
+                    _run_script_test_task(task)
+            await asyncio.to_thread(_locked_script_test)
+            return
         if _honor_provider_cooldown(task, agent):
             return
         if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
@@ -6825,6 +6907,7 @@ def create_app(
             server_project=project,
             repo=repo,
             repo_cwd=_any_worktree_path(),
+            tester_agent=_DISPATCH_ROLE_TO_AGENT.get("tester"),
         )
         if test_id:
             _try_push_next("tester")
@@ -8190,7 +8273,10 @@ def create_app(
         else:
             # Failure handling: rate-limit → reroute via fallback chain (#81),
             # otherwise auto-retry the same role up to MAX_RETRIES.
-            if result.status == "failed":
+            # #772: re-running a deterministic script repeats the same verdict.
+            if result.status == "failed" and _script_tester.is_script_test_result(result):
+                logger.info(f"POST /tasks/{task_id}/result: script test failed; no retry")
+            elif result.status == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
                 if not _auto_fallback_failed_task(task_id, result, task_type):
                     _auto_retry_failed_task(task_id, result, task_type)

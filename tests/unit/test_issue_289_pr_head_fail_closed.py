@@ -243,7 +243,7 @@ def _dispatch(tmp_path, monkeypatch, pr_repo, *, head=None, unused_tcp_port):
     from agent_crew.server import create_app
 
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 0, "worktrees": {"gemini": str(wt)}}))
+    state.write_text(json.dumps({"port": 0, "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {"gemini": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.delenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", raising=False)
     monkeypatch.setenv("AGENT_CREW_BASE", str(tmp_path / "lockbase"))

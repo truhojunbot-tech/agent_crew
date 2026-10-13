@@ -42,7 +42,7 @@ def _state(tmp_path) -> str:
         (wt / ".git").mkdir()
         wts[name] = str(wt)
     state_file = tmp_path / "state.json"
-    state_file.write_text(json.dumps({"worktrees": wts}))
+    state_file.write_text(json.dumps({"role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": wts}))
     return str(state_file)
 
 

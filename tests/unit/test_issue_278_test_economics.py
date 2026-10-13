@@ -192,7 +192,7 @@ def _dispatch(tmp_path, monkeypatch, *, lock_base, task_id="test-d", scope=None,
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(scope))
     state = tmp_path / "state.json"
-    state.write_text(json.dumps({"port": 8111, "worktrees": {"gemini": str(wt)}}))
+    state.write_text(json.dumps({"port": 8111, "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {"gemini": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setenv("AGENT_CREW_BASE", lock_base)

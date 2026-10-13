@@ -45,7 +45,7 @@ def test_u_i201_transient_retry_counter_caps_and_fails(tmp_db, tmp_path, *, unus
         (wt / ".git").mkdir()
 
     state = {
-        "worktrees": {
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {
             "claude": str(wt_claude),
             "codex": str(wt_codex),
             "gemini": str(wt_gemini),

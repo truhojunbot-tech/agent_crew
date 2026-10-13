@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shutil
@@ -544,7 +545,13 @@ def task_queue(tmp_db):
 
 @pytest.fixture
 def test_client(tmp_db):
-    app = create_app(tmp_db)
+    # Tests on this client post tester results themselves, standing in for an
+    # LLM tester; #772 made that path opt-in (the default tester is a script).
+    state_path = f"{tmp_db}.state.json"
+    with open(state_path, "w") as f:
+        json.dump({"role_agents": {"implementer": "codex", "reviewer": "claude",
+                                   "tester": "gemini"}}, f)
+    app = create_app(tmp_db, state_path=state_path)
     with TestClient(app) as client:
         yield client
 

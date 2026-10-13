@@ -11,7 +11,7 @@ _logger = logging.getLogger(__name__)
 
 from agent_crew import instructions, session
 from agent_crew.port_validation import require_project_port
-from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
+from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
 
 _AGENT_CMDS = {
     "claude": "claude --dangerously-skip-permissions --continue --model claude-sonnet-5",
@@ -503,7 +503,7 @@ def _convert_origin_to_ssh_if_safe(project_path: str) -> None:
 
 # Legacy setup keeps its existing agent-first behavior.  The runtime resolves
 # explicit per-project role assignments from state.json after setup.
-_AGENT_TO_ROLE = {agent: role for role, agent in DEFAULT_ROLE_TO_AGENT.items()}
+_AGENT_TO_ROLE = dict(LEGACY_AGENT_TO_ROLE)
 
 
 def _iter_role_entries(

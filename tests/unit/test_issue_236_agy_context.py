@@ -261,7 +261,7 @@ def _dispatch_and_collect_events(tmp_path, monkeypatch, *, task_context,
     wt.mkdir()
     (wt / ".git").mkdir()
     state_file = tmp_path / "state.json"
-    state_file.write_text(_json.dumps({"worktrees": {"gemini": str(wt)}}))
+    state_file.write_text(_json.dumps({"role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {"gemini": str(wt)}}))
     db = str(tmp_path / "t.db")
     events_path = tmp_path / "context_events.jsonl"
 

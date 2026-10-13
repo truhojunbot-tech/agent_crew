@@ -51,7 +51,7 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path, unused_
     (worktree_dir / ".git").mkdir()
 
     state = {
-        "worktrees": {
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {
             "claude": str(worktree_dir),
             "codex": str(worktree_dir),
             "gemini": str(worktree_dir),

@@ -36,6 +36,8 @@ from agent_crew.fallback import (
 )
 from agent_crew.cea.input_providers.budget import QuotaBudgetProvider
 from agent_crew.loop import _resolve_verdict
+from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
+from agent_crew.script_tester import SCRIPT_TESTER
 from agent_crew.protocol import (
     GateRequest,
     TaskRequest,
@@ -2277,8 +2279,13 @@ def auto_enqueue_test(
     pr_state_fn=None,
     repo: str = "",
     repo_cwd: str = "",
+    tester_agent: Optional[str] = None,
 ) -> Optional[str]:
     """Create the test task that follows an approved review.
+
+    ``tester_agent`` is the tester role's agent (default: the role-mapping
+    default). A script tester (#772) calls no provider, so no provider
+    cooldown can skip its stage.
 
     Returns the new test task_id, or ``None`` when no test is created
     (review missing/rejected, exception).
@@ -2365,11 +2372,13 @@ def auto_enqueue_test(
                     queue.patch_context(review_task_id, {"test_stage_skip": skip_note})
                 return None  # Replay the skipped-stage merge, never a second test.
             return test_id
-        until = QuotaBudgetProvider().active_cooldown_until("gemini")
+        tester_agent = tester_agent or DEFAULT_ROLE_TO_AGENT["tester"]
+        until = (None if tester_agent == SCRIPT_TESTER
+                 else QuotaBudgetProvider().active_cooldown_until(tester_agent))
         skip_note = None
         if until is not None:
-            skip_note = {"reason": "gemini tester stage not run (provider limit)",
-                         "provider": "gemini",
+            skip_note = {"reason": f"{tester_agent} tester stage not run (provider limit)",
+                         "provider": tester_agent,
                          "cooldown_until": until if math.isfinite(until) else "unknown"}
         test_context: dict = {"prev_task_id": review_task_id}
         inherited_tiers = [tier for tier in (review_ctx.get("risk_tier"), contract.tier)
@@ -2439,9 +2448,9 @@ def auto_enqueue_test(
         if skip_note:
             queue.patch_context(review_task_id, {"test_stage_skip": skip_note})
             logger.warning(
-                "auto_enqueue_test: %s; provider=gemini since=unknown until=%s "
+                "auto_enqueue_test: %s; provider=%s since=unknown until=%s "
                 "tasks_skipped=1 deferred_test=%s",
-                skip_note["reason"], skip_note["cooldown_until"], test_id)
+                skip_note["reason"], tester_agent, skip_note["cooldown_until"], test_id)
             return None  # Continue the reviewed PR; verify after recovery.
         return test_id
     except PausedError:

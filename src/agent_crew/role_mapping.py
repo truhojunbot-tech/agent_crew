@@ -12,8 +12,16 @@ ROLE_ORDER = ("implementer", "reviewer", "tester")
 DEFAULT_ROLE_TO_AGENT = {
     "implementer": "codex",
     "reviewer": "claude",
-    "tester": "gemini",
+    # #772: the test stage is a deterministic script run (script_tester.py),
+    # not a provider. The gemini provider code stays; an explicit
+    # ``role_agents.tester = "gemini"`` restores the LLM tester.
+    "tester": "script",
 }
+#: Agent-keyed legacy state (``worktrees: {agent: path}``) names a worktree's
+#: role by its agent. This is a schema reading, not the default provider: a
+#: gemini worktree is still the tester's checkout even though the default
+#: tester is the script (#772), and an override to gemini still finds it.
+LEGACY_AGENT_TO_ROLE = {"codex": "implementer", "claude": "reviewer", "gemini": "tester"}
 EXPLICIT_SOURCE = "explicit project config"
 LEGACY_SOURCE = "legacy state.json.roles"
 DEFAULT_SOURCE = "hardcoded default"
