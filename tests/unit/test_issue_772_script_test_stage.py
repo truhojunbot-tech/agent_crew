@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import subprocess
 import sys
 import urllib.error
@@ -159,6 +160,41 @@ def test_config_default_and_timeout(tmp_path):
 def test_timeout_fails_the_stage(tmp_path):
     outcome = script_tester.run_command("sleep 5", str(tmp_path), 0.2)
     assert outcome.timed_out and outcome.exit_code is None
+
+
+def test_test_command_isolated_from_dispatcher_and_provider_env(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_PROJECT", "live_project")
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
+    monkeypatch.setenv("PYTHONPATH", "/wrong/source")
+    command = (f"{sys.executable} -c 'import os; "
+               "assert \"AGENT_CREW_PROJECT\" not in os.environ; "
+               "assert \"OPENAI_API_KEY\" not in os.environ; "
+               "assert os.environ[\"PYTHONPATH\"] == os.path.join(os.getcwd(), \"src\"); "
+               "assert os.environ[\"PROJECT_TEST_FLAG\"] == \"yes\"'")
+    outcome = script_tester.run_command(
+        command, str(tmp_path), 10,
+        env=script_tester.test_environment(str(tmp_path),
+                                           {"test_env": {"PROJECT_TEST_FLAG": "yes"}}))
+    assert outcome.exit_code == 0, outcome.output_tail
+
+
+def test_test_environment_rejects_runtime_and_provider_keys(tmp_path):
+    for key in ("AGENT_CREW_PROJECT", "OPENAI_API_KEY", "ANTHROPIC_API_KEY"):
+        with pytest.raises(ValueError, match=key):
+            script_tester.test_environment(str(tmp_path), {"test_env": {key: "x"}})
+
+
+def test_base_cache_identity_changes_with_test_environment(project, tmp_path):
+    repo, head = project(BROKEN_BASE, {"tests/test_b.py": "def test_two():\n    assert True\n"})
+    first = _execute(repo, head, tmp_path, state={"test_command": PYTEST,
+                                                   "test_env": {"PROJECT_TEST_FLAG": "one"}})
+    second = _execute(repo, head, tmp_path, state={"test_command": PYTEST,
+                                                    "test_env": {"PROJECT_TEST_FLAG": "two"}})
+    third = _execute(repo, head, tmp_path, state={"test_command": PYTEST,
+                                                   "test_env": {"PROJECT_TEST_FLAG": "two"}})
+    assert first.error_info["script_test"]["base"]["cached"] is False
+    assert second.error_info["script_test"]["base"]["cached"] is False
+    assert third.error_info["script_test"]["base"]["cached"] is True
 
 
 def test_gemini_is_not_the_default_tester():

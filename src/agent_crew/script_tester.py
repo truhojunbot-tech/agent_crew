@@ -5,7 +5,8 @@ PR head squashed onto its base branch). No LLM provider is called, so a
 provider quota can no longer block or skip this stage.
 
 Failures that also fail on the base head are ``pre_existing`` and are not
-blamed on the PR. The base run is cached per (base sha, command).
+blamed on the PR. The base run is cached per base sha, command and test
+environment/config identity.
 
 ⛔No command configured is ``SKIPPED_NO_TEST_COMMAND`` — reported as
   ``needs_human`` so the server never auto-merges it. It never auto-passes.
@@ -20,6 +21,7 @@ import os
 import re
 import shutil
 import signal
+import site
 import subprocess
 import tempfile
 import time
@@ -45,6 +47,9 @@ _OUTPUT_TAIL_CHARS = 4000
 _ID_RE = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.MULTILINE)
 _COUNT_RE = re.compile(
     r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b")
+_TEST_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
+_PRIVATE_ENV_KEY = re.compile(
+    r"(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL|AUTH|PRIVATE_KEY)", re.I)
 
 
 @dataclass
@@ -112,12 +117,48 @@ def parse_test_output(text: str) -> tuple[dict, list]:
     return counts, ids
 
 
-def run_command(command: str, cwd: str, timeout_s: float) -> RunOutcome:
+def test_environment(checkout: str, state: Optional[Mapping]) -> dict[str, str]:
+    """Small, explicit environment for a test checkout, never the dispatcher env.
+
+    ``state.test_env`` supplies project-specific non-secret values. PYTHONPATH
+    always points at this checkout, so pytest imports the code under test.
+    """
+    env = {key: os.environ[key] for key in _TEST_ENV_KEYS if key in os.environ}
+    env.setdefault("PATH", os.defpath)
+    if site.USER_BASE:
+        # Tests that isolate HOME still need the installed pytest in user site.
+        env["PYTHONUSERBASE"] = site.USER_BASE
+    env["PYTHONPATH"] = os.path.join(checkout, "src")
+    extra = (state or {}).get("test_env", {})
+    if not isinstance(extra, Mapping):
+        raise ValueError("test_env must be an object")
+    for key, value in extra.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+            raise ValueError(f"invalid test_env key {key!r}")
+        if (key.startswith("AGENT_CREW_") or key == "PYTHONPATH"
+                or _PRIVATE_ENV_KEY.search(key)):
+            raise ValueError(f"test_env key {key} is reserved")
+        if not isinstance(value, str):
+            raise ValueError(f"test_env value for {key} must be text")
+        env[key] = value
+    return env
+
+
+def _test_environment_identity(state: Optional[Mapping], timeout_s: float) -> str:
+    template = test_environment("<CHECKOUT>", state)
+    payload = json.dumps({"environment": template, "timeout_s": timeout_s},
+                         sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
+
+
+def run_command(command: str, cwd: str, timeout_s: float,
+                *, env: Optional[Mapping[str, str]] = None) -> RunOutcome:
     """Run ``command`` in ``cwd``; kill its process group on timeout."""
     started = time.monotonic()
     proc = subprocess.Popen(
         ["/bin/sh", "-c", command], cwd=cwd, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, start_new_session=True)
+        stderr=subprocess.STDOUT, text=True, start_new_session=True,
+        env=dict(env) if env is not None else test_environment(cwd, {}))
     timed_out = False
     try:
         output, _ = proc.communicate(timeout=timeout_s)
@@ -203,22 +244,26 @@ class MergeConflict(RuntimeError):
     pass
 
 
-def _cache_path(cache_dir: str, base_sha: str, command: str) -> str:
-    digest = hashlib.sha256(command.encode()).hexdigest()[:12]
+def _cache_path(cache_dir: str, base_sha: str, command: str,
+                environment_identity: str) -> str:
+    digest = hashlib.sha256((command + "\0" + environment_identity).encode()).hexdigest()[:12]
     return os.path.join(cache_dir, f"{base_sha}-{digest}.json")
 
 
 def base_outcome(repo: str, base_sha: str, command: str, timeout_s: float,
-                 cache_dir: str, runner: Callable = run_command) -> tuple[RunOutcome, bool]:
-    """The base head's outcome, cached per (base sha, command). Returns (outcome, cached)."""
-    path = _cache_path(cache_dir, base_sha, command)
+                 cache_dir: str, state: Optional[Mapping],
+                 runner: Callable = run_command) -> tuple[RunOutcome, bool]:
+    """The base outcome, cached per base sha, command and test environment."""
+    path = _cache_path(cache_dir, base_sha, command,
+                       _test_environment_identity(state, timeout_s))
     try:
         with open(path) as f:
             return RunOutcome.from_dict(json.load(f)), True
     except (OSError, ValueError):
         pass
     with Checkout(repo, base_sha) as checkout:
-        outcome = runner(command, checkout, timeout_s)
+        outcome = runner(command, checkout, timeout_s,
+                         env=test_environment(checkout, state))
     if not outcome.timed_out:
         os.makedirs(cache_dir, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"
@@ -240,7 +285,8 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
             if not command:
                 record["outcome"] = SKIPPED_NO_TEST_COMMAND
                 return record
-            head = runner(command, checkout, timeout_s)
+            head = runner(command, checkout, timeout_s,
+                          env=test_environment(checkout, state))
     except MergeConflict as exc:
         record.update(outcome=FAILED, reason="merge_conflict", detail=str(exc))
         return record
@@ -249,7 +295,8 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
     pre_existing: list = []
     new_failures = list(head.failing_ids)
     if head.failing_ids:
-        base, cached = base_outcome(repo, base_sha, command, timeout_s, cache_dir, runner)
+        base, cached = base_outcome(repo, base_sha, command, timeout_s,
+                                    cache_dir, state, runner)
         record["base"] = {**base.to_dict(), "cached": cached}
         base_ids = set(base.failing_ids)
         pre_existing = [i for i in head.failing_ids if i in base_ids]
