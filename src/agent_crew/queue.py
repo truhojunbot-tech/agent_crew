@@ -763,6 +763,8 @@ CREATE TABLE IF NOT EXISTS task_exec_events (
     fields    TEXT NOT NULL DEFAULT '{}'
 )
 """
+
+_COORDINATOR_NOTICE_MAX_ATTEMPTS = 3
 def _claim_build() -> tuple:
     """The build of the process making the claim, as `/health` reports it.
 
@@ -5390,14 +5392,27 @@ class TaskQueue:
             latest = conn.execute(
                 "SELECT event, at FROM task_exec_events WHERE task_id=? "
                 "AND event IN ('coordinator_notice', 'coordinator_notice_failed', "
-                "'coordinator_notice_delivered') "
+                "'coordinator_notice_delivered', 'coordinator_notice_gave_up') "
                 "AND json_extract(fields, '$.kind')=? ORDER BY event_id DESC LIMIT 1",
                 (task_id, kind),
             ).fetchone()
             now = time.time()
-            if latest and (latest[0] == "coordinator_notice_delivered" or
+            if latest and (latest[0] in ("coordinator_notice_delivered",
+                                      "coordinator_notice_gave_up") or
                            (latest[0] == "coordinator_notice" and now - latest[1] < 30)):
                 conn.execute("ROLLBACK")
+                return False
+            attempts = conn.execute(
+                "SELECT COUNT(*) FROM task_exec_events WHERE task_id=? "
+                "AND event='coordinator_notice' "
+                "AND json_extract(fields, '$.kind')=?",
+                (task_id, kind),
+            ).fetchone()[0]
+            if attempts >= _COORDINATOR_NOTICE_MAX_ATTEMPTS:
+                # Also closes pre-upgrade failure histories without sending again.
+                self._append_exec_event_on(conn, task_id, "coordinator_notice_gave_up",
+                                           now, kind=kind, attempts=attempts)
+                conn.commit()
                 return False
             self._append_exec_event_on(conn, task_id, "coordinator_notice",
                                        now, kind=kind)
@@ -5409,8 +5424,8 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def finish_coordinator_notice(self, task_id: str, kind: str, *, delivered: bool) -> None:
-        """Record delivery; a failed attempt becomes claimable on the next tick."""
+    def finish_coordinator_notice(self, task_id: str, kind: str, *, delivered: bool) -> bool:
+        """Record delivery and return whether a failed notice remains retryable."""
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
@@ -5418,7 +5433,20 @@ class TaskQueue:
                 conn, task_id,
                 "coordinator_notice_delivered" if delivered else "coordinator_notice_failed",
                 time.time(), kind=kind)
+            retryable = False
+            if not delivered:
+                attempts = conn.execute(
+                    "SELECT COUNT(*) FROM task_exec_events WHERE task_id=? "
+                    "AND event='coordinator_notice' "
+                    "AND json_extract(fields, '$.kind')=?",
+                    (task_id, kind),
+                ).fetchone()[0]
+                retryable = attempts < _COORDINATOR_NOTICE_MAX_ATTEMPTS
+                if not retryable:
+                    self._append_exec_event_on(conn, task_id, "coordinator_notice_gave_up",
+                                               time.time(), kind=kind, attempts=attempts)
             conn.commit()
+            return retryable
         except Exception:
             conn.rollback()
             raise
@@ -5433,7 +5461,8 @@ class TaskQueue:
                 "WITH latest AS (SELECT MAX(event_id) AS event_id, task_id, "
                 "json_extract(fields, '$.kind') AS kind FROM task_exec_events "
                 "WHERE event IN ('coordinator_notice', 'coordinator_notice_failed', "
-                "'coordinator_notice_delivered') GROUP BY task_id, kind) "
+                "'coordinator_notice_delivered', 'coordinator_notice_gave_up') "
+                "GROUP BY task_id, kind) "
                 "SELECT e.task_id, latest.kind, e.event, e.at FROM latest "
                 "JOIN task_exec_events e ON e.event_id=latest.event_id"
             ).fetchall()
