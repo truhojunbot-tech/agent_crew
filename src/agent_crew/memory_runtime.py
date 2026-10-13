@@ -58,8 +58,9 @@ def procedural_row_servable(layer: str, value: dict,
 
     A procedural row that carries the lifecycle contract is served only while
     its status is active, it holds the validated procedure (an object with a
-    ``procedure_id``, ``state`` active and a numeric ``expires_at``) and that
-    expiry is still ahead. Anything else -- pending, held, rejected,
+    non-empty text ``procedure_id``, an integer ``version``, text ``title`` and
+    ``rule``, ``state`` active and a numeric ``expires_at``) and that expiry is
+    still ahead. Anything else -- pending, held, rejected,
     superseded or malformed -- fails closed: not served, never raises.
     Procedural rows written before the contract (no ``lifecycle`` and no
     candidate kind, e.g. ``owner_principle:*``) keep their existing behaviour.
@@ -77,6 +78,12 @@ def procedural_row_servable(layer: str, value: dict,
         return False
     procedure_id = procedure.get("procedure_id")
     if not isinstance(procedure_id, str) or not procedure_id:
+        return False
+    # Required `Procedure` fields: without them active_procedures cannot build it.
+    version = procedure.get("version")
+    if isinstance(version, bool) or not isinstance(version, int):
+        return False
+    if not isinstance(procedure.get("title"), str) or not isinstance(procedure.get("rule"), str):
         return False
     expires = procedure.get("expires_at")
     if isinstance(expires, bool) or not isinstance(expires, (int, float)):
@@ -102,6 +109,9 @@ def procedural_servable_sql(alias: str = "") -> str:
             f"AND json_extract({v},'$.lifecycle.procedure.state') IS '{_PROCEDURE_ACTIVE}' "
             f"AND json_type({v},'$.lifecycle.procedure.procedure_id') IS 'text' "
             f"AND json_extract({v},'$.lifecycle.procedure.procedure_id') <> '' "
+            f"AND json_type({v},'$.lifecycle.procedure.version') IS 'integer' "
+            f"AND json_type({v},'$.lifecycle.procedure.title') IS 'text' "
+            f"AND json_type({v},'$.lifecycle.procedure.rule') IS 'text' "
             f"AND json_type({v},'$.lifecycle.procedure.expires_at') IN ('integer','real') "
             f"AND json_extract({v},'$.lifecycle.procedure.expires_at') "
             f"> (julianday('now') - 2440587.5) * 86400.0 "

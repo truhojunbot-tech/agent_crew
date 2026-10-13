@@ -304,7 +304,21 @@ def _malformed_active_rows(template: dict) -> dict:
         "procedure:bad-expiry-zero": variant(set_expiry(0)),
         "procedure:bad-expiry-null": variant(set_expiry(None)),
         "procedure:bad-expiry-bool": variant(set_expiry(True)),
-        "procedure:bad-expiry-infinite": variant(set_expiry(float("inf"))),
+        # Storable on every SQLite build (a non-finite float is not valid JSON).
+        "procedure:bad-expiry-list": variant(set_expiry([4102444800])),
+        "procedure:bad-expiry-object": variant(set_expiry({"at": 4102444800})),
+        # Required Procedure fields: active_procedures must not raise on them.
+        "procedure:bad-no-version": variant(lambda lc: lc["procedure"].pop("version")),
+        "procedure:bad-text-version": variant(
+            lambda lc: lc["procedure"].__setitem__("version", "1")),
+        "procedure:bad-bool-version": variant(
+            lambda lc: lc["procedure"].__setitem__("version", True)),
+        "procedure:bad-no-title": variant(lambda lc: lc["procedure"].pop("title")),
+        "procedure:bad-null-title": variant(
+            lambda lc: lc["procedure"].__setitem__("title", None)),
+        "procedure:bad-no-rule": variant(lambda lc: lc["procedure"].pop("rule")),
+        "procedure:bad-list-rule": variant(
+            lambda lc: lc["procedure"].__setitem__("rule", ["r"])),
         "procedure:bad-lifecycle-list": {**template, "lifecycle": []},
     }
 
