@@ -3666,23 +3666,42 @@ def create_app(
         return state["queue"]
 
     def _coordinator_notice(task_id: str, kind: str, detail: str = "") -> None:
-        """Wake the coordinator once for a terminal, uncollected run."""
+        """Wake the coordinator once after confirmed delivery."""
+        claimed = False
         try:
             task = q().get_task(task_id)
             if task is None or not q().claim_coordinator_notice(task_id, kind):
                 return
+            claimed = True
             ctx = task.context if isinstance(task.context, dict) else {}
+            # Pane output can contain private task text and is unbounded. Keep
+            # the notice actionable without forwarding captured pane content.
+            safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
             message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
                        f"branch={task.branch} repo={ctx.get('repo') or ''} "
-                       f"session_url={ctx.get('cloud_session_url') or ''} {detail}")
+                       f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
             if coordinator_notify_fn is not None:
-                coordinator_notify_fn(message)
+                delivered = bool(coordinator_notify_fn(message))
             else:
                 from agent_crew.notify import notify_console, notify_telegram
-                if not notify_telegram(message):
+                delivered = bool(notify_telegram(message))
+                if not delivered:
                     notify_console(message)
+            q().finish_coordinator_notice(task_id, kind, delivered=delivered)
+            claimed = False
+            if not delivered:
+                logger.warning("coordinator notice delivery failed task=%s kind=%s; retryable",
+                               task_id, kind)
         except Exception:
             logger.exception("coordinator notice failed task=%s kind=%s", task_id, kind)
+            if claimed:
+                try:
+                    q().finish_coordinator_notice(task_id, kind, delivered=False)
+                except Exception:
+                    logger.exception("coordinator notice release failed task=%s kind=%s",
+                                     task_id, kind)
+
+    app.state.coordinator_notice = _coordinator_notice
 
     def _reconcile_cloud_and_notify() -> None:
         outcomes = _claude_cloud.reconcile_all_cloud_tasks(
@@ -4551,6 +4570,11 @@ def create_app(
         - ``recovered`` — unstarted dispatcher claims returned to pending
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        try:
+            for notice_task_id, notice_kind in q().retryable_coordinator_notices():
+                _coordinator_notice(notice_task_id, notice_kind, "delivery retry")
+        except Exception:
+            logger.exception("watchdog: coordinator notice retry failed")
         # #499 r0 HIGH: claude_cloud dispatches have no pane and are
         # otherwise invisible to this pane-oriented watchdog (every check
         # below resolves a pane per row and skips rows with none) — without
@@ -4747,7 +4771,7 @@ def create_app(
                 }
                 tt = q().force_fail(task_id, summary, error_info=watchdog_error_info)
                 if tt is not None:
-                    _coordinator_notice(task_id, "watchdog_timeout", summary)
+                    _coordinator_notice(task_id, "watchdog_timeout", summary.split("\npane_tail:", 1)[0])
                 logger.error(
                     f"WATCHDOG TIMEOUT: task_id={task_id} marked failed; "
                     f"task_type={tt}, idle_for={idle_for:.0f}s"
@@ -7018,6 +7042,7 @@ def create_app(
         if original is None:
             return ""
         ctx = _successor_context(original.context)
+        ctx["lineage_root_task_id"] = ctx.get("lineage_root_task_id") or task_id
         for key in (RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY):
             ctx.pop(key, None)
         root = str(ctx.get("provider_capacity_root") or task_id)
@@ -7163,6 +7188,8 @@ def create_app(
 
             # Create retry task with incremented retry count
             retry_context = _successor_context(original_task.context)
+            retry_context["lineage_root_task_id"] = (
+                retry_context.get("lineage_root_task_id") or task_id)
             retry_risk = retry_context.pop("risk_declaration", None)
             # Both fields are post-admission observations. Older brokers sign
             # them when they arrive in an admission context, while claim-time

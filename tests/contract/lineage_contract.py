@@ -26,12 +26,28 @@ def assert_lineage_contract(db, root_id, intent):
     assert intent["reviewer"] != intent["implementer"]
     for task in lineage.values():
         ctx = task.context or {}
+        parent_id = ctx.get("prev_task_id") or ctx.get("original_task_id")
+        if task.task_id == root_id:
+            assert not parent_id, task.task_id
+        else:
+            assert parent_id in lineage, (task.task_id, parent_id)
+            parent_round = int((lineage[parent_id].context or {}).get("fix_round") or 0)
+            expected_round = parent_round + int(task.task_type == "implement"
+                                                and lineage[parent_id].task_type == "review")
+            assert int(ctx.get("fix_round") or 0) == expected_round, task.task_id
         assert task.branch == intent["branch"], task.task_id
         assert ctx.get("repo") == intent["repo"], task.task_id
         assert ctx.get("issue") == intent["issue"], task.task_id
         assert ctx.get("base_branch") == intent["base_branch"], task.task_id
         assert ctx.get("coordinator_managed") == intent["coordinator_managed"], task.task_id
-        assert ctx.get("lineage_root_task_id", root_id) == root_id, task.task_id
+        assert ctx.get("no_tester", False) == intent["no_tester"], task.task_id
+        assert type(ctx.get("risk_tier")) is int and ctx["risk_tier"] >= intent["risk_tier"], task.task_id
+        declaration = ctx.get("risk_declaration")
+        assert isinstance(declaration, dict), task.task_id
+        for key, value in intent["risk_declaration"].items():
+            assert declaration.get(key) == value, (task.task_id, key)
+        if task.task_id != root_id:
+            assert ctx.get("lineage_root_task_id") == root_id, task.task_id
         assert ctx.get("implementer_agent") == intent["implementer"], task.task_id
         assert ctx.get("reviewer_agent") == intent["reviewer"], task.task_id
         expected_role = {"implement": "implementer", "review": "reviewer",
@@ -41,5 +57,4 @@ def assert_lineage_contract(db, root_id, intent):
                           role_map["tester"])
         assert ctx.get("agent_override", role_map[expected_role]) == expected_agent, task.task_id
         assert expected_agent in role_map.values(), task.task_id
-        assert task.status != "pending" or expected_agent in role_map.values(), task.task_id
     return lineage

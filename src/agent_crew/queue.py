@@ -5378,7 +5378,7 @@ class TaskQueue:
         )
 
     def claim_coordinator_notice(self, task_id: str, kind: str) -> bool:
-        """Claim one terminal-stall notice using the existing exec event log.
+        """Lease a terminal-stall notice using the existing exec event log.
 
         The claim is durable across watchdog ticks and process restarts. It is
         taken under the queue write lock so two reconcilers cannot both wake
@@ -5387,22 +5387,59 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            seen = conn.execute(
-                "SELECT 1 FROM task_exec_events WHERE task_id=? "
-                "AND event='coordinator_notice' "
-                "AND json_extract(fields, '$.kind')=? LIMIT 1",
+            latest = conn.execute(
+                "SELECT event, at FROM task_exec_events WHERE task_id=? "
+                "AND event IN ('coordinator_notice', 'coordinator_notice_failed', "
+                "'coordinator_notice_delivered') "
+                "AND json_extract(fields, '$.kind')=? ORDER BY event_id DESC LIMIT 1",
                 (task_id, kind),
             ).fetchone()
-            if seen:
+            now = time.time()
+            if latest and (latest[0] == "coordinator_notice_delivered" or
+                           (latest[0] == "coordinator_notice" and now - latest[1] < 30)):
                 conn.execute("ROLLBACK")
                 return False
             self._append_exec_event_on(conn, task_id, "coordinator_notice",
-                                       time.time(), kind=kind)
+                                       now, kind=kind)
             conn.commit()
             return True
         except Exception:
             conn.rollback()
             raise
+        finally:
+            conn.close()
+
+    def finish_coordinator_notice(self, task_id: str, kind: str, *, delivered: bool) -> None:
+        """Record delivery; a failed attempt becomes claimable on the next tick."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._append_exec_event_on(
+                conn, task_id,
+                "coordinator_notice_delivered" if delivered else "coordinator_notice_failed",
+                time.time(), kind=kind)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def retryable_coordinator_notices(self) -> list[tuple[str, str]]:
+        """Return failed or expired notice leases; successful notices stay closed."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "WITH latest AS (SELECT MAX(event_id) AS event_id, task_id, "
+                "json_extract(fields, '$.kind') AS kind FROM task_exec_events "
+                "WHERE event IN ('coordinator_notice', 'coordinator_notice_failed', "
+                "'coordinator_notice_delivered') GROUP BY task_id, kind) "
+                "SELECT e.task_id, latest.kind, e.event, e.at FROM latest "
+                "JOIN task_exec_events e ON e.event_id=latest.event_id"
+            ).fetchall()
+            now = time.time()
+            return [(row[0], row[1]) for row in rows if row[2] == "coordinator_notice_failed"
+                    or (row[2] == "coordinator_notice" and now - row[3] >= 30)]
         finally:
             conn.close()
 
