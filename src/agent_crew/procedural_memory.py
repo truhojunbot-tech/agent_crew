@@ -30,10 +30,11 @@ you promote without one, because "the model suggested it" is not governance.
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -246,6 +247,83 @@ class Procedure:
         if refs:
             lines.append(f"  because: {refs}")
         return "\n".join(lines)
+
+
+#: Fields a stored procedure must carry. The dataclass defaults the rest, but a
+#: stored row without these was never produced by `Procedure.to_dict` (#716).
+STORED_PROCEDURE_REQUIRED = ("procedure_id", "version", "title", "rule", "scope",
+                             "state", "expires_at")
+
+
+def _check_type(name: str, value, expected) -> None:
+    if expected is float:
+        ok = (isinstance(value, (int, float)) and not isinstance(value, bool)
+              and math.isfinite(value))
+    elif expected is int:
+        ok = isinstance(value, int) and not isinstance(value, bool)
+    else:
+        ok = isinstance(value, expected)
+    if not ok:
+        raise TypeError(f"{name} must be {expected.__name__}, got {type(value).__name__}")
+
+
+def _scope_from_stored(raw) -> Scope:
+    if not isinstance(raw, dict):
+        raise TypeError(f"scope must be an object, got {type(raw).__name__}")
+    names = {f.name for f in fields(Scope)}
+    if set(raw) != names:
+        raise ValueError(f"scope keys must be exactly {sorted(names)}, got {sorted(raw)}")
+    for name, items in raw.items():
+        if not isinstance(items, list) or not all(isinstance(i, str) for i in items):
+            raise TypeError(f"scope.{name} must be a list of text")
+    return Scope(**raw)
+
+
+def _evidence_from_stored(raw) -> list:
+    if not isinstance(raw, list):
+        raise TypeError(f"evidence must be a list, got {type(raw).__name__}")
+    out = []
+    for item in raw:
+        if not isinstance(item, dict):
+            raise TypeError("evidence items must be objects")
+        for name, value in item.items():
+            if name not in Evidence.__dataclass_fields__ or not isinstance(value, str):
+                raise ValueError(f"invalid evidence field {name!r}")
+        out.append(Evidence(**item))
+    return out
+
+
+def procedure_from_stored(raw) -> "Procedure":
+    """Build a `Procedure` from its stored dict, or raise. Never coerces.
+
+    The one validator every reader of stored procedures shares (#716): a row is
+    servable only if this succeeds. Each field is checked against the dataclass
+    type, the nested scope must have exactly the `Scope` keys holding lists of
+    text, and evidence items must be `Evidence` objects. It does not judge
+    lifecycle state or expiry — callers that serve rules check those on the
+    returned object.
+    """
+    if not isinstance(raw, dict):
+        raise TypeError(f"procedure must be an object, got {type(raw).__name__}")
+    known = {f.name: f.type for f in fields(Procedure)}
+    unknown = set(raw) - set(known)
+    if unknown:
+        raise ValueError(f"unknown procedure fields {sorted(unknown)}")
+    missing = [name for name in STORED_PROCEDURE_REQUIRED if name not in raw]
+    if missing:
+        raise ValueError(f"missing procedure fields {missing}")
+    values = {}
+    for name, value in raw.items():
+        if name == "scope":
+            values[name] = _scope_from_stored(value)
+        elif name == "evidence":
+            values[name] = _evidence_from_stored(value)
+        else:
+            _check_type(name, value, known[name])
+            values[name] = value
+    if not values["procedure_id"]:
+        raise ValueError("procedure_id must not be empty")
+    return Procedure(**values)
 
 
 @dataclass

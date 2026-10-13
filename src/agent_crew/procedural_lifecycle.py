@@ -31,6 +31,7 @@ from typing import Optional
 from . import procedural_memory as pm
 from .memory_runtime import (
     PROCEDURE_CANDIDATE_KIND, MemoryRecord, MemoryScope, SQLiteMemoryStorage,
+    procedural_row_servable, servable_procedure,
 )
 
 CONTRACT_VERSION = "agent_crew.procedural_lifecycle/v1"
@@ -247,10 +248,8 @@ def _as_lesson(lifecycle: dict, extra_evidence: Optional[list] = None) -> pm.Can
 
 
 def _procedure_from(raw: dict) -> pm.Procedure:
-    d = dict(raw)
-    scope = _scope_obj(d.pop("scope", {}))
-    evidence = _evidence_list(d.pop("evidence", []))
-    return pm.Procedure(**{**d, "scope": scope, "evidence": evidence})
+    """Stored procedure dict -> `Procedure` through the shared strict validator."""
+    return pm.procedure_from_stored(raw)
 
 
 def _outcome(action: str, row_project: str, candidate_id: str, **kw) -> TransitionOutcome:
@@ -416,12 +415,13 @@ def promote_candidate(storage, *, project: str, candidate_id: str, approver: App
     if supersedes:
         target = _load(storage, project, fleet, supersedes)
         if target is None or target.status != pm.ACTIVE \
-                or not pm.can_transition(target.status, pm.DEPRECATED):
+                or not pm.can_transition(target.status, pm.DEPRECATED) \
+                or _servable(target) is None:
             reasons.append(f"superseded candidate {supersedes} is not an active procedure "
                            "in this project")
-    active = [_procedure_from(r.lifecycle["procedure"])
-              for r in active_rows(storage, project=project, fleet=fleet)
-              if r.candidate_id not in (candidate_id, supersedes)]
+    active = [p for r in active_rows(storage, project=project, fleet=fleet)
+              if r.candidate_id not in (candidate_id, supersedes)
+              for p in [_servable(r)] if p is not None]
     validation = pm.validate_candidate(lesson, existing=active,
                                        authoritative_text=authoritative_text, now=now)
     reasons.extend(validation.reasons)
@@ -569,19 +569,34 @@ def candidate(storage, *, project: str, candidate_id: str, reviewer: Approver,
     return _load(storage, project, fleet, candidate_id)
 
 
+def _servable(row: CandidateRow) -> Optional[pm.Procedure]:
+    """The row's validated active procedure, or None. Never raises on stored data."""
+    if not procedural_row_servable(LAYER, row.value, key=row.key):
+        return None
+    try:
+        return servable_procedure(row.value)
+    except Exception:  # noqa: BLE001 - expired between the two checks
+        return None
+
+
 def active_rows(storage, *, project: str, fleet: str = "") -> list:
-    """Active lifecycle rows, read through the same filter every live reader uses."""
+    """Active lifecycle rows, read through the same filter every live reader uses.
+
+    Each row is re-checked with the shared validator, so a row that is not
+    servable is skipped here even if a storage backend let it through.
+    """
     records = _require_storage(storage).retrieve(_scope(project, fleet))
     return [CandidateRow(r.key, r.scope.project, r.version, r.value) for r in records
             if r.layer == LAYER and r.scope.project == project and r.scope.fleet == fleet
             and r.value.get("kind") == PROCEDURE_CANDIDATE_KIND
-            and isinstance((r.value.get("lifecycle") or {}).get("procedure"), dict)]
+            and procedural_row_servable(LAYER, r.value, key=r.key)]
 
 
 def active_procedures(storage, *, project: str, fleet: str = "") -> list:
     """The active procedure view as `procedural_memory.Procedure` objects.
 
     Feed it to `procedural_memory.match_procedures` like any other procedure set.
+    Invalid stored rows are skipped (and logged once), never raised.
     """
-    return [_procedure_from(r.lifecycle["procedure"])
-            for r in active_rows(storage, project=project, fleet=fleet)]
+    return [p for r in active_rows(storage, project=project, fleet=fleet)
+            for p in [_servable(r)] if p is not None]

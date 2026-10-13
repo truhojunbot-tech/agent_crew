@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 from .memory_runtime import (
     MemoryRecord, MemoryScope, MemoryStorage, SQLiteMemoryStorage,
-    _scope_from_json, _retrieval_rank, procedural_servable_sql,
+    _scope_from_json, _retrieval_rank, procedural_row_servable, procedural_servable_sql,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,7 +151,7 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
 
 def _effective_sql(alias: str = "m") -> str:
     # Every hybrid reader (head, candidates, render-time rejoin) goes through
-    # this clause, so lifecycle rows that are not active never render (#716).
+    # this clause as a coarse prefilter, then `_servable` decides (#716).
     return (f"{alias}.superseded_by IS NULL "
             f"AND {alias}.invalidated_at IS NULL "
             f"AND {procedural_servable_sql(alias)}")
@@ -181,6 +181,12 @@ def _row_record(row) -> dict:
     return {"rowid": rowid, "layer": layer, "key": key, "value": body,
             "scope": asdict(_scope_from_json(scope)), "version": version,
             "created": created}
+
+
+def _servable(rows: list[dict]) -> list[dict]:
+    """Python authority over the coarse SQL lifecycle prefilter (#716)."""
+    return [row for row in rows
+            if procedural_row_servable(row["layer"], row["value"], key=row["key"])]
 
 
 def _bytes(record: dict) -> int:
@@ -267,7 +273,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                 "SELECT m.rowid FROM adr001_memory m WHERE m.rowid IN (" +
                 ",".join("?" for _ in ids) + ") AND " + clause +
                 " AND " + _effective_sql(), [*ids, *params])}
-        return [row for row in rows if row["rowid"] in effective]
+        return _servable([row for row in rows if row["rowid"] in effective])
 
     def _candidates(self, db: sqlite3.Connection, scope: MemoryScope,
                     query: str = "") -> list[dict]:
@@ -291,7 +297,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                                 [*params, MIDDLE_CANDIDATE_LIMIT]).fetchall()
             rows.extend(row for row in recent if row[0] not in seen)
             rows = rows[:MIDDLE_CANDIDATE_LIMIT]
-        result = [_row_record(row) for row in rows]
+        result = _servable([_row_record(row) for row in rows])
         decisions = {hashlib.sha256(json.dumps(row["value"], sort_keys=True).encode()).hexdigest()
                      for row in result if row["layer"] == "decision"}
         return [row for row in result if row["layer"] != "episodic" or
@@ -304,10 +310,10 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
         prefix = ("SELECT m.rowid,m.layer,m.key,m.value,m.scope,m.version,m.created "
                   "FROM adr001_memory m WHERE " + clause + " AND " + _effective_sql())
         with closing(sqlite3.connect(self.path)) as db:
-            principles = [_row_record(row) for row in db.execute(
+            principles = _servable([_row_record(row) for row in db.execute(
                 prefix + " AND m.layer='procedural' AND "
                 "(m.key LIKE 'owner_principle:%' OR json_extract(m.value,'$.kind')='owner_principle') "
-                "ORDER BY m.key", params)]
+                "ORDER BY m.key", params)])
             standing = [_row_record(row) for row in db.execute(
                 prefix + " AND json_extract(m.value,'$.kind')='standing_decision' "
                 "ORDER BY json_extract(m.value,'$.verb'),json_extract(m.value,'$.subject'),"
@@ -458,7 +464,7 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                     ",".join("?" for _ in ids) + ") AND " + clause +
                     " AND " + _effective_sql(), [*ids, *params],
                 )} if ids else set()
-            selected = [r for r in selected if r["rowid"] in fresh]
+            selected = _servable([r for r in selected if r["rowid"] in fresh])
             elapsed = (time.perf_counter() - started) * 1000
             if elapsed > LATENCY_BUDGET_SECONDS * 1000:
                 raise TimeoutError("retrieval exceeded 300 ms")

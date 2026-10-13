@@ -134,19 +134,30 @@ never a candidate.
 
 ## 4. Active-reader filter (production paths)
 
-`memory_runtime.procedural_row_servable` / `procedural_servable_sql` is the
-single rule. A procedural row that has the lifecycle marker (`kind ==
+`memory_runtime.procedural_row_servable` is the single rule, and it is the
+authority. A procedural row that has the lifecycle marker (`kind ==
 "procedure_candidate"` or any `lifecycle` key) is served **only** if
-`lifecycle.status == "active_procedure"` and its procedure has not expired.
+`memory_runtime.servable_procedure` accepts it: `lifecycle.status ==
+"active_procedure"`, the stored procedure passes the shared validator
+`procedural_memory.procedure_from_stored` (required fields, every field's
+dataclass type, a scope with exactly the `Scope` keys holding lists of text,
+well-formed evidence, no unknown fields), its `state` is active and its
+`expires_at` is still ahead. Any failure means not served; a row that claims to
+be active but fails is logged once. Readers never raise on stored data.
+
+`procedural_servable_sql` is only a **coarse prefilter** (status, required
+field types, expiry). It may admit a row the validator rejects (for example a
+string `scope`), so every SQL read path also filters its rows in Python.
 
 | Reader | File / function | How the rule is applied |
 |---|---|---|
 | live context reconstruction | `memory_runtime.reconstruct_context` → `retrieve` | Python filter in `SQLiteMemoryStorage.retrieve` |
 | live dispatch block | `memory_runtime.dispatch_memory_block` → `retrieve` | same |
 | owner-statement resolution | `memory_runtime._scoped_owner_records` → `retrieve` | same |
-| shadow retrieval | `SQLiteMemoryStorage.retrieve_shadow` | SQL clause in the shared `base` predicate |
+| shadow retrieval | `SQLiteMemoryStorage.retrieve_shadow` | SQL prefilter in `base`, then Python filter |
 | shadow provider fallback | `RuntimeMemoryProvider.retrieve` (non-SQLite storage) → `retrieve` | same as `retrieve` |
-| hybrid head / candidates / render-time rejoin | `memory_hybrid._effective_sql` (used by `render_head`, `_candidates`, `effective_rows`, `retrieve_ranked`) | SQL clause |
+| hybrid head / candidates / render-time rejoin | `memory_hybrid._effective_sql` + `memory_hybrid._servable` (in `render_head`, `_candidates`, `effective_rows`, `retrieve_ranked`) | SQL prefilter, then Python filter |
+| public lifecycle view | `procedural_lifecycle.active_rows` / `active_procedures` | Python filter; invalid rows skipped |
 
 Only the lifecycle API passes `retrieve(..., include_inactive_procedures=True)`.
 
@@ -171,8 +182,8 @@ consumer that wants the row-backed set calls `active_procedures()`.
 
 Revert `procedural_lifecycle.py` and the reader-filter hunks. Stored lifecycle
 rows stay in place for audit. After a revert, readers would serve marked rows
-again, so a rollback must keep the filter: `procedural_row_servable` /
-`procedural_servable_sql`. Never restore a read path that treats candidate rows
+again, so a rollback must keep the filter: `procedural_row_servable` (with
+`procedural_servable_sql` as its prefilter). Never restore a read path that treats candidate rows
 as active procedures.
 
 ## 6. Tests
@@ -182,6 +193,9 @@ temp-DB `SQLiteMemoryStorage` and `HybridMemoryStorage`. It covers create,
 duplicate delivery, approve, reject, hold/recheck, supersede, restart
 round-trip, cross-project read = 0, broad-scope single-evidence refusal,
 unqualified approver, missing source, a marker row without status, legacy
-principle serving, expiry, a lost compare-and-set, and a consumer adapter that
+principle serving, expiry, malformed active rows (one parametrized case per
+broken field: id, version, title, rule, scope shape, evidence, expiry type,
+lifecycle status; each asserts not served, no raise, valid rows still served
+on both backends and the hybrid path), a lost compare-and-set, and a consumer adapter that
 uses only the public interface. No layer or validation is monkeypatched. The
 only `monkeypatch` is the env flag that turns on `reconstruct_context`.

@@ -356,6 +356,110 @@ def test_active_status_without_a_valid_procedure_or_expiry_fails_closed(store, m
     assert out.key in sql_ok and not set(bad) & sql_ok
 
 
+def _set(field, value):
+    return lambda lc: lc["procedure"].__setitem__(field, value)
+
+
+def _drop(field):
+    return lambda lc: lc["procedure"].pop(field)
+
+
+def _scope(mutate):
+    return lambda lc: mutate(lc["procedure"]["scope"])
+
+
+#: Round 3 of PR #771: fix the class, not the field. Every variant claims to be
+#: an active, unexpired procedure; each breaks one thing the shared validator
+#: (`procedural_memory.procedure_from_stored`) checks.
+MALFORMED = {
+    "id-missing": _drop("procedure_id"),
+    "id-int": _set("procedure_id", 7),
+    "id-empty": _set("procedure_id", ""),
+    "version-missing": _drop("version"),
+    "version-text": _set("version", "1"),
+    "version-float": _set("version", 1.0),
+    "version-bool": _set("version", True),
+    "title-missing": _drop("title"),
+    "title-null": _set("title", None),
+    "title-int": _set("title", 3),
+    "rule-missing": _drop("rule"),
+    "rule-list": _set("rule", ["r"]),
+    "scope-missing": _drop("scope"),
+    "scope-string": _set("scope", "broken"),
+    "scope-null": _set("scope", None),
+    "scope-list": _set("scope", [["repos", ["r"]]]),
+    "scope-unknown-key": _scope(lambda sc: sc.__setitem__("colour", ["red"])),
+    "scope-missing-key": _scope(lambda sc: sc.pop("repos")),
+    "scope-empty": _set("scope", {}),
+    "scope-value-string": _scope(lambda sc: sc.__setitem__("repos", "r")),
+    "scope-value-ints": _scope(lambda sc: sc.__setitem__("paths", [1, 2])),
+    "evidence-string": _set("evidence", "pr-2"),
+    "evidence-bad-item": _set("evidence", [{"kind": "pr", "ref": 2}]),
+    "trigger-list": _set("trigger", ["failed: x"]),
+    "confidence-text": _set("confidence", "high"),
+    "unknown-field": _set("surprise", 1),
+    "state-missing": _drop("state"),
+    "state-int": _set("state", 1),
+    "expires-missing": _drop("expires_at"),
+    "expires-text": _set("expires_at", "4102444800"),
+    "expires-invalid-text": _set("expires_at", "not-a-time"),
+    "expires-null": _set("expires_at", None),
+    "expires-bool": _set("expires_at", True),
+    "expires-list": _set("expires_at", [4102444800]),
+    "expires-past": _set("expires_at", 1.0),
+    "status-missing": lambda lc: lc.pop("status"),
+    "status-int": lambda lc: lc.__setitem__("status", 1),
+    "status-pending": lambda lc: lc.__setitem__("status", pm.CANDIDATE),
+    "status-deprecated": lambda lc: lc.__setitem__("status", pm.DEPRECATED),
+}
+
+
+@pytest.mark.parametrize("variant", sorted(MALFORMED))
+def test_malformed_active_row_is_never_served_and_never_raises(store, monkeypatch, caplog,
+                                                               variant):
+    """Python validator is the authority on SQLite, hybrid and the public API."""
+    out = create(store, scope={"repos": ["r"]})
+    assert pl.promote_candidate(store, project="proj-a", candidate_id=out.candidate_id,
+                                approver=COORD).ok
+    template = pl._load(store, "proj-a", "", out.candidate_id).value
+    good_id = template["lifecycle"]["procedure"]["procedure_id"]
+    bad = json.loads(json.dumps(template))
+    bad["lifecycle"]["procedure"]["procedure_id"] = "proc-bad"
+    MALFORMED[variant](bad["lifecycle"])
+    bad_key = f"procedure:bad-{variant}"
+    scope = MemoryScope(project="proj-a")
+    store.put(MemoryRecord("procedural", bad_key, bad, scope))
+
+    for s in (store, reopen(store)):
+        served = served_keys(s)  # retrieve, retrieve_shadow, provider, hybrid head/render
+        assert out.key in served, "the well-formed active row stays served"
+        assert bad_key not in served
+        assert bad_key not in live_keys(s, monkeypatch)
+        assert [r.key for r in pl.active_rows(s, project="proj-a")] == [out.key]
+        assert [p.procedure_id for p in pl.active_procedures(s, project="proj-a")] == [good_id]
+        assert not mr.procedural_row_servable("procedural", bad, key=bad_key)
+
+    # SQL is only a coarse prefilter: it may admit the row, Python never does.
+    with sqlite3.connect(store.path) as db:
+        sql_ok = {k for (k,) in db.execute(
+            "SELECT key FROM adr001_memory WHERE " + mr.procedural_servable_sql())}
+    assert out.key in sql_ok
+
+    # A row that claims active is logged once, not on every read.
+    status = bad["lifecycle"].get("status")
+    logged = [r for r in caplog.records if bad_key in r.getMessage()]
+    assert len(logged) == (1 if status == pm.ACTIVE else 0)
+
+
+def test_shared_validator_accepts_what_promotion_writes():
+    procedure = pm.Procedure("p-1", 1, "t", "r", scope=pm.Scope(repos=["r"]),
+                             evidence=[pm.Evidence("pr", "2")], state=pm.ACTIVE,
+                             expires_at=T0)
+    assert pm.procedure_from_stored(procedure.to_dict()) == procedure
+    with pytest.raises((TypeError, ValueError)):
+        pm.procedure_from_stored({**procedure.to_dict(), "scope": "broken"})
+
+
 def test_concurrent_transition_loses_cleanly(store):
     out = create(store, scope={"repos": ["r"]})
     stale = pl._load(store, "proj-a", "", out.candidate_id)
