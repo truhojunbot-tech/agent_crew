@@ -192,6 +192,10 @@ def cancel_task_with_signal(
         return {"status": prior_status, "cancelled": False, "reason": "NOT_ACTIVE",
                 "worker_reachable": False, "cancel_signal_outcome": "not_active",
                 "pane_exit_observed": False}
+    try:
+        _claude_cloud.record_terminal_cloud_cost(queue, task_id)
+    except Exception:
+        logger.exception("cloud cost recording failed for cancelled task=%s", task_id)
     outcome = "not_running"
     reachable = False
     pane_exit_observed = False
@@ -5106,6 +5110,10 @@ def create_app(
                                            **(details or {})}),
                     dispatcher_failed=status == "failed",
                 )
+                try:
+                    _claude_cloud.record_terminal_cloud_cost(q(), task_id)
+                except Exception:
+                    logger.exception("cloud cost recording failed for task=%s", task_id)
                 capture_result_best_effort(db_path, task_id, TaskResult(
                     task_id=task_id, status=status, summary=summary))
                 _attr = q().get_attribution(task_id)
@@ -8140,6 +8148,10 @@ def create_app(
                                           allow_review_replay=_REPLAYING.get(),
                                           validate_review=not _REPLAYING.get(),
                                           adopted_fallback_task_id=_adopted_fallback_id)
+            try:
+                _claude_cloud.record_terminal_cloud_cost(q(), task_id)
+            except Exception:
+                logger.exception("cloud cost recording failed for task=%s", task_id)
             capture_result_best_effort(db_path, task_id, result)
             # #750: quota-core's configured atomic publisher runs off-thread.
             # A failed or slow emitter cannot change result admission or latency.

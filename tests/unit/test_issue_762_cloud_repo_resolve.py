@@ -1,8 +1,13 @@
 """#762: cloud implement tasks resolve their repo from the crew checkout."""
 
 import json
+import sqlite3
 import subprocess
+import time
 from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
 
 from click.testing import CliRunner
 
@@ -10,6 +15,7 @@ from agent_crew import claude_cloud as cloud
 from agent_crew.cli import crew
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+from agent_crew.server import create_app
 
 
 def _git_repo(path, origin):
@@ -145,3 +151,79 @@ def test_default_pr_state_lookup_is_bound_to_context_repo(tmp_path, monkeypatch)
     assert queue.get_task("impl-762").status == "completed"
     reviews = [t for t in queue.list_tasks() if t.task_type == "review"]
     assert len(reviews) == 1
+
+
+@pytest.mark.parametrize("branch", ["main", " "])
+def test_cloud_implement_refuses_base_or_missing_branch_before_launch(tmp_path, monkeypatch,
+                                                                      branch):
+    _cloud_env(monkeypatch)
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-branch", "implement", "Implement #762",
+                              branch=branch, project="agent_crew",
+                              context={"repo": "owner/agent_crew", "base_branch": "main"}))
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return _run(argv, **kwargs)
+    outcome = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                            run_fn=run)
+    assert outcome.launch_error == "cloud_branch_unpublishable"
+    assert queue.get_task("impl-branch").status == "failed"
+    assert calls == [["claude", "--help"]]
+
+
+@pytest.mark.parametrize("description", [
+    "Read ~/alfred/governance/plan.md before editing",
+    "Inspect ~/.agent_crew/state.json for this task",
+    "Use /tmp/worktrees/agent_crew/codex/local.txt",
+])
+def test_cloud_preflight_refuses_local_only_files(tmp_path, monkeypatch, description):
+    _cloud_env(monkeypatch)
+    monkeypatch.setattr(cloud, "_validated_cloud_checkout",
+                        lambda *a, **kw: ("/fixture/claude", "owner/agent_crew"))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-local", "implement", description,
+                              branch="agent/762-work", project="agent_crew",
+                              context={"repo": "owner/agent_crew"}))
+    calls = []
+    def run(argv, **kwargs):
+        calls.append(argv)
+        return _run(argv, **kwargs)
+    outcome = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                            run_fn=run)
+    assert outcome.launch_error == "cloud_local_files_required"
+    assert queue.get_task("impl-local").status == "failed"
+    assert calls == [["claude", "--help"]]
+
+
+def test_cloud_cost_recorded_on_result_cancel_and_fail(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "0")
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    for task_id in ("posted", "cancelled", "failed"):
+        queue.enqueue(_implement(task_id, {"repo": "owner/agent_crew",
+                                           "cloud_session_id": "session_abc12345",
+                                           "cloud_credit_used_before": 4.0}))
+        queue.record_attribution(task_id=task_id, project="agent_crew",
+                                 agent="claude_cloud", role="implementer",
+                                 task_type="implement", provider_session_id="session_abc12345",
+                                 started_at=time.time())
+    with sqlite3.connect(queue._db_path) as db:
+        db.execute("UPDATE tasks SET status='in_progress', claim_source='cloud_push', "
+                   "dispatch_channel='claude_cloud' WHERE task_id IN "
+                   "('posted', 'cancelled', 'failed')")
+    monkeypatch.setattr(cloud, "read_cloud_credit_used", lambda: 4.5)
+    app = create_app(queue._db_path, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True, identity_required=False)
+    with TestClient(app) as client:
+        assert client.post("/tasks/posted/result", json={
+            "task_id": "posted", "status": "completed", "summary": "done"}).status_code == 200
+        assert client.delete("/tasks/cancelled").status_code == 200
+        assert app.state.fail_if_active("failed", "test_failure")
+    assert [queue.get_attribution(task_id)["cloud_usd"] for task_id in
+            ("posted", "cancelled", "failed")] == [0.5, 0.5, 0.5]
+    day_start = int(time.time() // 86400) * 86400
+    assert queue.cloud_implement_usd_since(day_start) == 1.5
+    monkeypatch.setattr(cloud, "read_cloud_credit_used", lambda: 9.0)
+    cloud.record_terminal_cloud_cost(queue, "posted")
+    assert queue.get_attribution("posted")["cloud_usd"] == 0.5

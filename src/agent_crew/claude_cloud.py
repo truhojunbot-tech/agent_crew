@@ -165,12 +165,26 @@ def cloud_max_usd_per_day() -> Optional[float]:
 def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
     if task.task_type == "review":
         return
+    if queue.get_task_context(task.task_id).get("cloud_cost_finalized_at"):
+        return
     before = (task.context or {}).get("cloud_credit_used_before")
     after = read_cloud_credit_used()
     usd = (round(max(0.0, after - before), 6)
            if isinstance(before, (int, float)) and after is not None and after >= before else None)
-    queue.patch_context(task.task_id, {"cloud_credit_used_after": after, "cloud_usd": usd})
     queue.record_cloud_cost(task.task_id, before, after, usd)
+    queue.patch_context(task.task_id, {"cloud_credit_used_after": after, "cloud_usd": usd,
+                                      "cloud_cost_finalized_at": time.time()})
+
+
+def record_terminal_cloud_cost(queue: TaskQueue, task_id: str) -> None:
+    """Close an implementer's cloud credit interval after any terminal write."""
+    task = queue.get_task(task_id)
+    attribution = queue.get_attribution(task_id)
+    if (task is not None and task.status in {"completed", "failed", "cancelled",
+                                             "timed_out", "needs_human"}
+            and attribution and attribution.get("agent") == CLOUD_PROVIDER_NAME
+            and attribution.get("role") == "implementer"):
+        _record_reconciled_cloud_cost(queue, task)
 
 
 _ENV_STALE_SECONDS = "AGENT_CREW_CLOUD_STALE_SECONDS"
@@ -441,12 +455,8 @@ def _resolve_task_repo(task: TaskRequest, explicit_repo: Optional[str],
     OWN ``context["repo"]`` (the registered repo it was created against —
     the same key ``pipeline.auto_enqueue_review``/``_auto_enqueue_fix``
     already read) > the registered ``repo_path`` in state > the origin of the
-    state's Claude checkout > the legacy dispatcher-cwd fallback. The checkout
-    preflight rejects a mismatched fallback before any cloud launch.
-
-    #762: implement (and fix) tasks never use the dispatcher-cwd fallback —
-    the server cwd is a different repository. They resolve to ``""`` so the
-    dispatch fails closed with ``cloud_repo_unresolved``.
+    state's Claude checkout. An unresolved repo fails closed; the process cwd
+    may belong to an entirely different repository.
     """
     if explicit_repo:
         return explicit_repo
@@ -471,13 +481,7 @@ def _resolve_task_repo(task: TaskRequest, explicit_repo: Optional[str],
                         return registered
         except (OSError, ValueError, TypeError):
             logger.warning("claude_cloud: could not read registered repo for %s", task.project)
-    if task.task_type == "implement":
-        return ""
-    try:
-        return _github.get_repo() or ""
-    except Exception:
-        logger.exception("claude_cloud: get_repo() failed while resolving prompt repo")
-        return ""
+    return ""
 
 
 def _claude_checkout_path(state: dict, state_path: str, project: str) -> str:
@@ -594,6 +598,10 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
         queue.patch_context(task.task_id, {"cloud_ended_at": time.time(),
                                            "cloud_terminal_error": reason})
     queue.force_fail(task.task_id, reason)
+    try:
+        record_terminal_cloud_cost(queue, task.task_id)
+    except Exception:
+        logger.exception("claude_cloud: cost recording failed for %s", task.task_id)
     result = TaskResult(task_id=task.task_id, status="failed", summary=reason[:2000])
     try:
         from agent_crew.pipeline import auto_fallback_failed_task
@@ -601,6 +609,28 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     except Exception:
         logger.exception("claude_cloud: fallback failed for %s", task.task_id)
     return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason)
+
+
+_LOCAL_ONLY_PATH = re.compile(
+    r"(?<![\w/])(?:~/|/home/[^\s/'\"`]+/|/tmp/|/var/tmp/|\.agent_crew/)",
+    re.IGNORECASE,
+)
+
+
+def _cloud_preflight_reason(task: TaskRequest, repo: str) -> str:
+    if task.task_type == "implement":
+        branch = (task.branch or "").strip()
+        base = (task.context or {}).get("base_branch") or "main"
+        if not branch or branch in {"main", "master", base}:
+            return "cloud_branch_unpublishable"
+    if not repo or not _github._repo_slug(repo):
+        return "cloud_repo_unresolved"
+    context = task.context if isinstance(task.context, dict) else {}
+    instructions = context.get("instructions")
+    work = task.description + "\n" + (instructions if isinstance(instructions, str) else "")
+    if _LOCAL_ONLY_PATH.search(work):
+        return "cloud_local_files_required"
+    return ""
 
 
 def _claimable_cloud_reviews(queue: TaskQueue) -> list[TaskRequest]:
@@ -716,6 +746,11 @@ def dispatch_cloud_for_role(
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
 
+    preflight_repo = _resolve_task_repo(task, repo, state_path)
+    preflight_reason = _cloud_preflight_reason(task, preflight_repo)
+    if preflight_reason:
+        return _fail_closed_dispatch(queue, task, task_type, preflight_reason)
+
     # A fix round reuses the existing PR branch. Snapshot its head before the
     # dispatch channel becomes visible to reconciliation, otherwise the first
     # reconcile tick can mistake the previous round's PR for this session's
@@ -726,7 +761,7 @@ def dispatch_cloud_for_role(
     prior_pr_head = None
     prior_branch_message = None
     if role == "implementer" and (existing_pr or fix_round):
-        task_repo = _resolve_task_repo(task, repo, state_path)
+        task_repo = preflight_repo
         if not task_repo:
             return _fail_closed_dispatch(queue, task, task_type, "cloud_repo_unresolved")
         try:
@@ -777,7 +812,7 @@ def dispatch_cloud_for_role(
                                          "cloud_review_missing_pinned_pr_or_sha")
 
     resume_session_id = _resolve_resume_session_id(queue, task)
-    effective_repo = _resolve_task_repo(task, repo, state_path)
+    effective_repo = preflight_repo
     if not effective_repo:
         return _fail_closed_dispatch(queue, task, task_type,
                                      "cloud_review_repo_unresolved" if task.task_type == "review"
