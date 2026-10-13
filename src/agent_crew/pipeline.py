@@ -70,6 +70,32 @@ def successor_context(parent_context: object) -> dict:
             if not key.startswith("cea_")}
 
 
+_LINEAGE_INTENT_FIELDS = (
+    "repo", "issue", "issue_number", "issue_title", "issue_body", "issue_url",
+    "base_branch", "coordinator_managed", "coordinator_generation",
+    "implementer_agent", "reviewer_agent", "no_tester", "risk_tier",
+    "lineage_root_task_id",
+)
+
+
+def _carry_lineage_intent(context: dict, parent_task: TaskRequest, role: str) -> None:
+    """Keep durable CLI choices while selecting the successor's own role.
+
+    ``agent_override`` is execution routing, so copying it across a role
+    boundary would make the implementer review their own work (#773).
+    """
+    parent = parent_task.context if isinstance(parent_task.context, dict) else {}
+    for key in _LINEAGE_INTENT_FIELDS:
+        if key in parent:
+            context.setdefault(key, parent[key])
+    context.setdefault("lineage_root_task_id",
+                       parent.get("lineage_root_task_id") or parent_task.task_id)
+    choice = parent.get("reviewer_agent" if role == "reviewer" else
+                        "implementer_agent" if role == "implementer" else "tester_agent")
+    if isinstance(choice, str) and choice.strip():
+        context["agent_override"] = choice.strip()
+
+
 def _review_cascade_contract(queue: TaskQueue, review_task):
     """Use the stricter admission contract when a pipeline review was blocked."""
     standing = _cascade.stored(review_task)
@@ -1757,6 +1783,7 @@ def auto_enqueue_fix(
         )
         if implementer_agent:
             fix_context["implementer_agent"] = implementer_agent
+        _carry_lineage_intent(fix_context, review_task, "implementer")
 
         # EGD Step 2 (#51): carry the contract's recommended round budget next
         # to the cap actually in force, so the gap between them is measurable
@@ -2212,6 +2239,7 @@ def auto_enqueue_review(
                 review_context[key] = impl_ctx[key]
         if _impl_repo:
             review_context["repo"] = _impl_repo
+        _carry_lineage_intent(review_context, impl_task, "reviewer")
 
         # #305: pin the review to the commit the implementer actually pushed.
         # ⛔Only when it is a real object id — `TaskResult` normalises anything
@@ -2406,6 +2434,7 @@ def auto_enqueue_test(
         if skip_note:
             test_context["post_recovery_verification"] = True
             test_context["test_stage_skip"] = skip_note
+        _carry_lineage_intent(test_context, review_task, "tester")
 
         # #164: compact test description — reviewer can fetch full spec via
         # get_task(prev_task_id) chain if needed.

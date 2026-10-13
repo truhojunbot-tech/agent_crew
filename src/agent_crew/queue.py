@@ -3571,7 +3571,8 @@ class TaskQueue:
             return
         for key in ("prev_task_id", "fix_round", "issue", "issue_number",
                     "issue_title", "issue_body", "issue_url", "repo",
-                    "implementer_agent", "no_tester", "base_branch",
+                    "implementer_agent", "reviewer_agent", "no_tester", "base_branch",
+                    "lineage_root_task_id", "coordinator_managed", "coordinator_generation",
                     "risk_declaration", "risk_tier_source"):
             if key == "no_tester" and survivor["status"] == "completed":
                 continue  # A completed approval may already have started a tester.
@@ -5375,6 +5376,35 @@ class TaskQueue:
              json.dumps({k: v for k, v in fields.items() if include_none or v is not None},
                         sort_keys=True)),
         )
+
+    def claim_coordinator_notice(self, task_id: str, kind: str) -> bool:
+        """Claim one terminal-stall notice using the existing exec event log.
+
+        The claim is durable across watchdog ticks and process restarts. It is
+        taken under the queue write lock so two reconcilers cannot both wake
+        the coordinator for the same task and reason (#773).
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            seen = conn.execute(
+                "SELECT 1 FROM task_exec_events WHERE task_id=? "
+                "AND event='coordinator_notice' "
+                "AND json_extract(fields, '$.kind')=? LIMIT 1",
+                (task_id, kind),
+            ).fetchone()
+            if seen:
+                conn.execute("ROLLBACK")
+                return False
+            self._append_exec_event_on(conn, task_id, "coordinator_notice",
+                                       time.time(), kind=kind)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
 
     def _record_claim_on(self, conn, task_id: str, at: float, *, role: Optional[str],
                          agent: Optional[str], via: str) -> None:
