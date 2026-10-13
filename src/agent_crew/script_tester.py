@@ -330,17 +330,17 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
     record["new_failures"] = new_failures
     if head.timed_out:
         record.update(outcome=FAILED, reason="timeout")
+    elif head.exit_code not in (0, 1):
+        # Collection, configuration and interrupted runs can print ERROR ids,
+        # but they did not produce a test verdict about the PR.
+        record.update(outcome=FAILED, reason=f"exit_code_{head.exit_code}")
+        record["output_tail"] = head.output_tail[-1500:]
     elif new_failures:
         record.update(outcome=FAILED, reason="new_failures")
     elif head.exit_code == 0 or (head.exit_code == 1 and head.failing_ids):
         record["outcome"] = PASSED
     else:
-        # Any other exit (pytest 2-5: interrupted/collection abort, internal
-        # error, usage, no tests; or a non-pytest failure with no ids) means
-        # the suite did not judge the PR. Even if base aborts the same way,
-        # that is not a pass.
         record.update(outcome=FAILED, reason=f"exit_code_{head.exit_code}")
-        record["output_tail"] = head.output_tail[-1500:]
     return record
 
 

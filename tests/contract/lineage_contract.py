@@ -31,6 +31,9 @@ def assert_lineage_contract(db, root_id, intent):
             assert not parent_id, task.task_id
         else:
             assert parent_id in lineage, (task.task_id, parent_id)
+            if task.task_type == "implement" and ctx.get("retry"):
+                assert lineage[parent_id].task_type == "test", task.task_id
+                assert ctx.get("lineage_root_task_id") == root_id, task.task_id
             parent_round = int((lineage[parent_id].context or {}).get("fix_round") or 0)
             expected_round = parent_round + int(task.task_type == "implement"
                                                 and lineage[parent_id].task_type == "review")

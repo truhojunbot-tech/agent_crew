@@ -3072,6 +3072,11 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
 
     impl_id = _adopted_impl_id or enqueue_implement(
         queue, task, branch, context=impl_context, port=_run_port)
+    lineage_root_id = impl_id
+    try:
+        lineage_root_id = queue.get_task_context(impl_id).get("lineage_root_task_id") or impl_id
+    except (AttributeError, KeyError):
+        pass
     click.echo(f"[1/{max_iter}] Implementing... ({impl_id})")
     if _run_port and not _verify_delivery(_run_port, impl_id, timeout=15.0,
                                           project=project):
@@ -3120,7 +3125,14 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
         except (AttributeError, KeyError):
             pass
 
-        review_context = {**_CM, **risk_context, **issue_context, **run_branch_context}
+        review_context = {**_CM, **risk_context, **issue_context, **run_branch_context,
+                          "lineage_root_task_id": lineage_root_id}
+        try:
+            impl_round = queue.get_task_context(impl_id).get("fix_round")
+            if impl_round is not None:
+                review_context["fix_round"] = impl_round
+        except (AttributeError, KeyError):
+            pass
         if repo:
             review_context["repo"] = repo
         if reviewer:
@@ -3209,7 +3221,10 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             if _run_port:
                 _drain_resolvable_gates(_run_port)
             if not no_tester:
-                test_context = {**_CM, **risk_context}
+                test_context = {**review_context, **artifact_context}
+                # The tester is independent of the reviewer; preserve both
+                # named role choices without routing the test to the reviewer.
+                test_context.pop("agent_override", None)
                 if reviewed_head:
                     test_context["reviewed_sha"] = reviewed_head
                 if _loop_pr_number:
@@ -3223,11 +3238,14 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                 test_outcome = handle_test_result(test_result)
                 _script = ((getattr(test_result, "error_info", None) or {}).get("script_test")
                            if isinstance(getattr(test_result, "error_info", None), dict) else None)
-                if test_outcome == "needs_human" and isinstance(_script, dict):
-                    # #772: the suite did not judge this PR (no command, or it
-                    # could not run). Never auto-pass, never re-implement.
+                if test_outcome in {"needs_human", "not_run"}:
+                    # A provider exit or an aborted script suite did not judge
+                    # the PR. Leave its test result for the coordinator gate.
+                    recorded_outcome = (_script.get("outcome") if isinstance(_script, dict)
+                                        else test_result.status)
                     click.echo(
-                        f"[{iteration}/{max_iter}] ⏸ test stage {_script.get('outcome')}: "
+                        f"[{iteration}/{max_iter}] ⏸ test stage not_run "
+                        f"({recorded_outcome}): "
                         f"{test_result.summary}; PR #{_loop_pr_number or '?'} left for the "
                         "coordinator gate.")
                     return
@@ -3253,11 +3271,17 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                         _run_worktrees, base_branch=impl_branch or branch,
                         port=_run_port, project=project,
                         role_to_agent=_run_role_to_agent) if _run_worktrees else {}
+                    retry_context = {**impl_context, **risk_context,
+                                     "retry": True, "sync_landed_bases": retry_bases,
+                                     "prev_task_id": test_id,
+                                     "lineage_root_task_id": lineage_root_id}
+                    try:
+                        retry_context["fix_round"] = (queue.get_task_context(test_id)
+                                                      .get("fix_round") or 0)
+                    except (AttributeError, KeyError):
+                        pass
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
-                                               context={**_CM, **run_branch_context, **risk_context,
-                                                        **issue_context,
-                                                        **artifact_context,
-                                                        "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
+                                                context=retry_context, port=_run_port)
                     continue
             else:
                 if _run_port:

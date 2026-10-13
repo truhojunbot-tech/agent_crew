@@ -441,6 +441,16 @@ def handle_test_result(result: TaskResult) -> str:
         return "passed"
     if result.status == "needs_human":
         return "needs_human"
+    info = result.error_info if isinstance(result.error_info, dict) else {}
+    script = info.get("script_test")
+    if isinstance(script, dict):
+        # Only identified new test failures are a verdict about this PR.
+        # Setup, collection and timeout failures did not judge it.
+        if script.get("reason") == "new_failures" and script.get("new_failures"):
+            return "failed"
+        return "not_run"
+    if result.status != "failed" or (info.get("final") and not result.findings):
+        return "not_run"
     return "failed"
 
 

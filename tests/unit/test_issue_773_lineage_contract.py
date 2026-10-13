@@ -5,6 +5,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+from click.testing import CliRunner
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +15,7 @@ from agent_crew.queue import TaskQueue
 from agent_crew.queue import LateResultRejected
 from agent_crew.server import create_app
 from agent_crew.server import _DispatchSlot
+from agent_crew.cli import crew
 from tests.contract.lineage_contract import assert_lineage_contract
 
 
@@ -301,3 +303,40 @@ def test_server_retry_keeps_both_role_choices(tmp_db, monkeypatch):
     assert retry.context["reviewer_agent"] == "claude"
     assert retry.context["original_task_id"] == "impl-773"
     assert_lineage_contract(tmp_db, "impl-773", INTENT)
+
+
+def test_cli_test_failure_retry_preserves_full_lineage(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    monkeypatch.setattr("agent_crew.cli._writable_queue", lambda *args, **kwargs: queue)
+
+    def result_for(task_id):
+        if task_id.startswith("review-"):
+            return TaskResult(task_id, "completed", "approved", verdict="approve",
+                              findings=[], pr_number=773)
+        if task_id.startswith("test-"):
+            return TaskResult(task_id, "failed", "one new failing test",
+                              findings=["new failure: tests/test_new.py::test_one"],
+                              error_info={"script_test": {"outcome": "FAILED",
+                                                          "reason": "new_failures",
+                                                          "new_failures": ["tests/test_new.py::test_one"]}})
+        return TaskResult(task_id, "completed", "done", branch=INTENT["branch"],
+                          commit="a" * 40, pr_number=773)
+
+    monkeypatch.setattr(queue, "get_result", result_for)
+    out = CliRunner().invoke(crew, ["run", "work", "--db", tmp_db, "--max-iter", "1",
+                                    "--branch", INTENT["branch"], "--risk-tier", "2",
+                                    "--issue", "773", "--repo", INTENT["repo"],
+                                    "--implementer", "codex", "--reviewer", "claude"])
+    assert out.exception is None, out.output
+    roots = [row for row in queue.list_tasks() if row.task_type == "implement"
+             and not (row.context or {}).get("prev_task_id")]
+    assert len(roots) == 1
+    root = roots[0]
+    lineage_intent = {**INTENT, "risk_declaration": root.context["risk_declaration"],
+                      "role_map": {**INTENT["role_map"], "tester": "script"}}
+    lineage = assert_lineage_contract(tmp_db, root.task_id, lineage_intent)
+    assert [row.task_type for row in lineage.values()].count("implement") == 2
+    retry = next(row for row in lineage.values() if row.task_type == "implement"
+                 and row.task_id != root.task_id)
+    assert retry.context["prev_task_id"].startswith("test-")
