@@ -239,7 +239,8 @@ def test_watchdog_uses_two_suite_timeouts_for_running_script_test(
     with sqlite3.connect(db) as conn:
         conn.execute(
             "UPDATE tasks SET status='in_progress', claim_source=?, "
-            "last_activity_at=?, dispatched_at=?, lease_owner=? WHERE task_id=?",
+            "last_activity_at=?, dispatched_at=?, lease_owner=?, "
+            "dispatch_agent='script', dispatch_target='script_tester' WHERE task_id=?",
             (claim_source, started_at, started_at,
              "script:pid:1" if claim_source == "dispatcher" else None,
              f"test-{claim_source}"))
@@ -256,6 +257,30 @@ def test_watchdog_uses_two_suite_timeouts_for_running_script_test(
         assert queue.get_task_status(f"test-{claim_source}") == "in_progress"
         late = app.state.watchdog_tick(started_at + 3001)
         assert late["timed_out"] == [f"test-{claim_source}"]
+
+
+def test_watchdog_keeps_provider_test_on_dispatcher_reap_under_script_default(
+        tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"test_timeout_s": 1200}))
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest(task_id="provider-test", task_type="test",
+                              description="provider test", branch="main"))
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE tasks SET status='in_progress', claim_source='dispatcher', "
+            "last_activity_at=1000, dispatched_at=1000, "
+            "dispatch_agent='gemini', dispatch_target='pid:123' "
+            "WHERE task_id='provider-test'")
+    app = create_app(db, pane_map={}, state_path=str(state_path),
+                     timeout_seconds=900, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        actions = app.state.watchdog_tick(1901)
+    assert actions["timed_out"] == ["provider-test"]
+    assert app.state.watchdog_expiry_counts["dispatcher_idle"] == 1
 
 
 # ── server: the real test-stage path, with provider calls counted ───────────

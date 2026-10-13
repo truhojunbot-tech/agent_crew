@@ -6882,7 +6882,8 @@ class TaskQueue:
         try:
             rows = conn.execute(
                 "SELECT task_id, task_type, context, last_activity_at, last_heartbeat_at, "
-                "push_at, project, claim_source, dispatched_at, lease_owner "
+                "push_at, project, claim_source, dispatched_at, dispatch_agent, "
+                "dispatch_target, lease_owner "
                 "FROM tasks WHERE status = 'in_progress'"
             ).fetchall()
             return [
@@ -6896,6 +6897,8 @@ class TaskQueue:
                     "project": r["project"] if r["project"] else "",
                     "claim_source": r["claim_source"] or "",
                     "dispatched_at": r["dispatched_at"] or 0.0,
+                    "dispatch_agent": r["dispatch_agent"] or "",
+                    "dispatch_target": r["dispatch_target"] or "",
                     "lease_owner": r["lease_owner"],
                 }
                 for r in rows

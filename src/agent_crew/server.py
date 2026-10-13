@@ -4630,8 +4630,8 @@ def create_app(
         script_claims: set[str] = set()
         for row in rows:
             if (row["task_type"] == "test" and
-                    (row.get("claim_source") == "script_tester" or
-                     (row.get("claim_source") == "dispatcher" and _script_tester_active()))):
+                    row.get("dispatch_agent") == _script_tester.SCRIPT_TESTER and
+                    row.get("dispatch_target") == "script_tester"):
                 task_id = row["task_id"]
                 script_claims.add(task_id)
                 # A failing head runs the same suite again on base. Bound both
