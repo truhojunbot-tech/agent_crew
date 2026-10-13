@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import os
 import sqlite3
@@ -12,6 +13,11 @@ from contextlib import closing
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, Protocol
+
+from . import procedural_memory as _procedural_memory
+from .procedural_memory import ACTIVE as _PROCEDURE_ACTIVE
+
+logger = logging.getLogger(__name__)
 
 LAYERS = frozenset({"authoritative", "checkpoint", "procedural", "episodic",
                     "decision", "failure_pattern"})
@@ -43,6 +49,112 @@ class MemoryScope:
 @dataclass(frozen=True)
 class MemoryRecord:
     layer: str; key: str; value: dict; scope: MemoryScope; version: int = 1
+
+
+#: #716 lifecycle rows on the procedural layer. See
+#: docs/procedural_lifecycle_contract.md and procedural_lifecycle.py.
+PROCEDURE_CANDIDATE_KIND = "procedure_candidate"
+
+
+def servable_procedure(value: dict, now: Optional[float] = None):
+    """The validated active `Procedure` held by a lifecycle row, or raise (#716).
+
+    The single authority on whether a stored procedure may be served: the
+    lifecycle status and procedure state are active, the procedure passes
+    :func:`procedural_memory.procedure_from_stored` (every field, nested scope,
+    types) and its expiry is still ahead. ``procedural_lifecycle`` builds its
+    public view from this, and every Python read path filters with it.
+    """
+    if not isinstance(value, dict):
+        raise TypeError("row value must be an object")
+    lifecycle = value.get("lifecycle")
+    if not isinstance(lifecycle, dict) or lifecycle.get("status") != _PROCEDURE_ACTIVE:
+        raise ValueError("lifecycle status is not active")
+    procedure = _procedural_memory.procedure_from_stored(lifecycle.get("procedure"))
+    if procedure.state != _PROCEDURE_ACTIVE:
+        raise ValueError(f"procedure state {procedure.state!r} is not active")
+    if not (now or time.time()) < procedure.expires_at < _PROCEDURE_MAX_EXPIRES:
+        raise ValueError("procedure expiry is not ahead")
+    return procedure
+
+
+#: (key, value digest) of rows already reported unservable, so one bad row
+#: does not log on every read. Bounded: cleared when it grows past the cap.
+_UNSERVABLE_LOGGED: set = set()
+_UNSERVABLE_LOG_CAP = 4096
+
+
+def _log_unservable_once(key: str, value: dict, exc: Exception) -> None:
+    digest = hashlib.sha256(json.dumps(value, sort_keys=True, default=repr)
+                            .encode()).hexdigest()
+    marker = (key, digest)
+    if marker in _UNSERVABLE_LOGGED:
+        return
+    if len(_UNSERVABLE_LOGGED) >= _UNSERVABLE_LOG_CAP:
+        _UNSERVABLE_LOGGED.clear()
+    _UNSERVABLE_LOGGED.add(marker)
+    logger.warning("procedural row %s claims active but is not servable: %s: %s",
+                   key or "<unknown>", type(exc).__name__, exc)
+
+
+def procedural_row_servable(layer: str, value: dict,
+                            now: Optional[float] = None, *, key: str = "") -> bool:
+    """Whether an active reader may serve this row (#716). Never raises.
+
+    A procedural row that carries the lifecycle contract is served only if
+    :func:`servable_procedure` accepts it. Anything else -- pending, held,
+    rejected, superseded or malformed in any field -- fails closed. A row that
+    claims to be active but fails validation is logged once.
+    Procedural rows written before the contract (no ``lifecycle`` and no
+    candidate kind, e.g. ``owner_principle:*``) keep their existing behaviour.
+    :func:`procedural_servable_sql` is only a coarse prefilter; this decides.
+    """
+    if layer != "procedural" or not isinstance(value, dict):
+        return True
+    lifecycle = value.get("lifecycle")
+    if value.get("kind") != PROCEDURE_CANDIDATE_KIND and lifecycle is None:
+        return True
+    try:
+        servable_procedure(value, now)
+    except Exception as exc:  # noqa: BLE001 - stored data must never break a reader
+        if isinstance(lifecycle, dict) and lifecycle.get("status") == _PROCEDURE_ACTIVE:
+            _log_unservable_once(key, value, exc)
+        return False
+    return True
+
+
+#: Upper bound on a servable expiry. It keeps non-finite values (``Infinity``
+#: parsed by either JSON reader) out of both the Python and SQL paths alike.
+_PROCEDURE_MAX_EXPIRES = 1e308
+
+
+def procedural_servable_sql(alias: str = "") -> str:
+    """Coarse SQL prefilter for :func:`procedural_row_servable` (#716).
+
+    It never admits a row the Python check rejects on the fields it covers, but
+    it does not check nested scope shape or every field type: SQL readers must
+    still filter their rows with :func:`procedural_row_servable`, which is the
+    authority.
+    """
+    a = f"{alias}." if alias else ""
+    v = f"{a}value"
+    return (f"NOT ({a}layer='procedural' AND ("
+            f"COALESCE(json_extract({v},'$.kind'),'')='{PROCEDURE_CANDIDATE_KIND}' "
+            f"OR COALESCE(json_type({v},'$.lifecycle'),'null')<>'null') AND NOT ("
+            f"json_type({v},'$.lifecycle') IS 'object' "
+            f"AND json_extract({v},'$.lifecycle.status') IS '{_PROCEDURE_ACTIVE}' "
+            f"AND json_type({v},'$.lifecycle.procedure') IS 'object' "
+            f"AND json_extract({v},'$.lifecycle.procedure.state') IS '{_PROCEDURE_ACTIVE}' "
+            f"AND json_type({v},'$.lifecycle.procedure.procedure_id') IS 'text' "
+            f"AND json_extract({v},'$.lifecycle.procedure.procedure_id') <> '' "
+            f"AND json_type({v},'$.lifecycle.procedure.version') IS 'integer' "
+            f"AND json_type({v},'$.lifecycle.procedure.title') IS 'text' "
+            f"AND json_type({v},'$.lifecycle.procedure.rule') IS 'text' "
+            f"AND json_type({v},'$.lifecycle.procedure.expires_at') IN ('integer','real') "
+            f"AND json_extract({v},'$.lifecycle.procedure.expires_at') "
+            f"> (julianday('now') - 2440587.5) * 86400.0 "
+            f"AND json_extract({v},'$.lifecycle.procedure.expires_at') "
+            f"< {_PROCEDURE_MAX_EXPIRES!r}))")
 
 
 def _scope_from_json(scope: str) -> MemoryScope:
@@ -256,7 +368,14 @@ class SQLiteMemoryStorage:
                 ORDER BY created DESC,rowid DESC LIMIT ? OFFSET ?)""",
                 (project, SHADOW_PRUNE_BATCH_ROWS, max_rows_per_project))
             db.commit()
-    def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]:
+    def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "", *,
+                 include_inactive_procedures: bool = False) -> list[MemoryRecord]:
+        """Scoped effective rows.
+
+        ``include_inactive_procedures`` is for the #716 lifecycle API only:
+        reviewers read pending rows through it. Every active reader keeps the
+        default, which drops procedural rows that are not servable.
+        """
         fields = asdict(scope)
         clauses, params = [], []
         for name, value in fields.items():
@@ -291,9 +410,38 @@ class SQLiteMemoryStorage:
                   if _scope_applies(record.scope, scope)
                   and not record.value.get("invalidated_at")
                   and not record.value.get("superseded_at")
-                  and not record.value.get("superseded")]
+                  and not record.value.get("superseded")
+                  and (include_inactive_procedures
+                       or procedural_row_servable(record.layer, record.value,
+                                                  key=record.key))]
         terms = set(query.lower().replace('-', ' ').split())
         return sorted(result, key=lambda record: _retrieval_rank(record, terms))
+
+    def compare_and_set(self, writes: list[tuple[MemoryRecord, int]]) -> bool:
+        """Replace each record only if its stored version still equals the expected one.
+
+        All writes commit in one transaction or none do, so a transition that
+        touches two rows (supersession) cannot leave half of itself behind. A
+        concurrent writer that got there first makes this return False.
+        """
+        if not writes:
+            return True
+        with closing(sqlite3.connect(self.path, timeout=5.0)) as db:
+            db.execute("BEGIN IMMEDIATE")
+            for record, expected in writes:
+                if record.layer not in LAYERS:
+                    raise ValueError("unknown memory layer")
+                changed = db.execute(
+                    "UPDATE adr001_memory SET value=?,version=?,created=? "
+                    "WHERE layer=? AND key=? AND scope=? AND version=?",
+                    (json.dumps(record.value), record.version, time.time(),
+                     record.layer, record.key, _canonical_scope_json(record.scope),
+                     expected)).rowcount
+                if changed != 1:
+                    db.rollback()
+                    return False
+            db.commit()
+        return True
 
     def retrieve_shadow(self, scope: MemoryScope, layers: set[str], limit: int,
                         query: str = "", predecessor_task_ids: tuple[str, ...] = (),
@@ -331,7 +479,8 @@ class SQLiteMemoryStorage:
                 + " AND ".join(clauses)
                 + " AND json_extract(value,'$.invalidated_at') IS NULL"
                 + " AND json_extract(value,'$.superseded_at') IS NULL"
-                + " AND COALESCE(json_extract(value,'$.superseded'),0)=0")
+                + " AND COALESCE(json_extract(value,'$.superseded'),0)=0"
+                + " AND " + procedural_servable_sql())
         args = [*sorted(layers), *params]
         uri = Path(self.path).resolve().as_uri() + "?mode=ro"
         connect_started = time.perf_counter()
@@ -407,6 +556,11 @@ class SQLiteMemoryStorage:
                                 version) for layer, key, value, record_scope, version in rows]
         failures = [MemoryRecord(layer, key, json.loads(value), _scope_from_json(record_scope),
                                  version) for layer, key, value, record_scope, version in failure_rows]
+        # The SQL clause in `base` is a coarse prefilter; Python decides (#716).
+        records = [r for r in records
+                   if procedural_row_servable(r.layer, r.value, key=r.key)]
+        failures = [r for r in failures
+                    if procedural_row_servable(r.layer, r.value, key=r.key)]
         scoped = [r for r in records if _scope_applies(r.scope, scope, strict=False)]
         if query.strip():
             terms = set(query.lower().replace('-', ' ').split())
