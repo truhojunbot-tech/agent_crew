@@ -37,7 +37,7 @@ def _worktree_state(tmp_path):
         wt.mkdir()
         (wt / ".git").mkdir()
     state = {
-        "worktrees": {
+        "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {
             "claude": str(wt_claude),
             "codex": str(wt_codex),
             "gemini": str(wt_gemini),

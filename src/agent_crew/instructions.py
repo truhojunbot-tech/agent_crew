@@ -3,7 +3,7 @@ import os
 from agent_crew.prompts.task_loop import build_task_loop_prompt
 from agent_crew.testing_policy import load_scope, render_scope, render_implementer_scope
 from agent_crew.port_validation import require_project_port
-from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
+from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
 
 # Per-role instruction file paths inside each worktree (Issue #110 fix).
 #
@@ -45,7 +45,9 @@ _AGENT_CREW_BLOCK_END = "<!-- agent_crew:end -->"
 # Default agent name per role — used when a caller passes role but not the
 # agent identifier. The agent name is what appears inside the task-loop
 # prompt's `[agent: NAME]` tag and the `get_next_task(agent=...)` arg.
-_DEFAULT_AGENT_FOR_ROLE: dict = DEFAULT_ROLE_TO_AGENT
+# Instruction files are per pane (GEMINI.md is gemini's), so this follows the
+# legacy pane layout, not the default provider (#772: tester = script).
+_DEFAULT_AGENT_FOR_ROLE: dict = {role: agent for agent, role in LEGACY_AGENT_TO_ROLE.items()}
 
 _COMMON = """\
 # Agent Crew — <project>

@@ -7,6 +7,7 @@ E-LO03: crew run --max-iter 2, perpetual rejection → escalation gate after 2 i
 E-LO04: crew run --no-tester → no test task enqueued after approval
 """
 
+import json
 import os
 import pathlib
 import socket
@@ -42,7 +43,11 @@ def live_server(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     db_path = str(tmp_path / "tasks.db")
     port = _find_free_port()
-    app = create_app(db_path)
+    # Stub agents include a stub tester; #772 made the LLM tester opt-in.
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"role_agents": {
+        "implementer": "codex", "reviewer": "claude", "tester": "gemini"}}))
+    app = create_app(db_path, state_path=str(state_path))
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error")
     server = uvicorn.Server(config)

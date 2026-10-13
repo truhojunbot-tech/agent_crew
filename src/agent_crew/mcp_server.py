@@ -51,18 +51,18 @@ from agent_crew.queue import (
     AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
     LateResultRejected, PausedError as _PausedError, TaskQueue,
 )
-from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
+from agent_crew.role_mapping import LEGACY_AGENT_TO_ROLE
 
 logger = logging.getLogger(__name__)
 
 # Default role per agent. The MCP `get_next_task(agent=...)` flow falls
 # back to this when no explicit ``role`` is passed, so each agent picks up
 # tasks of its primary type unless an override redirects work elsewhere.
-# Stays in lockstep with `setup._AGENT_TO_ROLE`; kept here so this module
-# stays free of `setup` import overhead.
-_DEFAULT_ROLE_FOR_AGENT: dict[str, str] = {
-    agent: role for role, agent in DEFAULT_ROLE_TO_AGENT.items()
-}
+# MCP provider polling still needs each provider's role when a project opts
+# into a provider tester. The script tester default is a dispatch choice, not
+# an agent identity; reversing it would remove gemini from this path (#772).
+# Stays in lockstep with `setup._AGENT_TO_ROLE` without importing setup.
+_DEFAULT_ROLE_FOR_AGENT: dict[str, str] = dict(LEGACY_AGENT_TO_ROLE)
 
 
 def _task_to_dict(task: TaskRequest, *, nonce: Optional[str] = None) -> dict[str, Any]:

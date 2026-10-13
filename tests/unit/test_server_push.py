@@ -745,7 +745,8 @@ def test_u_sp22c_gate_approve_dispatches_all_roles_once_panes_recover(tmp_db):
 
     gate_payload = {"id": "gate-sp22c", "type": "approval", "message": "resume"}
 
-    dead_then_alive = [False, False, False, True, True, True]
+    # #772: the test task goes to the script runner, which probes no pane.
+    dead_then_alive = [False, False, True, True]
 
     with patch("agent_crew.server._pane_alive_for_push", side_effect=dead_then_alive):
         with TestClient(app) as client:
@@ -761,10 +762,12 @@ def test_u_sp22c_gate_approve_dispatches_all_roles_once_panes_recover(tmp_db):
             assert resp.json() == {"status": "resolved"}
 
     pushed_ids = {pane_id: text for pane_id, text in push.calls}
-    assert len(push.calls) == 3
+    # #772: the default tester is the script runner; a test task is never
+    # pushed to a provider pane, even when one is mapped.
+    assert len(push.calls) == 2
     assert "impl-sp22c" in pushed_ids["%100"]
     assert "review-sp22c" in pushed_ids["%200"]
-    assert "test-sp22c" in pushed_ids["%300"]
+    assert "%300" not in pushed_ids
 
 
 # U-SP23: POST /gates/{id}/resolve rejected → _try_push_next NOT called

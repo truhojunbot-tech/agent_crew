@@ -11,6 +11,7 @@ import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import agent_crew.server as srv_module
@@ -38,7 +39,9 @@ def _discuss_payload(task_id: str, agent: str = "claude") -> dict:
 # U-DD01: Dispatcher loop dispatches discuss tasks per agent
 # ---------------------------------------------------------------------------
 
-def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path, unused_tcp_port):
+@pytest.mark.parametrize("explicit_tester", [False, True])
+def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(
+        tmp_db, tmp_path, unused_tcp_port, explicit_tester):
     """In dispatcher mode, pending discuss tasks must transition to in_progress
     within seconds — not remain stuck as 'pending' forever.
 
@@ -46,17 +49,19 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path, unused_
     ('implementer','reviewer','tester') and never called
     dequeue_discuss_for_agent, so discuss tasks were never dispatched.
     """
-    worktree_dir = tmp_path / "wt"
-    worktree_dir.mkdir()
-    (worktree_dir / ".git").mkdir()
+    worktrees = {}
+    for agent in ("claude", "codex", "gemini"):
+        worktree_dir = tmp_path / agent
+        worktree_dir.mkdir()
+        (worktree_dir / ".git").mkdir()
+        worktrees[agent] = str(worktree_dir)
 
     state = {
-        "worktrees": {
-            "claude": str(worktree_dir),
-            "codex": str(worktree_dir),
-            "gemini": str(worktree_dir),
-        }
+        "worktrees": worktrees,
     }
+    if explicit_tester:
+        state["role_agents"] = {"implementer": "codex", "reviewer": "claude",
+                                "tester": "gemini"}
     state_file = tmp_path / "state.json"
     state_file.write_text(json.dumps(state))
 
@@ -74,6 +79,7 @@ def test_u_dd01_dispatcher_loop_picks_up_discuss_tasks(tmp_db, tmp_path, unused_
             dispatched_agents.append("codex")
         else:
             dispatched_agents.append("claude")
+        assert kwargs["cwd"] == worktrees[dispatched_agents[-1]]
         proc = MagicMock()
         proc.returncode = 0
         proc.kill = MagicMock()

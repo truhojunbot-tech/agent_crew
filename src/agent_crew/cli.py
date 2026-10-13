@@ -2521,6 +2521,30 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
             create_issue: bool, create_pr: bool, repo: str,
             implementer: str, reviewer: str, auto_merge: bool):
     """Run TASK through the code-review loop."""
+    import urllib.error
+    try:
+        return _run_loop(task, db, project, allow_cross_project, base, max_iter, no_tester,
+                         branch, risk_tier, issue, artifact_kind, timeout, create_issue,
+                         create_pr, repo, implementer, reviewer, auto_merge)
+    except urllib.error.HTTPError as exc:
+        # #772: a 409 from enqueue_* means the server already owns (or refused)
+        # that successor. Stop the loop with a message, not a traceback.
+        if exc.code != 409:
+            raise
+        try:
+            detail = exc.read().decode(errors="replace")[:300]
+        except Exception:  # noqa: BLE001
+            detail = ""
+        click.echo(f"❌ Server answered 409 Conflict to a task enqueue ({exc.url}): "
+                   f"{detail or exc.reason}. Stopping the run loop; the server "
+                   "owns the existing task.")
+
+
+def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base: str,
+              max_iter: int, no_tester: bool, branch: str, risk_tier: int | None,
+              issue: int | None, artifact_kind: str | None, timeout: int,
+              create_issue: bool, create_pr: bool, repo: str,
+              implementer: str, reviewer: str, auto_merge: bool):
     if not task.strip():
         raise click.UsageError("task must not be empty")
 
@@ -3180,6 +3204,16 @@ def run_cmd(task: str, db: str, project: str, allow_cross_project: bool, base: s
                 test_result = _wait(test_id)
                 test_elapsed = int(time.time() - test_start)
                 test_outcome = handle_test_result(test_result)
+                _script = ((getattr(test_result, "error_info", None) or {}).get("script_test")
+                           if isinstance(getattr(test_result, "error_info", None), dict) else None)
+                if test_outcome == "needs_human" and isinstance(_script, dict):
+                    # #772: the suite did not judge this PR (no command, or it
+                    # could not run). Never auto-pass, never re-implement.
+                    click.echo(
+                        f"[{iteration}/{max_iter}] ⏸ test stage {_script.get('outcome')}: "
+                        f"{test_result.summary}; PR #{_loop_pr_number or '?'} left for the "
+                        "coordinator gate.")
+                    return
                 if test_outcome == "passed":
                     _loop_pr_number = _loop_pr_number or getattr(test_result, "pr_number", None)
                     if _run_port:

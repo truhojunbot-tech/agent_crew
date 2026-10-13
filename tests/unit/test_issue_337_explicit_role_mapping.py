@@ -69,7 +69,8 @@ def test_malformed_explicit_mapping_warns_and_preserves_legacy_resolution(caplog
 
     mapping, source = effective_role_mapping(state, project="demo")
 
-    assert mapping == {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}
+    # #772: the unset tester role takes the default, now the script tester.
+    assert mapping == {"implementer": "codex", "reviewer": "claude", "tester": "script"}
     assert source == "legacy state.json.roles"
     assert "demo" in caplog.text
     assert "role_agents" in caplog.text

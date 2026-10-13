@@ -14,6 +14,28 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
+def _gemini_tester_state(tmp_db):
+    """These cases cover the kept LLM-tester path; #772 made it opt-in."""
+    path = f"{tmp_db}.state.json"
+    with open(path, "w") as f:
+        json.dump({"role_agents": {"implementer": "codex", "reviewer": "claude",
+                                   "tester": "gemini"}}, f)
+    return path
+
+
+def test_script_tester_is_not_skipped_by_a_gemini_cooldown(tmp_db, cooldown):
+    cooldown("gemini", time.time() + 3600)
+    queue = TaskQueue(tmp_db)
+    review = "review-script"
+    queue.enqueue(TaskRequest(task_id=review, task_type="review",
+                              description="review", branch="topic"))
+    queue.submit_result(review, TaskResult(review, "completed", "approved",
+                                          verdict="approve", findings=[]))
+    assert auto_enqueue_test(queue, review) == f"test-{review}"
+    assert "post_recovery_verification" not in queue.get_task_context(f"test-{review}")
+    assert "test_stage_skip" not in queue.get_task_context(review)
+
+
 @pytest.fixture
 def cooldown(tmp_path, monkeypatch):
     path = tmp_path / "cooldown.json"
@@ -57,15 +79,15 @@ def test_gemini_cooldown_skips_test_with_note(tmp_db, cooldown, monkeypatch):
                               description="review", branch="topic"))
     queue.submit_result(review, TaskResult(review, "completed", "approved",
                                           verdict="approve", findings=[]))
-    assert auto_enqueue_test(queue, review) is None
+    assert auto_enqueue_test(queue, review, tester_agent="gemini") is None
     deferred = f"test-{review}"
     assert queue.get_task_status(deferred) == "pending"
     assert queue.get_task_context(deferred)["post_recovery_verification"] is True
     assert queue.get_task_context(review)["test_stage_skip"]["reason"] == (
         "gemini tester stage not run (provider limit)")
-    assert auto_enqueue_test(queue, review) is None
+    assert auto_enqueue_test(queue, review, tester_agent="gemini") is None
     assert len([task for task in queue.list_tasks() if task.task_type == "test"]) == 1
-    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True)
+    app = create_app(tmp_db, pane_map={}, state_path=_gemini_tester_state(tmp_db), watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         task = queue.dequeue(role="tester")
         assert task is not None and task.task_id == deferred
@@ -88,14 +110,16 @@ def test_skipped_pr_test_is_queued_before_merge_for_pinned_verification(
                                  "reviewed_sha": "a" * 40}))
     queue.submit_result(review, TaskResult(review, "completed", "approved",
                                           verdict="approve", findings=[]))
-    assert auto_enqueue_test(queue, review, pr_state_fn=lambda _number: "open") is None
+    assert auto_enqueue_test(queue, review, pr_state_fn=lambda _number: "open",
+                             tester_agent="gemini") is None
     deferred = f"test-{review}"
     assert queue.get_task_status(deferred) == "pending"
     context = queue.get_task_context(deferred)
     assert context["pr_number"] == 42
     assert context["reviewed_sha"] == "a" * 40
     assert context["post_recovery_verification"] is True
-    assert auto_enqueue_test(queue, review, pr_state_fn=lambda _number: "open") is None
+    assert auto_enqueue_test(queue, review, pr_state_fn=lambda _number: "open",
+                             tester_agent="gemini") is None
     assert len([task for task in queue.list_tasks() if task.task_type == "test"]) == 1
 
 
@@ -111,7 +135,7 @@ def test_queued_test_becomes_deferred_verification(tmp_db, cooldown, monkeypatch
     queue.enqueue(TaskRequest(task_id=queued, task_type="test",
                               description="test", branch="topic",
                               context={"prev_task_id": review}))
-    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True, anomaly_disabled=True)
+    app = create_app(tmp_db, pane_map={}, state_path=_gemini_tester_state(tmp_db), watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app):
         task = queue.dequeue(role="tester")
         assert task is not None

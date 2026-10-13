@@ -88,10 +88,13 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
 from agent_crew.queue import CANCEL_REASON_STALE_LEASE as _CANCEL_REASON_STALE_LEASE
 from agent_crew import claude_cloud as _claude_cloud
+from agent_crew import script_tester as _script_tester
 from agent_crew import contract_emit as _contract_emit
 from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.cea import wiring as cea_wiring
-from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, effective_role_mapping
+from agent_crew.role_mapping import (
+    DEFAULT_ROLE_TO_AGENT, EXPLICIT_SOURCE, LEGACY_AGENT_TO_ROLE, effective_role_mapping,
+)
 from agent_crew.risk_tier import risk_declaration as _risk_declaration
 from agent_crew.testing_policy import (
     effective_scope as _effective_scope,
@@ -1253,7 +1256,7 @@ def _review_result_is_actionable(result) -> bool:
 
 
 _DEFAULT_ROLE_TO_AGENT = dict(DEFAULT_ROLE_TO_AGENT)
-_DEFAULT_AGENT_TO_ROLE = {v: k for k, v in _DEFAULT_ROLE_TO_AGENT.items()}
+_DEFAULT_AGENT_TO_ROLE = dict(LEGACY_AGENT_TO_ROLE)
 
 
 # Tags that mean "retryable in the next few minutes" (server-side load-shed).
@@ -2312,6 +2315,29 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
         return result
     except Exception:
         logger.exception("_load_worktree_map: failed to read state.json")
+        return {}
+
+
+def _load_discuss_worktrees(state_path: Optional[str]) -> dict[str, str]:
+    """Resolve each provider's own checkout, independent of role assignment."""
+    if not state_path or not os.path.exists(state_path):
+        return {}
+    try:
+        with open(state_path) as file:
+            state = json.load(file)
+        worktrees = state.get("worktrees") or {}
+        result = {agent: path for agent, path in worktrees.items()
+                  if isinstance(agent, str) and isinstance(path, str) and path}
+        by_agent: dict[str, set[str]] = {}
+        for entry in state.get("roles") or []:
+            if isinstance(entry, dict) and entry.get("agent") and entry.get("worktree"):
+                by_agent.setdefault(entry["agent"], set()).add(entry["worktree"])
+        for agent, paths in by_agent.items():
+            if agent not in result and len(paths) == 1:
+                result[agent] = next(iter(paths))
+        return result
+    except (OSError, ValueError, AttributeError, TypeError):
+        logger.exception("_load_discuss_worktrees: failed to read %s", state_path)
         return {}
 
 
@@ -4151,6 +4177,15 @@ def create_app(
             logger.debug(f"_try_push_next: replay 중 — push skip (role={role})")
             return
         logger.debug(f"_try_push_next: role={role}")
+        # #772: a script tester has no pane and needs no delivery channel. The
+        # headless dispatcher runs it through `_dispatch_task` instead.
+        if role == "tester" and _script_tester_active():
+            if not _dispatcher_enabled:
+                worker = threading.Thread(target=_drain_script_tests, daemon=True,
+                                          name="agent-crew-script-test")
+                app.state.script_test_thread = worker
+                worker.start()
+            return
         if not _push_enabled:
             logger.warning(
                 f"_try_push_next: AGENT_CREW_DELIVERY={_delivery_raw!r} — tmux push disabled. "
@@ -4592,7 +4627,36 @@ def create_app(
         # refresh an older dispatcher row's activity. Expire a displaced row
         # immediately, or an idle row after its live-process leash, even when
         # no pane reminder was delivered.
+        script_claims: set[str] = set()
         for row in rows:
+            if (row["task_type"] == "test" and
+                    row.get("dispatch_agent") == _script_tester.SCRIPT_TESTER and
+                    row.get("dispatch_target") == "script_tester"):
+                task_id = row["task_id"]
+                script_claims.add(task_id)
+                # A failing head runs the same suite again on base. Bound both
+                # runs and checkout setup, regardless of pane/dispatcher claim.
+                stored_timeout = (row.get("context") or {}).get("script_test_timeout_s")
+                state = {"test_timeout_s": stored_timeout} if stored_timeout is not None else {}
+                if stored_timeout is None and state_path and os.path.exists(state_path):
+                    try:
+                        with open(state_path) as file:
+                            state = json.load(file)
+                    except (OSError, ValueError):
+                        logger.exception("watchdog: could not read script test config")
+                budget = _script_tester.watchdog_timeout_seconds(state, timeout_seconds)
+                last_activity = max(row["last_activity_at"],
+                                    row.get("last_heartbeat_at") or 0.0,
+                                    row.get("dispatched_at") or 0.0) or now
+                idle_for = max(0.0, now - last_activity)
+                if idle_for >= budget and _fail_if_active(
+                        task_id, "watchdog_script_test_timeout", status="timed_out",
+                        details={"idle_seconds": round(idle_for, 1),
+                                 "threshold_seconds": budget}):
+                    actions["timed_out"].append(task_id)
+                    watchdog_expiry_counts["script_test_timeout"] = (
+                        watchdog_expiry_counts.get("script_test_timeout", 0) + 1)
+                continue
             if row.get("claim_source") != "dispatcher":
                 continue
             task_id = row["task_id"]
@@ -4631,7 +4695,7 @@ def create_app(
             return actions
 
         for row in rows:
-            if row.get("claim_source") == "dispatcher":
+            if row.get("claim_source") == "dispatcher" or row["task_id"] in script_claims:
                 continue
             task_id = row["task_id"]
             pane_id = _resolve_pane_for_row(row)
@@ -4919,6 +4983,73 @@ def create_app(
     # hardcoded default (codex/claude/gemini). This is what lets the same
     # agent serve multiple roles (e.g. claude implementer + claude reviewer).
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
+    _DISPATCH_DISCUSS_WORKTREES = _load_discuss_worktrees(state_path)
+
+    # #772: the test stage is a deterministic script, not a provider call.
+    # One run at a time per server: suites share the repo's object store and
+    # the base-result cache.
+    _script_test_lock = threading.Lock()
+
+    def _script_tester_active() -> bool:
+        return _DISPATCH_ROLE_TO_AGENT.get("tester") == _script_tester.SCRIPT_TESTER
+
+    def _run_script_test_task(task: TaskRequest) -> None:
+        """Run one claimed test task by script and submit it like any result."""
+        state = {}
+        if state_path and os.path.exists(state_path):
+            try:
+                with open(state_path) as f:
+                    state = json.load(f)
+            except (OSError, ValueError):
+                logger.exception("script test: could not read %s", state_path)
+        # Same P2 DISPATCH → EXECUTE_START → RESULT receipts as a pane or a
+        # subprocess; the executor is this server, not a provider.
+        try:
+            nonce = q().record_dispatch(task.task_id, channel="api",
+                                        agent=_script_tester.SCRIPT_TESTER,
+                                        target="script_tester",
+                                        context_patch={"script_test_timeout_s":
+                                                       _script_tester.resolve_test_config(
+                                                           state, "")[1]})
+        except AdmissionRefused as exc:
+            logger.warning("script test: dispatch refused for %s — %s", task.task_id, exc)
+            return
+        if nonce:
+            started = q().start_execution(task.task_id, nonce,
+                                          presenter=_script_tester.SCRIPT_TESTER)
+            if isinstance(started, dict) and started.get("go") is False:
+                logger.warning("script test: start refused for %s — %s", task.task_id,
+                               started.get("reason"))
+                return
+        result = _script_tester.execute_test_task(
+            task, repo=_any_worktree_path(), state=state,
+            cache_dir=os.path.join(os.path.dirname(db_path), "script_test_cache"))
+        q().patch_context(task.task_id, {"script_test": result.error_info["script_test"]})
+        logger.info("script test: task=%s status=%s %s", task.task_id, result.status,
+                    result.summary)
+        if nonce:
+            result.executor_binding = {"nonce": nonce, "presenter": _script_tester.SCRIPT_TESTER}
+        submit_result(task.task_id, result,
+                      x_agent_crew_project=_server_identity()["project"])
+
+    def _drain_script_tests() -> None:
+        if not _script_test_lock.acquire(blocking=False):
+            return
+        try:
+            while True:
+                task = q().dequeue(agent=_script_tester.SCRIPT_TESTER, role="tester", claimed_via="script_tester",
+                                   claim_source="script_tester")
+                if task is None:
+                    return
+                try:
+                    _run_script_test_task(task)
+                except Exception:
+                    logger.exception("script test: task %s raised", task.task_id)
+                    _fail_if_active(task.task_id, "script_test_exception")
+        finally:
+            _script_test_lock.release()
+
+    app.state.drain_script_tests = _drain_script_tests
 
     # task_id → transient retry count, used to decide whether an upstream
     # 429 (claude throttle / gemini capacity-exhausted) gets requeued or
@@ -5013,6 +5144,13 @@ def create_app(
         ``_dispatch_task`` (to actually run it). Both callers resolving via
         the same function means they can never disagree about the target.
         """
+        if task.task_type == "discuss":
+            ctx = task.context if isinstance(task.context, dict) else {}
+            agent = (ctx.get("agent") or "").strip().lower()
+            wt = (_DISPATCH_DISCUSS_WORKTREES.get(agent) or
+                  _agent_worktree(worktree_map, agent, role,
+                                  role_to_agent=_DISPATCH_ROLE_TO_AGENT))
+            return agent, wt or None
         agent = _DISPATCH_ROLE_TO_AGENT.get(role, "claude")
         wt_override: Optional[str] = None
         _ctx = task.context if isinstance(task.context, dict) else {}
@@ -5076,6 +5214,13 @@ def create_app(
         agent, wt = _resolve_dispatch_target(task, role)
         if dispatch_agent is not None:
             agent = dispatch_agent
+        if task.task_type == "test" and agent == _script_tester.SCRIPT_TESTER:
+            # #772: before any provider cooldown or spawn — no provider runs here.
+            def _locked_script_test() -> None:
+                with _script_test_lock:
+                    _run_script_test_task(task)
+            await asyncio.to_thread(_locked_script_test)
+            return
         if _honor_provider_cooldown(task, agent):
             return
         if _override and _override != _DISPATCH_ROLE_TO_AGENT.get(role, "claude"):
@@ -6520,7 +6665,9 @@ def create_app(
             if _agent and _agent not in _workers:
                 _workers.append(_agent)
         # discuss 는 role 매핑에 없는 agent 로도 올 수 있다.
-        _discuss_workers = list(dict.fromkeys(_workers + ["claude", "codex", "gemini"]))
+        _discuss_workers = list(dict.fromkeys(
+            [worker for worker in _workers if worker != _script_tester.SCRIPT_TESTER]
+            + ["claude", "codex", "gemini"]))
 
         # ⭐dispatcher 가 **실제로 들고 있는 lease**. orphan 판정의 권위다 —
         #   `in_progress` 인데 여기 없으면 주인이 사라진 task 다(GET /tasks/orphans).
@@ -6708,7 +6855,7 @@ def create_app(
                                                               claim_source="dispatcher")
                         if task is None:
                             continue
-                        role = _AGENT_TO_ROLES.get(agent, ["implementer"])[0]
+                        role = _AGENT_TO_ROLES.get(agent, [_DEFAULT_AGENT_TO_ROLE.get(agent, "")])[0]
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
                         _slot = _target_agent or agent
                         if _slot in active_workers:
@@ -6825,6 +6972,7 @@ def create_app(
             server_project=project,
             repo=repo,
             repo_cwd=_any_worktree_path(),
+            tester_agent=_DISPATCH_ROLE_TO_AGENT.get("tester"),
         )
         if test_id:
             _try_push_next("tester")
@@ -8190,7 +8338,10 @@ def create_app(
         else:
             # Failure handling: rate-limit → reroute via fallback chain (#81),
             # otherwise auto-retry the same role up to MAX_RETRIES.
-            if result.status == "failed":
+            # #772: re-running a deterministic script repeats the same verdict.
+            if result.status == "failed" and _script_tester.is_script_test_result(result):
+                logger.info(f"POST /tasks/{task_id}/result: script test failed; no retry")
+            elif result.status == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
                 if not _auto_fallback_failed_task(task_id, result, task_type):
                     _auto_retry_failed_task(task_id, result, task_type)
