@@ -2965,6 +2965,13 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
             _run_port = _pstate.get("port", 0)
             _run_worktrees = _pstate.get("worktrees", {})
             _run_role_to_agent, _ = effective_role_mapping(_pstate, project=project)
+    for option, chosen in (("--implementer", implementer), ("--reviewer", reviewer)):
+        if chosen and chosen not in _run_role_to_agent.values():
+            raise click.ClickException(
+                f"{option} {chosen!r} has no claimable role on this server; "
+                f"role map: {_run_role_to_agent}")
+    if implementer and reviewer and implementer == reviewer:
+        raise click.ClickException("--reviewer must differ from --implementer")
 
     # Fast server liveness check — avoid the 70+ second task-wait timeout when
     # the server is simply not running (crashed or not yet started).
@@ -3053,8 +3060,13 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
     impl_context = {**_CM, **run_branch_context, **risk_context, **issue_context,
                     **artifact_context,
                     "sync_landed_bases": _sync_landed_bases}
+    if repo:
+        impl_context["repo"] = repo
     if implementer:
         impl_context["agent_override"] = implementer
+        impl_context["implementer_agent"] = implementer
+    if reviewer:
+        impl_context["reviewer_agent"] = reviewer
     if no_tester:
         impl_context["no_tester"] = True
 
@@ -3108,9 +3120,14 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
         except (AttributeError, KeyError):
             pass
 
-        review_context = {**_CM, **risk_context}
+        review_context = {**_CM, **risk_context, **issue_context, **run_branch_context}
+        if repo:
+            review_context["repo"] = repo
         if reviewer:
             review_context["agent_override"] = reviewer
+            review_context["reviewer_agent"] = reviewer
+        if implementer:
+            review_context["implementer_agent"] = implementer
         if no_tester:
             review_context["no_tester"] = True
         if _loop_pr_number:
