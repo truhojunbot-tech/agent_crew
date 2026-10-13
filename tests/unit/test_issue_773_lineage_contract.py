@@ -208,6 +208,53 @@ def test_console_fallback_does_not_mark_notice_delivered(tmp_db, monkeypatch):
     assert len(console) == 1
 
 
+def test_never_delivered_notice_gives_up_after_bounded_attempts(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    _root(queue)
+    attempts = []
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True, identity_required=False,
+                     coordinator_notify_fn=lambda message: attempts.append(message) or False)
+    with TestClient(app):
+        app.state.coordinator_notice("impl-773", "missing_result", "first")
+        for tick in range(50):
+            app.state.watchdog_tick(2000 + tick)
+    with sqlite3.connect(tmp_db) as db:
+        events = [row[0] for row in db.execute(
+            "SELECT event FROM task_exec_events WHERE task_id='impl-773' "
+            "AND event LIKE 'coordinator_notice%' ORDER BY event_id")]
+    assert len(attempts) == 3
+    assert events.count("coordinator_notice") == 3
+    assert events.count("coordinator_notice_failed") == 3
+    assert events.count("coordinator_notice_gave_up") == 1
+    assert queue.retryable_coordinator_notices() == []
+    assert not queue.claim_coordinator_notice("impl-773", "missing_result")
+
+
+def test_preupgrade_failed_notice_history_is_closed_without_resend(tmp_db, monkeypatch):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    queue = TaskQueue(tmp_db)
+    _root(queue)
+    with sqlite3.connect(tmp_db) as db:
+        for _ in range(3):
+            for event in ("coordinator_notice", "coordinator_notice_failed"):
+                db.execute("INSERT INTO task_exec_events(task_id,event,at,fields) "
+                           "VALUES('impl-773', ?, 1000, ?)",
+                           (event, json.dumps({"kind": "missing_result"})))
+    attempts = []
+    app = create_app(tmp_db, pane_map={}, watchdog_disabled=True,
+                     anomaly_disabled=True, identity_required=False,
+                     coordinator_notify_fn=lambda msg: attempts.append(msg) or False)
+    with TestClient(app):
+        app.state.watchdog_tick(2000)
+        app.state.watchdog_tick(2001)
+    assert attempts == []
+    with sqlite3.connect(tmp_db) as db:
+        assert db.execute("SELECT COUNT(*) FROM task_exec_events WHERE task_id='impl-773' "
+                          "AND event='coordinator_notice_gave_up'").fetchone()[0] == 1
+
+
 def test_pane_timeout_notice_omits_captured_tail(tmp_db, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
     queue = TaskQueue(tmp_db)

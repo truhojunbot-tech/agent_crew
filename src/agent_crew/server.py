@@ -3687,11 +3687,11 @@ def create_app(
                 delivered = bool(notify_telegram(message))
                 if not delivered:
                     notify_console(message)
-            q().finish_coordinator_notice(task_id, kind, delivered=delivered)
+            retryable = q().finish_coordinator_notice(task_id, kind, delivered=delivered)
             claimed = False
             if not delivered:
-                logger.warning("coordinator notice delivery failed task=%s kind=%s; retryable",
-                               task_id, kind)
+                logger.warning("coordinator notice delivery failed task=%s kind=%s; %s",
+                               task_id, kind, "retryable" if retryable else "gave up")
         except Exception:
             logger.exception("coordinator notice failed task=%s kind=%s", task_id, kind)
             if claimed:
