@@ -2318,6 +2318,29 @@ def _load_worktree_map(state_path: Optional[str]) -> dict[str, str]:
         return {}
 
 
+def _load_discuss_worktrees(state_path: Optional[str]) -> dict[str, str]:
+    """Resolve each provider's own checkout, independent of role assignment."""
+    if not state_path or not os.path.exists(state_path):
+        return {}
+    try:
+        with open(state_path) as file:
+            state = json.load(file)
+        worktrees = state.get("worktrees") or {}
+        result = {agent: path for agent, path in worktrees.items()
+                  if isinstance(agent, str) and isinstance(path, str) and path}
+        by_agent: dict[str, set[str]] = {}
+        for entry in state.get("roles") or []:
+            if isinstance(entry, dict) and entry.get("agent") and entry.get("worktree"):
+                by_agent.setdefault(entry["agent"], set()).add(entry["worktree"])
+        for agent, paths in by_agent.items():
+            if agent not in result and len(paths) == 1:
+                result[agent] = next(iter(paths))
+        return result
+    except (OSError, ValueError, AttributeError, TypeError):
+        logger.exception("_load_discuss_worktrees: failed to read %s", state_path)
+        return {}
+
+
 def _load_role_to_agent_with_source(state_path: Optional[str]) -> tuple[dict[str, str], str]:
     """Load the effective provider-neutral mapping and its source label."""
     if not state_path or not os.path.exists(state_path):
@@ -4604,7 +4627,36 @@ def create_app(
         # refresh an older dispatcher row's activity. Expire a displaced row
         # immediately, or an idle row after its live-process leash, even when
         # no pane reminder was delivered.
+        script_claims: set[str] = set()
         for row in rows:
+            if (row["task_type"] == "test" and
+                    (row.get("claim_source") == "script_tester" or
+                     (row.get("claim_source") == "dispatcher" and _script_tester_active()))):
+                task_id = row["task_id"]
+                script_claims.add(task_id)
+                # A failing head runs the same suite again on base. Bound both
+                # runs and checkout setup, regardless of pane/dispatcher claim.
+                stored_timeout = (row.get("context") or {}).get("script_test_timeout_s")
+                state = {"test_timeout_s": stored_timeout} if stored_timeout is not None else {}
+                if stored_timeout is None and state_path and os.path.exists(state_path):
+                    try:
+                        with open(state_path) as file:
+                            state = json.load(file)
+                    except (OSError, ValueError):
+                        logger.exception("watchdog: could not read script test config")
+                budget = _script_tester.watchdog_timeout_seconds(state, timeout_seconds)
+                last_activity = max(row["last_activity_at"],
+                                    row.get("last_heartbeat_at") or 0.0,
+                                    row.get("dispatched_at") or 0.0) or now
+                idle_for = max(0.0, now - last_activity)
+                if idle_for >= budget and _fail_if_active(
+                        task_id, "watchdog_script_test_timeout", status="timed_out",
+                        details={"idle_seconds": round(idle_for, 1),
+                                 "threshold_seconds": budget}):
+                    actions["timed_out"].append(task_id)
+                    watchdog_expiry_counts["script_test_timeout"] = (
+                        watchdog_expiry_counts.get("script_test_timeout", 0) + 1)
+                continue
             if row.get("claim_source") != "dispatcher":
                 continue
             task_id = row["task_id"]
@@ -4643,7 +4695,7 @@ def create_app(
             return actions
 
         for row in rows:
-            if row.get("claim_source") == "dispatcher":
+            if row.get("claim_source") == "dispatcher" or row["task_id"] in script_claims:
                 continue
             task_id = row["task_id"]
             pane_id = _resolve_pane_for_row(row)
@@ -4931,6 +4983,7 @@ def create_app(
     # hardcoded default (codex/claude/gemini). This is what lets the same
     # agent serve multiple roles (e.g. claude implementer + claude reviewer).
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
+    _DISPATCH_DISCUSS_WORKTREES = _load_discuss_worktrees(state_path)
 
     # #772: the test stage is a deterministic script, not a provider call.
     # One run at a time per server: suites share the repo's object store and
@@ -4954,7 +5007,10 @@ def create_app(
         try:
             nonce = q().record_dispatch(task.task_id, channel="api",
                                         agent=_script_tester.SCRIPT_TESTER,
-                                        target="script_tester")
+                                        target="script_tester",
+                                        context_patch={"script_test_timeout_s":
+                                                       _script_tester.resolve_test_config(
+                                                           state, "")[1]})
         except AdmissionRefused as exc:
             logger.warning("script test: dispatch refused for %s — %s", task.task_id, exc)
             return
@@ -5088,6 +5144,13 @@ def create_app(
         ``_dispatch_task`` (to actually run it). Both callers resolving via
         the same function means they can never disagree about the target.
         """
+        if task.task_type == "discuss":
+            ctx = task.context if isinstance(task.context, dict) else {}
+            agent = (ctx.get("agent") or "").strip().lower()
+            wt = (_DISPATCH_DISCUSS_WORKTREES.get(agent) or
+                  _agent_worktree(worktree_map, agent, role,
+                                  role_to_agent=_DISPATCH_ROLE_TO_AGENT))
+            return agent, wt or None
         agent = _DISPATCH_ROLE_TO_AGENT.get(role, "claude")
         wt_override: Optional[str] = None
         _ctx = task.context if isinstance(task.context, dict) else {}
@@ -6602,7 +6665,9 @@ def create_app(
             if _agent and _agent not in _workers:
                 _workers.append(_agent)
         # discuss 는 role 매핑에 없는 agent 로도 올 수 있다.
-        _discuss_workers = list(dict.fromkeys(_workers + ["claude", "codex", "gemini"]))
+        _discuss_workers = list(dict.fromkeys(
+            [worker for worker in _workers if worker != _script_tester.SCRIPT_TESTER]
+            + ["claude", "codex", "gemini"]))
 
         # ⭐dispatcher 가 **실제로 들고 있는 lease**. orphan 판정의 권위다 —
         #   `in_progress` 인데 여기 없으면 주인이 사라진 task 다(GET /tasks/orphans).
@@ -6790,7 +6855,7 @@ def create_app(
                                                               claim_source="dispatcher")
                         if task is None:
                             continue
-                        role = _AGENT_TO_ROLES.get(agent, ["implementer"])[0]
+                        role = _AGENT_TO_ROLES.get(agent, [_DEFAULT_AGENT_TO_ROLE.get(agent, "")])[0]
                         _target_agent, _target_wt = _resolve_dispatch_target(task, role)
                         _slot = _target_agent or agent
                         if _slot in active_workers:

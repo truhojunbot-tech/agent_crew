@@ -3,8 +3,10 @@
 import asyncio
 import json
 import os
+import sqlite3
 import subprocess
 import sys
+import time
 import urllib.error
 from unittest.mock import patch
 
@@ -118,6 +120,27 @@ def test_pre_existing_failures_only_pass_with_list_and_cache(project, tmp_path):
     assert again["pre_existing"] == record["pre_existing"]
 
 
+def test_spaced_parametrized_id_is_not_mistaken_for_pre_existing(project, tmp_path):
+    base = {"tests/test_cases.py": (
+        'import pytest\n@pytest.mark.parametrize("case", ["a b", "a c"])\n'
+        'def test_case(case):\n    assert case != "a b"\n')}
+    head = {"tests/test_cases.py": (
+        'import pytest\n@pytest.mark.parametrize("case", ["a b", "a c"])\n'
+        'def test_case(case):\n    assert False\n')}
+    repo, head_sha = project(base, head)
+    result = _execute(repo, head_sha, tmp_path)
+    record = result.error_info["script_test"]
+    assert result.status == "failed"
+    assert record["pre_existing"] == ["tests/test_cases.py::test_case[a b]"]
+    assert record["new_failures"] == ["tests/test_cases.py::test_case[a c]"]
+
+
+def test_failure_parser_keeps_separator_inside_param_id():
+    text = "FAILED tests/test_x.py::test_case[a - b] - AssertionError: bad - detail\n"
+    _, ids = script_tester.parse_test_output(text)
+    assert ids == ["tests/test_x.py::test_case[a - b]"]
+
+
 def test_collection_abort_shared_with_base_is_not_a_pass(project, tmp_path):
     broken = {"tests/test_a.py": "def test_one():\n    assert True\n",
               "tests/test_bad.py": "import does_not_exist\n"}
@@ -201,6 +224,40 @@ def test_gemini_is_not_the_default_tester():
     assert DEFAULT_ROLE_TO_AGENT["tester"] == script_tester.SCRIPT_TESTER
 
 
+@pytest.mark.parametrize("claim_source", ["dispatcher", "script_tester"])
+def test_watchdog_uses_two_suite_timeouts_for_running_script_test(
+        tmp_path, monkeypatch, claim_source):
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({"test_timeout_s": 1200}))
+    db = str(tmp_path / "tasks.db")
+    queue = TaskQueue(db)
+    queue.enqueue(TaskRequest(task_id=f"test-{claim_source}", task_type="test",
+                              description="script test", branch="main"))
+    started_at = time.time()
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE tasks SET status='in_progress', claim_source=?, "
+            "last_activity_at=?, dispatched_at=?, lease_owner=? WHERE task_id=?",
+            (claim_source, started_at, started_at,
+             "script:pid:1" if claim_source == "dispatcher" else None,
+             f"test-{claim_source}"))
+    queue.patch_context(f"test-{claim_source}", {"script_test_timeout_s": 1200})
+    # The running suite uses the config captured at dispatch, even if the
+    # project state is edited while it runs.
+    state_path.write_text(json.dumps({"test_timeout_s": 1}))
+    app = create_app(db, pane_map={"tester": "%3"} if claim_source == "dispatcher" else {},
+                     state_path=str(state_path),
+                     timeout_seconds=900, watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        early = app.state.watchdog_tick(started_at + 901)
+        assert early["timed_out"] == []
+        assert queue.get_task_status(f"test-{claim_source}") == "in_progress"
+        late = app.state.watchdog_tick(started_at + 3001)
+        assert late["timed_out"] == [f"test-{claim_source}"]
+
+
 # ── server: the real test-stage path, with provider calls counted ───────────
 
 @pytest.fixture
@@ -253,6 +310,7 @@ def test_server_runs_test_stage_by_script_and_merges_on_pass(project, server):
     done = _run_through_push_path(app, queue, _task(head))
     assert done.status == "completed"
     assert queue.get_task_context(done.task_id)["script_test"]["counts"] == {"passed": 2}
+    assert queue.get_task_context(done.task_id)["script_test_timeout_s"] == 1800
     assert (pushes, spawns) == ([], [])          # 0 provider calls
     assert merges == [f"merge:pr:{PR}"]
 

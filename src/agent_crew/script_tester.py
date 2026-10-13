@@ -44,7 +44,7 @@ SKIPPED_NO_TEST_COMMAND = "SKIPPED_NO_TEST_COMMAND"
 SETUP_ERROR = "SETUP_ERROR"
 
 _OUTPUT_TAIL_CHARS = 4000
-_ID_RE = re.compile(r"^(?:FAILED|ERROR) (\S+)", re.MULTILINE)
+_ID_RE = re.compile(r"^(?:FAILED|ERROR) (.+)$")
 _COUNT_RE = re.compile(
     r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed|deselected)\b")
 _TEST_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
@@ -105,7 +105,26 @@ def resolve_test_config(state: Optional[Mapping], checkout: str) -> tuple[Option
 
 def parse_test_output(text: str) -> tuple[dict, list]:
     """Pytest summary counts and failing node ids (``FAILED``/``ERROR`` lines)."""
-    ids = list(dict.fromkeys(_ID_RE.findall(text or "")))
+    ids = []
+    for line in (text or "").splitlines():
+        match = _ID_RE.match(line)
+        if not match:
+            continue
+        # The pytest summary separates a node id from its reason with " - ".
+        # A parametrized id can contain both spaces and that separator inside
+        # brackets, so split only after the closing bracket.
+        entry = match.group(1)
+        depth = 0
+        for index, char in enumerate(entry):
+            if char == "[":
+                depth += 1
+            elif char == "]" and depth:
+                depth -= 1
+            elif depth == 0 and entry.startswith(" - ", index):
+                entry = entry[:index]
+                break
+        if entry and entry not in ids:
+            ids.append(entry)
     counts: dict = {}
     for line in reversed((text or "").splitlines()):
         found = _COUNT_RE.findall(line)
@@ -115,6 +134,12 @@ def parse_test_output(text: str) -> tuple[dict, list]:
                 counts[kind] = int(number)
             break
     return counts, ids
+
+
+def watchdog_timeout_seconds(state: Optional[Mapping], ordinary_timeout_s: float) -> float:
+    """Bound both possible suite runs, plus fetch/checkout setup time."""
+    _, suite_timeout_s = resolve_test_config(state, "")
+    return max(ordinary_timeout_s, 2 * suite_timeout_s + 600.0)
 
 
 def test_environment(checkout: str, state: Optional[Mapping]) -> dict[str, str]:
