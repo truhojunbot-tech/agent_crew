@@ -1,12 +1,15 @@
 """#342(A): required-context recall is nullable evidence, never a guess."""
 import json
-import sys
 from pathlib import Path
 
 import jsonschema
 
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+
+QUOTA_CORE_SCHEMA_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "quota_core_evidence_schema_4d8aa06.json"
+)
 
 
 def test_context_pack_observation_maps_healthy_degraded_and_absent_to_tri_state():
@@ -57,15 +60,15 @@ def test_context_evidence_has_quota_core_required_shape(tmp_db):
         "uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
         "output_tokens", "reasoning_tokens",
     }
-    quota_core = Path("/home/truhojun/alfred/repos/quota-core")
-    sys.path.insert(0, str(quota_core))
-    try:
-        from quota_core.context_economics.policy import policy_contract_schema
-        quality_evidence = {key: value for key, value in evidence.items()
-                            if key != "risk_declaration"}
-        jsonschema.validate(quality_evidence, policy_contract_schema()["properties"]["evidence"])
-    finally:
-        sys.path.remove(str(quota_core))
+    # Validate against the vendored quota-core 4d8aa06 schema (#765), never a
+    # mutable checkout.  quota-core derives recall_not_applicable itself, so
+    # the fixture document carries it as unknown.
+    fixture = json.loads(QUOTA_CORE_SCHEMA_FIXTURE.read_text())
+    assert fixture["source_sha"].startswith("4d8aa06")
+    quality_evidence = {key: value for key, value in evidence.items()
+                        if key != "risk_declaration"}
+    quality_evidence["recall_not_applicable"] = None
+    jsonschema.validate(quality_evidence, fixture["evidence_schema"])
 
 
 def test_context_evidence_failure_is_best_effort(monkeypatch, tmp_db):

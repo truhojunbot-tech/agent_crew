@@ -1,14 +1,15 @@
 """#342(C): admission risk declarations are nullable, attributed evidence."""
 import json
-import subprocess
-import sys
 from pathlib import Path
 
 import jsonschema
-import pytest
 
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+
+QUOTA_CORE_SCHEMA_FIXTURE = (
+    Path(__file__).resolve().parents[1] / "fixtures" / "quota_core_evidence_schema_4d8aa06.json"
+)
 
 
 def test_explicit_risk_declaration_is_persisted_with_explicit_provenance(tmp_db):
@@ -88,20 +89,18 @@ def test_declaration_failure_cannot_veto_admission_or_completion(monkeypatch, tm
 
 
 def test_risk_declaration_uses_quota_core_da6779b_quality_evidence_fields(tmp_db):
-    """Pin producer field names to quota-core origin/main at da6779b (#86)."""
-    quota_core = Path("/home/truhojun/alfred/repos/quota-core")
-    if not quota_core.is_dir():
-        pytest.skip("quota-core checkout unavailable")
-    sha = "da6779bc1bd5a7a75fa615e5da5eec406c90c26c"
-    source = subprocess.check_output(
-        ["git", "-C", str(quota_core), "show", f"{sha}:quota_core/context_economics/policy.py"],
-        text=True,
-    )
+    """Pin producer field names to quota-core da6779b (#86), schema to 4d8aa06 (#765).
+
+    The risk field names were introduced at da6779b and are unchanged at
+    4d8aa06; both come from the vendored fixture, never a mutable checkout.
+    """
+    fixture = json.loads(QUOTA_CORE_SCHEMA_FIXTURE.read_text())
+    assert fixture["source_sha"].startswith("4d8aa06")
     expected = {
         "safety_or_live_change", "broad_architecture_change",
         "bounded_routine_fix", "human_gate_required",
     }
-    assert all(f"    {field}: bool | None = None" in source for field in expected)
+    assert set(fixture["risk_declaration_fields"]) == expected
 
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest("risk-schema", "implement", "x", context={"risk_tier": 1}))
@@ -111,11 +110,9 @@ def test_risk_declaration_uses_quota_core_da6779b_quality_evidence_fields(tmp_db
     # Keep the deployed #342(A) evidence document flat.  The additive
     # declaration is removed only for validation against quota-core's closed
     # quality-evidence schema; consumers still read both from one document.
-    sys.path.insert(0, str(quota_core))
-    try:
-        from quota_core.context_economics.policy import policy_contract_schema
-        quality_evidence = {key: value for key, value in evidence.items()
-                            if key != "risk_declaration"}
-        jsonschema.validate(quality_evidence, policy_contract_schema()["properties"]["evidence"])
-    finally:
-        sys.path.remove(str(quota_core))
+    # quota-core derives recall_not_applicable itself; the fixture document
+    # carries it as unknown.
+    quality_evidence = {key: value for key, value in evidence.items()
+                        if key != "risk_declaration"}
+    quality_evidence["recall_not_applicable"] = None
+    jsonschema.validate(quality_evidence, fixture["evidence_schema"])
