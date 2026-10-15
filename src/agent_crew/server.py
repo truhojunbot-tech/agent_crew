@@ -106,6 +106,33 @@ from agent_crew.telemetry_response import response_log_telemetry
 from agent_crew.worktree_default_branch import remote_default_branch
 
 logger = logging.getLogger(__name__)
+_DEFAULT_GEMINI_MODEL = "Gemini 3.8 Flash (Medium)"
+
+
+def _resolve_gemini_model() -> str:
+    """Use the explicit provider pin or the current headless Gemini default."""
+    return os.getenv("AGENT_CREW_GEMINI_MODEL", "").strip() or _DEFAULT_GEMINI_MODEL
+
+
+def _provider_zero_turn_config_error(agent: str, output: str) -> bool:
+    """Identify provider launch/config errors before any test work occurred."""
+    if agent not in {"gemini", "claude", "codex"}:
+        return False
+    for line in [output, *output.splitlines()]:
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("num_turns") not in (0, "0"):
+            continue
+        if (str(record.get("status") or "").upper() == "ERROR"
+                or record.get("is_error") is True):
+            return True
+    lowered = output.lower()
+    return any(marker in lowered for marker in (
+        "invalid model selection", "model is not recognized", "unknown model",
+        "missing api key", "authentication required", "configuration error"))
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="[%(asctime)s] %(levelname)s: %(message)s",
@@ -5372,10 +5399,7 @@ def create_app(
         # model stays unknown (empty) rather than guessed. Resolved once,
         # here, and reused below when building the gemini `cmd` so the two
         # can't drift apart.
-        _known_model = (
-            os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.7 Flash (Medium)")
-            if agent == "gemini" else ""
-        )
+        _known_model = _resolve_gemini_model() if agent == "gemini" else ""
 
         # #202: resolve durable context identity before dispatch. A context
         # is scoped by (project, agent, worktree) — not role — since
@@ -6240,11 +6264,10 @@ def create_app(
             #   `--output-format stream-json` has no equivalent — agy prints
             #   plain stdout, which the dispatcher captures into the log file
             #   the same way.
-            # Pin model explicitly so kickoffs don't get routed to a rotating
-            # default. agy 1.1.x switched --model to take the display name
-            # from `agy models` rather than a slug (e.g. "gemini-3.5-flash"
-            # now 400s with "model ... is not recognized"). Override via
-            # AGENT_CREW_GEMINI_MODEL. (_known_model resolved earlier,
+            # Pin a display name explicitly so kickoffs don't get routed to a
+            # rotating default. Override via AGENT_CREW_GEMINI_MODEL; a bad
+            # pin is classified as not-run if agy returns a zero-turn error.
+            # (_known_model resolved earlier,
             # before dispatch, so the attribution record and this cmd can't
             # drift apart — #202.)
             # #236: resume only when Agent Crew's own context policy says
@@ -6319,10 +6342,17 @@ def create_app(
                 #   handle is closed and every dispatch dies with
                 #   "I/O operation on closed file" (review of 720ac76). The
                 #   child keeps its own dup, so closing ours on exit is safe.
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
-                    start_new_session=True,
-                )
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
+                        start_new_session=True,
+                    )
+                except OSError as exc:
+                    if task.task_type != "test":
+                        raise
+                    _fail_if_active(task.task_id, "config_error", status="needs_human",
+                                    details={"provider": agent, "launch_error": str(exc)[:300]})
+                    return
             # ⛔I-B: publish the child into its reservation and decide, under the
             #   same lock, whether a cancel has already landed. A cancel that
             #   committed in the handoff window is not allowed to end with the
@@ -6534,8 +6564,24 @@ def create_app(
                 )
                 _fail_if_active(task.task_id, _transient)
             elif proc.returncode != 0:
-                _fail_if_active(task.task_id, f"exit_{proc.returncode}",
-                                details=_codex_no_result_details)
+                if task.task_type == "test":
+                    _config_error = _provider_zero_turn_config_error(agent, _task_log_tail)
+                    _silent_exit = not _task_log_tail.strip()
+                    _reason = "config_error" if _config_error else "provider_test_not_run"
+                    # A completely silent child crash is an execution failure.
+                    # Keep that terminal status for attribution, but mark its
+                    # result as not-run so a CLI loop cannot treat it as a test
+                    # verdict and re-implement the unchanged PR.
+                    _ended = _fail_if_active(
+                        task.task_id, _reason,
+                        status="failed" if _silent_exit else "needs_human",
+                        details={"provider": agent, "provider_exit_code": proc.returncode,
+                                 "not_run": True, **_codex_no_result_details})
+                    if _silent_exit and _ended:
+                        _coordinator_notice(task.task_id, _reason, "provider exited without output")
+                else:
+                    _fail_if_active(task.task_id, f"exit_{proc.returncode}",
+                                    details=_codex_no_result_details)
             else:
                 # Same reasoning: the process is gone without a result, but the
                 # POST can still be in flight. "We did not observe a result" is
@@ -8070,6 +8116,15 @@ def create_app(
         ctx = q().get_task_context(task_id)
         _artifact_held = None
         _task = q().get_task(task_id)
+        _provider_error = result.error_info if isinstance(result.error_info, dict) else {}
+        if (_task is not None and _task.task_type == "test" and result.status == "failed"
+                and (_provider_error.get("reason") in {"config_error", "provider_test_not_run"}
+                     or (_provider_error.get("provider_status") == "ERROR"
+                         and _provider_error.get("provider_num_turns") in (0, "0")))):
+            _provider_error = {**_provider_error, "reason": "config_error",
+                               "final": False, "not_run": True}
+            result = dataclasses.replace(result, status="needs_human",
+                                         error_info=_provider_error)
         # #586: a review result that `_resolve_verdict` cannot map to a verdict
         # used to be marked done (200) and then dropped by the cascade, so the
         # reviewer never learned it was rejected. Refuse it before anything is
@@ -8258,6 +8313,10 @@ def create_app(
                         task_id,
                     )
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
+            if (task_type == "test" and result.status == "needs_human"
+                    and isinstance(result.error_info, dict)
+                    and result.error_info.get("reason") == "config_error"):
+                _coordinator_notice(task_id, "config_error", result.summary)
             if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
                 logger.warning(
                     f"POST /tasks/{task_id}/result: LATE RESULT — this task was "

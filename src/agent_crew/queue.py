@@ -6822,7 +6822,7 @@ class TaskQueue:
         conn = self._connect()
         try:
             row = conn.execute(
-                "SELECT task_id, status, summary, verdict, findings, pr_number, context "
+                "SELECT task_id, status, summary, verdict, findings, pr_number, context, error_info "
                 "FROM tasks WHERE task_id = ?",
                 (task_id,),
             ).fetchone()
@@ -6842,6 +6842,7 @@ class TaskQueue:
                 verdict=row["verdict"],
                 findings=json.loads(row["findings"]) if row["findings"] else [],
                 pr_number=row["pr_number"],
+                error_info=json.loads(row["error_info"]) if row["error_info"] else None,
                 branch=context.get(RESULT_BRANCH_CONTEXT_KEY) or "",
                 commit=context.get(RESULT_COMMIT_CONTEXT_KEY) or "",
             )
