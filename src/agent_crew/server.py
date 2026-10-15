@@ -8796,7 +8796,7 @@ def create_app(
                 "pending_remaining": len(q().outbox_pending(include_replaying=False))}
 
     @app.delete("/tasks/{task_id}", status_code=200)
-    def cancel_task(task_id: str):
+    def cancel_task(task_id: str, reason: str = _CANCEL_REASON_ATTEMPT):
         """G12 I-A then I-B, in that order.
 
         The authoritative cancel — status ``cancelled``, receipt ``REVOKED``,
@@ -8807,8 +8807,9 @@ def create_app(
         was running.  On commit failure we return 5xx and kill nothing, so the
         caller can retry against an unchanged world.
 
-        Only an *active* row can be cancelled. A row already decided (completed,
-        failed, cancelled, timed_out, blocked) answers 409 ``NOT_ACTIVE`` and
+        Only a row with unfinished work can be cancelled, including ``blocked``
+        and ``needs_human``. A row already decided (completed, failed,
+        cancelled, timed_out) answers 409 ``NOT_ACTIVE`` and
         nothing happens at all — no revocation, no nonce spent, no worker
         signal. Before this, DELETE on a completed task returned 200 and
         persisted ``cancelled``, retroactively revoking a finished attempt and
@@ -8823,7 +8824,7 @@ def create_app(
         try:
             outcome = cancel_task_with_signal(
                 q(), task_id, state_path=state_path, pane_map=pane_map,
-                events_path=_context_events_path, reason=_CANCEL_REASON_ATTEMPT,
+                events_path=_context_events_path, reason=reason,
             )
         except ValueError:
             return {"status": "unknown", "reason": "NO_SUCH_TASK",

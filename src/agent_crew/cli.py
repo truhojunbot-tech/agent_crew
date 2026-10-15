@@ -20,7 +20,7 @@ from agent_crew.conformance_gate import (
     _conformance_gate_allows_merge, _registry_capability_for_paths,
 )
 from agent_crew.pipeline import ARTIFACT_KINDS
-from agent_crew.queue import _TYPE_TO_ROLE
+from agent_crew.queue import CANCEL_REASON_ATTEMPT, _TYPE_TO_ROLE
 from agent_crew.worktree_default_branch import remote_default_branch
 from agent_crew.role_mapping import (
     DEFAULT_ROLE_TO_AGENT,
@@ -1924,7 +1924,10 @@ def task_group():
 @click.option("--allow-cross-project", is_flag=True, help="Allow targeting a different cwd project")
 @click.option("--base", default=_DEFAULT_BASE, show_default=True)
 @click.option("--db", default="", help="SQLite DB path (standalone)")
-def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str, db: str):
+@click.option("--reason", default=CANCEL_REASON_ATTEMPT, show_default=True,
+              help="Reason recorded in the cancellation audit")
+def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str,
+                db: str, reason: str):
     """Cancel TASK_ID and attempt to interrupt its bound worker pane."""
     from agent_crew.server import cancel_task_with_signal
     if not db:
@@ -1940,6 +1943,7 @@ def task_cancel(task_id: str, project: str, allow_cross_project: bool, base: str
             state_path=state_path, pane_map=None,
             events_path=os.path.join(os.path.dirname(os.path.abspath(db)),
                                      "context_events.jsonl"),
+            reason=reason,
         )
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc

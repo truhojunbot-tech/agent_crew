@@ -121,10 +121,10 @@ CANCEL_REASON_STALE_LEASE = "STALE_LEASE"
 #: been decided: the attempt posted a result, expired, or was revoked. Cancelling
 #: one retroactively would revoke a completed attempt's authorization and orphan
 #: the successors it legitimately spawned, so :meth:`TaskQueue.cancel` refuses.
-#: ⛔Not an allowlist of the opposite: ``orphaned`` and ``needs_human`` rows are
+#: ⛔Not an allowlist of the opposite: ``orphaned``, ``blocked`` and ``needs_human`` rows are
 #:   still live work an operator must be able to cancel (see :meth:`cancel`).
 TERMINAL_TASK_STATUSES = frozenset(
-    {"completed", "failed", "cancelled", "timed_out", "blocked"})
+    {"completed", "failed", "cancelled", "timed_out"})
 
 
 class PausedError(Exception):
@@ -6212,7 +6212,7 @@ class TaskQueue:
                         conn, self.cea_engine(), receipt_id, "REVOKED",
                         note=f"cancel({reason}): active attempt authorization revoked")
             self._record_end_on(conn, task_id, time.time(), "cancelled", posted=False,
-                                reason=reason)
+                                prior_status=status, reason=reason)
             # Mark pending dependents as orphaned (not cancelled) so the operator
             # can see them and decide whether to cancel or reassign.
             conn.execute(
