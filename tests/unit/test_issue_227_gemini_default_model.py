@@ -4,6 +4,7 @@ import os
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 from agent_crew.queue import TaskQueue
@@ -42,14 +43,18 @@ def _setup(tmp_path):
     return state_file
 
 
-def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None, *, unused_tcp_port):
+def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None, *, unused_tcp_port,
+                  exit_code=0, output="", notices=None, wait_for_terminal=False):
     state_file = _setup(tmp_path)
     spawn_log: list[list[str]] = []
 
     async def fake_subprocess(*args, **_kwargs):
         spawn_log.append([str(a) for a in args])
+        if output:
+            _kwargs["stdout"].write(output.encode())
+            _kwargs["stdout"].flush()
         proc = MagicMock()
-        proc.returncode = 0
+        proc.returncode = exit_code
         proc.kill = MagicMock()
         proc.wait = AsyncMock(return_value=0)
         return proc
@@ -79,7 +84,8 @@ def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None, *, unused_tcp_port)
                 watchdog_disabled=True,
                 anomaly_disabled=True,
                 identity_required=False,
-                coordinator_notify_fn=lambda message: True,
+                coordinator_notify_fn=lambda message: notices.append(message) or True
+                if notices is not None else lambda message: True,
             )
             with TestClient(app) as client:
                 resp = client.post("/tasks", json=_test_payload(task_id))
@@ -88,7 +94,8 @@ def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None, *, unused_tcp_port)
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
                     status = queue.get_task_status(task_id)
-                    if spawn_log or status in {"needs_human", "failed", "timed_out", "completed"}:
+                    if ((not wait_for_terminal and spawn_log)
+                            or status in {"needs_human", "failed", "timed_out", "completed"}):
                         break
                     time.sleep(0.02)
                 else:
@@ -140,3 +147,22 @@ def test_u776_explicit_model_pin_is_recorded_without_substitution(
         unused_tcp_port=unused_tcp_port)
     assert _model_arg(spawn_log[0]) == "Gemini 3.7 Flash (Medium)"
     assert TaskQueue(tmp_db).get_attribution("test-776-pin")["model"] == "Gemini 3.7 Flash (Medium)"
+
+
+@pytest.mark.parametrize("output, reason", [
+    ('{"status":"ERROR","num_turns":0,"error":"invalid model selection"}\n', "config_error"),
+    ("provider exited before running tests\n", "provider_test_not_run"),
+])
+def test_u776_nonzero_agy_exit_does_not_reimplement(
+        tmp_db, tmp_path, *, unused_tcp_port, output, reason):
+    notices = []
+    spawn_log = _run_dispatch(
+        tmp_db, tmp_path, "test-776-exit", unused_tcp_port=unused_tcp_port,
+        exit_code=1, output=output, notices=notices, wait_for_terminal=True)
+    queue = TaskQueue(tmp_db)
+    assert len(spawn_log) == 1
+    assert queue.get_task("test-776-exit").status == "needs_human"
+    result = queue.get_result("test-776-exit")
+    assert result.summary == reason
+    assert not any(row.task_type == "implement" for row in queue.list_tasks())
+    assert len(notices) == 1
