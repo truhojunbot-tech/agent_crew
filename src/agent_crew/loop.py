@@ -439,9 +439,11 @@ def enqueue_implement_with_feedback(
 def handle_test_result(result: TaskResult) -> str:
     if result.status == "completed":
         return "passed"
+    info = result.error_info if isinstance(result.error_info, dict) else {}
+    if info.get("reason") == "script_test_timeout":
+        return "not_run"
     if result.status == "needs_human":
         return "needs_human"
-    info = result.error_info if isinstance(result.error_info, dict) else {}
     if info.get("reason") in {"config_error", "provider_test_not_run"}:
         return "not_run"
     script = info.get("script_test")

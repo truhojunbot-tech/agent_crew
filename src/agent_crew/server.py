@@ -8315,8 +8315,11 @@ def create_app(
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
             if (task_type == "test" and result.status == "needs_human"
                     and isinstance(result.error_info, dict)
-                    and result.error_info.get("reason") == "config_error"):
-                _coordinator_notice(task_id, "config_error", result.summary)
+                    and result.error_info.get("reason") in {
+                        "config_error", "script_test_timeout", "script_test_rerun_limit",
+                        "script_test_rerun_unavailable", "script_test_rerun_unjudged",
+                    }):
+                _coordinator_notice(task_id, result.error_info["reason"], result.summary)
             if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
                 logger.warning(
                     f"POST /tasks/{task_id}/result: LATE RESULT — this task was "
