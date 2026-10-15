@@ -106,6 +106,69 @@ from agent_crew.telemetry_response import response_log_telemetry
 from agent_crew.worktree_default_branch import remote_default_branch
 
 logger = logging.getLogger(__name__)
+_AGY_MODELS_CACHE: tuple[float, tuple[str, ...]] = (0.0, ())
+_GEMINI_FLASH_MODEL = re.compile(
+    r"Gemini\s+(\d+(?:\.\d+)*)\s+Flash\s+\((High|Medium|Low)\)", re.IGNORECASE)
+_AGY_GEMINI_MODEL = re.compile(
+    r"(Gemini\s+\d+(?:\.\d+)*\s+[A-Za-z][A-Za-z0-9 ._-]*?)\s*"
+    r"\(((?:High|Medium|Low)(?:\s*\|\s*(?:High|Medium|Low))*)\)", re.IGNORECASE)
+
+
+def _agy_models() -> tuple[str, ...]:
+    """Read the installed CLI's model names, briefly cached per process."""
+    global _AGY_MODELS_CACHE
+    now = time.monotonic()
+    if now < _AGY_MODELS_CACHE[0]:
+        return _AGY_MODELS_CACHE[1]
+    try:
+        result = subprocess.run(["agy", "models"], capture_output=True, text=True,
+                                timeout=5)
+        output = f"{result.stdout or ''}\n{result.stderr or ''}" if result.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        output = ""
+    models = tuple(dict.fromkeys(
+        f"{match.group(1).strip()} ({tier.strip()})"
+        for match in _AGY_GEMINI_MODEL.finditer(output)
+        for tier in match.group(2).split("|")))
+    _AGY_MODELS_CACHE = (now + (60 if models else 10), models)
+    return models
+
+
+def _resolve_gemini_model() -> str:
+    """Honor a listed pin; otherwise choose the newest Flash of its tier."""
+    models = _agy_models()
+    configured = os.getenv("AGENT_CREW_GEMINI_MODEL", "").strip()
+    if configured and configured in models:
+        return configured
+    tier_match = re.search(r"\((High|Medium|Low)\)$", configured, re.IGNORECASE)
+    tier = tier_match.group(1).lower() if tier_match else "medium"
+    candidates = []
+    for model in models:
+        match = _GEMINI_FLASH_MODEL.fullmatch(model)
+        if match and match.group(2).lower() == tier:
+            candidates.append((tuple(int(part) for part in match.group(1).split(".")), model))
+    return max(candidates)[1] if candidates else ""
+
+
+def _provider_zero_turn_config_error(agent: str, output: str) -> bool:
+    """Identify provider launch/config errors before any test work occurred."""
+    if agent not in {"gemini", "claude", "codex"}:
+        return False
+    for line in [output, *output.splitlines()]:
+        try:
+            record = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict) or record.get("num_turns") not in (0, "0"):
+            continue
+        if (str(record.get("status") or "").upper() == "ERROR"
+                or record.get("is_error") is True):
+            return True
+    lowered = output.lower()
+    return any(marker in lowered for marker in (
+        "invalid model selection", "model is not recognized", "unknown model",
+        "missing api key", "authentication required", "configuration error"))
+
 logging.basicConfig(
     level=logging.DEBUG,
     format="[%(asctime)s] %(levelname)s: %(message)s",
@@ -5372,10 +5435,14 @@ def create_app(
         # model stays unknown (empty) rather than guessed. Resolved once,
         # here, and reused below when building the gemini `cmd` so the two
         # can't drift apart.
-        _known_model = (
-            os.getenv("AGENT_CREW_GEMINI_MODEL", "Gemini 3.7 Flash (Medium)")
-            if agent == "gemini" else ""
-        )
+        _known_model = _resolve_gemini_model() if agent == "gemini" else ""
+        if agent == "gemini" and not _known_model:
+            try:
+                _fail_if_active(task.task_id, "config_error", status="needs_human",
+                                details={"provider": "agy", "detail": "no listed Gemini Flash model at requested tier"})
+            finally:
+                _lock_stack.close()
+            return
 
         # #202: resolve durable context identity before dispatch. A context
         # is scoped by (project, agent, worktree) — not role — since
@@ -6319,10 +6386,17 @@ def create_app(
                 #   handle is closed and every dispatch dies with
                 #   "I/O operation on closed file" (review of 720ac76). The
                 #   child keeps its own dup, so closing ours on exit is safe.
-                proc = await asyncio.create_subprocess_exec(
-                    *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
-                    start_new_session=True,
-                )
+                try:
+                    proc = await asyncio.create_subprocess_exec(
+                        *cmd, stdout=log_f, stderr=log_f, cwd=wt, env=_dispatch_env,
+                        start_new_session=True,
+                    )
+                except OSError as exc:
+                    if task.task_type != "test":
+                        raise
+                    _fail_if_active(task.task_id, "config_error", status="needs_human",
+                                    details={"provider": agent, "launch_error": str(exc)[:300]})
+                    return
             # ⛔I-B: publish the child into its reservation and decide, under the
             #   same lock, whether a cancel has already landed. A cancel that
             #   committed in the handoff window is not allowed to end with the
@@ -6534,8 +6608,16 @@ def create_app(
                 )
                 _fail_if_active(task.task_id, _transient)
             elif proc.returncode != 0:
-                _fail_if_active(task.task_id, f"exit_{proc.returncode}",
-                                details=_codex_no_result_details)
+                if task.task_type == "test":
+                    _config_error = _provider_zero_turn_config_error(agent, _task_log_tail)
+                    _fail_if_active(task.task_id,
+                                    "config_error" if _config_error else "provider_test_not_run",
+                                    status="needs_human",
+                                    details={"provider": agent, "provider_exit_code": proc.returncode,
+                                             **_codex_no_result_details})
+                else:
+                    _fail_if_active(task.task_id, f"exit_{proc.returncode}",
+                                    details=_codex_no_result_details)
             else:
                 # Same reasoning: the process is gone without a result, but the
                 # POST can still be in flight. "We did not observe a result" is
@@ -8070,6 +8152,15 @@ def create_app(
         ctx = q().get_task_context(task_id)
         _artifact_held = None
         _task = q().get_task(task_id)
+        _provider_error = result.error_info if isinstance(result.error_info, dict) else {}
+        if (_task is not None and _task.task_type == "test" and result.status == "failed"
+                and (_provider_error.get("reason") in {"config_error", "provider_test_not_run"}
+                     or (_provider_error.get("provider_status") == "ERROR"
+                         and _provider_error.get("provider_num_turns") in (0, "0")))):
+            _provider_error = {**_provider_error, "reason": "config_error",
+                               "final": False, "not_run": True}
+            result = dataclasses.replace(result, status="needs_human",
+                                         error_info=_provider_error)
         # #586: a review result that `_resolve_verdict` cannot map to a verdict
         # used to be marked done (200) and then dropped by the cascade, so the
         # reviewer never learned it was rejected. Refuse it before anything is
@@ -8258,6 +8349,10 @@ def create_app(
                         task_id,
                     )
             logger.info(f"POST /tasks/{task_id}/result: marked done, task_type={task_type}")
+            if (task_type == "test" and result.status == "needs_human"
+                    and isinstance(result.error_info, dict)
+                    and result.error_info.get("reason") == "config_error"):
+                _coordinator_notice(task_id, "config_error", result.summary)
             if _prior in _LATE_RESULT_STATUSES and result.status != _prior:
                 logger.warning(
                     f"POST /tasks/{task_id}/result: LATE RESULT — this task was "

@@ -442,6 +442,8 @@ def handle_test_result(result: TaskResult) -> str:
     if result.status == "needs_human":
         return "needs_human"
     info = result.error_info if isinstance(result.error_info, dict) else {}
+    if info.get("reason") in {"config_error", "provider_test_not_run"}:
+        return "not_run"
     script = info.get("script_test")
     if isinstance(script, dict):
         # Only identified new test failures are a verdict about this PR.
