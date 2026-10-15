@@ -90,7 +90,9 @@ def test_dispatch_renewal(tmp_path, monkeypatch, unused_tcp_port,
             async def wait(self): return 0
         return Process()
 
-    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    # This test claims and dispatches both tasks itself. A background
+    # dispatcher races those manual claims under full-suite load.
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setattr(sv.asyncio, "create_subprocess_exec", fake_exec)
     session = ["old"]

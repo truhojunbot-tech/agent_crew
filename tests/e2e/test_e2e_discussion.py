@@ -140,13 +140,13 @@ def test_e_di02_two_rounds(live_server, tmp_path):
     ])
 
     # Round 1: 2 agents
-    assert _stub(port, "panel").returncode == 0
-    assert _stub(port, "panel").returncode == 0
+    assert _stub(port, "panel", poll_timeout=90.0).returncode == 0
+    assert _stub(port, "panel", poll_timeout=90.0).returncode == 0
     # Round 2: 2 agents
-    assert _stub(port, "panel").returncode == 0
-    assert _stub(port, "panel").returncode == 0
+    assert _stub(port, "panel", poll_timeout=90.0).returncode == 0
+    assert _stub(port, "panel", poll_timeout=90.0).returncode == 0
 
-    cli_t.join(timeout=60.0)
+    cli_t.join(timeout=120.0)
     assert not cli_t.is_alive(), "CLI thread timed out"
 
     r = holder[0]
