@@ -214,6 +214,107 @@ def test_isolated_rerun_timeout_is_incomplete(project, tmp_path):
     assert script_tester.record_to_result("test-rerun-timeout", record).status == "needs_human"
 
 
+def test_many_new_failures_do_not_start_unbounded_reruns(project, tmp_path):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    ids = [f"tests/test_b.py::test_case_{i}" for i in range(3)]
+    calls = []
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        calls.append(command)
+        if command != PYTEST:
+            pytest.fail("a large failure set must not start isolated reruns")
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=ids)
+        return script_tester.RunOutcome(exit_code=0)
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": PYTEST}, cache_dir=str(tmp_path / "cache"),
+        runner=runner)
+    assert record["outcome"] == "INCOMPLETE"
+    assert record["reason"] == "script_test_rerun_limit"
+    assert record["reruns"] == {}
+    assert calls == [PYTEST, PYTEST]
+
+
+@pytest.mark.parametrize("command", ["pytest tests/unit", "make test", "pytest -q && echo done"])
+def test_non_plain_command_does_not_rerun_whole_suite(project, tmp_path, command):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    node = "tests/test_b.py::test_two"
+    calls = []
+
+    def runner(actual, cwd, timeout_s, *, env=None):
+        calls.append(actual)
+        if actual != command:
+            pytest.fail("configured suite command must not be reused for a node rerun")
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
+        return script_tester.RunOutcome(exit_code=0)
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": command}, cache_dir=str(tmp_path / "cache"),
+        runner=runner)
+    assert record["outcome"] == "INCOMPLETE"
+    assert record["reason"] == "script_test_rerun_unavailable"
+    assert calls == [command, command]
+
+
+def test_isolated_reruns_share_bounded_watchdog_allowance(project, tmp_path):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    node = "tests/test_b.py::test_two"
+    rerun_timeouts = []
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        if command != PYTEST:
+            rerun_timeouts.append(timeout_s)
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
+        return script_tester.RunOutcome(exit_code=0)
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": PYTEST, "test_timeout_s": 1800},
+        cache_dir=str(tmp_path / "cache"), runner=runner)
+    assert record["outcome"] == "FAILED"
+    assert len(rerun_timeouts) == 2
+    assert all(0 < timeout <= 300 for timeout in rerun_timeouts)
+    assert record["rerun_budget_s"] <= 300
+
+
+def test_unjudged_rerun_is_incomplete_and_notifies_once(project, server, monkeypatch):
+    build, pushes, spawns, merges = server
+    repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    notices = []
+    app, queue = build(repo, {"test_command": PYTEST}, notices=notices)
+    node = "tests/test_b.py::test_two"
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        if command != PYTEST:
+            return script_tester.RunOutcome(exit_code=2, output_tail="collection failed")
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
+        return script_tester.RunOutcome(exit_code=0)
+
+    execute = script_tester.execute_test_task
+    monkeypatch.setattr(script_tester, "execute_test_task", lambda *args, **kwargs:
+                        execute(*args, **kwargs, runner=runner))
+    done = _run_through_push_path(app, queue, _task(head))
+    assert done.status == "needs_human"
+    assert queue.get_task_context(done.task_id)["script_test"]["reason"] == (
+        "script_test_rerun_unjudged")
+    assert [task.task_id for task in queue.list_tasks()] == [done.task_id]
+    assert len(notices) == 1 and "script_test_rerun_unjudged" in notices[0]
+    assert (pushes, spawns, merges) == ([], [], [])
+
+
 def test_collection_abort_shared_with_base_is_not_a_pass(project, tmp_path):
     broken = {"tests/test_a.py": "def test_one():\n    assert True\n",
               "tests/test_bad.py": "import does_not_exist\n"}

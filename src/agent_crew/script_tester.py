@@ -52,6 +52,8 @@ _COUNT_RE = re.compile(
 _TEST_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 _PRIVATE_ENV_KEY = re.compile(
     r"(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL|AUTH|PRIVATE_KEY)", re.I)
+_MAX_RERUN_CANDIDATES = 2
+_RERUN_BUDGET_S = 300.0  # watchdog allows 600s beyond the two suite runs
 
 
 @dataclass
@@ -144,6 +146,36 @@ def watchdog_timeout_seconds(state: Optional[Mapping], ordinary_timeout_s: float
     """Bound both possible suite runs, plus fetch/checkout setup time."""
     _, suite_timeout_s = resolve_test_config(state, "")
     return max(ordinary_timeout_s, 2 * suite_timeout_s + 600.0)
+
+
+def _isolated_rerun_command(command: str, node_id: str) -> Optional[str]:
+    """Only append a node to a plain pytest invocation with no suite target.
+
+    A project command can invoke make, a shell pipeline, or a directory target.
+    Appending a node to any of those does not run that node in isolation.
+    """
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return None
+    if not words:
+        return None
+    if os.path.basename(words[0]) in {"pytest", "py.test"}:
+        index = 1
+    elif (re.fullmatch(r"python(?:\d+(?:\.\d+)?)?", os.path.basename(words[0]))
+          and words[1:3] == ["-m", "pytest"]):
+        index = 3
+    else:
+        return None
+    while index < len(words):
+        word = words[index]
+        if word in {"-q", "-v", "-x", "--disable-warnings"}:
+            index += 1
+        elif word == "-p" and index + 1 < len(words):
+            index += 2
+        else:
+            return None
+    return f"{command} {shlex.quote(node_id)}"
 
 
 def test_environment(checkout: str, state: Optional[Mapping]) -> dict[str, str]:
@@ -335,11 +367,28 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 record["pre_existing"] = [i for i in head.failing_ids if i in base_ids]
                 candidates = [i for i in head.failing_ids if i not in base_ids]
                 if head.exit_code == 1:
+                    if len(candidates) > _MAX_RERUN_CANDIDATES:
+                        record.update(outcome=INCOMPLETE, reason="script_test_rerun_limit")
+                        return record
+                    rerun_commands = {
+                        node_id: _isolated_rerun_command(command, node_id)
+                        for node_id in candidates
+                    }
+                    if any(value is None for value in rerun_commands.values()):
+                        record.update(outcome=INCOMPLETE,
+                                      reason="script_test_rerun_unavailable")
+                        return record
+                    record["rerun_budget_s"] = min(_RERUN_BUDGET_S, timeout_s)
+                    rerun_deadline = time.monotonic() + record["rerun_budget_s"]
                     for node_id in candidates:
                         attempts = record["reruns"][node_id] = []
                         for _ in range(2):
-                            rerun = runner(f"{command} {shlex.quote(node_id)}", checkout,
-                                           timeout_s, env=head_env)
+                            remaining = rerun_deadline - time.monotonic()
+                            if remaining <= 0:
+                                record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+                                return record
+                            rerun = runner(rerun_commands[node_id], checkout,
+                                           min(timeout_s, remaining), env=head_env)
                             attempts.append(rerun.to_dict())
                             record["duration_s"] += rerun.duration_s
                             if rerun.timed_out:
