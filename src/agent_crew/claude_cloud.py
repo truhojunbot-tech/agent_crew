@@ -162,28 +162,77 @@ def cloud_max_usd_per_day() -> Optional[float]:
     return value
 
 
+def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
+                         ended: float, *, shadow: bool = False) -> list[str]:
+    """Global credit cannot be split between intersecting cloud intervals."""
+    overlaps = []
+    for other in queue.list_tasks():
+        context = other.context if isinstance(other.context, dict) else {}
+        for is_shadow, prefix in ((False, "cloud_"), (True, "cloud_shadow_")):
+            if other.task_id == task_id and is_shadow == shadow:
+                continue
+            began = context.get(prefix + "attempt_started_at") or context.get(prefix + "launched_at")
+            if not isinstance(began, (int, float)):
+                continue
+            finished = context.get(prefix + "ended_at")
+            if began <= ended and (not isinstance(finished, (int, float)) or finished >= started):
+                overlaps.append(("cloud-shadow:" if is_shadow else "") + other.task_id)
+    return sorted(set(overlaps))
+
+
 def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
-    if task.task_type == "review":
+    context = queue.get_task_context(task.task_id)
+    if context.get("cloud_cost_finalized_at"):
         return
-    if queue.get_task_context(task.task_id).get("cloud_cost_finalized_at"):
-        return
-    before = (task.context or {}).get("cloud_credit_used_before")
+    before = context.get("cloud_credit_used_before")
     after = read_cloud_credit_used()
+    ended = time.time()
+    started = context.get("cloud_attempt_started_at") or context.get("cloud_launched_at")
+    overlaps = (_cloud_cost_overlaps(queue, task.task_id, started, ended)
+                if isinstance(started, (int, float)) else [])
     usd = (round(max(0.0, after - before), 6)
-           if isinstance(before, (int, float)) and after is not None and after >= before else None)
+           if not overlaps and isinstance(before, (int, float))
+           and after is not None and after >= before else None)
     queue.record_cloud_cost(task.task_id, before, after, usd)
     queue.patch_context(task.task_id, {"cloud_credit_used_after": after, "cloud_usd": usd,
-                                      "cloud_cost_finalized_at": time.time()})
+                                      "cloud_cost_overlaps": overlaps,
+                                      "cloud_ended_at": context.get("cloud_ended_at") or ended,
+                                      "cloud_cost_finalized_at": ended})
+
+
+def _record_shadow_review_cost(queue: TaskQueue, task_id: str) -> None:
+    context = queue.get_task_context(task_id)
+    if context.get("cloud_shadow_cost_finalized_at"):
+        return
+    before = context.get("cloud_shadow_credit_used_before")
+    after = read_cloud_credit_used()
+    ended = time.time()
+    started = (context.get("cloud_shadow_attempt_started_at")
+               or context.get("cloud_shadow_launched_at"))
+    overlaps = (_cloud_cost_overlaps(queue, task_id, started, ended, shadow=True)
+                if isinstance(started, (int, float)) else [])
+    usd = (round(max(0.0, after - before), 6)
+           if not overlaps and isinstance(before, (int, float))
+           and after is not None and after >= before else None)
+    queue.record_cloud_cost(f"cloud-shadow:{task_id}", before, after, usd)
+    shadow_status = context.get("cloud_shadow_status") or "failed"
+    queue.update_attribution_status(f"cloud-shadow:{task_id}", shadow_status)
+    queue.update_attribution_outcome(f"cloud-shadow:{task_id}", shadow_status)
+    queue.patch_context(task_id, {"cloud_shadow_credit_used_after": after,
+                                  "cloud_shadow_usd": usd,
+                                  "cloud_shadow_cost_overlaps": overlaps,
+                                  "cloud_shadow_ended_at": context.get("cloud_shadow_ended_at") or ended,
+                                  "cloud_shadow_cost_finalized_at": ended})
 
 
 def record_terminal_cloud_cost(queue: TaskQueue, task_id: str) -> None:
-    """Close an implementer's cloud credit interval after any terminal write."""
+    """Close a cloud credit interval after any terminal write."""
     task = queue.get_task(task_id)
     attribution = queue.get_attribution(task_id)
     if (task is not None and task.status in {"completed", "failed", "cancelled",
                                              "timed_out", "needs_human"}
             and attribution and attribution.get("agent") == CLOUD_PROVIDER_NAME
-            and attribution.get("role") == "implementer"):
+            and attribution.get("role") in {"implementer", "reviewer"}):
         _record_reconciled_cloud_cost(queue, task)
 
 
@@ -598,6 +647,9 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
         queue.patch_context(task.task_id, {"cloud_ended_at": time.time(),
                                            "cloud_terminal_error": reason})
     queue.force_fail(task.task_id, reason)
+    if queue.get_attribution(task.task_id):
+        queue.update_attribution_status(task.task_id, "failed")
+        queue.update_attribution_outcome(task.task_id, "failed")
     try:
         record_terminal_cloud_cost(queue, task.task_id)
     except Exception:
@@ -825,7 +877,21 @@ def dispatch_cloud_for_role(
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
                 prompt, cli_path=cli_path, base_ref=_detached_cloud_ref(cwd)))
-    credit_before = read_cloud_credit_used() if role == "implementer" else None
+    credit_before = read_cloud_credit_used()
+    attempt_started_at = time.time()
+    prev_task_id = (task.context or {}).get("prev_task_id") if isinstance(task.context, dict) else ""
+    queue.record_attribution(
+        task_id=task.task_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
+        role=role, task_type=task.task_type, worktree_path="", git_branch=task.branch or "",
+        status="in_progress", previous_task_id=prev_task_id or "",
+        started_at=attempt_started_at,
+    )
+    queue.record_cloud_cost(task.task_id, credit_before, None, None)
+    queue.patch_context(task.task_id, {
+        "cloud_attempt_started_at": attempt_started_at,
+        "cloud_credit_used_before": credit_before,
+        "cloud_credit_used_after": None, "cloud_usd": None,
+    })
 
     try:
         proc = run(argv, cwd=cwd)
@@ -861,9 +927,6 @@ def dispatch_cloud_for_role(
         "cloud_session_url": launch.session_url,
         "cloud_session_id": launch.session_id,
         "cloud_launched_at": launched_at,
-        **({"cloud_credit_used_before": credit_before,
-            "cloud_credit_used_after": None, "cloud_usd": None}
-           if role == "implementer" else {}),
         "execution_policy": execution_policy,
         # #762: reconcile/pr_state/auto_enqueue_review read context.repo; the
         # dispatcher cwd is another repository.
@@ -872,8 +935,6 @@ def dispatch_cloud_for_role(
                                    "repo": _github._repo_slug(effective_repo).casefold(),
                                    "cwd": cwd},
     })
-    if role == "implementer":
-        queue.record_cloud_cost(task.task_id, credit_before, None, None)
     queue.set_push_at(task.task_id, pane_id=f"cloud:{launch.session_id}")
     logger.info("claude_cloud: dispatched %s session_id=%s url=%s",
                 task.task_id, launch.session_id, launch.session_url)
@@ -922,6 +983,21 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
         return _log_shadow_skip(task, "cwd_mismatch")
     if not queue.reserve_cloud_shadow_launch(task.task_id):
         return _log_shadow_skip(task, "already_reserved")
+    attempt_started_at = time.time()
+    credit_before = read_cloud_credit_used()
+    attribution_id = f"cloud-shadow:{task.task_id}"
+    queue.record_attribution(
+        task_id=attribution_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
+        role="reviewer", task_type="review", worktree_path="",
+        git_branch=task.branch or "", status="in_progress",
+        started_at=attempt_started_at,
+    )
+    queue.record_cloud_cost(attribution_id, credit_before, None, None)
+    queue.patch_context(task.task_id, {
+        "cloud_shadow_attempt_started_at": attempt_started_at,
+        "cloud_shadow_credit_used_before": credit_before,
+        "cloud_shadow_credit_used_after": None, "cloud_shadow_usd": None,
+    })
     try:
         proc = run(build_launch_argv(build_cloud_task_prompt(task, repo=repo),
                                      base_ref=_detached_cloud_ref(cwd)), cwd=cwd)
@@ -930,11 +1006,19 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
         logger.exception("claude_cloud: shadow launch failed for %s", task.task_id)
         queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
                                            "cloud_shadow_ended_at": time.time()})
+        _record_shadow_review_cost(queue, task.task_id)
         return False
     if not launch or not launch.dispatched:
         queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
                                            "cloud_shadow_ended_at": time.time()})
+        _record_shadow_review_cost(queue, task.task_id)
         return False
+    queue.record_attribution(
+        task_id=attribution_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
+        role="reviewer", task_type="review", worktree_path="",
+        git_branch=task.branch or "", status="in_progress",
+        provider_session_id=launch.session_id or "", started_at=attempt_started_at,
+    )
     queue.patch_context(task.task_id, {
         "cloud_shadow_session_id": launch.session_id,
         "cloud_shadow_session_url": launch.session_url,
@@ -977,11 +1061,13 @@ def reconcile_shadow_reviews(queue: TaskQueue, *, pr_comments_fn=None) -> None:
                     "cloud_shadow_findings": review.findings,
                     "cloud_shadow_ended_at": time.time(),
                 })
+                _record_shadow_review_cost(queue, task.task_id)
                 continue
         except ValueError as exc:
             queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
                                               "cloud_shadow_error": str(exc),
                                               "cloud_shadow_ended_at": time.time()})
+            _record_shadow_review_cost(queue, task.task_id)
             continue
         except Exception:
             logger.exception("claude_cloud: shadow reconciliation failed for %s", task.task_id)
@@ -989,6 +1075,7 @@ def reconcile_shadow_reviews(queue: TaskQueue, *, pr_comments_fn=None) -> None:
             queue.patch_context(task.task_id, {"cloud_shadow_status": "failed",
                                               "cloud_shadow_error": "stale: no marked review",
                                               "cloud_shadow_ended_at": time.time()})
+            _record_shadow_review_cost(queue, task.task_id)
 
 
 # ---------------------------------------------------------------------------
