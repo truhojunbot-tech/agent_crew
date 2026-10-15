@@ -763,6 +763,8 @@ CREATE TABLE IF NOT EXISTS task_exec_events (
     fields    TEXT NOT NULL DEFAULT '{}'
 )
 """
+
+_COORDINATOR_NOTICE_MAX_ATTEMPTS = 3
 def _claim_build() -> tuple:
     """The build of the process making the claim, as `/health` reports it.
 
@@ -3571,7 +3573,8 @@ class TaskQueue:
             return
         for key in ("prev_task_id", "fix_round", "issue", "issue_number",
                     "issue_title", "issue_body", "issue_url", "repo",
-                    "implementer_agent", "no_tester", "base_branch",
+                    "implementer_agent", "reviewer_agent", "no_tester", "base_branch",
+                    "lineage_root_task_id", "coordinator_managed", "coordinator_generation",
                     "risk_declaration", "risk_tier_source"):
             if key == "no_tester" and survivor["status"] == "completed":
                 continue  # A completed approval may already have started a tester.
@@ -5375,6 +5378,99 @@ class TaskQueue:
              json.dumps({k: v for k, v in fields.items() if include_none or v is not None},
                         sort_keys=True)),
         )
+
+    def claim_coordinator_notice(self, task_id: str, kind: str) -> bool:
+        """Lease a terminal-stall notice using the existing exec event log.
+
+        The claim is durable across watchdog ticks and process restarts. It is
+        taken under the queue write lock so two reconcilers cannot both wake
+        the coordinator for the same task and reason (#773).
+        """
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            latest = conn.execute(
+                "SELECT event, at FROM task_exec_events WHERE task_id=? "
+                "AND event IN ('coordinator_notice', 'coordinator_notice_failed', "
+                "'coordinator_notice_delivered', 'coordinator_notice_gave_up') "
+                "AND json_extract(fields, '$.kind')=? ORDER BY event_id DESC LIMIT 1",
+                (task_id, kind),
+            ).fetchone()
+            now = time.time()
+            if latest and (latest[0] in ("coordinator_notice_delivered",
+                                      "coordinator_notice_gave_up") or
+                           (latest[0] == "coordinator_notice" and now - latest[1] < 30)):
+                conn.execute("ROLLBACK")
+                return False
+            attempts = conn.execute(
+                "SELECT COUNT(*) FROM task_exec_events WHERE task_id=? "
+                "AND event='coordinator_notice' "
+                "AND json_extract(fields, '$.kind')=?",
+                (task_id, kind),
+            ).fetchone()[0]
+            if attempts >= _COORDINATOR_NOTICE_MAX_ATTEMPTS:
+                # Also closes pre-upgrade failure histories without sending again.
+                self._append_exec_event_on(conn, task_id, "coordinator_notice_gave_up",
+                                           now, kind=kind, attempts=attempts)
+                conn.commit()
+                return False
+            self._append_exec_event_on(conn, task_id, "coordinator_notice",
+                                       now, kind=kind)
+            conn.commit()
+            return True
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def finish_coordinator_notice(self, task_id: str, kind: str, *, delivered: bool) -> bool:
+        """Record delivery and return whether a failed notice remains retryable."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            self._append_exec_event_on(
+                conn, task_id,
+                "coordinator_notice_delivered" if delivered else "coordinator_notice_failed",
+                time.time(), kind=kind)
+            retryable = False
+            if not delivered:
+                attempts = conn.execute(
+                    "SELECT COUNT(*) FROM task_exec_events WHERE task_id=? "
+                    "AND event='coordinator_notice' "
+                    "AND json_extract(fields, '$.kind')=?",
+                    (task_id, kind),
+                ).fetchone()[0]
+                retryable = attempts < _COORDINATOR_NOTICE_MAX_ATTEMPTS
+                if not retryable:
+                    self._append_exec_event_on(conn, task_id, "coordinator_notice_gave_up",
+                                               time.time(), kind=kind, attempts=attempts)
+            conn.commit()
+            return retryable
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def retryable_coordinator_notices(self) -> list[tuple[str, str]]:
+        """Return failed or expired notice leases; successful notices stay closed."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                "WITH latest AS (SELECT MAX(event_id) AS event_id, task_id, "
+                "json_extract(fields, '$.kind') AS kind FROM task_exec_events "
+                "WHERE event IN ('coordinator_notice', 'coordinator_notice_failed', "
+                "'coordinator_notice_delivered', 'coordinator_notice_gave_up') "
+                "GROUP BY task_id, kind) "
+                "SELECT e.task_id, latest.kind, e.event, e.at FROM latest "
+                "JOIN task_exec_events e ON e.event_id=latest.event_id"
+            ).fetchall()
+            now = time.time()
+            return [(row[0], row[1]) for row in rows if row[2] == "coordinator_notice_failed"
+                    or (row[2] == "coordinator_notice" and now - row[3] >= 30)]
+        finally:
+            conn.close()
 
     def _record_claim_on(self, conn, task_id: str, at: float, *, role: Optional[str],
                          agent: Optional[str], via: str) -> None:

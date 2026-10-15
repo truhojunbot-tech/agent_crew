@@ -15,7 +15,7 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 from agent_crew import script_tester
-from agent_crew.protocol import TaskRequest
+from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 from agent_crew.server import create_app
@@ -149,6 +149,14 @@ def test_collection_abort_shared_with_base_is_not_a_pass(project, tmp_path):
     record = result.error_info["script_test"]
     assert record["pre_existing"] == ["tests/test_bad.py"]
     assert result.status == "failed" and record["reason"] == "exit_code_2"
+
+
+def test_new_collection_error_is_not_a_test_failure_verdict(project, tmp_path):
+    repo, head = project(GREEN, {"tests/test_bad.py": "import does_not_exist\n"})
+    result = _execute(repo, head, tmp_path)
+    assert result.error_info["script_test"]["reason"] == "exit_code_2"
+    from agent_crew.loop import handle_test_result
+    assert handle_test_result(result) == "not_run"
 
 
 def test_no_command_is_skipped_not_passed(project, tmp_path):
@@ -475,4 +483,26 @@ def test_run_loop_skipped_test_stage_stops_without_reimplement(monkeypatch, tmp_
     assert out.exception is None, out.output
     assert "SKIPPED_NO_TEST_COMMAND" in out.output
     assert "left for the coordinator gate" in out.output
+    assert dispatched == ["implement", "review", "test"]
+
+
+@pytest.mark.parametrize("test_result", [
+    script_tester.record_to_result("test-review-1", {"outcome": "FAILED", "reason": "timeout"}),
+    script_tester.record_to_result("test-review-1", {"outcome": "FAILED", "reason": "exit_code_4"}),
+    script_tester.record_to_result("test-review-1", {"outcome": "FAILED", "reason": "merge_conflict"}),
+    script_tester.record_to_result("test-review-1", {"outcome": "SETUP_ERROR", "detail": "config"}),
+    TaskResult(
+        "test-review-1", "failed", "provider exit_1", error_info={"reason": "exit_1", "final": True}),
+])
+def test_run_loop_unjudged_test_stage_stops_without_reimplement(monkeypatch, tmp_path,
+                                                                 test_result):
+    from agent_crew.protocol import TaskResult
+
+    results = [_impl_done(),
+               TaskResult("review-1", "completed", "ok", verdict="approve", findings=[]),
+               test_result]
+    out, dispatched = _crew_run(monkeypatch, tmp_path, results, tester=True)
+    assert out.exception is None, out.output
+    assert "test stage not_run" in out.output
+    assert "coordinator gate" in out.output
     assert dispatched == ["implement", "review", "test"]
