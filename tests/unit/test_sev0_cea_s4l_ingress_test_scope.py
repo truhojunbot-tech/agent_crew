@@ -61,7 +61,9 @@ def _dispatch(tmp_path, monkeypatch, *, mode, context=None, receipt_extra=None,
     state = tmp_path / "state.json"
     state.write_text(json.dumps({"port": 8112, "role_agents": {"implementer": "codex", "reviewer": "claude", "tester": "gemini"}, "worktrees": {"gemini": str(wt)}}))
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "shadow")
-    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    # This test claims and dispatches the row itself. A background dispatcher
+    # can claim it between POST and q.dequeue, making the scope check vacuous.
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
     monkeypatch.setenv("AGENT_CREW_BASE", str(tmp_path / "lb"))
     monkeypatch.setattr("agent_crew.server.asyncio.create_subprocess_exec", _fake_exec)
@@ -70,7 +72,7 @@ def _dispatch(tmp_path, monkeypatch, *, mode, context=None, receipt_extra=None,
     app = create_app(db_path=db, pane_map={}, port=8112, state_path=str(state),
                      project="demo", watchdog_disabled=True, anomaly_disabled=True)
     with TestClient(app) as client:
-        resp = client.post("/tasks", json={
+        resp = client.post("/tasks", headers={"X-Agent-Crew-Project": "demo"}, json={
             "task_id": task_id, "task_type": "test", "description": "run",
             "branch": "main", "project": "demo", "context": context or {}})
         assert resp.status_code < 300, resp.text

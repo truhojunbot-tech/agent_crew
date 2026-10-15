@@ -15,6 +15,7 @@ cools down and requeues instead of retrying at once or failing.
 import json
 import logging
 import os
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -72,9 +73,10 @@ def test_u_581_cooldown_doubles_caps_at_15_min_with_jitter(monkeypatch):
 # ── dispatcher end to end ────────────────────────────────────────────────
 
 def _run(tmp_db, tmp_path, port, *, env: dict, succeed_on: int, task_id: str,
-         timeout: float = 15.0):
+         timeout: float = 60.0):
     """Dispatch one task whose first ``succeed_on - 1`` runs hit capacity."""
     spawn_times: list[float] = []
+    completed = threading.Event()
 
     async def fake_subprocess(*args, **kwargs):
         spawn_times.append(time.time())
@@ -89,6 +91,7 @@ def _run(tmp_db, tmp_path, port, *, env: dict, succeed_on: int, task_id: str,
         else:
             TaskQueue(tmp_db).submit_result(task_id, TaskResult(
                 task_id=task_id, status="completed", summary="done"))
+            completed.set()
             proc.returncode = 0
         proc.wait = AsyncMock(return_value=proc.returncode)
         return proc
@@ -111,15 +114,8 @@ def _run(tmp_db, tmp_path, port, *, env: dict, succeed_on: int, task_id: str,
                         "description": "Test PR #1", "branch": "main",
                         "priority": 3, "context": {}, "project": "test_project"})
                     assert resp.status_code == 201
-                    deadline = time.time() + timeout
-                    status = None
-                    while time.time() < deadline:
-                        row = next((r for r in TaskQueue(tmp_db).list_all_with_status()
-                                    if r["task_id"] == task_id), None)
-                        status = row["status"] if row else None
-                        if status in ("completed", "failed"):
-                            break
-                        time.sleep(0.05)
+                    completed.wait(timeout)
+                    status = TaskQueue(tmp_db).get_task_status(task_id)
     return status, spawn_times
 
 
@@ -137,12 +133,15 @@ def test_u_581_capacity_n_times_then_success_completes_without_transient_budget(
     }, succeed_on=6, task_id="t-581-ok")
     assert status == "completed", f"status={status!r} spawns={len(spawns)}"
     assert len(spawns) == 6
-    gaps = [b - a for a, b in zip(spawns, spawns[1:])]
-    for gap, want in zip(gaps, (0.1, 0.2, 0.3, 0.3, 0.3)):
-        assert gap >= want, f"retry gaps {gaps} shorter than cooldown 0.1/0.2/0.3(cap)"
-
     requeues = _events(tmp_db, "t-581-ok", "requeued")
     assert len(requeues) == 5
+    claims = _events(tmp_db, "t-581-ok", "claimed")
+    assert len(claims) == 6
+    # The persisted schedule and claim times prove every cooldown was honoured.
+    # Process spawn timestamps include unrelated scheduler delays under load.
+    for requeue, claim, want in zip(requeues, claims[1:], (0.1, 0.2, 0.3, 0.3, 0.3)):
+        assert requeue["not_before"] - requeue["at"] == pytest.approx(want, abs=0.001)
+        assert claim["at"] >= requeue["not_before"]
     assert all(e["waste_reason"] == PROVIDER_CAPACITY and e["waste_class"] == "infra"
                for e in requeues)
     assert [e["capacity_refusals"] for e in requeues] == [1, 2, 3, 4, 5]
