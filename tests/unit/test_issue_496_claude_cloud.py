@@ -64,7 +64,8 @@ def _enqueue_implement(q, task_id=None, branch=None, context=None):
     task_id = task_id or f"impl-{uuid.uuid4().hex[:8]}"
     branch = branch or f"claude/{task_id}"
     q.enqueue(TaskRequest(task_id=task_id, task_type="implement", description="do the thing",
-                          branch=branch, context=context or {}, project="agent_crew"))
+                          branch=branch, context={"repo": "owner/repo", **(context or {})},
+                          project="agent_crew"))
     return task_id, branch
 
 
@@ -248,7 +249,7 @@ def test_at6_dispatch_uses_resume_argv_for_fix_task(q, monkeypatch):
 
     fix_id = f"fix-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=fix_id, task_type="implement", description="address findings",
-                          branch=branch, context={"prev_task_id": impl_id}, project="agent_crew"))
+                          branch=branch, context={"prev_task_id": impl_id, "repo": "owner/repo"}, project="agent_crew"))
 
     seen_argv = {}
 
@@ -288,7 +289,7 @@ def test_at8_continuation_failure_falls_back_via_existing_mechanism(q, monkeypat
 
     fix_id = f"fix-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=fix_id, task_type="implement", description="address findings",
-                          branch=branch, context={"prev_task_id": impl_id}, project="agent_crew"))
+                          branch=branch, context={"prev_task_id": impl_id, "repo": "owner/repo"}, project="agent_crew"))
 
     calls = []
     import agent_crew.pipeline as pipeline_module
@@ -447,7 +448,7 @@ def test_at13_resumed_dispatch_records_resume_policy(q):
                          provider_session_id=OBSERVED_SESSION_ID)
     fix_id = f"fix-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=fix_id, task_type="implement", description="address findings",
-                          branch=branch, context={"prev_task_id": impl_id}, project="agent_crew"))
+                          branch=branch, context={"prev_task_id": impl_id, "repo": "owner/repo"}, project="agent_crew"))
     run = _run_sequence(_Proc(0, HELP_TEXT_WITH_CLOUD), _Proc(0, OBSERVED_LAUNCH_TEXT))
     cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
     row = [t for t in q.list_tasks() if t.task_id == fix_id][0]

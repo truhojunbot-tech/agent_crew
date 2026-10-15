@@ -133,10 +133,11 @@ def test_fix_divergent_server_cwd_and_multiple_task_repos(q, monkeypatch):
     )
 
 
-def test_fix_falls_back_to_server_cwd_only_when_task_has_no_repo(q, monkeypatch):
-    """When a task's context genuinely carries no repo, falling back to
-    `github.get_repo()` (the server cwd) is still correct — that fallback is
-    for a single-project deployment, not the per-task bug this fixes."""
+def test_implement_never_falls_back_to_server_cwd_when_task_has_no_repo(q, monkeypatch):
+    """#762: the server cwd is a different repository. An implement task with
+    no repo (and no registered checkout) resolves to "" rather than
+    `github.get_repo()`; dispatch now writes context.repo at launch."""
+    monkeypatch.delenv("AGENT_CREW_STATE", raising=False)
     monkeypatch.setattr(cc._github, "get_repo", lambda *a, **kw: "server/cwd-repo")
     seen_repos = {}
 
@@ -152,7 +153,7 @@ def test_fix_falls_back_to_server_cwd_only_when_task_has_no_repo(q, monkeypatch)
 
     cc.reconcile_all_cloud_tasks(q)
 
-    assert seen_repos[branch] == "server/cwd-repo"
+    assert seen_repos[branch] == ""
 
 
 def test_fix_explicit_override_still_wins_over_task_context(q, monkeypatch):

@@ -2562,6 +2562,8 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
     risk_context = {"risk_tier": risk_tier}
     issue_context = {"issue": issue} if issue is not None else {}
     artifact_context = {"artifact_kind": artifact_kind} if artifact_kind is not None else {}
+    # #762: the server cwd is another repo; carry --repo on the task itself.
+    repo_context = {"repo": repo} if repo else {}
 
     if not db:
         project = _select_project(base, project, allow_cross_project)
@@ -3051,7 +3053,7 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
     run_branch_context = {"base_branch": declared_base,
                           "crew_run_branch": branch != declared_base and not implicit_main}
     impl_context = {**_CM, **run_branch_context, **risk_context, **issue_context,
-                    **artifact_context,
+                    **artifact_context, **repo_context,
                     "sync_landed_bases": _sync_landed_bases}
     if implementer:
         impl_context["agent_override"] = implementer
@@ -3239,7 +3241,7 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                     impl_id = enqueue_implement(queue, task, impl_branch or branch,
                                                context={**_CM, **run_branch_context, **risk_context,
                                                         **issue_context,
-                                                        **artifact_context,
+                                                        **artifact_context, **repo_context,
                                                         "retry": True, "sync_landed_bases": retry_bases}, port=_run_port)
                     continue
             else:
@@ -3273,7 +3275,7 @@ def _run_loop(task: str, db: str, project: str, allow_cross_project: bool, base:
                 port=_run_port, project=project,
                 role_to_agent=_run_role_to_agent) if _run_worktrees else {}
             retry_context = {**_CM, **run_branch_context, **risk_context, **issue_context,
-                             **artifact_context,
+                             **artifact_context, **repo_context,
                              "feedback": feedback,
                              "sync_landed_bases": retry_bases}
             if implementer:

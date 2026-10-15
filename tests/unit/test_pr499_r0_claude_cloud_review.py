@@ -89,8 +89,11 @@ def test_finding1_end_to_end_pr_appears_and_review_gets_enqueued(q, monkeypatch)
     """Full reproduction with the actual reconciliation function (not a spy):
     a dispatched cloud task whose branch now has a PR must, via
     reconcile_all_cloud_tasks alone (the thing the watchdog now calls),
-    complete AND enqueue a review — with no server.py/tmux involved at all."""
-    task_id, branch = _enqueue_implement(q)
+    complete AND enqueue a review — with no server.py/tmux involved at all.
+
+    #762 r1: a real cloud dispatch records context.repo; the default
+    pr_state lookup is bound to it (no repo -> no cwd guess -> unknown)."""
+    task_id, branch = _enqueue_implement(q, context={"repo": "owner/agent_crew"})
     q.dequeue(role="implementer")
     q.record_dispatch(task_id, channel=cc.DISPATCH_CHANNEL, agent=cc.CLOUD_PROVIDER_NAME,
                       target="pending")
@@ -146,25 +149,25 @@ def test_finding2_dispatch_resolves_repo_from_task_context(q):
         "task's own context, not an empty string")
 
 
-def test_finding2_dispatch_falls_back_to_get_repo_when_context_has_none(q, monkeypatch):
-    """When the task's context carries no repo (e.g. a bare-bones enqueue),
-    fall back to `github.get_repo()` — the same cwd-based resolution every
-    other call site in this codebase already uses — rather than silently
-    omitting the repo line."""
+def test_finding2_implement_dispatch_never_falls_back_to_server_cwd(q, monkeypatch):
+    """#762: an implement task whose context carries no repo must NOT inherit
+    `github.get_repo()` of the server cwd — that is a different repository.
+    With no registered checkout to resolve, the dispatch fails closed."""
     task_id, branch = _enqueue_implement(q, context={})
     import agent_crew.claude_cloud as cc_module
+    monkeypatch.delenv("AGENT_CREW_STATE", raising=False)
     monkeypatch.setattr(cc_module._github, "get_repo", lambda *a, **kw: "fallback/repo")
-
-    seen_argv = {}
+    launched = []
 
     def run(argv, **_kw):
         if "--help" in argv:
             return _HelpProc()
-        seen_argv["argv"] = argv
+        launched.append(argv)
         return _LaunchProc()
 
-    cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
-    assert "fallback/repo" in " ".join(seen_argv["argv"])
+    outcome = cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
+    assert outcome.launch_error == "cloud_repo_unresolved"
+    assert launched == []
 
 
 # ── Finding 3: no-PR terminal outcomes with no pushed commit hang forever ──

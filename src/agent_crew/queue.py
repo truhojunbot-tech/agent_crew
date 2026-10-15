@@ -6354,6 +6354,7 @@ class TaskQueue:
             row = conn.execute(
                 "SELECT COUNT(*) AS n FROM task_attribution "
                 "WHERE agent='claude_cloud' AND task_type='review' "
+                "AND task_id NOT LIKE 'cloud-shadow:%' "
                 "AND provider_session_id<>'' AND started_at>=?", (since,)
             ).fetchone()
             shadow = conn.execute(
