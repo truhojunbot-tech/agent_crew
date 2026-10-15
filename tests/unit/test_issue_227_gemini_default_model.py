@@ -149,20 +149,26 @@ def test_u776_explicit_model_pin_is_recorded_without_substitution(
     assert TaskQueue(tmp_db).get_attribution("test-776-pin")["model"] == "Gemini 3.7 Flash (Medium)"
 
 
-@pytest.mark.parametrize("output, reason", [
-    ('{"status":"ERROR","num_turns":0,"error":"invalid model selection"}\n', "config_error"),
-    ("provider exited before running tests\n", "provider_test_not_run"),
+@pytest.mark.parametrize("output, reason, status", [
+    ('{"status":"ERROR","num_turns":0,"error":"invalid model selection"}\n', "config_error", "needs_human"),
+    ("provider exited before running tests\n", "provider_test_not_run", "needs_human"),
+    ("", "provider_test_not_run", "failed"),
 ])
 def test_u776_nonzero_agy_exit_does_not_reimplement(
-        tmp_db, tmp_path, *, unused_tcp_port, output, reason):
+        tmp_db, tmp_path, *, unused_tcp_port, output, reason, status):
     notices = []
     spawn_log = _run_dispatch(
         tmp_db, tmp_path, "test-776-exit", unused_tcp_port=unused_tcp_port,
         exit_code=1, output=output, notices=notices, wait_for_terminal=True)
     queue = TaskQueue(tmp_db)
     assert len(spawn_log) == 1
-    assert queue.get_task("test-776-exit").status == "needs_human"
+    assert queue.get_task("test-776-exit").status == status
     result = queue.get_result("test-776-exit")
     assert result.summary == reason
+    if status == "failed":
+        from agent_crew.loop import handle_test_result
+        assert result.error_info["reason"] == "provider_test_not_run"
+        assert result.error_info["not_run"] is True
+        assert handle_test_result(result) == "not_run"
     assert not any(row.task_type == "implement" for row in queue.list_tasks())
     assert len(notices) == 1

@@ -6566,11 +6566,19 @@ def create_app(
             elif proc.returncode != 0:
                 if task.task_type == "test":
                     _config_error = _provider_zero_turn_config_error(agent, _task_log_tail)
-                    _fail_if_active(task.task_id,
-                                    "config_error" if _config_error else "provider_test_not_run",
-                                    status="needs_human",
-                                    details={"provider": agent, "provider_exit_code": proc.returncode,
-                                             **_codex_no_result_details})
+                    _silent_exit = not _task_log_tail.strip()
+                    _reason = "config_error" if _config_error else "provider_test_not_run"
+                    # A completely silent child crash is an execution failure.
+                    # Keep that terminal status for attribution, but mark its
+                    # result as not-run so a CLI loop cannot treat it as a test
+                    # verdict and re-implement the unchanged PR.
+                    _ended = _fail_if_active(
+                        task.task_id, _reason,
+                        status="failed" if _silent_exit else "needs_human",
+                        details={"provider": agent, "provider_exit_code": proc.returncode,
+                                 "not_run": True, **_codex_no_result_details})
+                    if _silent_exit and _ended:
+                        _coordinator_notice(task.task_id, _reason, "provider exited without output")
                 else:
                     _fail_if_active(task.task_id, f"exit_{proc.returncode}",
                                     details=_codex_no_result_details)
