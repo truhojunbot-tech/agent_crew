@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
+from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
@@ -90,7 +91,15 @@ def _run_dispatch(tmp_db, tmp_path, task_id, extra_env=None, *, unused_tcp_port,
                 with TestClient(app) as client:
                     resp = client.post("/tasks", json=_test_payload(task_id))
                     assert resp.status_code == 201
-                    time.sleep(0.4)
+                    queue = TaskQueue(tmp_db)
+                    deadline = time.monotonic() + 10
+                    while time.monotonic() < deadline:
+                        status = queue.get_task_status(task_id)
+                        if spawn_log or status in {"needs_human", "failed", "timed_out", "completed"}:
+                            break
+                        time.sleep(0.02)
+                    else:
+                        raise AssertionError(f"test task {task_id} was not dispatched or stopped")
 
     return spawn_log
 
