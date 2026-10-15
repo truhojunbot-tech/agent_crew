@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import site
@@ -124,7 +125,9 @@ def parse_test_output(text: str) -> tuple[dict, list]:
             elif depth == 0 and entry.startswith(" - ", index):
                 entry = entry[:index]
                 break
-        if entry and entry not in ids:
+        path, separator, name = entry.partition("::")
+        if (separator and path.endswith(".py") and path and name
+                and not re.search(r"[\s:]", path) and entry not in ids):
             ids.append(entry)
     counts: dict = {}
     for line in reversed((text or "").splitlines()):
@@ -303,7 +306,8 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                     cache_dir: str, runner: Callable = run_command) -> dict:
     """Run the stage and return its durable record (``outcome`` is the verdict)."""
     record: dict = {"executor": SCRIPT_TESTER, "provider_calls": 0,
-                    "base_sha": base_sha, "head_sha": head_sha, "rebased": True}
+                    "base_sha": base_sha, "head_sha": head_sha, "rebased": True,
+                    "pre_existing": [], "new_failures": [], "flaky": [], "reruns": {}}
     try:
         with Checkout(repo, base_sha, head_sha) as checkout:
             command, timeout_s = resolve_test_config(state, checkout)
@@ -311,38 +315,53 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
             if not command:
                 record["outcome"] = SKIPPED_NO_TEST_COMMAND
                 return record
-            head = runner(command, checkout, timeout_s,
-                          env=test_environment(checkout, state))
+            head_env = test_environment(checkout, state)
+            head = runner(command, checkout, timeout_s, env=head_env)
+            record["head"] = head.to_dict()
+            record["counts"] = dict(head.counts)
+            record["duration_s"] = head.duration_s
+            if head.timed_out:
+                record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+                return record
+            if head.failing_ids:
+                base, cached = base_outcome(repo, base_sha, command, timeout_s,
+                                            cache_dir, state, runner)
+                record["base"] = {**base.to_dict(), "cached": cached}
+                record["duration_s"] += base.duration_s
+                if base.timed_out:
+                    record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+                    return record
+                base_ids = set(base.failing_ids)
+                record["pre_existing"] = [i for i in head.failing_ids if i in base_ids]
+                candidates = [i for i in head.failing_ids if i not in base_ids]
+                if head.exit_code == 1:
+                    for node_id in candidates:
+                        attempts = record["reruns"][node_id] = []
+                        for _ in range(2):
+                            rerun = runner(f"{command} {shlex.quote(node_id)}", checkout,
+                                           timeout_s, env=head_env)
+                            attempts.append(rerun.to_dict())
+                            record["duration_s"] += rerun.duration_s
+                            if rerun.timed_out:
+                                record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+                                return record
+                            if rerun.exit_code == 0 and not rerun.failing_ids:
+                                record["flaky"].append(node_id)
+                                break
+                            if rerun.exit_code != 1 or node_id not in rerun.failing_ids:
+                                record.update(outcome=INCOMPLETE,
+                                              reason="script_test_rerun_unjudged")
+                                return record
+                record["new_failures"] = [i for i in candidates if i not in record["flaky"]]
     except MergeConflict as exc:
         record.update(outcome=FAILED, reason="merge_conflict", detail=str(exc))
         return record
-    record["head"] = head.to_dict()
-    record["counts"] = dict(head.counts)
-    record["duration_s"] = head.duration_s
-    if head.timed_out:
-        record.update(outcome=INCOMPLETE, reason="script_test_timeout")
-        return record
-    pre_existing: list = []
-    new_failures = list(head.failing_ids)
-    if head.failing_ids:
-        base, cached = base_outcome(repo, base_sha, command, timeout_s,
-                                    cache_dir, state, runner)
-        record["base"] = {**base.to_dict(), "cached": cached}
-        record["duration_s"] += base.duration_s
-        if base.timed_out:
-            record.update(outcome=INCOMPLETE, reason="script_test_timeout")
-            return record
-        base_ids = set(base.failing_ids)
-        pre_existing = [i for i in head.failing_ids if i in base_ids]
-        new_failures = [i for i in head.failing_ids if i not in base_ids]
-    record["pre_existing"] = pre_existing
-    record["new_failures"] = new_failures
     if head.exit_code not in (0, 1):
         # Collection, configuration and interrupted runs can print ERROR ids,
         # but they did not produce a test verdict about the PR.
         record.update(outcome=FAILED, reason=f"exit_code_{head.exit_code}")
         record["output_tail"] = head.output_tail[-1500:]
-    elif new_failures:
+    elif record["new_failures"]:
         record.update(outcome=FAILED, reason="new_failures")
     elif head.exit_code == 0 or (head.exit_code == 1 and head.failing_ids):
         record["outcome"] = PASSED
@@ -361,8 +380,10 @@ def record_to_result(task_id: str, record: Mapping, pr_number=None) -> TaskResul
     info = {"script_test": dict(record)}
     if outcome == PASSED:
         pre = record.get("pre_existing") or []
+        flaky = record.get("flaky") or []
         summary = (f"script test {PASSED}: {_counts_text(record.get('counts') or {})}"
-                   + (f"; pre_existing failures not blamed on PR: {len(pre)}" if pre else ""))
+                   + (f"; pre_existing failures not blamed on PR: {len(pre)}" if pre else "")
+                   + (f"; flaky: {', '.join(flaky[:20])}" if flaky else ""))
         return TaskResult(task_id, "completed", summary, pr_number=pr_number, error_info=info)
     if outcome == SKIPPED_NO_TEST_COMMAND:
         return TaskResult(task_id, "needs_human",
@@ -386,6 +407,9 @@ def record_to_result(task_id: str, record: Mapping, pr_number=None) -> TaskResul
     summary = f"script test {FAILED} ({reason}): {_counts_text(record.get('counts') or {})}"
     if new:
         summary += f"; new failures: {', '.join(new[:20])}"
+    flaky = record.get("flaky") or []
+    if flaky:
+        summary += f"; flaky: {', '.join(flaky[:20])}"
     return TaskResult(task_id, "failed", summary, findings=[f"new failure: {i}" for i in new],
                       pr_number=pr_number,
                       error_info={**info, "reason": f"script_test_{reason}", "final": True})

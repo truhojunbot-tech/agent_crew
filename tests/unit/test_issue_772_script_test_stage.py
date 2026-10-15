@@ -141,13 +141,86 @@ def test_failure_parser_keeps_separator_inside_param_id():
     assert ids == ["tests/test_x.py::test_case[a - b]"]
 
 
+def test_failure_parser_excludes_log_lines_and_collection_paths():
+    text = ("ERROR agent_crew.server:server.py:1199 provider failed\n"
+            "ERROR tests/test_bad.py - ImportError: missing\n"
+            "FAILED tests/test_x.py::test_real - AssertionError: bad\n")
+    _, ids = script_tester.parse_test_output(text)
+    assert ids == ["tests/test_x.py::test_real"]
+
+
+@pytest.mark.parametrize("rerun_exit_codes, expected_outcome, expected_flaky, expected_reruns", [
+    ([0], "PASSED", ["tests/test_b.py::test_two"], 1),
+    ([1, 0], "PASSED", ["tests/test_b.py::test_two"], 2),
+    ([1, 1], "FAILED", [], 2),
+])
+def test_new_failure_is_judged_from_isolated_head_reruns(
+        project, tmp_path, rerun_exit_codes, expected_outcome, expected_flaky,
+        expected_reruns):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    node = "tests/test_b.py::test_two"
+    calls = []
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        calls.append((command, cwd, dict(env)))
+        if len(calls) == 1:
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node],
+                                            counts={"failed": 1}, duration_s=3)
+        if command == PYTEST:
+            return script_tester.RunOutcome(exit_code=0, duration_s=2)
+        code = rerun_exit_codes.pop(0)
+        return script_tester.RunOutcome(exit_code=code, duration_s=1,
+                                        failing_ids=[node] if code else [])
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": PYTEST}, cache_dir=str(tmp_path / "cache"),
+        runner=runner)
+    assert record["outcome"] == expected_outcome
+    assert record["flaky"] == expected_flaky
+    assert record["new_failures"] == ([] if expected_flaky else [node])
+    assert len(record["reruns"][node]) == expected_reruns
+    rerun_calls = [call for call in calls if call[0] != PYTEST]
+    assert all(command.endswith(" " + node) for command, _, _ in rerun_calls)
+    assert all(cwd == calls[0][1] and env == calls[0][2]
+               for _, cwd, env in rerun_calls)
+    result = script_tester.record_to_result("test-flake", record)
+    assert result.status == ("completed" if expected_flaky else "failed")
+    if expected_flaky:
+        assert node in result.summary and "flaky" in result.summary
+
+
+def test_isolated_rerun_timeout_is_incomplete(project, tmp_path):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    node = "tests/test_b.py::test_two"
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        if command != PYTEST:
+            return script_tester.RunOutcome(exit_code=None, timed_out=True, duration_s=10)
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node], duration_s=1)
+        return script_tester.RunOutcome(exit_code=0, duration_s=1)
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": PYTEST, "test_timeout_s": 10},
+        cache_dir=str(tmp_path / "cache"), runner=runner)
+    assert record["outcome"] == "INCOMPLETE"
+    assert record["reason"] == "script_test_timeout"
+    assert script_tester.record_to_result("test-rerun-timeout", record).status == "needs_human"
+
+
 def test_collection_abort_shared_with_base_is_not_a_pass(project, tmp_path):
     broken = {"tests/test_a.py": "def test_one():\n    assert True\n",
               "tests/test_bad.py": "import does_not_exist\n"}
     repo, head = project(broken, {"tests/test_b.py": "def test_two():\n    assert True\n"})
     result = _execute(repo, head, tmp_path)
     record = result.error_info["script_test"]
-    assert record["pre_existing"] == ["tests/test_bad.py"]
+    assert record["pre_existing"] == []  # collection path is not a pytest node id
     assert result.status == "failed" and record["reason"] == "exit_code_2"
 
 
@@ -394,6 +467,30 @@ def test_server_new_failure_fails_without_retry_or_merge(project, server):
         "tests/test_b.py::test_two"]
     assert [t.task_id for t in queue.list_tasks()] == [done.task_id]   # no retry clone
     assert (pushes, spawns, merges) == ([], [], [])
+
+
+def test_server_flaky_head_failure_has_no_implement_successor(
+        project, server, monkeypatch):
+    build, pushes, spawns, _ = server
+    repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    app, queue = build(repo, {"test_command": PYTEST})
+    node = "tests/test_b.py::test_two"
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        if command != PYTEST:
+            return script_tester.RunOutcome(exit_code=0, counts={"passed": 1})
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
+        return script_tester.RunOutcome(exit_code=0)
+
+    execute = script_tester.execute_test_task
+    monkeypatch.setattr(script_tester, "execute_test_task", lambda *args, **kwargs:
+                        execute(*args, **kwargs, runner=runner))
+    done = _run_through_push_path(app, queue, _task(head))
+    assert done.status == "completed"
+    assert queue.get_task_context(done.task_id)["script_test"]["flaky"] == [node]
+    assert [task.task_id for task in queue.list_tasks()] == [done.task_id]
+    assert (pushes, spawns) == ([], [])
 
 
 def test_server_no_command_never_auto_merges(project, server):
