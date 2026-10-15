@@ -493,6 +493,8 @@ def test_run_loop_skipped_test_stage_stops_without_reimplement(monkeypatch, tmp_
     script_tester.record_to_result("test-review-1", {"outcome": "SETUP_ERROR", "detail": "config"}),
     TaskResult(
         "test-review-1", "failed", "provider exit_1", error_info={"reason": "exit_1", "final": True}),
+    TaskResult(
+        "test-review-1", "failed", "invalid model", error_info={"reason": "config_error"}),
 ])
 def test_run_loop_unjudged_test_stage_stops_without_reimplement(monkeypatch, tmp_path,
                                                                  test_result):
