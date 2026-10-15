@@ -367,40 +367,45 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 record["pre_existing"] = [i for i in head.failing_ids if i in base_ids]
                 candidates = [i for i in head.failing_ids if i not in base_ids]
                 if head.exit_code == 1:
-                    if len(candidates) > _MAX_RERUN_CANDIDATES:
-                        record.update(outcome=INCOMPLETE, reason="script_test_rerun_limit")
-                        return record
-                    rerun_commands = {
+                    skip_reason = ("script_test_rerun_limit"
+                                   if len(candidates) > _MAX_RERUN_CANDIDATES else None)
+                    rerun_commands = ({
                         node_id: _isolated_rerun_command(command, node_id)
                         for node_id in candidates
-                    }
-                    if any(value is None for value in rerun_commands.values()):
-                        record.update(outcome=INCOMPLETE,
-                                      reason="script_test_rerun_unavailable")
-                        return record
-                    record["rerun_budget_s"] = min(_RERUN_BUDGET_S, timeout_s)
-                    rerun_deadline = time.monotonic() + record["rerun_budget_s"]
-                    for node_id in candidates:
-                        attempts = record["reruns"][node_id] = []
-                        for _ in range(2):
-                            remaining = rerun_deadline - time.monotonic()
-                            if remaining <= 0:
-                                record.update(outcome=INCOMPLETE, reason="script_test_timeout")
-                                return record
-                            rerun = runner(rerun_commands[node_id], checkout,
-                                           min(timeout_s, remaining), env=head_env)
-                            attempts.append(rerun.to_dict())
-                            record["duration_s"] += rerun.duration_s
-                            if rerun.timed_out:
-                                record.update(outcome=INCOMPLETE, reason="script_test_timeout")
-                                return record
-                            if rerun.exit_code == 0 and not rerun.failing_ids:
-                                record["flaky"].append(node_id)
-                                break
-                            if rerun.exit_code != 1 or node_id not in rerun.failing_ids:
-                                record.update(outcome=INCOMPLETE,
-                                              reason="script_test_rerun_unjudged")
-                                return record
+                    } if not skip_reason else {})
+                    if not skip_reason and any(
+                            value is None for value in rerun_commands.values()):
+                        skip_reason = "script_test_rerun_unavailable"
+                    if skip_reason:
+                        # The head suite produced a test verdict; unavailable
+                        # flake checks must not suppress its new failures.
+                        record["reruns_skipped"] = skip_reason
+                    else:
+                        record["rerun_budget_s"] = min(_RERUN_BUDGET_S, timeout_s)
+                        rerun_deadline = time.monotonic() + record["rerun_budget_s"]
+                        for node_id in candidates:
+                            attempts = record["reruns"][node_id] = []
+                            for _ in range(2):
+                                remaining = rerun_deadline - time.monotonic()
+                                if remaining <= 0:
+                                    record.update(outcome=INCOMPLETE,
+                                                  reason="script_test_timeout")
+                                    return record
+                                rerun = runner(rerun_commands[node_id], checkout,
+                                               min(timeout_s, remaining), env=head_env)
+                                attempts.append(rerun.to_dict())
+                                record["duration_s"] += rerun.duration_s
+                                if rerun.timed_out:
+                                    record.update(outcome=INCOMPLETE,
+                                                  reason="script_test_timeout")
+                                    return record
+                                if rerun.exit_code == 0 and not rerun.failing_ids:
+                                    record["flaky"].append(node_id)
+                                    break
+                                if rerun.exit_code != 1 or node_id not in rerun.failing_ids:
+                                    record.update(outcome=INCOMPLETE,
+                                                  reason="script_test_rerun_unjudged")
+                                    return record
                 record["new_failures"] = [i for i in candidates if i not in record["flaky"]]
     except MergeConflict as exc:
         record.update(outcome=FAILED, reason="merge_conflict", detail=str(exc))

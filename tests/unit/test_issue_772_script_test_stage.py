@@ -233,9 +233,16 @@ def test_many_new_failures_do_not_start_unbounded_reruns(project, tmp_path):
         repo, base_sha=base_sha, head_sha=head_sha,
         state={"test_command": PYTEST}, cache_dir=str(tmp_path / "cache"),
         runner=runner)
-    assert record["outcome"] == "INCOMPLETE"
-    assert record["reason"] == "script_test_rerun_limit"
+    assert record["outcome"] == "FAILED"
+    assert record["reason"] == "new_failures"
+    assert record["new_failures"] == ids
+    assert record["reruns_skipped"] == "script_test_rerun_limit"
     assert record["reruns"] == {}
+    result = script_tester.record_to_result("test-many-failures", record)
+    assert result.status == "failed"
+    assert result.findings == [f"new failure: {node}" for node in ids]
+    from agent_crew.loop import handle_test_result
+    assert handle_test_result(result) == "failed"
     assert calls == [PYTEST, PYTEST]
 
 
@@ -259,8 +266,15 @@ def test_non_plain_command_does_not_rerun_whole_suite(project, tmp_path, command
         repo, base_sha=base_sha, head_sha=head_sha,
         state={"test_command": command}, cache_dir=str(tmp_path / "cache"),
         runner=runner)
-    assert record["outcome"] == "INCOMPLETE"
-    assert record["reason"] == "script_test_rerun_unavailable"
+    assert record["outcome"] == "FAILED"
+    assert record["reason"] == "new_failures"
+    assert record["new_failures"] == [node]
+    assert record["reruns_skipped"] == "script_test_rerun_unavailable"
+    result = script_tester.record_to_result("test-command-unavailable", record)
+    assert result.status == "failed"
+    assert result.findings == [f"new failure: {node}"]
+    from agent_crew.loop import handle_test_result
+    assert handle_test_result(result) == "failed"
     assert calls == [command, command]
 
 
