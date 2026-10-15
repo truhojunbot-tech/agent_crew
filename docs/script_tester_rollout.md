@@ -10,6 +10,11 @@ its server must restart to load the new role mapping.
 Run the migration in read-only mode and review **every** project's old and new
 tester, including unchanged projects:
 
+Set `test_timeout_s` to at least 1.5 times the measured full suite duration
+for each project. Pass `--test-timeout-s` and `--test-command` when planning
+and repeat the same options when applying; they are included in the guarded
+report hash. Omit either option to leave that state field unchanged.
+
 ```bash
 PYTHONPATH=src python3 scripts/migrate_script_tester.py \
   --crew-home "$CREW_HOME" > /tmp/script-tester-plan.json

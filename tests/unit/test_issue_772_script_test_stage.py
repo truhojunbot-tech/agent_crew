@@ -193,6 +193,39 @@ def test_timeout_fails_the_stage(tmp_path):
     assert outcome.timed_out and outcome.exit_code is None
 
 
+@pytest.mark.parametrize("timeout_on", ["head", "base"])
+def test_timeout_is_incomplete_with_duration_and_no_verdict(project, tmp_path, timeout_on):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    calls = []
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        calls.append(cwd)
+        if timeout_on == "head" or len(calls) == 2:
+            return script_tester.RunOutcome(
+                exit_code=None, timed_out=True, duration_s=12,
+                failing_ids=["tests/test_b.py::test_two"])
+        return script_tester.RunOutcome(
+            exit_code=1, timed_out=False, duration_s=2,
+            failing_ids=["tests/test_b.py::test_two"])
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": PYTEST, "test_timeout_s": 12},
+        cache_dir=str(tmp_path / "cache"), runner=runner)
+    assert len(calls) == (1 if timeout_on == "head" else 2)
+    assert record["outcome"] == "INCOMPLETE"
+    assert record["reason"] == "script_test_timeout"
+    assert record["timeout_s"] == 12
+    assert record["duration_s"] == (12 if timeout_on == "head" else 14)
+    result = script_tester.record_to_result("test-timeout", record)
+    assert result.status == "needs_human"
+    assert result.error_info["reason"] == "script_test_timeout"
+    from agent_crew.loop import handle_test_result
+    assert handle_test_result(result) == "not_run"
+
+
 def test_test_command_isolated_from_dispatcher_and_provider_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_PROJECT", "live_project")
     monkeypatch.setenv("OPENAI_API_KEY", "must-not-leak")
@@ -315,12 +348,15 @@ def server(tmp_path, monkeypatch):
     monkeypatch.setattr(gh, "pr_head_sha", lambda *a, **k: "")
     monkeypatch.setattr(gh, "pr_state", lambda *a, **k: "open")
 
-    def build(repo, state):
+    def build(repo, state, *, notices=None):
         state_path = tmp_path / "state.json"
         state_path.write_text(json.dumps({"project": "proj", **state}))
         db = str(tmp_path / "tasks.db")
         app = create_app(db, pane_map={"tester": "%9"}, project="proj",
                          push_fn=lambda pane, text: pushes.append(pane),
+                         coordinator_notify_fn=(
+                             (lambda message: notices.append(message) or True)
+                             if notices is not None else None),
                          watchdog_disabled=True, anomaly_disabled=True,
                          state_path=str(state_path),
                          worktree_map={"implementer": repo, "reviewer": repo})
@@ -368,6 +404,24 @@ def test_server_no_command_never_auto_merges(project, server):
     assert done.status == "needs_human"
     assert queue.get_task_context(done.task_id)["script_test"]["outcome"] == (
         "SKIPPED_NO_TEST_COMMAND")
+    assert (pushes, spawns, merges) == ([], [], [])
+
+
+def test_server_timeout_never_enqueues_implement_and_notifies_once(
+        project, server, monkeypatch):
+    build, pushes, spawns, merges = server
+    repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert True\n"})
+    notices = []
+    app, queue = build(repo, {"test_command": PYTEST, "test_timeout_s": 12},
+                       notices=notices)
+    record = {"outcome": "INCOMPLETE", "reason": "script_test_timeout",
+              "timeout_s": 12, "duration_s": 12}
+    monkeypatch.setattr(script_tester, "execute_test_task", lambda *a, **k:
+                        script_tester.record_to_result("test-review-1", record, PR))
+    done = _run_through_push_path(app, queue, _task(head))
+    assert done.status == "needs_human"
+    assert [t.task_id for t in queue.list_tasks()] == [done.task_id]
+    assert len(notices) == 1 and "script_test_timeout" in notices[0]
     assert (pushes, spawns, merges) == ([], [], [])
 
 

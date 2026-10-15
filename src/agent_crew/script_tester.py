@@ -40,6 +40,7 @@ DEFAULT_TEST_TIMEOUT_S = 1800.0
 
 PASSED = "PASSED"
 FAILED = "FAILED"
+INCOMPLETE = "INCOMPLETE"
 SKIPPED_NO_TEST_COMMAND = "SKIPPED_NO_TEST_COMMAND"
 SETUP_ERROR = "SETUP_ERROR"
 
@@ -317,20 +318,26 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
         return record
     record["head"] = head.to_dict()
     record["counts"] = dict(head.counts)
+    record["duration_s"] = head.duration_s
+    if head.timed_out:
+        record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+        return record
     pre_existing: list = []
     new_failures = list(head.failing_ids)
     if head.failing_ids:
         base, cached = base_outcome(repo, base_sha, command, timeout_s,
                                     cache_dir, state, runner)
         record["base"] = {**base.to_dict(), "cached": cached}
+        record["duration_s"] += base.duration_s
+        if base.timed_out:
+            record.update(outcome=INCOMPLETE, reason="script_test_timeout")
+            return record
         base_ids = set(base.failing_ids)
         pre_existing = [i for i in head.failing_ids if i in base_ids]
         new_failures = [i for i in head.failing_ids if i not in base_ids]
     record["pre_existing"] = pre_existing
     record["new_failures"] = new_failures
-    if head.timed_out:
-        record.update(outcome=FAILED, reason="timeout")
-    elif head.exit_code not in (0, 1):
+    if head.exit_code not in (0, 1):
         # Collection, configuration and interrupted runs can print ERROR ids,
         # but they did not produce a test verdict about the PR.
         record.update(outcome=FAILED, reason=f"exit_code_{head.exit_code}")
@@ -368,6 +375,12 @@ def record_to_result(task_id: str, record: Mapping, pr_number=None) -> TaskResul
                           f"script test {SETUP_ERROR}: {record.get('detail', '')[:300]}; "
                           "PR left for the coordinator gate",
                           pr_number=pr_number, error_info=info)
+    if outcome == INCOMPLETE:
+        return TaskResult(task_id, "needs_human",
+                          f"script test {INCOMPLETE}: {record.get('reason')}; "
+                          "PR left for the coordinator gate",
+                          pr_number=pr_number,
+                          error_info={**info, "reason": record.get("reason")})
     reason = record.get("reason") or "failed"
     new = record.get("new_failures") or []
     summary = f"script test {FAILED} ({reason}): {_counts_text(record.get('counts') or {})}"

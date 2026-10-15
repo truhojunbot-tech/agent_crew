@@ -65,6 +65,8 @@ def test_apply_requires_matching_dry_run_hash_and_preserves_other_state(crew_hom
         assert mapping["tester"] == wanted
         assert state.get("roles") == original.get("roles")
         assert state.get("port") == original.get("port")
+        assert "test_timeout_s" not in state
+        assert "test_command" not in state
     with pytest.raises(ValueError, match="report hash"):
         migrate_script_tester.apply_migration(home, plan["sha256"])
     assert migrate_script_tester.apply_migration(
@@ -81,3 +83,37 @@ def test_opt_in_requires_boolean_and_is_inventoried_before_any_write(crew_home):
     with pytest.raises(ValueError, match="tester_provider_opt_in must be boolean"):
         migrate_script_tester.plan_migration(home)
     assert {path: path.read_bytes() for path in before} == before
+
+
+def test_optional_suite_config_is_reported_and_hash_guarded(crew_home):
+    home, cases = crew_home
+    command = "python3 -m pytest -q"
+    plain = migrate_script_tester.plan_migration(home)
+    assert all("test_timeout_s" not in json.loads(
+        (home / name / "state.json").read_text()) for name in cases)
+    report = migrate_script_tester.plan_migration(
+        home, test_timeout_s=2700, test_command=command)
+    for row in report["projects"]:
+        assert row["old_test_timeout_s"] is None
+        assert row["new_test_timeout_s"] == 2700
+        assert row["new_test_command"] == command
+    with pytest.raises(ValueError, match="report hash"):
+        migrate_script_tester.apply_migration(home, report["sha256"])
+    assert migrate_script_tester.apply_migration(
+        home, report["sha256"], test_timeout_s=2700, test_command=command) == len(cases)
+    for name in cases:
+        state = json.loads((home / name / "state.json").read_text())
+        assert state["test_timeout_s"] == 2700
+        assert state["test_command"] == command
+    assert plain["sha256"] != report["sha256"]
+
+
+def test_timeout_option_does_not_write_command(crew_home):
+    home, cases = crew_home
+    report = migrate_script_tester.plan_migration(home, test_timeout_s=2700)
+    assert migrate_script_tester.apply_migration(
+        home, report["sha256"], test_timeout_s=2700) == len(cases)
+    for name in cases:
+        state = json.loads((home / name / "state.json").read_text())
+        assert state["test_timeout_s"] == 2700
+        assert "test_command" not in state
