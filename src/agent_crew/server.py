@@ -106,50 +106,12 @@ from agent_crew.telemetry_response import response_log_telemetry
 from agent_crew.worktree_default_branch import remote_default_branch
 
 logger = logging.getLogger(__name__)
-_AGY_MODELS_CACHE: tuple[float, tuple[str, ...] | None] = (0.0, ())
-_GEMINI_FLASH_MODEL = re.compile(
-    r"Gemini\s+(\d+(?:\.\d+)*)\s+Flash\s+\((High|Medium|Low)\)", re.IGNORECASE)
-_AGY_GEMINI_MODEL = re.compile(
-    r"(Gemini\s+\d+(?:\.\d+)*\s+[A-Za-z][A-Za-z0-9 ._-]*?)\s*"
-    r"\(((?:High|Medium|Low)(?:\s*\|\s*(?:High|Medium|Low))*)\)", re.IGNORECASE)
+_DEFAULT_GEMINI_MODEL = "Gemini 3.8 Flash (Medium)"
 
 
-def _agy_models() -> tuple[str, ...] | None:
-    """Read model names; None means discovery failed, not an empty listing."""
-    global _AGY_MODELS_CACHE
-    now = time.monotonic()
-    if now < _AGY_MODELS_CACHE[0]:
-        return _AGY_MODELS_CACHE[1]
-    try:
-        result = subprocess.run(["agy", "models"], capture_output=True, text=True,
-                                timeout=5)
-        output = f"{result.stdout or ''}\n{result.stderr or ''}" if result.returncode == 0 else None
-    except (OSError, subprocess.TimeoutExpired):
-        output = None
-    models = None if output is None else tuple(dict.fromkeys(
-        f"{match.group(1).strip()} ({tier.strip()})"
-        for match in _AGY_GEMINI_MODEL.finditer(output)
-        for tier in match.group(2).split("|")))
-    _AGY_MODELS_CACHE = (now + (60 if models else 10), models)
-    return models
-
-
-def _resolve_gemini_model() -> str | None:
-    """Honor a listed pin; otherwise choose the newest Flash of its tier."""
-    models = _agy_models()
-    configured = os.getenv("AGENT_CREW_GEMINI_MODEL", "").strip()
-    if models is None:
-        return configured or None
-    if configured and configured in models:
-        return configured
-    tier_match = re.search(r"\((High|Medium|Low)\)$", configured, re.IGNORECASE)
-    tier = tier_match.group(1).lower() if tier_match else "medium"
-    candidates = []
-    for model in models:
-        match = _GEMINI_FLASH_MODEL.fullmatch(model)
-        if match and match.group(2).lower() == tier:
-            candidates.append((tuple(int(part) for part in match.group(1).split(".")), model))
-    return max(candidates)[1] if candidates else ""
+def _resolve_gemini_model() -> str:
+    """Use the explicit provider pin or the current headless Gemini default."""
+    return os.getenv("AGENT_CREW_GEMINI_MODEL", "").strip() or _DEFAULT_GEMINI_MODEL
 
 
 def _provider_zero_turn_config_error(agent: str, output: str) -> bool:
@@ -5437,20 +5399,7 @@ def create_app(
         # model stays unknown (empty) rather than guessed. Resolved once,
         # here, and reused below when building the gemini `cmd` so the two
         # can't drift apart.
-        _known_model = await asyncio.to_thread(_resolve_gemini_model) if agent == "gemini" else ""
-        if agent == "gemini" and not _known_model:
-            try:
-                _discovery_failed = _known_model is None
-                _fail_if_active(
-                    task.task_id,
-                    "model_discovery_unavailable" if _discovery_failed else "config_error",
-                    status="needs_human",
-                    details={"provider": "agy", "detail": (
-                        "agy models discovery unavailable and no model is configured"
-                        if _discovery_failed else "no listed Gemini Flash model at requested tier")})
-            finally:
-                _lock_stack.close()
-            return
+        _known_model = _resolve_gemini_model() if agent == "gemini" else ""
 
         # #202: resolve durable context identity before dispatch. A context
         # is scoped by (project, agent, worktree) — not role — since
@@ -6315,11 +6264,10 @@ def create_app(
             #   `--output-format stream-json` has no equivalent — agy prints
             #   plain stdout, which the dispatcher captures into the log file
             #   the same way.
-            # Pin model explicitly so kickoffs don't get routed to a rotating
-            # default. agy 1.1.x switched --model to take the display name
-            # from `agy models` rather than a slug (e.g. "gemini-3.5-flash"
-            # now 400s with "model ... is not recognized"). Override via
-            # AGENT_CREW_GEMINI_MODEL. (_known_model resolved earlier,
+            # Pin a display name explicitly so kickoffs don't get routed to a
+            # rotating default. Override via AGENT_CREW_GEMINI_MODEL; a bad
+            # pin is classified as not-run if agy returns a zero-turn error.
+            # (_known_model resolved earlier,
             # before dispatch, so the attribution record and this cmd can't
             # drift apart — #202.)
             # #236: resume only when Agent Crew's own context policy says
