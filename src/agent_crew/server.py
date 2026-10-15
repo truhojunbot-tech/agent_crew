@@ -7846,17 +7846,21 @@ def create_app(
         on is worse than a stated gap.
         """
         _require_project_identity(x_agent_crew_project)
+        def _agent_can_receive(agent: object) -> bool:
+            return (isinstance(agent, str) and
+                    (agent in _DISPATCH_ROLE_TO_AGENT.values() or
+                     (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
+
         override = (task.context or {}).get("agent_override") if isinstance(task.context, dict) else None
         if override is not None:
-            if not isinstance(override, str) or override not in _DISPATCH_ROLE_TO_AGENT.values():
+            if not _agent_can_receive(override):
                 raise HTTPException(status_code=422, detail=(
                     f"agent_override {override!r} has no claimable role on this server; "
                     f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
         ctx = task.context if isinstance(task.context, dict) else {}
         for field in ("implementer_agent", "reviewer_agent"):
             choice = ctx.get(field)
-            if choice is not None and (not isinstance(choice, str)
-                                       or choice not in _DISPATCH_ROLE_TO_AGENT.values()):
+            if choice is not None and not _agent_can_receive(choice):
                 raise HTTPException(status_code=422, detail=(
                     f"{field} {choice!r} has no claimable role on this server; "
                     f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
