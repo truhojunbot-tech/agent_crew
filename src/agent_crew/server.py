@@ -3168,6 +3168,7 @@ def create_app(
     shadow_memory_enabled: Optional[bool] = None,
     shadow_memory_timeout_seconds: Optional[float] = None,
     identity_required: Optional[bool] = None,
+    coordinator_notify_fn: Optional[Callable[[str], bool]] = None,
 ) -> FastAPI:
     """
     pane_map: {role: pane_id} — e.g. {"implementer": "%475"}. If None, push is disabled.
@@ -3693,6 +3694,52 @@ def create_app(
 
     def q() -> TaskQueue:
         return state["queue"]
+
+    def _coordinator_notice(task_id: str, kind: str, detail: str = "") -> None:
+        """Wake the coordinator once after confirmed delivery."""
+        claimed = False
+        try:
+            task = q().get_task(task_id)
+            if task is None or not q().claim_coordinator_notice(task_id, kind):
+                return
+            claimed = True
+            ctx = task.context if isinstance(task.context, dict) else {}
+            # Pane output can contain private task text and is unbounded. Keep
+            # the notice actionable without forwarding captured pane content.
+            safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
+            message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
+                       f"branch={task.branch} repo={ctx.get('repo') or ''} "
+                       f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
+            if coordinator_notify_fn is not None:
+                delivered = bool(coordinator_notify_fn(message))
+            else:
+                from agent_crew.notify import notify_console, notify_telegram
+                delivered = bool(notify_telegram(message))
+                if not delivered:
+                    notify_console(message)
+            retryable = q().finish_coordinator_notice(task_id, kind, delivered=delivered)
+            claimed = False
+            if not delivered:
+                logger.warning("coordinator notice delivery failed task=%s kind=%s; %s",
+                               task_id, kind, "retryable" if retryable else "gave up")
+        except Exception:
+            logger.exception("coordinator notice failed task=%s kind=%s", task_id, kind)
+            if claimed:
+                try:
+                    q().finish_coordinator_notice(task_id, kind, delivered=False)
+                except Exception:
+                    logger.exception("coordinator notice release failed task=%s kind=%s",
+                                     task_id, kind)
+
+    app.state.coordinator_notice = _coordinator_notice
+
+    def _reconcile_cloud_and_notify() -> None:
+        outcomes = _claude_cloud.reconcile_all_cloud_tasks(
+            q(), submit_review_result_fn=lambda task_id, result: submit_result(
+                task_id, result, x_agent_crew_project=_server_identity()["project"]))
+        for outcome in outcomes:
+            if outcome.action == "needs_decision":
+                _coordinator_notice(outcome.task_id, "cloud_needs_decision", outcome.detail)
 
     def _resume_codex_quota_holds() -> list[str]:
         """Release one probe, then its cohort after a dispatch was recorded."""
@@ -4562,6 +4609,11 @@ def create_app(
         - ``recovered`` — unstarted dispatcher claims returned to pending
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        try:
+            for notice_task_id, notice_kind in q().retryable_coordinator_notices():
+                _coordinator_notice(notice_task_id, notice_kind, "delivery retry")
+        except Exception:
+            logger.exception("watchdog: coordinator notice retry failed")
         # #499 r0 HIGH: claude_cloud dispatches have no pane and are
         # otherwise invisible to this pane-oriented watchdog (every check
         # below resolves a pane per row and skips rows with none) — without
@@ -4571,9 +4623,7 @@ def create_app(
         # Independent of pane_map so a cloud-only deployment (no tmux panes
         # configured at all) still reconciles.
         try:
-            _claude_cloud.reconcile_all_cloud_tasks(
-                q(), submit_review_result_fn=lambda task_id, result: submit_result(
-                    task_id, result, x_agent_crew_project=_server_identity()["project"]))
+            _reconcile_cloud_and_notify()
             if _claude_cloud.cloud_shadow_enabled():
                 _claude_cloud.reconcile_shadow_reviews(q())
         except Exception:
@@ -4788,6 +4838,8 @@ def create_app(
                     "pane_id": pane_id,
                 }
                 tt = q().force_fail(task_id, summary, error_info=watchdog_error_info)
+                if tt is not None:
+                    _coordinator_notice(task_id, "watchdog_timeout", summary.split("\npane_tail:", 1)[0])
                 logger.error(
                     f"WATCHDOG TIMEOUT: task_id={task_id} marked failed; "
                     f"task_type={tt}, idle_for={idle_for:.0f}s"
@@ -5114,6 +5166,11 @@ def create_app(
                     _claude_cloud.record_terminal_cloud_cost(q(), task_id)
                 except Exception:
                     logger.exception("cloud cost recording failed for task=%s", task_id)
+                if status in ("timed_out", "needs_human"):
+                    # Revoke the old attempt before the dispatch coroutine can
+                    # release its execution slot for a successor (#773).
+                    _stop_worker_for_ended_task(task_id, reason=reason)
+                    _coordinator_notice(task_id, reason, summary)
                 capture_result_best_effort(db_path, task_id, TaskResult(
                     task_id=task_id, status=status, summary=summary))
                 _attr = q().get_attribution(task_id)
@@ -6718,12 +6775,7 @@ def create_app(
                             and time.monotonic() >= cloud_refresh_after):
                         cloud_refresh_after = time.monotonic() + max(
                             interval, min(10.0, _claude_cloud.cloud_stale_seconds() / 4))
-                        _start_refresh(
-                            "cloud reviews", _claude_cloud.reconcile_all_cloud_tasks, q(),
-                            submit_review_result_fn=lambda task_id, result: submit_result(
-                                task_id, result,
-                                x_agent_crew_project=_server_identity()["project"]),
-                        )
+                        _start_refresh("cloud reviews", _reconcile_cloud_and_notify)
                         if _claude_cloud.cloud_shadow_enabled():
                             _start_refresh("shadow reviews", _claude_cloud.reconcile_shadow_reviews, q())
                     logger.debug(
@@ -7146,6 +7198,7 @@ def create_app(
         if original is None:
             return ""
         ctx = _successor_context(original.context)
+        ctx["lineage_root_task_id"] = ctx.get("lineage_root_task_id") or task_id
         for key in (RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY):
             ctx.pop(key, None)
         root = str(ctx.get("provider_capacity_root") or task_id)
@@ -7291,6 +7344,8 @@ def create_app(
 
             # Create retry task with incremented retry count
             retry_context = _successor_context(original_task.context)
+            retry_context["lineage_root_task_id"] = (
+                retry_context.get("lineage_root_task_id") or task_id)
             retry_risk = retry_context.pop("risk_declaration", None)
             # Both fields are post-admission observations. Older brokers sign
             # them when they arrive in an admission context, while claim-time
@@ -7799,6 +7854,29 @@ def create_app(
         on is worse than a stated gap.
         """
         _require_project_identity(x_agent_crew_project)
+        def _agent_can_receive(agent: object) -> bool:
+            return (isinstance(agent, str) and
+                    (agent in _DISPATCH_ROLE_TO_AGENT.values() or
+                     (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
+
+        override = (task.context or {}).get("agent_override") if isinstance(task.context, dict) else None
+        if override is not None:
+            if not _agent_can_receive(override):
+                raise HTTPException(status_code=422, detail=(
+                    f"agent_override {override!r} has no claimable role on this server; "
+                    f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
+        ctx = task.context if isinstance(task.context, dict) else {}
+        for field in ("implementer_agent", "reviewer_agent"):
+            choice = ctx.get(field)
+            if choice is not None and not _agent_can_receive(choice):
+                raise HTTPException(status_code=422, detail=(
+                    f"{field} {choice!r} has no claimable role on this server; "
+                    f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
+        if (ctx.get("implementer_agent") and ctx.get("reviewer_agent")
+                and ctx["implementer_agent"] == ctx["reviewer_agent"]):
+            raise HTTPException(status_code=422, detail=(
+                "independent reviewer must differ from implementer; "
+                f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
             validate_http_root_risk(task.context)
