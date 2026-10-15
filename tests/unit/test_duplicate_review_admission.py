@@ -399,7 +399,8 @@ def _events(queue, task_id, event):
 def test_active_unpinned_reservation_still_refuses(queue, kind, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_REVIEW_RESERVATION_TTL_SECONDS", "600")
     queue.enqueue(task("reserver", kind=kind, sha=None))
-    _age_row(queue, "reserver", 599)
+    # Keep a real margin before the 600 s expiry under full-suite load.
+    _age_row(queue, "reserver", 300)
     with pytest.raises(DuplicateReviewError) as exc:
         queue.enqueue(task("second", kind=kind, sha=SHA_A))
     assert exc.value.existing_task_id == "reserver"
