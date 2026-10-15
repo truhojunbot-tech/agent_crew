@@ -1,5 +1,6 @@
 """Cloud review credit intervals, including comparison reviews (#762)."""
 import json
+import sqlite3
 import time
 from types import SimpleNamespace
 
@@ -156,3 +157,32 @@ def test_shadow_overlap_is_recorded_without_double_counting_daily_launch(tmp_pat
         pr_comments_fn=lambda *_a, **_kw: [{"body": comment}])
     assert queue.get_attribution("cloud-shadow:first")["cloud_usd"] is None
     assert queue.get_task_context("first")["cloud_shadow_cost_overlaps"] == ["second"]
+
+
+@pytest.mark.parametrize("missing_status_stamp", [False, True])
+def test_terminal_legacy_cloud_row_does_not_overlap_new_cost(tmp_path, monkeypatch,
+                                                             missing_status_stamp):
+    """Pre-#766 terminal rows have a launch time but no cloud_ended_at."""
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="impl-old", task_type="implement",
+                              description="old", branch="agent/old", project="agent_crew",
+                              context={"cloud_launched_at": time.time() - 120}))
+    queue.cancel("impl-old")
+    if missing_status_stamp:
+        with sqlite3.connect(queue._db_path) as db:
+            db.execute("UPDATE tasks SET status_changed_at=0 WHERE task_id='impl-old'")
+    assert "cloud_ended_at" not in queue.get_task_context("impl-old")
+
+    started = time.time()
+    queue.enqueue(TaskRequest(task_id="impl-new", task_type="implement",
+                              description="new", branch="agent/new", project="agent_crew",
+                              context={"cloud_attempt_started_at": started,
+                                       "cloud_credit_used_before": 10.0}))
+    queue.record_attribution(task_id="impl-new", project="agent_crew",
+                             agent="claude_cloud", role="implementer",
+                             task_type="implement", provider_session_id="new-session",
+                             started_at=started)
+    monkeypatch.setattr(cloud, "read_cloud_credit_used", lambda: 10.2)
+    cloud._record_reconciled_cloud_cost(queue, queue.get_task("impl-new"))
+    assert queue.get_attribution("impl-new")["cloud_usd"] == pytest.approx(0.2)
+    assert queue.get_task_context("impl-new")["cloud_cost_overlaps"] == []

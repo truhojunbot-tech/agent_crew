@@ -175,6 +175,16 @@ def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
             if not isinstance(began, (int, float)):
                 continue
             finished = context.get(prefix + "ended_at")
+            if not isinstance(finished, (int, float)) and other.status not in ("pending", "in_progress"):
+                # Older terminal cloud tasks predate ended_at. Their status
+                # transition is the best available end of the interval; when
+                # even that stamp is absent, do not leave a legacy session
+                # open forever against every future credit measurement.
+                changed = other.status_changed_at
+                if isinstance(changed, (int, float)) and changed >= began:
+                    finished = changed
+                elif not context.get(prefix + "attempt_started_at"):
+                    continue
             if began <= ended and (not isinstance(finished, (int, float)) or finished >= started):
                 overlaps.append(("cloud-shadow:" if is_shadow else "") + other.task_id)
     return sorted(set(overlaps))
