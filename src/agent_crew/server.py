@@ -3769,10 +3769,6 @@ def create_app(
     def _failed_no_successor_notice(task_id: str, result: TaskResult,
                                     task_type: str) -> None:
         """Use a durable notice key for each terminal failure, including retries."""
-        task = q().get_task(task_id)
-        ctx = task.context if task is not None and isinstance(task.context, dict) else {}
-        if not ctx.get("coordinator_managed"):
-            return
         info = result.error_info if isinstance(result.error_info, dict) else {}
         reason = str(info.get("reason") or "failed")
         provider_not_run = (task_type == "test" and info.get("final")
@@ -6622,14 +6618,11 @@ def create_app(
                     # Keep that terminal status for attribution, but mark its
                     # result as not-run so a CLI loop cannot treat it as a test
                     # verdict and re-implement the unchanged PR.
-                    _ended = _fail_if_active(
+                    _fail_if_active(
                         task.task_id, _reason,
                         status="failed" if _silent_exit else "needs_human",
                         details={"provider": agent, "provider_exit_code": proc.returncode,
                                  "not_run": True, **_codex_no_result_details})
-                    if (_silent_exit and _ended
-                            and not _ctx.get("coordinator_managed")):
-                        _coordinator_notice(task.task_id, _reason, "provider exited without output")
                 else:
                     _fail_if_active(task.task_id, f"exit_{proc.returncode}",
                                     details=_codex_no_result_details)
