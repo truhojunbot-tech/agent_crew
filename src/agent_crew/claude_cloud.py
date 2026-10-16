@@ -190,6 +190,16 @@ def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
     return sorted(set(overlaps))
 
 
+def _cloud_cost_status(before: object, after: object, overlaps: list[str]) -> str:
+    if overlaps:
+        return "UNKNOWN_OVERLAP"
+    if not isinstance(before, (int, float)) or not isinstance(after, (int, float)):
+        return "UNKNOWN_NO_READING"
+    if after < before:
+        return "UNKNOWN_COUNTER_DECREASED"
+    return "MEASURED"
+
+
 def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
     context = queue.get_task_context(task.task_id)
     if context.get("cloud_cost_finalized_at"):
@@ -200,10 +210,10 @@ def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
     started = context.get("cloud_attempt_started_at") or context.get("cloud_launched_at")
     overlaps = (_cloud_cost_overlaps(queue, task.task_id, started, ended)
                 if isinstance(started, (int, float)) else [])
-    usd = (round(max(0.0, after - before), 6)
-           if not overlaps and isinstance(before, (int, float))
-           and after is not None and after >= before else None)
-    queue.record_cloud_cost(task.task_id, before, after, usd)
+    status = _cloud_cost_status(before, after, overlaps)
+    usd = round(after - before, 6) if status == "MEASURED" else None
+    queue.record_cloud_cost(task.task_id, before, after, usd,
+                            status=status, overlaps=overlaps)
     queue.patch_context(task.task_id, {"cloud_credit_used_after": after, "cloud_usd": usd,
                                       "cloud_cost_overlaps": overlaps,
                                       "cloud_ended_at": context.get("cloud_ended_at") or ended,
@@ -221,10 +231,10 @@ def _record_shadow_review_cost(queue: TaskQueue, task_id: str) -> None:
                or context.get("cloud_shadow_launched_at"))
     overlaps = (_cloud_cost_overlaps(queue, task_id, started, ended, shadow=True)
                 if isinstance(started, (int, float)) else [])
-    usd = (round(max(0.0, after - before), 6)
-           if not overlaps and isinstance(before, (int, float))
-           and after is not None and after >= before else None)
-    queue.record_cloud_cost(f"cloud-shadow:{task_id}", before, after, usd)
+    status = _cloud_cost_status(before, after, overlaps)
+    usd = round(after - before, 6) if status == "MEASURED" else None
+    queue.record_cloud_cost(f"cloud-shadow:{task_id}", before, after, usd,
+                            status=status, overlaps=overlaps)
     shadow_status = context.get("cloud_shadow_status") or "failed"
     queue.update_attribution_status(f"cloud-shadow:{task_id}", shadow_status)
     queue.update_attribution_outcome(f"cloud-shadow:{task_id}", shadow_status)

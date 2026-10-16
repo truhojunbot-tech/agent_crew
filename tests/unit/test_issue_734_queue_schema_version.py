@@ -17,6 +17,7 @@ from agent_crew.server import create_app
 SCHEMA_SIGNATURES = {
     1: "5651630a8037b6c1af8b8a21af380f0501048a54b9e6df416047d26526c5b36f",
     2: "61b97344300aeedd35eeed29542d6e3d2ada4f414a50722bcd36067ac13f2bba",
+    3: "d9dfc5889ab0b27f4fbdaf9ff0fac518eabb6e70eb40b3d21439d2b612c4ee60",
 }
 _SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "agent_crew"
 _DDL_SOURCES = {
