@@ -5104,9 +5104,24 @@ def create_app(
                 logger.warning("script test: start refused for %s — %s", task.task_id,
                                started.get("reason"))
                 return
+        repo_path = _any_worktree_path()
+        q().record_attribution(
+            task_id=task.task_id, project=_server_identity()["project"],
+            agent=_script_tester.SCRIPT_TESTER, role="tester", task_type="test",
+            worktree_path=repo_path, git_branch=task.branch or "",
+            status="in_progress", provider_session_id=None, started_at=time.time(),
+        )
         result = _script_tester.execute_test_task(
-            task, repo=_any_worktree_path(), state=state,
+            task, repo=repo_path, state=state,
             cache_dir=os.path.join(os.path.dirname(db_path), "script_test_cache"))
+        if isinstance(result.error_info["script_test"].get("head"), dict):
+            # The suite ran and made no LLM calls. A setup error or explicit
+            # no-command skip has no such observation and keeps tokens NULL.
+            from agent_crew.telemetry import TaskTelemetry
+            q().record_task_telemetry(task.task_id, TaskTelemetry(
+                uncached_input_tokens=0, cache_write_tokens=0, cache_read_tokens=0,
+                output_tokens=0, reasoning_tokens=0,
+            ))
         q().patch_context(task.task_id, {"script_test": result.error_info["script_test"]})
         logger.info("script test: task=%s status=%s %s", task.task_id, result.status,
                     result.summary)

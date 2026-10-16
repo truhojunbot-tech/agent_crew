@@ -4725,7 +4725,20 @@ class TaskQueue:
             # outcome sitting next to a stale in_progress status broke
             # status-based external queries (review of PR #203, finding 3).
             outcome = result.status
-            if result.status == "failed" and isinstance(result.error_info, dict):
+            script_result = (result.error_info.get("script_test")
+                             if task_type == "test" and isinstance(result.error_info, dict)
+                             else None)
+            if isinstance(script_result, dict):
+                # Collection/setup errors can leave the task failed without a
+                # verdict about the PR. Match the CLI's test-result decision.
+                if result.status == "completed":
+                    outcome = "completed"
+                elif (script_result.get("reason") == "new_failures"
+                      and script_result.get("new_failures")):
+                    outcome = "failed"
+                else:
+                    outcome = "not_run"
+            elif result.status == "failed" and isinstance(result.error_info, dict):
                 reason = result.error_info.get("reason")
                 if reason:
                     outcome = f"failed:{reason}"
@@ -7057,7 +7070,7 @@ class TaskQueue:
         # keep working, and new rows without them default to empty/0.
         model: str = "",
         context_id: str = "",
-        provider_session_id: str = "",
+        provider_session_id: Optional[str] = "",
         context_policy: str = "",
         context_generation: int = 0,
         session_task_index: int = 0,
