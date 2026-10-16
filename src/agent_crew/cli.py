@@ -893,6 +893,118 @@ def crew():
     """agent_crew — multi-agent development crew CLI."""
 
 
+@crew.group("intent")
+@click.option("--project", required=True, help="Project whose server owns the intent")
+@click.option("--base", default=_DEFAULT_BASE, show_default=True)
+@click.pass_context
+def intent_group(ctx, project: str, base: str):
+    """Admit, bind and inspect durable work intents through the project server."""
+    state = _read_state(base, project)
+    if not state or not state.get("port"):
+        raise click.ClickException(f"running server for project {project!r} not found")
+    ctx.obj = (project, int(state["port"]))
+
+
+def _intent_http(project: str, port: int, path: str, body: dict | None = None):
+    import urllib.error
+    import urllib.request
+
+    url = f"http://127.0.0.1:{port}/work-intents/{path}"
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode() if body is not None else None,
+        headers={"Content-Type": "application/json", "X-Agent-Crew-Project": project},
+        method="POST" if body is not None else "GET")
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            return json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        raise click.ClickException(f"work intent request failed ({exc.code}): "
+                                   f"{exc.read().decode()}") from exc
+    except urllib.error.URLError as exc:
+        raise click.ClickException(f"work intent server unavailable: {exc}") from exc
+
+
+@intent_group.command("admit")
+@click.argument("body_json")
+@click.pass_obj
+def intent_admit(connection, body_json: str):
+    """Admit a JSON work intent, optionally with its first task."""
+    try:
+        body = json.loads(body_json)
+    except ValueError as exc:
+        raise click.ClickException(f"invalid JSON: {exc}") from exc
+    click.echo(json.dumps(_intent_http(*connection, "admit", body), sort_keys=True))
+
+
+@intent_group.command("bind")
+@click.argument("external_operation_id")
+@click.argument("task_id")
+@click.pass_obj
+def intent_bind(connection, external_operation_id: str, task_id: str):
+    """Bind an existing Crew task to a work intent."""
+    from urllib.parse import quote
+    path = quote(external_operation_id, safe="") + "/bind"
+    click.echo(json.dumps(_intent_http(*connection, path, {"task_id": task_id}), sort_keys=True))
+
+
+def _intent_decision(connection, external_operation_id: str, action: str, body_json: str):
+    from urllib.parse import quote
+    try:
+        body = json.loads(body_json)
+    except ValueError as exc:
+        raise click.ClickException(f"invalid JSON: {exc}") from exc
+    path = quote(external_operation_id, safe="") + "/" + action
+    click.echo(json.dumps(_intent_http(*connection, path, body), sort_keys=True))
+
+
+@intent_group.command("block")
+@click.argument("external_operation_id")
+@click.argument("blocker_json")
+@click.pass_obj
+def intent_block(connection, external_operation_id: str, blocker_json: str):
+    """Record blocker_type, reason, unblock_action, owner and next_check_at."""
+    _intent_decision(connection, external_operation_id, "block", blocker_json)
+
+
+@intent_group.command("supersede")
+@click.argument("external_operation_id")
+@click.argument("decision_json")
+@click.pass_obj
+def intent_supersede(connection, external_operation_id: str, decision_json: str):
+    """Supersede an intent with reason and authority JSON."""
+    _intent_decision(connection, external_operation_id, "supersede", decision_json)
+
+
+@intent_group.command("reject")
+@click.argument("external_operation_id")
+@click.argument("decision_json")
+@click.pass_obj
+def intent_reject(connection, external_operation_id: str, decision_json: str):
+    """Reject an intent with reason and authority JSON."""
+    _intent_decision(connection, external_operation_id, "reject", decision_json)
+
+
+@intent_group.command("get")
+@click.argument("external_operation_id")
+@click.pass_obj
+def intent_get(connection, external_operation_id: str):
+    """Read one durable work intent."""
+    from urllib.parse import quote
+    click.echo(json.dumps(_intent_http(*connection, quote(external_operation_id, safe="")),
+                          sort_keys=True))
+
+
+@intent_group.command("list")
+@click.option("--state", default="")
+@click.pass_obj
+def intent_list(connection, state: str):
+    """List work intents, optionally filtered by state."""
+    from urllib.parse import quote
+    path = "?state=" + quote(state) if state else ""
+    # The collection route has no trailing operation id.
+    click.echo(json.dumps(_intent_http(*connection, "" + path), sort_keys=True))
+
+
 @crew.group()
 def roles():
     """Inspect or explicitly configure a project's role-to-provider mapping."""
