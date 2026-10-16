@@ -7789,10 +7789,16 @@ def create_app(
         except Exception as exc:
             _outbox_out = {"pending": None, "expired": None,
                            "error": f"{type(exc).__name__}: {exc}"}
+        try:
+            _work_intents_out = q().work_intent_counts()
+        except Exception as exc:
+            # /health is also used before TestClient enters the lifespan and
+            # must remain a liveness probe if its queue is unavailable.
+            _work_intents_out = {"error": f"{type(exc).__name__}: {exc}"}
         return {
             "status": "ok",
             "schema_version": QUEUE_SCHEMA_VERSION,
-            "work_intents": q().work_intent_counts(),
+            "work_intents": _work_intents_out,
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,

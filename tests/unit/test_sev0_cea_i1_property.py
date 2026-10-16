@@ -59,7 +59,7 @@ from tests.unit.sev0_cea_acceptance_helpers import (
 #: ``protocol.py`` are included on purpose: they must contribute *zero* ingress
 #: call sites (adapters.py documents MCP as deliberately absent).
 SWEPT = ("server.py", "mcp_server.py", "pipeline.py", "loop.py", "watch.py",
-         "triage.py", "discussion.py", "protocol.py", "cli.py")
+         "triage.py", "discussion.py", "protocol.py", "cli.py", "queue.py")
 
 #: The adapter list as documented in the ADR §2.2 / adapters.INGRESSES docstring.
 DOCUMENTED = {
@@ -114,9 +114,11 @@ def test_the_swept_modules_carry_every_adapter_and_mcp_protocol_carry_none():
 
 
 def test_every_task_creating_route_is_the_http_tasks_adapter():
-    """Route table half: the only FastAPI route that creates a task is ``POST
-    /tasks`` and it enqueues as ``http.tasks``. Other routes may mutate state
-    (claim/start/result) — those are I2's call sites, not ingresses."""
+    """Task-creating HTTP routes reach the ``http.tasks`` admission adapter.
+
+    #793's work-intent admit creates its optional first task in queue.py so
+    the intent row and task row share one SQLite transaction.
+    """
     src = (SRC / "server.py").read_text(encoding="utf-8")
     tree = ast.parse(src)
     creating = []
@@ -135,6 +137,10 @@ def test_every_task_creating_route_is_the_http_tasks_adapter():
             creating.append((path, sorted(set(re.findall(r'ingress="([^"]+)"', body)))))
     assert ("/tasks", ["http.tasks"]) in creating, creating
     assert all(ids and set(ids) <= set(adapters.BY_ID) for _, ids in creating), creating
+    admit = next(fn for fn in ast.walk(tree) if isinstance(fn, ast.FunctionDef)
+                 and fn.name == "admit_work_intent")
+    assert "q().admit_work_intent(body)" in (ast.get_source_segment(src, admit) or "")
+    assert any(site.startswith("queue.py:") for site in _ingress_call_sites()["http.tasks"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -249,8 +255,14 @@ DOCUMENTED_MUTATING_ROUTES = {
     ("POST", "/tasks/{task_id}/checkpoint"), ("POST", "/tasks/{task_id}/result"),
     ("POST", "/tasks/{task_id}/start"),
     ("POST", "/tasks/{task_id}/recover"),
+    # #793: admit atomically creates an optional first task via queue.enqueue
+    # with the existing http.tasks adapter; the others mutate intent state.
+    ("POST", "/work-intents/admit"), ("POST", "/work-intents/{op_id}/bind"),
+    ("POST", "/work-intents/{op_id}/block"),
+    ("POST", "/work-intents/{op_id}/reject"),
+    ("POST", "/work-intents/{op_id}/supersede"),
 }
-INGRESS_ROUTES = {("POST", "/tasks")}
+INGRESS_ROUTES = {("POST", "/tasks"), ("POST", "/work-intents/admit")}
 REQUEUE_ROUTES = {("POST", "/tasks/{task_id}/recover")}
 
 #: MCP exposes no task-creating tool (adapters.py: MCP deliberately absent);
