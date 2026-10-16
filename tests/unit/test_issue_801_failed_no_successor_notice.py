@@ -1,6 +1,9 @@
 """#801: terminal provider failures must not strand coordinator-managed lineages."""
 
+import asyncio
+import json
 import time
+from unittest.mock import AsyncMock, MagicMock
 
 from fastapi.testclient import TestClient
 
@@ -59,6 +62,26 @@ def test_no_retry_terminal_failure_notifies_once(tmp_path, monkeypatch):
     assert "agent stopped" in notices[0]
 
 
+def test_two_terminal_tasks_in_one_lineage_share_the_notice(tmp_path, monkeypatch):
+    app, queue, notices = _harness(tmp_path, monkeypatch, retry_attempt=2)
+    with TestClient(app) as client:
+        assert _fail(client, summary="first exit_1").status_code == 200
+        queue.enqueue(TaskRequest(
+            task_id="retry-root-801-a2", task_type="test", description="provider retry",
+            branch="agent/801-failed-no-successor-notice", project="agent_crew",
+            context={"coordinator_managed": True, "retry_attempt": 2,
+                     "lineage_root_task_id": "root-801"}),
+            ingress="http.tasks")
+        response = client.post("/tasks/retry-root-801-a2/result", json={
+            "task_id": "retry-root-801-a2", "status": "failed",
+            "summary": "second exit_1", "findings": [],
+            "error_info": {"reason": "exit_1", "final": True},
+        })
+        assert response.status_code == 200, response.text
+    assert len(notices) == 1
+    assert "first exit_1" in notices[0]
+
+
 def test_implement_retry_with_budget_has_no_notice(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch, task_type="implement")
     with TestClient(app) as client:
@@ -77,3 +100,52 @@ def test_rate_limit_exhaustion_keeps_escalation_gate(tmp_path, monkeypatch):
     assert queue.get_task("retry-root-801-a3") is None
     assert any(g.id == "escalation-root-801-provider-limit" for g in queue.list_gates())
     assert notices == []
+
+
+def test_dispatcher_failed_provider_without_result_notifies_once(
+        tmp_path, monkeypatch, unused_tcp_port):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", "0.05")
+    monkeypatch.setenv("AGENT_CREW_WORKTREE_SYNC_DISABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE", "off")
+    worktrees = {}
+    for agent in ("codex", "claude", "gemini"):
+        worktree = tmp_path / agent
+        worktree.mkdir()
+        (worktree / ".git").mkdir()
+        worktrees[agent] = str(worktree)
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps({
+        "role_agents": {"implementer": "codex", "reviewer": "claude",
+                        "tester": "gemini"},
+        "worktrees": worktrees,
+    }))
+    notices = []
+
+    async def failed_process(*_args, **_kwargs):
+        process = MagicMock()
+        process.returncode = 1
+        process.wait = AsyncMock(return_value=1)
+        return process
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", failed_process)
+    db = str(tmp_path / "tasks.db")
+    app = create_app(db, state_path=str(state_file), port=unused_tcp_port,
+                     identity_required=False, watchdog_disabled=True,
+                     anomaly_disabled=True,
+                     coordinator_notify_fn=lambda message: notices.append(message) or True)
+    with TestClient(app) as client:
+        response = client.post("/tasks", json={
+            "task_id": "test-dispatch-801", "task_type": "test",
+            "description": "provider test", "branch": "main", "priority": 3,
+            "project": "agent_crew", "context": {"coordinator_managed": True},
+        })
+        assert response.status_code == 201, response.text
+        queue = TaskQueue(db)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not notices:
+            time.sleep(0.02)
+    assert queue.get_task_status("test-dispatch-801") == "failed"
+    assert len(notices) == 1
+    assert "failed_no_successor" in notices[0]
+    assert "test not run (provider)" in notices[0]

@@ -3766,6 +3766,26 @@ def create_app(
         """Wake the coordinator once after confirmed delivery."""
         coordinator_notice_once(q(), task_id, kind, detail, coordinator_notify_fn)
 
+    def _failed_no_successor_notice(task_id: str, result: TaskResult,
+                                    task_type: str) -> None:
+        """Use one durable notice key for every failed task in a lineage."""
+        task = q().get_task(task_id)
+        ctx = task.context if task is not None and isinstance(task.context, dict) else {}
+        if not ctx.get("coordinator_managed"):
+            return
+        root_id = str(ctx.get("lineage_root_task_id") or task_id)
+        if q().get_task(root_id) is None:
+            root_id = task_id
+        info = result.error_info if isinstance(result.error_info, dict) else {}
+        reason = str(info.get("reason") or "failed")
+        provider_not_run = (task_type == "test" and info.get("final")
+                            and not result.findings
+                            and handle_test_result(result) == "not_run")
+        detail = (f"failed_task={task_id} reason={reason} "
+                  f"{'test not run (provider); ' if provider_not_run else ''}"
+                  f"last_summary={result.summary or ''}")
+        _coordinator_notice(root_id, "failed_no_successor", detail)
+
     app.state.coordinator_notice = _coordinator_notice
 
     def _reconcile_cloud_and_notify() -> None:
@@ -5211,13 +5231,12 @@ def create_app(
                 summary = reason
                 if details and "last_output_age_s" in details:
                     summary += f" (last output {details['last_output_age_s']:.1f}s ago)"
-                q().submit_result(
-                    task_id,
-                    TaskResult(task_id=task_id, status=status, summary=summary,
-                               error_info={"reason": reason, "final": status == "failed",
-                                           **(details or {})}),
-                    dispatcher_failed=status == "failed",
-                )
+                terminal_result = TaskResult(
+                    task_id=task_id, status=status, summary=summary,
+                    error_info={"reason": reason, "final": status == "failed",
+                                **(details or {})})
+                q().submit_result(task_id, terminal_result,
+                                  dispatcher_failed=status == "failed")
                 try:
                     _claude_cloud.record_terminal_cloud_cost(q(), task_id)
                 except Exception:
@@ -5227,6 +5246,11 @@ def create_app(
                     # release its execution slot for a successor (#773).
                     _stop_worker_for_ended_task(task_id, reason=reason)
                     _coordinator_notice(task_id, reason, summary)
+                elif status == "failed":
+                    failed_task = q().get_task(task_id)
+                    if failed_task is not None:
+                        _failed_no_successor_notice(task_id, terminal_result,
+                                                    failed_task.task_type)
                 capture_result_best_effort(db_path, task_id, TaskResult(
                     task_id=task_id, status=status, summary=summary))
                 _attr = q().get_attribution(task_id)
@@ -6606,7 +6630,8 @@ def create_app(
                         status="failed" if _silent_exit else "needs_human",
                         details={"provider": agent, "provider_exit_code": proc.returncode,
                                  "not_run": True, **_codex_no_result_details})
-                    if _silent_exit and _ended:
+                    if (_silent_exit and _ended
+                            and not _ctx.get("coordinator_managed")):
                         _coordinator_notice(task.task_id, _reason, "provider exited without output")
                 else:
                     _fail_if_active(task.task_id, f"exit_{proc.returncode}",
@@ -7301,15 +7326,15 @@ def create_app(
                    expected_status="in_progress")
         return successor.task_id
 
-    def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> None:
+    def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> bool:
         """Auto-retry a failed task if it hasn't exceeded max retries.
-        This provides resilience against transient failures."""
+        Return whether a retry or provider-limit escalation was recorded."""
         MAX_RETRIES = 2
         try:
             # Get the original task to extract description, branch, and context
             original_task = q().get_task(task_id)
             if original_task is None:
-                return
+                return False
             # A reported commit at the pushed PR/branch head is already work
             # for the coordinator to assess. Repeating the implement on that
             # same head spends an agent invocation without changing the artifact.
@@ -7340,7 +7365,7 @@ def create_app(
                         "_auto_retry_failed_task: skipping %s; reported commit %s is pushed head",
                         task_id, result.commit,
                     )
-                    return
+                    return False
             # Opt-in for projects where repeating an agent-reported implement
             # failure has proved wasteful. Read per call so the default retry
             # behavior remains unchanged when the flag is unset.
@@ -7354,7 +7379,7 @@ def create_app(
                     "_auto_retry_failed_task: skipping retry for %s: agent-reported implement failure; retry would repeat the same work",
                     task_id,
                 )
-                return
+                return False
 
             # #167: use the DB context retry_attempt, not result.retry_count.
             # Agents always submit retry_count=0 (they don't track it); the DB
@@ -7388,7 +7413,8 @@ def create_app(
                         pass  # Same failed result replayed; reuse its gate.
                     q().patch_context(task_id, {"provider_limit_escalation": gate_id})
                     logger.warning("provider limit exhausted: task=%s gate=%s", task_id, gate_id)
-                return
+                    return True
+                return False
 
             # #161: review tasks with no branch AND no pr_number have no way to
             # locate a PR — retrying will produce the same failure. Abort early
@@ -7400,7 +7426,7 @@ def create_app(
                         f"_auto_retry_failed_task: skipping review retry for {task_id} "
                         f"— no branch and no pr_number; retry would loop (#161)"
                     )
-                    return
+                    return False
                 # #216: a branch IS set here, but if it genuinely has no PR
                 # (open or closed), a retry re-dispatches the exact same
                 # branch to the exact same "gh pr list" dead end — the agent
@@ -7417,7 +7443,7 @@ def create_app(
                             f"— branch {original_task.branch!r} has no PR (open or closed); "
                             f"retry would hit the same dead end (#216)"
                         )
-                        return
+                        return False
 
             # Create retry task with incremented retry count
             retry_context = _successor_context(original_task.context)
@@ -7472,7 +7498,14 @@ def create_app(
             # Try to push the retry task
             role = _TYPE_TO_ROLE.get(task_type)
             if role:
-                _try_push_next(role)
+                try:
+                    _try_push_next(role)
+                except Exception:
+                    # The durable retry already exists; a pane nudge failure
+                    # must not turn it into a false no-successor notice.
+                    logger.exception("_auto_retry_failed_task: push failed for %s",
+                                     retry_req.task_id)
+            return True
         except _PausedError:
             # #314 §4 P0-2: STOP race — 부모(failed task) outbox reopen + 전파(handler suppressed 200).
             try:
@@ -7482,7 +7515,7 @@ def create_app(
             raise
         except Exception as e:
             logger.warning(f"Failed to auto-retry task {task_id}: {e}")
-            pass
+            return False
 
     def _auto_merge_pr(pr_number: int, repo: str = "", repo_cwd: str = "",
                        review_task_id: str = "") -> None:
@@ -8643,10 +8676,12 @@ def create_app(
                         _coordinator_notice(task_id, "test_failed_no_successor", result.summary)
             elif result.status == "failed" and _script_tester.is_script_test_result(result):
                 logger.info(f"POST /tasks/{task_id}/result: script test failed; no retry")
+                _failed_no_successor_notice(task_id, result, task_type)
             elif result.status == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
                 if not _auto_fallback_failed_task(task_id, result, task_type):
-                    _auto_retry_failed_task(task_id, result, task_type)
+                    if not _auto_retry_failed_task(task_id, result, task_type):
+                        _failed_no_successor_notice(task_id, result, task_type)
             # Auto-transition: impl task completed → auto-enqueue review task.
             # Pass through the PR number from the impl result so the reviewer
             # task description nails down which PR head to diff (#86).
