@@ -560,6 +560,24 @@ def _run_through_push_path(app, queue, task):
     return queue.get_task(task.task_id)
 
 
+def _assert_script_attribution(queue, task_id, *, outcome, suite_started):
+    with sqlite3.connect(queue._db_path) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM task_attribution WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+    assert count == 1
+    attr = queue.get_attribution(task_id)
+    assert (attr["agent"], attr["role"], attr["task_type"]) == (
+        "script", "tester", "test")
+    assert attr["outcome"] == outcome
+    assert attr["provider_session_id"] is None
+    assert attr["started_at"] > 0
+    assert attr["completed_at"] >= attr["started_at"]
+    for field in ("uncached_input_tokens", "cache_write_tokens", "cache_read_tokens",
+                  "output_tokens", "reasoning_tokens"):
+        assert attr[field] == (0 if suite_started else None), field
+
+
 def test_server_runs_test_stage_by_script_and_merges_on_pass(project, server):
     build, pushes, spawns, merges = server
     repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert True\n"})
@@ -570,6 +588,7 @@ def test_server_runs_test_stage_by_script_and_merges_on_pass(project, server):
     assert queue.get_task_context(done.task_id)["script_test_timeout_s"] == 1800
     assert (pushes, spawns) == ([], [])          # 0 provider calls
     assert merges == [f"merge:pr:{PR}"]
+    _assert_script_attribution(queue, done.task_id, outcome="completed", suite_started=True)
 
 
 def test_server_new_failure_fails_without_retry_or_merge(project, server):
@@ -582,6 +601,7 @@ def test_server_new_failure_fails_without_retry_or_merge(project, server):
         "tests/test_b.py::test_two"]
     assert [t.task_id for t in queue.list_tasks()] == [done.task_id]   # no retry clone
     assert (pushes, spawns, merges) == ([], [], [])
+    _assert_script_attribution(queue, done.task_id, outcome="failed", suite_started=True)
 
 
 def test_server_flaky_head_failure_has_no_implement_successor(
@@ -617,10 +637,23 @@ def test_server_no_command_never_auto_merges(project, server):
     assert queue.get_task_context(done.task_id)["script_test"]["outcome"] == (
         "SKIPPED_NO_TEST_COMMAND")
     assert (pushes, spawns, merges) == ([], [], [])
+    _assert_script_attribution(queue, done.task_id, outcome="not_run", suite_started=False)
 
 
+def test_server_collection_error_has_no_test_verdict_in_attribution(project, server):
+    build, pushes, spawns, merges = server
+    repo, head = project(GREEN, {"tests/test_bad.py": "import does_not_exist\n"})
+    app, queue = build(repo, {"test_command": PYTEST})
+    done = _run_through_push_path(app, queue, _task(head))
+    assert done.status == "failed"
+    assert queue.get_task_context(done.task_id)["script_test"]["reason"] == "exit_code_2"
+    _assert_script_attribution(queue, done.task_id, outcome="not_run", suite_started=True)
+    assert (pushes, spawns, merges) == ([], [], [])
+
+
+@pytest.mark.parametrize("suite_started", [False, True])
 def test_server_timeout_never_enqueues_implement_and_notifies_once(
-        project, server, monkeypatch):
+        project, server, monkeypatch, suite_started):
     build, pushes, spawns, merges = server
     repo, head = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert True\n"})
     notices = []
@@ -628,6 +661,9 @@ def test_server_timeout_never_enqueues_implement_and_notifies_once(
                        notices=notices)
     record = {"outcome": "INCOMPLETE", "reason": "script_test_timeout",
               "timeout_s": 12, "duration_s": 12}
+    if suite_started:
+        record["head"] = script_tester.RunOutcome(
+            exit_code=None, timed_out=True, duration_s=12).to_dict()
     monkeypatch.setattr(script_tester, "execute_test_task", lambda *a, **k:
                         script_tester.record_to_result("test-review-1", record, PR))
     done = _run_through_push_path(app, queue, _task(head))
@@ -635,6 +671,8 @@ def test_server_timeout_never_enqueues_implement_and_notifies_once(
     assert [t.task_id for t in queue.list_tasks()] == [done.task_id]
     assert len(notices) == 1 and "script_test_timeout" in notices[0]
     assert (pushes, spawns, merges) == ([], [], [])
+    _assert_script_attribution(queue, done.task_id, outcome="not_run",
+                               suite_started=suite_started)
 
 
 def test_dispatcher_path_runs_script_not_provider(project, server):
