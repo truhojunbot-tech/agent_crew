@@ -300,17 +300,86 @@ def test_at8_continuation_failure_falls_back_via_existing_mechanism(q, monkeypat
         return real_fallback(*args, **kwargs)
     monkeypatch.setattr(pipeline_module, "auto_fallback_failed_task", _spy)
 
+    launches = []
+
     def run(argv, **_kw):
         if "--help" in argv:
             return _Proc(0, HELP_TEXT_WITH_CLOUD)
-        return _Proc(0, "resume attempt produced unrecognized output")
+        launches.append(argv)
+        if len(launches) == 1:
+            return _Proc(0, "resume attempt produced unrecognized output")
+        return _Proc(2, "fresh session refused")
 
     outcome = cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
     assert outcome.dispatched is False
     assert "cloud_continuation_unavailable" in outcome.launch_error
+    assert "cloud_cli_exit_2" in outcome.launch_error
+    assert len(launches) == 2
     assert len(calls) == 1, "the SAME fallback function local providers use must be invoked"
     failed = [t for t in q.list_tasks(status="failed") if t.task_id == fix_id]
     assert failed, "the fix task must not be lost"
+    context = q.get_task_context(fix_id)
+    assert context["execution_policy"] == "fresh_cloud_after_resume_failed"
+    assert context["cloud_resume_error"] == (
+        "cloud_continuation_unavailable: unrecognized_cli_output")
+
+
+@pytest.mark.parametrize("resume_result", [
+    _Proc(1, "attaching to an existing session is disabled"),
+    _Proc(0, "unrecognized resume output"),
+])
+def test_resume_failure_launches_one_fresh_session(q, monkeypatch, resume_result):
+    impl_id, branch = _enqueue_implement(q, task_id="impl-resume-fallback")
+    q.dequeue(role="implementer")
+    q.record_dispatch(impl_id, channel=cc.DISPATCH_CHANNEL, agent=cc.CLOUD_PROVIDER_NAME,
+                      target="pending")
+    q.record_attribution(task_id=impl_id, agent=cc.CLOUD_PROVIDER_NAME,
+                         provider_session_id=OBSERVED_SESSION_ID)
+    fix_id, _ = _enqueue_implement(q, task_id="fix-resume-fallback", branch=branch,
+                                   context={"prev_task_id": impl_id})
+    calls = []
+    credit_reads = []
+    monkeypatch.setattr(cc, "read_cloud_credit_used",
+                        lambda: credit_reads.append(True) or 1.25)
+
+    def run(argv, **_kw):
+        if "--help" in argv:
+            return _Proc(0, HELP_TEXT_WITH_CLOUD)
+        calls.append(argv)
+        return resume_result if len(calls) == 1 else _Proc(
+            0, '{"session_id":"session_fresh123",'
+               '"url":"https://claude.ai/code/session_fresh123"}')
+
+    outcome = cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
+    assert outcome.dispatched is True
+    assert outcome.session_id == "session_fresh123"
+    assert len(calls) == 2
+    assert OBSERVED_SESSION_ID in " ".join(calls[0])
+    assert OBSERVED_SESSION_ID not in " ".join(calls[1])
+    assert credit_reads == [True]
+    context = q.get_task_context(fix_id)
+    assert context["execution_policy"] == "fresh_cloud_after_resume_failed"
+    assert context["cloud_resume_error"] == (
+        "cloud_cli_exit_1: attaching to an existing session is disabled"
+        if resume_result.returncode else
+        "cloud_continuation_unavailable: unrecognized_cli_output")
+    assert q.get_task(fix_id).status == "in_progress"
+
+
+def test_root_launch_does_not_retry_on_failure(q):
+    task_id, _ = _enqueue_implement(q, task_id="impl-no-resume")
+    launches = []
+
+    def run(argv, **_kw):
+        if "--help" in argv:
+            return _Proc(0, HELP_TEXT_WITH_CLOUD)
+        launches.append(argv)
+        return _Proc(1, "launch refused")
+
+    outcome = cc.dispatch_cloud_for_role(q, role="implementer", task_type="implement", run_fn=run)
+    assert not outcome.dispatched
+    assert len(launches) == 1
+    assert q.get_task(task_id).status == "failed"
 
 
 # ── AT9: max cloud concurrency is enforced ──────────────────────────────
