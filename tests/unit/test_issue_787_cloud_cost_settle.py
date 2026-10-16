@@ -104,6 +104,36 @@ def test_settle_window_overlap_is_unknown(tmp_path, monkeypatch, shadow):
 
 
 @pytest.mark.parametrize("shadow", [False, True], ids=["normal", "shadow"])
+def test_previous_task_settle_window_overlaps_next_task(tmp_path, monkeypatch, shadow):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    attribution_id = _task(queue, shadow=shadow)
+    prefix = "cloud_shadow_" if shadow else "cloud_"
+    queue.patch_context("target", {
+        prefix + "attempt_started_at": 1160.0,
+        prefix + "ended_at": 1300.0,
+        prefix + "credit_before_fetched_at": 1159.0,
+    })
+    queue.enqueue(TaskRequest(task_id="previous", task_type="implement",
+                              description="Previous cloud task", branch="agent/previous",
+                              context={"cloud_attempt_started_at": 1000.0,
+                                       "cloud_ended_at": 1100.0}))
+    monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "900")
+    monkeypatch.setattr(cloud, "time", SimpleNamespace(time=lambda: 2200.0))
+    monkeypatch.setattr(cloud, "read_cloud_credit_used",
+                        lambda: SimpleNamespace(used_dollars=11.0, fetched_at=2200.0))
+    if shadow:
+        cloud._record_shadow_review_cost(queue, "target")
+        cloud._record_shadow_review_cost(queue, "target")
+    else:
+        cloud.record_terminal_cloud_cost(queue, "target")
+        cloud.record_terminal_cloud_cost(queue, "target")
+    attr = queue.get_attribution(attribution_id)
+    assert attr["cloud_cost_status"] == "UNKNOWN_OVERLAP"
+    assert attr["cloud_usd"] is None
+    assert json.loads(attr["cloud_cost_overlaps"]) == ["previous"]
+
+
+@pytest.mark.parametrize("shadow", [False, True], ids=["normal", "shadow"])
 def test_no_fresh_snapshot_after_settle_is_unknown(tmp_path, monkeypatch, shadow):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     attribution_id = _task(queue, shadow=shadow)
@@ -190,3 +220,29 @@ def test_preflight_failure_writes_one_unknown_attribution_row(tmp_path, monkeypa
     assert attr["cloud_cost_status"] == "UNKNOWN_NO_FRESH_READING"
     assert attr["uncached_input_tokens"] is None
     assert attr["output_tokens"] is None
+
+
+def test_fail_closed_preserves_existing_attribution_lineage(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    task = TaskRequest(task_id="launch-failure", task_type="implement",
+                       description="Implement", branch="agent/launch-failure",
+                       project="agent_crew", context={"repo": "owner/repo"})
+    queue.enqueue(task)
+    queue.record_attribution(task_id=task.task_id, project="agent_crew",
+                             agent="claude_cloud", role="implementer",
+                             task_type="implement", status="in_progress",
+                             model="claude-test", context_id="context-1",
+                             previous_task_id="previous-task",
+                             context_generation=2, session_task_index=3)
+    monkeypatch.setattr("agent_crew.pipeline.auto_fallback_failed_task",
+                        lambda *a, **k: None)
+    cloud._fail_closed_dispatch(queue, task, "implement", "cloud_launch_failed")
+    attr = queue.get_attribution(task.task_id)
+    assert attr["status"] == "failed"
+    assert attr["outcome"] == "failed"
+    assert (attr["previous_task_id"], attr["model"], attr["context_id"],
+            attr["context_generation"], attr["session_task_index"]) == (
+                "previous-task", "claude-test", "context-1", 2, 3)
+    with sqlite3.connect(queue._db_path) as db:
+        assert db.execute("SELECT COUNT(*) FROM task_attribution WHERE task_id=?",
+                          (task.task_id,)).fetchone()[0] == 1

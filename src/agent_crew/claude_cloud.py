@@ -194,6 +194,7 @@ def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
                          ended: float, *, shadow: bool = False) -> list[str]:
     """Global credit cannot be split between intersecting cloud intervals."""
     overlaps = []
+    settle_seconds = cloud_cost_settle_seconds()
     for other in queue.list_tasks():
         context = other.context if isinstance(other.context, dict) else {}
         for is_shadow, prefix in ((False, "cloud_"), (True, "cloud_shadow_")):
@@ -213,7 +214,10 @@ def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
                     finished = changed
                 elif not context.get(prefix + "attempt_started_at"):
                     continue
-            if began <= ended and (not isinstance(finished, (int, float)) or finished >= started):
+            # Credit from another session may post after that session ends.
+            # Its settle window can contaminate this task's later reading.
+            if began <= ended and (not isinstance(finished, (int, float)) or
+                                   finished + settle_seconds >= started):
                 overlaps.append(("cloud-shadow:" if is_shadow else "") + other.task_id)
     return sorted(set(overlaps))
 
@@ -751,12 +755,15 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                                        "cloud_cost_finalized_at": ended,
                                        "cloud_usd": None})
     queue.force_fail(task.task_id, reason)
-    queue.record_attribution(task_id=task.task_id, project=task.project or "",
-                             agent=CLOUD_PROVIDER_NAME,
-                             role="reviewer" if task_type == "review" else "implementer",
-                             task_type=task_type, git_branch=task.branch or "",
-                             status="failed", provider_session_id=context.get("cloud_session_id") or "",
-                             started_at=context.get("cloud_attempt_started_at") or ended)
+    if queue.get_attribution(task.task_id) is None:
+        queue.record_attribution(task_id=task.task_id, project=task.project or "",
+                                 agent=CLOUD_PROVIDER_NAME,
+                                 role="reviewer" if task_type == "review" else "implementer",
+                                 task_type=task_type, git_branch=task.branch or "",
+                                 status="failed", provider_session_id=context.get("cloud_session_id") or "",
+                                 started_at=context.get("cloud_attempt_started_at") or ended)
+    else:
+        queue.update_attribution_status(task.task_id, "failed")
     queue.update_attribution_outcome(task.task_id, "failed")
     queue.record_cloud_cost(task.task_id, context.get("cloud_credit_used_before"),
                             None, None, status="UNKNOWN_NO_FRESH_READING", overlaps=[])
