@@ -404,9 +404,8 @@ def build_resume_argv(session_id: str, prompt: str, *, cli_path: Optional[str] =
     ("Try the same-session fix continuation only after verifying the
     installed CLI behavior ... Record a precise fallback/hold if it is
     unsupported rather than claiming it works") — callers MUST treat a
-    launch that does not parse as ``dispatch_cloud_for_role`` does: fail
-    closed and fall back through the existing chain (acceptance test 8),
-    never assume the resume silently worked.
+    launch that does not parse as ``dispatch_cloud_for_role`` does: try one
+    fresh cloud launch, then fail closed if that also fails.
     """
     path = cli_path or cloud_cli_path()
     inner = f"{path} --cloud {shlex.quote(session_id)} {shlex.quote(prompt)} --output-format json"
@@ -913,25 +912,35 @@ def dispatch_cloud_for_role(
         "cloud_credit_used_after": None, "cloud_usd": None,
     })
 
-    try:
-        proc = run(argv, cwd=cwd)
-    except Exception as exc:
-        return _fail_closed_dispatch(queue, task, task_type, f"cloud_cli_invocation_error: {exc}")
+    def launch_once(command: List[str], *, resuming: bool):
+        try:
+            proc = run(command, cwd=cwd)
+        except Exception as exc:
+            return None, f"cloud_cli_invocation_error: {exc}"
+        if getattr(proc, "returncode", 1) != 0:
+            return None, f"cloud_cli_exit_{proc.returncode}: {(proc.stdout or '')[:500]}"
+        result = parse_cloud_launch_output(proc.stdout or "")
+        if not result.dispatched:
+            prefix = "cloud_continuation_unavailable" if resuming else "cloud_output_unrecognized"
+            return None, f"{prefix}: {result.error}"
+        return result, None
 
-    if getattr(proc, "returncode", 1) != 0:
-        reason = f"cloud_cli_exit_{proc.returncode}: {(proc.stdout or '')[:500]}"
+    launch, launch_error = launch_once(argv, resuming=bool(resume_session_id))
+    resume_error = None
+    if launch_error and resume_session_id:
+        resume_error = launch_error
+        queue.patch_context(task.task_id, {"cloud_resume_error": resume_error,
+                                           "execution_policy": "fresh_cloud_after_resume_failed"})
+        fresh_argv = build_launch_argv(prompt, cli_path=cli_path,
+                                       base_ref=_detached_cloud_ref(cwd))
+        launch, launch_error = launch_once(fresh_argv, resuming=False)
+    if launch_error:
+        reason = (f"resume failed: {resume_error}; fresh failed: {launch_error}"
+                  if resume_error else launch_error)
         return _fail_closed_dispatch(queue, task, task_type, reason)
 
-    launch = parse_cloud_launch_output(proc.stdout or "")
-    if not launch.dispatched:
-        # Acceptance test 8: a continuation (resume) that fails closed is
-        # NOT the same event as a fresh dispatch that fails closed — both
-        # still route through the SAME existing fallback, just labeled
-        # distinctly for operators reading the failure reason.
-        prefix = "cloud_continuation_unavailable" if resume_session_id else "cloud_output_unrecognized"
-        return _fail_closed_dispatch(queue, task, task_type, f"{prefix}: {launch.error}")
-
-    execution_policy = "fresh_cloud_resume" if resume_session_id else "fresh_cloud"
+    execution_policy = ("fresh_cloud_after_resume_failed" if resume_error else
+                        "fresh_cloud_resume" if resume_session_id else "fresh_cloud")
     prev_task_id = ""
     if isinstance(task.context, dict):
         prev = task.context.get("prev_task_id")
