@@ -24,6 +24,32 @@ PYTEST = f"{sys.executable} -m pytest -q -p no:cacheprovider"
 PR = 7
 
 
+@pytest.mark.parametrize(("command", "node_id", "expected"), [
+    (
+        "python3 -m pytest -q --timeout=180 -p no:cacheprovider tests",
+        "tests/unit/test_x.py::test_y",
+        "python3 -m pytest -q --timeout=180 -p no:cacheprovider tests/unit/test_x.py::test_y",
+    ),
+    (
+        "pytest --timeout 180 tests/unit",
+        "tests/unit/test_x.py::test_y",
+        "pytest --timeout 180 tests/unit/test_x.py::test_y",
+    ),
+    (
+        "pytest --capture=no tests",
+        "tests/unit/test_x.py::test_y",
+        "pytest --capture=no tests/unit/test_x.py::test_y",
+    ),
+    ("pytest tests/unit_other", "tests/unit/test_x.py::test_y", None),
+    ("pytest -k smoke tests", "tests/unit/test_x.py::test_y", None),
+    ("pytest -k=smoke tests", "tests/unit/test_x.py::test_y", None),
+    ("pytest tests && echo done", "tests/unit/test_x.py::test_y", None),
+    ("make test", "tests/unit/test_x.py::test_y", None),
+])
+def test_isolated_rerun_command_replaces_only_matching_suite_target(command, node_id, expected):
+    assert script_tester._isolated_rerun_command(command, node_id) == expected
+
+
 def _git(cwd, *args):
     subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True)
 
