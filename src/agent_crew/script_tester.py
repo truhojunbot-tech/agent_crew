@@ -149,9 +149,9 @@ def watchdog_timeout_seconds(state: Optional[Mapping], ordinary_timeout_s: float
 
 
 def _isolated_rerun_command(command: str, node_id: str) -> Optional[str]:
-    """Only append a node to a plain pytest invocation with no suite target.
+    """Run one node from a plain pytest invocation with at most one suite target.
 
-    A project command can invoke make, a shell pipeline, or a directory target.
+    A project command can invoke make, a shell pipeline, or an unrelated target.
     Appending a node to any of those does not run that node in isolation.
     """
     try:
@@ -167,14 +167,27 @@ def _isolated_rerun_command(command: str, node_id: str) -> Optional[str]:
         index = 3
     else:
         return None
+    target_index = None
+    node_path = node_id.split("::", 1)[0]
     while index < len(words):
         word = words[index]
         if word in {"-q", "-v", "-x", "--disable-warnings"}:
             index += 1
         elif word == "-p" and index + 1 < len(words):
             index += 2
+        elif word == "--timeout" and index + 1 < len(words) and re.fullmatch(
+                r"\d+(?:\.\d+)?", words[index + 1]):
+            index += 2
+        elif re.fullmatch(r"--[A-Za-z][A-Za-z0-9-]*=.+", word):
+            index += 1
+        elif target_index is None and node_path.startswith(word.rstrip("/") + "/"):
+            target_index = index
+            index += 1
         else:
             return None
+    if target_index is not None:
+        words[target_index] = node_id
+        return shlex.join(words)
     return f"{command} {shlex.quote(node_id)}"
 
 
