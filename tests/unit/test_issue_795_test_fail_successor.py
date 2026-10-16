@@ -2,8 +2,10 @@
 
 from dataclasses import asdict
 
+import pytest
 from fastapi.testclient import TestClient
 
+from agent_crew.mcp_server import build_mcp_server
 from agent_crew.pipeline import fix_task_id
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
@@ -16,6 +18,7 @@ def _harness(tmp_path, monkeypatch):
     import agent_crew.github as github
     monkeypatch.setattr(github, "pr_state", lambda *args, **kwargs: "open")
     monkeypatch.setattr(github, "pr_head_sha", lambda *args, **kwargs: "a" * 40)
+    monkeypatch.setattr("agent_crew.pipeline._repo_default_branch", lambda repo: "main")
     db = str(tmp_path / "tasks.db")
     notices = []
     app = create_app(db, project="agent_crew", pane_map={}, identity_required=False,
@@ -91,12 +94,60 @@ def test_llm_test_failure_with_findings_creates_fix(tmp_path, monkeypatch):
     assert notices == []
 
 
-def test_fix_cap_sends_one_notice_without_successor(tmp_path, monkeypatch):
+@pytest.mark.parametrize("transport", ["http", "mcp"])
+def test_failed_tester_result_creates_one_fix_on_both_transports(
+        tmp_path, monkeypatch, transport):
+    app, queue, _ = _harness(tmp_path, monkeypatch)
+    finding = "tests/test_y.py::test_y failed"
+    if transport == "http":
+        with TestClient(app) as client:
+            response = _post(client, findings=[finding])
+        assert response.status_code == 200, response.text
+    else:
+        mcp = build_mcp_server(queue.db_path)
+        response = mcp._tool_manager._tools["submit_result"].fn(
+            task_id="test-795", status="failed", summary="test outcome",
+            findings=[finding], pr_number=794)
+        assert response["acknowledged"] is True, response
+    fixes = [task for task in queue.list_tasks()
+             if task.task_id == fix_task_id("test-795", 1)]
+    assert len(fixes) == 1
+    assert fixes[0].context["review_findings"] == [finding]
+    assert fixes[0].context["prev_task_id"] == "test-795"
+
+
+def test_mcp_script_new_failures_without_findings_create_fix(tmp_path, monkeypatch):
+    _, queue, _ = _harness(tmp_path, monkeypatch)
+    mcp = build_mcp_server(queue.db_path)
+    response = mcp._tool_manager._tools["submit_result"].fn(
+        task_id="test-795", status="failed", summary="script test FAILED",
+        pr_number=794, error_info={
+            "reason": "script_test_new_failures", "final": True,
+            "script_test": {"reason": "new_failures",
+                            "new_failures": ["tests/test_x.py::test_x"]},
+        })
+    assert response["acknowledged"] is True, response
+    fix = queue.get_task(fix_task_id("test-795", 1))
+    assert fix is not None
+    assert fix.context["review_findings"] == ["new failure: tests/test_x.py::test_x"]
+
+
+@pytest.mark.parametrize("transport", ["http", "mcp"])
+def test_fix_cap_sends_one_notice_without_successor(tmp_path, monkeypatch, transport):
     monkeypatch.setenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", "0")
     app, queue, notices = _harness(tmp_path, monkeypatch)
-    with TestClient(app) as client:
-        response = _failed_script_result(client)
-    assert response.status_code == 200, response.text
+    if transport == "http":
+        with TestClient(app) as client:
+            response = _failed_script_result(client)
+        assert response.status_code == 200, response.text
+    else:
+        monkeypatch.setattr("agent_crew.notify.notify_telegram",
+                            lambda message: notices.append(message) or True)
+        mcp = build_mcp_server(queue.db_path)
+        response = mcp._tool_manager._tools["submit_result"].fn(
+            task_id="test-795", status="failed", summary="test outcome",
+            findings=["tests/test_y.py::test_y failed"], pr_number=794)
+        assert response["acknowledged"] is True, response
     assert queue.get_task(fix_task_id("test-795", 1)) is None
     assert len(notices) == 1 and "test_failed_no_successor" in notices[0]
 

@@ -34,11 +34,12 @@ try:
 except ImportError:  # pragma: no cover — surfaced loud at import time
     FastMCP = None  # type: ignore
 
-from agent_crew.loop import _resolve_verdict
+from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.pipeline import (
     auto_enqueue_fix,
     auto_enqueue_review,
     auto_enqueue_test,
+    fix_task_id,
     auto_fallback_failed_task,    hold_mismatched_pr_result,
     artifact_gate_applies, declared_artifact_kind, no_artifact_result,
     verify_implement_artifact, verify_task_artifact,
@@ -168,6 +169,7 @@ def build_mcp_server(
         summary: str = "",
         verdict: Optional[str] = None,
         findings: Optional[list[Union[str, dict]]] = None,
+        error_info: Optional[dict] = None,
         # `int | str` for the same reason as the HTTP body: agents write PR
         # numbers as `#268`, and a transport that 422s on the spelling throws
         # the whole result away (review of PR #270).
@@ -204,6 +206,7 @@ def build_mcp_server(
                 summary=summary,
                 verdict=verdict,  # type: ignore[arg-type]
                 findings=list(findings or []),
+                error_info=error_info,
                 pr_number=pr_number,
                 # #305: `commit` is normalised by `TaskResult` itself — a value
                 # that is not a full object id becomes empty rather than a pin
@@ -362,7 +365,21 @@ def build_mcp_server(
             # avoid, only "use what the task context already names."
             auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "",
                              require_repo_default=True)
-        if result.status == "failed":
+        info = result.error_info if isinstance(result.error_info, dict) else {}
+        script = info.get("script_test")
+        script_failures = script.get("new_failures") if isinstance(script, dict) else None
+        actionable_test_failure = (task_type == "test"
+                                   and handle_test_result(result) == "failed"
+                                   and bool(result.findings or script_failures))
+        if actionable_test_failure:
+            fix_id = auto_enqueue_fix(queue, task_id, repo=(_task_ctx or {}).get("repo") or "",
+                                      require_repo_default=True)
+            round_number = int((_task_ctx or {}).get("fix_round") or 0) + 1
+            if not fix_id and queue.get_task(fix_task_id(task_id, round_number)) is None:
+                from agent_crew.server import coordinator_notice_once
+                coordinator_notice_once(queue, task_id, "test_failed_no_successor",
+                                        result.summary)
+        elif result.status == "failed":
             auto_fallback_failed_task(queue, task_id, result, task_type)
 
     @mcp.tool()

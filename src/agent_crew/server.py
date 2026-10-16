@@ -108,6 +108,44 @@ from agent_crew.telemetry_response import response_log_telemetry
 from agent_crew.worktree_default_branch import remote_default_branch
 
 logger = logging.getLogger(__name__)
+
+
+def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
+                            detail: str = "", notify_fn=None) -> None:
+    """Deliver one durable coordinator notice across HTTP and MCP transports."""
+    claimed = False
+    try:
+        task = queue.get_task(task_id)
+        intent = (queue.get_work_intent(task_id[len("work-intent:"):])
+                  if task is None and task_id.startswith("work-intent:") else None)
+        if (task is None and intent is None) or not queue.claim_coordinator_notice(task_id, kind):
+            return
+        claimed = True
+        ctx = task.context if task is not None and isinstance(task.context, dict) else {}
+        safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
+        message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
+                   f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
+                   f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
+        if notify_fn is not None:
+            delivered = bool(notify_fn(message))
+        else:
+            from agent_crew.notify import notify_console, notify_telegram
+            delivered = bool(notify_telegram(message))
+            if not delivered:
+                notify_console(message)
+        retryable = queue.finish_coordinator_notice(task_id, kind, delivered=delivered)
+        claimed = False
+        if not delivered:
+            logger.warning("coordinator notice delivery failed task=%s kind=%s; %s",
+                           task_id, kind, "retryable" if retryable else "gave up")
+    except Exception:
+        logger.exception("coordinator notice failed task=%s kind=%s", task_id, kind)
+        if claimed:
+            try:
+                queue.finish_coordinator_notice(task_id, kind, delivered=False)
+            except Exception:
+                logger.exception("coordinator notice release failed task=%s kind=%s",
+                                 task_id, kind)
 _DEFAULT_GEMINI_MODEL = "Gemini 3.8 Flash (Medium)"
 
 
@@ -3726,41 +3764,7 @@ def create_app(
 
     def _coordinator_notice(task_id: str, kind: str, detail: str = "") -> None:
         """Wake the coordinator once after confirmed delivery."""
-        claimed = False
-        try:
-            task = q().get_task(task_id)
-            intent = (q().get_work_intent(task_id[len("work-intent:"):])
-                      if task is None and task_id.startswith("work-intent:") else None)
-            if (task is None and intent is None) or not q().claim_coordinator_notice(task_id, kind):
-                return
-            claimed = True
-            ctx = task.context if task is not None and isinstance(task.context, dict) else {}
-            # Pane output can contain private task text and is unbounded. Keep
-            # the notice actionable without forwarding captured pane content.
-            safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
-            message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
-                       f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
-                       f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
-            if coordinator_notify_fn is not None:
-                delivered = bool(coordinator_notify_fn(message))
-            else:
-                from agent_crew.notify import notify_console, notify_telegram
-                delivered = bool(notify_telegram(message))
-                if not delivered:
-                    notify_console(message)
-            retryable = q().finish_coordinator_notice(task_id, kind, delivered=delivered)
-            claimed = False
-            if not delivered:
-                logger.warning("coordinator notice delivery failed task=%s kind=%s; %s",
-                               task_id, kind, "retryable" if retryable else "gave up")
-        except Exception:
-            logger.exception("coordinator notice failed task=%s kind=%s", task_id, kind)
-            if claimed:
-                try:
-                    q().finish_coordinator_notice(task_id, kind, delivered=False)
-                except Exception:
-                    logger.exception("coordinator notice release failed task=%s kind=%s",
-                                     task_id, kind)
+        coordinator_notice_once(q(), task_id, kind, detail, coordinator_notify_fn)
 
     app.state.coordinator_notice = _coordinator_notice
 
