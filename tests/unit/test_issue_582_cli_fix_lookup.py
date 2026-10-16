@@ -54,3 +54,76 @@ def test_fallback_passes_repo_and_repo_cwd(monkeypatch):
 
     assert calls == [("rev-1", {"repo": "o/r", "repo_cwd": "/wt/codex"})]
     assert [t.task_id for t in fixes] == ["fix-1"]
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 0.0
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+    def monotonic(self):
+        return self.now
+
+    def time(self):
+        return self.now
+
+
+def test_adopts_fix_created_after_45_seconds_while_outbox_pending(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    fallback = []
+    import agent_crew.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "auto_enqueue_fix", lambda *a, **k: fallback.append(True))
+
+    class Queue:
+        def list_tasks(self):
+            return [_fix("rev-1")] if clock.now >= 45 else []
+
+        def outbox_get(self, parent_task_id):
+            assert parent_task_id == "rev-1"
+            return {"state": "pending"}
+
+    fixes = cli._await_review_fix(Queue(), "rev-1", poll_interval=5.0)
+    assert [task.task_id for task in fixes] == ["fix-1"]
+    assert clock.now == 45.0
+    assert fallback == []
+
+
+def test_terminal_outbox_without_fix_falls_back_immediately(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    fallback = []
+    import agent_crew.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "auto_enqueue_fix", lambda *a, **k: fallback.append(True))
+
+    class Queue:
+        def list_tasks(self):
+            return []
+
+        def outbox_get(self, parent_task_id):
+            return {"state": "applied" if clock.now >= 10 else "replaying"}
+
+    assert cli._await_review_fix(Queue(), "rev-1", poll_interval=5.0) == []
+    assert clock.now == 10.0
+    assert fallback == [True]
+
+
+def test_no_outbox_row_waits_at_most_300_seconds(monkeypatch):
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    fallback = []
+    import agent_crew.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "auto_enqueue_fix", lambda *a, **k: fallback.append(True))
+
+    class Queue:
+        def list_tasks(self):
+            return []
+
+        def outbox_get(self, parent_task_id):
+            return None
+
+    assert cli._await_review_fix(Queue(), "rev-1", poll_interval=7.0) == []
+    assert clock.now == 300.0
+    assert fallback == [True]
