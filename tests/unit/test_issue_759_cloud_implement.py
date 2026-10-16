@@ -94,10 +94,11 @@ def test_headless_cloud_implement_reconciles_pr_and_records_cost(tmp_path, monke
     assert queue.get_attribution("impl-cloud")["agent"] == "claude_cloud"
     with sqlite3.connect(queue._db_path) as conn:
         assert conn.execute("SELECT dispatch_channel FROM tasks WHERE task_id='impl-cloud'").fetchone()[0] == "claude_cloud"
-    assert queue.get_task_context("impl-cloud")["cloud_usd"] == .75
+    assert queue.get_task_context("impl-cloud")["cloud_usd"] is None
     assert queue.get_task_context("impl-cloud")["cloud_credit_used_before"] == 12.0
-    assert queue.get_task_context("impl-cloud")["cloud_credit_used_after"] == 12.75
-    assert queue.get_attribution("impl-cloud")["cloud_usd"] == .75
+    assert isinstance(queue.get_task_context("impl-cloud")["cloud_credit_before_fetched_at"], float)
+    assert queue.get_task_context("impl-cloud")["cloud_credit_used_after"] is None
+    assert queue.get_attribution("impl-cloud")["cloud_cost_status"] == "PENDING_SETTLE"
     reviews = [t for t in queue.list_tasks() if t.task_type == "review"]
     assert len(reviews) == 1
     assert reviews[0].context.get("agent_override") != "claude_cloud"
@@ -131,6 +132,9 @@ def test_cloud_usd_cap_leaves_second_implement_pending(tmp_path, monkeypatch):
     monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: 759)
     monkeypatch.setattr(cloud._github, "pr_head_sha", lambda *a, **kw: "a" * 40)
     monkeypatch.setattr(cloud._github, "pr_state", lambda *a, **kw: "open")
+    cloud.reconcile_all_cloud_tasks(queue)
+    monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")
+    queue.patch_context("one", {"cloud_ended_at": time.time() - 1})
     cloud.reconcile_all_cloud_tasks(queue)
     assert queue.get_attribution("one")["cloud_usd"] == 1.2
     outcome = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement", run_fn=run)

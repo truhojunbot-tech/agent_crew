@@ -15,8 +15,8 @@ from agent_crew.queue import TaskQueue
 @pytest.mark.parametrize("before,after,overlap,status,usd", [
     (4.0, 4.5, False, "MEASURED", 0.5),
     (4.0, 4.5, True, "UNKNOWN_OVERLAP", None),
-    (None, 4.5, False, "UNKNOWN_NO_READING", None),
-    (4.0, None, False, "UNKNOWN_NO_READING", None),
+    (None, 4.5, False, "UNKNOWN_NO_FRESH_READING", None),
+    (4.0, None, False, "UNKNOWN_NO_FRESH_READING", None),
     (5.0, 4.5, False, "UNKNOWN_COUNTER_DECREASED", None),
     (5.0, 4.5, True, "UNKNOWN_OVERLAP", None),
     (None, None, True, "UNKNOWN_OVERLAP", None),
@@ -28,10 +28,13 @@ def test_terminal_cloud_cost_status_and_overlaps(
     queue.enqueue(TaskRequest(task_id="target", task_type=task_type,
                               description="Cloud task", branch="agent/target"))
     started = time.time() - 10
+    monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")
     prefix = "cloud_shadow_" if shadow else "cloud_"
     queue.patch_context("target", {
         prefix + "attempt_started_at": started,
+        prefix + "ended_at": time.time() - 1,
         prefix + "credit_used_before": before,
+        prefix + "credit_before_fetched_at": started - 1,
     })
     attribution_id = "cloud-shadow:target" if shadow else "target"
     queue.record_attribution(task_id=attribution_id, project="agent_crew",
@@ -43,11 +46,16 @@ def test_terminal_cloud_cost_status_and_overlaps(
                                   description="Overlapping cloud session",
                                   branch="agent/other",
                                   context={"cloud_attempt_started_at": started + 1}))
-    monkeypatch.setattr(cloud, "read_cloud_credit_used", lambda: after)
+    monkeypatch.setattr(cloud, "read_cloud_credit_used",
+                        lambda: cloud.CloudCreditSnapshot(after, time.time()) if after is not None else None)
 
     if shadow:
         cloud._record_shadow_review_cost(queue, "target")
+        assert queue.get_attribution(attribution_id)["cloud_cost_status"] == "PENDING_SETTLE"
+        cloud._record_shadow_review_cost(queue, "target")
     else:
+        cloud._record_reconciled_cloud_cost(queue, queue.get_task("target"))
+        assert queue.get_attribution(attribution_id)["cloud_cost_status"] == "PENDING_SETTLE"
         cloud._record_reconciled_cloud_cost(queue, queue.get_task("target"))
 
     attr = queue.get_attribution(attribution_id)
