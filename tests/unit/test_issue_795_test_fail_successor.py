@@ -1,5 +1,7 @@
 """#795: a server-owned test failure must continue its lineage."""
 
+from dataclasses import asdict
+
 from fastapi.testclient import TestClient
 
 from agent_crew.pipeline import fix_task_id
@@ -20,14 +22,24 @@ def _harness(tmp_path, monkeypatch):
                      watchdog_disabled=True, anomaly_disabled=True,
                      coordinator_notify_fn=lambda message: notices.append(message) or True)
     queue = TaskQueue(db)
-    queue.enqueue(TaskRequest(
+    task = TaskRequest(
         task_id="test-795", task_type="test", description="test PR",
         branch="agent/795-test-fail-successor", project="agent_crew",
         context={"pr_number": 794, "base_branch": "main", "repo": "owner/repo",
                  "issue": 795, "risk_tier": 2, "external_operation_id": "op-795",
                  "reviewed_sha": "a" * 40, "fix_round": 0,
                  "implementer_agent": "codex", "reviewer_agent": "claude",
-                 "agent_override": "gemini"}), ingress="http.tasks")
+                 "agent_override": "gemini"})
+    if hasattr(queue, "admit_work_intent"):
+        # #793 may merge before this PR; exercise the durable binding too.
+        queue.admit_work_intent({
+            "external_operation_id": "op-795", "project": "agent_crew",
+            "repo": "owner/repo", "issue": 795, "coordinator_identity": "owner",
+            "coordinator_session": "session", "priority": 3, "risk_tier": 2,
+            "execution_slo_s": 60, "task": asdict(task),
+        })
+    else:
+        queue.enqueue(task, ingress="http.tasks")
     return app, queue, notices
 
 
@@ -40,7 +52,7 @@ def _post(client, status="failed", findings=None, error_info=None):
 
 
 def _failed_script_result(client):
-    return _post(client, findings=["new failure: tests/test_x.py::test_x"], error_info={
+    return _post(client, error_info={
         "reason": "script_test_new_failures", "final": True,
         "script_test": {"outcome": "FAILED", "reason": "new_failures",
                         "new_failures": ["tests/test_x.py::test_x"]},
@@ -63,6 +75,19 @@ def test_script_new_failures_create_one_fix_with_lineage(tmp_path, monkeypatch):
     assert fix.context["pr_number"] == 794 and fix.context["issue"] == 795
     assert fix.context["external_operation_id"] == "op-795"
     assert fix.context["agent_override"] == "codex"
+    if hasattr(queue, "get_work_intent"):
+        assert queue.get_work_intent("op-795")["task_ids"] == ["test-795", fix_id]
+    assert notices == []
+
+
+def test_llm_test_failure_with_findings_creates_fix(tmp_path, monkeypatch):
+    app, queue, notices = _harness(tmp_path, monkeypatch)
+    with TestClient(app) as client:
+        response = _post(client, findings=["tests/test_y.py::test_y failed"])
+    assert response.status_code == 200, response.text
+    fix = queue.get_task(fix_task_id("test-795", 1))
+    assert fix is not None
+    assert fix.context["review_findings"] == ["tests/test_y.py::test_y failed"]
     assert notices == []
 
 

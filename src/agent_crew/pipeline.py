@@ -4,7 +4,7 @@ When a task gets a result submitted, three follow-up flows may fire:
 
   1. ``auto_enqueue_review``           impl ✓  → enqueue a review task
   2. ``auto_enqueue_test``             review approve → enqueue a test task
-  3. ``auto_enqueue_fix``              review request_changes → enqueue a fix
+  3. ``auto_enqueue_fix``              review request_changes / test failure → fix
   4. ``auto_fallback_failed_task``     rate-limit ✗ → same-role retry
 
 Both transports — HTTP ``submit_result`` and MCP ``submit_result`` — must
@@ -35,7 +35,7 @@ from agent_crew.fallback import (
     has_rate_limit_signal,
 )
 from agent_crew.cea.input_providers.budget import QuotaBudgetProvider
-from agent_crew.loop import _resolve_verdict
+from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.role_mapping import DEFAULT_ROLE_TO_AGENT
 from agent_crew.script_tester import SCRIPT_TESTER
 from agent_crew.protocol import (
@@ -1439,7 +1439,7 @@ def auto_enqueue_fix(
     require_repo_default: bool = False,
     suppress_side_effects: bool = False,
 ) -> Optional[str]:
-    """Create the fix task that follows a ``request_changes`` review (#244).
+    """Create the fix task after an actionable review or test failure (#244, #795).
 
     #314 §4 P0: ``suppress_side_effects`` (replay 경로) 시 fix-budget 소진 PR comment 게시
     (_announce_fix_budget_exhausted)를 skip한다. pr_announcements claim이 동시 중복엔 강하나
@@ -1484,14 +1484,22 @@ def auto_enqueue_fix(
         review_result = queue.get_result(review_task_id)
         if not review_result:
             return None
-        if getattr(review_result, "status", None) != "completed":
+        failed_test = review_task.task_type == "test"
+        if failed_test:
+            script = (review_result.error_info or {}).get("script_test") if isinstance(
+                review_result.error_info, dict) else None
+            if (handle_test_result(review_result) != "failed"
+                    or not (review_result.findings or
+                            (isinstance(script, dict) and script.get("new_failures")))):
+                return None
+        elif getattr(review_result, "status", None) != "completed":
             logger.info(
                 f"auto_enqueue_fix: review {review_task_id} did not complete "
                 f"(status={getattr(review_result, 'status', None)!r}) — leaving it "
                 f"to the retry/fallback path, not enqueueing a fix"
             )
             return None
-        if _resolve_verdict(review_result) != "request_changes":
+        if not failed_test and _resolve_verdict(review_result) != "request_changes":
             return None
 
         review_ctx = review_task.context if isinstance(review_task.context, dict) else {}
@@ -1710,6 +1718,10 @@ def auto_enqueue_fix(
                 f"the automated fix budget is spent (round {fix_round} > "
                 f"max {max_rounds}) — stopping, this needs a human"
             )
+            if failed_test:
+                # A failed test has no reviewer comment to publish. The server
+                # sends its coordinator notice when no fix was created.
+                return None
             # #314 §4 P0: replay 중에는 exhaustion PR comment를 게시하지 않는다(중복 방지).
             if suppress_side_effects:
                 logger.debug(f"auto_enqueue_fix: replay 중 — fix-budget exhaustion comment skip "
@@ -1738,7 +1750,16 @@ def auto_enqueue_fix(
                     logger.exception(f"auto_enqueue_fix: external_op_mark({_cop}) 실패")
             return None
 
-        findings_text = _findings_block(review_result.findings or [], review_task_id)
+        findings = list(review_result.findings or [])
+        if failed_test:
+            script = (review_result.error_info or {}).get("script_test") if isinstance(
+                review_result.error_info, dict) else None
+            if isinstance(script, dict):
+                for node_id in script.get("new_failures") or []:
+                    finding = f"new failure: {node_id}"
+                    if finding not in findings:
+                        findings.append(finding)
+        findings_text = _findings_block(findings, review_task_id)
         summary = (review_result.summary or "").strip()
         if not findings_text and not summary:
             logger.warning(
@@ -1750,7 +1771,8 @@ def auto_enqueue_fix(
         where = (f"PR #{pr_number}" if pr_number
                  else f"branch {cascade_branch!r}")
         parts = [
-            f"Fix {where} per {review_task_id} request_changes "
+            f"Fix {where} per {review_task_id} "
+            f"{'test failure' if failed_test else 'request_changes'} "
             f"(automated fix round {fix_round}/{max_rounds}).",
         ]
         if summary:
@@ -1766,8 +1788,10 @@ def auto_enqueue_fix(
         fix_context: dict = {
             "prev_task_id": review_task_id,
             "fix_round": fix_round,
-            "review_findings": list(review_result.findings or []),
+            "review_findings": findings,
         }
+        if failed_test:
+            fix_context["feedback"] = findings_text
         inherited_tiers = [tier for tier in (review_ctx.get("risk_tier"), contract.tier)
                            if type(tier) is int and 0 <= tier <= 3]
         if inherited_tiers:

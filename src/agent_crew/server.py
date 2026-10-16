@@ -52,7 +52,7 @@ from agent_crew.context_identity import (
 from agent_crew.fallback import has_rate_limit_signal, is_rate_limit_error
 from agent_crew import tokenomics_canary as _canary
 from agent_crew.github import get_repo, _repo_slug
-from agent_crew.loop import _resolve_verdict
+from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.pipeline import (
     auto_enqueue_fix as _pipeline_auto_enqueue_fix,
     auto_enqueue_review as _pipeline_auto_enqueue_review,
@@ -69,6 +69,7 @@ from agent_crew.pipeline import (
     resume_tier3_gate as _resume_tier3_gate,
     review_publication_decision,
     _lineage_root_task_id,
+    fix_task_id,
     stale_review_task_id,
     verify_implement_artifact,
 )
@@ -7212,7 +7213,7 @@ def create_app(
                 f"_requeue_review_at_head: could not requeue a review for PR "
                 f"#{pr_number} at {head[:12]}")
 
-    def _auto_enqueue_fix(review_task_id: str, repo: str = "") -> None:
+    def _auto_enqueue_fix(review_task_id: str, repo: str = "") -> Optional[str]:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123, #244)."""
         # The cascade swallows its own errors, but the invariant it is
@@ -7239,6 +7240,7 @@ def create_app(
             )
             if fix_id:
                 _try_push_next("implementer")
+            return fix_id
         except _PausedError:
             # #314 §4 P0-2: pipeline이 이미 outbox reopen했음 — handler suppressed 200 위해 전파.
             raise
@@ -7247,6 +7249,7 @@ def create_app(
                 f"_auto_enqueue_fix: cascade failed for {review_task_id} — "
                 f"the review result stands, the fix was not enqueued"
             )
+        return None
 
     def _readmit_provider_capacity(task_id: str, cap: dict, delay_s: float, tag: str) -> str:
         """Re-admit capacity-refused work whose receipt §8 superseded (#581).
@@ -8617,7 +8620,24 @@ def create_app(
             # Failure handling: rate-limit → reroute via fallback chain (#81),
             # otherwise auto-retry the same role up to MAX_RETRIES.
             # #772: re-running a deterministic script repeats the same verdict.
-            if result.status == "failed" and _script_tester.is_script_test_result(result):
+            _test_verdict = handle_test_result(result) if task_type == "test" else None
+            _test_info = result.error_info if isinstance(result.error_info, dict) else {}
+            _script_failures = (_test_info.get("script_test") or {}).get("new_failures") if isinstance(
+                _test_info.get("script_test"), dict) else None
+            if (task_type == "test" and _test_verdict == "failed"
+                    and (result.findings or _script_failures)):
+                logger.info(f"POST /tasks/{task_id}/result: actionable test failure; enqueueing fix")
+                _fix_id = _auto_enqueue_fix(task_id, repo=str((ctx or {}).get("repo") or ""))
+                _round = int((ctx or {}).get("fix_round") or 0) + 1
+                if not _fix_id:
+                    try:
+                        _existing_fix = q().get_task(fix_task_id(task_id, _round))
+                    except Exception:
+                        logger.exception("test fix lookup failed for %s", task_id)
+                        _existing_fix = None
+                    if _existing_fix is None:
+                        _coordinator_notice(task_id, "test_failed_no_successor", result.summary)
+            elif result.status == "failed" and _script_tester.is_script_test_result(result):
                 logger.info(f"POST /tasks/{task_id}/result: script test failed; no retry")
             elif result.status == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
