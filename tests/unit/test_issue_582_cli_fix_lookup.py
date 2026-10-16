@@ -3,6 +3,8 @@ review result, and its local fallback must name the repo and a checkout."""
 from types import SimpleNamespace
 
 from agent_crew import cli
+from agent_crew.protocol import TaskRequest, TaskResult
+from agent_crew.queue import TaskQueue
 
 
 def _fix(review_id):
@@ -91,7 +93,7 @@ def test_adopts_fix_created_after_45_seconds_while_outbox_pending(monkeypatch):
     assert fallback == []
 
 
-def test_terminal_outbox_without_fix_falls_back_immediately(monkeypatch):
+def test_expired_outbox_without_fix_falls_back_immediately(monkeypatch):
     clock = _Clock()
     monkeypatch.setattr(cli, "time", clock)
     fallback = []
@@ -103,11 +105,48 @@ def test_terminal_outbox_without_fix_falls_back_immediately(monkeypatch):
             return []
 
         def outbox_get(self, parent_task_id):
-            return {"state": "applied" if clock.now >= 10 else "replaying"}
+            return {"state": "expired" if clock.now >= 10 else "replaying"}
 
     assert cli._await_review_fix(Queue(), "rev-1", poll_interval=5.0) == []
     assert clock.now == 10.0
     assert fallback == [True]
+
+
+def test_active_result_applied_outbox_adopts_fix_created_after_45_seconds(tmp_db, monkeypatch):
+    queue = TaskQueue(tmp_db)
+    queue.enqueue(TaskRequest(task_id="review-real", task_type="review",
+                              description="Review PR #790", context={"pr_number": 790}))
+    assert queue.dequeue(role="reviewer").task_id == "review-real"
+    queue.submit_result("review-real", TaskResult(
+        task_id="review-real", status="completed", summary="Changes requested",
+        verdict="request_changes", pr_number=790,
+        findings=["HIGH src/agent_crew/cli.py:2491 - Wait for the cascade fix"]),
+    )
+    assert queue.outbox_get("review-real")["state"] == "applied"
+
+    clock = _Clock()
+    monkeypatch.setattr(cli, "time", clock)
+    fallback = []
+    import agent_crew.pipeline as pipeline
+    monkeypatch.setattr(pipeline, "auto_enqueue_fix", lambda *a, **k: fallback.append(True))
+    advance = clock.sleep
+    created = []
+
+    def sleep(seconds):
+        advance(seconds)
+        if clock.now >= 45 and not created:
+            queue.enqueue(TaskRequest(
+                task_id="fix-review-real-r1", task_type="implement",
+                description="Fix PR #790", branch="agent/790-await-fix",
+                context={"prev_task_id": "review-real"},
+            ))
+            created.append(True)
+
+    clock.sleep = sleep
+    fixes = cli._await_review_fix(queue, "review-real", poll_interval=5.0)
+    assert [task.task_id for task in fixes] == ["fix-review-real-r1"]
+    assert clock.now == 45.0
+    assert fallback == []
 
 
 def test_no_outbox_row_waits_at_most_300_seconds(monkeypatch):

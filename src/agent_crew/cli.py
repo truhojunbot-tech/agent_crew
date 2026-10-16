@@ -2474,10 +2474,11 @@ def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = 
                       timeout: float = 300.0, poll_interval: float = 1.0) -> list:
     """Return the fix tasks whose ``prev_task_id`` is ``review_id`` (#582).
 
-    Wait for the server's durable cascade outbox to finish, or for a fix to
-    appear, before falling back to local ``auto_enqueue_fix``. Legacy queues
-    without an outbox use the same bounded poll. The fallback names the repo
-    and a checkout of it so ``pr_is_actionable`` can resolve the PR.
+    Wait for a server-created fix, or an expired cascade outbox, before falling
+    back to local ``auto_enqueue_fix``. An ACTIVE result writes ``applied``
+    before its live cascade runs, so that state cannot end the wait. Legacy
+    queues without an outbox use the same bounded poll. The fallback names
+    the repo and a checkout so ``pr_is_actionable`` can resolve the PR.
     """
     def _fixes():
         return [t for t in queue.list_tasks()
@@ -2489,7 +2490,7 @@ def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = 
     fixes = _fixes()
     while not fixes:
         outbox = queue.outbox_get(review_id) if hasattr(queue, "outbox_get") else None
-        if outbox and outbox["state"] in ("applied", "expired"):
+        if outbox and outbox["state"] == "expired":
             break
         remaining = deadline - time.monotonic()
         if remaining <= 0:
