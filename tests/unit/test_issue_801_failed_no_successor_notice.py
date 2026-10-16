@@ -62,7 +62,7 @@ def test_no_retry_terminal_failure_notifies_once(tmp_path, monkeypatch):
     assert "agent stopped" in notices[0]
 
 
-def test_two_terminal_tasks_in_one_lineage_share_the_notice(tmp_path, monkeypatch):
+def test_distinct_terminal_tasks_in_one_lineage_each_notify_once(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch, retry_attempt=2)
     with TestClient(app) as client:
         assert _fail(client, summary="first exit_1").status_code == 200
@@ -78,8 +78,13 @@ def test_two_terminal_tasks_in_one_lineage_share_the_notice(tmp_path, monkeypatc
             "error_info": {"reason": "exit_1", "final": True},
         })
         assert response.status_code == 200, response.text
-    assert len(notices) == 1
+        assert len(notices) == 2
+        # Replaying the same failed task must reuse its durable notice claim.
+        app.state.coordinator_notice("retry-root-801-a2", "failed_no_successor",
+                                     "failed_task=retry-root-801-a2 reason=exit_1")
+    assert len(notices) == 2
     assert "first exit_1" in notices[0]
+    assert "second exit_1" in notices[1]
 
 
 def test_implement_retry_with_budget_has_no_notice(tmp_path, monkeypatch):

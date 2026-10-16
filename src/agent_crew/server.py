@@ -3768,14 +3768,11 @@ def create_app(
 
     def _failed_no_successor_notice(task_id: str, result: TaskResult,
                                     task_type: str) -> None:
-        """Use one durable notice key for every failed task in a lineage."""
+        """Use a durable notice key for each terminal failure, including retries."""
         task = q().get_task(task_id)
         ctx = task.context if task is not None and isinstance(task.context, dict) else {}
         if not ctx.get("coordinator_managed"):
             return
-        root_id = str(ctx.get("lineage_root_task_id") or task_id)
-        if q().get_task(root_id) is None:
-            root_id = task_id
         info = result.error_info if isinstance(result.error_info, dict) else {}
         reason = str(info.get("reason") or "failed")
         provider_not_run = (task_type == "test" and info.get("final")
@@ -3784,7 +3781,7 @@ def create_app(
         detail = (f"failed_task={task_id} reason={reason} "
                   f"{'test not run (provider); ' if provider_not_run else ''}"
                   f"last_summary={result.summary or ''}")
-        _coordinator_notice(root_id, "failed_no_successor", detail)
+        _coordinator_notice(task_id, "failed_no_successor", detail)
 
     app.state.coordinator_notice = _coordinator_notice
 
