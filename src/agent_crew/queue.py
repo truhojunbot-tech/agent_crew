@@ -3754,12 +3754,14 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            task = conn.execute("SELECT context, project FROM tasks WHERE task_id=?",
+            task = conn.execute("SELECT context, project, status FROM tasks WHERE task_id=?",
                                 (task_id,)).fetchone()
             intent = conn.execute("SELECT project, repo, issue, risk_tier FROM work_intents WHERE external_operation_id=?",
                                   (op_id,)).fetchone()
             if task is None or intent is None:
                 raise KeyError("task or work intent not found")
+            if task["status"] not in ("pending", "in_progress"):
+                raise ValueError(f"task is not active: {task['status']}")
             if task["project"] != intent["project"]:
                 raise ValueError("task project differs from work intent")
             context = json.loads(task["context"] or "{}")

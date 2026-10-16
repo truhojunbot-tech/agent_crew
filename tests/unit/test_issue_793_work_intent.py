@@ -66,6 +66,30 @@ def test_atomic_first_task_and_existing_bind(tmp_path):
         assert queue.get_task("review-793").context["external_operation_id"] == "directive-1"
 
 
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "timed_out"])
+def test_terminal_task_cannot_bind_unstarted_intent(tmp_path, status):
+    db = tmp_path / "tasks.db"
+    notices = []
+    with TestClient(_app(db, notices)) as client:
+        admitted = client.post("/work-intents/admit", json=_intent()).json()
+        queue = TaskQueue(str(db))
+        queue.enqueue(TaskRequest(**_task()), ingress="http.tasks")
+        with sqlite3.connect(db) as conn:
+            conn.execute("UPDATE tasks SET status=? WHERE task_id='impl-793'", (status,))
+
+        response = client.post("/work-intents/directive-1/bind", json={"task_id": "impl-793"})
+        assert response.status_code == 409
+        assert status in response.json()["detail"]
+        intent = client.get("/work-intents/directive-1").json()
+        assert intent["state"] == "ADMITTED"
+        assert intent["task_ids"] == []
+        assert queue.get_task("impl-793").context.get("external_operation_id") is None
+
+        client.app.state.watchdog_tick(admitted["received_at"] + 11)
+        assert client.get("/work-intents/directive-1").json()["state"] == "EXECUTION_STALLED"
+        assert len(notices) == 1
+
+
 def test_first_task_rolls_back_when_intent_insert_fails(tmp_path):
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
