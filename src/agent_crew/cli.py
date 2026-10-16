@@ -2471,13 +2471,14 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
 
 
 def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = "",
-                      timeout: float = 30.0, poll_interval: float = 1.0) -> list:
+                      timeout: float = 300.0, poll_interval: float = 1.0) -> list:
     """Return the fix tasks whose ``prev_task_id`` is ``review_id`` (#582).
 
-    The server cascade enqueues the fix ~10 s after the review result lands,
-    so poll for it before falling back to a local ``auto_enqueue_fix``. The
-    fallback names the repo and a checkout of it; without them
-    ``pr_is_actionable`` resolves to unknown and no fix is created.
+    Wait for a server-created fix, or an expired cascade outbox, before falling
+    back to local ``auto_enqueue_fix``. An ACTIVE result writes ``applied``
+    before its live cascade runs, so that state cannot end the wait. Legacy
+    queues without an outbox use the same bounded poll. The fallback names
+    the repo and a checkout so ``pr_is_actionable`` can resolve the PR.
     """
     def _fixes():
         return [t for t in queue.list_tasks()
@@ -2485,10 +2486,16 @@ def _await_review_fix(queue, review_id: str, *, repo: str = "", repo_cwd: str = 
                 and isinstance(t.context, dict)
                 and t.context.get("prev_task_id") == review_id]
 
-    deadline = time.time() + timeout
+    deadline = time.monotonic() + timeout
     fixes = _fixes()
-    while not fixes and time.time() < deadline:
-        time.sleep(poll_interval)
+    while not fixes:
+        outbox = queue.outbox_get(review_id) if hasattr(queue, "outbox_get") else None
+        if outbox and outbox["state"] == "expired":
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval, remaining))
         fixes = _fixes()
     if not fixes:
         from agent_crew.pipeline import auto_enqueue_fix
