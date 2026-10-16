@@ -203,6 +203,7 @@ def test_cloud_cost_recorded_on_result_cancel_and_fail(tmp_path, monkeypatch):
     for task_id in ("posted", "cancelled", "failed"):
         queue.enqueue(_implement(task_id, {"repo": "owner/agent_crew",
                                            "cloud_session_id": "session_abc12345",
+                                           "cloud_attempt_started_at": time.time() - 20,
                                            "cloud_credit_used_before": 4.0}))
         queue.record_attribution(task_id=task_id, project="agent_crew",
                                  agent="claude_cloud", role="implementer",
@@ -220,10 +221,16 @@ def test_cloud_cost_recorded_on_result_cancel_and_fail(tmp_path, monkeypatch):
             "task_id": "posted", "status": "completed", "summary": "done"}).status_code == 200
         assert client.delete("/tasks/cancelled").status_code == 200
         assert app.state.fail_if_active("failed", "test_failure")
+    assert [queue.get_attribution(task_id)["cloud_cost_status"] for task_id in
+            ("posted", "cancelled", "failed")] == ["PENDING_SETTLE"] * 3
     assert [queue.get_attribution(task_id)["cloud_usd"] for task_id in
-            ("posted", "cancelled", "failed")] == [0.5, 0.5, 0.5]
+            ("posted", "cancelled", "failed")] == [None] * 3
     day_start = int(time.time() // 86400) * 86400
-    assert queue.cloud_implement_usd_since(day_start) == 1.5
+    assert queue.cloud_implement_usd_since(day_start) == 0.0
+    monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")
+    cloud.reconcile_all_cloud_tasks(queue)
+    assert [queue.get_attribution(task_id)["cloud_cost_status"] for task_id in
+            ("posted", "cancelled", "failed")] == ["UNKNOWN_OVERLAP"] * 3
     monkeypatch.setattr(cloud, "read_cloud_credit_used", lambda: 9.0)
     cloud.record_terminal_cloud_cost(queue, "posted")
-    assert queue.get_attribution("posted")["cloud_usd"] == 0.5
+    assert queue.get_attribution("posted")["cloud_usd"] is None

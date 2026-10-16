@@ -57,7 +57,8 @@ def test_marked_review_records_credit_at_launch_and_completion(tmp_path, monkeyp
     outcomes = cloud.reconcile_all_cloud_tasks(
         queue, submit_review_result_fn=lambda task_id, result: queue.submit_result(task_id, result))
     assert outcomes[0].action == "review_completed"
-    assert queue.get_attribution("review-cost")["cloud_usd"] == pytest.approx(0.4)
+    assert queue.get_attribution("review-cost")["cloud_usd"] is None
+    assert queue.get_attribution("review-cost")["cloud_cost_status"] == "PENDING_SETTLE"
 
 
 @pytest.mark.parametrize("terminal", ["stale", "cancel"])
@@ -77,7 +78,9 @@ def test_review_failure_and_cancel_record_credit(tmp_path, monkeypatch, cloud_en
     else:
         queue.cancel("review-cost")
         cloud.record_terminal_cloud_cost(queue, "review-cost")
-    assert queue.get_attribution("review-cost")["cloud_usd"] == pytest.approx(0.2)
+    assert queue.get_attribution("review-cost")["cloud_usd"] is None
+    assert queue.get_attribution("review-cost")["cloud_cost_status"] == (
+        "UNKNOWN_NO_FRESH_READING" if terminal == "stale" else "PENDING_SETTLE")
 
 
 def test_review_launch_failure_records_credit(tmp_path, monkeypatch, cloud_env):
@@ -92,7 +95,8 @@ def test_review_launch_failure_records_credit(tmp_path, monkeypatch, cloud_env):
             return _runner(argv, **kwargs)
         return SimpleNamespace(returncode=3, stdout="failed")
     cloud.dispatch_cloud_for_role(queue, role="reviewer", task_type="review", run_fn=fail)
-    assert queue.get_attribution("review-cost")["cloud_usd"] == pytest.approx(0.1)
+    assert queue.get_attribution("review-cost")["cloud_usd"] is None
+    assert queue.get_attribution("review-cost")["cloud_cost_status"] == "UNKNOWN_NO_FRESH_READING"
     assert queue.get_attribution("review-cost")["status"] == "failed"
 
 
@@ -119,7 +123,8 @@ def test_shadow_review_records_cost_on_every_terminal(tmp_path, monkeypatch, clo
         monkeypatch.setenv("AGENT_CREW_CLOUD_STALE_SECONDS", "1")
         queue.patch_context("review-cost", {"cloud_shadow_launched_at": time.time() - 10})
         cloud.reconcile_shadow_reviews(queue, pr_comments_fn=lambda *_a, **_kw: [])
-    assert queue.get_attribution("cloud-shadow:review-cost")["cloud_usd"] == pytest.approx(0.3)
+    assert queue.get_attribution("cloud-shadow:review-cost")["cloud_usd"] is None
+    assert queue.get_attribution("cloud-shadow:review-cost")["cloud_cost_status"] == "PENDING_SETTLE"
 
 
 def test_overlapping_review_sessions_keep_cost_unknown(tmp_path, monkeypatch, cloud_env):
@@ -135,7 +140,7 @@ def test_overlapping_review_sessions_keep_cost_unknown(tmp_path, monkeypatch, cl
     queue.cancel(active[0].task_id)
     cloud.record_terminal_cloud_cost(queue, active[0].task_id)
     assert queue.get_attribution(active[0].task_id)["cloud_usd"] is None
-    assert queue.get_task_context(active[0].task_id)["cloud_cost_overlaps"] == [active[1].task_id]
+    assert queue.get_attribution(active[0].task_id)["cloud_cost_status"] == "PENDING_SETTLE"
 
 
 def test_shadow_overlap_is_recorded_without_double_counting_daily_launch(tmp_path, monkeypatch,
@@ -156,7 +161,7 @@ def test_shadow_overlap_is_recorded_without_double_counting_daily_launch(tmp_pat
     cloud.reconcile_shadow_reviews(queue,
         pr_comments_fn=lambda *_a, **_kw: [{"body": comment}])
     assert queue.get_attribution("cloud-shadow:first")["cloud_usd"] is None
-    assert queue.get_task_context("first")["cloud_shadow_cost_overlaps"] == ["second"]
+    assert queue.get_attribution("cloud-shadow:first")["cloud_cost_status"] == "PENDING_SETTLE"
 
 
 @pytest.mark.parametrize("missing_status_stamp", [False, True])
@@ -174,15 +179,20 @@ def test_terminal_legacy_cloud_row_does_not_overlap_new_cost(tmp_path, monkeypat
     assert "cloud_ended_at" not in queue.get_task_context("impl-old")
 
     started = time.time()
+    monkeypatch.setenv("AGENT_CREW_CLOUD_COST_SETTLE_SECONDS", "0")
     queue.enqueue(TaskRequest(task_id="impl-new", task_type="implement",
                               description="new", branch="agent/new", project="agent_crew",
                               context={"cloud_attempt_started_at": started,
-                                       "cloud_credit_used_before": 10.0}))
+                                       "cloud_credit_used_before": 10.0,
+                                       "cloud_credit_before_fetched_at": started - 1,
+                                       "cloud_ended_at": started}))
     queue.record_attribution(task_id="impl-new", project="agent_crew",
                              agent="claude_cloud", role="implementer",
                              task_type="implement", provider_session_id="new-session",
                              started_at=started)
-    monkeypatch.setattr(cloud, "read_cloud_credit_used", lambda: 10.2)
+    monkeypatch.setattr(cloud, "read_cloud_credit_used",
+                        lambda: cloud.CloudCreditSnapshot(10.2, time.time()))
+    cloud._record_reconciled_cloud_cost(queue, queue.get_task("impl-new"))
     cloud._record_reconciled_cloud_cost(queue, queue.get_task("impl-new"))
     assert queue.get_attribution("impl-new")["cloud_usd"] == pytest.approx(0.2)
     assert queue.get_task_context("impl-new")["cloud_cost_overlaps"] == []

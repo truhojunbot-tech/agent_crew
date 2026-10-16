@@ -68,7 +68,9 @@ _ENV_SHADOW = "AGENT_CREW_CLOUD_SHADOW"
 _ENV_CLI_PATH = "AGENT_CREW_CLOUD_CLI_PATH"
 _ENV_CREDIT_FILE = "AGENT_CREW_CLOUD_CREDIT_FILE"
 _ENV_MAX_USD_PER_DAY = "AGENT_CREW_CLOUD_MAX_USD_PER_DAY"
+_ENV_COST_SETTLE_SECONDS = "AGENT_CREW_CLOUD_COST_SETTLE_SECONDS"
 _CREDIT_MAX_AGE_SECONDS = 600
+DEFAULT_COST_SETTLE_SECONDS = 900.0
 DEFAULT_MAX_CONCURRENCY = 3
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -124,7 +126,13 @@ def cloud_cli_path() -> str:
     return (os.getenv(_ENV_CLI_PATH) or "claude").strip() or "claude"
 
 
-def read_cloud_credit_used() -> Optional[float]:
+@dataclass(frozen=True)
+class CloudCreditSnapshot:
+    used_dollars: float
+    fetched_at: float
+
+
+def read_cloud_credit_used() -> Optional[CloudCreditSnapshot]:
     """Read a recent Quota monitor snapshot; absence never blocks dispatch."""
     path = (os.getenv(_ENV_CREDIT_FILE) or "").strip()
     if not path:
@@ -143,9 +151,29 @@ def read_cloud_credit_used() -> Optional[float]:
         if not 0 <= time.time() - fetched_at <= _CREDIT_MAX_AGE_SECONDS:
             return None
         used = float(payload["cloud_credit"]["used_dollars"])
-        return used if math.isfinite(used) and used >= 0 else None
+        return CloudCreditSnapshot(used, fetched_at) if math.isfinite(used) and used >= 0 else None
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return None
+
+
+def cloud_cost_settle_seconds() -> float:
+    raw = (os.getenv(_ENV_COST_SETTLE_SECONDS) or "").strip()
+    try:
+        value = float(raw) if raw else DEFAULT_COST_SETTLE_SECONDS
+    except ValueError:
+        value = DEFAULT_COST_SETTLE_SECONDS
+    return value if math.isfinite(value) and value >= 0 else DEFAULT_COST_SETTLE_SECONDS
+
+
+def _credit_parts(snapshot: object) -> tuple[Optional[float], Optional[float]]:
+    """Accept legacy value-only readings as unknown-date, never measurable."""
+    value = getattr(snapshot, "used_dollars", snapshot)
+    fetched_at = getattr(snapshot, "fetched_at", None)
+    if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return None, None
+    if not isinstance(fetched_at, (int, float)) or not math.isfinite(fetched_at):
+        fetched_at = None
+    return float(value), fetched_at
 
 
 def cloud_max_usd_per_day() -> Optional[float]:
@@ -190,11 +218,17 @@ def _cloud_cost_overlaps(queue: TaskQueue, task_id: str, started: float,
     return sorted(set(overlaps))
 
 
-def _cloud_cost_status(before: object, after: object, overlaps: list[str]) -> str:
+def _cloud_cost_status(before: object, after: object, overlaps: list[str], *,
+                       before_fetched_at: object, after_fetched_at: object,
+                       started: object, settle_end: float) -> str:
     if overlaps:
         return "UNKNOWN_OVERLAP"
-    if not isinstance(before, (int, float)) or not isinstance(after, (int, float)):
-        return "UNKNOWN_NO_READING"
+    if (not isinstance(before, (int, float)) or not isinstance(after, (int, float))
+            or not isinstance(started, (int, float))
+            or not isinstance(before_fetched_at, (int, float))
+            or not isinstance(after_fetched_at, (int, float))
+            or before_fetched_at > started or after_fetched_at < settle_end):
+        return "UNKNOWN_NO_FRESH_READING"
     if after < before:
         return "UNKNOWN_COUNTER_DECREASED"
     return "MEASURED"
@@ -205,19 +239,31 @@ def _record_reconciled_cloud_cost(queue: TaskQueue, task: TaskRequest) -> None:
     if context.get("cloud_cost_finalized_at"):
         return
     before = context.get("cloud_credit_used_before")
-    after = read_cloud_credit_used()
-    ended = time.time()
+    ended = context.get("cloud_ended_at") or time.time()
     started = context.get("cloud_attempt_started_at") or context.get("cloud_launched_at")
-    overlaps = (_cloud_cost_overlaps(queue, task.task_id, started, ended)
+    if not context.get("cloud_cost_pending_at"):
+        queue.record_cloud_cost(task.task_id, before, None, None, status="PENDING_SETTLE")
+        queue.patch_context(task.task_id, {"cloud_ended_at": ended,
+                                          "cloud_cost_pending_at": time.time(),
+                                          "cloud_usd": None})
+        return
+    settle_end = ended + cloud_cost_settle_seconds()
+    if time.time() < settle_end:
+        return
+    after, after_fetched_at = _credit_parts(read_cloud_credit_used())
+    overlaps = (_cloud_cost_overlaps(queue, task.task_id, started, settle_end)
                 if isinstance(started, (int, float)) else [])
-    status = _cloud_cost_status(before, after, overlaps)
+    status = _cloud_cost_status(before, after, overlaps,
+                                before_fetched_at=context.get("cloud_credit_before_fetched_at"),
+                                after_fetched_at=after_fetched_at,
+                                started=started, settle_end=settle_end)
     usd = round(after - before, 6) if status == "MEASURED" else None
     queue.record_cloud_cost(task.task_id, before, after, usd,
                             status=status, overlaps=overlaps)
     queue.patch_context(task.task_id, {"cloud_credit_used_after": after, "cloud_usd": usd,
+                                      "cloud_credit_after_fetched_at": after_fetched_at,
                                       "cloud_cost_overlaps": overlaps,
-                                      "cloud_ended_at": context.get("cloud_ended_at") or ended,
-                                      "cloud_cost_finalized_at": ended})
+                                      "cloud_cost_finalized_at": time.time()})
 
 
 def _record_shadow_review_cost(queue: TaskQueue, task_id: str) -> None:
@@ -225,24 +271,60 @@ def _record_shadow_review_cost(queue: TaskQueue, task_id: str) -> None:
     if context.get("cloud_shadow_cost_finalized_at"):
         return
     before = context.get("cloud_shadow_credit_used_before")
-    after = read_cloud_credit_used()
-    ended = time.time()
+    ended = context.get("cloud_shadow_ended_at") or time.time()
     started = (context.get("cloud_shadow_attempt_started_at")
                or context.get("cloud_shadow_launched_at"))
-    overlaps = (_cloud_cost_overlaps(queue, task_id, started, ended, shadow=True)
+    attribution_id = f"cloud-shadow:{task_id}"
+    if not context.get("cloud_shadow_cost_pending_at"):
+        shadow_status = context.get("cloud_shadow_status") or "failed"
+        queue.update_attribution_status(attribution_id, shadow_status)
+        queue.update_attribution_outcome(attribution_id, shadow_status)
+        queue.record_cloud_cost(attribution_id, before, None, None, status="PENDING_SETTLE")
+        queue.patch_context(task_id, {"cloud_shadow_ended_at": ended,
+                                      "cloud_shadow_cost_pending_at": time.time(),
+                                      "cloud_shadow_usd": None})
+        return
+    settle_end = ended + cloud_cost_settle_seconds()
+    if time.time() < settle_end:
+        return
+    after, after_fetched_at = _credit_parts(read_cloud_credit_used())
+    overlaps = (_cloud_cost_overlaps(queue, task_id, started, settle_end, shadow=True)
                 if isinstance(started, (int, float)) else [])
-    status = _cloud_cost_status(before, after, overlaps)
+    status = _cloud_cost_status(before, after, overlaps,
+                                before_fetched_at=context.get("cloud_shadow_credit_before_fetched_at"),
+                                after_fetched_at=after_fetched_at,
+                                started=started, settle_end=settle_end)
     usd = round(after - before, 6) if status == "MEASURED" else None
-    queue.record_cloud_cost(f"cloud-shadow:{task_id}", before, after, usd,
+    queue.record_cloud_cost(attribution_id, before, after, usd,
                             status=status, overlaps=overlaps)
-    shadow_status = context.get("cloud_shadow_status") or "failed"
-    queue.update_attribution_status(f"cloud-shadow:{task_id}", shadow_status)
-    queue.update_attribution_outcome(f"cloud-shadow:{task_id}", shadow_status)
     queue.patch_context(task_id, {"cloud_shadow_credit_used_after": after,
+                                  "cloud_shadow_credit_after_fetched_at": after_fetched_at,
                                   "cloud_shadow_usd": usd,
                                   "cloud_shadow_cost_overlaps": overlaps,
-                                  "cloud_shadow_ended_at": context.get("cloud_shadow_ended_at") or ended,
-                                  "cloud_shadow_cost_finalized_at": ended})
+                                  "cloud_shadow_cost_finalized_at": time.time()})
+
+
+def _reclassify_legacy_cloud_cost(queue: TaskQueue, task: TaskRequest, *,
+                                  shadow: bool = False) -> None:
+    """Older measured rows have no snapshot dates, so their USD is unproven."""
+    context = task.context if isinstance(task.context, dict) else {}
+    prefix = "cloud_shadow_" if shadow else "cloud_"
+    if (context.get(prefix + "usd") is None or
+            not context.get(prefix + "cost_finalized_at") or
+            context.get(prefix + "credit_before_fetched_at") is not None):
+        return
+    started = context.get(prefix + "attempt_started_at") or context.get(prefix + "launched_at")
+    ended = context.get(prefix + "ended_at")
+    overlaps = (_cloud_cost_overlaps(queue, task.task_id, started,
+                                     ended + cloud_cost_settle_seconds(), shadow=shadow)
+                if isinstance(started, (int, float)) and isinstance(ended, (int, float)) else [])
+    status = "UNKNOWN_OVERLAP" if overlaps else "UNKNOWN_NO_FRESH_READING"
+    attribution_id = f"cloud-shadow:{task.task_id}" if shadow else task.task_id
+    queue.record_cloud_cost(attribution_id, context.get(prefix + "credit_used_before"),
+                            context.get(prefix + "credit_used_after"), None,
+                            status=status, overlaps=overlaps)
+    queue.patch_context(task.task_id, {prefix + "usd": None,
+                                      prefix + "cost_overlaps": overlaps})
 
 
 def record_terminal_cloud_cost(queue: TaskQueue, task_id: str) -> None:
@@ -662,17 +744,22 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     gets a chance to reroute it — never a new fallback policy (acceptance
     test 8)."""
     logger.warning("claude_cloud: dispatch failed closed for %s — %s", task.task_id, reason)
-    if (task.context or {}).get("cloud_session_id") or queue.get_task_context(task.task_id).get("cloud_session_id"):
-        queue.patch_context(task.task_id, {"cloud_ended_at": time.time(),
-                                           "cloud_terminal_error": reason})
+    context = queue.get_task_context(task.task_id)
+    ended = time.time()
+    queue.patch_context(task.task_id, {"cloud_ended_at": ended,
+                                       "cloud_terminal_error": reason,
+                                       "cloud_cost_finalized_at": ended,
+                                       "cloud_usd": None})
     queue.force_fail(task.task_id, reason)
-    if queue.get_attribution(task.task_id):
-        queue.update_attribution_status(task.task_id, "failed")
-        queue.update_attribution_outcome(task.task_id, "failed")
-    try:
-        record_terminal_cloud_cost(queue, task.task_id)
-    except Exception:
-        logger.exception("claude_cloud: cost recording failed for %s", task.task_id)
+    queue.record_attribution(task_id=task.task_id, project=task.project or "",
+                             agent=CLOUD_PROVIDER_NAME,
+                             role="reviewer" if task_type == "review" else "implementer",
+                             task_type=task_type, git_branch=task.branch or "",
+                             status="failed", provider_session_id=context.get("cloud_session_id") or "",
+                             started_at=context.get("cloud_attempt_started_at") or ended)
+    queue.update_attribution_outcome(task.task_id, "failed")
+    queue.record_cloud_cost(task.task_id, context.get("cloud_credit_used_before"),
+                            None, None, status="UNKNOWN_NO_FRESH_READING", overlaps=[])
     result = TaskResult(task_id=task.task_id, status="failed", summary=reason[:2000])
     try:
         from agent_crew.pipeline import auto_fallback_failed_task
@@ -896,7 +983,7 @@ def dispatch_cloud_for_role(
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
                 prompt, cli_path=cli_path, base_ref=_detached_cloud_ref(cwd)))
-    credit_before = read_cloud_credit_used()
+    credit_before, credit_before_fetched_at = _credit_parts(read_cloud_credit_used())
     attempt_started_at = time.time()
     prev_task_id = (task.context or {}).get("prev_task_id") if isinstance(task.context, dict) else ""
     queue.record_attribution(
@@ -909,6 +996,7 @@ def dispatch_cloud_for_role(
     queue.patch_context(task.task_id, {
         "cloud_attempt_started_at": attempt_started_at,
         "cloud_credit_used_before": credit_before,
+        "cloud_credit_before_fetched_at": credit_before_fetched_at,
         "cloud_credit_used_after": None, "cloud_usd": None,
     })
 
@@ -1012,8 +1100,8 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
         return _log_shadow_skip(task, "cwd_mismatch")
     if not queue.reserve_cloud_shadow_launch(task.task_id):
         return _log_shadow_skip(task, "already_reserved")
+    credit_before, credit_before_fetched_at = _credit_parts(read_cloud_credit_used())
     attempt_started_at = time.time()
-    credit_before = read_cloud_credit_used()
     attribution_id = f"cloud-shadow:{task.task_id}"
     queue.record_attribution(
         task_id=attribution_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
@@ -1025,6 +1113,7 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
     queue.patch_context(task.task_id, {
         "cloud_shadow_attempt_started_at": attempt_started_at,
         "cloud_shadow_credit_used_before": credit_before,
+        "cloud_shadow_credit_before_fetched_at": credit_before_fetched_at,
         "cloud_shadow_credit_used_after": None, "cloud_shadow_usd": None,
     })
     try:
@@ -1065,6 +1154,10 @@ def reconcile_shadow_reviews(queue: TaskQueue, *, pr_comments_fn=None) -> None:
     comments_for_pr = pr_comments_fn or _github.pr_comments
     for task in queue.list_tasks():
         context = task.context if isinstance(task.context, dict) else {}
+        _reclassify_legacy_cloud_cost(queue, task, shadow=True)
+        if context.get("cloud_shadow_cost_pending_at") and not context.get(
+                "cloud_shadow_cost_finalized_at"):
+            _record_shadow_review_cost(queue, task.task_id)
         if not context.get("cloud_shadow_session_id"):
             continue
         result = queue.get_result(task.task_id)
@@ -1429,4 +1522,10 @@ def reconcile_all_cloud_tasks(queue: TaskQueue, *, repo: Optional[str] = None,
         if outcome.action not in ("still_dispatched", "unknown_outcome"):
             _record_reconciled_cloud_cost(queue, task)
         outcomes.append(outcome)
+    for task in queue.list_tasks():
+        context = task.context if isinstance(task.context, dict) else {}
+        _reclassify_legacy_cloud_cost(queue, task)
+        if (context.get("cloud_cost_pending_at") and not context.get("cloud_cost_finalized_at")
+                and task.status in {"completed", "failed", "cancelled", "timed_out", "needs_human"}):
+            _record_reconciled_cloud_cost(queue, task)
     return outcomes
