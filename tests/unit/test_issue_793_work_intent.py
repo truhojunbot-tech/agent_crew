@@ -3,9 +3,13 @@
 import json
 import sqlite3
 
+import pytest
+from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
+from agent_crew import cli
 from agent_crew.protocol import TaskRequest
+from agent_crew.pipeline import _carry_lineage_intent
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
@@ -62,6 +66,18 @@ def test_atomic_first_task_and_existing_bind(tmp_path):
         assert queue.get_task("review-793").context["external_operation_id"] == "directive-1"
 
 
+def test_first_task_rolls_back_when_intent_insert_fails(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TRIGGER reject_intent BEFORE INSERT ON work_intents "
+                     "BEGIN SELECT RAISE(ABORT, 'intent insert refused'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        queue.admit_work_intent(_intent(task=_task()))
+    assert queue.get_task("impl-793") is None
+    assert queue.get_work_intent("directive-1") is None
+
+
 def test_block_and_terminal_decisions_are_structured(tmp_path):
     with TestClient(_app(tmp_path / "tasks.db", [])) as client:
         client.post("/work-intents/admit", json=_intent())
@@ -75,6 +91,11 @@ def test_block_and_terminal_decisions_are_structured(tmp_path):
                                json={"reason": "duplicate", "authority": "owner"}).json()
         assert rejected["state"] == "REJECTED"
         assert rejected["decision_reason"] == "duplicate"
+        assert rejected["decision_authority"] == "owner"
+        client.post("/work-intents/admit", json=_intent("directive-2"))
+        superseded = client.post("/work-intents/directive-2/supersede",
+                                 json={"reason": "replaced", "authority": "owner"}).json()
+        assert superseded["state"] == "SUPERSEDED"
 
 
 def test_unbound_slo_notices_once_then_escalates_and_survives_restart(tmp_path):
@@ -93,6 +114,7 @@ def test_unbound_slo_notices_once_then_escalates_and_survives_restart(tmp_path):
         assert len(notices) == 1
         assert client.get("/work-intents", params={"state": "EXECUTION_STALLED"}).json()[0]["escalated"]
         assert client.get("/health").json()["work_intents"]["EXECUTION_STALLED"] == 1
+        assert client.get("/health").json()["work_intents"]["EXECUTION_STALLED_ESCALATED"] == 1
     with TestClient(_app(db, notices)) as client:
         assert client.get("/work-intents/directive-1").json()["escalated"]
         client.app.state.watchdog_tick(stalled["next_check_at"] + 2)
@@ -123,3 +145,29 @@ def test_blocked_does_not_notify_before_check_and_successor_lineage(tmp_path):
             "owner": "coordinator", "next_check_at": row["received_at"] + 100})
         client.app.state.watchdog_tick(row["received_at"] + 50)
         assert notices == []
+        client.app.state.watchdog_tick(row["received_at"] + 101)
+        assert len(notices) == 1 and "work_intent_blocked_due" in notices[0]
+
+
+def test_pipeline_carries_operation_id_across_all_successor_roles():
+    parent = TaskRequest(**_task())
+    parent.context["external_operation_id"] = "directive-1"
+    for role in ("implementer", "reviewer", "tester"):
+        context = {"prev_task_id": parent.task_id}
+        _carry_lineage_intent(context, parent, role)
+        assert context["external_operation_id"] == "directive-1"
+
+
+def test_intent_cli_routes_to_project_server(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cli, "_read_state", lambda base, project: {"port": 8105})
+    monkeypatch.setattr(cli, "_intent_http", lambda *args: calls.append(args) or {"state": "BOUND"})
+    runner = CliRunner()
+    response = runner.invoke(cli.crew, ["intent", "--project", "agent_crew",
+                                        "admit", json.dumps(_intent())])
+    assert response.exit_code == 0, response.output
+    assert calls[-1] == ("agent_crew", 8105, "admit", _intent())
+    response = runner.invoke(cli.crew, ["intent", "--project", "agent_crew",
+                                        "bind", "directive-1", "impl-793"])
+    assert response.exit_code == 0, response.output
+    assert calls[-1] == ("agent_crew", 8105, "directive-1/bind", {"task_id": "impl-793"})

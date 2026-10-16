@@ -79,6 +79,7 @@ from agent_crew.protocol import (
 )
 from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, DuplicateReviewError,
                               DuplicateReviewResult, InvalidReviewResult, InvalidRiskTierError,
+                              PausedError,
                               LateResultRejected,
                               TaskAlreadyExistsError,
                               TaskQueue, QUEUE_SCHEMA_VERSION, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
@@ -3727,15 +3728,17 @@ def create_app(
         claimed = False
         try:
             task = q().get_task(task_id)
-            if task is None or not q().claim_coordinator_notice(task_id, kind):
+            intent = (q().get_work_intent(task_id[len("work-intent:"):])
+                      if task is None and task_id.startswith("work-intent:") else None)
+            if (task is None and intent is None) or not q().claim_coordinator_notice(task_id, kind):
                 return
             claimed = True
-            ctx = task.context if isinstance(task.context, dict) else {}
+            ctx = task.context if task is not None and isinstance(task.context, dict) else {}
             # Pane output can contain private task text and is unbounded. Keep
             # the notice actionable without forwarding captured pane content.
             safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
             message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
-                       f"branch={task.branch} repo={ctx.get('repo') or ''} "
+                       f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
                        f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
             if coordinator_notify_fn is not None:
                 delivered = bool(coordinator_notify_fn(message))
@@ -4636,6 +4639,12 @@ def create_app(
         - ``recovered`` — unstarted dispatcher claims returned to pending
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        try:
+            for op_id, kind in q().advance_work_intents(now):
+                _coordinator_notice("work-intent:" + op_id, kind,
+                                    "work intent requires coordinator action")
+        except Exception:
+            logger.exception("watchdog: work intent liveness failed")
         try:
             for notice_task_id, notice_kind in q().retryable_coordinator_notices():
                 _coordinator_notice(notice_task_id, notice_kind, "delivery retry")
@@ -7783,6 +7792,7 @@ def create_app(
         return {
             "status": "ok",
             "schema_version": QUEUE_SCHEMA_VERSION,
+            "work_intents": q().work_intent_counts(),
             "project": ident["project"],
             "identity": ident,
             "stop": _stop_out,
@@ -7879,6 +7889,124 @@ def create_app(
         logger.info(f"pane_map reloaded: {pane_map}")
         return {"status": "ok", "pane_map": pane_map}
 
+    def _validate_task_admission_request(task: TaskRequest) -> None:
+        """Apply the public /tasks guard to an atomically admitted first task."""
+        def _agent_can_receive(agent: object) -> bool:
+            return (isinstance(agent, str) and
+                    (agent in _DISPATCH_ROLE_TO_AGENT.values() or
+                     (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
+
+        ctx = task.context if isinstance(task.context, dict) else {}
+        for field in ("agent_override", "implementer_agent", "reviewer_agent"):
+            choice = ctx.get(field)
+            if choice is not None and not _agent_can_receive(choice):
+                raise HTTPException(status_code=422, detail=(
+                    f"{field} {choice!r} has no claimable role on this server; "
+                    f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
+        if (ctx.get("implementer_agent") and ctx.get("reviewer_agent")
+                and ctx["implementer_agent"] == ctx["reviewer_agent"]):
+            raise HTTPException(status_code=422, detail=(
+                "independent reviewer must differ from implementer; "
+                f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
+        try:
+            validate_http_root_risk(ctx)
+        except InvalidRiskTierError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/work-intents/admit", status_code=201)
+    def admit_work_intent(body: dict,
+                          x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
+        required = ("external_operation_id", "project", "repo", "issue", "coordinator_identity",
+                    "coordinator_session", "priority", "risk_tier", "execution_slo_s")
+        if any(body.get(key) in (None, "") for key in required):
+            raise HTTPException(status_code=422, detail=f"required: {', '.join(required)}")
+        if body["project"] != _server_identity()["project"]:
+            raise HTTPException(status_code=422, detail="work intent project differs from server")
+        try:
+            if (isinstance(body["risk_tier"], bool)
+                    or not isinstance(body["risk_tier"], int)
+                    or not 0 <= body["risk_tier"] <= 3
+                    or isinstance(body["priority"], bool)
+                    or not isinstance(body["priority"], int)
+                    or isinstance(body["issue"], bool)
+                    or not isinstance(body["issue"], int)
+                    or body["issue"] <= 0
+                    or not isinstance(body["execution_slo_s"], (int, float))
+                    or not math.isfinite(body["execution_slo_s"])
+                    or body["execution_slo_s"] <= 0):
+                raise ValueError("invalid issue, priority, risk_tier or execution_slo_s")
+            if any(not isinstance(body[key], str) or not body[key].strip()
+                   for key in ("external_operation_id", "project", "repo",
+                               "coordinator_identity", "coordinator_session")):
+                raise ValueError("work intent identity fields must be nonempty text")
+            if body.get("task") is not None:
+                task = TaskRequest(**body["task"])
+                _validate_task_admission_request(task)
+            return q().admit_work_intent(body)
+        except TaskAlreadyExistsError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except DuplicateReviewError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except PausedError as exc:
+            raise HTTPException(status_code=423, detail=str(exc)) from exc
+        except (ValueError, TypeError, KeyError) as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.get("/work-intents")
+    def list_work_intents(state: Optional[str] = None,
+                          x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
+        return q().list_work_intents(state)
+
+    @app.get("/work-intents/{op_id}")
+    def get_work_intent(op_id: str,
+                        x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
+        result = q().get_work_intent(op_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="work intent not found")
+        return result
+
+    @app.post("/work-intents/{op_id}/bind")
+    def bind_work_intent(op_id: str, body: dict,
+                         x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
+        if not isinstance(body.get("task_id"), str) or not body["task_id"]:
+            raise HTTPException(status_code=422, detail="task_id required")
+        try:
+            return q().bind_work_intent(op_id, body["task_id"])
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/work-intents/{op_id}/block")
+    def block_work_intent(op_id: str, body: dict,
+                          x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
+        try:
+            return q().decide_work_intent(op_id, "BLOCKED", blocker=body)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    @app.post("/work-intents/{op_id}/supersede")
+    @app.post("/work-intents/{op_id}/reject")
+    def close_work_intent(op_id: str, body: dict, request: Request,
+                          x_agent_crew_project: Optional[str] = Header(default=None)):
+        _require_project_identity(x_agent_crew_project)
+        decision = "SUPERSEDED" if request.url.path.endswith("/supersede") else "REJECTED"
+        try:
+            return q().decide_work_intent(op_id, decision,
+                                          reason=body.get("reason") or "",
+                                          authority=body.get("authority") or "")
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     @app.post("/tasks", status_code=201)
     def post_task(task: TaskRequest,
                   x_agent_crew_project: Optional[str] = Header(default=None)):
@@ -7915,32 +8043,9 @@ def create_app(
         on is worse than a stated gap.
         """
         _require_project_identity(x_agent_crew_project)
-        def _agent_can_receive(agent: object) -> bool:
-            return (isinstance(agent, str) and
-                    (agent in _DISPATCH_ROLE_TO_AGENT.values() or
-                     (not _dispatcher_enabled and bool(pane_map and pane_map.get(agent)))))
-
-        override = (task.context or {}).get("agent_override") if isinstance(task.context, dict) else None
-        if override is not None:
-            if not _agent_can_receive(override):
-                raise HTTPException(status_code=422, detail=(
-                    f"agent_override {override!r} has no claimable role on this server; "
-                    f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
-        ctx = task.context if isinstance(task.context, dict) else {}
-        for field in ("implementer_agent", "reviewer_agent"):
-            choice = ctx.get(field)
-            if choice is not None and not _agent_can_receive(choice):
-                raise HTTPException(status_code=422, detail=(
-                    f"{field} {choice!r} has no claimable role on this server; "
-                    f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
-        if (ctx.get("implementer_agent") and ctx.get("reviewer_agent")
-                and ctx["implementer_agent"] == ctx["reviewer_agent"]):
-            raise HTTPException(status_code=422, detail=(
-                "independent reviewer must differ from implementer; "
-                f"role map: {_DISPATCH_ROLE_TO_AGENT}"))
+        _validate_task_admission_request(task)
         logger.info(f"POST /tasks: task_type={task.task_type}, task_id (will assign)...")
         try:
-            validate_http_root_risk(task.context)
             task_id = q().enqueue(task, ingress="http.tasks")
         except InvalidRiskTierError as e:
             raise HTTPException(status_code=422, detail=str(e))

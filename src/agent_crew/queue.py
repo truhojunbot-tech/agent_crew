@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 3
+QUEUE_SCHEMA_VERSION = 4
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -1279,6 +1279,29 @@ CREATE TABLE IF NOT EXISTS external_op (
     done_at       REAL
 )
 """
+_DDL_WORK_INTENTS = """
+CREATE TABLE IF NOT EXISTS work_intents (
+    external_operation_id TEXT PRIMARY KEY,
+    project TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    issue INTEGER,
+    received_at REAL NOT NULL,
+    admitted_at REAL NOT NULL,
+    task_ids TEXT NOT NULL DEFAULT '[]',
+    coordinator_identity TEXT NOT NULL,
+    coordinator_session TEXT NOT NULL,
+    priority INTEGER NOT NULL,
+    risk_tier INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    blocker TEXT,
+    decision_reason TEXT,
+    decision_authority TEXT,
+    last_progress_at REAL NOT NULL,
+    execution_slo_s REAL NOT NULL,
+    next_check_at REAL,
+    escalated_at REAL
+)
+"""
 _DDL_MIGRATE_EXTERNAL_OP_ADMITTED = "ALTER TABLE external_op ADD COLUMN admitted_epoch INTEGER"
 
 # Performance indexes for common queries
@@ -1516,6 +1539,7 @@ class TaskQueue:
         _cea_ensure_schema(conn)
         conn.execute(_DDL_CASCADE_OUTBOX)
         conn.execute(_DDL_EXTERNAL_OP)
+        conn.execute(_DDL_WORK_INTENTS)
         try:
             conn.execute(_DDL_MIGRATE_EXTERNAL_OP_ADMITTED)
         except Exception:
@@ -2842,7 +2866,8 @@ class TaskQueue:
     def enqueue_with_receipt(self, task: TaskRequest, receipt: dict, *,
                              context: Optional[dict] = None,
                              _capacity_predecessor: str = "",
-                             _successor_provenance: object | None = None) -> str:
+                             _successor_provenance: object | None = None,
+                             _work_intent: Optional[dict] = None) -> str:
         """Write the task row for an admitted intent. **The only writer there is.**
 
         P2: "without a valid receipt there is no enqueue". That is a property of
@@ -3020,6 +3045,12 @@ class TaskQueue:
                     receipt_id,
                 ),
             )
+            if _work_intent is not None:
+                self._insert_work_intent_on(conn, _work_intent, task.task_id, admit_at,
+                                            blocked=bool(owner_conflict))
+            elif isinstance(context.get("external_operation_id"), str) and context["external_operation_id"]:
+                self._bind_work_intent_on(conn, context["external_operation_id"],
+                                          task.task_id, admit_at, project=task.project)
             if missing_root_risk:
                 self._append_exec_event_on(conn, task.task_id, "missing_risk_metadata",
                                            admit_at)
@@ -3605,9 +3636,236 @@ class TaskQueue:
             (json.dumps(context), survivor_id),
         )
 
+    @staticmethod
+    def _insert_work_intent_on(conn, intent: dict, task_id: Optional[str], now: float, *,
+                               blocked: bool = False) -> None:
+        op_id = intent["external_operation_id"]
+        slo = float(intent["execution_slo_s"])
+        blocker = ({"blocker_type": "human_gate", "reason": "owner approval required",
+                    "unblock_action": "approve the task admission gate",
+                    "owner": intent["coordinator_identity"], "next_check_at": now + slo}
+                   if blocked else None)
+        conn.execute(
+            "INSERT INTO work_intents (external_operation_id, project, repo, issue, "
+            "received_at, admitted_at, task_ids, coordinator_identity, "
+            "coordinator_session, priority, risk_tier, state, blocker, last_progress_at, "
+            "execution_slo_s, next_check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (op_id, intent["project"], intent["repo"], intent.get("issue"), now, now,
+             json.dumps([task_id] if task_id else []), intent["coordinator_identity"],
+             intent["coordinator_session"], int(intent["priority"]),
+             int(intent["risk_tier"]), "BLOCKED" if blocked else "BOUND" if task_id else "ADMITTED",
+             json.dumps(blocker) if blocker else None, now,
+             slo, now + slo if blocked or not task_id else None))
+
+    @staticmethod
+    def _bind_work_intent_on(conn, op_id: str, task_id: str, now: float, *,
+                             project: Optional[str] = None) -> None:
+        row = conn.execute("SELECT task_ids, state, project FROM work_intents WHERE external_operation_id=?",
+                           (op_id,)).fetchone()
+        if row is None:
+            raise ValueError("work intent does not exist")
+        if project is not None and row["project"] != project:
+            raise ValueError("task project differs from work intent")
+        if row["state"] in ("REJECTED", "SUPERSEDED"):
+            raise ValueError("work intent is terminal")
+        ids = json.loads(row["task_ids"])
+        if task_id not in ids:
+            ids.append(task_id)
+        conn.execute("UPDATE work_intents SET task_ids=?, state='BOUND', blocker=NULL, "
+                     "last_progress_at=?, next_check_at=NULL WHERE external_operation_id=?",
+                     (json.dumps(ids), now, op_id))
+
+    def admit_work_intent(self, intent: dict) -> dict:
+        """Deduplicate an external operation; optional first task shares enqueue's txn."""
+        op_id = intent["external_operation_id"]
+        existing = self.get_work_intent(op_id)
+        if existing is not None:
+            return existing
+        task_data = intent.get("task")
+        if task_data is not None:
+            task = TaskRequest(**task_data)
+            ctx = task.context if isinstance(task.context, dict) else {}
+            for key, expected in (("issue", intent["issue"]), ("risk_tier", intent["risk_tier"]),
+                                  ("repo", intent["repo"])):
+                if key in ctx and ctx[key] != expected:
+                    raise ValueError(f"task {key} differs from work intent")
+            task.context = {**ctx, "issue": intent["issue"], "risk_tier": intent["risk_tier"],
+                            "repo": intent["repo"], "external_operation_id": op_id}
+            task.priority = int(intent["priority"])
+            if task.project != intent["project"]:
+                raise ValueError("task project differs from work intent")
+            try:
+                self.enqueue(task, ingress="http.tasks", _work_intent=intent)
+            except sqlite3.IntegrityError:
+                existing = self.get_work_intent(op_id)
+                if existing is None:
+                    raise
+                return existing
+        else:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                self._insert_work_intent_on(conn, intent, None, time.time())
+                conn.commit()
+            except sqlite3.IntegrityError:
+                conn.rollback()
+            finally:
+                conn.close()
+        return self.get_work_intent(op_id)
+
+    def get_work_intent(self, op_id: str) -> Optional[dict]:
+        conn = self._connect()
+        try:
+            row = conn.execute("SELECT * FROM work_intents WHERE external_operation_id=?",
+                               (op_id,)).fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            result["task_ids"] = json.loads(result["task_ids"])
+            result["blocker"] = json.loads(result["blocker"]) if result["blocker"] else None
+            result["escalated"] = result["escalated_at"] is not None
+            return result
+        finally:
+            conn.close()
+
+    def list_work_intents(self, state: Optional[str] = None) -> list[dict]:
+        conn = self._connect()
+        try:
+            ids = [r[0] for r in conn.execute(
+                "SELECT external_operation_id FROM work_intents WHERE (? IS NULL OR state=?) "
+                "ORDER BY received_at, external_operation_id", (state, state)).fetchall()]
+        finally:
+            conn.close()
+        return [self.get_work_intent(op_id) for op_id in ids]
+
+    def work_intent_counts(self) -> dict[str, int]:
+        conn = self._connect()
+        try:
+            counts = {r[0]: r[1] for r in conn.execute(
+                "SELECT state, COUNT(*) FROM work_intents GROUP BY state").fetchall()}
+            counts["EXECUTION_STALLED_ESCALATED"] = conn.execute(
+                "SELECT COUNT(*) FROM work_intents WHERE state='EXECUTION_STALLED' "
+                "AND escalated_at IS NOT NULL").fetchone()[0]
+            return counts
+        finally:
+            conn.close()
+
+    def bind_work_intent(self, op_id: str, task_id: str) -> dict:
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            task = conn.execute("SELECT context, project FROM tasks WHERE task_id=?",
+                                (task_id,)).fetchone()
+            intent = conn.execute("SELECT project, repo, issue, risk_tier FROM work_intents WHERE external_operation_id=?",
+                                  (op_id,)).fetchone()
+            if task is None or intent is None:
+                raise KeyError("task or work intent not found")
+            if task["project"] != intent["project"]:
+                raise ValueError("task project differs from work intent")
+            context = json.loads(task["context"] or "{}")
+            if context.get("external_operation_id") not in (None, op_id):
+                raise ValueError("task already bound to another work intent")
+            for key in ("repo", "issue", "risk_tier"):
+                if key in context and context[key] != intent[key]:
+                    raise ValueError(f"task {key} differs from work intent")
+                context[key] = intent[key]
+            context["external_operation_id"] = op_id
+            conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                         (json.dumps(context), task_id))
+            self._bind_work_intent_on(conn, op_id, task_id, time.time(),
+                                      project=task["project"])
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return self.get_work_intent(op_id)
+
+    def decide_work_intent(self, op_id: str, state: str, *, blocker: Optional[dict] = None,
+                           reason: str = "", authority: str = "") -> dict:
+        if state not in ("BLOCKED", "SUPERSEDED", "REJECTED"):
+            raise ValueError("invalid work intent decision")
+        if state == "BLOCKED":
+            required = ("blocker_type", "reason", "unblock_action", "owner", "next_check_at")
+            if not isinstance(blocker, dict) or any(blocker.get(k) in (None, "") for k in required):
+                raise ValueError("blocker_type, reason, unblock_action, owner, next_check_at required")
+            if (any(not isinstance(blocker[k], str) or not blocker[k].strip()
+                    for k in required[:-1])
+                    or isinstance(blocker["next_check_at"], bool)
+                    or not isinstance(blocker["next_check_at"], (int, float))
+                    or not math.isfinite(blocker["next_check_at"])):
+                raise ValueError("blocker fields must have text and a finite next_check_at")
+        elif not reason or not authority:
+            raise ValueError("reason and authority required")
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT state FROM work_intents WHERE external_operation_id=?",
+                               (op_id,)).fetchone()
+            if row is None:
+                raise KeyError(op_id)
+            if row["state"] in ("REJECTED", "SUPERSEDED") and row["state"] != state:
+                raise ValueError("work intent already terminal")
+            conn.execute("UPDATE work_intents SET state=?, blocker=?, decision_reason=?, "
+                         "decision_authority=?, next_check_at=?, last_progress_at=? "
+                         "WHERE external_operation_id=?",
+                         (state, json.dumps(blocker) if blocker else None, reason or None,
+                          authority or None, blocker["next_check_at"] if blocker else None,
+                          time.time(), op_id))
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return self.get_work_intent(op_id)
+
+    def advance_work_intents(self, now: float) -> list[tuple[str, str]]:
+        """Watch admitted operations with no task, using the existing watchdog tick."""
+        notices = []
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute("SELECT external_operation_id, state, next_check_at, "
+                                "execution_slo_s, escalated_at FROM work_intents "
+                                "WHERE state IN ('ADMITTED', 'EXECUTION_STALLED', 'BLOCKED')").fetchall()
+            for row in rows:
+                op_id = row["external_operation_id"]
+                # Re-enter the durable notice claim after a crash between the
+                # ADMITTED -> STALLED commit and notification delivery.
+                if row["state"] == "EXECUTION_STALLED":
+                    notices.append((op_id, "work_intent_stalled"))
+                if row["next_check_at"] is None or now < row["next_check_at"]:
+                    continue
+                if row["state"] == "ADMITTED":
+                    conn.execute("UPDATE work_intents SET state='EXECUTION_STALLED', "
+                                 "last_progress_at=?, next_check_at=? WHERE external_operation_id=?",
+                                 (now, now + row["execution_slo_s"], op_id))
+                    notices.append((op_id, "work_intent_stalled"))
+                elif row["state"] == "BLOCKED":
+                    conn.execute("UPDATE work_intents SET next_check_at=NULL "
+                                 "WHERE external_operation_id=?", (op_id,))
+                    notices.append((op_id, "work_intent_blocked_due:" +
+                                    str(row["next_check_at"])))
+                elif row["escalated_at"] is None:
+                    conn.execute("UPDATE work_intents SET escalated_at=?, next_check_at=NULL "
+                                 "WHERE external_operation_id=?", (now, op_id))
+                    self._append_exec_event_on(conn, "work-intent:" + op_id,
+                                               "work_intent_escalated", now,
+                                               external_operation_id=op_id)
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+        return notices
+
     def enqueue(self, task: TaskRequest, *, ingress: Optional[str] = None,
                 provenance: Optional["_CeaProvenance"] = None,
-                _successor_provenance: object | None = None) -> str:
+                _successor_provenance: object | None = None,
+                _work_intent: Optional[dict] = None) -> str:
         """Admit a task and write its row — the one path every §7 adapter takes.
 
         ``ingress`` names the adapter from
@@ -3705,7 +3963,8 @@ class TaskQueue:
             admitted_id = self.enqueue_with_receipt(
                 task, auth.receipt, context=context,
                 _capacity_predecessor=capacity_predecessor,
-                _successor_provenance=_successor_provenance)
+                _successor_provenance=_successor_provenance,
+                _work_intent=_work_intent)
             # The promotion denominator is natural, admitted project ingress.
             # Cascades/retries, lineage children, and even shadow-admitted
             # project refusals must not count toward that floor.

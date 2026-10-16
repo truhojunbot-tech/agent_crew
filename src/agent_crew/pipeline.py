@@ -76,7 +76,7 @@ _LINEAGE_INTENT_FIELDS = (
     "repo", "issue", "issue_number", "issue_title", "issue_body", "issue_url",
     "base_branch", "coordinator_managed", "coordinator_generation",
     "implementer_agent", "reviewer_agent", "no_tester", "risk_tier",
-    "lineage_root_task_id",
+    "lineage_root_task_id", "external_operation_id",
 )
 
 
