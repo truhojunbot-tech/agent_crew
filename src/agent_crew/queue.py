@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 2
+QUEUE_SCHEMA_VERSION = 3
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -926,6 +926,10 @@ _DDL_MIGRATE_ATTR_CLOUD_CREDIT_AFTER = (
     "ALTER TABLE task_attribution ADD COLUMN cloud_credit_used_after REAL DEFAULT NULL")
 _DDL_MIGRATE_ATTR_CLOUD_USD = (
     "ALTER TABLE task_attribution ADD COLUMN cloud_usd REAL DEFAULT NULL")
+_DDL_MIGRATE_ATTR_CLOUD_COST_STATUS = (
+    "ALTER TABLE task_attribution ADD COLUMN cloud_cost_status TEXT DEFAULT NULL")
+_DDL_MIGRATE_ATTR_CLOUD_COST_OVERLAPS = (
+    "ALTER TABLE task_attribution ADD COLUMN cloud_cost_overlaps TEXT DEFAULT NULL")
 
 _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_SCHEMA_VERSION,
@@ -971,6 +975,8 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_CLOUD_CREDIT_BEFORE,
     _DDL_MIGRATE_ATTR_CLOUD_CREDIT_AFTER,
     _DDL_MIGRATE_ATTR_CLOUD_USD,
+    _DDL_MIGRATE_ATTR_CLOUD_COST_STATUS,
+    _DDL_MIGRATE_ATTR_CLOUD_COST_OVERLAPS,
 )
 
 _DDL_CHECKPOINTS = """
@@ -6491,13 +6497,18 @@ class TaskQueue:
             conn.close()
 
     def record_cloud_cost(self, task_id: str, before: Optional[float],
-                          after: Optional[float], usd: Optional[float]) -> None:
+                          after: Optional[float], usd: Optional[float],
+                          *, status: Optional[str] = None,
+                          overlaps: Optional[list[str]] = None) -> None:
         conn = self._connect()
         try:
             conn.execute(
                 "UPDATE task_attribution SET cloud_credit_used_before=?, "
-                "cloud_credit_used_after=?, cloud_usd=?, updated_at=? WHERE task_id=?",
-                (before, after, usd, time.time(), task_id),
+                "cloud_credit_used_after=?, cloud_usd=?, cloud_cost_status=?, "
+                "cloud_cost_overlaps=?, updated_at=? WHERE task_id=?",
+                (before, after, usd, status,
+                 json.dumps(overlaps) if overlaps is not None else None,
+                 time.time(), task_id),
             )
             conn.commit()
         finally:
