@@ -62,6 +62,16 @@ def test_no_retry_terminal_failure_notifies_once(tmp_path, monkeypatch):
     assert "agent stopped" in notices[0]
 
 
+def test_notice_does_not_depend_on_coordinator_provenance(tmp_path, monkeypatch):
+    app, queue, notices = _harness(tmp_path, monkeypatch, retry_attempt=2)
+    queue.patch_context("root-801", {"coordinator_managed": False})
+    with TestClient(app) as client:
+        response = _fail(client, summary="provider exit_1")
+        assert response.status_code == 200, response.text
+    assert len(notices) == 1
+    assert "failed_no_successor" in notices[0]
+
+
 def test_distinct_terminal_tasks_in_one_lineage_each_notify_once(tmp_path, monkeypatch):
     app, queue, notices = _harness(tmp_path, monkeypatch, retry_attempt=2)
     with TestClient(app) as client:
