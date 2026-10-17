@@ -108,16 +108,34 @@ def resolve_test_config(state: Optional[Mapping], checkout: str) -> tuple[Option
 
 
 def parse_test_output(text: str) -> tuple[dict, list]:
-    """Pytest summary counts and failing node ids (``FAILED``/``ERROR`` lines)."""
+    """Pytest summary counts and failing parent node ids."""
     ids = []
     for line in (text or "").splitlines():
         match = _ID_RE.match(line)
-        if not match:
+        if match:
+            entry = match.group(1)
+        elif line.startswith(("SUBFAILED(", "SUBFAILED[")):
+            # Pytest subtests put their case detail before the parent node ID.
+            # Find the matching delimiter: detail can contain nested delimiters
+            # and the same " - " separator used before a failure reason.
+            opener = line[len("SUBFAILED")]
+            closer = ")" if opener == "(" else "]"
+            depth = 1
+            end = len("SUBFAILED") + 1
+            while end < len(line) and depth:
+                if line[end] == opener:
+                    depth += 1
+                elif line[end] == closer:
+                    depth -= 1
+                end += 1
+            if depth or not line.startswith(" ", end):
+                continue
+            entry = line[end + 1:]
+        else:
             continue
         # The pytest summary separates a node id from its reason with " - ".
         # A parametrized id can contain both spaces and that separator inside
         # brackets, so split only after the closing bracket.
-        entry = match.group(1)
         depth = 0
         for index, char in enumerate(entry):
             if char == "[":
