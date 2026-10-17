@@ -98,6 +98,38 @@ def test_decision_present_at_first_sweep_after_deadline_is_recorded(tmp_path, mo
     assert queue.get_tokenomics_shadow_receipt("test-late-sweep")["shadow_decision_source"] == "quota_core_contract"
 
 
+def test_unavailable_contract_does_not_finalize_absence(tmp_path, monkeypatch):
+    policy = tmp_path / "missing-policy.json"
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("test-unavailable", "test", "run suite", branch="agent/e3"))
+    with sqlite3.connect(queue._db_path) as conn:
+        conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
+                     (time.time() - 7 * 3600, "test-unavailable"))
+    assert queue.reresolve_tokenomics_shadow_receipts() == 0
+    assert queue.get_tokenomics_shadow_receipt("test-unavailable")["shadow_reason"] != "UNKNOWN_NOT_IN_CONTRACT"
+    _emit(policy, [{"task_id": "test-unavailable"}])
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    assert queue.get_tokenomics_shadow_receipt("test-unavailable")["shadow_decision_source"] == "quota_core_contract"
+
+
+def test_unsupported_contract_does_not_finalize_absence(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    policy.write_text(json.dumps({"contract_version": "unsupported", "mode": "shadow",
+                                  "decisions": []}))
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("test-unsupported", "test", "run suite", branch="agent/e3"))
+    with sqlite3.connect(queue._db_path) as conn:
+        conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
+                     (time.time() - 7 * 3600, "test-unsupported"))
+    queue.reresolve_tokenomics_shadow_receipts()
+    assert queue.get_tokenomics_shadow_receipt("test-unsupported")["shadow_reason"] != "UNKNOWN_NOT_IN_CONTRACT"
+    _emit(policy, [{"task_id": "test-unsupported"}])
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    assert queue.get_tokenomics_shadow_receipt("test-unsupported")["shadow_decision_source"] == "quota_core_contract"
+
+
 def test_successor_cites_nearest_predecessor_without_changing_execution(tmp_path, monkeypatch):
     policy = tmp_path / "policy.json"
     _emit(policy, [{"task_id": "impl-e3", "recommended_max_review_fix_rounds": 1}])

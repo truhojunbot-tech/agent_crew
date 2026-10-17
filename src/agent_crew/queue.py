@@ -5296,7 +5296,7 @@ class TaskQueue:
                 return
             if (now - receipt["created_at"] >= TOKENOMICS_SHADOW_SETTLE_SECONDS
                     and receipt["shadow_decision_source"] in (None, "baseline")
-                    and shadow.get("decision_source") != "quota_core_contract"):
+                    and shadow.get("reason") == "task_decision_unavailable"):
                 conn.execute(
                     """UPDATE tokenomics_shadow_receipts
                        SET shadow_decision_source='baseline', shadow_reason='UNKNOWN_NOT_IN_CONTRACT',
@@ -5333,7 +5333,9 @@ class TaskQueue:
         if limit < 1:
             raise ValueError("limit must be positive")
         now = time.time()
-        contract_sha = shadow_recommendation_for_task_id("").get("contract_sha") or ""
+        contract_sha = shadow_recommendation_for_task_id("").get("contract_sha")
+        if contract_sha is None:
+            return 0
         conn = self._connect()
         try:
             rows = conn.execute(
