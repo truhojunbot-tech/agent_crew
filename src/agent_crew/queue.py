@@ -662,6 +662,10 @@ CREATE TABLE IF NOT EXISTS tokenomics_shadow_receipts (
 )
 """
 
+# #342 E3: a quota-core task decision can appear after admission.
+TOKENOMICS_SHADOW_SETTLE_SECONDS = 6 * 3600
+TOKENOMICS_SHADOW_SWEEP_LIMIT = 64
+
 _DDL_MIGRATE_SHADOW_COLUMNS = (
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_decision_source TEXT",
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_policy_version TEXT",
@@ -3134,6 +3138,15 @@ class TaskQueue:
                 conn.close()
         except Exception:
             logger.exception("tokenomics shadow receipt failed after enqueue for %s", task.task_id)
+        # Successors may cite an already-published predecessor decision before
+        # their own task ID appears in the contract. Admission fields above
+        # remain the immutable observation made for this task ID.
+        if isinstance(context.get("prev_task_id"), str):
+            try:
+                if self._cited_shadow_decision(task.task_id) is not None:
+                    self._refresh_shadow_after_commit(task.task_id)
+            except Exception:
+                logger.exception("tokenomics successor shadow refresh failed for %s", task.task_id)
         if owner_conflict:
             try:
                 self._request_owner_approval(task, receipt, context=context)
@@ -5215,7 +5228,40 @@ class TaskQueue:
         finally:
             conn.close()
 
-    def _refresh_shadow_after_commit(self, task_id: str, outcome: Optional[str] = None) -> None:
+    def _cited_shadow_decision(self, task_id: str) -> Optional[tuple[dict, str]]:
+        """Walk prev_task_id toward the root, citing the nearest decision."""
+        task = self.get_task(task_id)
+        seen = {task_id}
+        while task is not None:
+            context = task.context if isinstance(task.context, dict) else {}
+            parent_id = context.get("prev_task_id")
+            if not isinstance(parent_id, str) or not parent_id or parent_id in seen:
+                break
+            seen.add(parent_id)
+            task = self.get_task(parent_id)
+            if task is None:
+                break
+            shadow = shadow_recommendation_for_task_id(parent_id)
+            if shadow.get("decision_source") == "quota_core_contract":
+                return shadow, parent_id
+            receipt = self.get_tokenomics_shadow_receipt(parent_id)
+            if receipt and receipt.get("shadow_decision_source") == "quota_core_contract":
+                try:
+                    stored = json.loads(receipt.get("shadow_recommendation_json") or "null")
+                except (TypeError, ValueError):
+                    stored = None
+                if (isinstance(stored, dict) and not stored.get("cited_task_id")
+                        and isinstance(stored.get("recommendation"), dict)):
+                    return ({"decision_source": "quota_core_contract",
+                             "policy_version": receipt.get("shadow_policy_version"),
+                             "recommendation": stored["recommendation"],
+                             "produced_at": stored.get("produced_at"),
+                             "contract_sha": receipt.get("shadow_contract_sha"),
+                             "reason": "shadow_only"}, parent_id)
+        return None
+
+    def _refresh_shadow_after_commit(self, task_id: str, outcome: Optional[str] = None,
+                                     *, only_baseline: bool = False) -> None:
         """Best-effort completion-time policy observation (#342 Option A).
 
         This deliberately opens a new transaction after result/telemetry has
@@ -5224,6 +5270,11 @@ class TaskQueue:
         rather than laundering the immutable admission-time receipt.
         """
         shadow = shadow_recommendation_for_task_id(task_id)
+        cited_task_id = None
+        if shadow.get("decision_source") != "quota_core_contract":
+            citation = self._cited_shadow_decision(task_id)
+            if citation is not None:
+                shadow, cited_task_id = citation
         produced_at = shadow.get("produced_at")
         if produced_at is None and shadow.get("contract_mtime") is not None:
             try:
@@ -5236,6 +5287,23 @@ class TaskQueue:
         try:
             conn.execute("BEGIN IMMEDIATE")
             self._refresh_shadow_economics(conn, task_id, now, outcome)
+            receipt = conn.execute(
+                "SELECT created_at, shadow_decision_source, shadow_reason "
+                "FROM tokenomics_shadow_receipts WHERE task_id=?", (task_id,)).fetchone()
+            if receipt is None or receipt["shadow_reason"] == "UNKNOWN_NOT_IN_CONTRACT" or (
+                    only_baseline and receipt["shadow_decision_source"] not in (None, "baseline")):
+                conn.commit()
+                return
+            if (now - receipt["created_at"] >= TOKENOMICS_SHADOW_SETTLE_SECONDS
+                    and receipt["shadow_decision_source"] in (None, "baseline")
+                    and shadow.get("reason") == "task_decision_unavailable"):
+                conn.execute(
+                    """UPDATE tokenomics_shadow_receipts
+                       SET shadow_decision_source='baseline', shadow_reason='UNKNOWN_NOT_IN_CONTRACT',
+                           shadow_resolved_at=?, updated_at=? WHERE task_id=?""",
+                    (now, now, task_id))
+                conn.commit()
+                return
             conn.execute(
                 """UPDATE tokenomics_shadow_receipts
                    SET shadow_decision_source=?, shadow_policy_version=?,
@@ -5244,7 +5312,8 @@ class TaskQueue:
                    WHERE task_id=?""",
                 (shadow["decision_source"], shadow["policy_version"],
                  (json.dumps({"produced_at": produced_at,
-                              "recommendation": shadow["recommendation"]})
+                              "recommendation": shadow["recommendation"],
+                              **({"cited_task_id": cited_task_id} if cited_task_id else {})})
                   if shadow["recommendation"] is not None else None), shadow.get("contract_sha"),
                  now, shadow["reason"], now, task_id),
             )
@@ -5257,6 +5326,36 @@ class TaskQueue:
             raise
         finally:
             conn.close()
+
+    def reresolve_tokenomics_shadow_receipts(self, *,
+                                            limit: int = TOKENOMICS_SHADOW_SWEEP_LIMIT) -> int:
+        """Best-effort bounded catch-up for baseline receipts after contract re-emission."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        now = time.time()
+        contract_sha = shadow_recommendation_for_task_id("").get("contract_sha")
+        if contract_sha is None:
+            return 0
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT task_id FROM tokenomics_shadow_receipts
+                   WHERE (shadow_decision_source IS NULL OR shadow_decision_source='baseline')
+                     AND COALESCE(shadow_reason, '') != 'UNKNOWN_NOT_IN_CONTRACT'
+                     AND (created_at <= ? OR COALESCE(shadow_contract_sha, '') != ?)
+                   ORDER BY created_at, task_id LIMIT ?""",
+                (now - TOKENOMICS_SHADOW_SETTLE_SECONDS, contract_sha, limit),
+            ).fetchall()
+        finally:
+            conn.close()
+        resolved = 0
+        for row in rows:
+            try:
+                self._refresh_shadow_after_commit(row["task_id"], only_baseline=True)
+                resolved += 1
+            except Exception:
+                logger.exception("tokenomics shadow re-resolution failed for %s", row["task_id"])
+        return resolved
 
     @staticmethod
     def _codex_token_observations(

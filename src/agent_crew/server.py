@@ -4657,6 +4657,12 @@ def create_app(
         - ``recovered`` — unstarted dispatcher claims returned to pending
         """
         actions: dict = {"bumped": [], "reminded": [], "timed_out": []}
+        # #342 E3: record-only catch-up when quota-core publishes a task's
+        # decision after admission. A shadow read/write cannot stop watchdog.
+        try:
+            q().reresolve_tokenomics_shadow_receipts()
+        except Exception:
+            logger.exception("watchdog: tokenomics shadow re-resolution failed")
         try:
             for op_id, kind in q().advance_work_intents(now):
                 _coordinator_notice("work-intent:" + op_id, kind,
