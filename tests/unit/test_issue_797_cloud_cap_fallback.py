@@ -12,12 +12,15 @@ from agent_crew.queue import TaskQueue
 
 def _state(tmp_path, *, local=True):
     path = tmp_path / "state.json"
-    roles = [{"role": "implementer", "agent": "codex",
-              "worktree": str(tmp_path / "codex")}] if local else []
+    roles = ([{"role": "implementer", "agent": "codex",
+               "worktree": str(tmp_path / "codex")},
+              {"role": "reviewer", "agent": "claude",
+               "worktree": str(tmp_path / "claude")}] if local else [])
     path.write_text(json.dumps({"project": "agent_crew", "role_agents": {
-        "implementer": "claude_cloud", "reviewer": "codex" if local else "claude_cloud",
-        "tester": "script"}, "roles": roles,
-        "worktrees": {"codex": str(tmp_path / "codex")} if local else {}}))
+        "implementer": "claude_cloud", "reviewer": "claude" if local else "claude_cloud",
+        "tester": "codex" if local else "script"}, "roles": roles,
+        "worktrees": {"codex": str(tmp_path / "codex"),
+                      "claude": str(tmp_path / "claude")} if local else {}}))
     return str(path)
 
 
@@ -73,6 +76,49 @@ def test_cap_without_local_implementer_notifies_once(tmp_path, monkeypatch):
     assert len(notices) == 1
     assert notices[0][0][2] == "cloud_cap_no_local_implementer"
     assert queue.get_task("fix-pr").error_info["reason"] == "cloud_daily_cap"
+
+
+@pytest.mark.parametrize("reviewer", ["claude", "codex"])
+def test_cap_does_not_route_to_reviewer_seat(tmp_path, monkeypatch, reviewer):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _task(queue)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"project": "agent_crew", "role_agents": {
+        "implementer": "claude_cloud", "reviewer": reviewer, "tester": "script"},
+        "roles": [{"role": "implementer", "agent": "codex",
+                   "worktree": str(tmp_path / "codex")},
+                  {"role": "reviewer", "agent": "claude",
+                   "worktree": str(tmp_path / "claude")}],
+        "worktrees": {"codex": str(tmp_path / "codex"),
+                      "claude": str(tmp_path / "claude")}}))
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_PER_DAY", "1")
+    monkeypatch.setattr(queue, "count_cloud_implements_started_since", lambda _: 1)
+    notices = []
+    monkeypatch.setattr("agent_crew.server.coordinator_notice_once",
+                        lambda *a, **kw: notices.append((a, kw)))
+    cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                  state_path=str(state))
+    task = queue.get_task("fix-pr")
+    assert task.status == "pending"
+    assert task.context.get("agent_override") not in ("claude", "codex")
+    assert len(notices) == 1
+
+
+def test_cap_respects_task_reviewer_override(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _task(queue)
+    queue.patch_context("fix-pr", {"reviewer_agent": "codex"})
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_PER_DAY", "1")
+    monkeypatch.setattr(queue, "count_cloud_implements_started_since", lambda _: 1)
+    notices = []
+    monkeypatch.setattr("agent_crew.server.coordinator_notice_once",
+                        lambda *a, **kw: notices.append((a, kw)))
+    cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                  state_path=_state(tmp_path))
+    assert queue.get_task("fix-pr").context.get("agent_override") != "codex"
+    assert len(notices) == 1
 
 
 def test_cloud_retry_attribution_carries_retry_of(tmp_path, monkeypatch):

@@ -836,10 +836,15 @@ def _local_implementer(task: TaskRequest, state_path: Optional[str]) -> str:
                   if isinstance(row, dict) and row.get("role") == "implementer"
                   and row.get("worktree")]
     worktrees = state.get("worktrees") or {}
-    if isinstance(worktrees, dict):
-        candidates.extend(agent for agent in ("codex", "claude", "gemini")
-                          if worktrees.get(agent))
-    return next((agent for agent in candidates if agent in workers), "")
+    if isinstance(worktrees, dict) and worktrees.get("codex"):
+        candidates.append("codex")
+    # A provider that is only the independent review seat cannot implement
+    # this task. In particular, never turn a cloud cap into a Claude review
+    # worker doing implementation.
+    context = task.context if isinstance(task.context, dict) else {}
+    reviewer = context.get("reviewer_agent") or mapping.get("reviewer")
+    return ("codex" if "codex" in candidates and "codex" in workers
+            and reviewer != "codex" and mapping.get("reviewer") != "codex" else "")
 
 
 def _route_capped_implement(queue: TaskQueue, *, state_path: Optional[str],
