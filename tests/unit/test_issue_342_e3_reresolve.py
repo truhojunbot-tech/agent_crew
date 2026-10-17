@@ -10,10 +10,17 @@ from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue, _CEA_SYSTEM_SUCCESSOR_PROVENANCE
 
 
-def _emit(path, decisions):
+def _emit(path, decisions, *, produced_at=None):
     path.write_text(json.dumps({"contract_version": "1.0", "mode": "shadow",
-                                "produced_at": datetime.now(timezone.utc).isoformat(),
+                                "produced_at": produced_at or datetime.now(timezone.utc).isoformat(),
                                 "decisions": decisions}))
+
+
+def _posted(queue, task_id, at=None):
+    posted_at = at if at is not None else time.time() - 2
+    with sqlite3.connect(queue._db_path) as conn:
+        conn.execute("UPDATE tasks SET result_posted_at=? WHERE task_id=?", (posted_at, task_id))
+    return posted_at
 
 
 def _preserved(queue, task_id):
@@ -40,6 +47,7 @@ def test_late_test_decision_reresolves_after_contract_reemit(tmp_path, monkeypat
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("test-e3", "test", "run suite", branch="agent/e3"))
+    _posted(queue, "test-e3")
     before = _preserved(queue, "test-e3")
     _emit(policy, [{"task_id": "test-e3", "recommended_provider_tier": "preserve_current"}])
     assert queue.reresolve_tokenomics_shadow_receipts() == 1
@@ -56,6 +64,7 @@ def test_late_review_decision_reresolves_after_contract_reemit(tmp_path, monkeyp
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("review-e3", "review", "review code", branch="agent/e3",
                               context={"pr_number": 342, "reviewed_sha": "a" * 40}))
+    _posted(queue, "review-e3")
     before = _preserved(queue, "review-e3")
     _emit(policy, [{"task_id": "review-e3", "recommended_max_review_fix_rounds": 2}])
     assert queue.reresolve_tokenomics_shadow_receipts() == 1
@@ -90,6 +99,7 @@ def test_decision_present_at_first_sweep_after_deadline_is_recorded(tmp_path, mo
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("test-late-sweep", "test", "run suite", branch="agent/e3"))
+    _posted(queue, "test-late-sweep")
     with sqlite3.connect(queue._db_path) as conn:
         conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
                      (time.time() - 7 * 3600, "test-late-sweep"))
@@ -103,6 +113,7 @@ def test_unavailable_contract_does_not_finalize_absence(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("test-unavailable", "test", "run suite", branch="agent/e3"))
+    _posted(queue, "test-unavailable")
     with sqlite3.connect(queue._db_path) as conn:
         conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
                      (time.time() - 7 * 3600, "test-unavailable"))
@@ -120,6 +131,7 @@ def test_unsupported_contract_does_not_finalize_absence(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("test-unsupported", "test", "run suite", branch="agent/e3"))
+    _posted(queue, "test-unsupported")
     with sqlite3.connect(queue._db_path) as conn:
         conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
                      (time.time() - 7 * 3600, "test-unsupported"))
@@ -130,13 +142,102 @@ def test_unsupported_contract_does_not_finalize_absence(tmp_path, monkeypatch):
     assert queue.get_tokenomics_shadow_receipt("test-unsupported")["shadow_decision_source"] == "quota_core_contract"
 
 
+def test_same_second_decision_waits_for_fresh_reemit(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    _emit(policy, [])
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("test-freshness", "test", "run suite", branch="agent/e3"))
+    before = _preserved(queue, "test-freshness")
+    posted_at = _posted(queue, "test-freshness", time.time())
+    same_second = datetime.fromtimestamp(posted_at, timezone.utc).replace(microsecond=0).isoformat()
+    _emit(policy, [{"task_id": "test-freshness", "confidence": "low"}],
+          produced_at=same_second)
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    pending = queue.get_tokenomics_shadow_receipt("test-freshness")
+    assert pending["shadow_decision_source"] in (None, "baseline")
+    assert pending["shadow_reason"] == "decision_not_after_result"
+    _assert_preserved(queue, "test-freshness", before)
+
+    fresh_at = datetime.fromtimestamp(posted_at + 2, timezone.utc).isoformat()
+    _emit(policy, [{"task_id": "test-freshness", "confidence": "medium"}],
+          produced_at=fresh_at)
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    resolved = queue.get_tokenomics_shadow_receipt("test-freshness")
+    assert resolved["shadow_decision_source"] == "quota_core_contract"
+    assert json.loads(resolved["shadow_recommendation_json"])["recommendation"]["confidence"] == "medium"
+    _assert_preserved(queue, "test-freshness", before)
+
+
+def test_running_task_cannot_accept_contract_decision(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    _emit(policy, [])
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("test-running", "test", "run suite", branch="agent/e3"))
+    _emit(policy, [{"task_id": "test-running"}])
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    row = queue.get_tokenomics_shadow_receipt("test-running")
+    assert row["shadow_decision_source"] in (None, "baseline")
+    assert row["shadow_reason"] == "decision_not_after_result"
+
+
+def test_successor_waits_for_predecessor_post_outcome_decision(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    _emit(policy, [])
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-freshness", "implement", "implement", branch="agent/e3"))
+    posted_at = _posted(queue, "impl-freshness", time.time())
+    same_second = datetime.fromtimestamp(posted_at, timezone.utc).replace(microsecond=0).isoformat()
+    _emit(policy, [{"task_id": "impl-freshness", "confidence": "low"}],
+          produced_at=same_second)
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    assert queue.get_tokenomics_shadow_receipt("impl-freshness")["shadow_decision_source"] == "baseline"
+
+    queue.enqueue(TaskRequest("review-freshness", "review", "review", branch="agent/e3",
+                              context={"prev_task_id": "impl-freshness", "pr_number": 342,
+                                       "reviewed_sha": "a" * 40}),
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    pending = queue.get_tokenomics_shadow_receipt("review-freshness")
+    assert pending["shadow_decision_source"] in (None, "baseline")
+    assert pending["shadow_reason"] == "decision_not_after_result"
+
+    _emit(policy, [{"task_id": "impl-freshness", "confidence": "medium"}],
+          produced_at=datetime.fromtimestamp(posted_at + 2, timezone.utc).isoformat())
+    assert queue.reresolve_tokenomics_shadow_receipts() == 2
+    resolved = queue.get_tokenomics_shadow_receipt("review-freshness")
+    assert resolved["shadow_decision_source"] == "quota_core_contract"
+    cited = json.loads(resolved["shadow_recommendation_json"])
+    assert cited["cited_task_id"] == "impl-freshness"
+    assert cited["recommendation"]["confidence"] == "medium"
+
+
+def test_pre_outcome_decision_expires_if_never_refreshed(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    _emit(policy, [])
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("test-stale", "test", "run suite", branch="agent/e3"))
+    posted_at = _posted(queue, "test-stale", time.time())
+    with sqlite3.connect(queue._db_path) as conn:
+        conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
+                     (time.time() - 7 * 3600, "test-stale"))
+    _emit(policy, [{"task_id": "test-stale"}],
+          produced_at=datetime.fromtimestamp(posted_at, timezone.utc).isoformat())
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    assert queue.get_tokenomics_shadow_receipt("test-stale")["shadow_reason"] == "UNKNOWN_NOT_IN_CONTRACT"
+
+
 def test_successor_cites_nearest_predecessor_without_changing_execution(tmp_path, monkeypatch):
     policy = tmp_path / "policy.json"
-    _emit(policy, [{"task_id": "impl-e3", "recommended_max_review_fix_rounds": 1}])
+    _emit(policy, [])
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
     monkeypatch.delenv("AGENT_CREW_REVIEW_FIX_MAX_ROUNDS", raising=False)
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("impl-e3", "implement", "implement", branch="agent/e3"))
+    _posted(queue, "impl-e3")
+    _emit(policy, [{"task_id": "impl-e3", "recommended_max_review_fix_rounds": 1}])
     queue.enqueue(TaskRequest("test-e3-successor", "test", "test", branch="agent/e3",
                               context={"prev_task_id": "impl-e3", "agent_override": "gemini"}),
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
@@ -155,10 +256,12 @@ def test_successor_cites_nearest_predecessor_without_changing_execution(tmp_path
 
 def test_successor_walks_past_a_parent_without_own_decision(tmp_path, monkeypatch):
     policy = tmp_path / "policy.json"
-    _emit(policy, [{"task_id": "impl-root", "recommended_max_review_fix_rounds": 2}])
+    _emit(policy, [])
     monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     queue.enqueue(TaskRequest("impl-root", "implement", "implement", branch="agent/e3"))
+    _posted(queue, "impl-root")
+    _emit(policy, [{"task_id": "impl-root", "recommended_max_review_fix_rounds": 2}])
     queue.enqueue(TaskRequest("review-middle", "review", "review", branch="agent/e3",
                               context={"prev_task_id": "impl-root", "pr_number": 342,
                                        "reviewed_sha": "a" * 40}),
@@ -177,6 +280,7 @@ def test_reresolve_batch_is_bounded_and_keeps_admission_and_canary(tmp_path, mon
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     for task_id in ("test-one", "test-two"):
         queue.enqueue(TaskRequest(task_id, "test", "run", branch=f"agent/{task_id}"))
+        _posted(queue, task_id)
     before = {task_id: _preserved(queue, task_id) for task_id in ("test-one", "test-two")}
     _emit(policy, [{"task_id": task_id} for task_id in ("test-one", "test-two")])
     assert queue.reresolve_tokenomics_shadow_receipts(limit=1) == 1
