@@ -761,7 +761,8 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                                  role="reviewer" if task_type == "review" else "implementer",
                                  task_type=task_type, git_branch=task.branch or "",
                                  status="failed", provider_session_id=context.get("cloud_session_id") or "",
-                                 started_at=context.get("cloud_attempt_started_at") or ended)
+                                 started_at=context.get("cloud_attempt_started_at") or ended,
+                                 **_attribution_lineage(task))
     else:
         queue.update_attribution_status(task.task_id, "failed")
     queue.update_attribution_outcome(task.task_id, "failed")
@@ -811,6 +812,71 @@ def _claimable_cloud_reviews(queue: TaskQueue) -> list[TaskRequest]:
             return False
 
     return [task for task in queue.list_tasks(status="pending") if claimable(task)]
+
+
+def _local_implementer(task: TaskRequest, state_path: Optional[str]) -> str:
+    """Return the project's configured, routable local implementer checkout."""
+    path = state_path or os.getenv("AGENT_CREW_STATE", "")
+    if not path:
+        return ""
+    try:
+        with open(path, encoding="utf-8") as state_file:
+            state = json.load(state_file)
+    except (OSError, ValueError, TypeError):
+        return ""
+    if not isinstance(state, dict) or state.get("project") != task.project:
+        return ""
+    from agent_crew.role_mapping import effective_role_mapping
+    mapping, _ = effective_role_mapping(state, project=task.project or "")
+    # The role mapping selects cloud, while the retained implementer checkout
+    # identifies the local provider. The provider must also have a dispatcher
+    # seat, otherwise agent_override would strand the task again.
+    workers = set(mapping.values()) - {CLOUD_PROVIDER_NAME, "script"}
+    candidates = [row.get("agent") for row in state.get("roles", [])
+                  if isinstance(row, dict) and row.get("role") == "implementer"
+                  and row.get("worktree")]
+    worktrees = state.get("worktrees") or {}
+    if isinstance(worktrees, dict):
+        candidates.extend(agent for agent in ("codex", "claude", "gemini")
+                          if worktrees.get(agent))
+    return next((agent for agent in candidates if agent in workers), "")
+
+
+def _route_capped_implement(queue: TaskQueue, *, state_path: Optional[str],
+                            metric: str, count: float, limit: float) -> None:
+    """Claim once through admission, then route the same row off cloud."""
+    task = queue.dequeue(agent=CLOUD_PROVIDER_NAME, role="implementer",
+                         claimed_via="cloud_push", skip_deferred=True)
+    if task is None:
+        return
+    reason = {"reason": "cloud_daily_cap", "metric": metric,
+              "count": count, "limit": limit}
+    queue.annotate_error_info(task.task_id, reason)
+    local = _local_implementer(task, state_path)
+    if local:
+        queue.patch_context(task.task_id, {
+            "agent_override": local, "fallback_from_task_id": task.task_id,
+            "cloud_cap_skip": reason})
+        queue.requeue(task.task_id, reason="cloud_daily_cap_local_fallback")
+        logger.info("claude_cloud: cap rerouted %s to %s", task.task_id, local)
+        return
+    first_notice = not (task.context or {}).get("cloud_cap_no_local_notified")
+    queue.patch_context(task.task_id, {"cloud_cap_skip": reason,
+                                       "cloud_cap_no_local_notified": True,
+                                       "push_not_before": time.time() + 60})
+    queue.requeue(task.task_id, reason="cloud_daily_cap_no_local_implementer")
+    if first_notice:
+        from agent_crew.server import coordinator_notice_once
+        coordinator_notice_once(queue, task.task_id, "cloud_cap_no_local_implementer",
+                                f"cloud cap {metric}={count} limit={limit}; no local implementer")
+
+
+def _attribution_lineage(task: TaskRequest) -> dict[str, str]:
+    context = task.context if isinstance(task.context, dict) else {}
+    retry_of = context.get("retry_of") or (
+        context.get("original_task_id") if context.get("retry_attempt") else "")
+    fallback_of = context.get("fallback_of") or context.get("fallback_from_task_id")
+    return {"retry_of": str(retry_of or ""), "fallback_of": str(fallback_of or "")}
 
 
 def cloud_review_skip_ids(queue: TaskQueue) -> set[str]:
@@ -872,16 +938,18 @@ def dispatch_cloud_for_role(
     elif role == "implementer":
         day_start = int(time.time() // 86400) * 86400
         daily_cap = cloud_max_per_day()
-        if daily_cap is not None and queue.count_cloud_implements_started_since(day_start) >= daily_cap:
-            logger.info("claude_cloud: daily implement launch cap %d reached; leaving task pending",
-                        daily_cap)
-            return CloudDispatchOutcome(False, skipped_reason="daily_cap")
+        if daily_cap is not None:
+            count = queue.count_cloud_implements_started_since(day_start)
+            if count >= daily_cap:
+                _route_capped_implement(queue, state_path=state_path, metric="launches",
+                                        count=count, limit=daily_cap)
+                return CloudDispatchOutcome(False, skipped_reason="daily_cap")
         usd_cap = cloud_max_usd_per_day()
         if usd_cap is not None:
             spent = queue.cloud_implement_usd_since(day_start)
             if spent >= usd_cap:
-                logger.info("claude_cloud: daily implement USD cap %.2f reached (spent %.2f); "
-                            "leaving task pending", usd_cap, spent)
+                _route_capped_implement(queue, state_path=state_path, metric="usd",
+                                        count=spent, limit=usd_cap)
                 return CloudDispatchOutcome(False, skipped_reason="usd_cap")
             # An active session has no final credit delta. Reserve the remaining
             # daily budget until reconciliation records its observed cost.
@@ -997,7 +1065,7 @@ def dispatch_cloud_for_role(
         task_id=task.task_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
         role=role, task_type=task.task_type, worktree_path="", git_branch=task.branch or "",
         status="in_progress", previous_task_id=prev_task_id or "",
-        started_at=attempt_started_at,
+        started_at=attempt_started_at, **_attribution_lineage(task),
     )
     queue.record_cloud_cost(task.task_id, credit_before, None, None)
     queue.patch_context(task.task_id, {
@@ -1046,6 +1114,7 @@ def dispatch_cloud_for_role(
         role=role, task_type=task.task_type, worktree_path="", git_branch=task.branch or "",
         status="in_progress", provider_session_id=launch.session_id or "",
         previous_task_id=prev_task_id, started_at=launched_at,
+        **_attribution_lineage(task),
     )
     queue.patch_context(task.task_id, {
         "cloud_session_url": launch.session_url,
@@ -1114,7 +1183,7 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
         task_id=attribution_id, project=task.project or "", agent=CLOUD_PROVIDER_NAME,
         role="reviewer", task_type="review", worktree_path="",
         git_branch=task.branch or "", status="in_progress",
-        started_at=attempt_started_at,
+        started_at=attempt_started_at, **_attribution_lineage(task),
     )
     queue.record_cloud_cost(attribution_id, credit_before, None, None)
     queue.patch_context(task.task_id, {
@@ -1143,6 +1212,7 @@ def launch_shadow_review(queue: TaskQueue, task: TaskRequest, *, run_fn: Optiona
         role="reviewer", task_type="review", worktree_path="",
         git_branch=task.branch or "", status="in_progress",
         provider_session_id=launch.session_id or "", started_at=attempt_started_at,
+        **_attribution_lineage(task),
     )
     queue.patch_context(task.task_id, {
         "cloud_shadow_session_id": launch.session_id,
