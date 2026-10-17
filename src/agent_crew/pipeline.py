@@ -1148,7 +1148,10 @@ def _shadow_rounds_citation(tasks_by_id: dict, review_task,
                 recommendation = (stored.get("recommendation")
                                   if isinstance(stored, dict) else None)
                 if (produced_at and decision_at and produced_at <= decision_at
-                        and isinstance(recommendation, dict)):
+                        and isinstance(recommendation, dict)
+                        # E3 shadow citations are observations about an
+                        # ancestor, not this row's own rounds-cap decision.
+                        and stored.get("cited_task_id") in (None, current.task_id)):
                     candidates.append((produced_at, current.task_id, {
                         "decision_source": "quota_core_contract",
                         "produced_at": produced_at.isoformat(),

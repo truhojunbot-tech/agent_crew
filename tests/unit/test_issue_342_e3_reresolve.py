@@ -84,6 +84,20 @@ def test_missing_after_settle_window_stays_unknown(tmp_path, monkeypatch):
     _assert_preserved(queue, "test-expired", before)
 
 
+def test_decision_present_at_first_sweep_after_deadline_is_recorded(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    _emit(policy, [])
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("test-late-sweep", "test", "run suite", branch="agent/e3"))
+    with sqlite3.connect(queue._db_path) as conn:
+        conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
+                     (time.time() - 7 * 3600, "test-late-sweep"))
+    _emit(policy, [{"task_id": "test-late-sweep"}])
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    assert queue.get_tokenomics_shadow_receipt("test-late-sweep")["shadow_decision_source"] == "quota_core_contract"
+
+
 def test_successor_cites_nearest_predecessor_without_changing_execution(tmp_path, monkeypatch):
     policy = tmp_path / "policy.json"
     _emit(policy, [{"task_id": "impl-e3", "recommended_max_review_fix_rounds": 1}])
@@ -105,6 +119,23 @@ def test_successor_cites_nearest_predecessor_without_changing_execution(tmp_path
     assert queue.get_task("test-e3-successor").context["agent_override"] == task_before.context["agent_override"]
     assert review_fix_max_rounds() == cap_before == 3
     _assert_preserved(queue, "test-e3-successor", before)
+
+
+def test_successor_walks_past_a_parent_without_own_decision(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    _emit(policy, [{"task_id": "impl-root", "recommended_max_review_fix_rounds": 2}])
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-root", "implement", "implement", branch="agent/e3"))
+    queue.enqueue(TaskRequest("review-middle", "review", "review", branch="agent/e3",
+                              context={"prev_task_id": "impl-root", "pr_number": 342,
+                                       "reviewed_sha": "a" * 40}),
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    queue.enqueue(TaskRequest("test-leaf", "test", "test", branch="agent/e3",
+                              context={"prev_task_id": "review-middle"}),
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    row = queue.get_tokenomics_shadow_receipt("test-leaf")
+    assert json.loads(row["shadow_recommendation_json"])["cited_task_id"] == "impl-root"
 
 
 def test_reresolve_batch_is_bounded_and_keeps_admission_and_canary(tmp_path, monkeypatch):
