@@ -100,30 +100,30 @@ def test_slow_emitter_adds_less_than_50ms_to_http_result(tmp_path, monkeypatch):
     monkeypatch.delenv("AGENT_CREW_CONTRACT_EMIT_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
     queue = TaskQueue(db)
-    for task_id in ("baseline", "slow"):
-        queue.enqueue(TaskRequest(task_id, "discuss", "discuss", project="agent_crew"))
+    queue.enqueue(TaskRequest("slow", "discuss", "discuss", project="agent_crew"))
+    entered = threading.Event()
     release = threading.Event()
+    emitter_threads = []
     def slow_failure(_command, _project):
-        release.wait(timeout=2)
+        emitter_threads.append(threading.current_thread())
+        entered.set()
+        release.wait(timeout=10)
         raise RuntimeError("emitter unavailable")
     monkeypatch.setattr(contract_emit, "_emit", slow_failure)
     app = create_app(db, project="agent_crew", pane_map={}, watchdog_disabled=True,
                      anomaly_disabled=True)
-    def post(client, task_id):
-        started = time.perf_counter()
-        response = client.post(f"/tasks/{task_id}/result",
-                               json={"task_id": task_id, "status": "completed",
-                                     "summary": "done"},
-                               headers={"X-Agent-Crew-Project": "agent_crew"})
-        return response, time.perf_counter() - started
     try:
         with TestClient(app) as client:
-            baseline, base_seconds = post(client, "baseline")
             monkeypatch.setenv("AGENT_CREW_CONTRACT_EMIT_CMD", "emitter")
-            slow, slow_seconds = post(client, "slow")
-        assert baseline.status_code == slow.status_code == 200
-        assert slow_seconds - base_seconds < 0.05
-        assert contract_emit.in_flight("agent_crew") == 1
+            response = client.post("/tasks/slow/result",
+                                   json={"task_id": "slow", "status": "completed",
+                                         "summary": "done"},
+                                   headers={"X-Agent-Crew-Project": "agent_crew"})
+            assert response.status_code == 200, response.text
+            assert entered.wait(timeout=5)
+            assert not release.is_set()
+            assert emitter_threads[0].is_alive()
+            assert contract_emit.in_flight("agent_crew") == 1
     finally:
         release.set()
         assert contract_emit.wait_idle("agent_crew", timeout=2)
