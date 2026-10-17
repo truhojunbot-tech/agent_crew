@@ -29,6 +29,17 @@ def test_both_subfailed_forms_keep_parent_with_nested_delimiters():
     assert ids == [PARENT]
 
 
+def test_subfailed_message_and_params_keep_parent():
+    output = (
+        "SUBFAILED[m (a)] (i=1) test_p.py::test_fx - assert 1 == 0\n"
+        "SUBFAILED[msg] (k=1) test_s.py::T::test_msg - AssertionError\n"
+        "SUBFAILED[msg [nested] - text] (k=(1, 2)) "
+        f"{PARENT} - AssertionError: bad\n"
+    )
+    _, ids = script_tester.parse_test_output(output)
+    assert ids == ["test_p.py::test_fx", "test_s.py::T::test_msg", PARENT]
+
+
 def test_subfailed_parent_becomes_new_failure_and_finding(tmp_path, monkeypatch):
     class Checkout:
         def __init__(self, repo, base_sha, head_sha=""):
