@@ -1,0 +1,107 @@
+{
+ "additionalProperties": false,
+ "properties": {
+  "context_growth_tokens": {
+   "minimum": 0,
+   "type": [
+    "integer",
+    "null"
+   ]
+  },
+  "fallback_of": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "independent_review_correct": {
+   "type": [
+    "boolean",
+    "null"
+   ]
+  },
+  "outcome": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "recall_not_applicable": {
+   "type": [
+    "boolean",
+    "null"
+   ]
+  },
+  "required_context_recalled": {
+   "type": [
+    "boolean",
+    "null"
+   ]
+  },
+  "retry_of": {
+   "type": [
+    "string",
+    "null"
+   ]
+  },
+  "token_observations": {
+   "additionalProperties": false,
+   "properties": {
+    "cache_read_tokens": {
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "cache_write_tokens": {
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "output_tokens": {
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "reasoning_tokens": {
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    },
+    "uncached_input_tokens": {
+     "minimum": 0,
+     "type": [
+      "integer",
+      "null"
+     ]
+    }
+   },
+   "required": [
+    "uncached_input_tokens",
+    "cache_write_tokens",
+    "cache_read_tokens",
+    "output_tokens",
+    "reasoning_tokens"
+   ],
+   "type": "object"
+  }
+ },
+ "required": [
+  "outcome",
+  "independent_review_correct",
+  "required_context_recalled",
+  "recall_not_applicable",
+  "context_growth_tokens",
+  "retry_of",
+  "fallback_of",
+  "token_observations"
+ ],
+ "type": "object"
+}
