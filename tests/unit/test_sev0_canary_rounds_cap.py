@@ -550,13 +550,26 @@ def test_pre_verdict_mtime_receipt_cannot_narrow_with_future_contract(
     monkeypatch.setenv(ROUNDS_CAP_ENV, "1")
     _contract(tmp_path, monkeypatch, recommended=1, produced=False)
     path = tmp_path / "policy.json"
-    # Model a post-result contract re-emit captured in the durable receipt.
+    # A contract without produced_at cannot become a durable E3 decision.
     observed_mtime = datetime.now(timezone.utc).timestamp()
     os.utime(path, (observed_mtime, observed_mtime))
     q._refresh_shadow_after_commit(ROOT)
     stored = q.get_tokenomics_shadow_receipt(ROOT)
-    assert json.loads(stored["shadow_recommendation_json"])["produced_at"] == (
-        datetime.fromtimestamp(observed_mtime, timezone.utc).isoformat())
+    assert stored["shadow_decision_source"] == "baseline"
+    assert stored["shadow_reason"] == "decision_not_after_result"
+    assert stored["shadow_recommendation_json"] is None
+    # Model a legacy receipt captured before E3's freshness gate. The canary
+    # must keep its existing citation and routing behavior for that evidence.
+    with sqlite3.connect(q._db_path) as conn:
+        conn.execute(
+            """UPDATE tokenomics_shadow_receipts
+               SET shadow_decision_source='quota_core_contract',
+                   shadow_recommendation_json=?, shadow_contract_sha='legacy-mtime'
+               WHERE task_id=?""",
+            (json.dumps({"produced_at": datetime.fromtimestamp(
+                observed_mtime, timezone.utc).isoformat(),
+                "recommendation": {"recommended_max_review_fix_rounds": 1}}), ROOT),
+        )
 
     review = _review(q, refresh_contract=False)
     decision_at = q.get_exec_state(review)["events"][-1]["at"]

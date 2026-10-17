@@ -123,7 +123,18 @@ def test_completion_refresh_preserves_admission_receipt_and_records_later_decisi
     assert receipt["decision_source"] == "baseline"
     assert receipt["policy_version"] is None
     assert json.loads(receipt["recommendation_json"]) is None
-    # Separately-provenanced completion fact.
+    # The first completion read is pre-outcome, so it waits for a re-emission.
+    assert receipt["shadow_decision_source"] == "baseline"
+    assert receipt["shadow_reason"] == "decision_not_after_result"
+    posted_at = queue.get_exec_state("completion-refresh")["result_posted_at"]
+    policy.write_text(json.dumps({
+        "contract_version": "1.0", "mode": "shadow",
+        "produced_at": datetime.fromtimestamp(posted_at + 1, timezone.utc).isoformat(),
+        "decisions": [{"task_id": "completion-refresh", "risk_tier": "routine"}],
+    }))
+    assert queue.reresolve_tokenomics_shadow_receipts() == 1
+    receipt = queue.get_tokenomics_shadow_receipt("completion-refresh")
+    # Separately-provenanced post-outcome fact.
     assert receipt["shadow_decision_source"] == "quota_core_contract"
     assert receipt["shadow_policy_version"] == "1.0"
     assert json.loads(receipt["shadow_recommendation_json"])["recommendation"]["risk_tier"] == "routine"
@@ -132,7 +143,7 @@ def test_completion_refresh_preserves_admission_receipt_and_records_later_decisi
 
 
 @pytest.mark.parametrize("produced_at", [None, "2026-09-30T12:00:00+00:00"])
-def test_completion_receipt_uses_contract_mtime_only_without_produced_at(
+def test_completion_receipt_rejects_missing_or_pre_outcome_produced_at(
         monkeypatch, tmp_path, tmp_db, produced_at):
     policy = tmp_path / "policy.json"
     contract = {"contract_version": "1.0", "mode": "shadow",
@@ -149,9 +160,9 @@ def test_completion_receipt_uses_contract_mtime_only_without_produced_at(
         task_id="mtime-receipt", status="completed", summary="done"))
 
     receipt = queue.get_tokenomics_shadow_receipt("mtime-receipt")
-    stored = json.loads(receipt["shadow_recommendation_json"])
-    assert stored["produced_at"] == (produced_at or datetime.fromtimestamp(
-        observed_mtime, timezone.utc).isoformat())
+    assert receipt["shadow_decision_source"] == "baseline"
+    assert receipt["shadow_reason"] == "decision_not_after_result"
+    assert receipt["shadow_recommendation_json"] is None
 
 
 def test_completion_refresh_marks_missing_or_corrupt_contract_baseline(monkeypatch, tmp_path, tmp_db):

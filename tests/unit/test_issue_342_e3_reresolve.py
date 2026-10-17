@@ -213,6 +213,42 @@ def test_successor_waits_for_predecessor_post_outcome_decision(tmp_path, monkeyp
     assert cited["recommendation"]["confidence"] == "medium"
 
 
+def test_successor_rejects_stored_predecessor_decision_from_before_result(tmp_path, monkeypatch):
+    policy = tmp_path / "policy.json"
+    _emit(policy, [])
+    monkeypatch.setenv("AGENT_CREW_TOKENOMICS_POLICY_PATH", str(policy))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest("impl-stored", "implement", "implement", branch="agent/e3"))
+    posted_at = _posted(queue, "impl-stored", time.time())
+    stale_at = datetime.fromtimestamp(posted_at, timezone.utc).replace(microsecond=0).isoformat()
+    with sqlite3.connect(queue._db_path) as conn:
+        conn.execute(
+            "UPDATE tokenomics_shadow_receipts SET shadow_decision_source='quota_core_contract', "
+            "shadow_recommendation_json=?, shadow_contract_sha='stored' WHERE task_id='impl-stored'",
+            (json.dumps({"produced_at": stale_at,
+                         "recommendation": {"task_id": "impl-stored", "confidence": "low"}}),))
+    queue.enqueue(TaskRequest("review-stored", "review", "review", branch="agent/e3",
+                              context={"prev_task_id": "impl-stored", "pr_number": 342,
+                                       "reviewed_sha": "a" * 40}),
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    pending = queue.get_tokenomics_shadow_receipt("review-stored")
+    assert pending["shadow_decision_source"] == "baseline"
+    assert pending["shadow_reason"] == "decision_not_after_result"
+    assert pending["shadow_recommendation_json"] is None
+
+    fresh_at = datetime.fromtimestamp(posted_at + 2, timezone.utc).isoformat()
+    with sqlite3.connect(queue._db_path) as conn:
+        conn.execute("UPDATE tokenomics_shadow_receipts SET shadow_recommendation_json=? "
+                     "WHERE task_id='impl-stored'",
+                     (json.dumps({"produced_at": fresh_at,
+                                  "recommendation": {"task_id": "impl-stored",
+                                                     "confidence": "medium"}}),))
+    queue._refresh_shadow_after_commit("review-stored")
+    resolved = queue.get_tokenomics_shadow_receipt("review-stored")
+    assert resolved["shadow_decision_source"] == "quota_core_contract"
+    assert json.loads(resolved["shadow_recommendation_json"])["cited_task_id"] == "impl-stored"
+
+
 def test_pre_outcome_decision_expires_if_never_refreshed(tmp_path, monkeypatch):
     policy = tmp_path / "policy.json"
     _emit(policy, [])
@@ -224,7 +260,8 @@ def test_pre_outcome_decision_expires_if_never_refreshed(tmp_path, monkeypatch):
         conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=? WHERE task_id=?",
                      (time.time() - 7 * 3600, "test-stale"))
     _emit(policy, [{"task_id": "test-stale"}],
-          produced_at=datetime.fromtimestamp(posted_at, timezone.utc).isoformat())
+          produced_at=datetime.fromtimestamp(posted_at, timezone.utc).replace(
+              microsecond=0).isoformat())
     assert queue.reresolve_tokenomics_shadow_receipts() == 1
     assert queue.get_tokenomics_shadow_receipt("test-stale")["shadow_reason"] == "UNKNOWN_NOT_IN_CONTRACT"
 

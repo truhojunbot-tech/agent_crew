@@ -5228,10 +5228,25 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def _shadow_decision_after_result(self, task_id: str, produced_at: object) -> bool:
+        """A quota decision is evidence only after its source task posted a result."""
+        try:
+            produced = datetime.fromisoformat(str(produced_at).replace("Z", "+00:00"))
+            if produced.tzinfo is None:
+                return False
+            produced_s = produced.timestamp()
+        except (TypeError, ValueError, OverflowError, OSError):
+            return False
+        state = self.get_exec_state(task_id)
+        posted_at = state.get("result_posted_at") if isinstance(state, dict) else None
+        return isinstance(posted_at, (int, float)) and not isinstance(posted_at, bool) \
+            and produced_s > posted_at
+
     def _cited_shadow_decision(self, task_id: str) -> Optional[tuple[dict, str]]:
         """Walk prev_task_id toward the root, citing the nearest decision."""
         task = self.get_task(task_id)
         seen = {task_id}
+        stale = None
         while task is not None:
             context = task.context if isinstance(task.context, dict) else {}
             parent_id = context.get("prev_task_id")
@@ -5243,7 +5258,10 @@ class TaskQueue:
                 break
             shadow = shadow_recommendation_for_task_id(parent_id)
             if shadow.get("decision_source") == "quota_core_contract":
-                return shadow, parent_id
+                if self._shadow_decision_after_result(parent_id, shadow.get("produced_at")):
+                    return shadow, parent_id
+                if stale is None:
+                    stale = shadow, parent_id
             receipt = self.get_tokenomics_shadow_receipt(parent_id)
             if receipt and receipt.get("shadow_decision_source") == "quota_core_contract":
                 try:
@@ -5252,13 +5270,17 @@ class TaskQueue:
                     stored = None
                 if (isinstance(stored, dict) and not stored.get("cited_task_id")
                         and isinstance(stored.get("recommendation"), dict)):
-                    return ({"decision_source": "quota_core_contract",
-                             "policy_version": receipt.get("shadow_policy_version"),
-                             "recommendation": stored["recommendation"],
-                             "produced_at": stored.get("produced_at"),
-                             "contract_sha": receipt.get("shadow_contract_sha"),
-                             "reason": "shadow_only"}, parent_id)
-        return None
+                    candidate = ({"decision_source": "quota_core_contract",
+                                  "policy_version": receipt.get("shadow_policy_version"),
+                                  "recommendation": stored["recommendation"],
+                                  "produced_at": stored.get("produced_at"),
+                                  "contract_sha": receipt.get("shadow_contract_sha"),
+                                  "reason": "shadow_only"}, parent_id)
+                    if self._shadow_decision_after_result(parent_id, stored.get("produced_at")):
+                        return candidate
+                    if stale is None:
+                        stale = candidate
+        return stale
 
     def _refresh_shadow_after_commit(self, task_id: str, outcome: Optional[str] = None,
                                      *, only_baseline: bool = False) -> None:
@@ -5276,12 +5298,12 @@ class TaskQueue:
             if citation is not None:
                 shadow, cited_task_id = citation
         produced_at = shadow.get("produced_at")
-        if produced_at is None and shadow.get("contract_mtime") is not None:
-            try:
-                produced_at = datetime.fromtimestamp(
-                    shadow["contract_mtime"], timezone.utc).isoformat()
-            except (TypeError, ValueError, OverflowError, OSError):
-                pass
+        if (shadow.get("decision_source") == "quota_core_contract" and not
+                self._shadow_decision_after_result(cited_task_id or task_id, produced_at)):
+            shadow = {"decision_source": "baseline", "policy_version": None,
+                      "recommendation": None, "reason": "decision_not_after_result",
+                      "contract_sha": shadow.get("contract_sha")}
+            cited_task_id = None
         now = time.time()
         conn = self._connect()
         try:
@@ -5296,7 +5318,8 @@ class TaskQueue:
                 return
             if (now - receipt["created_at"] >= TOKENOMICS_SHADOW_SETTLE_SECONDS
                     and receipt["shadow_decision_source"] in (None, "baseline")
-                    and shadow.get("reason") == "task_decision_unavailable"):
+                    and shadow.get("reason") in ("task_decision_unavailable",
+                                                "decision_not_after_result")):
                 conn.execute(
                     """UPDATE tokenomics_shadow_receipts
                        SET shadow_decision_source='baseline', shadow_reason='UNKNOWN_NOT_IN_CONTRACT',
