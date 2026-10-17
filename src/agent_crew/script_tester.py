@@ -107,17 +107,45 @@ def resolve_test_config(state: Optional[Mapping], checkout: str) -> tuple[Option
     return None, timeout
 
 
+def _after_balanced_group(line: str, start: int) -> Optional[int]:
+    opener = line[start]
+    closer = ")" if opener == "(" else "]"
+    depth = 1
+    end = start + 1
+    while end < len(line) and depth:
+        if line[end] == opener:
+            depth += 1
+        elif line[end] == closer:
+            depth -= 1
+        end += 1
+    return end if depth == 0 else None
+
+
 def parse_test_output(text: str) -> tuple[dict, list]:
-    """Pytest summary counts and failing node ids (``FAILED``/``ERROR`` lines)."""
+    """Pytest summary counts and failing parent node ids."""
     ids = []
     for line in (text or "").splitlines():
         match = _ID_RE.match(line)
-        if not match:
+        if match:
+            entry = match.group(1)
+        elif line.startswith(("SUBFAILED(", "SUBFAILED[")):
+            # Pytest subtests put their case detail before the parent node ID.
+            # Find the matching delimiter: detail can contain nested delimiters
+            # and the same " - " separator used before a failure reason.
+            end = _after_balanced_group(line, len("SUBFAILED"))
+            if end is None or not line.startswith(" ", end):
+                continue
+            entry = line[end + 1:]
+            if entry.startswith("("):
+                params_end = _after_balanced_group(entry, 0)
+                if params_end is None or not entry.startswith(" ", params_end):
+                    continue
+                entry = entry[params_end + 1:]
+        else:
             continue
         # The pytest summary separates a node id from its reason with " - ".
         # A parametrized id can contain both spaces and that separator inside
         # brackets, so split only after the closing bracket.
-        entry = match.group(1)
         depth = 0
         for index, char in enumerate(entry):
             if char == "[":
