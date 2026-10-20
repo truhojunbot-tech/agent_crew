@@ -3205,10 +3205,16 @@ def worker_environment(server_env, worktree: str) -> dict[str, str]:
     The server may capture into a live shadow DB, but a worker running pytest
     must not pass that DB path to its own in-test server (#430).
     """
+    claude_session_keys = {
+        "CLAUDECODE", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_ENTRYPOINT",
+        "CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_MESSAGING_SOCKET",
+        "CLAUDE_CODE_MESSAGING_TOKEN", "CLAUDE_CODE_SESSION_ATTENDED",
+        "CLAUDE_CODE_SESSION_ID", "CLAUDE_PID", "CLAUDE_SESSION_NAME",
+    }
     child = {
         key: value for key, value in server_env.items()
         if not key.startswith(("AGENT_CREW_SHADOW_MEMORY_", "AGENT_CREW_ADR001_"))
-        and key not in {"PYTHONPATH", "PYTHONHOME"}
+        and key not in ({"PYTHONPATH", "PYTHONHOME"} | claude_session_keys)
     }
     child["TELEGRAM_STATE_DIR"] = os.path.join(worktree, ".telegram")
     return child
@@ -5446,13 +5452,12 @@ def create_app(
             except Exception:
                 logger.exception(
                     f"dispatcher: could not read lock-wait for {task.task_id}")
-        # #202: capture the model in use where it's actually known. Only
-        # gemini passes an explicit --model flag today; claude/codex rely on
-        # their own CLI/config defaults with no reliable flag here, so their
-        # model stays unknown (empty) rather than guessed. Resolved once,
-        # here, and reused below when building the gemini `cmd` so the two
-        # can't drift apart.
-        _known_model = _resolve_gemini_model() if agent == "gemini" else ""
+        # #202: resolve the explicit provider model once so attribution and
+        # argv cannot drift. An unpinned Claude/Codex model remains unknown.
+        _known_model = (
+            _resolve_gemini_model() if agent == "gemini" else
+            os.getenv("AGENT_CREW_CLAUDE_MODEL", "").strip() if agent == "claude" else ""
+        )
 
         # #202: resolve durable context identity before dispatch. A context
         # is scoped by (project, agent, worktree) — not role — since
@@ -5516,9 +5521,17 @@ def create_app(
             # worktree since 2026-08-21, alpha_engine's at 290 MB. Sizing is
             # provider-specific; everything after this line is not.
             _ctx_over, _ctx_cap_info = claude_context_exceeds_cap(wt)
+            _previous_task_id = ""
+            try:
+                _previous_task_id = q().peek_context_last_task_id(_project, agent, wt)
+                if _previous_task_id and _previous_task_id != task.task_id:
+                    _previous_model = (q().get_attribution(_previous_task_id) or {}).get("model") or ""
+                    if _previous_model != _known_model:
+                        _force_context_reset = True
+            except Exception:
+                logger.exception("dispatcher: Claude model lookup failed for task=%s", task.task_id)
             if os.getenv("AGENT_CREW_CLAUDE_CONTEXT_SCOPE", "lineage").strip().lower() != "worktree":
                 try:
-                    _previous_task_id = q().peek_context_last_task_id(_project, agent, wt)
                     if _previous_task_id and _previous_task_id != task.task_id:
                         _lineage_ids, _ = task_lineage(db_path, task.task_id)
                         if _previous_task_id not in _lineage_ids:
@@ -6308,6 +6321,8 @@ def create_app(
                 cmd.append("--continue")
             cmd += ["--dangerously-skip-permissions",
                     "--verbose", "--output-format", "stream-json"]
+            if _known_model:
+                cmd += ["--model", _known_model]
         elif agent == "gemini":
             # gemini-cli + oauth-personal stopped serving on 2026-06-18
             # (IneligibleTierError) and the replacement, Antigravity CLI
