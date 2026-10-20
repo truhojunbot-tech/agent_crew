@@ -101,7 +101,8 @@ def _queue(tmp_db, task_branch="main", ctx=None):
     q.enqueue(TaskRequest(
         task_id="impl-watch-0073c3a7", task_type="implement",
         description="Implement #304", branch=task_branch,
-        context=ctx if ctx is not None else {"issue": 304, "reviewed_sha": "990ce86"}))
+        context=ctx if ctx is not None else {"issue": 304, "reviewed_sha": "990ce86",
+                                             "crew_run_branch": True}))
     return q
 
 
@@ -208,7 +209,7 @@ def test_the_server_routes_a_real_posted_result_to_the_pushed_branch(tmp_db, mon
     q.enqueue(TaskRequest(
         task_id="impl-watch-0073c3a7", task_type="implement",
         description="Implement #304", branch="main",
-        context={"issue": 304, "reviewed_sha": "990ce86"}))
+        context={"issue": 304, "reviewed_sha": "990ce86", "crew_run_branch": True}))
 
     # #366: this test exercises review routing, not git reachability.  #354
     # correctly made its old made-up SHA fail closed before the cascade.  Give
@@ -259,7 +260,7 @@ def _mcp_call(mcp, tool_name, **kwargs):
     return func(**kwargs)
 
 
-def _mcp_submit(tmp_db, monkeypatch=None, **result_fields):
+def _mcp_submit(tmp_db, monkeypatch=None, *, crew_run_branch=True, **result_fields):
     """Enqueue a watch-shaped implement task and complete it over MCP."""
     from agent_crew.mcp_server import build_mcp_server
     from agent_crew.protocol import TaskRequest
@@ -268,7 +269,8 @@ def _mcp_submit(tmp_db, monkeypatch=None, **result_fields):
     TaskQueue(tmp_db).enqueue(TaskRequest(
         task_id="impl-watch-mcp", task_type="implement",
         description="Implement #304", branch="main",
-        context={"issue": 304, "reviewed_sha": "990ce86"}))
+        context={"issue": 304, "reviewed_sha": "990ce86",
+                 "crew_run_branch": crew_run_branch}))
     if monkeypatch is not None:
         # Keep the fail-closed gate in the real path.  These transport/routing
         # tests supply the gate's positive evidence at its boundary instead of
@@ -330,7 +332,7 @@ def test_an_mcp_submission_reporting_nothing_is_held_for_missing_refs(tmp_db, mo
 
     monkeypatch.setattr("agent_crew.pipeline.subprocess.run", advanced_main)
 
-    ack, reviews = _mcp_submit(tmp_db)
+    ack, reviews = _mcp_submit(tmp_db, crew_run_branch=False)
     assert ack["held"] == "no_artifact"
     assert ack["reason"] == "no_artifact"
     assert "result named no commit, branch or pr_number" in ack["detail"]

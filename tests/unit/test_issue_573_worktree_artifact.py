@@ -71,6 +71,13 @@ def test_missing_refs_use_only_descendant_dispatched_worktree_head(
     app = create_app(db, worktree_map={"implementer": str(worker)},
                      pane_map={}, identity_required=False,
                      watchdog_disabled=True, anomaly_disabled=True)
+    if head_state == "descendant":
+        # This case checks review routing for an inferred artifact. Give that
+        # branch a reviewable PR; the other cases still exercise no_artifact.
+        monkeypatch.setattr("agent_crew.github.pr_number_for_branch",
+                            lambda branch, **kwargs: 573 if branch == "feature" else None)
+        monkeypatch.setattr("agent_crew.pipeline.pr_is_actionable",
+                            lambda *args, **kwargs: (True, "open"))
     with caplog.at_level(logging.INFO), TestClient(app) as client:
         response = client.post("/tasks/impl-573/result", json={
             "task_id": "impl-573", "status": "completed", "summary": "work done",

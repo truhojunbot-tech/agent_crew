@@ -456,7 +456,7 @@ def branch_has_pr(branch: str, repo: Optional[str] = None) -> bool:
 
 
 def pr_number_for_branch(branch: str, repo: Optional[str] = None,
-                          timeout: float = 15.0) -> Optional[int]:
+                          timeout: float = 15.0, *, state: str = "all") -> Optional[int]:
     """Like `branch_has_pr`, but returns the PR number instead of a bool.
 
     #496: a `claude_cloud` dispatch has no local callback to this
@@ -476,7 +476,7 @@ def pr_number_for_branch(branch: str, repo: Optional[str] = None,
     try:
         result = subprocess.run(
             ["gh", "pr", "list", "--repo", repo, "--head", branch,
-             "--state", "all", "--json", "number", "--limit", "1"],
+             "--state", state, "--json", "number", "--limit", "1"],
             capture_output=True, text=True, timeout=timeout,
         )
         if result.returncode != 0:

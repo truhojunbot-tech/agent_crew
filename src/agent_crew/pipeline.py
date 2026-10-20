@@ -120,6 +120,9 @@ def _review_cascade_contract(queue: TaskQueue, review_task):
 #: a disagreement no additional round will settle. After the cap the loop stops
 #: and says so on the PR, because the next move is a human's.
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
+# The same-role retry budget used by the server's failed-task path and the
+# implementer PR-opening retry (#666).
+MAX_TASK_RETRIES = 2
 CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
 ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS = 60
 ROUNDS_CAP_CASCADE_MAX_ATTEMPTS = 3
@@ -2149,6 +2152,97 @@ def auto_enqueue_review(
                     f"using #{pr_number} from the task context"
                 )
 
+        # Keep cross-project tasks out of this server's review and notice path.
+        impl_project = impl_task.project
+        if impl_project and server_project and impl_project != server_project:
+            logger.warning(
+                f"auto_enqueue_review: skipping cross-project review — "
+                f"impl project={impl_project!r}, server project={server_project!r}"
+            )
+            return None
+
+        # Only an explicit standalone branch declaration opts into this guard.
+        # Older tasks omit crew_run_branch; preserve their existing cascade.
+        # A crew-run branch's CLI may open the PR after this result (#666).
+        if (pr_number is None and impl_task.branch
+                and impl_ctx.get("crew_run_branch") is False):
+            from agent_crew.github import pr_number_for_branch
+
+            found_pr = pr_number_for_branch(
+                impl_task.branch, repo=_impl_repo or None, state="open"
+            )
+            if found_pr is not None and pr_is_actionable(
+                found_pr, pr_state_fn=pr_state_fn, repo=_impl_repo, repo_cwd=repo_cwd
+            )[0]:
+                pr_number = found_pr
+            else:
+                reason = "no_pr_for_review"
+                queue.patch_context(impl_task_id, {
+                    "review_blocked_reason": reason,
+                    "review_target_branch": impl_task.branch,
+                })
+                try:
+                    retry_attempt = int(impl_ctx.get("retry_attempt") or 0)
+                except (TypeError, ValueError):
+                    retry_attempt = MAX_TASK_RETRIES
+                retry_id = ""
+                if retry_attempt < MAX_TASK_RETRIES:
+                    retry_id = f"retry-{impl_task_id}-a{retry_attempt + 1}"
+                    retry_context = successor_context(impl_ctx)
+                    retry_context.update({
+                        "prev_task_id": impl_task_id,
+                        "original_task_id": impl_task_id,
+                        "retry_attempt": retry_attempt + 1,
+                        "retry_reason": reason,
+                        "lineage_root_task_id": (
+                            impl_ctx.get("lineage_root_task_id") or impl_task_id),
+                    })
+                    _carry_lineage_intent(retry_context, impl_task, "implementer")
+                    retry_task = TaskRequest(
+                        task_id=retry_id, task_type="implement",
+                        description=(
+                            f"Open a PR for pushed branch {impl_task.branch!r} "
+                            f"and report its pr_number. Do not reimplement the code.\n\n"
+                            f"Original task: {impl_task.description}"
+                        ),
+                        branch=impl_task.branch,
+                        priority=impl_task.priority + 1,
+                        context=retry_context,
+                        project=_successor_project(queue, impl_task, server_project),
+                    )
+                    try:
+                        _enqueue_with_inherited_risk(
+                            queue, retry_task,
+                            {task.task_id: task for task in queue.list_tasks()},
+                            impl_task, ingress="retry.failed_task",
+                            successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                        )
+                    except TaskAlreadyExistsError:
+                        pass  # The same result was replayed.
+                    else:
+                        logger.info("auto_enqueue_review: %s will open the PR", retry_id)
+                if retry_id and queue.get_task(retry_id) is not None:
+                    queue.patch_context(impl_task_id, {"review_retry_task_id": retry_id})
+                from agent_crew.server import coordinator_notice_once
+
+                notice_kind = reason if retry_id else "no_pr_for_review_exhausted"
+                if not retry_id:
+                    queue.patch_context(impl_task_id, {
+                        "review_blocked_reason": notice_kind,
+                    })
+                coordinator_notice_once(
+                    queue, impl_ctx.get("lineage_root_task_id") or impl_task_id,
+                    notice_kind,
+                    f"reason={reason} branch={impl_task.branch} " +
+                    (f"implementer_retry={retry_id}" if retry_id else
+                     "retry cap exhausted; open a PR for the pushed branch"),
+                )
+                logger.warning(
+                    "auto_enqueue_review: %s has no open PR for branch %s",
+                    impl_task_id, impl_task.branch,
+                )
+                return None
+
         # #250: reviewing a merged/closed PR cannot change the artifact.
         if _skip_terminal_pr(queue, "auto_enqueue_review", impl_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_impl_repo, repo_cwd=repo_cwd):
@@ -2162,17 +2256,6 @@ def auto_enqueue_review(
             logger.warning(
                 f"auto_enqueue_review: skipping — impl task {impl_task_id} has "
                 f"no branch and no pr_number; reviewer has nothing to find (#161)"
-            )
-            return None
-
-        # Cross-project guard: if the impl task carries a top-level project tag
-        # and the server was started for a different project, skip auto-review
-        # to prevent misrouting tasks across project queues.
-        impl_project = impl_task.project
-        if impl_project and server_project and impl_project != server_project:
-            logger.warning(
-                f"auto_enqueue_review: skipping cross-project review — "
-                f"impl project={impl_project!r}, server project={server_project!r}"
             )
             return None
 

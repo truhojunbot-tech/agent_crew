@@ -444,9 +444,9 @@ def test_a_string_pr_number_in_context_is_still_resolved(q):
 
 
 def test_a_task_with_no_pr_anywhere_still_cascades(q):
-    """⛔The resolution must not invent a PR. A task that genuinely has none is
-    still actionable — that is the pre-PR implement→review hop."""
+    """A crew-run branch keeps its pre-PR implement-to-review hop."""
     impl_id = _impl_with_context_pr(q, task_id="impl-nopr", pr=None)
+    q.patch_context(impl_id, {"crew_run_branch": True})
 
     assert auto_enqueue_review(q, impl_id, None, pr_state_fn=_state("merged")) is not None
 
