@@ -95,9 +95,10 @@ class TestAutoEnqueueReviewNoPRGuard:
         review_id = auto_enqueue_review(q, impl_id, pr_number=None)
         assert review_id is None
 
-    def test_u161_creates_review_when_branch_present(self):
-        """If branch is set (even without pr_number), review IS created."""
+    def test_u161_creates_review_when_cli_will_open_pr(self):
+        """The crew-run CLI may open the PR after implement completion."""
         q, impl_id = _make_queue_with_impl(branch="feat/thing")
+        q.patch_context(impl_id, {"crew_run_branch": True})
         review_id = auto_enqueue_review(q, impl_id, pr_number=None)
         assert review_id is not None
 

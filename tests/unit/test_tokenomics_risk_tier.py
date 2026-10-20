@@ -125,7 +125,8 @@ def test_tier_two_marks_adversarial_review_and_tier_three_requires_gate(
     queue.enqueue(TaskRequest("core", "implement", "change src/agent_crew/queue.py", branch="b", context={"risk_tier": 2}))
     review_id = auto_enqueue_review(queue, "core", pr_number=3, pr_state_fn=_open)
     assert _task(queue, review_id).context["review_mode"] == "adversarial"
-    queue.enqueue(TaskRequest("deploy", "implement", "deploy release", branch="b", context={"risk_tier": 3}))
+    queue.enqueue(TaskRequest("deploy", "implement", "deploy release", branch="b",
+                              context={"risk_tier": 3, "pr_number": 4}))
     assert auto_enqueue_review(queue, "deploy", pr_number=4, pr_state_fn=_open) is None
     gates = queue.list_gates(status="pending")
     assert len(gates) == 1
@@ -141,7 +142,8 @@ def test_tier_three_gate_approval_via_http_enqueues_review(
     """The production gate endpoint, not only the helper, resumes Tier 3 work."""
     monkeypatch.setenv("AGENT_CREW_RISK_TIER_ENFORCEMENT", "1")
     queue = TaskQueue(tmp_db)
-    queue.enqueue(TaskRequest("endpoint-deploy", "implement", "deploy release", branch="b", context={"risk_tier": 3}))
+    queue.enqueue(TaskRequest("endpoint-deploy", "implement", "deploy release", branch="b",
+                              context={"risk_tier": 3, "crew_run_branch": True}))
     assert auto_enqueue_review(queue, "endpoint-deploy", pr_number=4, pr_state_fn=_open) is None
 
     response = test_client.post(

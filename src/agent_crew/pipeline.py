@@ -2149,6 +2149,47 @@ def auto_enqueue_review(
                     f"using #{pr_number} from the task context"
                 )
 
+        # Keep cross-project tasks out of this server's review and notice path.
+        impl_project = impl_task.project
+        if impl_project and server_project and impl_project != server_project:
+            logger.warning(
+                f"auto_enqueue_review: skipping cross-project review — "
+                f"impl project={impl_project!r}, server project={server_project!r}"
+            )
+            return None
+
+        # A standalone implement result needs an open PR before a reviewer can
+        # act on it. A crew-run branch is different: its CLI may open the PR
+        # after this result, so preserve that cascade (#666).
+        if pr_number is None and impl_task.branch and not impl_ctx.get("crew_run_branch"):
+            from agent_crew.github import pr_number_for_branch
+
+            found_pr = pr_number_for_branch(
+                impl_task.branch, repo=_impl_repo or None, state="open"
+            )
+            if found_pr is not None and pr_is_actionable(
+                found_pr, pr_state_fn=pr_state_fn, repo=_impl_repo, repo_cwd=repo_cwd
+            )[0]:
+                pr_number = found_pr
+            else:
+                reason = "no_pr_for_review"
+                queue.patch_context(impl_task_id, {
+                    "review_blocked_reason": reason,
+                    "review_target_branch": impl_task.branch,
+                })
+                from agent_crew.server import coordinator_notice_once
+
+                coordinator_notice_once(
+                    queue, impl_task_id, reason,
+                    f"reason={reason} branch={impl_task.branch} "
+                    "open a PR for the pushed branch before review",
+                )
+                logger.warning(
+                    "auto_enqueue_review: %s has no open PR for branch %s",
+                    impl_task_id, impl_task.branch,
+                )
+                return None
+
         # #250: reviewing a merged/closed PR cannot change the artifact.
         if _skip_terminal_pr(queue, "auto_enqueue_review", impl_task_id, pr_number,
                              pr_state_fn=pr_state_fn, repo=_impl_repo, repo_cwd=repo_cwd):
@@ -2162,17 +2203,6 @@ def auto_enqueue_review(
             logger.warning(
                 f"auto_enqueue_review: skipping — impl task {impl_task_id} has "
                 f"no branch and no pr_number; reviewer has nothing to find (#161)"
-            )
-            return None
-
-        # Cross-project guard: if the impl task carries a top-level project tag
-        # and the server was started for a different project, skip auto-review
-        # to prevent misrouting tasks across project queues.
-        impl_project = impl_task.project
-        if impl_project and server_project and impl_project != server_project:
-            logger.warning(
-                f"auto_enqueue_review: skipping cross-project review — "
-                f"impl project={impl_project!r}, server project={server_project!r}"
             )
             return None
 
