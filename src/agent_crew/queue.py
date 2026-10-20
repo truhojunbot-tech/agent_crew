@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 4
+QUEUE_SCHEMA_VERSION = 5
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -674,6 +674,10 @@ _DDL_MIGRATE_SHADOW_COLUMNS = (
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_resolved_at REAL",
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN shadow_reason TEXT",
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN evidence_json TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN quality_evidence_state TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN quality_veto_reason TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN quality_recommendation_json TEXT",
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN quality_actual_action TEXT",
 )
 
 #: SEV-0 §11 ONE-TASK tokenomics canary (issue #51).
@@ -3116,10 +3120,12 @@ class TaskQueue:
                 conn.execute(
                     """INSERT OR IGNORE INTO tokenomics_shadow_receipts
                        (task_id, decision_source, policy_version, recommendation_json,
-                        actual_execution_json, evidence_json, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                        actual_execution_json, evidence_json, created_at, updated_at,
+                        quality_evidence_state, quality_veto_reason,
+                        quality_recommendation_json, quality_actual_action)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (task.task_id, shadow["decision_source"], shadow["policy_version"],
-                     json.dumps(shadow["recommendation"]),
+                     json.dumps(shadow.get("raw_recommendation", shadow["recommendation"])),
                      json.dumps({"cascade": "baseline", "task_type": task.task_type,
                                  "shadow_reason": shadow["reason"]}),
                      json.dumps(_quality_evidence_envelope({
@@ -3131,7 +3137,11 @@ class TaskQueue:
                              "cache_read_tokens": None, "output_tokens": None,
                              "reasoning_tokens": None,
                          },
-                     }, declaration)), now, now),
+                     }, declaration)), now, now,
+                     shadow.get("quality_evidence_state", "legacy_absent"),
+                     shadow.get("quality_veto_reason"),
+                     json.dumps(shadow.get("raw_recommendation", shadow["recommendation"])),
+                     "baseline"),
                 )
                 conn.commit()
             finally:
@@ -5273,6 +5283,10 @@ class TaskQueue:
                     candidate = ({"decision_source": "quota_core_contract",
                                   "policy_version": receipt.get("shadow_policy_version"),
                                   "recommendation": stored["recommendation"],
+                                  "raw_recommendation": json.loads(
+                                      receipt.get("quality_recommendation_json") or "null"),
+                                  "quality_evidence_state": receipt.get("quality_evidence_state"),
+                                  "quality_veto_reason": receipt.get("quality_veto_reason"),
                                   "produced_at": stored.get("produced_at"),
                                   "contract_sha": receipt.get("shadow_contract_sha"),
                                   "reason": "shadow_only"}, parent_id)
@@ -5331,14 +5345,26 @@ class TaskQueue:
                 """UPDATE tokenomics_shadow_receipts
                    SET shadow_decision_source=?, shadow_policy_version=?,
                        shadow_recommendation_json=?, shadow_contract_sha=?,
-                       shadow_resolved_at=?, shadow_reason=?, updated_at=?
+                       shadow_resolved_at=?, shadow_reason=?, updated_at=?,
+                       quality_evidence_state=CASE WHEN ?='quota_core_contract'
+                           THEN ? ELSE quality_evidence_state END,
+                       quality_veto_reason=CASE WHEN ?='quota_core_contract'
+                           THEN ? ELSE quality_veto_reason END,
+                       quality_recommendation_json=CASE WHEN ?='quota_core_contract'
+                           THEN ? ELSE quality_recommendation_json END
                    WHERE task_id=?""",
                 (shadow["decision_source"], shadow["policy_version"],
                  (json.dumps({"produced_at": produced_at,
                               "recommendation": shadow["recommendation"],
                               **({"cited_task_id": cited_task_id} if cited_task_id else {})})
                   if shadow["recommendation"] is not None else None), shadow.get("contract_sha"),
-                 now, shadow["reason"], now, task_id),
+                 now, shadow["reason"], now,
+                 shadow["decision_source"],
+                 shadow.get("quality_evidence_state", "legacy_absent"),
+                 shadow["decision_source"], shadow.get("quality_veto_reason"),
+                 shadow["decision_source"],
+                 json.dumps(shadow.get("raw_recommendation", shadow["recommendation"])),
+                 task_id),
             )
             conn.commit()
         except Exception:
@@ -8030,10 +8056,12 @@ class TaskQueue:
                 """UPDATE tokenomics_shadow_receipts
                    SET canary_decision_source=?, canary_recommendation_json=?,
                        canary_applied=?, canary_counterfactual=?, canary_reason=?,
-                       canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?
+                       canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?,
+                       quality_actual_action=?
                    WHERE task_id=? AND (?=0 OR canary_applied IS NULL OR canary_applied=0 OR ?=1)""",
                 (decision_source, json.dumps(recommendation), int(bool(applied)),
-                 counterfactual or None, reason, cea_receipt_id, now, now, task_id,
+                 counterfactual or None, reason, cea_receipt_id, now, now,
+                 (recommendation.get("kind") or "round_cap") if applied else "baseline", task_id,
                  int(bool(preserve_applied)), int(bool(applied))),
             )
             conn.commit()
@@ -8249,7 +8277,8 @@ class TaskQueue:
                    SET canary_decision_source='quota_core_contract',
                        canary_recommendation_json=?, canary_applied=1,
                        canary_counterfactual=?, canary_reason='round_cap_reached',
-                       canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?
+                       canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?,
+                       quality_actual_action='round_cap'
                    WHERE task_id=?""",
                 (json.dumps(recommendation), json.dumps(counterfactual),
                  receipt_id, now, now, receipt_task_id),
@@ -8277,10 +8306,12 @@ class TaskQueue:
             """UPDATE tokenomics_shadow_receipts
                SET canary_decision_source=?, canary_recommendation_json=?,
                    canary_applied=1, canary_counterfactual=?, canary_reason=?,
-                   canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?
+                   canary_cea_receipt_id=?, canary_resolved_at=?, updated_at=?,
+                   quality_actual_action=?
                WHERE task_id=?""",
             (decision_source, json.dumps(recommendation), counterfactual or None,
-             reason, cea_receipt_id, now, now, task_id),
+             reason, cea_receipt_id, now, now,
+             recommendation.get("kind") or "round_cap", task_id),
         )
         self._append_canary_history_in_txn(
             conn, task_id, at=now, decision_source=decision_source,

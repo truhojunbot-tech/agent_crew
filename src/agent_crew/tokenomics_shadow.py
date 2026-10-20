@@ -15,6 +15,27 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 
+def quality_evidence(recommendation: Any) -> tuple[str, str | None]:
+    """Normalize quota-core's optional evidence state without guessing a boolean."""
+    if not isinstance(recommendation, dict) or "quality_evidence_state" not in recommendation:
+        return "legacy_absent", None
+    state = recommendation["quality_evidence_state"]
+    if state not in ("preserving", "not_preserving", "unknown"):
+        state = "unknown"
+    reason = {"unknown": "quality_evidence_unknown",
+              "not_preserving": "quality_evidence_not_preserving"}.get(state)
+    return state, reason
+
+
+def _quality_gated(recommendation: dict) -> dict:
+    state, veto = quality_evidence(recommendation)
+    effective = recommendation
+    if veto and "recommended_max_review_fix_rounds" in recommendation:
+        effective = {**recommendation, "recommended_max_review_fix_rounds": None}
+    return {"recommendation": effective, "raw_recommendation": recommendation,
+            "quality_evidence_state": state, "quality_veto_reason": veto}
+
+
 def shadow_recommendation(task) -> dict[str, Any]:
     return shadow_recommendation_for_task_id(task.task_id)
 
@@ -59,7 +80,7 @@ def shadow_recommendation_for_task_id(task_id: str) -> dict[str, Any]:
                     "policy_version": contract["contract_version"],
                     "produced_at": contract.get("produced_at"),
                     "contract_mtime": contract_mtime,
-                    "recommendation": recommendation,
+                    **_quality_gated(recommendation),
                     "reason": "shadow_only", "contract_sha": contract_sha}
         if "contract_version" in contract:
             logger.warning("unsupported tokenomics policy contract version %r at %s",
@@ -70,7 +91,7 @@ def shadow_recommendation_for_task_id(task_id: str) -> dict[str, Any]:
             return {**baseline, "contract_sha": contract_sha}
         return {"decision_source": "quota_core_contract",
                 "policy_version": contract.get("version"),
-                "recommendation": contract["recommendation"],
+                **_quality_gated(contract["recommendation"]),
                 "reason": "shadow_only", "contract_sha": contract_sha}
     except (OSError, ValueError, TypeError):
         return {**baseline, "contract_sha": contract_sha}
