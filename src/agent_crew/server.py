@@ -789,8 +789,8 @@ def _prepare_worktree_for_task(
       via `gh pr view` so the worktree tracks the real PR branch rather than
       the base branch stored in task.branch.
 
-    Failures are logged but never propagate — task dispatch continues even if
-    the git prep encounters a transient error (e.g. merge conflict on stash pop).
+    A survivable prep error uses a verified caller base or the worktree HEAD.
+    The delivery paths refuse to launch if neither is available.
     """
     try:
         return _prepare_worktree_for_task_inner(
@@ -802,12 +802,26 @@ def _prepare_worktree_for_task(
         #   is merely stale. This one is not: continuing means reviewing the
         #   wrong artifact and saying nothing (#289).
         raise
-    except Exception:
+    except Exception as exc:
         logger.exception(
             f"_prepare_worktree_for_task: unexpected error for {role} "
             f"task_id={task_id} — continuing"
         )
-        return ""
+        context = task_context if isinstance(task_context, dict) else {}
+        context["prep_error"] = type(exc).__name__
+        if role == "implementer":
+            caller_base = _object_id_or_empty(context.get("worktree_base_sha"))
+            if caller_base:
+                try:
+                    if _branch_ref(worktree_path, caller_base).lower() == caller_base.lower():
+                        context["prep_error_base_source"] = "caller"
+                        return caller_base
+                except Exception:
+                    logger.exception("_prepare_worktree_for_task: caller base lookup failed")
+        head = _object_id_or_empty(_worktree_head(worktree_path))
+        if head:
+            context["prep_error_base_source"] = "head"
+        return head
 
 
 def _worktree_head(worktree_path: str) -> str:
@@ -4006,10 +4020,25 @@ def create_app(
         """Persist the exact prepared base, including an explicit unknown (#358)."""
         try:
             base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
+            prep_error = (task.context or {}).get("prep_error")
+            caller_base = (_object_id_or_empty((task.context or {}).get("worktree_base_sha"))
+                           if role == "implementer" else "")
+            caller_when_unknown = not prepared_sha and bool(caller_base)
+            if caller_when_unknown:
+                prepared_sha = caller_base
+            base_status = "known" if prepared_sha else "unknown"
+            if caller_when_unknown:
+                base_status = "caller_when_prep_unknown"
+            if prep_error and prepared_sha:
+                source = (task.context or {}).get("prep_error_base_source")
+                base_status = ("caller_after_prep_error" if source == "caller" or caller_when_unknown
+                               else "head_after_prep_error")
             base_context = {
                 base_key: prepared_sha or None,
-                "worktree_base_status": "known" if prepared_sha else "unknown",
+                "worktree_base_status": base_status,
             }
+            if prep_error:
+                base_context["prep_error"] = prep_error
             landed = (task.context or {}).get("sync_landed_bases", {})
             if isinstance(landed, dict):
                 record = landed.get(role)
@@ -4383,6 +4412,10 @@ def create_app(
                     # and a reviewer that cannot has no way to notice the head
                     # moved under it.
                     if not _record_prepared_base(task, role, _reviewed_sha, "_try_push_next"):
+                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                        status="needs_human")
+                        return
+                    if (task.context or {}).get("prep_error") and not _reviewed_sha:
                         _fail_if_active(task.task_id, "prepared_base_not_recorded",
                                         status="needs_human")
                         return
@@ -5682,6 +5715,11 @@ def create_app(
                 # dispatches, but can no longer masquerade as an unrecorded
                 # stale base later in the task lineage.
                 if not _record_prepared_base(task, role, _reviewed_sha, "dispatcher"):
+                    _lock_stack.close()
+                    _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                    status="needs_human")
+                    return
+                if (task.context or {}).get("prep_error") and not _reviewed_sha:
                     _lock_stack.close()
                     _fail_if_active(task.task_id, "prepared_base_not_recorded",
                                     status="needs_human")
