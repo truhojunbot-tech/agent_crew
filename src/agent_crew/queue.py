@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 4
+QUEUE_SCHEMA_VERSION = 5
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
