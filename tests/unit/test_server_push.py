@@ -436,7 +436,9 @@ def test_u_sp14_impl_completed_auto_enqueue_review(tmp_db):
         push_fn=push,
     )
     with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("impl-001", "implement", "Add feature X"))
+        impl = _task_payload("impl-001", "implement", "Add feature X")
+        impl["context"]["crew_run_branch"] = True
+        client.post("/tasks", json=impl)
         assert len(push.calls) == 1
         assert "impl-001" in push.calls[0][1]
 
@@ -508,7 +510,9 @@ def test_u_sp17_auto_review_task_queryable(tmp_db):
         push_fn=push,
     )
     with TestClient(app) as client:
-        client.post("/tasks", json=_task_payload("impl-004", "implement", "Fix bug Y"))
+        impl = _task_payload("impl-004", "implement", "Fix bug Y")
+        impl["context"]["crew_run_branch"] = True
+        client.post("/tasks", json=impl)
         client.post("/tasks/impl-004/result", json=_result_payload("impl-004"))
 
         # Auto-enqueued review task gets pushed immediately, so it's in_progress
@@ -611,6 +615,7 @@ def test_u_sp20_auto_enqueue_review_inherits_project(tmp_db):
     with TestClient(app) as client:
         # Enqueue impl task with top-level project field
         impl = _task_payload("impl-sp20", project="project_a")
+        impl["context"]["crew_run_branch"] = True
         client.post("/tasks", json=impl)
 
         # Submit completed result → triggers _auto_enqueue_review

@@ -60,6 +60,7 @@ from agent_crew.pipeline import (
     reresolve_pending_rounds_caps as _pipeline_reresolve_pending_rounds_caps,
     auto_fallback_failed_task as _pipeline_auto_fallback_failed_task,
     successor_context as _successor_context,
+    MAX_TASK_RETRIES,
     hold_mismatched_pr_result,
     MISSING_IMPLEMENT_REF_DETAIL,
     artifact_gate_applies,
@@ -7117,6 +7118,10 @@ def create_app(
         )
         if review_id:
             _try_push_next("reviewer")
+        elif ((parent := q().get_task(impl_task_id)) is not None
+              and isinstance(parent.context, dict)
+              and parent.context.get("review_retry_task_id")):
+            _try_push_next("implementer")
 
     def _auto_enqueue_test(review_task_id: str, repo: str = "") -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
@@ -7325,7 +7330,7 @@ def create_app(
     def _auto_retry_failed_task(task_id: str, result: TaskResult, task_type: str) -> bool:
         """Auto-retry a failed task if it hasn't exceeded max retries.
         Return whether a retry or provider-limit escalation was recorded."""
-        MAX_RETRIES = 2
+        MAX_RETRIES = MAX_TASK_RETRIES
         try:
             # Get the original task to extract description, branch, and context
             original_task = q().get_task(task_id)

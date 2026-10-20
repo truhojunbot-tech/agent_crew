@@ -120,6 +120,9 @@ def _review_cascade_contract(queue: TaskQueue, review_task):
 #: a disagreement no additional round will settle. After the cap the loop stops
 #: and says so on the PR, because the next move is a human's.
 DEFAULT_REVIEW_FIX_MAX_ROUNDS = 3
+# The same-role retry budget used by the server's failed-task path and the
+# implementer PR-opening retry (#666).
+MAX_TASK_RETRIES = 2
 CANARY_CONTRACT_MAX_AGE_SECONDS = 24 * 60 * 60
 ROUNDS_CAP_RERESOLVE_WINDOW_SECONDS = 60
 ROUNDS_CAP_CASCADE_MAX_ATTEMPTS = 3
@@ -2177,12 +2180,55 @@ def auto_enqueue_review(
                     "review_blocked_reason": reason,
                     "review_target_branch": impl_task.branch,
                 })
+                try:
+                    retry_attempt = int(impl_ctx.get("retry_attempt") or 0)
+                except (TypeError, ValueError):
+                    retry_attempt = MAX_TASK_RETRIES
+                retry_id = ""
+                if retry_attempt < MAX_TASK_RETRIES:
+                    retry_id = f"retry-{impl_task_id}-a{retry_attempt + 1}"
+                    retry_context = successor_context(impl_ctx)
+                    retry_context.update({
+                        "prev_task_id": impl_task_id,
+                        "original_task_id": impl_task_id,
+                        "retry_attempt": retry_attempt + 1,
+                        "retry_reason": reason,
+                        "lineage_root_task_id": (
+                            impl_ctx.get("lineage_root_task_id") or impl_task_id),
+                    })
+                    _carry_lineage_intent(retry_context, impl_task, "implementer")
+                    retry_task = TaskRequest(
+                        task_id=retry_id, task_type="implement",
+                        description=(
+                            f"Open a PR for pushed branch {impl_task.branch!r} "
+                            f"and report its pr_number. Do not reimplement the code.\n\n"
+                            f"Original task: {impl_task.description}"
+                        ),
+                        branch=impl_task.branch,
+                        priority=impl_task.priority + 1,
+                        context=retry_context,
+                        project=_successor_project(queue, impl_task, server_project),
+                    )
+                    try:
+                        _enqueue_with_inherited_risk(
+                            queue, retry_task,
+                            {task.task_id: task for task in queue.list_tasks()},
+                            impl_task, ingress="cascade.fallback",
+                            successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                        )
+                    except TaskAlreadyExistsError:
+                        pass  # The same result was replayed.
+                    else:
+                        logger.info("auto_enqueue_review: %s will open the PR", retry_id)
+                if retry_id and queue.get_task(retry_id) is not None:
+                    queue.patch_context(impl_task_id, {"review_retry_task_id": retry_id})
                 from agent_crew.server import coordinator_notice_once
 
                 coordinator_notice_once(
-                    queue, impl_task_id, reason,
-                    f"reason={reason} branch={impl_task.branch} "
-                    "open a PR for the pushed branch before review",
+                    queue, impl_ctx.get("lineage_root_task_id") or impl_task_id, reason,
+                    f"reason={reason} branch={impl_task.branch} " +
+                    (f"implementer_retry={retry_id}" if retry_id else
+                     "retry cap exhausted; open a PR for the pushed branch"),
                 )
                 logger.warning(
                     "auto_enqueue_review: %s has no open PR for branch %s",
