@@ -74,7 +74,7 @@ def test_pr_opened_on_retry_resumes_review(tmp_path):
     assert _reviews(queue)[0].context["pr_number"] == 666
 
 
-def test_no_pr_retry_uses_existing_cap_and_notifies_once(tmp_path):
+def test_no_pr_retry_cap_sends_one_terminal_notice(tmp_path):
     queue = _completed_impl(tmp_path)
     messages = []
     with patch("agent_crew.github.pr_number_for_branch", return_value=None), patch(
@@ -97,7 +97,10 @@ def test_no_pr_retry_uses_existing_cap_and_notifies_once(tmp_path):
         auto_enqueue_review(queue, second.task_id)
     assert len(_pr_opening_retries(queue)) == 2
     assert _reviews(queue) == []
-    assert len(messages) == 1
+    assert len(messages) == 2
+    assert "kind=no_pr_for_review_exhausted" in messages[1]
+    assert "retry cap exhausted" in messages[1]
+    assert "branch=agent/work" in messages[1]
 
 
 def test_existing_pr_number_is_carried_to_review(tmp_path):

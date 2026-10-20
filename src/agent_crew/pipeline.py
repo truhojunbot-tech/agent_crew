@@ -2224,8 +2224,14 @@ def auto_enqueue_review(
                     queue.patch_context(impl_task_id, {"review_retry_task_id": retry_id})
                 from agent_crew.server import coordinator_notice_once
 
+                notice_kind = reason if retry_id else "no_pr_for_review_exhausted"
+                if not retry_id:
+                    queue.patch_context(impl_task_id, {
+                        "review_blocked_reason": notice_kind,
+                    })
                 coordinator_notice_once(
-                    queue, impl_ctx.get("lineage_root_task_id") or impl_task_id, reason,
+                    queue, impl_ctx.get("lineage_root_task_id") or impl_task_id,
+                    notice_kind,
                     f"reason={reason} branch={impl_task.branch} " +
                     (f"implementer_retry={retry_id}" if retry_id else
                      "retry cap exhausted; open a PR for the pushed branch"),
