@@ -29,6 +29,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from agent_crew.tokenomics_shadow import shadow_recommendation_for_task_id
+
 logger = logging.getLogger(__name__)
 
 #: The single arming switch. Alfred sets it; this repo never does.
@@ -226,6 +228,10 @@ def evaluate_review_dispatch(
 
     if (getattr(task, "task_type", "") or "") != "review":
         return CanaryDecision(applied=False, reason="not_a_review_task", **base)
+    context = task.context if isinstance(getattr(task, "context", None), dict) else {}
+    admission = context.get("cea_enqueue")
+    if isinstance(admission, dict) and admission.get("outcome") in ("STOP", "HUMAN_GATE"):
+        return CanaryDecision(applied=False, reason="admission_hold", **base)
     if reviewed_artifact_kind == "report":
         # A report can leave the branch head unchanged while changing the
         # artifact under review. Git SHA equality proves nothing about it.
@@ -293,6 +299,14 @@ def evaluate_review_dispatch(
             applied=False, reason="condition_holds_not_the_pinned_task",
             standing_review_task_id=standing_id, counterfactual=counterfactual,
             extra=extra, **base)
+    quality = shadow_recommendation_for_task_id(task.task_id)
+    veto = quality.get("quality_veto_reason")
+    if veto:
+        return CanaryDecision(
+            applied=False, reason=veto,
+            standing_review_task_id=standing_id, counterfactual=counterfactual,
+            extra={**extra, "quality_evidence_state": quality["quality_evidence_state"]},
+            **base)
     return CanaryDecision(
         applied=True,
         reason="standing_request_changes_on_identical_sha",
@@ -300,6 +314,7 @@ def evaluate_review_dispatch(
         standing_verdict=verdict,
         standing_findings=list(standing.get("findings") or []),
         counterfactual=counterfactual,
-        extra=extra,
+        extra={**extra, "quality_evidence_state": quality.get("quality_evidence_state",
+                                                               "legacy_absent")},
         **base,
     )
