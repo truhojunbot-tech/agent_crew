@@ -121,6 +121,23 @@ def test_cli_branch_can_still_enqueue_before_pr_exists(tmp_path):
     assert len(_reviews(queue)) == 1
 
 
+def test_legacy_task_without_crew_run_branch_keeps_review_cascade(tmp_path):
+    queue = TaskQueue(str(tmp_path / "legacy.db"))
+    queue.enqueue(TaskRequest(
+        "impl-legacy", "implement", "legacy branch", branch="agent/work",
+    ))
+    queue.submit_result("impl-legacy", TaskResult(
+        task_id="impl-legacy", status="completed", summary="pushed",
+        branch="agent/work", commit="a" * 40,
+    ))
+    with patch("agent_crew.github.pr_number_for_branch") as lookup:
+        review_id = auto_enqueue_review(queue, "impl-legacy")
+    assert review_id is not None
+    assert len(_reviews(queue)) == 1
+    assert _pr_opening_retries(queue) == []
+    lookup.assert_not_called()
+
+
 def test_no_branch_and_no_pr_keeps_161_guard(tmp_path):
     queue = _completed_impl(tmp_path, branch="")
     with patch("agent_crew.github.pr_number_for_branch", return_value=None):
@@ -146,7 +163,8 @@ def test_http_result_pushes_pr_opening_retry_to_implementer(tmp_path, monkeypatc
         response = client.post("/tasks", json={
             "task_id": "impl-http-666", "task_type": "implement",
             "description": "Implement #666", "branch": "agent/work",
-            "context": {"repo": "owner/repo", "risk_tier": 1},
+            "context": {"repo": "owner/repo", "risk_tier": 1,
+                        "crew_run_branch": False},
         })
         assert response.status_code == 201
         result = client.post("/tasks/impl-http-666/result", json={

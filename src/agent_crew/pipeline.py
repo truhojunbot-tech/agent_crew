@@ -2161,10 +2161,11 @@ def auto_enqueue_review(
             )
             return None
 
-        # A standalone implement result needs an open PR before a reviewer can
-        # act on it. A crew-run branch is different: its CLI may open the PR
-        # after this result, so preserve that cascade (#666).
-        if pr_number is None and impl_task.branch and not impl_ctx.get("crew_run_branch"):
+        # Only an explicit standalone branch declaration opts into this guard.
+        # Older tasks omit crew_run_branch; preserve their existing cascade.
+        # A crew-run branch's CLI may open the PR after this result (#666).
+        if (pr_number is None and impl_task.branch
+                and impl_ctx.get("crew_run_branch") is False):
             from agent_crew.github import pr_number_for_branch
 
             found_pr = pr_number_for_branch(
@@ -2213,7 +2214,7 @@ def auto_enqueue_review(
                         _enqueue_with_inherited_risk(
                             queue, retry_task,
                             {task.task_id: task for task in queue.list_tasks()},
-                            impl_task, ingress="cascade.fallback",
+                            impl_task, ingress="retry.failed_task",
                             successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                         )
                     except TaskAlreadyExistsError:
