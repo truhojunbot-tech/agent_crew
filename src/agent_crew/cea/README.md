@@ -99,7 +99,10 @@ The five call sites (`callsites.gate_off`) record that they stood down instead o
 building `B′` and running the validator; the dispatch nonce is still minted,
 since it is the executor-binding protocol and not a judgement. `CEA_MODE_OFF` is
 never in `ENFORCEABLE_REASON_CODES`. A row admitted while off does not carry
-into `enforce`: its unsigned, not-consulted receipt is refused at claim there.
+into `enforce`: its unsigned, not-consulted receipt is refused at claim there
+(`REFUSED_UNSIGNED_RECEIPT`; the row stays `pending`). Work that must run under
+`enforce` is re-enqueued through admission — there is no late verdict, because
+`tasks.receipt_id` is immutable and a stand-down receipt is trivially forgeable.
 The only place a verdict is computed and *not* enforced is the enforce-code
 allowlist below, which is why its refusals are labelled advisory.
 
