@@ -112,15 +112,21 @@ logger = logging.getLogger(__name__)
 
 
 def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
-                            detail: str = "", notify_fn=None) -> None:
-    """Deliver one durable coordinator notice across HTTP and MCP transports."""
+                            detail: str = "", notify_fn=None) -> bool:
+    """Deliver one durable coordinator notice across HTTP and MCP transports.
+
+    Returns True when the durable path ran to completion — delivered, or
+    nothing to do because the notice is already claimed/delivered — and False
+    when the queue itself failed (#816: the claim is a sqlite write, so a
+    caller that is retrying because of a lock needs to know).
+    """
     claimed = False
     try:
         task = queue.get_task(task_id)
         intent = (queue.get_work_intent(task_id[len("work-intent:"):])
                   if task is None and task_id.startswith("work-intent:") else None)
         if (task is None and intent is None) or not queue.claim_coordinator_notice(task_id, kind):
-            return
+            return True
         claimed = True
         ctx = task.context if task is not None and isinstance(task.context, dict) else {}
         safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
@@ -139,6 +145,7 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
         if not delivered:
             logger.warning("coordinator notice delivery failed task=%s kind=%s; %s",
                            task_id, kind, "retryable" if retryable else "gave up")
+        return True
     except Exception:
         logger.exception("coordinator notice failed task=%s kind=%s", task_id, kind)
         if claimed:
@@ -147,6 +154,7 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
             except Exception:
                 logger.exception("coordinator notice release failed task=%s kind=%s",
                                  task_id, kind)
+        return False
 _DEFAULT_GEMINI_MODEL = "Gemini 3.8 Flash (Medium)"
 
 
@@ -3722,6 +3730,8 @@ def create_app(
     # 'PausedError가 result 없이 억제 기록 → replay 스킵'을, result-carrying outbox reopen으로 해결.)
     from fastapi.responses import JSONResponse as _JSONResponse
     from agent_crew.queue import PausedError as _PausedError
+    from agent_crew import cascade_retry as _cascade_retry
+    from agent_crew.pipeline import _lineage_root_task_id as _pipeline_lineage_root_task_id
 
     @app.exception_handler(_PausedError)
     async def _paused_error_handler(request, exc):  # noqa: ANN001
@@ -3763,9 +3773,9 @@ def create_app(
     def q() -> TaskQueue:
         return state["queue"]
 
-    def _coordinator_notice(task_id: str, kind: str, detail: str = "") -> None:
+    def _coordinator_notice(task_id: str, kind: str, detail: str = "") -> bool:
         """Wake the coordinator once after confirmed delivery."""
-        coordinator_notice_once(q(), task_id, kind, detail, coordinator_notify_fn)
+        return coordinator_notice_once(q(), task_id, kind, detail, coordinator_notify_fn)
 
     def _failed_no_successor_notice(task_id: str, result: TaskResult,
                                     task_type: str) -> None:
@@ -3781,6 +3791,28 @@ def create_app(
         _coordinator_notice(task_id, "failed_no_successor", detail)
 
     app.state.coordinator_notice = _coordinator_notice
+
+    def _cascade_enqueue_failed_notice(parent_task_id: str, stage: str,
+                                       attempts: int, last_error: str) -> bool:
+        """#816: an exhausted cascade retry names the lineage and the missing step."""
+        lineage = parent_task_id
+        try:
+            tasks_by_id = {t.task_id: t for t in q().list_tasks()}
+            parent = tasks_by_id.get(parent_task_id)
+            if parent is not None:
+                lineage = _pipeline_lineage_root_task_id(tasks_by_id, parent)
+        except Exception:  # noqa: BLE001 — the queue may still be locked
+            logger.exception("cascade_enqueue_failed: lineage lookup failed for %s",
+                             parent_task_id)
+        detail = (f"lineage={lineage} parent={parent_task_id} missing_next_step={stage} "
+                  f"attempts={attempts} error={last_error}; the {stage} successor was "
+                  f"NOT created — enqueue it by hand (crew enqueue {stage})")
+        return _coordinator_notice(parent_task_id, _cascade_retry.NOTICE_KIND, detail)
+
+    _cascade_lock_retrier = _cascade_retry.CascadeLockRetrier(
+        notice_fn=_cascade_enqueue_failed_notice, paused_error=(_PausedError,))
+    app.state.cascade_lock_retrier = _cascade_lock_retrier
+    app.state.cascade_retry_wait = _cascade_lock_retrier.wait
 
     def _reconcile_cloud_and_notify() -> None:
         outcomes = _claude_cloud.reconcile_all_cloud_tasks(
@@ -7104,40 +7136,51 @@ def create_app(
         only adds the tmux push side-effect, which the MCP path skips —
         agents on the MCP loop pull tasks themselves.
         """
-        review_id = _pipeline_auto_enqueue_review(
-            q(),
-            impl_task_id,
-            pr_number,
-            pane_map=pane_map,
-            server_project=project,
-            # #305: the implementer's own report of where it pushed. Without it
-            # the cascade can only route from the task, which for a
-            # watch-ingested issue is `main`.
-            result=result,
-            repo_cwd=_any_worktree_path(),
-        )
-        if review_id:
-            _try_push_next("reviewer")
-        elif ((parent := q().get_task(impl_task_id)) is not None
-              and isinstance(parent.context, dict)
-              and parent.context.get("review_retry_task_id")):
-            _try_push_next("implementer")
+        def attempt():
+            return _pipeline_auto_enqueue_review(
+                q(),
+                impl_task_id,
+                pr_number,
+                pane_map=pane_map,
+                server_project=project,
+                # #305: the implementer's own report of where it pushed. Without it
+                # the cascade can only route from the task, which for a
+                # watch-ingested issue is `main`.
+                result=result,
+                repo_cwd=_any_worktree_path(),
+                raise_on_lock=True,
+            )
+
+        def after(review_id):
+            if review_id:
+                _try_push_next("reviewer")
+            elif ((parent := q().get_task(impl_task_id)) is not None
+                  and isinstance(parent.context, dict)
+                  and parent.context.get("review_retry_task_id")):
+                _try_push_next("implementer")
+
+        # #816: a transient `database is locked` used to end the lineage here.
+        _cascade_lock_retrier.run("review", impl_task_id, attempt, after)
 
     def _auto_enqueue_test(review_task_id: str, repo: str = "") -> None:
         """HTTP-side wrapper: run the transport-agnostic cascade then push.
         See ``_auto_enqueue_review`` for the rationale (#123)."""
-        test_id = _pipeline_auto_enqueue_test(
-            q(),
-            review_task_id,
-            pane_map=pane_map,
-            server_project=project,
-            repo=repo,
-            repo_cwd=_any_worktree_path(),
-            tester_agent=_DISPATCH_ROLE_TO_AGENT.get("tester"),
-        )
-        if test_id:
-            _try_push_next("tester")
-        else:
+        def attempt():
+            return _pipeline_auto_enqueue_test(
+                q(),
+                review_task_id,
+                pane_map=pane_map,
+                server_project=project,
+                repo=repo,
+                repo_cwd=_any_worktree_path(),
+                tester_agent=_DISPATCH_ROLE_TO_AGENT.get("tester"),
+                raise_on_lock=True,
+            )
+
+        def after(test_id):
+            if test_id:
+                _try_push_next("tester")
+                return
             review_ctx = q().get_task_context(review_task_id) or {}
             skipped = review_ctx.get("test_stage_skip") or {}
             if skipped.get("reason") == "gemini tester stage not run (provider limit)":
@@ -7145,6 +7188,9 @@ def create_app(
                 if isinstance(pr_number, int):
                     _auto_merge_pr(pr_number, repo=repo or review_ctx.get("repo") or "",
                                    review_task_id=review_task_id)
+
+        # #816: retry a transient `database is locked` instead of dropping the test.
+        _cascade_lock_retrier.run("test", review_task_id, attempt, after)
 
     def _any_worktree_path() -> str:
         """A worktree that is a checkout of THIS project's repository.
@@ -7251,8 +7297,11 @@ def create_app(
         # a FOLLOW-UP failed. The agent has already done the work, and an
         # agent that cannot POST its result is a task the dispatcher marks
         # failed on timeout.
-        try:
-            fix_id = _pipeline_auto_enqueue_fix(
+        # Captured now: a background retry runs outside this request's context.
+        replaying = _REPLAYING.get()
+
+        def attempt():
+            return _pipeline_auto_enqueue_fix(
                 q(),
                 review_task_id,
                 pane_map=pane_map,
@@ -7266,11 +7315,17 @@ def create_app(
                 # no explicit `repo`.
                 repo_cwd=_any_worktree_path(),
                 # #314 §4 P0: replay 중엔 fix-budget exhaustion PR comment skip.
-                suppress_side_effects=_REPLAYING.get(),
+                suppress_side_effects=replaying,
+                raise_on_lock=True,
             )
+
+        def after(fix_id):
             if fix_id:
                 _try_push_next("implementer")
-            return fix_id
+
+        try:
+            # #816: retry a transient `database is locked` instead of dropping the fix.
+            return _cascade_lock_retrier.run("fix", review_task_id, attempt, after)
         except _PausedError:
             # #314 §4 P0-2: pipeline이 이미 outbox reopen했음 — handler suppressed 200 위해 전파.
             raise

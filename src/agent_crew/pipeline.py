@@ -55,6 +55,7 @@ from agent_crew import tokenomics_canary as _tokenomics_canary
 #   is what made this file a second decision implementation; the static rule in
 #   tests/unit/test_sev0_cea_guard_count.py fails if the import comes back.
 from agent_crew.cea import cascade_contract as _cascade
+from agent_crew.cascade_retry import CascadeEnqueueLocked, is_database_locked
 
 logger = logging.getLogger(__name__)
 
@@ -1444,6 +1445,7 @@ def auto_enqueue_fix(
     repo_cwd: str = "",
     require_repo_default: bool = False,
     suppress_side_effects: bool = False,
+    raise_on_lock: bool = False,
 ) -> Optional[str]:
     """Create the fix task after an actionable review or test failure (#244, #795).
 
@@ -1883,6 +1885,10 @@ def auto_enqueue_fix(
             logger.exception(f"auto_enqueue_fix: outbox_reopen({review_task_id}) 실패")
         raise
     except Exception as e:
+        if raise_on_lock and is_database_locked(e):
+            # #816: a transient sqlite lock is retryable, and this cascade is
+            # idempotent — let an opted-in caller retry the whole call.
+            raise CascadeEnqueueLocked("fix", review_task_id, e) from e
         logger.warning(f"auto_enqueue_fix: unexpected error: {e}")
         return None
 
@@ -2072,6 +2078,7 @@ def auto_enqueue_review(
     pr_state_fn=None,
     result=None,
     repo_cwd: str = "",
+    raise_on_lock: bool = False,
 ) -> Optional[str]:
     """Create the review task that follows a completed impl task.
 
@@ -2404,6 +2411,10 @@ def auto_enqueue_review(
             logger.exception(f"auto_enqueue_review: outbox_reopen({impl_task_id}) 실패")
         raise
     except Exception as e:
+        if raise_on_lock and is_database_locked(e):
+            # #816: a transient sqlite lock is retryable, and this cascade is
+            # idempotent — let an opted-in caller retry the whole call.
+            raise CascadeEnqueueLocked("review", impl_task_id, e) from e
         logger.warning(f"auto_enqueue_review: unexpected error: {e}")
         return None
 
@@ -2418,6 +2429,7 @@ def auto_enqueue_test(
     repo: str = "",
     repo_cwd: str = "",
     tester_agent: Optional[str] = None,
+    raise_on_lock: bool = False,
 ) -> Optional[str]:
     """Create the test task that follows an approved review.
 
@@ -2600,6 +2612,10 @@ def auto_enqueue_test(
             logger.exception(f"auto_enqueue_test: outbox_reopen({review_task_id}) 실패")
         raise
     except Exception as e:
+        if raise_on_lock and is_database_locked(e):
+            # #816: a transient sqlite lock is retryable, and this cascade is
+            # idempotent — let an opted-in caller retry the whole call.
+            raise CascadeEnqueueLocked("test", review_task_id, e) from e
         logger.warning(f"auto_enqueue_test: unexpected error: {e}")
         return None
 
