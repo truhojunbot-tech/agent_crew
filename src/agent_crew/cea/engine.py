@@ -337,7 +337,7 @@ class EngineConfig:
     credential boundary. That is a named, explicit choice rather than a silent
     default, which is the only honest way to offer it.
     """
-    mode: str = SHADOW
+    mode: str = OFF
     endpoint: Optional[str] = None          # unix socket path; None ⇒ in-process
     broker_socket: Optional[str] = None    # opt-in broker decision endpoint
     broker_degraded: bool = False          # sandbox only; same uid never proves isolation
@@ -361,6 +361,12 @@ class EngineConfig:
 
     enforce_codes: Optional[frozenset[str]] = None
     """Codes allowed to stop work; ``None`` preserves full ENFORCE behavior."""
+
+    def __post_init__(self) -> None:
+        # Owner 2026-10-21: even direct EngineConfig construction cannot
+        # resurrect the historical observation-only shadow mode.
+        if self.mode == SHADOW or self.mode not in MODES:
+            object.__setattr__(self, "mode", OFF)
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None,
