@@ -8,7 +8,7 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 from agent_crew import cli
-from agent_crew.protocol import TaskRequest
+from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.pipeline import _carry_lineage_intent
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
@@ -100,6 +100,239 @@ def test_first_task_rolls_back_when_intent_insert_fails(tmp_path):
         queue.admit_work_intent(_intent(task=_task()))
     assert queue.get_task("impl-793") is None
     assert queue.get_work_intent("directive-1") is None
+
+
+def test_completed_bound_test_terminalizes_intent_without_manual_transition(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    test_task = _task("test-189a1205") | {"task_type": "test",
+                                          "description": "Read-only verification"}
+    admitted = queue.admit_work_intent(_intent("alpha5599:6283277797", task=test_task))
+    assert admitted["state"] == "BOUND"
+    queue.submit_result(
+        "test-189a1205",
+        TaskResult(task_id="test-189a1205", status="completed",
+                   summary="Read-only verification completed successfully."),
+    )
+    terminal = queue.get_work_intent("alpha5599:6283277797")
+    assert terminal["state"] == "SUCCESS"
+    assert terminal["task_ids"] == ["test-189a1205"]
+    assert terminal["decision_authority"] == "agent_crew:task_result"
+
+
+def test_completed_implement_does_not_terminalize_before_successor(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    admitted = queue.admit_work_intent(_intent(task=_task()))
+    assert admitted["state"] == "BOUND"
+    queue.submit_result(
+        "impl-793",
+        TaskResult(task_id="impl-793", status="completed",
+                   summary="Implementation completed; review successor is still required."),
+    )
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+@pytest.mark.parametrize("order", [("test-793", "review-793"), ("review-793", "test-793")])
+def test_all_bound_completed_terminalizes_in_either_order(tmp_path, order):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    queue.enqueue(TaskRequest(**_task("review-793") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    queue.bind_work_intent("directive-1", "review-793")
+    first, last = order
+    queue.submit_result(first, TaskResult(task_id=first, status="completed", summary="done"))
+    # One bound task is still pending: the operation is not done, whichever finished.
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.submit_result(last, TaskResult(task_id=last, status="completed", summary="done"))
+    terminal = queue.get_work_intent("directive-1")
+    assert terminal["state"] == "SUCCESS"
+    assert terminal["decision_authority"] == "agent_crew:task_result"
+
+
+def test_completed_review_does_not_terminalize_without_test(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    queue.enqueue(TaskRequest(**_task("review-793") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    queue.bind_work_intent("directive-1", "review-793")
+    for task_id in ("impl-793", "review-793"):
+        queue.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
+                                                summary="done"))
+    # Every bound task is completed, but no test ran: review is not the terminal role.
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_terminal_success_rejects_result_correction(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    queue.submit_result("test-793", TaskResult(task_id="test-793", status="completed",
+                                               summary="passed"))
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+    with pytest.raises(ValueError, match="terminal SUCCESS"):
+        queue.submit_result("test-793", TaskResult(
+            task_id="test-793", status="failed",
+            summary="correction: suite actually failed"))
+    assert queue.get_task("test-793").status == "completed"
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+
+
+def test_request_changes_review_keeps_intent_bound_for_fix_successor(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    queue.enqueue(TaskRequest(**_task("review-793") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    queue.bind_work_intent("directive-1", "review-793")
+    queue.submit_result("test-793", TaskResult(
+        task_id="test-793", status="completed", summary="test passed"))
+    queue.submit_result("review-793", TaskResult(
+        task_id="review-793", status="completed", summary="changes required",
+        verdict="request_changes", findings=["fix the terminal-state edge case"]))
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.enqueue(TaskRequest(**_task("fix-793")), ingress="http.tasks")
+    bound = queue.bind_work_intent("directive-1", "fix-793")
+    assert "fix-793" in bound["task_ids"]
+    assert bound["state"] == "BOUND"
+
+
+def _lineage_task(task_id, task_type, prev_task_id, **context):
+    return _task(task_id) | {"task_type": task_type,
+                             "context": {"issue": 793, "risk_tier": 2,
+                                         "prev_task_id": prev_task_id,
+                                         "external_operation_id": "directive-1", **context}}
+
+
+def _complete(queue, task_id, **fields):
+    queue.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
+                                            summary=f"{task_id} done", **fields))
+
+
+def test_corrected_review_lineage_reaches_success(tmp_path):
+    """Review of PR #817 at acff035: a resolved request_changes must not veto SUCCESS."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    # Pipeline lineage: impl -> review-1 -> fix -> review-2 -> test (prev_task_id chain).
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("review-2", "review", "fix-1"),
+                 _lineage_task("test-793", "test", "review-2")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    assert set(queue.get_work_intent("directive-1")["task_ids"]) == {
+        "impl-793", "review-1", "fix-1", "review-2", "test-793"}
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    _complete(queue, "fix-1")
+    # Fix landed but its re-review has not spoken: the request_changes is still open.
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "review-2", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "test-793")
+    terminal = queue.get_work_intent("directive-1")
+    assert terminal["state"] == "SUCCESS"
+    assert terminal["decision_authority"] == "agent_crew:task_result"
+
+
+def test_second_request_changes_in_lineage_still_vetoes_success(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("review-2", "review", "fix-1"),
+                 _lineage_task("test-793", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "test-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["first"])
+    _complete(queue, "fix-1")
+    # review-1 is resolved by review-2, but review-2 itself requests changes again.
+    _complete(queue, "review-2", verdict="request_changes", findings=["second"])
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.enqueue(TaskRequest(**_lineage_task("fix-2", "implement", "review-2", fix_round=2)),
+                  ingress="http.tasks")
+    queue.enqueue(TaskRequest(**_lineage_task("review-3", "review", "fix-2")),
+                  ingress="http.tasks")
+    _complete(queue, "fix-2")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "review-3", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+
+
+def test_direct_rereview_without_fix_does_not_clear_request_changes(tmp_path):
+    """Review of PR #817 at 7b7f11e: an approving re-review resolves a
+    request_changes only through a completed bound implement fix. A review
+    that descends directly from the vetoing review carries no correction, so
+    the veto stands and the intent must not terminalize."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("review-2", "review", "review-1"),
+                 _lineage_task("test-793", "test", "review-2")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    _complete(queue, "review-2", verdict="approve")
+    _complete(queue, "test-793")
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BOUND"
+    assert "fix" not in " ".join(intent["task_ids"])  # no implement fix was ever bound
+
+
+def test_rereview_after_incomplete_fix_does_not_clear_request_changes(tmp_path):
+    """A fix task in the chain only counts as correction once it is completed."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("review-2", "review", "fix-1"),
+                 _lineage_task("test-793", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "test-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    queue.submit_result("fix-1", TaskResult(task_id="fix-1", status="failed",
+                                            summary="fix-1 could not land"))
+    _complete(queue, "review-2", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_intent_update_failure_rolls_back_task_completion(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TRIGGER reject_success BEFORE UPDATE OF state ON work_intents "
+                     "WHEN NEW.state='SUCCESS' "
+                     "BEGIN SELECT RAISE(ABORT, 'intent update refused'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        queue.submit_result("test-793", TaskResult(task_id="test-793", status="completed",
+                                                   summary="passed"))
+    # Same transaction: the task result is not durable without the intent update.
+    assert queue.get_task("test-793").status == "pending"
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_successful_intent_rejects_late_rebind(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    test_task = _task("test-793") | {"task_type": "test", "description": "Terminal test"}
+    queue.admit_work_intent(_intent(task=test_task))
+    queue.submit_result(
+        "test-793",
+        TaskResult(task_id="test-793", status="completed",
+                   summary="Terminal test completed successfully."),
+    )
+    queue.enqueue(TaskRequest(**_task("late-review") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    with pytest.raises(ValueError, match="terminal"):
+        queue.bind_work_intent("directive-1", "late-review")
 
 
 def test_block_and_terminal_decisions_are_structured(tmp_path):

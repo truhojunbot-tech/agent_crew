@@ -3689,7 +3689,7 @@ class TaskQueue:
             raise ValueError("work intent does not exist")
         if project is not None and row["project"] != project:
             raise ValueError("task project differs from work intent")
-        if row["state"] in ("REJECTED", "SUPERSEDED"):
+        if row["state"] in ("REJECTED", "SUPERSEDED", "SUCCESS"):
             raise ValueError("work intent is terminal")
         ids = json.loads(row["task_ids"])
         if task_id not in ids:
@@ -3697,6 +3697,117 @@ class TaskQueue:
         conn.execute("UPDATE work_intents SET task_ids=?, state='BOUND', blocker=NULL, "
                      "last_progress_at=?, next_check_at=NULL WHERE external_operation_id=?",
                      (json.dumps(ids), now, op_id))
+
+    @staticmethod
+    def _bound_ancestors(by_id: dict, task_id: str) -> list:
+        """Walk ``prev_task_id`` from ``task_id`` through the bound task rows.
+
+        Stops at the first task outside the bound set or on a cycle, so a
+        malformed context cannot loop.
+        """
+        chain, seen, current = [], set(), task_id
+        while isinstance(current, str) and current in by_id and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            try:
+                context = json.loads(by_id[current]["context"] or "{}")
+            except (TypeError, ValueError):
+                break
+            current = context.get("prev_task_id") if isinstance(context, dict) else None
+        return chain
+
+    @staticmethod
+    def _terminalize_work_intent_on(conn, task_id: str, task_type: str,
+                                    result_status: str, now: float) -> None:
+        """Reconcile a bound operation's terminal state with its tasks' results.
+
+        The invariant is: an operation is SUCCESS exactly when every bound task
+        is completed and at least one of them is a completed test. Test is the
+        pipeline's terminal role, so implement/review completion alone never
+        closes the operation -- their normal successors may not be enqueued
+        yet. But the test is not necessarily the *last* bound task to finish
+        (review of PR #817, finding 1), so the check runs on every accepted
+        result for a bound task, whatever its type.
+
+        A completed review whose verdict is ``request_changes`` is not a
+        successful bound task while it is *unresolved*: its fix successor has
+        not been re-reviewed yet. It is resolved once a later bound review
+        completed that descends from it through the ``prev_task_id`` chain
+        **and** a completed bound implement (the fix) sits between the two
+        reviews (review -> fix -> review); that later review's own verdict is
+        then the one that counts. A historical request_changes therefore does
+        not veto a lineage that was corrected and approved (review of PR #817
+        at acff035). A re-review that descends directly from the vetoing
+        review, with no completed fix in between, carries no correction and
+        leaves the veto standing (review of PR #817 at 7b7f11e). SUCCESS
+        itself is terminal; submit_result rejects later revisions to tasks
+        belonging to a successful intent.
+
+        The update shares submit_result's transaction, so task completion and
+        operation state cannot diverge on crash.
+        """
+        task = conn.execute("SELECT context FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if task is None:
+            return
+        try:
+            context = json.loads(task["context"] or "{}")
+        except (TypeError, ValueError):
+            return
+        op_id = context.get("external_operation_id") if isinstance(context, dict) else None
+        if not isinstance(op_id, str) or not op_id:
+            return
+        intent = conn.execute(
+            "SELECT task_ids, state FROM work_intents WHERE external_operation_id=?",
+            (op_id,),
+        ).fetchone()
+        if intent is None or intent["state"] not in ("BOUND", "SUCCESS"):
+            return
+        try:
+            task_ids = json.loads(intent["task_ids"] or "[]")
+        except (TypeError, ValueError):
+            return
+        if not isinstance(task_ids, list) or not task_ids or task_id not in task_ids:
+            return
+        placeholders = ",".join("?" for _ in task_ids)
+        rows = conn.execute(
+            f"SELECT task_id, task_type, status, verdict, context FROM tasks "
+            f"WHERE task_id IN ({placeholders})",
+            tuple(task_ids),
+        ).fetchall()
+        # The row for ``task_id`` was already updated in this transaction, so
+        # ``rows`` reflects the result being accepted, not the prior status.
+        by_id = {row["task_id"]: row for row in rows}
+        all_completed = (len(by_id) == len(task_ids)
+                         and all(by_id[bound]["status"] == "completed" for bound in task_ids))
+        terminal_test_completed = any(
+            row["task_type"] == "test" and row["status"] == "completed" for row in by_id.values())
+        completed_reviews = [row for row in by_id.values()
+                             if row["task_type"] == "review" and row["status"] == "completed"]
+        resolved = set()
+        for review in completed_reviews:
+            # chain[0] is the review itself; every later entry is a bound
+            # ancestor, nearest first. An earlier review is resolved only once a
+            # completed implement has been passed on the way back to it -- that
+            # is the fix the re-review actually looked at.
+            corrected = False
+            for ancestor in TaskQueue._bound_ancestors(by_id, review["task_id"])[1:]:
+                row = by_id[ancestor]
+                if row["task_type"] == "implement" and row["status"] == "completed":
+                    corrected = True
+                elif row["task_type"] == "review" and corrected:
+                    resolved.add(ancestor)
+        review_requires_fix = any(
+            row["verdict"] == "request_changes" and row["task_id"] not in resolved
+            for row in completed_reviews)
+        succeeded = all_completed and terminal_test_completed and not review_requires_fix
+        if intent["state"] == "BOUND" and succeeded:
+            conn.execute(
+                "UPDATE work_intents SET state='SUCCESS', blocker=NULL, "
+                "decision_reason=?, decision_authority=?, last_progress_at=?, "
+                "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
+                ("all bound tasks completed; terminal test completed",
+                 "agent_crew:task_result", now, op_id),
+            )
 
     def admit_work_intent(self, intent: dict) -> dict:
         """Deduplicate an external operation; optional first task shares enqueue's txn."""
@@ -3830,6 +3941,8 @@ class TaskQueue:
                                (op_id,)).fetchone()
             if row is None:
                 raise KeyError(op_id)
+            if row["state"] == "SUCCESS":
+                raise ValueError("work intent already terminal")
             if row["state"] in ("REJECTED", "SUPERSEDED") and row["state"] != state:
                 raise ValueError("work intent already terminal")
             conn.execute("UPDATE work_intents SET state=?, blocker=?, decision_reason=?, "
@@ -4850,11 +4963,26 @@ class TaskQueue:
             # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT task_type, status FROM tasks WHERE task_id = ?",
+                "SELECT task_type, status, context FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             prior_status = row["status"]
+            try:
+                task_context = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                task_context = {}
+            op_id = (task_context.get("external_operation_id")
+                     if isinstance(task_context, dict) else None)
+            if isinstance(op_id, str) and op_id:
+                intent_state = conn.execute(
+                    "SELECT state FROM work_intents WHERE external_operation_id=?",
+                    (op_id,),
+                ).fetchone()
+                if intent_state is not None and intent_state["state"] == "SUCCESS":
+                    conn.execute("ROLLBACK")
+                    raise ValueError(
+                        f"work intent {op_id!r} is terminal SUCCESS; result revision rejected")
             if (row["task_type"] == "review" and prior_status == "completed"
                     and not allow_review_replay):
                 stored = conn.execute(
@@ -5037,6 +5165,7 @@ class TaskQueue:
                                 "dispatcher_failed" if dispatcher_failed else "result",
                                 posted=True, strict=dispatcher_failed,
                                 status=result.status, outcome=outcome)
+            self._terminalize_work_intent_on(conn, task_id, task_type, result.status, now)
             self._store_task_telemetry(conn, task_id, telemetry, now)
             # #204: completed_at >= started_at is expected to always hold —
             # started_at is set once at first dispatch and never rewritten
