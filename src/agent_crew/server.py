@@ -789,13 +789,18 @@ def _prepare_worktree_for_task(
       via `gh pr view` so the worktree tracks the real PR branch rather than
       the base branch stored in task.branch.
 
-    A survivable prep error uses a verified caller base or the worktree HEAD.
-    The delivery paths refuse to launch if neither is available.
+    A survivable implementer prep error uses a verified caller base or the
+    worktree HEAD. Reviewers and testers cannot substitute the worktree HEAD
+    for the PR revision. The delivery paths refuse to launch without a base.
     """
     try:
-        return _prepare_worktree_for_task_inner(
+        prepared = _prepare_worktree_for_task_inner(
             worktree_path, task_id, task_branch, role,
             task_context=task_context or {}, task_type=task_type) or ""
+        if isinstance(task_context, dict):
+            task_context.pop("prep_error", None)
+            task_context.pop("prep_error_base_source", None)
+        return prepared
     except WorktreePrepRefused:
         # ⛔Not swallowed. Every other prep failure is survivable — a stash
         #   conflict, a slow fetch — and dispatch continues on a worktree that
@@ -805,10 +810,11 @@ def _prepare_worktree_for_task(
     except Exception as exc:
         logger.exception(
             f"_prepare_worktree_for_task: unexpected error for {role} "
-            f"task_id={task_id} — continuing"
+            f"task_id={task_id} — checking dispatch base"
         )
         context = task_context if isinstance(task_context, dict) else {}
         context["prep_error"] = type(exc).__name__
+        context.pop("prep_error_base_source", None)
         if role == "implementer":
             caller_base = _object_id_or_empty(context.get("worktree_base_sha"))
             if caller_base:
@@ -818,10 +824,11 @@ def _prepare_worktree_for_task(
                         return caller_base
                 except Exception:
                     logger.exception("_prepare_worktree_for_task: caller base lookup failed")
-        head = _object_id_or_empty(_worktree_head(worktree_path))
-        if head:
-            context["prep_error_base_source"] = "head"
-        return head
+            head = _object_id_or_empty(_worktree_head(worktree_path))
+            if head:
+                context["prep_error_base_source"] = "head"
+            return head
+        return ""
 
 
 def _worktree_head(worktree_path: str) -> str:
@@ -4021,24 +4028,26 @@ def create_app(
         try:
             base_key = "worktree_base_sha" if role == "implementer" else "reviewed_sha"
             prep_error = (task.context or {}).get("prep_error")
+            source = (task.context or {}).get("prep_error_base_source")
             caller_base = (_object_id_or_empty((task.context or {}).get("worktree_base_sha"))
                            if role == "implementer" else "")
-            caller_when_unknown = not prepared_sha and bool(caller_base)
+            if prep_error and source not in ("caller", "head"):
+                prepared_sha = ""
+            caller_when_unknown = not prep_error and not prepared_sha and bool(caller_base)
             if caller_when_unknown:
                 prepared_sha = caller_base
             base_status = "known" if prepared_sha else "unknown"
             if caller_when_unknown:
                 base_status = "caller_when_prep_unknown"
             if prep_error and prepared_sha:
-                source = (task.context or {}).get("prep_error_base_source")
-                base_status = ("caller_after_prep_error" if source == "caller" or caller_when_unknown
+                base_status = ("caller_after_prep_error" if source == "caller"
                                else "head_after_prep_error")
             base_context = {
                 base_key: prepared_sha or None,
                 "worktree_base_status": base_status,
             }
-            if prep_error:
-                base_context["prep_error"] = prep_error
+            base_context["prep_error"] = prep_error or None
+            base_context["prep_error_base_source"] = source if prep_error else None
             landed = (task.context or {}).get("sync_landed_bases", {})
             if isinstance(landed, dict):
                 record = landed.get(role)
