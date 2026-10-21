@@ -165,22 +165,38 @@ def test_completed_review_does_not_terminalize_without_test(tmp_path):
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
 
-def test_corrected_failed_test_reopens_success_so_fix_can_bind(tmp_path):
+def test_terminal_success_rejects_result_correction(tmp_path):
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
     queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
     queue.submit_result("test-793", TaskResult(task_id="test-793", status="completed",
                                                summary="passed"))
     assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
-    queue.submit_result("test-793", TaskResult(task_id="test-793", status="failed",
-                                               summary="correction: suite actually failed"))
-    assert queue.get_task("test-793").status == "failed"
-    reopened = queue.get_work_intent("directive-1")
-    assert reopened["state"] == "BOUND"
-    assert "corrected to failed" in reopened["decision_reason"]
-    queue.enqueue(TaskRequest(**_task("fix-793")), ingress="http.tasks")
-    assert queue.bind_work_intent("directive-1", "fix-793")["task_ids"] == ["test-793", "fix-793"]
+    with pytest.raises(ValueError, match="terminal SUCCESS"):
+        queue.submit_result("test-793", TaskResult(
+            task_id="test-793", status="failed",
+            summary="correction: suite actually failed"))
+    assert queue.get_task("test-793").status == "completed"
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+
+
+def test_request_changes_review_keeps_intent_bound_for_fix_successor(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    queue.enqueue(TaskRequest(**_task("review-793") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    queue.bind_work_intent("directive-1", "review-793")
+    queue.submit_result("test-793", TaskResult(
+        task_id="test-793", status="completed", summary="test passed"))
+    queue.submit_result("review-793", TaskResult(
+        task_id="review-793", status="completed", summary="changes required",
+        verdict="request_changes", findings=["fix the terminal-state edge case"]))
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.enqueue(TaskRequest(**_task("fix-793")), ingress="http.tasks")
+    bound = queue.bind_work_intent("directive-1", "fix-793")
+    assert "fix-793" in bound["task_ids"]
+    assert bound["state"] == "BOUND"
 
 
 def test_intent_update_failure_rolls_back_task_completion(tmp_path):
