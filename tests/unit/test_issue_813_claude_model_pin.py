@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import sqlite3
 
 from fastapi.testclient import TestClient
 
@@ -111,3 +112,50 @@ def test_provider_child_env_drops_only_claude_session_identity():
     assert child["CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS"] == "1"
     assert child["ANTHROPIC_API_KEY"] == "keep"
     assert all(key in source for key in IDENTITY_KEYS)
+
+
+def _redispatch_same_task(app, queue, db, task_id):
+    """Re-dispatch ``task_id`` the way the capacity/transient paths do: the
+    same row, dequeued again. The fake worker never POSTs a result, so the
+    row is ``timed_out`` after each dispatch; roll it back to pending here."""
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("UPDATE tasks SET status='pending', claim_source='' WHERE task_id=?", (task_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    task = queue.dequeue(role="implementer")
+    assert task and task.task_id == task_id
+    asyncio.run(app.state.dispatch_task(task, "implementer"))
+    return queue.get_attribution(task_id)
+
+
+def test_same_task_redispatch_after_model_change_resets_once(tmp_path, monkeypatch, unused_tcp_port):
+    """review-2912af95: capacity/transient paths re-dispatch the SAME task_id.
+
+    The prior attribution must be compared even when it belongs to this task,
+    otherwise a model change between the two dispatches resumes the old
+    conversation under the new model.
+    """
+    monkeypatch.delenv("AGENT_CREW_CLAUDE_MODEL", raising=False)
+    app, queue, seen = _harness(tmp_path, monkeypatch, unused_tcp_port)
+    db = str(tmp_path / "tasks.db")
+    with TestClient(app):
+        first = _dispatch(app, queue, "impl-813-same")
+        assert first["context_policy"] == "fresh" and first["model"] == ""
+
+        monkeypatch.setenv("AGENT_CREW_CLAUDE_MODEL", "claude-fable-5-1")
+        changed = _redispatch_same_task(app, queue, db, "impl-813-same")
+        # Same model again on a third re-dispatch: the reset happens once.
+        same = _redispatch_same_task(app, queue, db, "impl-813-same")
+
+    assert changed["model"] == "claude-fable-5-1"
+    assert changed["context_policy"] == "fresh"
+    assert changed["context_generation"] == first["context_generation"] + 1
+    assert "--continue" not in seen[1][0]
+    assert seen[1][0][seen[1][0].index("--model") + 1] == "claude-fable-5-1"
+
+    assert same["model"] == "claude-fable-5-1"
+    assert same["context_policy"] == "resume"
+    assert same["context_generation"] == changed["context_generation"]
+    assert "--continue" in seen[2][0]

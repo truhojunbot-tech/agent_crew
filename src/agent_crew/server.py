@@ -5748,7 +5748,12 @@ def create_app(
             _previous_task_id = ""
             try:
                 _previous_task_id = q().peek_context_last_task_id(_project, agent, wt)
-                if _previous_task_id and _previous_task_id != task.task_id:
+                # review-2912af95: compare even when the previous task IS this
+                # task. Capacity/transient paths re-dispatch the same task_id,
+                # and its earlier attribution row holds the model that last
+                # ran in this conversation — a pin changed in between must
+                # not be `--continue`d onto the old model's context.
+                if _previous_task_id:
                     _previous_model = (q().get_attribution(_previous_task_id) or {}).get("model") or ""
                     if _previous_model != _known_model:
                         _force_context_reset = True
