@@ -176,13 +176,13 @@ _WORK_CLASS_ROLE = {
 # ═══════════════════════════════════════════════════════════════════════════
 
 OFF = "off"
-SHADOW = "shadow"
+SHADOW = "shadow"  # historical value only; operational shadow is forbidden (owner 2026-10-21)
 ENFORCE = "enforce"
 TEST = "test"
 
-MODES = (OFF, TEST, SHADOW, ENFORCE)
+MODES = (OFF, TEST, ENFORCE)
 
-EMBEDDED_MODES = (OFF, TEST, SHADOW)
+EMBEDDED_MODES = (OFF, TEST)
 """The modes in which :meth:`AuthorizationEngine.authorize` may run embedded.
 
 ⛔Codex, re-reviewing ``f1aee1d``: an in-process Python construct is not an
@@ -225,32 +225,27 @@ def project_mode_env_var(project: str) -> str:
 
 
 def resolve_mode(env: dict, project: Optional[str] = None) -> str:
-    """Rollout config: the engine mode in force for ``project``.
+    """Resolve the operational CEA mode for project.
 
-    Precedence: the per-project variable, then the process-wide
-    ``AGENT_CREW_CEA_MODE``, then :data:`SHADOW`.
-
-    ⛔Per-project, because rollout is per-project. A single process-wide switch
-      forces the whole fleet across the shadow→enforce boundary at once, which
-      means the first project that is ready cannot move until the last one is —
-      so in practice nobody moves. An unrecognised value falls back to
-      :data:`SHADOW` rather than raising: a typo in an operator's environment
-      must not be able to take admission down, and shadow is the mode that
-      changes nothing while still measuring.
-
-    ⛔The fallback direction is deliberately *not* fail-closed. That asymmetry
-      is only sound because this setting decides whether the engine's verdict
-      **stops work**, never what the verdict is (P7: the engine has no shadow
-      branch). Failing a typo closed would refuse real work over a misspelling.
+    Owner directive 2026-10-21 forbids operational shadow. Explicit ENFORCE
+    remains enforce, TEST remains test-only, and everything else -- including
+    the historical value shadow, an unset variable, or a typo -- is OFF.
     """
     for name in (project_mode_env_var(project) if project else None,
                  "AGENT_CREW_CEA_MODE"):
         if not name:
             continue
         raw = (env.get(name) or "").strip().lower()
-        if raw:
-            return raw if raw in MODES else SHADOW
-    return SHADOW
+        if not raw:
+            continue
+        if raw == SHADOW:
+            logger.warning("CEA shadow mode is forbidden; treating %s=shadow as OFF", name)
+            return OFF
+        if raw in MODES:
+            return raw
+        logger.warning("Unrecognised CEA mode %r in %s; treating as OFF", raw, name)
+        return OFF
+    return OFF
 
 
 # Codes emitted by the engine or the receipt validator. Keep this explicit so a
@@ -389,16 +384,14 @@ class EngineConfig:
     def enforcing(self) -> bool:
         """Does a non-PROCEED answer stop the work? ``test`` enforces like
         ``enforce``; they differ only in where the engine is allowed to run.
-        ``off`` and ``shadow`` both proceed — they differ in whether the answer
-        is computed and recorded at all."""
+        Operational shadow is forbidden; non-enforced deployments are OFF."""
         return self.mode in (ENFORCE, TEST)
 
     @property
     def recording(self) -> bool:
-        """Is a gate answer worth computing here? ``off`` is the rollout escape
-        hatch: no verdict is produced, so nothing is recorded and nothing is
-        measured. It exists so "turn the engine off for this project" is a
-        config change rather than a deploy, and it is never the default."""
+        """Is a gate answer worth computing here? OFF produces no verdict.
+        OFF is the safe state for any project not explicitly running ENFORCE
+        (or TEST in a harness); operational shadow is not supported."""
         return self.mode != OFF
 
     @property
