@@ -25,10 +25,11 @@ Two rules shape every path through them:
 
 **P7 — fail closed, and never shadow-ALLOW a missing input.** A provider that
 does not exist yet reports *unavailable*; it does not guess. An unavailable input
-means ``B′`` cannot be computed, so admission BLOCKs. The ``shadow`` config switch
-belongs to the **adapters** — whether they honour the decision — and never to the
-engine: the engine always decides truthfully, so a shadow deployment still writes
-the receipt that says the input was missing.
+means ``B′`` cannot be computed, so admission BLOCKs. The mode switch belongs to
+the **adapters** — whether they honour the decision — and never to the engine:
+the engine always decides truthfully, so a non-enforcing deployment still writes
+the receipt that says the input was missing. (The observation-only ``shadow``
+mode itself is gone — owner directive 2026-10-21, see :data:`MODES`.)
 
 **P2a — degraded identity is stated, not assumed away.** Under one uid there is no
 credential boundary. With no engine key the receipt is unsigned and both identity
@@ -49,6 +50,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 import time
 import uuid
 from dataclasses import dataclass, field, replace
@@ -181,6 +183,16 @@ ENFORCE = "enforce"
 TEST = "test"
 
 MODES = (OFF, TEST, ENFORCE)
+"""The modes an operator may still name. ``shadow`` is not one of them: owner
+directive 2026-10-21 prohibits observation-only operation, so the historical
+value — and anything unrecognised, and nothing at all — resolves to :data:`OFF`.
+
+The two operational modes are :data:`OFF` (no verdict is computed, nothing is
+recorded, nothing stops) and :data:`ENFORCE` (the verdict stops work and the
+engine must be reached across the credential-checking socket). :data:`TEST` is
+not an operational mode: it is honoured only inside a verifiable test harness
+(:func:`test_harness_active`) and is OFF everywhere else.
+"""
 
 EMBEDDED_MODES = (OFF, TEST)
 """The modes in which :meth:`AuthorizationEngine.authorize` may run embedded.
@@ -192,15 +204,36 @@ EMBEDDED_MODES = (OFF, TEST)
   that refusal, and it is what makes the choice a *deployment* decision rather
   than a claim about class privacy.
 
-  ``shadow`` may run embedded because it stops nothing: it measures. ``test``
-  may run embedded because it is a test harness and says so in its name. In
-  ``enforce`` — the only mode where the engine's verdict withholds work — the
-  engine must be reached across the unix socket in :mod:`agent_crew.cea.service`,
-  where the credential is checked by a peer that is not the caller. Same-uid
-  peers are still untrusted and ``caller_identity_status`` is still UNVERIFIED
-  by contract until the O21b broker (see ``src/agent_crew/cea/README.md``); the
-  socket is a process boundary, not a verified identity.
+  ``off`` may run embedded because it computes nothing and stops nothing.
+  ``test`` may run embedded because it is a test harness — and, since the
+  review of PR #818, because it *cannot exist* outside one: :func:`resolve_mode`
+  and :class:`EngineConfig` both demote ``test`` to ``off`` unless
+  :func:`test_harness_active` says this interpreter is running under pytest.
+  In ``enforce`` — the only operational mode where the engine's verdict
+  withholds work — the engine must be reached across the unix socket in
+  :mod:`agent_crew.cea.service`, where the credential is checked by a peer that
+  is not the caller. Same-uid peers are still untrusted and
+  ``caller_identity_status`` is still UNVERIFIED by contract until the O21b
+  broker (see ``src/agent_crew/cea/README.md``); the socket is a process
+  boundary, not a verified identity.
 """
+
+
+def test_harness_active() -> bool:
+    """Is *this interpreter* verifiably running under a test harness?
+
+    The fact is read from the live process — is ``pytest`` imported in this
+    interpreter? — and never from any ``env`` mapping a caller hands in, so
+    configuration cannot assert "I am a harness".
+
+    ⛔Not an environment variable. ``PYTEST_CURRENT_TEST`` is inherited by every
+      child process a test spawns, so it would let a dispatcher started *by* a
+      test — or by an operator copying a test's environment — run enforcement
+      with no credential boundary. The module check holds at collection time
+      too, which matters: several suites build ``EngineConfig(mode="test")`` at
+      import, before the runner has marked any test item current.
+    """
+    return "pytest" in sys.modules
 
 #: What a refusal receipt names as its ``project`` when the intent named none.
 #: §3 freezes ``project`` as a non-empty string and P2 requires the audit row
@@ -225,11 +258,26 @@ def project_mode_env_var(project: str) -> str:
 
 
 def resolve_mode(env: dict, project: Optional[str] = None) -> str:
-    """Resolve the operational CEA mode for project.
+    """Resolve the operational CEA mode for ``project``.
 
-    Owner directive 2026-10-21 forbids operational shadow. Explicit ENFORCE
-    remains enforce, TEST remains test-only, and everything else -- including
-    the historical value shadow, an unset variable, or a typo -- is OFF.
+    Precedence: the per-project variable, then the process-wide
+    ``AGENT_CREW_CEA_MODE``. The first non-empty value decides; an
+    exported-but-empty variable falls through to the next source.
+
+    Owner directive 2026-10-21 forbids operational shadow. What a value means:
+
+    * ``enforce`` → :data:`ENFORCE`.
+    * ``test`` → :data:`TEST` **only** when :func:`test_harness_active` holds
+      for this interpreter; in any other process it is :data:`OFF`. ``test`` is
+      enforcement without a credential boundary, which is acceptable in a
+      harness and in nothing else (review of PR #818).
+    * ``shadow`` (the historical observation-only mode), an unrecognised value,
+      or no value at all → :data:`OFF`.
+
+    ⛔The fallback is OFF rather than ENFORCE on purpose: a typo in an
+      operator's environment must not refuse real work, and the engine has
+      known historical false-block classes. Explicit enforcement authority is
+      preserved; nothing resolves to something *stricter* than what was written.
     """
     for name in (project_mode_env_var(project) if project else None,
                  "AGENT_CREW_CEA_MODE"):
@@ -240,6 +288,12 @@ def resolve_mode(env: dict, project: Optional[str] = None) -> str:
             continue
         if raw == SHADOW:
             logger.warning("CEA shadow mode is forbidden; treating %s=shadow as OFF", name)
+            return OFF
+        if raw == TEST:
+            if test_harness_active():
+                return TEST
+            logger.warning("CEA test mode is harness-only; treating %s=test as OFF "
+                           "outside a verifiable test harness", name)
             return OFF
         if raw in MODES:
             return raw
@@ -318,12 +372,11 @@ class EngineConfig:
     """How this runtime reaches the engine, and what the adapters do with it.
 
     ``mode`` is read by the **adapters** to decide whether a non-ALLOW receipt
-    stops the work: in ``shadow`` they record it and proceed as they do today; in
-    ``test`` and ``enforce`` non-PROCEED answers stop work according to the
-    optional reason-code allowlist. The engine's verdict is
-    identical in all three — that is what makes the shadow measurement worth
-    anything, and it is why "shadow-ALLOW because an input was missing" cannot
-    happen: the engine has no shadow branch to take.
+    stops the work: in ``off`` no verdict is computed at all; in ``test`` and
+    ``enforce`` non-PROCEED answers stop work according to the optional
+    reason-code allowlist. The engine's verdict is identical in every mode that
+    computes one — the engine has no mode branch to take, so "ALLOW because an
+    input was missing" cannot happen.
 
     ``mode`` is read by :meth:`AuthorizationEngine.authorize` for exactly one
     thing, and it is not a verdict: whether this deployment is allowed to
@@ -332,10 +385,15 @@ class EngineConfig:
     the socket, not in this interpreter.
 
     ``test`` is ``enforce`` minus that deployment requirement — enforcement in a
-    harness, where there is no socket and no production consequence. ⛔Setting
-    ``AGENT_CREW_CEA_MODE=test`` in a real deployment gets enforcement without a
-    credential boundary. That is a named, explicit choice rather than a silent
-    default, which is the only honest way to offer it.
+    harness, where there is no socket and no production consequence. ⛔It is
+    therefore *only* available in a harness: ``__post_init__`` demotes
+    ``mode="test"`` to ``off`` unless :func:`test_harness_active` holds, so
+    ``AGENT_CREW_CEA_MODE=test`` in a real deployment does not get enforcement
+    without a credential boundary — it gets nothing (review of PR #818).
+
+    The historical ``shadow`` mode (compute and record, never stop) is gone:
+    owner directive 2026-10-21 prohibits observation-only operation, and
+    ``__post_init__`` demotes it to ``off`` even on direct construction.
     """
     mode: str = OFF
     endpoint: Optional[str] = None          # unix socket path; None ⇒ in-process
@@ -364,8 +422,15 @@ class EngineConfig:
 
     def __post_init__(self) -> None:
         # Owner 2026-10-21: even direct EngineConfig construction cannot
-        # resurrect the historical observation-only shadow mode.
+        # resurrect the historical observation-only shadow mode...
         if self.mode == SHADOW or self.mode not in MODES:
+            object.__setattr__(self, "mode", OFF)
+        # ...nor run test-harness enforcement in a live process (PR #818 review).
+        # `from_env` already resolved this; the check here is what makes it
+        # hold for every other constructor path too.
+        elif self.mode == TEST and not test_harness_active():
+            logger.warning("CEA test mode is harness-only; EngineConfig(mode=test) "
+                           "demoted to OFF outside a verifiable test harness")
             object.__setattr__(self, "mode", OFF)
 
     @classmethod
@@ -390,7 +455,9 @@ class EngineConfig:
     def enforcing(self) -> bool:
         """Does a non-PROCEED answer stop the work? ``test`` enforces like
         ``enforce``; they differ only in where the engine is allowed to run.
-        Operational shadow is forbidden; non-enforced deployments are OFF."""
+        Operational shadow is forbidden, so every mode that computes a verdict
+        also enforces it: ``recording`` and ``enforcing`` now answer the same
+        question, and the two names survive only for their call sites."""
         return self.mode in (ENFORCE, TEST)
 
     @property
@@ -707,7 +774,7 @@ class AuthorizationEngine:
                 "P7/P2a: mode=enforce refuses embedded in-process authorization. The caller "
                 "credential boundary is the unix-socket service (AGENT_CREW_CEA_ENGINE_ENDPOINT), "
                 "not this interpreter; an in-process caller object is not authentication. Use "
-                "mode=shadow to measure, mode=test in a harness, or deploy crew-authz",
+                "mode=off to stand down, mode=test inside a pytest harness, or deploy crew-authz",
                 conn=conn, unavailable=("caller_credential_boundary",)),
             http_status=403, code="CREDENTIAL_BOUNDARY_UNAVAILABLE")
 
@@ -1643,7 +1710,7 @@ def reset_engine() -> None:
 
 __all__ = [
     "Authorization", "AuthorizationEngine", "DEFAULT_ROLE_AGENTS", "EMBEDDED_MODES",
-    "ENFORCE", "MODES", "TEST", "EngineConfig",
+    "ENFORCE", "MODES", "TEST", "EngineConfig", "test_harness_active",
     "EngineError", "REVIEW_FLOOR", "SHADOW", "UNNAMED_PROJECT", "SnapshotHumanGate", "UnauthenticatedCaller",
     "UnavailableBudget", "UnavailableCapabilityRegistry", "UnavailablePolicySnapshot",
     "UnavailableRuntimeState", "get_engine", "intent_from_receipt", "intent_hash",

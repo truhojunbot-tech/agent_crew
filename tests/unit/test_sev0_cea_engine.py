@@ -324,15 +324,17 @@ def test_the_default_engine_has_no_providers_and_therefore_blocks(conn):
     assert auth.decision == "BLOCK" and auth.code == "INPUTS_UNAVAILABLE"
 
 
-def test_shadow_mode_does_not_change_the_verdict(conn):
-    """The shadow switch is an adapter concern. If it reached the engine, a
-    shadow deployment would measure a policy nobody is going to enforce."""
-    shadow = engine(config=EngineConfig(mode="shadow"),
-                    snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s1"), caller())
+def test_the_mode_does_not_change_the_verdict(conn):
+    """The mode switch is an adapter concern. If it reached the engine, a
+    deployment would measure a policy nobody is going to enforce. The
+    historical ``shadow`` value is ``off`` now (owner 2026-10-21) — and even
+    an ``off`` config asked directly for a verdict gets the same one."""
+    off = engine(config=EngineConfig(mode="shadow"),
+                 snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s1"), caller())
     enforce = engine(config=EngineConfig(mode="test"),
                      snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s2"), caller())
-    assert shadow.decision == enforce.decision == "BLOCK"
-    assert shadow.code == enforce.code == "INPUTS_UNAVAILABLE"
+    assert off.decision == enforce.decision == "BLOCK"
+    assert off.code == enforce.code == "INPUTS_UNAVAILABLE"
 
 
 def test_no_authority_in_the_snapshot_blocks(conn):
@@ -832,7 +834,8 @@ def test_config_from_env_selects_the_boundary(monkeypatch):
     monkeypatch.delenv("AGENT_CREW_CEA_ENGINE_ENDPOINT")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "nonsense")
     assert EngineConfig.from_env().endpoint is None
-    assert EngineConfig.from_env().mode == "shadow", "an unreadable mode is the safe one"
+    assert EngineConfig.from_env().mode == "off", \
+        "an unreadable mode is the safe one — off, never enforce (owner 2026-10-21: no shadow)"
 
 
 # ---------------------------------------------------------------------------

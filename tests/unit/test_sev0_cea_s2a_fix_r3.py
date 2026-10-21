@@ -240,7 +240,8 @@ def test_shadow_and_test_may_still_run_embedded(conn, mode):
       widening of where the engine may decide."""
     auth = _engine(mode).authorize(conn, intent(f"emb-{mode}"), caller())
     assert auth.code != "CREDENTIAL_BOUNDARY_UNAVAILABLE"
-    assert mode in EMBEDDED_MODES and mode in (TEST, SHADOW, OFF)
+    assert mode in EMBEDDED_MODES and mode in (TEST, OFF)
+    assert SHADOW not in EMBEDDED_MODES, "operational shadow is forbidden (owner 2026-10-21)"
     assert ENFORCE not in EMBEDDED_MODES, \
         "enforce is the one mode whose verdict withholds work; it needs the socket"
 
@@ -369,13 +370,18 @@ def test_enforce_mode_still_enforces_at_the_call_sites(conn):
 
     assert enforcing(EngineConfig(mode=ENFORCE)) is True
     assert enforcing(EngineConfig(mode=TEST)) is True
-    assert enforcing(EngineConfig(mode=SHADOW)) is False
+    assert enforcing(EngineConfig(mode=OFF)) is False
+    assert enforcing(EngineConfig(mode=SHADOW)) is False, "the historical value is off"
 
 
-def test_an_unknown_mode_falls_back_to_shadow_not_to_enforcement():
+def test_an_unknown_mode_falls_back_to_off_not_to_enforcement():
     """A typo must not silently turn enforcement on, and must not silently turn
-    a credential boundary off either."""
-    assert EngineConfig.from_env({"AGENT_CREW_CEA_MODE": "enfroce"}).mode == SHADOW
+    a credential boundary off either. Owner 2026-10-21: the fallback is ``off``
+    — the observation-only ``shadow`` no longer exists. ``test`` resolves here
+    because this *is* a pytest harness (``test_harness_active``); the
+    live-process counterpart is in ``test_no_shadow_runtime.py``."""
+    assert EngineConfig.from_env({"AGENT_CREW_CEA_MODE": "enfroce"}).mode == OFF
+    assert EngineConfig.from_env({"AGENT_CREW_CEA_MODE": "shadow"}).mode == OFF
     assert EngineConfig.from_env({"AGENT_CREW_CEA_MODE": "test"}).mode == TEST
     assert EngineConfig.from_env({"AGENT_CREW_CEA_MODE": "enforce"}).mode == ENFORCE
     assert EngineConfig.from_env({}).embedded_authorization_permitted is True

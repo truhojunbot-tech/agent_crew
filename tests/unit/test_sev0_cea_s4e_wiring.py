@@ -225,7 +225,8 @@ def test_nothing_configured_wires_nothing_and_says_why_for_every_slot(tmp_path):
         assert status is not None, f"{slot} must be reported, not omitted"
         assert status.state == wiring.UNAVAILABLE
         assert status.reason, f"{slot} UNAVAILABLE with no reason is what made this undebuggable"
-    assert "mode=shadow" in w.log_line()
+    assert "mode=off" in w.log_line(), \
+        "nothing configured ⇒ off (owner 2026-10-21: the default is no longer shadow)"
 
 
 def test_an_unwired_engine_blocks_on_unavailable_inputs_rather_than_guessing(tmp_path, conn):
@@ -246,7 +247,10 @@ def test_an_unwired_engine_blocks_on_unavailable_inputs_rather_than_guessing(tmp
 
 
 def test_every_provider_path_missing_never_raises_into_organic_dispatch(tmp_path, monkeypatch):
-    """(4) ``mode=shadow`` must not be able to break the queue.
+    """(4) a non-enforcing mode must not be able to break the queue.
+
+    The environment still spells the historical ``shadow``, which resolves to
+    ``off`` (owner 2026-10-21); the property under test is the same.
 
     The strongest version of "missing" is not an absent file — it is a provider
     that *explodes*. So each slot here is wired to a class that raises on every
@@ -273,7 +277,7 @@ def test_every_provider_path_missing_never_raises_into_organic_dispatch(tmp_path
 
     receipts = db.execute("SELECT decision, reason FROM authorization_receipts").fetchall()
     db.close()
-    assert receipts, "shadow must still record what it decided"
+    assert receipts, "admission still writes its receipt (P2) even when nothing stops"
     assert {r[0] for r in receipts} == {"BLOCK"}
     assert {json.loads(r[1])["code"] for r in receipts} == {"INPUTS_UNAVAILABLE"}, \
         "a provider that raised is an unavailable input, not a 500"

@@ -17,12 +17,18 @@ rollout must not have, so these tests pin both directions.
 **Item 2 — receipt-less legacy rows.**
 A row written before step 2c has no receipt, so the gate cannot be asked. Under
 ``enforce`` claim already refuses it (``queue.py`` ``claim_through_gate``).
-Under ``shadow`` it runs, and the number a deployment needs before it turns
-enforcement on is *how many are left* — which a log line cannot answer after the
-fact. So each such row leaves a durable ``cea_legacy_row`` event and ``/health``
-reports ``cea.legacy_rows``.
+``/health`` reports ``cea.legacy_rows`` so the number a deployment needs before
+it turns enforcement on — *how many are left* — is countable from the table.
 
-Provenance: written against agent_crew ``e26ae5e`` (sev0/cea-lineage, s4h).
+Owner directive 2026-10-21 (PR #818): the observation-only ``shadow`` mode that
+used to claim such a row *and* leave a durable ``cea_legacy_row`` report is
+gone. The historical value resolves to ``off``, which claims the row and records
+nothing; there is no longer any mode that records without enforcing. The tests
+below pin that, so that a legacy environment still spelling ``shadow`` cannot
+silently resurrect measurement-only operation.
+
+Provenance: written against agent_crew ``e26ae5e`` (sev0/cea-lineage, s4h);
+item 2 re-pinned for PR #818.
 """
 from __future__ import annotations
 
@@ -77,11 +83,11 @@ def _events(q: TaskQueue, task_id: str, event: str) -> list:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_the_config_is_resolved_from_the_receipts_project(tmp_path, monkeypatch):
-    monkeypatch.setenv(PROCESS, SHADOW)
+    monkeypatch.setenv(PROCESS, SHADOW)      # a legacy environment: resolves to off
     monkeypatch.setenv(f"AGENT_CREW_CEA_MODE__{HOT.upper()}", ENFORCE)
     q = _queue(tmp_path)
     assert q.cea_config_for_receipt({"project": HOT}).mode == ENFORCE
-    assert q.cea_config_for_receipt({"project": COLD}).mode == SHADOW
+    assert q.cea_config_for_receipt({"project": COLD}).mode == OFF
 
 
 @pytest.mark.parametrize("receipt", [None, {}, {"project": ""}, {"project": "   "}, "not-a-dict"])
@@ -97,9 +103,9 @@ def test_a_receipt_with_no_project_falls_back_to_the_process_wide_mode(
 def test_a_pinned_config_still_wins_over_the_receipt(tmp_path, monkeypatch):
     """An operator or test that pinned the mode pinned it (s4c)."""
     monkeypatch.setenv(f"AGENT_CREW_CEA_MODE__{HOT.upper()}", ENFORCE)
-    q = TaskQueue(str(tmp_path / "pinned.db"), cea_config=EngineConfig(mode=SHADOW),
+    q = TaskQueue(str(tmp_path / "pinned.db"), cea_config=EngineConfig(mode=OFF),
                   cea_providers=dict(WIRED))
-    assert q.cea_config_for_receipt({"project": HOT}).mode == SHADOW
+    assert q.cea_config_for_receipt({"project": HOT}).mode == OFF
 
 
 def test_the_four_post_admission_sites_no_longer_read_the_process_wide_mode():
@@ -223,38 +229,40 @@ def _legacy_row(q: TaskQueue, task_id="legacy-1", status="pending", project="age
     return task_id
 
 
-def test_a_legacy_claim_under_shadow_leaves_one_durable_report(tmp_path, monkeypatch):
+def test_a_legacy_claim_under_the_historical_shadow_value_is_off(tmp_path, monkeypatch):
+    """Owner 2026-10-21: ``shadow`` is ``off``. The row is still claimed — off
+    stops nothing — but no measurement is recorded, because the mode that
+    recorded without enforcing no longer exists."""
     monkeypatch.setenv(PROCESS, SHADOW)
     q = _queue(tmp_path)
+    assert q.cea_config().mode == OFF
     tid = _legacy_row(q)
-    assert q.dequeue(agent="claude", role="implementer") is not None, "shadow claims it"
-    events = _events(q, tid, TaskQueue.CEA_LEGACY_ROW_EVENT)
-    assert [e["point"] for e in events] == ["claim"]
-    assert events[0]["reason"] == "NO_RECEIPT"
-    assert events[0]["mode"] == SHADOW and events[0].get("enforced") in (None, False)
+    assert q.dequeue(agent="claude", role="implementer") is not None, "off claims it"
+    assert _events(q, tid, TaskQueue.CEA_LEGACY_ROW_EVENT) == []
 
 
-def test_a_legacy_dispatch_is_reported_too(tmp_path, monkeypatch):
-    """DISPATCH mints no nonce for a receipt-less row, so EXECUTE_START and
-    RESULT will have nothing to check. That is worth a row of its own."""
+def test_a_legacy_dispatch_under_the_historical_shadow_value_records_nothing(
+        tmp_path, monkeypatch):
+    """DISPATCH mints no nonce for a receipt-less row. Under the historical
+    ``shadow`` value that used to earn a second durable report; under ``off``
+    the dispatch still happens and nothing is recorded."""
     monkeypatch.setenv(PROCESS, SHADOW)
     q = _queue(tmp_path)
     tid = _legacy_row(q)
     q.dequeue(agent="claude", role="implementer")
     assert q.record_dispatch(tid, channel="tmux_pane", agent="claude", target="%1") is None
-    assert [e["point"] for e in _events(q, tid, TaskQueue.CEA_LEGACY_ROW_EVENT)] == \
-        ["claim", "dispatch"]
+    assert _events(q, tid, TaskQueue.CEA_LEGACY_ROW_EVENT) == []
 
 
-def test_the_report_line_says_what_enforce_would_have_done(tmp_path, monkeypatch, caplog):
+def test_no_report_line_is_logged_under_the_historical_shadow_value(
+        tmp_path, monkeypatch, caplog):
     monkeypatch.setenv(PROCESS, SHADOW)
     q = _queue(tmp_path)
-    tid = _legacy_row(q)
+    _legacy_row(q)
     with caplog.at_level("WARNING"):
         q.dequeue(agent="claude", role="implementer")
     lines = [r.getMessage() for r in caplog.records if "REPORT legacy-row" in r.getMessage()]
-    assert len(lines) == 1, lines
-    assert tid in lines[0] and "point=claim" in lines[0] and "enforced=False" in lines[0]
+    assert lines == [], lines
 
 
 def test_off_reports_nothing(tmp_path, monkeypatch):
@@ -268,8 +276,8 @@ def test_off_reports_nothing(tmp_path, monkeypatch):
 
 
 def test_enforce_still_refuses_the_claim(tmp_path, monkeypatch):
-    """The refusal is unchanged by the report: "no receipt" is not "no
-    objection" (P2). ``shadow`` counts; ``enforce`` stops."""
+    """The refusal is unchanged: "no receipt" is not "no objection" (P2).
+    ``off`` runs it; ``enforce`` (here ``test``, in a harness) stops it."""
     monkeypatch.setenv(PROCESS, "test")
     q = _queue(tmp_path)
     tid = _legacy_row(q)
@@ -278,9 +286,10 @@ def test_enforce_still_refuses_the_claim(tmp_path, monkeypatch):
 
 
 def test_the_count_is_of_rows_not_of_sightings(tmp_path, monkeypatch):
-    """``total`` is ground truth — including rows no call site has touched.
-    ``reported`` counts distinct tasks per point, so a row claimed twice is one
-    legacy row and not two."""
+    """``total`` is ground truth — including rows no call site has touched, and
+    independent of whether any call site *reported* them. Under ``off`` (which
+    is what the historical ``shadow`` value resolves to) nothing is reported,
+    and the table still counts every legacy row."""
     monkeypatch.setenv(PROCESS, SHADOW)
     q = _queue(tmp_path)
     _legacy_row(q, "legacy-a")
@@ -291,7 +300,7 @@ def test_the_count_is_of_rows_not_of_sightings(tmp_path, monkeypatch):
     q.dequeue(agent="claude", role="implementer")      # legacy-b
     out = q.cea_legacy_rows()
     assert out["total"] == 3 and out["open"] == 3
-    assert out["reported"] == {"claim": 2}
+    assert out["reported"] == {}
     assert out["event"] == TaskQueue.CEA_LEGACY_ROW_EVENT
     assert "error" not in out
 

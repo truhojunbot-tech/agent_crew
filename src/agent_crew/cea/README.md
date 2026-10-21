@@ -75,11 +75,29 @@ engine rather than duplicating it.
 
 **2. The boundary is the process plus the credential, not the class.**
 
-| mode | may `authorize()` run embedded? | does a non-PROCEED answer stop work? |
-|------|-------------------------------|--------------------------------------|
-| `shadow` | yes — it stops nothing, it measures | no |
-| `test` | yes — a harness, and it says so in its name | yes |
-| `enforce` | **no** | yes |
+| mode | operational? | may `authorize()` run embedded? | does a non-PROCEED answer stop work? |
+|------|--------------|-------------------------------|--------------------------------------|
+| `off` | yes — the default and the fallback | yes — it computes nothing and stops nothing | no (no verdict is computed) |
+| `enforce` | yes | **no** | yes |
+| `test` | **no** — pytest harness only | yes — inside the harness | yes, inside the harness |
+
+**There is no operational shadow mode** (owner directive 2026-10-21, PR #818).
+The historical value `AGENT_CREW_CEA_MODE=shadow` — compute and record a verdict,
+never stop on it — is still spelled by old environments and resolves to `off`,
+as does an unset variable or an unrecognised value. Nothing resolves to
+something *stricter* than what was written: the fallback is `off`, never
+`enforce`, because the engine has known historical false-block classes and a
+typo must not refuse real work. `EngineConfig(mode="shadow")` constructed
+directly is also `off`. Consequence: every mode that computes a verdict also
+enforces it; there is no longer any mode that records without enforcing.
+
+`test` is honoured only when `agent_crew.cea.engine.test_harness_active()` holds
+for the interpreter resolving it — `pytest` imported in that process. That is
+read from the live interpreter, never from the configuration mapping or an
+environment variable, so configuration cannot declare itself a harness and a
+child process that merely inherits `PYTEST_CURRENT_TEST` is not one. Anywhere
+else, `test` resolves to `off` with a warning. `tests/unit/test_no_shadow_runtime.py`
+spawns a fresh interpreter and pins this.
 
 For staged enforcement, set `AGENT_CREW_CEA_ENFORCE_CODES_<PROJECT>` to a
 comma-separated set of reason codes, for example
@@ -100,9 +118,10 @@ socket in `service.py`, where the credential is validated by a peer that is not
 the caller — `AGENT_CREW_CEA_ENGINE_ENDPOINT` plus
 `AGENT_CREW_CEA_ADAPTER_TOKEN_FILE`.
 
-⛔`AGENT_CREW_CEA_MODE=test` in a real deployment gets enforcement *without* a
-credential boundary. It is offered as a named, explicit choice rather than a
-silent default; that is the only honest way to offer it at all.
+⛔`AGENT_CREW_CEA_MODE=test` in a real deployment used to get enforcement
+*without* a credential boundary. Since the review of PR #818 it gets nothing:
+outside a verifiable pytest harness `test` is `off` (see the mode table above),
+so the only way to enforce in a live process is `enforce`, across the socket.
 
 A process boundary with a validated credential is still not a *verified
 identity* under one uid — the receipts keep saying `UNVERIFIED` across the socket

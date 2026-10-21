@@ -6156,13 +6156,13 @@ class TaskQueue:
                 #   reads as a refusal on its own. Label it on the go path so no
                 #   field of the answer contradicts `go`. The enforced answer
                 #   never reaches here and stays byte-identical.
-                shadow = gate_config.mode == "shadow"
+                # PR #818: there is no "shadow mode" label any more — the
+                #   historical value resolves to `off` (owner 2026-10-21), so a
+                #   non-enforced verdict is advisory whatever was written. The
+                #   `shadow_outcome` key is kept for clients already reading it.
                 answer.update(advisory=True, shadow_outcome=gate.outcome.value,
-                              reason=("shadow (not enforced): " if shadow else
-                                      "advisory (not enforced): ") + str(gate.reason),
+                              reason="advisory (not enforced): " + str(gate.reason),
                               instruction=(
-                                  "shadow mode: not enforced — proceed; decide on go only"
-                                  if shadow else
                                   "advisory verdict: not enforced — proceed; decide on go only"))
                 if gate.review_required:
                     answer["review_required"] = True
