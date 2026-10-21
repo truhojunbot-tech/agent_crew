@@ -8,7 +8,7 @@ from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
 from agent_crew import cli
-from agent_crew.protocol import TaskRequest
+from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.pipeline import _carry_lineage_intent
 from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
@@ -100,6 +100,53 @@ def test_first_task_rolls_back_when_intent_insert_fails(tmp_path):
         queue.admit_work_intent(_intent(task=_task()))
     assert queue.get_task("impl-793") is None
     assert queue.get_work_intent("directive-1") is None
+
+
+def test_completed_bound_test_terminalizes_intent_without_manual_transition(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    test_task = _task("test-189a1205") | {"task_type": "test",
+                                          "description": "Read-only verification"}
+    admitted = queue.admit_work_intent(_intent("alpha5599:6283277797", task=test_task))
+    assert admitted["state"] == "BOUND"
+    queue.submit_result(
+        "test-189a1205",
+        TaskResult(task_id="test-189a1205", status="completed",
+                   summary="Read-only verification completed successfully."),
+    )
+    terminal = queue.get_work_intent("alpha5599:6283277797")
+    assert terminal["state"] == "SUCCESS"
+    assert terminal["task_ids"] == ["test-189a1205"]
+    assert terminal["decision_authority"] == "agent_crew:task_result"
+
+
+def test_completed_implement_does_not_terminalize_before_successor(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    admitted = queue.admit_work_intent(_intent(task=_task()))
+    assert admitted["state"] == "BOUND"
+    queue.submit_result(
+        "impl-793",
+        TaskResult(task_id="impl-793", status="completed",
+                   summary="Implementation completed; review successor is still required."),
+    )
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_successful_intent_rejects_late_rebind(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    test_task = _task("test-793") | {"task_type": "test", "description": "Terminal test"}
+    queue.admit_work_intent(_intent(task=test_task))
+    queue.submit_result(
+        "test-793",
+        TaskResult(task_id="test-793", status="completed",
+                   summary="Terminal test completed successfully."),
+    )
+    queue.enqueue(TaskRequest(**_task("late-review") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    with pytest.raises(ValueError, match="terminal"):
+        queue.bind_work_intent("directive-1", "late-review")
 
 
 def test_block_and_terminal_decisions_are_structured(tmp_path):
