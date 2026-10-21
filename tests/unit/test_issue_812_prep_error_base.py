@@ -271,3 +271,93 @@ def test_dispatcher_unreadable_head_never_spawns_provider(tmp_path, monkeypatch)
     assert spawned == []
     assert queue.get_task_status("impl-812-dispatch") == "needs_human"
     assert queue.get_task_context("impl-812-dispatch")["prep_error"] == "TimeoutExpired"
+
+
+def test_empty_second_prep_keeps_error_and_never_readopts_stale_head(
+        tmp_path, monkeypatch):
+    """review-98317bcb: an empty re-preparation must not launder the prior
+    HEAD fallback into a "caller" base once the worktree has moved on."""
+    worker, head_a = _repo(tmp_path)
+    app, queue = _app(tmp_path, monkeypatch, worker, [])
+    queue.enqueue(TaskRequest("impl-812-stale", "implement", "fix", branch="feature",
+                              project="demo", context={}))
+    task = queue.get_task("impl-812-stale")
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
+
+    with TestClient(app):
+        first = sv._prepare_worktree_for_task(str(worker), task.task_id, "feature",
+                                               "implementer", task_context=task.context)
+        assert first == head_a
+        assert app.state.record_prepared_base(task, "implementer", first, "test")
+        assert queue.get_task_context(task.task_id)["worktree_base_sha"] == head_a
+
+        (worker / "moved.txt").write_text("moved\n")
+        _git(worker, "add", "moved.txt")
+        _git(worker, "commit", "-m", "moved")
+        head_b = _git(worker, "rev-parse", "HEAD")
+        assert head_b != head_a
+
+        monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", lambda *a, **kw: "")
+        second = sv._prepare_worktree_for_task(str(worker), task.task_id, "feature",
+                                                "implementer", task_context=task.context)
+        assert second == ""
+        assert task.context["prep_error"] == "TimeoutExpired"
+        assert app.state.record_prepared_base(task, "implementer", second, "test")
+
+    context = queue.get_task_context(task.task_id)
+    assert context["worktree_base_sha"] is None
+    assert context["worktree_base_status"] == "unknown"
+    assert context["prep_error"] == "TimeoutExpired"
+    assert context.get("prep_error_base_source") is None
+
+
+def test_dispatcher_stops_when_empty_reprep_follows_prep_error(tmp_path, monkeypatch):
+    worker, head_a = _repo(tmp_path)
+    pushed = []
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
+    app, queue = _app(tmp_path, monkeypatch, worker, pushed)
+
+    with TestClient(app) as client:
+        admitted = client.post("/tasks", json={
+            "task_id": "impl-812-reprep-stop", "task_type": "implement",
+            "description": "fix", "branch": "feature", "project": "demo", "context": {},
+        })
+        assert admitted.status_code == 201
+        assert queue.get_task_context("impl-812-reprep-stop")["worktree_base_sha"] == head_a
+        assert len(pushed) == 1
+
+        (worker / "moved.txt").write_text("moved\n")
+        _git(worker, "add", "moved.txt")
+        _git(worker, "commit", "-m", "moved")
+
+        monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", lambda *a, **kw: "")
+        task = queue.get_task("impl-812-reprep-stop")
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    assert len(pushed) == 1
+    context = queue.get_task_context("impl-812-reprep-stop")
+    assert context["worktree_base_sha"] is None
+    assert context["worktree_base_status"] == "unknown"
+    assert context["prep_error"] == "TimeoutExpired"
+    assert queue.get_task_status("impl-812-reprep-stop") == "needs_human"
+    assert queue.get_result("impl-812-reprep-stop").error_info["reason"] == "prepared_base_not_recorded"
+
+
+def test_unknown_prep_rejects_caller_base_that_is_not_current_head(tmp_path, monkeypatch):
+    worker, base = _repo(tmp_path)
+    (worker / "later.txt").write_text("later\n")
+    _git(worker, "add", "later.txt")
+    _git(worker, "commit", "-m", "later")
+    assert _git(worker, "rev-parse", "HEAD") != base
+    app, queue = _app(tmp_path, monkeypatch, worker, [])
+    queue.enqueue(TaskRequest(
+        "impl-812-caller-moved", "implement", "fix", branch="feature",
+        project="demo", context={"worktree_base_sha": base},
+    ))
+    task = queue.get_task("impl-812-caller-moved")
+
+    with TestClient(app):
+        assert app.state.record_prepared_base(task, "implementer", "", "test")
+    context = queue.get_task_context(task.task_id)
+    assert context["worktree_base_sha"] is None
+    assert context["worktree_base_status"] == "unknown"
