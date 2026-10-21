@@ -263,6 +263,46 @@ def test_second_request_changes_in_lineage_still_vetoes_success(tmp_path):
     assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
 
 
+def test_direct_rereview_without_fix_does_not_clear_request_changes(tmp_path):
+    """Review of PR #817 at 7b7f11e: an approving re-review resolves a
+    request_changes only through a completed bound implement fix. A review
+    that descends directly from the vetoing review carries no correction, so
+    the veto stands and the intent must not terminalize."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("review-2", "review", "review-1"),
+                 _lineage_task("test-793", "test", "review-2")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    _complete(queue, "review-2", verdict="approve")
+    _complete(queue, "test-793")
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BOUND"
+    assert "fix" not in " ".join(intent["task_ids"])  # no implement fix was ever bound
+
+
+def test_rereview_after_incomplete_fix_does_not_clear_request_changes(tmp_path):
+    """A fix task in the chain only counts as correction once it is completed."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("review-2", "review", "fix-1"),
+                 _lineage_task("test-793", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "test-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    queue.submit_result("fix-1", TaskResult(task_id="fix-1", status="failed",
+                                            summary="fix-1 could not land"))
+    _complete(queue, "review-2", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
 def test_intent_update_failure_rolls_back_task_completion(tmp_path):
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))

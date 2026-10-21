@@ -3733,11 +3733,15 @@ class TaskQueue:
         successful bound task while it is *unresolved*: its fix successor has
         not been re-reviewed yet. It is resolved once a later bound review
         completed that descends from it through the ``prev_task_id`` chain
-        (review -> fix -> review); that later review's own verdict is then the
-        one that counts. A historical request_changes therefore does not veto
-        a lineage that was corrected and approved (review of PR #817 at
-        acff035). SUCCESS itself is terminal; submit_result rejects later
-        revisions to tasks belonging to a successful intent.
+        **and** a completed bound implement (the fix) sits between the two
+        reviews (review -> fix -> review); that later review's own verdict is
+        then the one that counts. A historical request_changes therefore does
+        not veto a lineage that was corrected and approved (review of PR #817
+        at acff035). A re-review that descends directly from the vetoing
+        review, with no completed fix in between, carries no correction and
+        leaves the veto standing (review of PR #817 at 7b7f11e). SUCCESS
+        itself is terminal; submit_result rejects later revisions to tasks
+        belonging to a successful intent.
 
         The update shares submit_result's transaction, so task completion and
         operation state cannot diverge on crash.
@@ -3781,9 +3785,16 @@ class TaskQueue:
                              if row["task_type"] == "review" and row["status"] == "completed"]
         resolved = set()
         for review in completed_reviews:
-            # chain[0] is the review itself; every later entry is a bound ancestor.
+            # chain[0] is the review itself; every later entry is a bound
+            # ancestor, nearest first. An earlier review is resolved only once a
+            # completed implement has been passed on the way back to it -- that
+            # is the fix the re-review actually looked at.
+            corrected = False
             for ancestor in TaskQueue._bound_ancestors(by_id, review["task_id"])[1:]:
-                if by_id[ancestor]["task_type"] == "review":
+                row = by_id[ancestor]
+                if row["task_type"] == "implement" and row["status"] == "completed":
+                    corrected = True
+                elif row["task_type"] == "review" and corrected:
                     resolved.add(ancestor)
         review_requires_fix = any(
             row["verdict"] == "request_changes" and row["task_id"] not in resolved
