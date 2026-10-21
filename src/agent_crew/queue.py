@@ -3689,7 +3689,7 @@ class TaskQueue:
             raise ValueError("work intent does not exist")
         if project is not None and row["project"] != project:
             raise ValueError("task project differs from work intent")
-        if row["state"] in ("REJECTED", "SUPERSEDED"):
+        if row["state"] in ("REJECTED", "SUPERSEDED", "SUCCESS"):
             raise ValueError("work intent is terminal")
         ids = json.loads(row["task_ids"])
         if task_id not in ids:
@@ -3697,6 +3697,57 @@ class TaskQueue:
         conn.execute("UPDATE work_intents SET task_ids=?, state='BOUND', blocker=NULL, "
                      "last_progress_at=?, next_check_at=NULL WHERE external_operation_id=?",
                      (json.dumps(ids), now, op_id))
+
+    @staticmethod
+    def _terminalize_work_intent_on(conn, task_id: str, task_type: str,
+                                    result_status: str, now: float) -> None:
+        """Close a bound operation when its terminal test proves the lineage done.
+
+        Test is the pipeline's terminal role. Implement/review completion cannot
+        close the operation because their normal successors may not have been
+        enqueued yet. The update shares submit_result's transaction, so task
+        completion and operation SUCCESS cannot diverge on crash.
+        """
+        if result_status != "completed" or task_type != "test":
+            return
+        task = conn.execute("SELECT context FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        if task is None:
+            return
+        try:
+            context = json.loads(task["context"] or "{}")
+        except (TypeError, ValueError):
+            return
+        op_id = context.get("external_operation_id") if isinstance(context, dict) else None
+        if not isinstance(op_id, str) or not op_id:
+            return
+        intent = conn.execute(
+            "SELECT task_ids, state FROM work_intents WHERE external_operation_id=?",
+            (op_id,),
+        ).fetchone()
+        if intent is None or intent["state"] != "BOUND":
+            return
+        try:
+            task_ids = json.loads(intent["task_ids"] or "[]")
+        except (TypeError, ValueError):
+            return
+        if not isinstance(task_ids, list) or not task_ids or task_id not in task_ids:
+            return
+        placeholders = ",".join("?" for _ in task_ids)
+        rows = conn.execute(
+            f"SELECT task_id, status FROM tasks WHERE task_id IN ({placeholders})",
+            tuple(task_ids),
+        ).fetchall()
+        statuses = {row["task_id"]: row["status"] for row in rows}
+        if len(statuses) != len(task_ids) or any(statuses.get(bound) != "completed"
+                                                 for bound in task_ids):
+            return
+        conn.execute(
+            "UPDATE work_intents SET state='SUCCESS', blocker=NULL, "
+            "decision_reason=?, decision_authority=?, last_progress_at=?, "
+            "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
+            ("all bound tasks completed; terminal test completed",
+             "agent_crew:task_result", now, op_id),
+        )
 
     def admit_work_intent(self, intent: dict) -> dict:
         """Deduplicate an external operation; optional first task shares enqueue's txn."""
@@ -3830,6 +3881,8 @@ class TaskQueue:
                                (op_id,)).fetchone()
             if row is None:
                 raise KeyError(op_id)
+            if row["state"] == "SUCCESS":
+                raise ValueError("work intent already terminal")
             if row["state"] in ("REJECTED", "SUPERSEDED") and row["state"] != state:
                 raise ValueError("work intent already terminal")
             conn.execute("UPDATE work_intents SET state=?, blocker=?, decision_reason=?, "
@@ -5037,6 +5090,7 @@ class TaskQueue:
                                 "dispatcher_failed" if dispatcher_failed else "result",
                                 posted=True, strict=dispatcher_failed,
                                 status=result.status, outcome=outcome)
+            self._terminalize_work_intent_on(conn, task_id, task_type, result.status, now)
             self._store_task_telemetry(conn, task_id, telemetry, now)
             # #204: completed_at >= started_at is expected to always hold —
             # started_at is set once at first dispatch and never rewritten
