@@ -199,6 +199,70 @@ def test_request_changes_review_keeps_intent_bound_for_fix_successor(tmp_path):
     assert bound["state"] == "BOUND"
 
 
+def _lineage_task(task_id, task_type, prev_task_id, **context):
+    return _task(task_id) | {"task_type": task_type,
+                             "context": {"issue": 793, "risk_tier": 2,
+                                         "prev_task_id": prev_task_id,
+                                         "external_operation_id": "directive-1", **context}}
+
+
+def _complete(queue, task_id, **fields):
+    queue.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
+                                            summary=f"{task_id} done", **fields))
+
+
+def test_corrected_review_lineage_reaches_success(tmp_path):
+    """Review of PR #817 at acff035: a resolved request_changes must not veto SUCCESS."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    # Pipeline lineage: impl -> review-1 -> fix -> review-2 -> test (prev_task_id chain).
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("review-2", "review", "fix-1"),
+                 _lineage_task("test-793", "test", "review-2")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    assert set(queue.get_work_intent("directive-1")["task_ids"]) == {
+        "impl-793", "review-1", "fix-1", "review-2", "test-793"}
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    _complete(queue, "fix-1")
+    # Fix landed but its re-review has not spoken: the request_changes is still open.
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "review-2", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "test-793")
+    terminal = queue.get_work_intent("directive-1")
+    assert terminal["state"] == "SUCCESS"
+    assert terminal["decision_authority"] == "agent_crew:task_result"
+
+
+def test_second_request_changes_in_lineage_still_vetoes_success(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("review-2", "review", "fix-1"),
+                 _lineage_task("test-793", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "test-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["first"])
+    _complete(queue, "fix-1")
+    # review-1 is resolved by review-2, but review-2 itself requests changes again.
+    _complete(queue, "review-2", verdict="request_changes", findings=["second"])
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.enqueue(TaskRequest(**_lineage_task("fix-2", "implement", "review-2", fix_round=2)),
+                  ingress="http.tasks")
+    queue.enqueue(TaskRequest(**_lineage_task("review-3", "review", "fix-2")),
+                  ingress="http.tasks")
+    _complete(queue, "fix-2")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "review-3", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+
+
 def test_intent_update_failure_rolls_back_task_completion(tmp_path):
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))

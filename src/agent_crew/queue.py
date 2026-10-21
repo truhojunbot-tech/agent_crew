@@ -3699,6 +3699,24 @@ class TaskQueue:
                      (json.dumps(ids), now, op_id))
 
     @staticmethod
+    def _bound_ancestors(by_id: dict, task_id: str) -> list:
+        """Walk ``prev_task_id`` from ``task_id`` through the bound task rows.
+
+        Stops at the first task outside the bound set or on a cycle, so a
+        malformed context cannot loop.
+        """
+        chain, seen, current = [], set(), task_id
+        while isinstance(current, str) and current in by_id and current not in seen:
+            seen.add(current)
+            chain.append(current)
+            try:
+                context = json.loads(by_id[current]["context"] or "{}")
+            except (TypeError, ValueError):
+                break
+            current = context.get("prev_task_id") if isinstance(context, dict) else None
+        return chain
+
+    @staticmethod
     def _terminalize_work_intent_on(conn, task_id: str, task_type: str,
                                     result_status: str, now: float) -> None:
         """Reconcile a bound operation's terminal state with its tasks' results.
@@ -3712,9 +3730,14 @@ class TaskQueue:
         result for a bound task, whatever its type.
 
         A completed review whose verdict is ``request_changes`` is not a
-        successful bound task: its required fix successor has not been admitted
-        yet. SUCCESS itself is terminal; submit_result rejects later revisions
-        to tasks belonging to a successful intent.
+        successful bound task while it is *unresolved*: its fix successor has
+        not been re-reviewed yet. It is resolved once a later bound review
+        completed that descends from it through the ``prev_task_id`` chain
+        (review -> fix -> review); that later review's own verdict is then the
+        one that counts. A historical request_changes therefore does not veto
+        a lineage that was corrected and approved (review of PR #817 at
+        acff035). SUCCESS itself is terminal; submit_result rejects later
+        revisions to tasks belonging to a successful intent.
 
         The update shares submit_result's transaction, so task completion and
         operation state cannot diverge on crash.
@@ -3743,7 +3766,8 @@ class TaskQueue:
             return
         placeholders = ",".join("?" for _ in task_ids)
         rows = conn.execute(
-            f"SELECT task_id, task_type, status, verdict FROM tasks WHERE task_id IN ({placeholders})",
+            f"SELECT task_id, task_type, status, verdict, context FROM tasks "
+            f"WHERE task_id IN ({placeholders})",
             tuple(task_ids),
         ).fetchall()
         # The row for ``task_id`` was already updated in this transaction, so
@@ -3753,11 +3777,17 @@ class TaskQueue:
                          and all(by_id[bound]["status"] == "completed" for bound in task_ids))
         terminal_test_completed = any(
             row["task_type"] == "test" and row["status"] == "completed" for row in by_id.values())
+        completed_reviews = [row for row in by_id.values()
+                             if row["task_type"] == "review" and row["status"] == "completed"]
+        resolved = set()
+        for review in completed_reviews:
+            # chain[0] is the review itself; every later entry is a bound ancestor.
+            for ancestor in TaskQueue._bound_ancestors(by_id, review["task_id"])[1:]:
+                if by_id[ancestor]["task_type"] == "review":
+                    resolved.add(ancestor)
         review_requires_fix = any(
-            row["task_type"] == "review"
-            and row["status"] == "completed"
-            and row["verdict"] == "request_changes"
-            for row in by_id.values())
+            row["verdict"] == "request_changes" and row["task_id"] not in resolved
+            for row in completed_reviews)
         succeeded = all_completed and terminal_test_completed and not review_requires_fix
         if intent["state"] == "BOUND" and succeeded:
             conn.execute(
