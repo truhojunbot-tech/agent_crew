@@ -133,6 +133,72 @@ def test_completed_implement_does_not_terminalize_before_successor(tmp_path):
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
 
+@pytest.mark.parametrize("order", [("test-793", "review-793"), ("review-793", "test-793")])
+def test_all_bound_completed_terminalizes_in_either_order(tmp_path, order):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    queue.enqueue(TaskRequest(**_task("review-793") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    queue.bind_work_intent("directive-1", "review-793")
+    first, last = order
+    queue.submit_result(first, TaskResult(task_id=first, status="completed", summary="done"))
+    # One bound task is still pending: the operation is not done, whichever finished.
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.submit_result(last, TaskResult(task_id=last, status="completed", summary="done"))
+    terminal = queue.get_work_intent("directive-1")
+    assert terminal["state"] == "SUCCESS"
+    assert terminal["decision_authority"] == "agent_crew:task_result"
+
+
+def test_completed_review_does_not_terminalize_without_test(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    queue.enqueue(TaskRequest(**_task("review-793") | {"task_type": "review"}),
+                  ingress="http.tasks")
+    queue.bind_work_intent("directive-1", "review-793")
+    for task_id in ("impl-793", "review-793"):
+        queue.submit_result(task_id, TaskResult(task_id=task_id, status="completed",
+                                                summary="done"))
+    # Every bound task is completed, but no test ran: review is not the terminal role.
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_corrected_failed_test_reopens_success_so_fix_can_bind(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    queue.submit_result("test-793", TaskResult(task_id="test-793", status="completed",
+                                               summary="passed"))
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+    queue.submit_result("test-793", TaskResult(task_id="test-793", status="failed",
+                                               summary="correction: suite actually failed"))
+    assert queue.get_task("test-793").status == "failed"
+    reopened = queue.get_work_intent("directive-1")
+    assert reopened["state"] == "BOUND"
+    assert "corrected to failed" in reopened["decision_reason"]
+    queue.enqueue(TaskRequest(**_task("fix-793")), ingress="http.tasks")
+    assert queue.bind_work_intent("directive-1", "fix-793")["task_ids"] == ["test-793", "fix-793"]
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_intent_update_failure_rolls_back_task_completion(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TRIGGER reject_success BEFORE UPDATE OF state ON work_intents "
+                     "WHEN NEW.state='SUCCESS' "
+                     "BEGIN SELECT RAISE(ABORT, 'intent update refused'); END")
+    with pytest.raises(sqlite3.IntegrityError):
+        queue.submit_result("test-793", TaskResult(task_id="test-793", status="completed",
+                                                   summary="passed"))
+    # Same transaction: the task result is not durable without the intent update.
+    assert queue.get_task("test-793").status == "pending"
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
 def test_successful_intent_rejects_late_rebind(tmp_path):
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))

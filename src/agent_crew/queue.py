@@ -3701,15 +3701,24 @@ class TaskQueue:
     @staticmethod
     def _terminalize_work_intent_on(conn, task_id: str, task_type: str,
                                     result_status: str, now: float) -> None:
-        """Close a bound operation when its terminal test proves the lineage done.
+        """Reconcile a bound operation's terminal state with its tasks' results.
 
-        Test is the pipeline's terminal role. Implement/review completion cannot
-        close the operation because their normal successors may not have been
-        enqueued yet. The update shares submit_result's transaction, so task
-        completion and operation SUCCESS cannot diverge on crash.
+        The invariant is: an operation is SUCCESS exactly when every bound task
+        is completed and at least one of them is a completed test. Test is the
+        pipeline's terminal role, so implement/review completion alone never
+        closes the operation -- their normal successors may not be enqueued
+        yet. But the test is not necessarily the *last* bound task to finish
+        (review of PR #817, finding 1), so the check runs on every accepted
+        result for a bound task, whatever its type.
+
+        The same invariant runs in reverse: an accepted correction that moves a
+        completed test (or any bound task) off ``completed`` reopens a SUCCESS
+        operation to BOUND, so the fix successor can bind instead of the
+        operation claiming success next to a failed task (finding 2).
+
+        The update shares submit_result's transaction, so task completion and
+        operation state cannot diverge on crash.
         """
-        if result_status != "completed" or task_type != "test":
-            return
         task = conn.execute("SELECT context FROM tasks WHERE task_id=?", (task_id,)).fetchone()
         if task is None:
             return
@@ -3724,7 +3733,7 @@ class TaskQueue:
             "SELECT task_ids, state FROM work_intents WHERE external_operation_id=?",
             (op_id,),
         ).fetchone()
-        if intent is None or intent["state"] != "BOUND":
+        if intent is None or intent["state"] not in ("BOUND", "SUCCESS"):
             return
         try:
             task_ids = json.loads(intent["task_ids"] or "[]")
@@ -3734,20 +3743,33 @@ class TaskQueue:
             return
         placeholders = ",".join("?" for _ in task_ids)
         rows = conn.execute(
-            f"SELECT task_id, status FROM tasks WHERE task_id IN ({placeholders})",
+            f"SELECT task_id, task_type, status FROM tasks WHERE task_id IN ({placeholders})",
             tuple(task_ids),
         ).fetchall()
-        statuses = {row["task_id"]: row["status"] for row in rows}
-        if len(statuses) != len(task_ids) or any(statuses.get(bound) != "completed"
-                                                 for bound in task_ids):
-            return
-        conn.execute(
-            "UPDATE work_intents SET state='SUCCESS', blocker=NULL, "
-            "decision_reason=?, decision_authority=?, last_progress_at=?, "
-            "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
-            ("all bound tasks completed; terminal test completed",
-             "agent_crew:task_result", now, op_id),
-        )
+        # The row for ``task_id`` was already updated in this transaction, so
+        # ``rows`` reflects the result being accepted, not the prior status.
+        by_id = {row["task_id"]: row for row in rows}
+        all_completed = (len(by_id) == len(task_ids)
+                         and all(by_id[bound]["status"] == "completed" for bound in task_ids))
+        terminal_test_completed = any(
+            row["task_type"] == "test" and row["status"] == "completed" for row in by_id.values())
+        succeeded = all_completed and terminal_test_completed
+        if intent["state"] == "BOUND" and succeeded:
+            conn.execute(
+                "UPDATE work_intents SET state='SUCCESS', blocker=NULL, "
+                "decision_reason=?, decision_authority=?, last_progress_at=?, "
+                "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
+                ("all bound tasks completed; terminal test completed",
+                 "agent_crew:task_result", now, op_id),
+            )
+        elif intent["state"] == "SUCCESS" and not succeeded:
+            conn.execute(
+                "UPDATE work_intents SET state='BOUND', blocker=NULL, "
+                "decision_reason=?, decision_authority=?, last_progress_at=?, "
+                "next_check_at=NULL WHERE external_operation_id=? AND state='SUCCESS'",
+                (f"reopened: bound task {task_id} result corrected to {result_status}",
+                 "agent_crew:task_result", now, op_id),
+            )
 
     def admit_work_intent(self, intent: dict) -> dict:
         """Deduplicate an external operation; optional first task shares enqueue's txn."""
