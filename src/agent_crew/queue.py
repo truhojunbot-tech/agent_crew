@@ -3711,10 +3711,10 @@ class TaskQueue:
         (review of PR #817, finding 1), so the check runs on every accepted
         result for a bound task, whatever its type.
 
-        The same invariant runs in reverse: an accepted correction that moves a
-        completed test (or any bound task) off ``completed`` reopens a SUCCESS
-        operation to BOUND, so the fix successor can bind instead of the
-        operation claiming success next to a failed task (finding 2).
+        A completed review whose verdict is ``request_changes`` is not a
+        successful bound task: its required fix successor has not been admitted
+        yet. SUCCESS itself is terminal; submit_result rejects later revisions
+        to tasks belonging to a successful intent.
 
         The update shares submit_result's transaction, so task completion and
         operation state cannot diverge on crash.
@@ -3743,7 +3743,7 @@ class TaskQueue:
             return
         placeholders = ",".join("?" for _ in task_ids)
         rows = conn.execute(
-            f"SELECT task_id, task_type, status FROM tasks WHERE task_id IN ({placeholders})",
+            f"SELECT task_id, task_type, status, verdict FROM tasks WHERE task_id IN ({placeholders})",
             tuple(task_ids),
         ).fetchall()
         # The row for ``task_id`` was already updated in this transaction, so
@@ -3753,21 +3753,18 @@ class TaskQueue:
                          and all(by_id[bound]["status"] == "completed" for bound in task_ids))
         terminal_test_completed = any(
             row["task_type"] == "test" and row["status"] == "completed" for row in by_id.values())
-        succeeded = all_completed and terminal_test_completed
+        review_requires_fix = any(
+            row["task_type"] == "review"
+            and row["status"] == "completed"
+            and row["verdict"] == "request_changes"
+            for row in by_id.values())
+        succeeded = all_completed and terminal_test_completed and not review_requires_fix
         if intent["state"] == "BOUND" and succeeded:
             conn.execute(
                 "UPDATE work_intents SET state='SUCCESS', blocker=NULL, "
                 "decision_reason=?, decision_authority=?, last_progress_at=?, "
                 "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
                 ("all bound tasks completed; terminal test completed",
-                 "agent_crew:task_result", now, op_id),
-            )
-        elif intent["state"] == "SUCCESS" and not succeeded:
-            conn.execute(
-                "UPDATE work_intents SET state='BOUND', blocker=NULL, "
-                "decision_reason=?, decision_authority=?, last_progress_at=?, "
-                "next_check_at=NULL WHERE external_operation_id=? AND state='SUCCESS'",
-                (f"reopened: bound task {task_id} result corrected to {result_status}",
                  "agent_crew:task_result", now, op_id),
             )
 
@@ -4925,11 +4922,26 @@ class TaskQueue:
             # 상태와 원자적으로 확정돼, 서버가 별도로 pause를 재확인하며 생기는 divergence가 사라진다.
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT task_type, status FROM tasks WHERE task_id = ?",
+                "SELECT task_type, status, context FROM tasks WHERE task_id = ?",
                 (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f"Task not found: {task_id!r}")
             prior_status = row["status"]
+            try:
+                task_context = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                task_context = {}
+            op_id = (task_context.get("external_operation_id")
+                     if isinstance(task_context, dict) else None)
+            if isinstance(op_id, str) and op_id:
+                intent_state = conn.execute(
+                    "SELECT state FROM work_intents WHERE external_operation_id=?",
+                    (op_id,),
+                ).fetchone()
+                if intent_state is not None and intent_state["state"] == "SUCCESS":
+                    conn.execute("ROLLBACK")
+                    raise ValueError(
+                        f"work intent {op_id!r} is terminal SUCCESS; result revision rejected")
             if (row["task_type"] == "review" and prior_status == "completed"
                     and not allow_review_replay):
                 stored = conn.execute(
