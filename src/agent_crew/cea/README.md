@@ -77,7 +77,7 @@ engine rather than duplicating it.
 
 | mode | operational? | may `authorize()` run embedded? | does a non-PROCEED answer stop work? |
 |------|--------------|-------------------------------|--------------------------------------|
-| `off` | yes — the default and the fallback | yes — it computes nothing and stops nothing | no (no verdict is computed) |
+| `off` | yes — the default and the fallback | yes — it computes nothing and stops nothing; the one receipt it writes is the `CEA_MODE_OFF` stand-down | no (no verdict is computed) |
 | `enforce` | yes | **no** | yes |
 | `test` | **no** — pytest harness only | yes — inside the harness | yes, inside the harness |
 
@@ -90,6 +90,18 @@ something *stricter* than what was written: the fallback is `off`, never
 typo must not refuse real work. `EngineConfig(mode="shadow")` constructed
 directly is also `off`. Consequence: every mode that computes a verdict also
 enforces it; there is no longer any mode that records without enforcing.
+
+`off` therefore **stands down** rather than observing (review of PR #818, round 1).
+`authorize()` reads no provider, claims no lineage and decides nothing; it writes
+one receipt — `decision: ALLOW`, reason `CEA_MODE_OFF`, `policy_hash: not-consulted`,
+fail-closed binding, unsigned — because every task row must name a receipt (P2).
+The five call sites (`callsites.gate_off`) record that they stood down instead of
+building `B′` and running the validator; the dispatch nonce is still minted,
+since it is the executor-binding protocol and not a judgement. `CEA_MODE_OFF` is
+never in `ENFORCEABLE_REASON_CODES`. A row admitted while off does not carry
+into `enforce`: its unsigned, not-consulted receipt is refused at claim there.
+The only place a verdict is computed and *not* enforced is the enforce-code
+allowlist below, which is why its refusals are labelled advisory.
 
 `test` is honoured only when `agent_crew.cea.engine.test_harness_active()` holds
 for the interpreter resolving it: the test runner's own `pytest_configure` hook in

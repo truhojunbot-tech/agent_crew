@@ -21,7 +21,7 @@ def test_broker_socket_selects_client_only_when_opted_in():
     assert not isinstance(get_engine(config=replace(config, broker_socket=None)), BrokerDecisionClient)
 
 
-@pytest.mark.parametrize("mode", ["enforce", "shadow", "test"])
+@pytest.mark.parametrize("mode", ["enforce", "off", "test"])
 def test_unreachable_broker_respects_embedded_mode(monkeypatch, mode):
     observed = []
 

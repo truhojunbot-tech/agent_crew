@@ -324,17 +324,25 @@ def test_the_default_engine_has_no_providers_and_therefore_blocks(conn):
     assert auth.decision == "BLOCK" and auth.code == "INPUTS_UNAVAILABLE"
 
 
-def test_the_mode_does_not_change_the_verdict(conn):
-    """The mode switch is an adapter concern. If it reached the engine, a
-    deployment would measure a policy nobody is going to enforce. The
-    historical ``shadow`` value is ``off`` now (owner 2026-10-21) — and even
-    an ``off`` config asked directly for a verdict gets the same one."""
+def test_off_computes_no_verdict_and_test_computes_the_real_one(conn):
+    """The mode switch is an adapter concern *between the computing modes*: the
+    verdict is the same wherever one is computed. ``off`` is not a computing
+    mode. The historical ``shadow`` value is ``off`` (owner 2026-10-21), and
+    ``off`` stands down (PR #818 round 1): no input is read, no verdict is
+    decided, and the one receipt written says ``CEA_MODE_OFF``."""
+    from agent_crew.cea.engine import CEA_MODE_OFF
+
+    class Exploding(FakeSnapshot):
+        def current(self, intent=None):
+            raise AssertionError("off consulted the policy snapshot")
+
     off = engine(config=EngineConfig(mode="shadow"),
-                 snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s1"), caller())
-    enforce = engine(config=EngineConfig(mode="test"),
-                     snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s2"), caller())
-    assert off.decision == enforce.decision == "BLOCK"
-    assert off.code == enforce.code == "INPUTS_UNAVAILABLE"
+                 snapshots=Exploding(available=False)).authorize(conn, intent("s1"), caller())
+    computed = engine(config=EngineConfig(mode="test"),
+                      snapshots=FakeSnapshot(available=False)).authorize(conn, intent("s2"), caller())
+    assert off.decision == "ALLOW" and off.code == CEA_MODE_OFF
+    assert off.receipt["policy_hash"] == "not-consulted"
+    assert computed.decision == "BLOCK" and computed.code == "INPUTS_UNAVAILABLE"
 
 
 def test_no_authority_in_the_snapshot_blocks(conn):

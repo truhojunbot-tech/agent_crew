@@ -187,11 +187,27 @@ MODES = (OFF, TEST, ENFORCE)
 directive 2026-10-21 prohibits observation-only operation, so the historical
 value — and anything unrecognised, and nothing at all — resolves to :data:`OFF`.
 
-The two operational modes are :data:`OFF` (no verdict is computed, nothing is
-recorded, nothing stops) and :data:`ENFORCE` (the verdict stops work and the
-engine must be reached across the credential-checking socket). :data:`TEST` is
+The two operational modes are :data:`OFF` (no verdict is computed and nothing
+stops — the engine stands down, and the one receipt it writes says exactly that,
+:data:`CEA_MODE_OFF`) and :data:`ENFORCE` (the verdict stops work and the engine
+must be reached across the credential-checking socket). :data:`TEST` is
 not an operational mode: it is honoured only inside a verifiable test harness
 (:func:`test_harness_active`) and is OFF everywhere else.
+"""
+
+CEA_MODE_OFF = "CEA_MODE_OFF"
+"""The reason code of the receipt :meth:`AuthorizationEngine.authorize` writes in
+:data:`OFF`. It is **not a verdict**: the receipt exists because the queue's
+``tasks.receipt_id`` trigger requires one for every row (P2), and it records that
+no policy, registry, runtime, budget or gate input was consulted. It is never in
+:data:`ENFORCEABLE_REASON_CODES` — there is nothing to enforce — and a validator
+never sees it in a computing mode, because a computing mode never writes it.
+
+⛔Review of PR #818 (round 1): before this, ``off`` ran the full
+  :meth:`AuthorizationEngine._authorize_authenticated` sweep — providers read,
+  verdict decided, ``BLOCK`` recorded — and the queue then wrote the row anyway.
+  That is observation-only operation under a mode whose contract is "no verdict
+  is computed", which the owner directive of 2026-10-21 forbids.
 """
 
 EMBEDDED_MODES = (OFF, TEST)
@@ -798,6 +814,9 @@ class AuthorizationEngine:
         idempotent replay, ``409`` ``DUPLICATE_INTENT``, ``403`` blocked/held,
         ``401`` no caller credential.
 
+        In ``mode=off`` nothing is computed: :meth:`_stand_down` writes the one
+        receipt the queue invariant needs and consults no input (PR #818 review).
+
         ⛔In ``mode=enforce`` this method is **unconditionally fail-closed**. It
           is the entry point any in-process caller can reach, so under P7 it can
           never be the one that enforces. The only enforcing path is
@@ -808,7 +827,35 @@ class AuthorizationEngine:
         """
         if self.config.mode == ENFORCE:
             return self._enforce_boundary_refusal(conn, intent, caller)
+        if self.config.mode == OFF:
+            return self._stand_down(conn, intent, caller)
         return self._authorize_authenticated(conn, intent, caller, retry=retry)
+
+    def _stand_down(self, conn: sqlite3.Connection, intent: Intent,
+                    caller: Caller) -> Authorization:
+        """``off``: no verdict. One receipt that says so, nothing else (P2).
+
+        Nothing is consulted — no snapshot, registry, runtime, budget or gate
+        provider is called, no lineage is read or claimed, no canonicalization
+        refusal is raised. The receipt is the audit row the queue's
+        ``tasks.receipt_id`` trigger requires, carrying ``decision: ALLOW`` with
+        :data:`CEA_MODE_OFF` as the only reason, ``policy_hash: not-consulted``
+        and fail-closed binding values, so it can never be mistaken for a
+        computed admission and never carries work across a later switch to
+        ``enforce`` (an unsigned, not-consulted binding is refused there).
+
+        ⛔Caller authentication still happens: J9's 401 is not a verdict, and an
+          unauthenticated caller does not get an audit row in a name it chose.
+        """
+        receipt_store.ensure_schema(conn)
+        self._require_authenticated(caller)
+        receipt = self._refusal(
+            intent, caller, uncanonical_intent_hash(intent.identity), CEA_MODE_OFF,
+            "CEA is off for this project: no admission verdict was computed and no input "
+            "was consulted (owner 2026-10-21, PR #818). This receipt exists only because "
+            "every task row must name one (P2); it is not a judgement about the work",
+            conn=conn, decision="ALLOW")
+        return Authorization(receipt=receipt, http_status=201, code=CEA_MODE_OFF)
 
     def _enforce_boundary_refusal(self, conn: sqlite3.Connection, intent: Intent,
                                   caller: Caller) -> Authorization:
@@ -849,7 +896,8 @@ class AuthorizationEngine:
     def _authorize_authenticated(self, conn: sqlite3.Connection, intent: Intent,
                                  caller: Caller, *, retry: bool = False) -> Authorization:
         """The real decision. Called by :class:`EngineService` once the presented
-        credential matched, and directly by the non-enforcing modes."""
+        credential matched, and directly in ``test`` mode (a harness). ``off``
+        never reaches it — see :meth:`_stand_down`."""
         receipt_store.ensure_schema(conn)
 
         # J9 — who is asking. 401 before anything else is read: an
@@ -1462,7 +1510,8 @@ class AuthorizationEngine:
 
     def _refusal(self, intent: Intent, caller: Caller, ih: str, code: str, text: str,
                  *, conn, unavailable: tuple = (), decision: str = "BLOCK") -> dict:
-        """A non-runnable receipt for a refusal or owner-approved hold (P2).
+        """A receipt built from its reason alone — a refusal, an owner-approved
+        hold, or (``decision="ALLOW"``, :data:`CEA_MODE_OFF`) the ``off`` stand-down (P2).
 
         It is deliberately built from the refusal alone and not from the full
         input sweep: the answer does not depend on policy, so reading policy to
@@ -1770,7 +1819,7 @@ def reset_engine() -> None:
 
 
 __all__ = [
-    "Authorization", "AuthorizationEngine", "DEFAULT_ROLE_AGENTS", "EMBEDDED_MODES",
+    "Authorization", "AuthorizationEngine", "CEA_MODE_OFF", "DEFAULT_ROLE_AGENTS", "EMBEDDED_MODES",
     "ENFORCE", "MODES", "TEST", "EngineConfig", "register_test_harness",
     "test_harness_active", "unregister_test_harness",
     "EngineError", "REVIEW_FLOOR", "SHADOW", "UNNAMED_PROJECT", "SnapshotHumanGate", "UnauthenticatedCaller",

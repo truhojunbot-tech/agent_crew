@@ -247,26 +247,39 @@ def test_an_unwired_engine_blocks_on_unavailable_inputs_rather_than_guessing(tmp
 
 
 def test_every_provider_path_missing_never_raises_into_organic_dispatch(tmp_path, monkeypatch):
-    """(4) a non-enforcing mode must not be able to break the queue.
+    """(4) a non-enforcing mode must not be able to break the queue — and must
+    not compute a verdict either.
 
     The environment still spells the historical ``shadow``, which resolves to
-    ``off`` (owner 2026-10-21); the property under test is the same.
+    ``off`` (owner 2026-10-21). The strongest version of "missing" is not an
+    absent file — it is a provider that *explodes*. So each slot here is wired to
+    a class that raises on every call, and the queue must still enqueue the task.
 
-    The strongest version of "missing" is not an absent file — it is a provider
-    that *explodes*. So each slot here is wired to a class that raises on every
-    call, and the queue must still enqueue, claim and finish the task.
+    Review of PR #818 (round 1): this test used to accept a persisted
+    ``BLOCK/INPUTS_UNAVAILABLE`` receipt next to a pending row — observation-only
+    operation under ``off``. Now ``off`` stands down: the one receipt says
+    ``CEA_MODE_OFF``, and no provider is ever touched, which is why the exploding
+    providers cannot explode.
     """
+    from agent_crew.cea.engine import CEA_MODE_OFF
     from agent_crew.queue import TaskQueue, TaskRequest
 
+    calls: list = []
+
     class Boom:
-        def __getattr__(self, _name):
+        def __init__(self, slot):
+            self.__dict__["slot"] = slot
+
+        def __getattr__(self, name):
             def raise_it(*a, **kw):
+                calls.append((self.slot, name))
                 raise RuntimeError("provider exploded")
             return raise_it
 
     monkeypatch.setenv("AGENT_CREW_CEA_MODE", "shadow")
     q = TaskQueue(str(tmp_path / "tasks.db"),
-                  cea_providers={slot: Boom() for slot in wiring.SLOTS})
+                  cea_providers={slot: Boom(slot) for slot in wiring.SLOTS})
+    assert q.cea_config("agent_crew").mode == "off"
     q.enqueue(TaskRequest(task_id="organic-1", task_type="implement",
                           description="unrelated work", project="agent_crew"),
               ingress="cli.enqueue")
@@ -275,12 +288,17 @@ def test_every_provider_path_missing_never_raises_into_organic_dispatch(tmp_path
     rows = db.execute("SELECT task_id, status FROM tasks").fetchall()
     assert rows == [("organic-1", "pending")], "organic enqueue must be unaffected"
 
-    receipts = db.execute("SELECT decision, reason FROM authorization_receipts").fetchall()
+    receipts = db.execute("SELECT decision, reason FROM authorization_receipts "
+                          "WHERE seq = 0").fetchall()
+    gate = json.loads(db.execute("SELECT context FROM tasks").fetchone()[0])["cea_enqueue"]
     db.close()
     assert receipts, "admission still writes its receipt (P2) even when nothing stops"
-    assert {r[0] for r in receipts} == {"BLOCK"}
-    assert {json.loads(r[1])["code"] for r in receipts} == {"INPUTS_UNAVAILABLE"}, \
-        "a provider that raised is an unavailable input, not a 500"
+    assert {r[0] for r in receipts} == {"ALLOW"}
+    assert {json.loads(r[1])["code"] for r in receipts} == {CEA_MODE_OFF}, \
+        "off records that it stood down — not a verdict it then ignores"
+    assert gate["outcome"] == "PROCEED" and gate["enforced"] is False
+    assert gate["reason"].startswith(f"{CEA_MODE_OFF}: ")
+    assert calls == [], f"off consulted a provider: {calls}"
 
 
 # ── 2. configured from real files ───────────────────────────────────────────

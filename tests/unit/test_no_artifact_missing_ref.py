@@ -147,6 +147,11 @@ def test_held_missing_ref_can_be_corrected_by_same_worker(
     worktree = tmp_path / "worktree"
     (worktree / ".git").mkdir(parents=True)
     db = str(tmp_path / "tasks.db")
+    # Admitted under a mode that computes a verdict, then finished under `mode`.
+    # `off` (the default, and what `shadow` resolves to) writes only the
+    # CEA_MODE_OFF stand-down receipt, which enforce refuses at claim as
+    # unsigned — a row admitted while off cannot be carried into enforce (#818).
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "test")
     queue = TaskQueue(db)
     queue.enqueue(TaskRequest("impl-missing", "implement", "change", branch="main",
                               project="demo", context=admitted({
@@ -208,6 +213,7 @@ def test_other_no_artifact_receipt_stays_consumed_under_enforce(
     worktree = tmp_path / "worktree"
     (worktree / ".git").mkdir(parents=True)
     db = str(tmp_path / "tasks.db")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "test")   # admit with a verdict (#818)
     queue = TaskQueue(db)
     queue.enqueue(TaskRequest("impl-base", "implement", "change", branch="main",
                               project="demo", context=admitted({"worktree_base_sha": BASE})))
