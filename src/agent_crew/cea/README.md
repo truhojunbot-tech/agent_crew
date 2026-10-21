@@ -92,12 +92,16 @@ directly is also `off`. Consequence: every mode that computes a verdict also
 enforces it; there is no longer any mode that records without enforcing.
 
 `test` is honoured only when `agent_crew.cea.engine.test_harness_active()` holds
-for the interpreter resolving it — `pytest` imported in that process. That is
-read from the live interpreter, never from the configuration mapping or an
-environment variable, so configuration cannot declare itself a harness and a
-child process that merely inherits `PYTEST_CURRENT_TEST` is not one. Anywhere
-else, `test` resolves to `off` with a warning. `tests/unit/test_no_shadow_runtime.py`
-spawns a fresh interpreter and pins this.
+for the interpreter resolving it: the test runner's own `pytest_configure` hook in
+`tests/conftest.py` has registered the running session's `Config` with the engine
+(`register_test_harness`), and that session is still open. The proof is state only
+the runner's session hook sets — never the configuration mapping, never an
+environment variable, and **not** `"pytest" in sys.modules`: a standalone process
+that imports pytest and exports `AGENT_CREW_CEA_MODE=test` is not a harness
+(review of PR #818, HIGH), nor is a child process that merely inherits
+`PYTEST_CURRENT_TEST`. Anywhere else, `test` resolves to `off` with a warning.
+`tests/unit/test_no_shadow_runtime.py` spawns fresh interpreters — with and
+without `import pytest` — and pins this.
 
 For staged enforcement, set `AGENT_CREW_CEA_ENFORCE_CODES_<PROJECT>` to a
 comma-separated set of reason codes, for example

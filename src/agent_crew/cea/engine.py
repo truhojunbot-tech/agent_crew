@@ -208,7 +208,8 @@ EMBEDDED_MODES = (OFF, TEST)
   ``test`` may run embedded because it is a test harness — and, since the
   review of PR #818, because it *cannot exist* outside one: :func:`resolve_mode`
   and :class:`EngineConfig` both demote ``test`` to ``off`` unless
-  :func:`test_harness_active` says this interpreter is running under pytest.
+  :func:`test_harness_active` says the test runner itself registered this
+  interpreter's pytest session (``tests/conftest.py``, ``pytest_configure``).
   In ``enforce`` — the only operational mode where the engine's verdict
   withholds work — the engine must be reached across the unix socket in
   :mod:`agent_crew.cea.service`, where the credential is checked by a peer that
@@ -219,21 +220,81 @@ EMBEDDED_MODES = (OFF, TEST)
 """
 
 
+_HARNESS_SESSIONS: list = []
+"""The pytest ``Config`` objects of the test sessions running in this interpreter.
+
+Written only by :func:`register_test_harness` / :func:`unregister_test_harness`,
+which the repository's ``tests/conftest.py`` calls from ``pytest_configure`` and
+``pytest_unconfigure`` — the runner's own session hooks. Innermost session last.
+"""
+
+
+def _pytest_config_class():
+    """The live ``_pytest.config.Config`` class, or ``None`` when pytest is not
+    imported in this interpreter. Resolved on every call, never cached: hiding
+    the module must make the proof fail, not leave a stale class behind."""
+    if "pytest" not in sys.modules:
+        return None
+    module = sys.modules.get("_pytest.config")
+    return getattr(module, "Config", None) if module is not None else None
+
+
+def register_test_harness(config) -> None:
+    """Record that a pytest session has started in this interpreter.
+
+    Called by the test runner's own ``pytest_configure`` in ``tests/conftest.py``
+    with the session's ``Config``. Nothing else should call it, and nothing in
+    this package does. ``config`` must be the live ``_pytest.config.Config``;
+    anything else is rejected rather than stored, so a caller cannot register
+    an arbitrary object as a "session".
+    """
+    config_cls = _pytest_config_class()
+    if config_cls is None or not isinstance(config, config_cls):
+        raise TypeError("register_test_harness needs the running pytest session's Config")
+    _HARNESS_SESSIONS.append(config)
+
+
+def unregister_test_harness(config) -> None:
+    """Forget a session registered by :func:`register_test_harness`
+    (``pytest_unconfigure``). Unknown objects are ignored."""
+    for i in range(len(_HARNESS_SESSIONS) - 1, -1, -1):
+        if _HARNESS_SESSIONS[i] is config:
+            del _HARNESS_SESSIONS[i]
+            return
+
+
 def test_harness_active() -> bool:
     """Is *this interpreter* verifiably running under a test harness?
 
-    The fact is read from the live process — is ``pytest`` imported in this
-    interpreter? — and never from any ``env`` mapping a caller hands in, so
-    configuration cannot assert "I am a harness".
+    True only while a pytest session the runner itself registered — via
+    :func:`register_test_harness` from ``tests/conftest.py``'s
+    ``pytest_configure`` — is still open, and the registered object is still an
+    instance of the live ``_pytest.config.Config``. The fact is never read from
+    an ``env`` mapping a caller hands in, so configuration cannot assert "I am
+    a harness".
 
-    ⛔Not an environment variable. ``PYTEST_CURRENT_TEST`` is inherited by every
-      child process a test spawns, so it would let a dispatcher started *by* a
-      test — or by an operator copying a test's environment — run enforcement
-      with no credential boundary. The module check holds at collection time
-      too, which matters: several suites build ``EngineConfig(mode="test")`` at
-      import, before the runner has marked any test item current.
+    ⛔Not ``"pytest" in sys.modules``. Review of PR #818 (HIGH): a standalone
+      ``python3`` process that happens to ``import pytest`` and exports
+      ``AGENT_CREW_CEA_MODE=test`` used to pass that check and get
+      ``enforcing=True`` with embedded authorization and no endpoint — enforcement
+      with no credential boundary. Importing a module is not proof of a harness;
+      only the runner's own session hook can supply the proof, and a process
+      that is not running under pytest has no such hook.
+
+    ⛔Not an environment variable either. ``PYTEST_CURRENT_TEST`` is inherited by
+      every child process a test spawns, so it would let a dispatcher started
+      *by* a test — or by an operator copying a test's environment — run
+      enforcement with no credential boundary. Registration happens at
+      ``pytest_configure``, before collection, so the proof holds for suites
+      that build ``EngineConfig(mode="test")`` at import time.
     """
-    return "pytest" in sys.modules
+    if not _HARNESS_SESSIONS:
+        return False
+    config_cls = _pytest_config_class()
+    if config_cls is None:
+        return False
+    return isinstance(_HARNESS_SESSIONS[-1], config_cls)
+
 
 #: What a refusal receipt names as its ``project`` when the intent named none.
 #: §3 freezes ``project`` as a non-empty string and P2 requires the audit row
@@ -1710,7 +1771,8 @@ def reset_engine() -> None:
 
 __all__ = [
     "Authorization", "AuthorizationEngine", "DEFAULT_ROLE_AGENTS", "EMBEDDED_MODES",
-    "ENFORCE", "MODES", "TEST", "EngineConfig", "test_harness_active",
+    "ENFORCE", "MODES", "TEST", "EngineConfig", "register_test_harness",
+    "test_harness_active", "unregister_test_harness",
     "EngineError", "REVIEW_FLOOR", "SHADOW", "UNNAMED_PROJECT", "SnapshotHumanGate", "UnauthenticatedCaller",
     "UnavailableBudget", "UnavailableCapabilityRegistry", "UnavailablePolicySnapshot",
     "UnavailableRuntimeState", "get_engine", "intent_from_receipt", "intent_hash",

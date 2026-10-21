@@ -111,8 +111,9 @@ def test_an_empty_value_is_not_a_choice():
 
 
 def test_this_suite_is_a_verifiable_harness():
-    """Every `test`-mode assertion below depends on it: pytest is imported in
-    this interpreter and has marked a test as current."""
+    """Every `test`-mode assertion below depends on it: the runner registered
+    this pytest session with the engine (`tests/conftest.py`, `pytest_configure`);
+    an imported pytest module alone would not count."""
     assert test_harness_active() is True
 
 
