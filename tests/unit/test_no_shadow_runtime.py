@@ -21,3 +21,7 @@ def test_explicit_enforce_and_test_still_work():
 
 def test_unknown_value_fails_safe_to_off():
     assert resolve_mode({"AGENT_CREW_CEA_MODE": "shdaow"}, "agent_crew") == OFF
+
+def test_direct_shadow_config_is_forced_off():
+    assert EngineConfig(mode="shadow").mode == OFF
+    assert EngineConfig().mode == OFF
