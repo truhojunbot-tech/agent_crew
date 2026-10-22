@@ -3892,7 +3892,8 @@ class TaskQueue:
         if not isinstance(op_id, str) or not op_id:
             return
         intent = conn.execute(
-            "SELECT task_ids, state FROM work_intents WHERE external_operation_id=?",
+            "SELECT task_ids, state, coordinator_identity, execution_slo_s "
+            "FROM work_intents WHERE external_operation_id=?",
             (op_id,),
         ).fetchone()
         if intent is None or intent["state"] not in ("BOUND", "SUCCESS"):
@@ -3949,6 +3950,40 @@ class TaskQueue:
                 "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
                 (reason, "agent_crew:task_result", now, op_id),
             )
+        elif intent["state"] == "BOUND":
+            # #823: a bound operation must not disappear into a permanent
+            # BOUND state after every active task has ended unsuccessfully.
+            # Superseded dead rounds (#821) are ignored here: a trusted retry
+            # owns their outcome. Completed-but-nonterminal pipeline stages
+            # (for example request_changes awaiting its fix) also stay BOUND.
+            active = {row["task_id"] for row in by_id.values()
+                      if row["status"] in ("pending", "in_progress")}
+            unsuccessful = {
+                row["task_id"]: row["status"] for row in by_id.values()
+                if row["task_id"] not in superseded
+                and row["status"] in (
+                    "failed", "timed_out", "cancelled", "canceled",
+                    "needs_human", "blocked", "expired")
+            }
+            if unsuccessful and not active:
+                statuses = ", ".join(
+                    f"{bound}={unsuccessful[bound]}" for bound in sorted(unsuccessful))
+                next_check_at = now + float(intent["execution_slo_s"])
+                blocker = {
+                    "blocker_type": "bound_tasks_unsuccessful",
+                    "reason": f"all active bound work ended; {statuses}",
+                    "unblock_action": "retry/bind a successor task or reject the operation",
+                    "owner": intent["coordinator_identity"],
+                    "next_check_at": next_check_at,
+                }
+                conn.execute(
+                    "UPDATE work_intents SET state='BLOCKED', blocker=?, "
+                    "decision_reason=?, decision_authority=?, last_progress_at=?, "
+                    "next_check_at=? "
+                    "WHERE external_operation_id=? AND state='BOUND'",
+                    (json.dumps(blocker), blocker["reason"],
+                     "agent_crew:task_result", now, next_check_at, op_id),
+                )
 
     def admit_work_intent(self, intent: dict) -> dict:
         """Deduplicate an external operation; optional first task shares enqueue's txn."""
