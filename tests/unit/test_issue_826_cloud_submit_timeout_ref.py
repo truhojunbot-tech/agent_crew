@@ -139,6 +139,30 @@ def test_dispatch_without_prepared_sha_pins_bare_main(tmp_path, monkeypatch):
     assert "--ref " + "b" * 40 not in launches[0][2]
 
 
+def test_lineage_implement_on_symbolic_checkout_launches_without_ref(tmp_path, monkeypatch):
+    _setup(monkeypatch)
+    monkeypatch.setattr(cloud, "_detached_cloud_ref", lambda cwd: "")
+    monkeypatch.setattr(cloud, "_resolve_resume_session_id", lambda queue, task: None)
+    crew_retry = TaskRequest(task_id="crew-retry", task_type="implement",
+                             description="Retry", branch="fix/826-test",
+                             context={"fix_round": 0})
+    assert cloud._launch_ref(crew_retry, "/fixture/claude", None) == ""
+    queue = _queue(tmp_path, context={"prev_task_id": "impl-prior", "fix_round": 0})
+    launches = []
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        launches.append(argv)
+        return SimpleNamespace(returncode=0, stdout=(
+            '{"session_id":"session_826abc",'
+            '"url":"https://claude.ai/code/session_826abc"}'))
+
+    assert cloud.dispatch_cloud_for_role(
+        queue, role="implementer", task_type="implement", run_fn=run).dispatched
+    assert len(launches) == 1 and "--ref" not in launches[0][2]
+
+
 def test_timeout_with_session_output_is_recovered_without_resubmit(tmp_path, monkeypatch):
     _setup(monkeypatch)
     queue = _queue(tmp_path)

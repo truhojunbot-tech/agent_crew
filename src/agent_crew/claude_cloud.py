@@ -769,7 +769,7 @@ def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) 
     if prior_pr_head:
         return prior_pr_head
     context = task.context if isinstance(task.context, dict) else {}
-    if context.get("prev_task_id") or context.get("fix_round"):
+    if context.get("prev_task_id") or "fix_round" in context:
         return _detached_cloud_ref(checkout)
     base_sha = context.get("worktree_base_sha")
     if isinstance(base_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", base_sha):
@@ -1110,8 +1110,10 @@ def dispatch_cloud_for_role(
                                      "cloud_review_cwd_repo_mismatch")
     prompt = build_cloud_task_prompt(task, repo=effective_repo)
     launch_ref = _launch_ref(task, cwd, prior_pr_head)
+    context = task.context if isinstance(task.context, dict) else {}
     if (task.task_type == "implement" and not resume_session_id
-            and not launch_ref):
+            and not launch_ref and not context.get("prev_task_id")
+            and "fix_round" not in context):
         return _fail_closed_dispatch(queue, task, task_type, "cloud_base_branch_invalid")
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
