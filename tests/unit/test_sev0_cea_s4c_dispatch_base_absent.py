@@ -100,8 +100,11 @@ def _baseless_implement(tmp_db, task_id="impl-nobase", project="demo"):
 
     ⛔Seeded before the rollout mode is raised. Admission under `enforce` refuses
       a receipt-less direct enqueue, which is a *different* gate (T1) and would
-      hide the one being tested here. Rows admitted under shadow and finished
-      under enforce are also the realistic rollout shape."""
+      hide the one being tested here. The enforce cases seed under ``test`` —
+      a mode that computes and records a verdict — because ``off`` (what
+      ``shadow`` now resolves to) writes only the ``CEA_MODE_OFF`` stand-down
+      receipt, and enforce refuses that at claim as unsigned: a row admitted
+      while off is not carried into enforce (PR #818)."""
     queue = TaskQueue(tmp_db)
     queue.enqueue(TaskRequest(task_id, "implement", "change", branch="feat/work",
                               project=project, context=admitted()))
@@ -124,6 +127,7 @@ def test_under_enforce_a_baseless_completion_is_held(tmp_db, monkeypatch,
       P2 (`RECEIPT_STATE_INVALID`) before T5 is reached. Running the real
       lifecycle is what isolates the artifact gate; skipping it would assert a
       refusal that comes from somewhere else."""
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "test")
     queue = _baseless_implement(tmp_db, project="hot")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "enforce")
     with _app(tmp_db) as client:
@@ -147,6 +151,7 @@ def test_under_enforce_the_review_cascade_never_starts(tmp_db, monkeypatch,
     Driven through the full lifecycle for the same reason as above: a result
     refused at P2 would also produce no review task, and would say nothing about
     the artifact gate."""
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "test")
     queue = _baseless_implement(tmp_db, project="hot")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "enforce")
     with _app(tmp_db) as client:
@@ -172,6 +177,7 @@ def test_the_rollout_mode_is_read_per_project(tmp_db, monkeypatch, hermetic_admi
     """⛔The whole reason the per-project variable exists: one project can hold
     this gate while another is still measuring, in one server process."""
     monkeypatch.setenv(MODE, "shadow")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "test")
     queue = _baseless_implement(tmp_db, "impl-hot", project="hot")
     _baseless_implement(tmp_db, "impl-cold", project="cold")
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "enforce")

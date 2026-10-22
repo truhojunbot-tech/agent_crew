@@ -34,8 +34,8 @@ from tests.unit.test_sev0_cea_s2c_writer_callsites import WIRED, admitted, task
 PANE = "%crew-s4b"
 
 
-def _queue(path, *, mode="shadow") -> TaskQueue:
-    return TaskQueue(str(path), cea_config=EngineConfig(mode=mode),
+def _queue(path, *, mode="shadow", **config) -> TaskQueue:
+    return TaskQueue(str(path), cea_config=EngineConfig(mode=mode, **config),
                      cea_providers=dict(WIRED))
 
 
@@ -68,9 +68,9 @@ def _receipt_state(db, task_id):
         conn.close()
 
 
-def _dispatched(db, *, mode, task_id="t-start"):
+def _dispatched(db, *, mode, task_id="t-start", **config):
     """enqueue → dequeue → record_dispatch. Stops one step short of /start."""
-    q = _queue(db, mode=mode)
+    q = _queue(db, mode=mode, **config)
     q.enqueue(task(task_id, context=admitted()), ingress="http.tasks")
     got = q.dequeue(role="implementer", agent="claude")
     assert got is not None and got.task_id == task_id
@@ -127,14 +127,27 @@ def test_the_same_submission_is_accepted_after_start(tmp_path):
     assert _row(db, "t-start")["status"] == "completed"
 
 
-def test_shadow_records_the_refusal_instead_of_hiding_it(tmp_path):
-    """Under ``shadow`` the work proceeds and the answer is still the truth.
+def test_off_stands_down_instead_of_recording_a_refusal(tmp_path):
+    """Under ``off`` the work proceeds and nothing is computed (PR #818 round 1):
+    the record says the RESULT gate stood down, not that it would have refused."""
+    from agent_crew.cea.engine import CEA_MODE_OFF
+    db = str(tmp_path / "off.db")
+    q, nonce = _dispatched(db, mode="shadow")   # the historical value resolves to off
+    assert q.cea_config().mode == "off"
 
-    The measurement shadow exists to produce is worthless if the gate reports
-    PROCEED for a submission it would have refused.
-    """
-    db = str(tmp_path / "shadow.db")
-    q, nonce = _dispatched(db, mode="shadow")
+    q.submit_result("t-start", _result(), nonce=nonce, presenter="claude")
+
+    gate = json.loads(_row(db, "t-start")["context"])["cea_result"]
+    assert gate["outcome"] == "PROCEED" and gate["reason"].startswith(f"{CEA_MODE_OFF}: ")
+    assert gate["proceed"] is True and gate["enforced"] is False
+    assert _row(db, "t-start")["status"] == "completed"
+
+
+def test_an_unenforced_allowlist_records_the_refusal_instead_of_hiding_it(tmp_path):
+    """A computed verdict the allowlist does not enforce is still the truth:
+    the gate reports the BLOCK it would have acted on, and the work proceeds."""
+    db = str(tmp_path / "advisory.db")
+    q, nonce = _dispatched(db, mode="test", enforce_codes=frozenset({"NONCE_REUSED"}))
 
     q.submit_result("t-start", _result(), nonce=nonce, presenter="claude")
 

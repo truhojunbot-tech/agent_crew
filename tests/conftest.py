@@ -12,6 +12,25 @@ from agent_crew.queue import TaskQueue
 from agent_crew.server import create_app
 
 
+def pytest_configure(config):
+    """Prove to the CEA engine that this interpreter is a test harness.
+
+    ``agent_crew.cea.engine.test_harness_active`` is what lets ``test`` mode be
+    anything other than ``off``. It is true only for a pytest session the runner
+    registered here, with its own ``Config`` — not because ``pytest`` happens to
+    be imported and not because an environment variable says so (review of
+    PR #818, HIGH). This hook runs before collection, so suites that build
+    ``EngineConfig(mode="test")`` at import time see the harness as active.
+    """
+    from agent_crew.cea import engine as cea_engine
+    cea_engine.register_test_harness(config)
+
+
+def pytest_unconfigure(config):
+    from agent_crew.cea import engine as cea_engine
+    cea_engine.unregister_test_harness(config)
+
+
 @pytest.fixture(autouse=True)
 def _tier_legacy_task_posts(monkeypatch, request):
     """Give pre-risk-contract HTTP fixtures an explicit tier at the client boundary.

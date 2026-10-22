@@ -4,7 +4,7 @@ import sqlite3
 import pytest
 
 from agent_crew.cea import store
-from agent_crew.cea.engine import intent_hash
+from agent_crew.cea.engine import EngineConfig, intent_hash
 from agent_crew.pipeline import auto_enqueue_test
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import intent_for_task
@@ -32,10 +32,18 @@ def test_new_head_changes_review_or_test_intent_but_same_head_does_not(task_type
     assert intent_hash(first) != intent_hash(changed)
 
 
+# ``advisory`` is the enforce-code allowlist: the verdict is computed and recorded
+# but only the listed codes stop work. It replaces the retired ``shadow`` mode
+# here, because ``off`` (which ``shadow`` now resolves to) stands down with
+# ``CEA_MODE_OFF`` and computes no verdict at all (PR #818).
+ADVISORY = EngineConfig(mode="test", enforce_codes=frozenset({"NONCE_REUSED"}))
+
+
 @pytest.mark.parametrize("task_type", ["review", "test"])
-@pytest.mark.parametrize("mode", ["test", "shadow"])
+@pytest.mark.parametrize("mode", ["test", "advisory"])
 def test_completed_head_blocks_replay_but_allows_new_head(tmp_path, task_type, mode):
-    q = queue_for(tmp_path, AuthorityState("active"), name="heads.db", mode=mode)
+    q = queue_for(tmp_path, AuthorityState("active"), name="heads.db",
+                  config=ADVISORY if mode == "advisory" else EngineConfig(mode=mode))
     admitted, first = enqueue_and_read(q, _task("first", task_type, SHA_A), ingress="cli.enqueue")
     assert admitted and first["decision"] == "ALLOW"
     with sqlite3.connect(q._db_path) as conn:
@@ -46,7 +54,7 @@ def test_completed_head_blocks_replay_but_allows_new_head(tmp_path, task_type, m
     replay_task.context["allow_duplicate_review"] = True
     replay_admitted, replay = enqueue_and_read(
         q, replay_task, ingress="cli.enqueue")
-    assert replay_admitted is (mode == "shadow")
+    assert replay_admitted is (mode == "advisory")
     assert replay["decision"] == "BLOCK"
     assert replay["reason"]["code"] == "ALREADY_COMPLETED"
 

@@ -40,7 +40,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from agent_crew.cea.engine import ENFORCE, TEST, EngineConfig
+from agent_crew.cea.engine import CEA_MODE_OFF, ENFORCE, TEST, EngineConfig
 from agent_crew.cea.validator import (
     ContractReceiptValidator, CurrentInputs, ReceiptValidator, RuntimeStateVerdict,
     ValidationOutcome, ValidationPoint, ValidationResult, binding_drifted,
@@ -124,6 +124,32 @@ def _gate(point: ValidationPoint, result: ValidationResult,
                        and result.outcome is not ValidationOutcome.PROCEED)
     return GateOutcome(point=point, result=result, proceed=proceed,
                        enforced=enforce, review_required=review_required)
+
+
+def gate_off(point: ValidationPoint, receipt: Optional[dict]) -> GateOutcome:
+    """The answer every call site gives in ``off``: nothing was computed.
+
+    ``off`` means no verdict (owner 2026-10-21). A call site in ``off`` must
+    therefore not build :class:`CurrentInputs` — that is the provider sweep
+    that computes ``B′`` — and must not run the validator over the receipt.
+    It records that it stood down and proceeds, unenforced. The receipt's own
+    decision is named in the reason when it is not ALLOW (a queue-side
+    refusal recorded via ``engine.refuse``), so the audit row still says what
+    was on file; it is not acted on, exactly as before this gate existed.
+
+    ⛔Review of PR #818 (round 1): before this, ``off`` computed the full
+      verdict at all five points and recorded BLOCK while proceeding —
+      observation-only operation under a mode that promises none.
+    """
+    text = "CEA is off for this project; no verdict was computed and nothing is enforced"
+    decision = (receipt or {}).get("decision")
+    if decision and decision != "ALLOW":
+        code = ((receipt or {}).get("reason") or {}).get("code")
+        text += f" (receipt on file: {decision}/{code}, recorded, not acted on)"
+    result = ValidationResult(point=point, outcome=ValidationOutcome.PROCEED,
+                              reason=f"{CEA_MODE_OFF}: {text}",
+                              receipt_id=str((receipt or {}).get("receipt_id") or ""))
+    return GateOutcome(point=point, result=result, proceed=True, enforced=False)
 
 
 def current_inputs(engine, receipt: dict, **overrides) -> CurrentInputs:
@@ -372,6 +398,6 @@ CALL_SITES = {
 
 __all__ = ["CALL_SITES", "GateOutcome", "REQUEUE_CALL_SITES", "RequeueOutcome",
            "RuntimeGateOutcome", "VALIDATOR",
-           "current_inputs", "enforcing", "recording",
+           "current_inputs", "enforcing", "gate_off", "recording",
            "gate_claim", "gate_dispatch", "gate_enqueue", "gate_execute_start", "gate_requeue",
            "gate_result", "gate_runtime_state"]

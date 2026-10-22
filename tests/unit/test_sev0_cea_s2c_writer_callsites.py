@@ -81,9 +81,18 @@ WIRED = {"snapshots": Snapshot(), "capabilities": Registry(), "runtime": Runtime
          "budgets": Budget(), "gates": Gate()}
 
 
-def queue(tmp_path, *, mode="shadow", wired=False, name="t.db") -> TaskQueue:
-    return TaskQueue(str(tmp_path / name), cea_config=EngineConfig(mode=mode),
+def queue(tmp_path, *, mode="shadow", wired=False, name="t.db", **config) -> TaskQueue:
+    """``config`` reaches :class:`EngineConfig` — ``enforce_codes=`` gives a
+    computing mode whose non-listed refusals are advisory (the only non-enforced
+    verdict left now that ``off`` computes none, PR #818 round 1)."""
+    return TaskQueue(str(tmp_path / name), cea_config=EngineConfig(mode=mode, **config),
                      cea_providers=(dict(WIRED) if wired else None))
+
+
+#: A computing mode in which this suite's refusals are *not* enforced: the
+#: allowlist names a code no fixture here produces, so every other non-PROCEED
+#: answer is recorded as advisory and the work proceeds (`callsites._gate`).
+ADVISORY = dict(mode="test", enforce_codes=frozenset({"NONCE_REUSED"}))
 
 
 def task(task_id="t1", *, task_type="implement", context=None, project="agent_crew",
@@ -460,15 +469,32 @@ def test_the_legacy_enqueue_goes_through_the_engine_and_records_a_receipt(tmp_pa
 
 
 def test_with_no_providers_the_receipt_says_so_instead_of_allowing(tmp_path):
-    """P7 through the adapter: an unwired runtime does not shadow-ALLOW."""
-    q = queue(tmp_path)
-    q.enqueue(task())
-    stored = receipt_of(q)
-    assert stored["decision"] == "BLOCK"
-    assert stored["reason"]["code"] == "INPUTS_UNAVAILABLE"
-    recorded = json.loads(row(q)["context"])["cea_enqueue"]
-    assert recorded["outcome"] == "BLOCK" and recorded["proceed"] is True
-    assert recorded["enforced"] is False, "shadow records the answer and proceeds"
+    """P7 through the adapter: an unwired runtime does not ALLOW on a guess.
+    In a computing mode that is a refusal; in ``off`` nothing is computed at all
+    (PR #818 round 1), so the receipt is the stand-down and no BLOCK exists."""
+    from agent_crew.cea.engine import CEA_MODE_OFF
+    q = queue(tmp_path, mode="test")
+    with pytest.raises(AdmissionRefused) as exc:
+        q.enqueue(task())
+    assert exc.value.outcome == "BLOCK"
+    conn = sqlite3.connect(q._db_path)
+    try:
+        refused = receipt_store.current_receipt(conn, exc.value.receipt_id)
+    finally:
+        conn.close()
+    assert refused["decision"] == "BLOCK"
+    assert refused["reason"]["code"] == "INPUTS_UNAVAILABLE"
+    assert row(q) is None, "an enforced refusal writes no row"
+
+    off = queue(tmp_path, mode="off", name="off.db")
+    off.enqueue(task())
+    stored = receipt_of(off)
+    assert stored["decision"] == "ALLOW" and stored["reason"]["code"] == CEA_MODE_OFF
+    recorded = json.loads(row(off)["context"])["cea_enqueue"]
+    assert recorded["outcome"] == "PROCEED" and recorded["proceed"] is True
+    assert recorded["enforced"] is False
+    assert recorded["reason"].startswith(f"{CEA_MODE_OFF}: "), \
+        "off records that it stood down, not a verdict it ignores"
 
 
 def test_every_receipt_the_queue_emits_validates_against_the_frozen_schema(tmp_path):
@@ -596,15 +622,24 @@ def test_the_same_intent_under_a_new_task_id_is_refused_as_a_duplicate(tmp_path)
 
 
 def test_the_same_idempotency_key_returns_the_existing_receipt(tmp_path):
-    q = queue(tmp_path, wired=True)
+    """P4 replay is a computed answer, so it lives in a computing mode (``off``
+    computes none, PR #818 round 1). The engine hands the replay the *existing*
+    receipt — and, enforcing, the queue then refuses to file that receipt under
+    a second task id rather than writing a row that points at t1's admission."""
+    q = queue(tmp_path, mode="test", wired=True)
     ctx = admitted({"idempotency_key": "k1"})
     # Use an implement task: the separate standing-review guard rejects a
     # second review before this CEA idempotency assertion can inspect it.
     q.enqueue(task("t1", task_type="implement", context=ctx))
     first = row(q, "t1")["receipt_id"]
-    q.enqueue(task("t2", task_type="implement", context=ctx))
-    assert row(q, "t2")["receipt_id"] == first, \
+    replay = q.authorize_task(task("t2", task_type="implement", context=ctx))
+    assert replay.receipt["receipt_id"] == first, \
         "a replayed request is the same work; it does not get a second receipt (P4)"
+    assert replay.http_status == 200
+    with pytest.raises(AdmissionRefused) as exc:
+        q.enqueue(task("t2", task_type="implement", context=ctx))
+    assert exc.value.gate.reason.startswith("TASK_ID_MISMATCH")
+    assert row(q, "t2") is None
 
 
 def test_completed_work_is_not_re_admitted(tmp_path):
@@ -691,8 +726,28 @@ def test_unknown_consumed_status_keeps_allowlisted_replay_no_go(tmp_path):
     assert q.get_task_status("replay") is None
 
 
-def test_shadow_block_start_is_explicitly_advisory(tmp_path):
+def test_off_start_answer_stands_down(tmp_path):
+    """Owner 2026-10-21 (PR #818): the historical ``shadow`` config is ``off``,
+    and ``off`` computes no verdict (round 1) — so the go path carries no
+    advisory label either: there is nothing to be advisory about."""
+    from agent_crew.cea.engine import CEA_MODE_OFF
     q = queue(tmp_path, mode="shadow", wired=True)
+    assert q.cea_config().mode == "off"
+    q.enqueue(task(task_type="review", context=admitted()))
+    q.dequeue(agent="codex", role="reviewer")
+    nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
+    answer = q.start_execution("t1", nonce, presenter="gemini")
+    assert answer["go"] is True and answer["enforced"] is False
+    assert answer["outcome"] == "PROCEED"
+    assert answer["reason"].startswith(f"{CEA_MODE_OFF}: ")
+    assert "advisory" not in answer and "shadow_outcome" not in answer
+    assert "shadow mode" not in json.dumps(answer)
+
+
+def test_non_enforced_block_start_is_explicitly_advisory(tmp_path):
+    """#409 / PR #818: a computed BLOCK that the allowlist does not enforce is
+    labelled advisory on the go path, and the label never says "shadow mode"."""
+    q = queue(tmp_path, wired=True, **ADVISORY)
     q.enqueue(task(task_type="review", context=admitted()))
     q.dequeue(agent="codex", role="reviewer")
     nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
@@ -702,26 +757,29 @@ def test_shadow_block_start_is_explicitly_advisory(tmp_path):
     assert answer["enforced"] is False
     assert answer["advisory"] is True
     assert answer["shadow_outcome"] == "BLOCK"
-    assert answer["instruction"] == "shadow mode: not enforced — proceed; decide on go only"
+    assert answer["instruction"] == "advisory verdict: not enforced — proceed; decide on go only"
+    assert "shadow mode" not in json.dumps(answer)
 
 
-def _start_answer(tmp_path, mode):
-    q = queue(tmp_path, mode=mode, wired=True, name=f"{mode}.db")
+def _start_answer(tmp_path, mode, **config):
+    q = queue(tmp_path, mode=mode, wired=True, name=f"{mode}-{len(config)}.db", **config)
     q.enqueue(task(task_type="review", context=admitted()))
     q.dequeue(agent="codex", role="reviewer")
     nonce = q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
     return q.start_execution("t1", nonce, presenter="gemini")
 
 
-def test_shadow_start_reason_is_labelled_not_enforced(tmp_path):
-    """#409: on go the reason prose must not read as an enforced refusal."""
-    shadow = _start_answer(tmp_path, "shadow")
+def test_non_enforced_start_reason_is_labelled_not_enforced(tmp_path):
+    """#409: on go the reason prose must not read as an enforced refusal.
+    The non-enforced verdict comes from the enforce-code allowlist: ``off`` no
+    longer computes one (PR #818 round 1)."""
+    advisory = _start_answer(tmp_path, **ADVISORY)
     enforced = _start_answer(tmp_path, "test")
-    assert shadow["go"] is True and enforced["go"] is False
-    assert shadow["reason"].startswith("shadow (not enforced): ")
+    assert advisory["go"] is True and enforced["go"] is False
+    assert advisory["reason"].startswith("advisory (not enforced): ")
     # Same gate verdict underneath: only the label differs, nothing is dropped.
-    assert shadow["reason"] == "shadow (not enforced): " + enforced["reason"]
-    assert shadow["outcome"] == enforced["outcome"] == "BLOCK"
+    assert advisory["reason"] == "advisory (not enforced): " + enforced["reason"]
+    assert advisory["outcome"] == enforced["outcome"] == "BLOCK"
 
 
 def test_enforced_start_reason_carries_no_shadow_label(tmp_path):
@@ -778,10 +836,30 @@ def test_result_refuses_a_presenter_that_is_not_the_bound_executor(tmp_path):
                         nonce=nonce, presenter="gemini")
 
 
-def test_shadow_accepts_the_same_result_and_records_the_refusal(tmp_path):
-    """The shadow measurement is only worth something if the answer is the same
-    one enforce would have acted on."""
+def test_off_accepts_the_result_and_records_that_it_stood_down(tmp_path):
+    """``off`` computes nothing at RESULT either (PR #818 round 1): the result
+    stands, and the record says the gate stood down — not that it would have
+    refused, because that question was never asked."""
+    from agent_crew.cea.engine import CEA_MODE_OFF
     q = queue(tmp_path, wired=True)
+    assert q.cea_config().mode == "off"
+    q.enqueue(task(task_type="review", context=admitted()))
+    q.dequeue(agent="codex", role="reviewer")
+    q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
+    q.submit_result("t1", TaskResult(task_id="t1", status="completed", summary="done"))
+    recorded = json.loads(row(q)["context"])["cea_result"]
+    assert recorded["outcome"] == "PROCEED" and recorded["proceed"] is True
+    assert recorded["enforced"] is False
+    assert recorded["reason"].startswith(f"{CEA_MODE_OFF}: ")
+    assert row(q)["status"] == "completed"
+
+
+def test_an_unenforced_allowlist_accepts_the_same_result_and_records_the_refusal(tmp_path):
+    """A non-enforced *computed* verdict is only worth something if it is the
+    answer enforce would have acted on — that property now lives on the
+    enforce-code allowlist, the one place a verdict can be computed and not
+    enforced."""
+    q = queue(tmp_path, wired=True, **ADVISORY)
     q.enqueue(task(task_type="review", context=admitted()))
     q.dequeue(agent="codex", role="reviewer")
     q.record_dispatch("t1", channel="tmux_pane", agent="codex", target="%1")
@@ -797,7 +875,8 @@ def test_shadow_accepts_the_same_result_and_records_the_refusal(tmp_path):
 # ═══════════════════════════════════════════════════════════════════════════
 
 def test_b_prime_is_recomputed_over_the_scope_admission_used(tmp_path):
-    q = queue(tmp_path, wired=True)
+    # B is only bound by a computing mode; ``off`` writes a not-consulted stand-down.
+    q = queue(tmp_path, mode="test", wired=True)
     q.enqueue(task(task_type="review", context=admitted(
         {"scope_anchors": ["src/agent_crew/server.py"]})))
     stored = receipt_of(q)

@@ -2,19 +2,23 @@
 
 Before this, one process-wide `AGENT_CREW_CEA_MODE` decided for everything the
 server touched. That is not a rollout control, it is a switch: the whole fleet
-crosses the shadow→enforce boundary together, so the first project ready to move
+crosses the off→enforce boundary together, so the first project ready to move
 waits on the last — and in practice nobody moves.
 
-⛔The mode never changes the **verdict**. P7 gives the engine no shadow branch;
-  the engine decides identically in every mode and the config decides only
-  whether a non-PROCEED answer *stops the work*. That is what makes the
-  fallback direction here safe to be open rather than closed: a typo in an
-  operator's environment must not refuse real work, and `shadow` changes nothing
-  while still producing the measurement.
+⛔The mode never changes the **verdict**. P7 gives the engine no mode branch;
+  the engine decides identically in every mode that computes a verdict and the
+  config decides only whether one is computed and whether a non-PROCEED answer
+  *stops the work*. That is what makes the fallback direction here safe to be
+  open rather than closed: a typo in an operator's environment must not refuse
+  real work.
 
-`off` is new and is the rollout escape hatch — no verdict computed, nothing
-recorded — so that "turn the engine off for this project" is a config change and
-not a deploy. It is never the default.
+Owner directive 2026-10-21 (PR #818): there is **no operational shadow mode**.
+`off` is the default and the fallback — no verdict computed, nothing recorded,
+nothing stopped. `enforce` is the only operational mode that computes a verdict,
+and it always enforces it. `test` is enforcement inside a verifiable pytest
+harness (`test_harness_active`) and resolves to `off` in any other process; the
+live-process proof of that lives in `test_no_shadow_runtime.py`. The historical
+value `shadow` is still spelled by old environments and resolves to `off`.
 """
 
 import pytest
@@ -22,7 +26,7 @@ import pytest
 from agent_crew.cea.callsites import enforcing, recording
 from agent_crew.cea.engine import (
     EMBEDDED_MODES, ENFORCE, MODES, OFF, SHADOW, TEST, EngineConfig,
-    project_mode_env_var, resolve_mode)
+    project_mode_env_var, resolve_mode, test_harness_active)
 
 PROCESS = "AGENT_CREW_CEA_MODE"
 
@@ -51,27 +55,40 @@ def test_no_project_means_the_process_wide_variable():
 
 
 def test_the_per_project_value_wins():
-    env = {PROCESS: "shadow", "AGENT_CREW_CEA_MODE__A": "enforce"}
+    env = {PROCESS: "off", "AGENT_CREW_CEA_MODE__A": "enforce"}
     assert resolve_mode(env, "a") == ENFORCE
-    assert resolve_mode(env, "b") == SHADOW, "an unlisted project keeps the process default"
+    assert resolve_mode(env, "b") == OFF, "an unlisted project keeps the process default"
 
 
 def test_a_project_may_also_be_held_back():
     """Rollout runs both ways: a project that is not ready stays behind a fleet
     that has moved on. A precedence rule that only lets projects move *forward*
     would make enforce irreversible per project."""
-    env = {PROCESS: "enforce", "AGENT_CREW_CEA_MODE__LEGACY": "shadow"}
-    assert resolve_mode(env, "legacy") == SHADOW
+    env = {PROCESS: "enforce", "AGENT_CREW_CEA_MODE__LEGACY": "off"}
+    assert resolve_mode(env, "legacy") == OFF
     assert resolve_mode(env, "ready") == ENFORCE
 
 
-def test_the_default_is_shadow():
-    assert resolve_mode({}, None) == SHADOW
-    assert resolve_mode({}, "anything") == SHADOW
+def test_the_default_is_off():
+    """Nothing set means nothing computed. Owner 2026-10-21: the default is no
+    longer the observation-only `shadow`, which no longer exists."""
+    assert resolve_mode({}, None) == OFF
+    assert resolve_mode({}, "anything") == OFF
 
 
-@pytest.mark.parametrize("value", ["enfroce", "ENFORCE ", "1", "true", "on"])
-def test_an_unrecognised_value_falls_back_to_shadow_not_to_enforce(value):
+def test_the_historical_shadow_value_resolves_to_off_at_every_level():
+    """Old environments still spell `shadow`. It must neither enforce nor
+    resurrect observation-only operation — including when a per-project
+    override says `shadow` over a process-wide `enforce` (holding a project
+    back is still allowed; it is held back to `off`)."""
+    assert resolve_mode({PROCESS: "shadow"}, None) == OFF
+    assert resolve_mode({PROCESS: "shadow"}, "a") == OFF
+    assert resolve_mode({PROCESS: "enforce", "AGENT_CREW_CEA_MODE__A": "shadow"}, "a") == OFF
+    assert SHADOW not in MODES and SHADOW not in EMBEDDED_MODES
+
+
+@pytest.mark.parametrize("value", ["enfroce", "ENFORCE ", "1", "true", "on", "shdaow"])
+def test_an_unrecognised_value_falls_back_to_off_not_to_enforce(value):
     """⛔The one case worth naming: `ENFORCE ` with a trailing space is
     *recognised* (stripped and lowered), while `enfroce` is not and must not
     enforce by accident. Neither may ever resolve to something stricter than
@@ -80,12 +97,12 @@ def test_an_unrecognised_value_falls_back_to_shadow_not_to_enforce(value):
     if value.strip().lower() in MODES:
         assert resolved == value.strip().lower()
     else:
-        assert resolved == SHADOW
+        assert resolved == OFF
 
 
 def test_an_empty_value_is_not_a_choice():
     """An exported-but-empty variable falls through to the next source rather
-    than being read as a mode; otherwise `export VAR=` would silently pin shadow
+    than being read as a mode; otherwise `export VAR=` would silently pin off
     over a process-wide enforce."""
     assert resolve_mode({PROCESS: "enforce", "AGENT_CREW_CEA_MODE__A": ""}, "a") == ENFORCE
 
@@ -93,23 +110,41 @@ def test_an_empty_value_is_not_a_choice():
 # ── what the modes mean at a gate ───────────────────────────────────────────
 
 
+def test_this_suite_is_a_verifiable_harness():
+    """Every `test`-mode assertion below depends on it: the runner registered
+    this pytest session with the engine (`tests/conftest.py`, `pytest_configure`);
+    an imported pytest module alone would not count."""
+    assert test_harness_active() is True
+
+
 @pytest.mark.parametrize("mode,stops_work,computes", [
     (OFF, False, False),
-    (SHADOW, False, True),
     (TEST, True, True),
     (ENFORCE, True, True),
 ])
 def test_each_mode_says_what_it_does(mode, stops_work, computes):
     config = EngineConfig(mode=mode)
+    assert config.mode == mode
     assert config.enforcing is stops_work
     assert config.recording is computes
     assert enforcing(config) is stops_work
     assert recording(config) is computes
 
 
+def test_no_operational_mode_records_without_enforcing():
+    """The defining property of the forbidden `shadow` mode was "compute and
+    record, never stop". No value an operator can write produces it any more:
+    direct construction of it is `off`, and every remaining mode either
+    computes nothing or enforces what it computes."""
+    assert EngineConfig(mode=SHADOW).mode == OFF
+    for mode in MODES:
+        config = EngineConfig(mode=mode)
+        assert not (config.recording and not config.enforcing), mode
+
+
 def test_off_is_embedded_and_enforce_is_not():
     """`off` withholds nothing, so there is nothing for a credential boundary to
-    protect. `enforce` is the one mode whose verdict withholds work."""
+    protect. `enforce` is the one operational mode whose verdict withholds work."""
     assert OFF in EMBEDDED_MODES and ENFORCE not in EMBEDDED_MODES
 
 
@@ -122,7 +157,7 @@ def test_an_explicit_config_is_not_re_resolved(monkeypatch):
     """A caller holding a config already answered the question. Re-resolving it
     from the environment would make their override advisory."""
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__A", "enforce")
-    assert enforcing(EngineConfig(mode=SHADOW), project="a") is False
+    assert enforcing(EngineConfig(mode=OFF), project="a") is False
     assert enforcing(project="a") is True
 
 
@@ -132,12 +167,12 @@ def test_an_explicit_config_is_not_re_resolved(monkeypatch):
 def test_the_queue_resolves_and_caches_per_project(tmp_db, monkeypatch):
     from agent_crew.queue import TaskQueue
 
-    monkeypatch.setenv(PROCESS, "shadow")
+    monkeypatch.setenv(PROCESS, "shadow")      # a legacy environment, still spelled this way
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "enforce")
     q = TaskQueue(tmp_db)
     assert q.cea_config("hot").mode == ENFORCE
-    assert q.cea_config("cold").mode == SHADOW
-    assert q.cea_config().mode == SHADOW
+    assert q.cea_config("cold").mode == OFF
+    assert q.cea_config().mode == OFF
     assert q.cea_config("hot") is q.cea_config("hot"), "resolved once per project"
 
 
@@ -145,5 +180,5 @@ def test_a_pinned_config_still_wins_for_every_project(tmp_db, monkeypatch):
     from agent_crew.queue import TaskQueue
 
     monkeypatch.setenv("AGENT_CREW_CEA_MODE__HOT", "enforce")
-    q = TaskQueue(tmp_db, cea_config=EngineConfig(mode=SHADOW))
-    assert q.cea_config("hot").mode == SHADOW
+    q = TaskQueue(tmp_db, cea_config=EngineConfig(mode=OFF))
+    assert q.cea_config("hot").mode == OFF

@@ -374,15 +374,25 @@ def test_the_registry_is_asked_about_the_canonical_anchor(conn):
 SUPERSEDING = DecisionRev(decision_id="T0-9999", body_hash="c" * 32, supersedes=("T0-1234",))
 
 
+def _computing(mode: str) -> EngineConfig:
+    """The two modes that still compute a verdict. ``advisory`` is the
+    enforce-code allowlist (compute, record, act only on the listed codes);
+    ``off`` is no longer a member — it stands down with ``CEA_MODE_OFF`` and
+    computes nothing (PR #818), so lineage behaviour cannot be observed there."""
+    if mode == "advisory":
+        return EngineConfig(mode="test", enforce_codes=frozenset({"NONCE_REUSED"}))
+    return EngineConfig(mode=mode)
+
+
 def _ops(task_id, *, authority=("T0-1234",), anchors=("ops/rotate.py",)):
     return intent(task_id, ident=identity(work_class=WorkClass.OPS, anchors=anchors,
                                           authority=authority))
 
 
-@pytest.mark.parametrize("mode", ["shadow", "test"])
+@pytest.mark.parametrize("mode", ["advisory", "test"])
 @pytest.mark.parametrize("status", ["needs_human", "failed", "cancelled", "timed_out"])
 def test_consumed_noncompleted_human_gate_retry_is_a_new_linked_lineage(conn, mode, status):
-    eng = engine(config=EngineConfig(mode=mode))
+    eng = engine(config=_computing(mode))
     first = eng.authorize(conn, _ops("attempt-1"), caller())
     assert first.decision == "HUMAN_GATE"
     run_to(eng, conn, first.receipt_id, "CONSUMED")
@@ -396,9 +406,9 @@ def test_consumed_noncompleted_human_gate_retry_is_a_new_linked_lineage(conn, mo
     assert receipt_store.lineage_for_intent(conn, first.receipt["intent_hash"])["receipt_id"] == retry.receipt_id
 
 
-@pytest.mark.parametrize("mode", ["shadow", "test"])
+@pytest.mark.parametrize("mode", ["advisory", "test"])
 def test_consumed_completed_task_still_blocks_same_intent(conn, mode):
-    eng = engine(config=EngineConfig(mode=mode))
+    eng = engine(config=_computing(mode))
     first = eng.authorize(conn, _ops("complete-1"), caller())
     run_to(eng, conn, first.receipt_id, "CONSUMED")
     set_task_status(conn, first.receipt_id, "completed")
@@ -409,10 +419,10 @@ def test_consumed_completed_task_still_blocks_same_intent(conn, mode):
         "re-admission requires a superseding decision record (P4)")
 
 
-@pytest.mark.parametrize("mode", ["shadow", "test"])
+@pytest.mark.parametrize("mode", ["advisory", "test"])
 @pytest.mark.parametrize("missing", ["task_row", "tasks_table"])
 def test_consumed_unknown_task_status_still_blocks_same_intent(conn, mode, missing):
-    eng = engine(config=EngineConfig(mode=mode))
+    eng = engine(config=_computing(mode))
     first = eng.authorize(conn, _ops("unknown-1"), caller())
     run_to(eng, conn, first.receipt_id, "CONSUMED")
     if missing == "tasks_table":
@@ -440,11 +450,11 @@ def test_consumed_other_known_statuses_do_not_release_lineage(conn, status):
     assert retry.code == "ALREADY_COMPLETED"
 
 
-@pytest.mark.parametrize("mode", ["shadow", "test"])
+@pytest.mark.parametrize("mode", ["advisory", "test"])
 def test_noncompleted_work_does_not_block_a_changed_authority_hash(conn, mode):
     extra = DecisionRev("T0-5555", "d" * 32)
     snapshot = FakeSnapshot(decisions=(DECISION, extra), in_scope=(DECISION, extra))
-    eng = engine(config=EngineConfig(mode=mode), snapshots=snapshot)
+    eng = engine(config=_computing(mode), snapshots=snapshot)
     first = eng.authorize(conn, _ops("authority-1"), caller())
     run_to(eng, conn, first.receipt_id, "CONSUMED")
     set_task_status(conn, first.receipt_id, "needs_human")
@@ -453,9 +463,9 @@ def test_noncompleted_work_does_not_block_a_changed_authority_hash(conn, mode):
     assert retry.code != "ALREADY_COMPLETED"
 
 
-@pytest.mark.parametrize("mode", ["shadow", "test"])
+@pytest.mark.parametrize("mode", ["advisory", "test"])
 def test_in_flight_human_gate_lineage_remains_duplicate(conn, mode):
-    eng = engine(config=EngineConfig(mode=mode))
+    eng = engine(config=_computing(mode))
     first = eng.authorize(conn, _ops("flight-1"), caller())
     retry = eng.authorize(conn, _ops("flight-2"), caller())
     assert first.decision == "HUMAN_GATE"

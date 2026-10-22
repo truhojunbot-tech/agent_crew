@@ -2918,10 +2918,17 @@ class TaskQueue:
         # is what the four post-admission sites will read it back from. s4k: the
         # queue's own declaration wins over the task when there is one, so a
         # request body cannot pick the mode it is judged under.
-        gate = _cea_callsites.gate_enqueue(
-            receipt, task_id=task.task_id,
-            current=_cea_callsites.current_inputs(engine, receipt),
-            config=self.cea_config(scope))
+        enqueue_config = self.cea_config(scope)
+        if not enqueue_config.recording:
+            # `off`: no verdict. Neither B′ (the provider sweep in
+            # `current_inputs`) nor the validator runs; the gate records that
+            # it stood down (PR #818 review, round 1).
+            gate = _cea_callsites.gate_off(_cea_validator.ValidationPoint.ENQUEUE, receipt)
+        else:
+            gate = _cea_callsites.gate_enqueue(
+                receipt, task_id=task.task_id,
+                current=_cea_callsites.current_inputs(engine, receipt),
+                config=enqueue_config)
         reason = receipt.get("reason")
         if (not gate.proceed and isinstance(reason, dict)
                 and reason.get("code") == "BROKER_UNREACHABLE"):
@@ -4199,6 +4206,8 @@ class TaskQueue:
     def _cea_result_gate_on(self, conn, receipt: dict, *, nonce: Optional[str],
                             presenter: Optional[str], config):
         """Read the RESULT gate without consuming a nonce or moving a receipt."""
+        if not config.recording:
+            return _cea_callsites.gate_off(_cea_validator.ValidationPoint.RESULT, receipt)
         nrow = _cea_store.nonce_row(conn, nonce) if nonce else None
         return _cea_callsites.gate_result(
             receipt, nonce=nonce, presenter=presenter,
@@ -4365,12 +4374,15 @@ class TaskQueue:
                 logger.warning("cea: task %s names receipt %s, which is not in the store",
                                task_id, receipt_id)
             return None
+        claim_config = self.cea_config_for_receipt(receipt)
+        if not claim_config.recording:
+            return _cea_callsites.gate_off(_cea_validator.ValidationPoint.CLAIM, receipt)
         engine = self.cea_engine()
         claimant = agent or role or None
         return _cea_callsites.gate_claim(
             receipt, claimant=claimant,
             current=_cea_callsites.current_inputs(engine, receipt, claimant=claimant),
-            config=self.cea_config_for_receipt(receipt))
+            config=claim_config)
 
     #: Every ``pending -> in_progress`` mutation names itself here. The static
     #: test in ``tests/unit/test_sev0_cea_s2b_adapters.py`` asserts that the set
@@ -6130,11 +6142,18 @@ class TaskQueue:
                                                    config=legacy_config, at=at)
             else:
                 engine = self.cea_engine()
-                gate = _cea_callsites.gate_dispatch(
-                    receipt, attempt=receipt.get("attempt"),
-                    current=_cea_callsites.current_inputs(
-                        engine, receipt, already_claimed=True),
-                    config=self.cea_config_for_receipt(receipt))
+                dispatch_config = self.cea_config_for_receipt(receipt)
+                if not dispatch_config.recording:
+                    # `off`: no verdict, but the nonce is still minted below —
+                    # it is the executor-binding protocol, not a judgement.
+                    gate = _cea_callsites.gate_off(
+                        _cea_validator.ValidationPoint.DISPATCH, receipt)
+                else:
+                    gate = _cea_callsites.gate_dispatch(
+                        receipt, attempt=receipt.get("attempt"),
+                        current=_cea_callsites.current_inputs(
+                            engine, receipt, already_claimed=True),
+                        config=dispatch_config)
                 if not gate.proceed:
                     logger.warning("cea: dispatch refused for %s — %s", task_id, gate.reason)
                     raise AdmissionRefused(gate)
@@ -6251,12 +6270,16 @@ class TaskQueue:
             engine = self.cea_engine()
             row = _cea_store.nonce_row(conn, nonce) if nonce else None
             gate_config = self.cea_config_for_receipt(receipt)
-            gate = _cea_callsites.gate_execute_start(
-                receipt, nonce=nonce,
-                current=_cea_callsites.current_inputs(
-                    engine, receipt, presenter=presenter, already_dispatched=True,
-                    nonce_unused=(None if row is None else row.get("used_at") is None)),
-                config=gate_config)
+            if not gate_config.recording:
+                gate = _cea_callsites.gate_off(
+                    _cea_validator.ValidationPoint.EXECUTE_START, receipt)
+            else:
+                gate = _cea_callsites.gate_execute_start(
+                    receipt, nonce=nonce,
+                    current=_cea_callsites.current_inputs(
+                        engine, receipt, presenter=presenter, already_dispatched=True,
+                        nonce_unused=(None if row is None else row.get("used_at") is None)),
+                    config=gate_config)
             spent = False
             if gate.proceed and nonce:
                 # ⛔Tag *who* spent it. RESULT reads this back to tell
@@ -6285,13 +6308,13 @@ class TaskQueue:
                 #   reads as a refusal on its own. Label it on the go path so no
                 #   field of the answer contradicts `go`. The enforced answer
                 #   never reaches here and stays byte-identical.
-                shadow = gate_config.mode == "shadow"
+                # PR #818: there is no "shadow mode" label any more — the
+                #   historical value resolves to `off` (owner 2026-10-21), so a
+                #   non-enforced verdict is advisory whatever was written. The
+                #   `shadow_outcome` key is kept for clients already reading it.
                 answer.update(advisory=True, shadow_outcome=gate.outcome.value,
-                              reason=("shadow (not enforced): " if shadow else
-                                      "advisory (not enforced): ") + str(gate.reason),
+                              reason="advisory (not enforced): " + str(gate.reason),
                               instruction=(
-                                  "shadow mode: not enforced — proceed; decide on go only"
-                                  if shadow else
                                   "advisory verdict: not enforced — proceed; decide on go only"))
                 if gate.review_required:
                     answer["review_required"] = True
