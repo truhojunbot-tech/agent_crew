@@ -384,18 +384,20 @@ def test_retry_fix_without_approve_rereview_still_vetoes(tmp_path):
 
 def test_failed_test_without_later_completed_test_does_not_succeed(tmp_path):
     """#821: a failed terminal test blocks until a later test of the same
-    explicit scope (the reviewed revision) on the lineage completed."""
+    explicit test scope and reviewed revision on the lineage completed."""
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
     queue.admit_work_intent(_intent(task=_task()))
     for spec in (_lineage_task("review-1", "review", "impl-793"),
-                 _lineage_task("test-1", "test", "review-1", reviewed_sha="a" * 40)):
+                 _lineage_task("test-1", "test", "review-1", test_scope="targeted",
+                               reviewed_sha="a" * 40)):
         queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
     _complete(queue, "impl-793")
     _complete(queue, "review-1", verdict="approve")
     _fail(queue, "test-1")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
     queue.enqueue(TaskRequest(**_lineage_task("test-1-retry", "test", "review-1",
+                                              test_scope="targeted",
                                               reviewed_sha="a" * 40)),
                   ingress="http.tasks")
     _complete(queue, "test-1-retry")
@@ -473,6 +475,45 @@ def test_unscoped_tests_off_same_parent_do_not_supersede(tmp_path):
     assert intent["decision_reason"] is None
 
 
+def test_same_reviewed_sha_tests_off_same_parent_do_not_supersede(tmp_path):
+    """Review of PR #822 at 1624758: the reviewed commit is not test scope.
+    Two different runs of one commit share its SHA; without a test-specific
+    scope claim the smoke run does not stand in for the failed full run."""
+    queue = _setup_approved_lineage(tmp_path)
+    queue.enqueue(TaskRequest(**_lineage_task("test-full", "test", "review-1",
+                                              reviewed_sha="a" * 40,
+                                              test_command="pytest tests")),
+                  ingress="http.tasks")
+    queue.submit_result("test-full", TaskResult(task_id="test-full", status="failed",
+                                                summary="3 product tests failed"))
+    queue.enqueue(TaskRequest(**_lineage_task("test-smoke", "test", "review-1",
+                                              reviewed_sha="a" * 40,
+                                              test_command="pytest tests/smoke")),
+                  ingress="http.tasks")
+    _complete(queue, "test-smoke")
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BOUND"
+    assert intent["decision_reason"] is None
+
+
+def test_declared_retry_of_other_revision_does_not_supersede(tmp_path):
+    """A system retry that names the dead test but declares a different
+    reviewed revision tested different code; it is not that test's retry."""
+    queue = _setup_approved_lineage(tmp_path)
+    queue.enqueue(TaskRequest(**_lineage_task("test-1", "test", "review-1",
+                                              reviewed_sha="a" * 40)),
+                  ingress="http.tasks")
+    _fail(queue, "test-1", status="timed_out")
+    queue.enqueue(TaskRequest(**_lineage_task("retry-test-1-a1", "test", "test-1",
+                                              reviewed_sha="b" * 40,
+                                              original_task_id="test-1",
+                                              retry_attempt=1)),
+                  ingress="retry.failed_task",
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    _complete(queue, "retry-test-1-a1")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
 def test_declared_retry_with_changed_scope_does_not_supersede(tmp_path):
     """Review of PR #822 at e7f639a: the declared-provenance path checks scope
     too. A system successor that names the dead test but narrows its scope
@@ -501,11 +542,11 @@ def test_completed_task_off_another_parent_does_not_supersede(tmp_path):
                   ingress="http.tasks")
     _complete(queue, "review-2", verdict="approve")
     queue.enqueue(TaskRequest(**_lineage_task("test-1", "test", "review-1",
-                                              reviewed_sha="a" * 40)),
+                                              test_scope="targeted", reviewed_sha="a" * 40)),
                   ingress="http.tasks")
     _fail(queue, "test-1")
     queue.enqueue(TaskRequest(**_lineage_task("test-2", "test", "review-2",
-                                              reviewed_sha="a" * 40)),
+                                              test_scope="targeted", reviewed_sha="a" * 40)),
                   ingress="http.tasks")
     _complete(queue, "test-2")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"

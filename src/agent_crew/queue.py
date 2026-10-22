@@ -3720,14 +3720,18 @@ class TaskQueue:
     # question for a person, and no sibling result answers it (review of PR
     # #822 at 4afcda7, finding 2).
     _SUPERSEDABLE_STATUSES = frozenset({"failed", "timed_out", "cancelled"})
-    # Explicit work-scope claims the system writes on a task: *which tests*
-    # (``test_scope``, pipeline-admitted reduction), *which revision*
-    # (``reviewed_sha`` / ``expected_head_sha``, pipeline review -> test) and
-    # *which findings* (``review_findings``, cascade review -> fix). Two tasks
-    # do the same work only when they declare the same scope; an absent claim
-    # is not "full scope by default", it is no claim at all (review of PR #822
-    # at e7f639a).
-    _WORK_SCOPE_KEYS = ("test_scope", "reviewed_sha", "expected_head_sha", "review_findings")
+    # Explicit, role-specific work-scope claims the system writes on a task:
+    # *which tests* for a test (``test_scope``, pipeline-admitted reduction) and
+    # *which findings* for a fix (``review_findings``, cascade review -> fix).
+    # Two tasks do the same work only when they declare the same scope; an
+    # absent claim is not "full scope by default", it is no claim at all
+    # (review of PR #822 at e7f639a). The reviewed revision is deliberately
+    # *not* scope: two different test runs of one commit share its SHA without
+    # being the same run (review of PR #822 at 1624758). It is a compatibility
+    # check instead (:meth:`_work_revision`): a retry of different code is not
+    # a retry.
+    _WORK_SCOPE_KEYS = {"test": ("test_scope",), "implement": ("review_findings",)}
+    _WORK_REVISION_KEYS = ("reviewed_sha", "expected_head_sha")
 
     @staticmethod
     def _row_context(row) -> dict:
@@ -3738,10 +3742,19 @@ class TaskQueue:
         return context if isinstance(context, dict) else {}
 
     @staticmethod
-    def _work_scope(context: dict) -> dict:
-        """The explicit scope claims a task context makes, or ``{}`` for none."""
-        return {key: context[key] for key in TaskQueue._WORK_SCOPE_KEYS
+    def _work_scope(task_type: str, context: dict) -> dict:
+        """The explicit role-specific scope claims a context makes, or ``{}``."""
+        return {key: context[key] for key in TaskQueue._WORK_SCOPE_KEYS.get(task_type, ())
                 if context.get(key) not in (None, "", [], {})}
+
+    @staticmethod
+    def _work_revision(context: dict) -> str:
+        """The revision a task declares it works on, or ``""`` for none."""
+        for key in TaskQueue._WORK_REVISION_KEYS:
+            value = context.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ""
 
     @staticmethod
     def _task_lineage_keys(row) -> set:
@@ -3768,9 +3781,10 @@ class TaskQueue:
         """Bound task ids whose failure is covered by a completed causal retry.
 
         A bound task in :data:`_SUPERSEDABLE_STATUSES` is superseded by a
-        completed bound task of the same ``task_type`` and the **same explicit
-        work scope** (:meth:`_work_scope`) in exactly two cases (#821; reviews
-        of PR #822 at 4afcda7 and e7f639a):
+        completed bound task of the same ``task_type``, the **same explicit
+        role-specific work scope** (:meth:`_work_scope`) and the same declared
+        revision (:meth:`_work_revision`) in exactly two cases (#821; reviews
+        of PR #822 at 4afcda7, e7f639a and 1624758):
 
         1. **Declared retry provenance.** The completed task names the dead
            one -- directly or through a chain of bound successors -- in a
@@ -3783,10 +3797,13 @@ class TaskQueue:
            that *changed* scope is different work and does not count.
         2. **Same-step redispatch with explicit scope.** Same ``prev_task_id``,
            same PR/branch lineage, created later (``created_at``, then
-           ``rowid``), and both tasks declare the same non-empty scope. Both
-           of those context keys are caller-supplied on ``http.tasks``, so
-           they are proof only together with an explicit scope claim: two
-           unscoped tests off one review are not shown to be the same run.
+           ``rowid``), and both tasks declare the same non-empty role-specific
+           scope. Both of those context keys are caller-supplied on
+           ``http.tasks``, so they are proof only together with an explicit
+           scope claim: two unscoped tests off one review are not shown to be
+           the same run, and neither are two tests that merely name the same
+           reviewed commit -- the commit says what was tested, not which
+           tests ran.
 
         A shared PR/branch by itself proves nothing: a smoke test off the same
         review does not stand in for a failed full-suite run, and a test off a
@@ -3798,13 +3815,17 @@ class TaskQueue:
                 if row["status"] in TaskQueue._SUPERSEDABLE_STATUSES}
         if not dead:
             return superseded
-        dead_scope = {task_id: TaskQueue._work_scope(TaskQueue._row_context(row))
-                      for task_id, row in dead.items()}
+        dead_identity = {}
+        for task_id, row in dead.items():
+            dead_context = TaskQueue._row_context(row)
+            dead_identity[task_id] = (TaskQueue._work_scope(row["task_type"], dead_context),
+                                      TaskQueue._work_revision(dead_context))
         for other in by_id.values():
             if other["status"] != "completed":
                 continue
             context = TaskQueue._row_context(other)
-            scope = TaskQueue._work_scope(context)
+            scope = TaskQueue._work_scope(other["task_type"], context)
+            identity = (scope, TaskQueue._work_revision(context))
             # 1. declared provenance: walk the declared-parent chain through the
             #    bound rows (bounded, cycle-safe) and lift every dead same-type,
             #    same-scope ancestor -- a retry of a retry covers both rounds.
@@ -3814,7 +3835,7 @@ class TaskQueue:
                 seen.add(parent)
                 parent_row = by_id[parent]
                 if (parent in dead and parent_row["task_type"] == other["task_type"]
-                        and dead_scope[parent] == scope):
+                        and dead_identity[parent] == identity):
                     superseded.add(parent)
                 parent = _cea_lineage_parent_from_ctx(TaskQueue._row_context(parent_row))
             # 2. same-step redispatch, only with an explicit matching scope.
@@ -3828,7 +3849,7 @@ class TaskQueue:
             for task_id, row in dead.items():
                 if task_id in superseded or row["task_type"] != other["task_type"]:
                     continue
-                if dead_scope[task_id] != scope:
+                if dead_identity[task_id] != identity:
                     continue
                 if TaskQueue._row_context(row).get("prev_task_id") != prev_task_id:
                     continue
