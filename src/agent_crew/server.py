@@ -109,24 +109,36 @@ from agent_crew.telemetry_response import response_log_telemetry
 from agent_crew.worktree_default_branch import remote_default_branch
 
 logger = logging.getLogger(__name__)
+_unclaimed_lock_notices: set[tuple[str, str, str]] = set()
+_unclaimed_lock_notices_guard = threading.Lock()
 
 
 def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
-                            detail: str = "", notify_fn=None) -> None:
+                            detail: str = "", notify_fn=None, *,
+                            fallback_on_claim_lock: bool = False) -> None:
     """Deliver one durable coordinator notice across HTTP and MCP transports."""
     claimed = False
+    task = None
+    message = ""
+    emergency_key = (str(queue._db_path), task_id, kind)
+    if fallback_on_claim_lock:
+        with _unclaimed_lock_notices_guard:
+            if emergency_key in _unclaimed_lock_notices:
+                return
     try:
         task = queue.get_task(task_id)
         intent = (queue.get_work_intent(task_id[len("work-intent:"):])
                   if task is None and task_id.startswith("work-intent:") else None)
-        if (task is None and intent is None) or not queue.claim_coordinator_notice(task_id, kind):
+        if task is None and intent is None:
             return
-        claimed = True
         ctx = task.context if task is not None and isinstance(task.context, dict) else {}
         safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
         message = (f"agent_crew coordinator notice: task={task_id} kind={kind} "
                    f"branch={task.branch if task else ''} repo={intent['repo'] if intent else ctx.get('repo') or ''} "
                    f"session_url={ctx.get('cloud_session_url') or ''} {safe_detail}")[:1000]
+        if not queue.claim_coordinator_notice(task_id, kind):
+            return
+        claimed = True
         if notify_fn is not None:
             delivered = bool(notify_fn(message))
         else:
@@ -139,8 +151,37 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
         if not delivered:
             logger.warning("coordinator notice delivery failed task=%s kind=%s; %s",
                            task_id, kind, "retryable" if retryable else "gave up")
-    except Exception:
+    except Exception as exc:
         logger.exception("coordinator notice failed task=%s kind=%s", task_id, kind)
+        if (fallback_on_claim_lock and not claimed
+                and isinstance(exc, sqlite3.OperationalError)
+                and "locked" in str(exc).lower()):
+            # The notice claim shares the busy tasks DB with the failed enqueue.
+            # Deliver the emergency alert without that claim, once per process.
+            with _unclaimed_lock_notices_guard:
+                first = emergency_key not in _unclaimed_lock_notices
+                if first:
+                    _unclaimed_lock_notices.add(emergency_key)
+            if first:
+                if not message:
+                    safe_detail = detail.split("\npane_tail:", 1)[0].replace("\n", " ")[:300]
+                    message = (f"agent_crew coordinator notice: task={task_id} "
+                               f"kind={kind} {safe_detail}")[:1000]
+                try:
+                    if notify_fn is not None:
+                        delivered = bool(notify_fn(message))
+                    else:
+                        from agent_crew.notify import notify_console, notify_telegram
+                        delivered = bool(notify_telegram(message))
+                        if not delivered:
+                            notify_console(message)
+                    if not delivered:
+                        with _unclaimed_lock_notices_guard:
+                            _unclaimed_lock_notices.discard(emergency_key)
+                except Exception:
+                    with _unclaimed_lock_notices_guard:
+                        _unclaimed_lock_notices.discard(emergency_key)
+                    logger.exception("unclaimed lock notice failed task=%s kind=%s", task_id, kind)
         if claimed:
             try:
                 queue.finish_coordinator_notice(task_id, kind, delivered=False)

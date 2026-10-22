@@ -29,13 +29,13 @@ def _parent(queue, stage):
     return task_id
 
 
-def _cascade(queue, stage, parent):
+def _cascade(queue, stage, parent, **kwargs):
     if stage == "review":
-        return auto_enqueue_review(queue, parent, PR, pr_state_fn=lambda _: "open")
+        return auto_enqueue_review(queue, parent, PR, pr_state_fn=lambda _: "open", **kwargs)
     if stage == "fix":
         return auto_enqueue_fix(queue, parent, repo="owner/repo",
-                                pr_state_fn=lambda _: "open")
-    return auto_enqueue_test(queue, parent, pr_state_fn=lambda _: "open")
+                                pr_state_fn=lambda _: "open", **kwargs)
+    return auto_enqueue_test(queue, parent, pr_state_fn=lambda _: "open", **kwargs)
 
 
 @pytest.mark.parametrize("stage", ["review", "fix", "test"])
@@ -84,3 +84,39 @@ def test_persistent_locked_enqueue_records_one_notice(tmp_path, monkeypatch, sta
     assert failure["lineage_task_id"] == parent
     assert len(notices) == 1
     assert parent in notices[0] and stage in notices[0]
+
+
+def test_real_write_lock_delivers_one_notice_without_db_claim(tmp_path, monkeypatch):
+    db_path = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db_path))
+    parent = _parent(queue, "review")
+    notices = []
+    original_connect = queue._connect
+
+    def short_timeout_connect():
+        conn = original_connect()
+        conn.execute("PRAGMA busy_timeout=200")
+        return conn
+
+    monkeypatch.setattr(queue, "_connect", short_timeout_connect)
+    holder = sqlite3.connect(db_path)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        for _ in range(2):
+            assert _cascade(
+                queue, "review", parent,
+                coordinator_notify_fn=lambda message: notices.append(message) or True,
+            ) is None
+        assert len(notices) == 1
+        assert parent in notices[0] and "missing_step=review" in notices[0]
+    finally:
+        holder.rollback()
+        holder.close()
+    assert not [task for task in queue.list_tasks() if task.task_id != parent]
+    from agent_crew.server import coordinator_notice_once
+    coordinator_notice_once(
+        queue, parent, "cascade_enqueue_locked_review", "missing_step=review",
+        lambda message: notices.append(message) or True,
+        fallback_on_claim_lock=True,
+    )
+    assert len(notices) == 1

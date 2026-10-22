@@ -1123,6 +1123,7 @@ def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
                 f"lineage={lineage} missing_step={step} successor={task.task_id} "
                 "reason=database is locked",
                 coordinator_notify_fn,
+                fallback_on_claim_lock=True,
             )
             raise
     if "risk_declaration" in inherited:
