@@ -49,7 +49,8 @@ from typing import Callable, List, Optional
 
 from agent_crew import github as _github
 from agent_crew.protocol import TaskRequest, TaskResult
-from agent_crew.queue import AdmissionRefused, TaskQueue
+from agent_crew.queue import (AdmissionRefused, TaskAlreadyExistsError, TaskQueue,
+                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE)
 
 logger = logging.getLogger(__name__)
 
@@ -602,6 +603,8 @@ def _resolve_resume_session_id(queue: TaskQueue, task: TaskRequest) -> Optional[
     on any lookup failure — a resume is an optimization, not a requirement.
     """
     ctx = task.context if isinstance(task.context, dict) else {}
+    if ctx.get("cloud_stale_retry"):
+        return None  # The predecessor's session was unobservable and must not be resumed.
     prev = ctx.get("prev_task_id")
     if not isinstance(prev, str) or not prev:
         return None
@@ -824,6 +827,53 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
                                 f"retryable cloud submit failure: {reason[:300]}")
     return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason,
                                 retryable=retryable)
+
+
+def _requeue_stale_cloud_once(queue: TaskQueue, task: TaskRequest,
+                              reason: str) -> Optional[str]:
+    """Free one stale cloud slot and create one same-role lineage retry."""
+    context = task.context if isinstance(task.context, dict) else {}
+    if context.get("cloud_stale_retry"):
+        return None
+    from agent_crew.pipeline import MAX_TASK_RETRIES, successor_context
+    try:
+        attempt = int(context.get("retry_attempt") or 0)
+    except (TypeError, ValueError):
+        return None
+    if attempt >= MAX_TASK_RETRIES:
+        return None
+    retry_id = f"retry-{task.task_id}-a{attempt + 1}"
+    _fail_closed_dispatch(queue, task, task.task_type, reason)
+    retry_context = {key: value for key, value in successor_context(context).items()
+                     if not key.startswith("cloud_")}
+    retry_context.update({
+        "prev_task_id": task.task_id,
+        "original_task_id": context.get("original_task_id") or task.task_id,
+        "retry_of": task.task_id,
+        "retry_attempt": attempt + 1,
+        "lineage_root_task_id": context.get("lineage_root_task_id") or task.task_id,
+        "cloud_stale_retry": True,
+    })
+    retry = TaskRequest(
+        task_id=retry_id, task_type=task.task_type,
+        description=task.description, branch=task.branch,
+        priority=task.priority + 1, context=retry_context,
+        project=task.project,
+    )
+    try:
+        queue.enqueue(retry, ingress="retry.failed_task",
+                      _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    except TaskAlreadyExistsError:
+        pass  # A repeated reconciliation uses the same successor id.
+    except Exception:
+        logger.exception("claude_cloud: stale retry enqueue failed for %s", task.task_id)
+        from agent_crew.server import coordinator_notice_once
+        coordinator_notice_once(queue, task.task_id, "cloud_stale_no_successor",
+                                f"lineage={retry_context['lineage_root_task_id']} "
+                                f"missing_retry={retry_id} reason={reason[:200]}")
+        return ""  # The original was closed, but its successor could not be queued.
+    queue.patch_context(task.task_id, {"cloud_stale_retry_task_id": retry_id})
+    return retry_id
 
 
 _LOCAL_ONLY_PATH = re.compile(
@@ -1402,7 +1452,7 @@ def parse_terminal_outcome(text: str) -> Optional[tuple]:
 class CloudReconciliationOutcome:
     task_id: str
     #: "pr_ready" | "already_fixed" | "blocked_for_cloud" | "needs_decision"
-    #: | "failed" | "still_dispatched" | "unknown_outcome"
+    #: | "failed" | "requeued" | "still_dispatched" | "unknown_outcome"
     action: str
     pr_number: Optional[int] = None
     detail: str = ""
@@ -1499,9 +1549,15 @@ def _reconcile_cloud_review(
                                                           pr_number=pr_number)
     age = time.time() - queue.get_dispatched_at(task.task_id)
     if age > cloud_stale_seconds():
+        stale_reason = (f"cloud_review_stale: {retry_detail or 'no marked comment'} "
+                        f"after {int(age)}s")
+        retry_id = _requeue_stale_cloud_once(queue, task, stale_reason)
+        if retry_id is not None:
+            return CloudReconciliationOutcome(
+                task.task_id, "requeued" if retry_id else "failed",
+                pr_number=pr_number, detail=f"stale cloud review; retry={retry_id}")
         _fail_closed_dispatch(queue, task, "review",
-                              f"cloud_review_stale: {retry_detail or 'no marked comment'} "
-                              f"after {int(age)}s")
+                              stale_reason)
         return CloudReconciliationOutcome(task.task_id, "failed", pr_number=pr_number,
                                           detail="stale cloud review")
     return CloudReconciliationOutcome(task.task_id, "still_dispatched", pr_number=pr_number,
@@ -1624,6 +1680,13 @@ def reconcile_cloud_dispatch(
         if age > cloud_stale_seconds():
             stale_detail = ("the existing PR head did not advance" if held_existing_head
                             else "no PR and no recognized outcome")
+            retry_id = _requeue_stale_cloud_once(
+                queue, task, f"claude_cloud: {stale_detail} for branch {branch} "
+                f"after {int(age)}s")
+            if retry_id is not None:
+                return CloudReconciliationOutcome(
+                    task.task_id, "requeued" if retry_id else "failed",
+                    detail=f"stale cloud implement; retry={retry_id}")
             stale_result = TaskResult(
                 task_id=task.task_id, status="needs_human",
                 summary=(f"claude_cloud: {stale_detail} for branch "
