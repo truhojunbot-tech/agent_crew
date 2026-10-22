@@ -3720,6 +3720,14 @@ class TaskQueue:
     # question for a person, and no sibling result answers it (review of PR
     # #822 at 4afcda7, finding 2).
     _SUPERSEDABLE_STATUSES = frozenset({"failed", "timed_out", "cancelled"})
+    # Explicit work-scope claims the system writes on a task: *which tests*
+    # (``test_scope``, pipeline-admitted reduction), *which revision*
+    # (``reviewed_sha`` / ``expected_head_sha``, pipeline review -> test) and
+    # *which findings* (``review_findings``, cascade review -> fix). Two tasks
+    # do the same work only when they declare the same scope; an absent claim
+    # is not "full scope by default", it is no claim at all (review of PR #822
+    # at e7f639a).
+    _WORK_SCOPE_KEYS = ("test_scope", "reviewed_sha", "expected_head_sha", "review_findings")
 
     @staticmethod
     def _row_context(row) -> dict:
@@ -3728,6 +3736,12 @@ class TaskQueue:
         except (TypeError, ValueError):
             return {}
         return context if isinstance(context, dict) else {}
+
+    @staticmethod
+    def _work_scope(context: dict) -> dict:
+        """The explicit scope claims a task context makes, or ``{}`` for none."""
+        return {key: context[key] for key in TaskQueue._WORK_SCOPE_KEYS
+                if context.get(key) not in (None, "", [], {})}
 
     @staticmethod
     def _task_lineage_keys(row) -> set:
@@ -3754,20 +3768,25 @@ class TaskQueue:
         """Bound task ids whose failure is covered by a completed causal retry.
 
         A bound task in :data:`_SUPERSEDABLE_STATUSES` is superseded by a
-        completed bound task of the same ``task_type`` in exactly two cases
-        (#821; review of PR #822 at 4afcda7, finding 1):
+        completed bound task of the same ``task_type`` and the **same explicit
+        work scope** (:meth:`_work_scope`) in exactly two cases (#821; reviews
+        of PR #822 at 4afcda7 and e7f639a):
 
         1. **Declared retry provenance.** The completed task names the dead
            one -- directly or through a chain of bound successors -- in a
            system lineage key (:data:`_CEA_LINEAGE_PARENT_KEYS`:
            ``original_task_id`` from ``_auto_retry_failed_task`` and the
-           owner-conflict re-admission, ``retry_of``, ``fallback_*``).
-        2. **Same-step redispatch.** The coordinator re-dispatched the same
-           pipeline step: same ``prev_task_id``, same PR/branch lineage, the
-           same ``test_scope`` claim, and created later (``created_at``, then
-           ``rowid``). This is how a timed-out fix round is actually replaced
-           in practice -- the live #818 lineage carries no retry key, only the
-           review both fix rounds hang off.
+           owner-conflict re-admission, ``retry_of``, ``fallback_*``). HTTP
+           ingress drops those keys (``_trusted_enqueue_context``), so only an
+           in-process constructor can make this claim. A system retry copies
+           its parent's context, so its scope is the parent's; a successor
+           that *changed* scope is different work and does not count.
+        2. **Same-step redispatch with explicit scope.** Same ``prev_task_id``,
+           same PR/branch lineage, created later (``created_at``, then
+           ``rowid``), and both tasks declare the same non-empty scope. Both
+           of those context keys are caller-supplied on ``http.tasks``, so
+           they are proof only together with an explicit scope claim: two
+           unscoped tests off one review are not shown to be the same run.
 
         A shared PR/branch by itself proves nothing: a smoke test off the same
         review does not stand in for a failed full-suite run, and a test off a
@@ -3779,24 +3798,28 @@ class TaskQueue:
                 if row["status"] in TaskQueue._SUPERSEDABLE_STATUSES}
         if not dead:
             return superseded
+        dead_scope = {task_id: TaskQueue._work_scope(TaskQueue._row_context(row))
+                      for task_id, row in dead.items()}
         for other in by_id.values():
             if other["status"] != "completed":
                 continue
             context = TaskQueue._row_context(other)
+            scope = TaskQueue._work_scope(context)
             # 1. declared provenance: walk the declared-parent chain through the
-            #    bound rows (bounded, cycle-safe) and lift every dead same-type
-            #    ancestor -- a retry of a retry covers both dead rounds.
+            #    bound rows (bounded, cycle-safe) and lift every dead same-type,
+            #    same-scope ancestor -- a retry of a retry covers both rounds.
             parent, seen = _cea_lineage_parent_from_ctx(context), set()
             while (parent and parent in by_id and parent not in seen
                    and len(seen) < _CEA_LINEAGE_MAX_DEPTH):
                 seen.add(parent)
                 parent_row = by_id[parent]
-                if parent in dead and parent_row["task_type"] == other["task_type"]:
+                if (parent in dead and parent_row["task_type"] == other["task_type"]
+                        and dead_scope[parent] == scope):
                     superseded.add(parent)
                 parent = _cea_lineage_parent_from_ctx(TaskQueue._row_context(parent_row))
-            # 2. same-step redispatch.
+            # 2. same-step redispatch, only with an explicit matching scope.
             prev_task_id = context.get("prev_task_id")
-            if not isinstance(prev_task_id, str) or not prev_task_id:
+            if not scope or not isinstance(prev_task_id, str) or not prev_task_id:
                 continue
             keys = TaskQueue._task_lineage_keys(other)
             if not keys:
@@ -3805,10 +3828,9 @@ class TaskQueue:
             for task_id, row in dead.items():
                 if task_id in superseded or row["task_type"] != other["task_type"]:
                     continue
-                dead_context = TaskQueue._row_context(row)
-                if dead_context.get("prev_task_id") != prev_task_id:
+                if dead_scope[task_id] != scope:
                     continue
-                if dead_context.get("test_scope") != context.get("test_scope"):
+                if TaskQueue._row_context(row).get("prev_task_id") != prev_task_id:
                     continue
                 if (row["created_at"], row["rowid"]) >= order:
                     continue
@@ -3847,8 +3869,10 @@ class TaskQueue:
         re-dispatched as a new task, and the dead round stays bound. A bound
         task in failed/timed_out/cancelled is *superseded* -- it no longer
         blocks SUCCESS -- once a completed bound task of the same task_type
-        is causally its retry (:meth:`_superseded_bound_tasks`). A shared
-        PR/branch alone is not that proof, and ``needs_human`` is never
+        and the same explicit work scope is causally its retry
+        (:meth:`_superseded_bound_tasks`). A shared PR/branch alone is not
+        that proof, nor is a shared parent without a declared scope (review
+        of PR #822 at e7f639a), and ``needs_human`` is never
         superseded: a human-waiting task is resolved by a human, not by a
         sibling that happened to pass (review of PR #822 at 4afcda7). A dead
         task with no completed successor still blocks, so an intent whose
