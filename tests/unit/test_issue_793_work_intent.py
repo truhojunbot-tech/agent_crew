@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from agent_crew import cli
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.pipeline import _carry_lineage_intent
-from agent_crew.queue import TaskQueue
+from agent_crew.queue import _CEA_SYSTEM_SUCCESSOR_PROVENANCE, TaskQueue
 from agent_crew.server import create_app
 
 
@@ -310,7 +310,8 @@ def _fail(queue, task_id, status="failed"):
 
 def test_timed_out_fix_superseded_by_completed_retry_reaches_success(tmp_path):
     """#821: a dead fix round stays bound but no longer vetoes SUCCESS once a
-    later fix on the same branch lineage completed, was approved and tested."""
+    later redispatch of the same pipeline step (same ``prev_task_id``, same
+    branch, same scope) completed, was approved and tested."""
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
     queue.admit_work_intent(_intent(task=_task()))
@@ -409,6 +410,97 @@ def test_completed_fix_on_other_branch_does_not_supersede_failed_fix(tmp_path):
     _complete(queue, "test-793")
     _fail(queue, "fix-1", status="timed_out")
     _complete(queue, "fix-other")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def _setup_approved_lineage(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    queue.enqueue(TaskRequest(**_lineage_task("review-1", "review", "impl-793")),
+                  ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="approve")
+    return queue
+
+
+def test_failed_full_suite_test_not_superseded_by_other_scope_test(tmp_path):
+    """Review of PR #822 at 4afcda7, finding 1: a shared PR/branch is not proof
+    of a retry. A later completed smoke test with a different ``test_scope``
+    does not stand in for the failed full-suite run, even off the same review."""
+    queue = _setup_approved_lineage(tmp_path)
+    queue.enqueue(TaskRequest(**_lineage_task("test-full", "test", "review-1",
+                                              test_scope="full")
+                              | {"description": "Run the full suite"}),
+                  ingress="http.tasks")
+    queue.submit_result("test-full", TaskResult(task_id="test-full", status="failed",
+                                                summary="3 product tests failed"))
+    queue.enqueue(TaskRequest(**_lineage_task("test-smoke", "test", "review-1",
+                                              test_scope="smoke")
+                              | {"description": "Smoke-test the CLI"}),
+                  ingress="http.tasks")
+    _complete(queue, "test-smoke")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_completed_task_off_another_parent_does_not_supersede(tmp_path):
+    """Same type, branch and scope but a different pipeline parent and no
+    declared retry provenance: not a redispatch of the dead step."""
+    queue = _setup_approved_lineage(tmp_path)
+    queue.enqueue(TaskRequest(**_lineage_task("review-2", "review", "impl-793")),
+                  ingress="http.tasks")
+    _complete(queue, "review-2", verdict="approve")
+    queue.enqueue(TaskRequest(**_lineage_task("test-1", "test", "review-1")),
+                  ingress="http.tasks")
+    _fail(queue, "test-1")
+    queue.enqueue(TaskRequest(**_lineage_task("test-2", "test", "review-2")),
+                  ingress="http.tasks")
+    _complete(queue, "test-2")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_declared_retry_provenance_supersedes_dead_task(tmp_path):
+    """A system retry names its parent in ``original_task_id`` (what
+    server._auto_retry_failed_task writes); that link supersedes the dead
+    task even though the retry chains off it rather than off the review.
+    The key survives admission only with the in-process provenance token;
+    HTTP ingress drops it (``_trusted_enqueue_context``), so a caller cannot
+    forge this path."""
+    queue = _setup_approved_lineage(tmp_path)
+    queue.enqueue(TaskRequest(**_lineage_task("test-1", "test", "review-1")),
+                  ingress="http.tasks")
+    _fail(queue, "test-1", status="timed_out")
+    queue.enqueue(TaskRequest(**_lineage_task("retry-test-1-a1", "test", "test-1",
+                                              original_task_id="test-1",
+                                              retry_attempt=1)),
+                  ingress="retry.failed_task",
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "retry-test-1-a1")
+    terminal = queue.get_work_intent("directive-1")
+    assert terminal["state"] == "SUCCESS"
+    assert "test-1" in terminal["decision_reason"]
+
+
+def test_needs_human_task_is_never_superseded(tmp_path):
+    """Review of PR #822 at 4afcda7, finding 2: a human-waiting task is not a
+    dead round. Neither a same-step redispatch nor a declared retry resolves
+    it; only a human can."""
+    queue = _setup_approved_lineage(tmp_path)
+    queue.enqueue(TaskRequest(**_lineage_task("test-held", "test", "review-1")),
+                  ingress="http.tasks")
+    queue.submit_result("test-held", TaskResult(task_id="test-held", status="needs_human",
+                                                summary="manual approval required"))
+    queue.enqueue(TaskRequest(**_lineage_task("test-2", "test", "review-1")),
+                  ingress="http.tasks")
+    _complete(queue, "test-2")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.enqueue(TaskRequest(**_lineage_task("retry-test-held-a1", "test", "test-held",
+                                              original_task_id="test-held",
+                                              retry_attempt=1)),
+                  ingress="retry.failed_task",
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    _complete(queue, "retry-test-held-a1")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
 

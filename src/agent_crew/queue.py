@@ -3716,7 +3716,18 @@ class TaskQueue:
             current = context.get("prev_task_id") if isinstance(context, dict) else None
         return chain
 
-    _SUPERSEDABLE_STATUSES = frozenset({"failed", "timed_out", "needs_human", "cancelled"})
+    # ``needs_human`` is deliberately absent: it is not a dead round but an open
+    # question for a person, and no sibling result answers it (review of PR
+    # #822 at 4afcda7, finding 2).
+    _SUPERSEDABLE_STATUSES = frozenset({"failed", "timed_out", "cancelled"})
+
+    @staticmethod
+    def _row_context(row) -> dict:
+        try:
+            context = json.loads(row["context"] or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return context if isinstance(context, dict) else {}
 
     @staticmethod
     def _task_lineage_keys(row) -> set:
@@ -3730,12 +3741,7 @@ class TaskQueue:
         keys = set()
         pr_number = row["pr_number"]
         if pr_number is None:
-            try:
-                context = json.loads(row["context"] or "{}")
-            except (TypeError, ValueError):
-                context = {}
-            if isinstance(context, dict):
-                pr_number = context.get("pr_number")
+            pr_number = TaskQueue._row_context(row).get("pr_number")
         if isinstance(pr_number, int) and not isinstance(pr_number, bool):
             keys.add(("pr", pr_number))
         branch = row["branch"]
@@ -3745,33 +3751,69 @@ class TaskQueue:
 
     @staticmethod
     def _superseded_bound_tasks(by_id: dict) -> set:
-        """Bound task ids whose failure is covered by a later completed retry.
+        """Bound task ids whose failure is covered by a completed causal retry.
 
-        A bound task in a non-success terminal status (failed, timed_out,
-        needs_human, cancelled) is superseded when another bound task of the
-        same ``task_type`` on the same PR/branch lineage was created later and
-        completed (#821). "Later" is ``created_at``, with ``rowid`` breaking
-        ties, so a retry enqueued in the same clock tick still counts. The
-        dead task stays bound and in the audit trail; only its veto on
-        SUCCESS is lifted.
+        A bound task in :data:`_SUPERSEDABLE_STATUSES` is superseded by a
+        completed bound task of the same ``task_type`` in exactly two cases
+        (#821; review of PR #822 at 4afcda7, finding 1):
+
+        1. **Declared retry provenance.** The completed task names the dead
+           one -- directly or through a chain of bound successors -- in a
+           system lineage key (:data:`_CEA_LINEAGE_PARENT_KEYS`:
+           ``original_task_id`` from ``_auto_retry_failed_task`` and the
+           owner-conflict re-admission, ``retry_of``, ``fallback_*``).
+        2. **Same-step redispatch.** The coordinator re-dispatched the same
+           pipeline step: same ``prev_task_id``, same PR/branch lineage, the
+           same ``test_scope`` claim, and created later (``created_at``, then
+           ``rowid``). This is how a timed-out fix round is actually replaced
+           in practice -- the live #818 lineage carries no retry key, only the
+           review both fix rounds hang off.
+
+        A shared PR/branch by itself proves nothing: a smoke test off the same
+        review does not stand in for a failed full-suite run, and a test off a
+        different review is different work. The dead task stays bound and in
+        the audit trail; only its veto on SUCCESS is lifted.
         """
         superseded = set()
-        completed = [row for row in by_id.values() if row["status"] == "completed"]
-        for row in by_id.values():
-            if row["status"] not in TaskQueue._SUPERSEDABLE_STATUSES:
+        dead = {task_id: row for task_id, row in by_id.items()
+                if row["status"] in TaskQueue._SUPERSEDABLE_STATUSES}
+        if not dead:
+            return superseded
+        for other in by_id.values():
+            if other["status"] != "completed":
                 continue
-            keys = TaskQueue._task_lineage_keys(row)
+            context = TaskQueue._row_context(other)
+            # 1. declared provenance: walk the declared-parent chain through the
+            #    bound rows (bounded, cycle-safe) and lift every dead same-type
+            #    ancestor -- a retry of a retry covers both dead rounds.
+            parent, seen = _cea_lineage_parent_from_ctx(context), set()
+            while (parent and parent in by_id and parent not in seen
+                   and len(seen) < _CEA_LINEAGE_MAX_DEPTH):
+                seen.add(parent)
+                parent_row = by_id[parent]
+                if parent in dead and parent_row["task_type"] == other["task_type"]:
+                    superseded.add(parent)
+                parent = _cea_lineage_parent_from_ctx(TaskQueue._row_context(parent_row))
+            # 2. same-step redispatch.
+            prev_task_id = context.get("prev_task_id")
+            if not isinstance(prev_task_id, str) or not prev_task_id:
+                continue
+            keys = TaskQueue._task_lineage_keys(other)
             if not keys:
                 continue
-            order = (row["created_at"], row["rowid"])
-            for other in completed:
-                if other["task_type"] != row["task_type"]:
+            order = (other["created_at"], other["rowid"])
+            for task_id, row in dead.items():
+                if task_id in superseded or row["task_type"] != other["task_type"]:
                     continue
-                if (other["created_at"], other["rowid"]) <= order:
+                dead_context = TaskQueue._row_context(row)
+                if dead_context.get("prev_task_id") != prev_task_id:
                     continue
-                if keys & TaskQueue._task_lineage_keys(other):
-                    superseded.add(row["task_id"])
-                    break
+                if dead_context.get("test_scope") != context.get("test_scope"):
+                    continue
+                if (row["created_at"], row["rowid"]) >= order:
+                    continue
+                if keys & TaskQueue._task_lineage_keys(row):
+                    superseded.add(task_id)
         return superseded
 
     @staticmethod
@@ -3803,11 +3845,14 @@ class TaskQueue:
 
         Retries are normal (#821): a fix round that hit dispatcher_timeout is
         re-dispatched as a new task, and the dead round stays bound. A bound
-        task in failed/timed_out/needs_human/cancelled is *superseded* -- it
-        no longer blocks SUCCESS -- once a later bound task of the same
-        task_type on the same PR/branch lineage completed. A dead task with
-        no completed successor still blocks, so an intent whose only fix
-        failed never closes on its own.
+        task in failed/timed_out/cancelled is *superseded* -- it no longer
+        blocks SUCCESS -- once a completed bound task of the same task_type
+        is causally its retry (:meth:`_superseded_bound_tasks`). A shared
+        PR/branch alone is not that proof, and ``needs_human`` is never
+        superseded: a human-waiting task is resolved by a human, not by a
+        sibling that happened to pass (review of PR #822 at 4afcda7). A dead
+        task with no completed successor still blocks, so an intent whose
+        only fix failed never closes on its own.
 
         The update shares submit_result's transaction, so task completion and
         operation state cannot diverge on crash.
