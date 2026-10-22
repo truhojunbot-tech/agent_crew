@@ -69,8 +69,10 @@ _ENV_CLI_PATH = "AGENT_CREW_CLOUD_CLI_PATH"
 _ENV_CREDIT_FILE = "AGENT_CREW_CLOUD_CREDIT_FILE"
 _ENV_MAX_USD_PER_DAY = "AGENT_CREW_CLOUD_MAX_USD_PER_DAY"
 _ENV_COST_SETTLE_SECONDS = "AGENT_CREW_CLOUD_COST_SETTLE_SECONDS"
+_ENV_SUBMIT_TIMEOUT_SECONDS = "AGENT_CREW_CLOUD_SUBMIT_TIMEOUT_SECONDS"
 _CREDIT_MAX_AGE_SECONDS = 600
 DEFAULT_COST_SETTLE_SECONDS = 900.0
+DEFAULT_SUBMIT_TIMEOUT_SECONDS = 90.0
 DEFAULT_MAX_CONCURRENCY = 3
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -376,7 +378,19 @@ def cloud_stale_seconds() -> float:
 RunFn = Callable[..., "subprocess.CompletedProcess"]
 
 
-def _default_run(argv: List[str], *, timeout: float = 20.0, cwd: Optional[str] = None):
+def _default_run(argv: List[str], *, timeout: Optional[float] = None,
+                 cwd: Optional[str] = None):
+    if timeout is None:
+        raw = (os.getenv(_ENV_SUBMIT_TIMEOUT_SECONDS) or "").strip()
+        try:
+            timeout = float(raw) if raw else DEFAULT_SUBMIT_TIMEOUT_SECONDS
+            if not math.isfinite(timeout) or timeout <= 0:
+                raise ValueError(raw)
+        except ValueError:
+            logger.warning("claude_cloud: invalid %s=%r; using %s",
+                           _ENV_SUBMIT_TIMEOUT_SECONDS, raw,
+                           DEFAULT_SUBMIT_TIMEOUT_SECONDS)
+            timeout = DEFAULT_SUBMIT_TIMEOUT_SECONDS
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd)
 
 
@@ -571,6 +585,7 @@ class CloudDispatchOutcome:
     #: Set only when a task WAS claimed (dequeued) but the launch failed
     #: closed — the task was handed to force_fail/fallback, not lost.
     launch_error: Optional[str] = None
+    retryable: bool = False
 
 
 def _resolve_resume_session_id(queue: TaskQueue, task: TaskRequest) -> Optional[str]:
@@ -741,8 +756,26 @@ def _detached_cloud_ref(checkout: str) -> str:
         r"[0-9a-f]{40}", head.stdout.strip()) else ""
 
 
+def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) -> str:
+    """Use the prepared base for a new implement, and the PR head for a fix."""
+    if task.task_type != "implement":
+        return _detached_cloud_ref(checkout)
+    if prior_pr_head:
+        return prior_pr_head
+    context = task.context if isinstance(task.context, dict) else {}
+    if context.get("prev_task_id") or context.get("fix_round"):
+        return _detached_cloud_ref(checkout)
+    base_sha = context.get("worktree_base_sha")
+    if isinstance(base_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", base_sha):
+        return base_sha
+    base_branch = context.get("base_branch") or "main"
+    if isinstance(base_branch, str) and re.fullmatch(r"[A-Za-z0-9._/-]+", base_branch):
+        return f"origin/{base_branch}"
+    return "origin/main"
+
+
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
-                          reason: str) -> CloudDispatchOutcome:
+                          reason: str, *, retryable: bool = False) -> CloudDispatchOutcome:
     """Fail closed without losing the task (acceptance test 3): force_fail
     records why, then the SAME rate-limit-shaped fallback local providers use
     gets a chance to reroute it — never a new fallback policy (acceptance
@@ -752,9 +785,11 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     ended = time.time()
     queue.patch_context(task.task_id, {"cloud_ended_at": ended,
                                        "cloud_terminal_error": reason,
+                                       "cloud_submit_retryable": retryable,
                                        "cloud_cost_finalized_at": ended,
                                        "cloud_usd": None})
-    queue.force_fail(task.task_id, reason)
+    queue.force_fail(task.task_id, reason, error_info=(
+        {"reason": "cloud_submit_timeout", "retryable": True} if retryable else None))
     if queue.get_attribution(task.task_id) is None:
         queue.record_attribution(task_id=task.task_id, project=task.project or "",
                                  agent=CLOUD_PROVIDER_NAME,
@@ -774,7 +809,12 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
         auto_fallback_failed_task(queue, task.task_id, result, task_type)
     except Exception:
         logger.exception("claude_cloud: fallback failed for %s", task.task_id)
-    return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason)
+    if retryable:
+        from agent_crew.server import coordinator_notice_once
+        coordinator_notice_once(queue, task.task_id, "cloud_submit_timeout",
+                                f"retryable cloud submit failure: {reason[:300]}")
+    return CloudDispatchOutcome(False, task_id=task.task_id, launch_error=reason,
+                                retryable=retryable)
 
 
 _LOCAL_ONLY_PATH = re.compile(
@@ -1060,9 +1100,10 @@ def dispatch_cloud_for_role(
         return _fail_closed_dispatch(queue, task, task_type,
                                      "cloud_review_cwd_repo_mismatch")
     prompt = build_cloud_task_prompt(task, repo=effective_repo)
+    launch_ref = _launch_ref(task, cwd, prior_pr_head)
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
-                prompt, cli_path=cli_path, base_ref=_detached_cloud_ref(cwd)))
+                prompt, cli_path=cli_path, base_ref=launch_ref))
     credit_before, credit_before_fetched_at = _credit_parts(read_cloud_credit_used())
     attempt_started_at = time.time()
     prev_task_id = (task.context or {}).get("prev_task_id") if isinstance(task.context, dict) else ""
@@ -1081,10 +1122,16 @@ def dispatch_cloud_for_role(
     })
 
     def launch_once(command: List[str], *, resuming: bool):
-        try:
-            proc = run(command, cwd=cwd)
-        except Exception as exc:
-            return None, f"cloud_cli_invocation_error: {exc}"
+        for attempt in range(3):
+            try:
+                proc = run(command, cwd=cwd)
+                break
+            except subprocess.TimeoutExpired as exc:
+                if attempt == 2:
+                    return None, f"cloud_submit_timeout: {exc}"
+                time.sleep(0.5 * (2 ** attempt))
+            except Exception as exc:
+                return None, f"cloud_cli_invocation_error: {exc}"
         if getattr(proc, "returncode", 1) != 0:
             return None, f"cloud_cli_exit_{proc.returncode}: {(proc.stdout or '')[:500]}"
         result = parse_cloud_launch_output(proc.stdout or "")
@@ -1100,12 +1147,13 @@ def dispatch_cloud_for_role(
         queue.patch_context(task.task_id, {"cloud_resume_error": resume_error,
                                            "execution_policy": "fresh_cloud_after_resume_failed"})
         fresh_argv = build_launch_argv(prompt, cli_path=cli_path,
-                                       base_ref=_detached_cloud_ref(cwd))
+                                       base_ref=launch_ref)
         launch, launch_error = launch_once(fresh_argv, resuming=False)
     if launch_error:
         reason = (f"resume failed: {resume_error}; fresh failed: {launch_error}"
                   if resume_error else launch_error)
-        return _fail_closed_dispatch(queue, task, task_type, reason)
+        return _fail_closed_dispatch(queue, task, task_type, reason,
+                                     retryable="cloud_submit_timeout:" in reason)
 
     execution_policy = ("fresh_cloud_after_resume_failed" if resume_error else
                         "fresh_cloud_resume" if resume_session_id else "fresh_cloud")
