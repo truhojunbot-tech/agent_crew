@@ -3744,15 +3744,22 @@ class TaskQueue:
 
     @staticmethod
     def _test_selection_identities_on(conn, task_ids: list) -> dict:
-        """Persisted, dispatcher-verified test selection per bound test (#278).
+        """Persisted, dispatcher-verified test *treatment* per bound test (#278).
 
         ``task_attribution.effective_test_scope`` / ``test_scope_hash`` are
         written by the dispatcher from the admission receipt and the test
         policy in force (``server.py``, ``record_test_economics``); the
         request's ``context.test_scope`` is logged and ignored there (§7.2),
         so it is ignored here too (review of PR #822 at 97edc73). A task with
-        no row, or NULL columns, has no identity: it was never dispatched as a
-        test, and nothing verified which tests it selected.
+        no row, or NULL columns, has no identity.
+
+        ⛔This is a *policy* fingerprint, not an executed-test identity:
+          ``testing_policy.scope_fingerprint`` hashes the configuration and
+          deliberately excludes the commands, so two different targeted runs
+          under one policy share it (review of PR #822 at 00c959a). Nothing in
+          the system persists which tests a run actually selected. It can
+          therefore only *refute* a retry (different treatment => different
+          work), never prove one.
         """
         if not task_ids:
             return {}
@@ -3770,58 +3777,34 @@ class TaskQueue:
         return identities
 
     @staticmethod
-    def _task_lineage_keys(row) -> set:
-        """PR/branch identity of a bound task row, for retry supersession (#821).
-
-        A task belongs to a PR lineage (``pr_number`` column, else
-        ``context.pr_number``) and/or a branch lineage (``branch``). Two tasks
-        share a lineage when any key matches; a task with neither key matches
-        nothing, so unrelated work never supersedes a dead round.
-        """
-        keys = set()
-        pr_number = row["pr_number"]
-        if pr_number is None:
-            pr_number = TaskQueue._row_context(row).get("pr_number")
-        if isinstance(pr_number, int) and not isinstance(pr_number, bool):
-            keys.add(("pr", pr_number))
-        branch = row["branch"]
-        if isinstance(branch, str) and branch:
-            keys.add(("branch", branch))
-        return keys
-
-    @staticmethod
     def _superseded_bound_tasks(by_id: dict, test_identities: dict) -> set:
-        """Bound task ids whose failure is covered by a completed causal retry.
+        """Bound task ids whose failure is covered by a completed, trusted retry.
 
-        A bound task in :data:`_SUPERSEDABLE_STATUSES` is superseded by a
-        completed bound task of the same ``task_type`` and the same declared
-        revision (:meth:`_work_revision`) in exactly two cases (#821; reviews
-        of PR #822 at 4afcda7, e7f639a, 1624758 and 97edc73):
+        A bound task in :data:`_SUPERSEDABLE_STATUSES` is superseded only by a
+        completed bound task of the same ``task_type`` that the **system
+        itself constructed as its retry** (#821; reviews of PR #822 at
+        4afcda7, e7f639a, 1624758, 97edc73 and 00c959a): the completed task
+        names the dead one -- directly or through a chain of bound successors
+        -- in a system lineage key (:data:`_CEA_LINEAGE_PARENT_KEYS`:
+        ``original_task_id`` from ``_auto_retry_failed_task`` and the
+        owner-conflict re-admission, ``retry_of``, ``fallback_*``). HTTP
+        ingress drops those keys (``_trusted_enqueue_context``), so only an
+        in-process constructor can make this claim. Two compatibility checks
+        can still refute the retry: the declared revision
+        (:meth:`_work_revision`) must match, and where both tasks carry a
+        persisted test treatment (:meth:`_test_selection_identities_on`) it
+        must match too.
 
-        1. **Trusted retry provenance.** The completed task names the dead
-           one -- directly or through a chain of bound successors -- in a
-           system lineage key (:data:`_CEA_LINEAGE_PARENT_KEYS`:
-           ``original_task_id`` from ``_auto_retry_failed_task`` and the
-           owner-conflict re-admission, ``retry_of``, ``fallback_*``). HTTP
-           ingress drops those keys (``_trusted_enqueue_context``), so only an
-           in-process constructor can make this claim. Where both tasks have a
-           persisted test selection it must match; a retry that ran a
-           different selection is different work.
-        2. **Same-step test redispatch with a verified test selection.** Test
-           tasks only: same ``prev_task_id``, same PR/branch lineage, created
-           later (``created_at``, then ``rowid``), and both tasks carry the
-           same dispatcher-persisted test selection
-           (:meth:`_test_selection_identities_on`). ``prev_task_id``, the
-           branch and every context key are caller-supplied on ``http.tasks``,
-           so nothing from the context -- not ``test_scope``, not
-           ``review_findings`` -- proves a retry. Only what the dispatcher
-           itself recorded does.
-
-        A shared PR/branch by itself proves nothing: a smoke test off the same
-        review does not stand in for a failed full-suite run, and a test off a
-        different review is different work. Implement and review rounds have
-        no dispatcher-verified selection, so they are superseded only through
-        trusted provenance. The dead task stays bound and in the audit trail;
+        There is deliberately no second path. Every "same step" heuristic --
+        shared PR/branch, shared ``prev_task_id``, equal ``context.test_scope``,
+        equal ``review_findings``, equal policy fingerprint -- was shown to let
+        a different run (a smoke test off the same review) stand in for a
+        failed one: those claims are either caller-supplied on ``http.tasks``
+        or describe policy rather than the work. Without a persisted
+        executed-test identity, which the system does not record, provenance
+        is the only proof. A coordinator that re-dispatches a dead round by
+        hand therefore does not close the intent; the cascade's retry
+        constructor does. The dead task stays bound and in the audit trail;
         only its veto on SUCCESS is lifted.
         """
         superseded = set()
@@ -3837,9 +3820,9 @@ class TaskQueue:
             context = TaskQueue._row_context(other)
             revision = TaskQueue._work_revision(context)
             selection = test_identities.get(other["task_id"])
-            # 1. trusted provenance: walk the declared-parent chain through the
-            #    bound rows (bounded, cycle-safe) and lift every dead same-type,
-            #    same-revision ancestor -- a retry of a retry covers both rounds.
+            # Walk the declared-parent chain through the bound rows (bounded,
+            # cycle-safe) and lift every dead same-type, compatible ancestor --
+            # a retry of a retry covers both rounds.
             parent, seen = _cea_lineage_parent_from_ctx(context), set()
             while (parent and parent in by_id and parent not in seen
                    and len(seen) < _CEA_LINEAGE_MAX_DEPTH):
@@ -3852,28 +3835,6 @@ class TaskQueue:
                              or parent_selection == selection)):
                     superseded.add(parent)
                 parent = _cea_lineage_parent_from_ctx(TaskQueue._row_context(parent_row))
-            # 2. same-step test redispatch, only with a verified test selection.
-            prev_task_id = context.get("prev_task_id")
-            if (other["task_type"] != "test" or selection is None
-                    or not isinstance(prev_task_id, str) or not prev_task_id):
-                continue
-            keys = TaskQueue._task_lineage_keys(other)
-            if not keys:
-                continue
-            order = (other["created_at"], other["rowid"])
-            for task_id, row in dead.items():
-                if task_id in superseded or row["task_type"] != "test":
-                    continue
-                if test_identities.get(task_id) != selection:
-                    continue
-                if dead_revision[task_id] != revision:
-                    continue
-                if TaskQueue._row_context(row).get("prev_task_id") != prev_task_id:
-                    continue
-                if (row["created_at"], row["rowid"]) >= order:
-                    continue
-                if keys & TaskQueue._task_lineage_keys(row):
-                    superseded.add(task_id)
         return superseded
 
     @staticmethod
@@ -3907,11 +3868,11 @@ class TaskQueue:
         re-dispatched as a new task, and the dead round stays bound. A bound
         task in failed/timed_out/cancelled is *superseded* -- it no longer
         blocks SUCCESS -- once a completed bound task of the same task_type
-        is causally its retry (:meth:`_superseded_bound_tasks`): trusted
-        retry provenance, or for tests the same dispatcher-persisted test
-        selection off the same step. A shared PR/branch alone is not that
-        proof, nor is anything the request context claims (reviews of PR
-        #822 at e7f639a, 1624758, 97edc73), and ``needs_human`` is never
+        is its system-constructed retry (:meth:`_superseded_bound_tasks`):
+        trusted retry provenance is the only proof. A shared PR/branch, a
+        shared parent, anything the request context claims and the persisted
+        policy fingerprint are not (reviews of PR #822 at e7f639a, 1624758,
+        97edc73, 00c959a), and ``needs_human`` is never
         superseded: a human-waiting task is resolved by a human, not by a
         sibling that happened to pass (review of PR #822 at 4afcda7). A dead
         task with no completed successor still blocks, so an intent whose
@@ -3944,8 +3905,8 @@ class TaskQueue:
             return
         placeholders = ",".join("?" for _ in task_ids)
         rows = conn.execute(
-            f"SELECT rowid, task_id, task_type, status, verdict, context, branch, pr_number, "
-            f"created_at FROM tasks WHERE task_id IN ({placeholders})",
+            f"SELECT task_id, task_type, status, verdict, context FROM tasks "
+            f"WHERE task_id IN ({placeholders})",
             tuple(task_ids),
         ).fetchall()
         # The row for ``task_id`` was already updated in this transaction, so

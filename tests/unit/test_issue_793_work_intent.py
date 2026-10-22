@@ -402,9 +402,9 @@ def test_retry_fix_without_approve_rereview_still_vetoes(tmp_path):
 
 
 def test_failed_test_without_later_completed_test_does_not_succeed(tmp_path):
-    """#821: a failed terminal test blocks until a later test off the same
-    step, of the same reviewed revision and the same dispatcher-persisted
-    test selection, completed."""
+    """#821: a failed terminal test blocks until its system retry, of the
+    same reviewed revision and the same dispatcher-persisted treatment,
+    completed."""
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
     queue.admit_work_intent(_intent(task=_task()))
@@ -416,9 +416,7 @@ def test_failed_test_without_later_completed_test_does_not_succeed(tmp_path):
     _complete(queue, "review-1", verdict="approve")
     _fail(queue, "test-1")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
-    queue.enqueue(TaskRequest(**_lineage_task("test-1-retry", "test", "review-1",
-                                              reviewed_sha="a" * 40)),
-                  ingress="http.tasks")
+    _system_retry(queue, "test-1-retry", "test-1", "test", reviewed_sha="a" * 40)
     _dispatched_test(queue, "test-1-retry")
     _complete(queue, "test-1-retry")
     assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
@@ -461,8 +459,8 @@ def _setup_approved_lineage(tmp_path):
 def test_failed_full_suite_test_not_superseded_by_other_scope_test(tmp_path):
     """Review of PR #822 at 4afcda7, finding 1: a shared PR/branch is not proof
     of a retry. A later completed test the dispatcher sent out with a
-    different test selection does not stand in for the failed full-suite
-    run, even off the same review."""
+    different treatment, and no retry provenance, does not stand in for the
+    failed full-suite run, even off the same review."""
     queue = _setup_approved_lineage(tmp_path)
     queue.enqueue(TaskRequest(**_lineage_task("test-full", "test", "review-1")
                               | {"description": "Run the full suite"}),
@@ -577,24 +575,29 @@ def test_declared_retry_with_changed_selection_does_not_supersede(tmp_path):
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
 
-def test_completed_task_off_another_parent_does_not_supersede(tmp_path):
-    """Same type, branch and scope but a different pipeline parent and no
-    declared retry provenance: not a redispatch of the dead step."""
+def test_same_policy_fingerprint_differing_run_does_not_supersede(tmp_path):
+    """Review of PR #822 at 00c959a: the persisted ``test_scope_hash`` is a
+    policy fingerprint, not an executed-test identity. Two different
+    targeted runs under one policy -- same parent, branch, revision and
+    hash, dispatched for real via the attribution rows -- are not shown to
+    be the same run; only trusted retry provenance is."""
     queue = _setup_approved_lineage(tmp_path)
-    queue.enqueue(TaskRequest(**_lineage_task("review-2", "review", "impl-793")),
+    queue.enqueue(TaskRequest(**_lineage_task("test-full", "test", "review-1",
+                                              reviewed_sha="a" * 40,
+                                              test_command="pytest tests")),
                   ingress="http.tasks")
-    _complete(queue, "review-2", verdict="approve")
-    queue.enqueue(TaskRequest(**_lineage_task("test-1", "test", "review-1",
-                                              reviewed_sha="a" * 40)),
+    _dispatched_test(queue, "test-full", scope="targeted", digest="policy-h1")
+    queue.submit_result("test-full", TaskResult(task_id="test-full", status="failed",
+                                                summary="3 product tests failed"))
+    queue.enqueue(TaskRequest(**_lineage_task("test-smoke", "test", "review-1",
+                                              reviewed_sha="a" * 40,
+                                              test_command="pytest tests/smoke")),
                   ingress="http.tasks")
-    _dispatched_test(queue, "test-1")
-    _fail(queue, "test-1")
-    queue.enqueue(TaskRequest(**_lineage_task("test-2", "test", "review-2",
-                                              reviewed_sha="a" * 40)),
-                  ingress="http.tasks")
-    _dispatched_test(queue, "test-2")
-    _complete(queue, "test-2")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _dispatched_test(queue, "test-smoke", scope="targeted", digest="policy-h1")
+    _complete(queue, "test-smoke")
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BOUND"
+    assert intent["decision_reason"] is None
 
 
 def test_declared_retry_provenance_supersedes_dead_task(tmp_path):
