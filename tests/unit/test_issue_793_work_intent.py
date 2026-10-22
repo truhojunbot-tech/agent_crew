@@ -303,6 +303,115 @@ def test_rereview_after_incomplete_fix_does_not_clear_request_changes(tmp_path):
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
 
+def _fail(queue, task_id, status="failed"):
+    queue.submit_result(task_id, TaskResult(task_id=task_id, status=status,
+                                            summary=f"{task_id} {status}"))
+
+
+def test_timed_out_fix_superseded_by_completed_retry_reaches_success(tmp_path):
+    """#821: a dead fix round stays bound but no longer vetoes SUCCESS once a
+    later fix on the same branch lineage completed, was approved and tested."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("fix-1-retry", "implement", "review-1", fix_round=1),
+                 _lineage_task("review-2", "review", "fix-1-retry"),
+                 _lineage_task("test-793", "test", "review-2")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    _fail(queue, "fix-1", status="timed_out")
+    _complete(queue, "fix-1-retry")
+    _complete(queue, "review-2", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _complete(queue, "test-793")
+    terminal = queue.get_work_intent("directive-1")
+    assert terminal["state"] == "SUCCESS"
+    assert terminal["decision_authority"] == "agent_crew:task_result"
+    assert "fix-1" in terminal["task_ids"]  # audit trail keeps the dead round
+    assert "superseded" in terminal["decision_reason"]
+    assert queue.get_task("fix-1").status == "timed_out"
+
+
+def test_only_fix_failed_does_not_reach_success(tmp_path):
+    """#821: a dead fix with no completed successor still blocks SUCCESS."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("test-793", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="approve")
+    _complete(queue, "test-793")
+    _fail(queue, "fix-1")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
+def test_retry_fix_without_approve_rereview_still_vetoes(tmp_path):
+    """#821 keeps the request_changes veto: a completed retry fix supersedes
+    the timed-out round, but the vetoing review is unresolved until a later
+    review approves it."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("fix-1-retry", "implement", "review-1", fix_round=1),
+                 _lineage_task("test-793", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "test-793")
+    _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
+    _fail(queue, "fix-1", status="timed_out")
+    _complete(queue, "fix-1-retry")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.enqueue(TaskRequest(**_lineage_task("review-2", "review", "fix-1-retry")),
+                  ingress="http.tasks")
+    _complete(queue, "review-2", verdict="approve")
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+
+
+def test_failed_test_without_later_completed_test_does_not_succeed(tmp_path):
+    """#821: a failed terminal test blocks until a later test on the lineage completed."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("test-1", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="approve")
+    _fail(queue, "test-1")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    queue.enqueue(TaskRequest(**_lineage_task("test-1-retry", "test", "review-1")),
+                  ingress="http.tasks")
+    _complete(queue, "test-1-retry")
+    assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
+
+
+def test_completed_fix_on_other_branch_does_not_supersede_failed_fix(tmp_path):
+    """#821: supersession needs the same PR/branch lineage, not just the same type."""
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task()))
+    for spec in (_lineage_task("review-1", "review", "impl-793"),
+                 _lineage_task("fix-1", "implement", "review-1", fix_round=1),
+                 _lineage_task("fix-other", "implement", "review-1", fix_round=1)
+                 | {"branch": "agent/unrelated-branch"},
+                 _lineage_task("test-793", "test", "review-1")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _complete(queue, "impl-793")
+    _complete(queue, "review-1", verdict="approve")
+    _complete(queue, "test-793")
+    _fail(queue, "fix-1", status="timed_out")
+    _complete(queue, "fix-other")
+    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+
+
 def test_intent_update_failure_rolls_back_task_completion(tmp_path):
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))

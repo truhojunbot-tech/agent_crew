@@ -3716,6 +3716,64 @@ class TaskQueue:
             current = context.get("prev_task_id") if isinstance(context, dict) else None
         return chain
 
+    _SUPERSEDABLE_STATUSES = frozenset({"failed", "timed_out", "needs_human", "cancelled"})
+
+    @staticmethod
+    def _task_lineage_keys(row) -> set:
+        """PR/branch identity of a bound task row, for retry supersession (#821).
+
+        A task belongs to a PR lineage (``pr_number`` column, else
+        ``context.pr_number``) and/or a branch lineage (``branch``). Two tasks
+        share a lineage when any key matches; a task with neither key matches
+        nothing, so unrelated work never supersedes a dead round.
+        """
+        keys = set()
+        pr_number = row["pr_number"]
+        if pr_number is None:
+            try:
+                context = json.loads(row["context"] or "{}")
+            except (TypeError, ValueError):
+                context = {}
+            if isinstance(context, dict):
+                pr_number = context.get("pr_number")
+        if isinstance(pr_number, int) and not isinstance(pr_number, bool):
+            keys.add(("pr", pr_number))
+        branch = row["branch"]
+        if isinstance(branch, str) and branch:
+            keys.add(("branch", branch))
+        return keys
+
+    @staticmethod
+    def _superseded_bound_tasks(by_id: dict) -> set:
+        """Bound task ids whose failure is covered by a later completed retry.
+
+        A bound task in a non-success terminal status (failed, timed_out,
+        needs_human, cancelled) is superseded when another bound task of the
+        same ``task_type`` on the same PR/branch lineage was created later and
+        completed (#821). "Later" is ``created_at``, with ``rowid`` breaking
+        ties, so a retry enqueued in the same clock tick still counts. The
+        dead task stays bound and in the audit trail; only its veto on
+        SUCCESS is lifted.
+        """
+        superseded = set()
+        completed = [row for row in by_id.values() if row["status"] == "completed"]
+        for row in by_id.values():
+            if row["status"] not in TaskQueue._SUPERSEDABLE_STATUSES:
+                continue
+            keys = TaskQueue._task_lineage_keys(row)
+            if not keys:
+                continue
+            order = (row["created_at"], row["rowid"])
+            for other in completed:
+                if other["task_type"] != row["task_type"]:
+                    continue
+                if (other["created_at"], other["rowid"]) <= order:
+                    continue
+                if keys & TaskQueue._task_lineage_keys(other):
+                    superseded.add(row["task_id"])
+                    break
+        return superseded
+
     @staticmethod
     def _terminalize_work_intent_on(conn, task_id: str, task_type: str,
                                     result_status: str, now: float) -> None:
@@ -3742,6 +3800,14 @@ class TaskQueue:
         leaves the veto standing (review of PR #817 at 7b7f11e). SUCCESS
         itself is terminal; submit_result rejects later revisions to tasks
         belonging to a successful intent.
+
+        Retries are normal (#821): a fix round that hit dispatcher_timeout is
+        re-dispatched as a new task, and the dead round stays bound. A bound
+        task in failed/timed_out/needs_human/cancelled is *superseded* -- it
+        no longer blocks SUCCESS -- once a later bound task of the same
+        task_type on the same PR/branch lineage completed. A dead task with
+        no completed successor still blocks, so an intent whose only fix
+        failed never closes on its own.
 
         The update shares submit_result's transaction, so task completion and
         operation state cannot diverge on crash.
@@ -3770,15 +3836,17 @@ class TaskQueue:
             return
         placeholders = ",".join("?" for _ in task_ids)
         rows = conn.execute(
-            f"SELECT task_id, task_type, status, verdict, context FROM tasks "
-            f"WHERE task_id IN ({placeholders})",
+            f"SELECT rowid, task_id, task_type, status, verdict, context, branch, pr_number, "
+            f"created_at FROM tasks WHERE task_id IN ({placeholders})",
             tuple(task_ids),
         ).fetchall()
         # The row for ``task_id`` was already updated in this transaction, so
         # ``rows`` reflects the result being accepted, not the prior status.
         by_id = {row["task_id"]: row for row in rows}
+        superseded = TaskQueue._superseded_bound_tasks(by_id)
         all_completed = (len(by_id) == len(task_ids)
-                         and all(by_id[bound]["status"] == "completed" for bound in task_ids))
+                         and all(by_id[bound]["status"] == "completed" or bound in superseded
+                                 for bound in task_ids))
         terminal_test_completed = any(
             row["task_type"] == "test" and row["status"] == "completed" for row in by_id.values())
         completed_reviews = [row for row in by_id.values()
@@ -3801,12 +3869,15 @@ class TaskQueue:
             for row in completed_reviews)
         succeeded = all_completed and terminal_test_completed and not review_requires_fix
         if intent["state"] == "BOUND" and succeeded:
+            reason = "all bound tasks completed; terminal test completed"
+            if superseded:
+                reason = ("all bound tasks completed or superseded by a completed retry "
+                          f"({', '.join(sorted(superseded))}); terminal test completed")
             conn.execute(
                 "UPDATE work_intents SET state='SUCCESS', blocker=NULL, "
                 "decision_reason=?, decision_authority=?, last_progress_at=?, "
                 "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
-                ("all bound tasks completed; terminal test completed",
-                 "agent_crew:task_result", now, op_id),
+                (reason, "agent_crew:task_result", now, op_id),
             )
 
     def admit_work_intent(self, intent: dict) -> dict:
