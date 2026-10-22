@@ -328,6 +328,46 @@ def _fail(queue, task_id, status="failed"):
                                             summary=f"{task_id} {status}"))
 
 
+def test_terminal_unsuccessful_bound_task_becomes_structured_blocked(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    _fail(queue, "test-793", status="timed_out")
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BLOCKED"
+    assert intent["blocker"]["blocker_type"] == "bound_tasks_unsuccessful"
+    assert "test-793=timed_out" in intent["blocker"]["reason"]
+    assert intent["blocker"]["unblock_action"]
+    assert intent["blocker"]["owner"]
+    assert intent["next_check_at"] == intent["blocker"]["next_check_at"]
+
+
+def test_binding_retry_reopens_blocked_intent_to_bound(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    _fail(queue, "test-793", status="failed")
+    assert queue.get_work_intent("directive-1")["state"] == "BLOCKED"
+    _system_retry(queue, "test-793-retry", "test-793", "test")
+    rebound = queue.bind_work_intent("directive-1", "test-793-retry")
+    assert rebound["state"] == "BOUND"
+    assert rebound["blocker"] is None
+
+
+def test_failed_bound_task_with_active_sibling_stays_bound(tmp_path):
+    db = tmp_path / "tasks.db"
+    queue = TaskQueue(str(db))
+    queue.admit_work_intent(_intent(task=_task("test-793") | {"task_type": "test"}))
+    queue.enqueue(TaskRequest(**_lineage_task("fix-793", "implement", "test-793")),
+                  ingress="http.tasks")
+    queue.bind_work_intent("directive-1", "fix-793")
+    _fail(queue, "test-793", status="failed")
+    assert queue.get_task("fix-793").status == "pending"
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BOUND"
+    assert intent["blocker"] is None
+
+
 def test_timed_out_fix_superseded_by_completed_retry_reaches_success(tmp_path):
     """#821: a dead fix round stays bound but no longer vetoes SUCCESS once
     its system retry (trusted ``original_task_id`` provenance) completed,
