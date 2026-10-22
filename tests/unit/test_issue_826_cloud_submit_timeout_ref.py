@@ -108,6 +108,77 @@ def test_fix_round_keeps_lineage_pr_head_pin(tmp_path, monkeypatch):
     assert cloud._launch_ref(task, "/fixture/claude", "c" * 40) == "c" * 40
 
 
+def test_new_implement_without_prepared_sha_uses_bare_base_branch(monkeypatch):
+    _setup(monkeypatch)
+    task = TaskRequest(task_id="impl-no-base", task_type="implement", description="New",
+                       branch="fix/new", context={"base_branch": "release/next"})
+    assert cloud._launch_ref(task, "/fixture/claude", None) == "release/next"
+    assert cloud._launch_ref(TaskRequest(
+        task_id="impl-invalid-base", task_type="implement", description="New",
+        branch="fix/new", context={"base_branch": "../../other"}),
+        "/fixture/claude", None) == ""
+
+
+def test_dispatch_without_prepared_sha_pins_bare_main(tmp_path, monkeypatch):
+    _setup(monkeypatch)
+    queue = _queue(tmp_path)
+    launches = []
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        launches.append(argv)
+        return SimpleNamespace(returncode=0, stdout=(
+            '{"session_id":"session_826abc",'
+            '"url":"https://claude.ai/code/session_826abc"}'))
+
+    assert cloud.dispatch_cloud_for_role(
+        queue, role="implementer", task_type="implement", run_fn=run).dispatched
+    assert "--ref main" in launches[0][2]
+    assert "--ref origin/main" not in launches[0][2]
+    assert "--ref " + "b" * 40 not in launches[0][2]
+
+
+def test_timeout_with_session_output_is_recovered_without_resubmit(tmp_path, monkeypatch):
+    _setup(monkeypatch)
+    queue = _queue(tmp_path)
+    attempts = []
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        attempts.append(argv)
+        raise subprocess.TimeoutExpired(argv, 90, output=(
+            b'{"session_id":"session_826abc",'
+            b'"url":"https://claude.ai/code/session_826abc"}'))
+
+    outcome = cloud.dispatch_cloud_for_role(
+        queue, role="implementer", task_type="implement", run_fn=run)
+    assert outcome.dispatched and len(attempts) == 1
+    assert queue.get_task_context("impl-826")["cloud_session_id"] == "session_826abc"
+
+
+def test_timeout_attempts_share_one_dispatch_deadline(tmp_path, monkeypatch):
+    _setup(monkeypatch)
+    queue = _queue(tmp_path)
+    clock, timeouts = [1000.0], []
+    monkeypatch.setattr(cloud.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cloud.time, "sleep", lambda seconds: None)
+
+    def run(argv, **kwargs):
+        if "--help" in argv:
+            return SimpleNamespace(returncode=0, stdout="  --cloud  Run remotely\n")
+        timeouts.append(kwargs.get("timeout"))
+        clock[0] += 60
+        raise subprocess.TimeoutExpired(argv, kwargs.get("timeout", 90))
+
+    outcome = cloud.dispatch_cloud_for_role(
+        queue, role="implementer", task_type="implement", run_fn=run)
+    assert outcome.retryable
+    assert timeouts == [90, 60]
+    assert len(queue.get_task_context("impl-826")["cloud_submit_timeout_attempts"]) == 2
+
+
 def test_default_submit_timeout_is_configurable(monkeypatch):
     seen = []
     monkeypatch.setenv("AGENT_CREW_CLOUD_SUBMIT_TIMEOUT_SECONDS", "120")

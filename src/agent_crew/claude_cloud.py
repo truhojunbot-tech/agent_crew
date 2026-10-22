@@ -73,6 +73,7 @@ _ENV_SUBMIT_TIMEOUT_SECONDS = "AGENT_CREW_CLOUD_SUBMIT_TIMEOUT_SECONDS"
 _CREDIT_MAX_AGE_SECONDS = 600
 DEFAULT_COST_SETTLE_SECONDS = 900.0
 DEFAULT_SUBMIT_TIMEOUT_SECONDS = 90.0
+DEFAULT_SUBMIT_TOTAL_BUDGET_SECONDS = 120.0
 DEFAULT_MAX_CONCURRENCY = 3
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 
@@ -378,19 +379,24 @@ def cloud_stale_seconds() -> float:
 RunFn = Callable[..., "subprocess.CompletedProcess"]
 
 
+def cloud_submit_timeout_seconds() -> float:
+    raw = (os.getenv(_ENV_SUBMIT_TIMEOUT_SECONDS) or "").strip()
+    try:
+        timeout = float(raw) if raw else DEFAULT_SUBMIT_TIMEOUT_SECONDS
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError(raw)
+    except ValueError:
+        logger.warning("claude_cloud: invalid %s=%r; using %s",
+                       _ENV_SUBMIT_TIMEOUT_SECONDS, raw,
+                       DEFAULT_SUBMIT_TIMEOUT_SECONDS)
+        timeout = DEFAULT_SUBMIT_TIMEOUT_SECONDS
+    return timeout
+
+
 def _default_run(argv: List[str], *, timeout: Optional[float] = None,
                  cwd: Optional[str] = None):
     if timeout is None:
-        raw = (os.getenv(_ENV_SUBMIT_TIMEOUT_SECONDS) or "").strip()
-        try:
-            timeout = float(raw) if raw else DEFAULT_SUBMIT_TIMEOUT_SECONDS
-            if not math.isfinite(timeout) or timeout <= 0:
-                raise ValueError(raw)
-        except ValueError:
-            logger.warning("claude_cloud: invalid %s=%r; using %s",
-                           _ENV_SUBMIT_TIMEOUT_SECONDS, raw,
-                           DEFAULT_SUBMIT_TIMEOUT_SECONDS)
-            timeout = DEFAULT_SUBMIT_TIMEOUT_SECONDS
+        timeout = cloud_submit_timeout_seconds()
     return subprocess.run(argv, capture_output=True, text=True, timeout=timeout, cwd=cwd)
 
 
@@ -769,9 +775,12 @@ def _launch_ref(task: TaskRequest, checkout: str, prior_pr_head: Optional[str]) 
     if isinstance(base_sha, str) and re.fullmatch(r"[0-9a-fA-F]{40}", base_sha):
         return base_sha
     base_branch = context.get("base_branch") or "main"
-    if isinstance(base_branch, str) and re.fullmatch(r"[A-Za-z0-9._/-]+", base_branch):
-        return f"origin/{base_branch}"
-    return "origin/main"
+    if (isinstance(base_branch, str)
+            and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", base_branch)
+            and ".." not in base_branch and "//" not in base_branch
+            and not base_branch.endswith(("/", ".lock"))):
+        return base_branch
+    return ""
 
 
 def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
@@ -1101,6 +1110,9 @@ def dispatch_cloud_for_role(
                                      "cloud_review_cwd_repo_mismatch")
     prompt = build_cloud_task_prompt(task, repo=effective_repo)
     launch_ref = _launch_ref(task, cwd, prior_pr_head)
+    if (task.task_type == "implement" and not resume_session_id
+            and not launch_ref):
+        return _fail_closed_dispatch(queue, task, task_type, "cloud_base_branch_invalid")
     argv = (build_resume_argv(resume_session_id, prompt, cli_path=cli_path)
             if resume_session_id else build_launch_argv(
                 prompt, cli_path=cli_path, base_ref=launch_ref))
@@ -1121,15 +1133,35 @@ def dispatch_cloud_for_role(
         "cloud_credit_used_after": None, "cloud_usd": None,
     })
 
+    submit_deadline = time.monotonic() + DEFAULT_SUBMIT_TOTAL_BUDGET_SECONDS
+    timeout_attempts = []
+
     def launch_once(command: List[str], *, resuming: bool):
         for attempt in range(3):
+            remaining = submit_deadline - time.monotonic()
+            if remaining <= 0:
+                return None, "cloud_submit_timeout: overall deadline exceeded"
             try:
-                proc = run(command, cwd=cwd)
+                proc = run(command, cwd=cwd,
+                           timeout=min(cloud_submit_timeout_seconds(), remaining))
                 break
             except subprocess.TimeoutExpired as exc:
-                if attempt == 2:
+                output = exc.stdout or exc.output or b""
+                if isinstance(output, bytes):
+                    output = output.decode("utf-8", errors="replace")
+                recovered = parse_cloud_launch_output(output)
+                timeout_attempts.append({"attempt": len(timeout_attempts) + 1,
+                                         "resuming": resuming,
+                                         "at": time.time(),
+                                         "recovered_session_id": recovered.session_id})
+                queue.patch_context(task.task_id,
+                                    {"cloud_submit_timeout_attempts": timeout_attempts})
+                if recovered.dispatched:
+                    return recovered, None
+                if attempt == 2 or submit_deadline - time.monotonic() <= 0:
                     return None, f"cloud_submit_timeout: {exc}"
-                time.sleep(0.5 * (2 ** attempt))
+                time.sleep(min(0.5 * (2 ** attempt),
+                               max(0, submit_deadline - time.monotonic())))
             except Exception as exc:
                 return None, f"cloud_cli_invocation_error: {exc}"
         if getattr(proc, "returncode", 1) != 0:
@@ -1142,7 +1174,8 @@ def dispatch_cloud_for_role(
 
     launch, launch_error = launch_once(argv, resuming=bool(resume_session_id))
     resume_error = None
-    if launch_error and resume_session_id:
+    if (launch_error and resume_session_id
+            and not launch_error.startswith("cloud_submit_timeout:")):
         resume_error = launch_error
         queue.patch_context(task.task_id, {"cloud_resume_error": resume_error,
                                            "execution_policy": "fresh_cloud_after_resume_failed"})
