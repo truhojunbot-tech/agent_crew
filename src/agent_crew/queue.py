@@ -3720,17 +3720,9 @@ class TaskQueue:
     # question for a person, and no sibling result answers it (review of PR
     # #822 at 4afcda7, finding 2).
     _SUPERSEDABLE_STATUSES = frozenset({"failed", "timed_out", "cancelled"})
-    # Explicit, role-specific work-scope claims the system writes on a task:
-    # *which tests* for a test (``test_scope``, pipeline-admitted reduction) and
-    # *which findings* for a fix (``review_findings``, cascade review -> fix).
-    # Two tasks do the same work only when they declare the same scope; an
-    # absent claim is not "full scope by default", it is no claim at all
-    # (review of PR #822 at e7f639a). The reviewed revision is deliberately
-    # *not* scope: two different test runs of one commit share its SHA without
-    # being the same run (review of PR #822 at 1624758). It is a compatibility
-    # check instead (:meth:`_work_revision`): a retry of different code is not
-    # a retry.
-    _WORK_SCOPE_KEYS = {"test": ("test_scope",), "implement": ("review_findings",)}
+    # The revision a task declares it works on (pipeline review -> test). It is
+    # a compatibility check, never scope: two different test runs of one commit
+    # share its SHA without being the same run (review of PR #822 at 1624758).
     _WORK_REVISION_KEYS = ("reviewed_sha", "expected_head_sha")
 
     @staticmethod
@@ -3742,12 +3734,6 @@ class TaskQueue:
         return context if isinstance(context, dict) else {}
 
     @staticmethod
-    def _work_scope(task_type: str, context: dict) -> dict:
-        """The explicit role-specific scope claims a context makes, or ``{}``."""
-        return {key: context[key] for key in TaskQueue._WORK_SCOPE_KEYS.get(task_type, ())
-                if context.get(key) not in (None, "", [], {})}
-
-    @staticmethod
     def _work_revision(context: dict) -> str:
         """The revision a task declares it works on, or ``""`` for none."""
         for key in TaskQueue._WORK_REVISION_KEYS:
@@ -3755,6 +3741,33 @@ class TaskQueue:
             if isinstance(value, str) and value:
                 return value
         return ""
+
+    @staticmethod
+    def _test_selection_identities_on(conn, task_ids: list) -> dict:
+        """Persisted, dispatcher-verified test selection per bound test (#278).
+
+        ``task_attribution.effective_test_scope`` / ``test_scope_hash`` are
+        written by the dispatcher from the admission receipt and the test
+        policy in force (``server.py``, ``record_test_economics``); the
+        request's ``context.test_scope`` is logged and ignored there (§7.2),
+        so it is ignored here too (review of PR #822 at 97edc73). A task with
+        no row, or NULL columns, has no identity: it was never dispatched as a
+        test, and nothing verified which tests it selected.
+        """
+        if not task_ids:
+            return {}
+        placeholders = ",".join("?" for _ in task_ids)
+        rows = conn.execute(
+            f"SELECT task_id, effective_test_scope, test_scope_hash FROM task_attribution "
+            f"WHERE task_id IN ({placeholders})",
+            tuple(task_ids),
+        ).fetchall()
+        identities = {}
+        for row in rows:
+            scope, digest = row["effective_test_scope"], row["test_scope_hash"]
+            if isinstance(scope, str) and scope and isinstance(digest, str) and digest:
+                identities[row["task_id"]] = (scope, digest)
+        return identities
 
     @staticmethod
     def _task_lineage_keys(row) -> set:
@@ -3777,79 +3790,83 @@ class TaskQueue:
         return keys
 
     @staticmethod
-    def _superseded_bound_tasks(by_id: dict) -> set:
+    def _superseded_bound_tasks(by_id: dict, test_identities: dict) -> set:
         """Bound task ids whose failure is covered by a completed causal retry.
 
         A bound task in :data:`_SUPERSEDABLE_STATUSES` is superseded by a
-        completed bound task of the same ``task_type``, the **same explicit
-        role-specific work scope** (:meth:`_work_scope`) and the same declared
+        completed bound task of the same ``task_type`` and the same declared
         revision (:meth:`_work_revision`) in exactly two cases (#821; reviews
-        of PR #822 at 4afcda7, e7f639a and 1624758):
+        of PR #822 at 4afcda7, e7f639a, 1624758 and 97edc73):
 
-        1. **Declared retry provenance.** The completed task names the dead
+        1. **Trusted retry provenance.** The completed task names the dead
            one -- directly or through a chain of bound successors -- in a
            system lineage key (:data:`_CEA_LINEAGE_PARENT_KEYS`:
            ``original_task_id`` from ``_auto_retry_failed_task`` and the
            owner-conflict re-admission, ``retry_of``, ``fallback_*``). HTTP
            ingress drops those keys (``_trusted_enqueue_context``), so only an
-           in-process constructor can make this claim. A system retry copies
-           its parent's context, so its scope is the parent's; a successor
-           that *changed* scope is different work and does not count.
-        2. **Same-step redispatch with explicit scope.** Same ``prev_task_id``,
-           same PR/branch lineage, created later (``created_at``, then
-           ``rowid``), and both tasks declare the same non-empty role-specific
-           scope. Both of those context keys are caller-supplied on
-           ``http.tasks``, so they are proof only together with an explicit
-           scope claim: two unscoped tests off one review are not shown to be
-           the same run, and neither are two tests that merely name the same
-           reviewed commit -- the commit says what was tested, not which
-           tests ran.
+           in-process constructor can make this claim. Where both tasks have a
+           persisted test selection it must match; a retry that ran a
+           different selection is different work.
+        2. **Same-step test redispatch with a verified test selection.** Test
+           tasks only: same ``prev_task_id``, same PR/branch lineage, created
+           later (``created_at``, then ``rowid``), and both tasks carry the
+           same dispatcher-persisted test selection
+           (:meth:`_test_selection_identities_on`). ``prev_task_id``, the
+           branch and every context key are caller-supplied on ``http.tasks``,
+           so nothing from the context -- not ``test_scope``, not
+           ``review_findings`` -- proves a retry. Only what the dispatcher
+           itself recorded does.
 
         A shared PR/branch by itself proves nothing: a smoke test off the same
         review does not stand in for a failed full-suite run, and a test off a
-        different review is different work. The dead task stays bound and in
-        the audit trail; only its veto on SUCCESS is lifted.
+        different review is different work. Implement and review rounds have
+        no dispatcher-verified selection, so they are superseded only through
+        trusted provenance. The dead task stays bound and in the audit trail;
+        only its veto on SUCCESS is lifted.
         """
         superseded = set()
         dead = {task_id: row for task_id, row in by_id.items()
                 if row["status"] in TaskQueue._SUPERSEDABLE_STATUSES}
         if not dead:
             return superseded
-        dead_identity = {}
-        for task_id, row in dead.items():
-            dead_context = TaskQueue._row_context(row)
-            dead_identity[task_id] = (TaskQueue._work_scope(row["task_type"], dead_context),
-                                      TaskQueue._work_revision(dead_context))
+        dead_revision = {task_id: TaskQueue._work_revision(TaskQueue._row_context(row))
+                         for task_id, row in dead.items()}
         for other in by_id.values():
             if other["status"] != "completed":
                 continue
             context = TaskQueue._row_context(other)
-            scope = TaskQueue._work_scope(other["task_type"], context)
-            identity = (scope, TaskQueue._work_revision(context))
-            # 1. declared provenance: walk the declared-parent chain through the
+            revision = TaskQueue._work_revision(context)
+            selection = test_identities.get(other["task_id"])
+            # 1. trusted provenance: walk the declared-parent chain through the
             #    bound rows (bounded, cycle-safe) and lift every dead same-type,
-            #    same-scope ancestor -- a retry of a retry covers both rounds.
+            #    same-revision ancestor -- a retry of a retry covers both rounds.
             parent, seen = _cea_lineage_parent_from_ctx(context), set()
             while (parent and parent in by_id and parent not in seen
                    and len(seen) < _CEA_LINEAGE_MAX_DEPTH):
                 seen.add(parent)
                 parent_row = by_id[parent]
+                parent_selection = test_identities.get(parent)
                 if (parent in dead and parent_row["task_type"] == other["task_type"]
-                        and dead_identity[parent] == identity):
+                        and dead_revision[parent] == revision
+                        and (parent_selection is None or selection is None
+                             or parent_selection == selection)):
                     superseded.add(parent)
                 parent = _cea_lineage_parent_from_ctx(TaskQueue._row_context(parent_row))
-            # 2. same-step redispatch, only with an explicit matching scope.
+            # 2. same-step test redispatch, only with a verified test selection.
             prev_task_id = context.get("prev_task_id")
-            if not scope or not isinstance(prev_task_id, str) or not prev_task_id:
+            if (other["task_type"] != "test" or selection is None
+                    or not isinstance(prev_task_id, str) or not prev_task_id):
                 continue
             keys = TaskQueue._task_lineage_keys(other)
             if not keys:
                 continue
             order = (other["created_at"], other["rowid"])
             for task_id, row in dead.items():
-                if task_id in superseded or row["task_type"] != other["task_type"]:
+                if task_id in superseded or row["task_type"] != "test":
                     continue
-                if dead_identity[task_id] != identity:
+                if test_identities.get(task_id) != selection:
+                    continue
+                if dead_revision[task_id] != revision:
                     continue
                 if TaskQueue._row_context(row).get("prev_task_id") != prev_task_id:
                     continue
@@ -3890,10 +3907,11 @@ class TaskQueue:
         re-dispatched as a new task, and the dead round stays bound. A bound
         task in failed/timed_out/cancelled is *superseded* -- it no longer
         blocks SUCCESS -- once a completed bound task of the same task_type
-        and the same explicit work scope is causally its retry
-        (:meth:`_superseded_bound_tasks`). A shared PR/branch alone is not
-        that proof, nor is a shared parent without a declared scope (review
-        of PR #822 at e7f639a), and ``needs_human`` is never
+        is causally its retry (:meth:`_superseded_bound_tasks`): trusted
+        retry provenance, or for tests the same dispatcher-persisted test
+        selection off the same step. A shared PR/branch alone is not that
+        proof, nor is anything the request context claims (reviews of PR
+        #822 at e7f639a, 1624758, 97edc73), and ``needs_human`` is never
         superseded: a human-waiting task is resolved by a human, not by a
         sibling that happened to pass (review of PR #822 at 4afcda7). A dead
         task with no completed successor still blocks, so an intent whose
@@ -3933,7 +3951,8 @@ class TaskQueue:
         # The row for ``task_id`` was already updated in this transaction, so
         # ``rows`` reflects the result being accepted, not the prior status.
         by_id = {row["task_id"]: row for row in rows}
-        superseded = TaskQueue._superseded_bound_tasks(by_id)
+        superseded = TaskQueue._superseded_bound_tasks(
+            by_id, TaskQueue._test_selection_identities_on(conn, task_ids))
         all_completed = (len(by_id) == len(task_ids)
                          and all(by_id[bound]["status"] == "completed" or bound in superseded
                                  for bound in task_ids))

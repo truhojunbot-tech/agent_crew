@@ -211,6 +211,26 @@ def _complete(queue, task_id, **fields):
                                             summary=f"{task_id} done", **fields))
 
 
+def _dispatched_test(queue, task_id, scope="full_suite", digest="policy-h1"):
+    """What the dispatcher persists for a test it actually sent out (#278):
+    the effective test selection, from the admission receipt and the policy
+    in force -- never from the request context."""
+    queue.record_attribution(task_id, project="agent_crew", role="tester", task_type="test")
+    queue.record_test_economics(task_id, effective_test_scope=scope,
+                                test_scope_source="builtin", test_scope_hash=digest)
+
+
+def _system_retry(queue, task_id, parent_id, task_type, **context):
+    """Enqueue a retry the way server._auto_retry_failed_task does: a
+    deterministic id, ``original_task_id`` lineage, and the in-process
+    provenance token without which admission drops that key."""
+    queue.enqueue(TaskRequest(**_lineage_task(task_id, task_type, parent_id,
+                                              original_task_id=parent_id,
+                                              retry_attempt=1, **context)),
+                  ingress="retry.failed_task",
+                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+
+
 def test_corrected_review_lineage_reaches_success(tmp_path):
     """Review of PR #817 at acff035: a resolved request_changes must not veto SUCCESS."""
     db = tmp_path / "tasks.db"
@@ -309,25 +329,24 @@ def _fail(queue, task_id, status="failed"):
 
 
 def test_timed_out_fix_superseded_by_completed_retry_reaches_success(tmp_path):
-    """#821: a dead fix round stays bound but no longer vetoes SUCCESS once a
-    later redispatch of the same pipeline step (same ``prev_task_id``, same
-    branch, same explicit scope -- here the review findings being fixed)
-    completed, was approved and tested."""
+    """#821: a dead fix round stays bound but no longer vetoes SUCCESS once
+    its system retry (trusted ``original_task_id`` provenance) completed,
+    was approved and tested."""
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
     queue.admit_work_intent(_intent(task=_task()))
-    findings = ["veto bug"]
     for spec in (_lineage_task("review-1", "review", "impl-793"),
                  _lineage_task("fix-1", "implement", "review-1", fix_round=1,
-                               review_findings=findings),
-                 _lineage_task("fix-1-retry", "implement", "review-1", fix_round=1,
-                               review_findings=findings),
-                 _lineage_task("review-2", "review", "fix-1-retry"),
-                 _lineage_task("test-793", "test", "review-2")):
+                               review_findings=["veto bug"])):
         queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
     _complete(queue, "impl-793")
     _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
     _fail(queue, "fix-1", status="timed_out")
+    _system_retry(queue, "fix-1-retry", "fix-1", "implement", fix_round=1,
+                  review_findings=["veto bug"])
+    for spec in (_lineage_task("review-2", "review", "fix-1-retry"),
+                 _lineage_task("test-793", "test", "review-2")):
+        queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
     _complete(queue, "fix-1-retry")
     _complete(queue, "review-2", verdict="approve")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
@@ -366,14 +385,14 @@ def test_retry_fix_without_approve_rereview_still_vetoes(tmp_path):
     for spec in (_lineage_task("review-1", "review", "impl-793"),
                  _lineage_task("fix-1", "implement", "review-1", fix_round=1,
                                review_findings=["veto bug"]),
-                 _lineage_task("fix-1-retry", "implement", "review-1", fix_round=1,
-                               review_findings=["veto bug"]),
                  _lineage_task("test-793", "test", "review-1")):
         queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
     _complete(queue, "impl-793")
     _complete(queue, "test-793")
     _complete(queue, "review-1", verdict="request_changes", findings=["veto bug"])
     _fail(queue, "fix-1", status="timed_out")
+    _system_retry(queue, "fix-1-retry", "fix-1", "implement", fix_round=1,
+                  review_findings=["veto bug"])
     _complete(queue, "fix-1-retry")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
     queue.enqueue(TaskRequest(**_lineage_task("review-2", "review", "fix-1-retry")),
@@ -383,45 +402,48 @@ def test_retry_fix_without_approve_rereview_still_vetoes(tmp_path):
 
 
 def test_failed_test_without_later_completed_test_does_not_succeed(tmp_path):
-    """#821: a failed terminal test blocks until a later test of the same
-    explicit test scope and reviewed revision on the lineage completed."""
+    """#821: a failed terminal test blocks until a later test off the same
+    step, of the same reviewed revision and the same dispatcher-persisted
+    test selection, completed."""
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
     queue.admit_work_intent(_intent(task=_task()))
     for spec in (_lineage_task("review-1", "review", "impl-793"),
-                 _lineage_task("test-1", "test", "review-1", test_scope="targeted",
-                               reviewed_sha="a" * 40)):
+                 _lineage_task("test-1", "test", "review-1", reviewed_sha="a" * 40)):
         queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
+    _dispatched_test(queue, "test-1")
     _complete(queue, "impl-793")
     _complete(queue, "review-1", verdict="approve")
     _fail(queue, "test-1")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
     queue.enqueue(TaskRequest(**_lineage_task("test-1-retry", "test", "review-1",
-                                              test_scope="targeted",
                                               reviewed_sha="a" * 40)),
                   ingress="http.tasks")
+    _dispatched_test(queue, "test-1-retry")
     _complete(queue, "test-1-retry")
     assert queue.get_work_intent("directive-1")["state"] == "SUCCESS"
 
 
-def test_completed_fix_on_other_branch_does_not_supersede_failed_fix(tmp_path):
-    """#821: supersession needs the same PR/branch lineage, not just the same type."""
+def test_http_redispatched_fix_does_not_supersede_without_provenance(tmp_path):
+    """#821: a fix round has no dispatcher-verified selection, so only trusted
+    retry provenance supersedes it. A second fix off the same review, branch
+    and findings via http.tasks -- every one of those claims caller-supplied
+    -- does not."""
     db = tmp_path / "tasks.db"
     queue = TaskQueue(str(db))
     queue.admit_work_intent(_intent(task=_task()))
     for spec in (_lineage_task("review-1", "review", "impl-793"),
                  _lineage_task("fix-1", "implement", "review-1", fix_round=1,
                                review_findings=["veto bug"]),
-                 _lineage_task("fix-other", "implement", "review-1", fix_round=1,
-                               review_findings=["veto bug"])
-                 | {"branch": "agent/unrelated-branch"},
+                 _lineage_task("fix-again", "implement", "review-1", fix_round=1,
+                               review_findings=["veto bug"]),
                  _lineage_task("test-793", "test", "review-1")):
         queue.enqueue(TaskRequest(**spec), ingress="http.tasks")
     _complete(queue, "impl-793")
     _complete(queue, "review-1", verdict="approve")
     _complete(queue, "test-793")
     _fail(queue, "fix-1", status="timed_out")
-    _complete(queue, "fix-other")
+    _complete(queue, "fix-again")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
 
@@ -438,19 +460,20 @@ def _setup_approved_lineage(tmp_path):
 
 def test_failed_full_suite_test_not_superseded_by_other_scope_test(tmp_path):
     """Review of PR #822 at 4afcda7, finding 1: a shared PR/branch is not proof
-    of a retry. A later completed smoke test with a different ``test_scope``
-    does not stand in for the failed full-suite run, even off the same review."""
+    of a retry. A later completed test the dispatcher sent out with a
+    different test selection does not stand in for the failed full-suite
+    run, even off the same review."""
     queue = _setup_approved_lineage(tmp_path)
-    queue.enqueue(TaskRequest(**_lineage_task("test-full", "test", "review-1",
-                                              test_scope="full")
+    queue.enqueue(TaskRequest(**_lineage_task("test-full", "test", "review-1")
                               | {"description": "Run the full suite"}),
                   ingress="http.tasks")
+    _dispatched_test(queue, "test-full", scope="full_suite", digest="policy-h1")
     queue.submit_result("test-full", TaskResult(task_id="test-full", status="failed",
                                                 summary="3 product tests failed"))
-    queue.enqueue(TaskRequest(**_lineage_task("test-smoke", "test", "review-1",
-                                              test_scope="smoke")
+    queue.enqueue(TaskRequest(**_lineage_task("test-smoke", "test", "review-1")
                               | {"description": "Smoke-test the CLI"}),
                   ingress="http.tasks")
+    _dispatched_test(queue, "test-smoke", scope="targeted", digest="policy-h2")
     _complete(queue, "test-smoke")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
@@ -496,6 +519,30 @@ def test_same_reviewed_sha_tests_off_same_parent_do_not_supersede(tmp_path):
     assert intent["decision_reason"] is None
 
 
+def test_caller_supplied_test_scope_does_not_supersede(tmp_path):
+    """Review of PR #822 at 97edc73: ``context.test_scope`` is a request claim
+    the dispatcher logs and ignores (§7.2), so it proves nothing here either.
+    Equal caller-supplied scopes on two different runs of one commit do not
+    make the smoke run a retry of the failed full run."""
+    queue = _setup_approved_lineage(tmp_path)
+    queue.enqueue(TaskRequest(**_lineage_task("test-full", "test", "review-1",
+                                              reviewed_sha="a" * 40,
+                                              test_scope="targeted",
+                                              test_command="pytest tests")),
+                  ingress="http.tasks")
+    queue.submit_result("test-full", TaskResult(task_id="test-full", status="failed",
+                                                summary="3 product tests failed"))
+    queue.enqueue(TaskRequest(**_lineage_task("test-smoke", "test", "review-1",
+                                              reviewed_sha="a" * 40,
+                                              test_scope="targeted",
+                                              test_command="pytest tests/smoke")),
+                  ingress="http.tasks")
+    _complete(queue, "test-smoke")
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BOUND"
+    assert intent["decision_reason"] is None
+
+
 def test_declared_retry_of_other_revision_does_not_supersede(tmp_path):
     """A system retry that names the dead test but declares a different
     reviewed revision tested different code; it is not that test's retry."""
@@ -514,22 +561,18 @@ def test_declared_retry_of_other_revision_does_not_supersede(tmp_path):
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
 
-def test_declared_retry_with_changed_scope_does_not_supersede(tmp_path):
-    """Review of PR #822 at e7f639a: the declared-provenance path checks scope
-    too. A system successor that names the dead test but narrows its scope
-    is different work, not a retry."""
+def test_declared_retry_with_changed_selection_does_not_supersede(tmp_path):
+    """Review of PR #822 at e7f639a: the declared-provenance path checks the
+    test selection too. A system successor that names the dead test but was
+    dispatched with a narrower selection is different work, not a retry."""
     queue = _setup_approved_lineage(tmp_path)
     queue.enqueue(TaskRequest(**_lineage_task("test-1", "test", "review-1",
                                               reviewed_sha="a" * 40)),
                   ingress="http.tasks")
+    _dispatched_test(queue, "test-1", scope="full_suite", digest="policy-h1")
     _fail(queue, "test-1", status="timed_out")
-    queue.enqueue(TaskRequest(**_lineage_task("retry-test-1-a1", "test", "test-1",
-                                              reviewed_sha="a" * 40,
-                                              test_scope="targeted",
-                                              original_task_id="test-1",
-                                              retry_attempt=1)),
-                  ingress="retry.failed_task",
-                  _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+    _system_retry(queue, "retry-test-1-a1", "test-1", "test", reviewed_sha="a" * 40)
+    _dispatched_test(queue, "retry-test-1-a1", scope="targeted", digest="policy-h2")
     _complete(queue, "retry-test-1-a1")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
@@ -542,12 +585,14 @@ def test_completed_task_off_another_parent_does_not_supersede(tmp_path):
                   ingress="http.tasks")
     _complete(queue, "review-2", verdict="approve")
     queue.enqueue(TaskRequest(**_lineage_task("test-1", "test", "review-1",
-                                              test_scope="targeted", reviewed_sha="a" * 40)),
+                                              reviewed_sha="a" * 40)),
                   ingress="http.tasks")
+    _dispatched_test(queue, "test-1")
     _fail(queue, "test-1")
     queue.enqueue(TaskRequest(**_lineage_task("test-2", "test", "review-2",
-                                              test_scope="targeted", reviewed_sha="a" * 40)),
+                                              reviewed_sha="a" * 40)),
                   ingress="http.tasks")
+    _dispatched_test(queue, "test-2")
     _complete(queue, "test-2")
     assert queue.get_work_intent("directive-1")["state"] == "BOUND"
 
