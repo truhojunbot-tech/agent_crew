@@ -304,6 +304,31 @@ def test_direct_rereview_without_fix_does_not_clear_request_changes(tmp_path):
     assert "fix" not in " ".join(intent["task_ids"])  # no implement fix was ever bound
 
 
+def _fail(queue, task_id, status="failed"):
+    queue.submit_result(task_id, TaskResult(task_id=task_id, status=status,
+                                            summary=f"{task_id} {status}"))
+
+
+def _assert_blocked_on(queue, *failed):
+    """#823: an unsuperseded terminal failure with no active bound task leaves
+    the intent BLOCKED with a structured blocker -- never SUCCESS, and never a
+    silent permanent BOUND. ``failed`` lists the expected ``task=status`` pairs."""
+    intent = queue.get_work_intent("directive-1")
+    assert intent["state"] == "BLOCKED"
+    assert intent["state"] != "SUCCESS"
+    blocker = intent["blocker"]
+    assert blocker["blocker_type"] == "bound_tasks_unsuccessful"
+    for pair in failed:
+        assert pair in blocker["reason"]
+    assert blocker["unblock_action"]
+    assert blocker["owner"] == "coordinator"
+    assert blocker["next_check_at"] is not None
+    assert intent["next_check_at"] == blocker["next_check_at"]
+    assert intent["decision_reason"] == blocker["reason"]
+    assert "superseded" not in intent["decision_reason"]
+    return intent
+
+
 def test_rereview_after_incomplete_fix_does_not_clear_request_changes(tmp_path):
     """A fix task in the chain only counts as correction once it is completed."""
     db = tmp_path / "tasks.db"
@@ -320,12 +345,9 @@ def test_rereview_after_incomplete_fix_does_not_clear_request_changes(tmp_path):
     queue.submit_result("fix-1", TaskResult(task_id="fix-1", status="failed",
                                             summary="fix-1 could not land"))
     _complete(queue, "review-2", verdict="approve")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "fix-1=failed")
 
 
-def _fail(queue, task_id, status="failed"):
-    queue.submit_result(task_id, TaskResult(task_id=task_id, status=status,
-                                            summary=f"{task_id} {status}"))
 
 
 def test_terminal_unsuccessful_bound_task_becomes_structured_blocked(tmp_path):
@@ -412,7 +434,7 @@ def test_only_fix_failed_does_not_reach_success(tmp_path):
     _complete(queue, "review-1", verdict="approve")
     _complete(queue, "test-793")
     _fail(queue, "fix-1")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "fix-1=failed")
 
 
 def test_retry_fix_without_approve_rereview_still_vetoes(tmp_path):
@@ -455,7 +477,7 @@ def test_failed_test_without_later_completed_test_does_not_succeed(tmp_path):
     _complete(queue, "impl-793")
     _complete(queue, "review-1", verdict="approve")
     _fail(queue, "test-1")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "test-1=failed")
     _system_retry(queue, "test-1-retry", "test-1", "test", reviewed_sha="a" * 40)
     _dispatched_test(queue, "test-1-retry")
     _complete(queue, "test-1-retry")
@@ -482,7 +504,7 @@ def test_http_redispatched_fix_does_not_supersede_without_provenance(tmp_path):
     _complete(queue, "test-793")
     _fail(queue, "fix-1", status="timed_out")
     _complete(queue, "fix-again")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "fix-1=timed_out")
 
 
 def _setup_approved_lineage(tmp_path):
@@ -513,7 +535,7 @@ def test_failed_full_suite_test_not_superseded_by_other_scope_test(tmp_path):
                   ingress="http.tasks")
     _dispatched_test(queue, "test-smoke", scope="targeted", digest="policy-h2")
     _complete(queue, "test-smoke")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "test-full=failed")
 
 
 def test_unscoped_tests_off_same_parent_do_not_supersede(tmp_path):
@@ -531,9 +553,7 @@ def test_unscoped_tests_off_same_parent_do_not_supersede(tmp_path):
                                               test_command="pytest tests/smoke")),
                   ingress="http.tasks")
     _complete(queue, "test-smoke")
-    intent = queue.get_work_intent("directive-1")
-    assert intent["state"] == "BOUND"
-    assert intent["decision_reason"] is None
+    _assert_blocked_on(queue, "test-full=failed")
 
 
 def test_same_reviewed_sha_tests_off_same_parent_do_not_supersede(tmp_path):
@@ -552,9 +572,7 @@ def test_same_reviewed_sha_tests_off_same_parent_do_not_supersede(tmp_path):
                                               test_command="pytest tests/smoke")),
                   ingress="http.tasks")
     _complete(queue, "test-smoke")
-    intent = queue.get_work_intent("directive-1")
-    assert intent["state"] == "BOUND"
-    assert intent["decision_reason"] is None
+    _assert_blocked_on(queue, "test-full=failed")
 
 
 def test_caller_supplied_test_scope_does_not_supersede(tmp_path):
@@ -576,9 +594,7 @@ def test_caller_supplied_test_scope_does_not_supersede(tmp_path):
                                               test_command="pytest tests/smoke")),
                   ingress="http.tasks")
     _complete(queue, "test-smoke")
-    intent = queue.get_work_intent("directive-1")
-    assert intent["state"] == "BOUND"
-    assert intent["decision_reason"] is None
+    _assert_blocked_on(queue, "test-full=failed")
 
 
 def test_declared_retry_of_other_revision_does_not_supersede(tmp_path):
@@ -596,7 +612,7 @@ def test_declared_retry_of_other_revision_does_not_supersede(tmp_path):
                   ingress="retry.failed_task",
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     _complete(queue, "retry-test-1-a1")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "test-1=timed_out")
 
 
 def test_declared_retry_with_changed_selection_does_not_supersede(tmp_path):
@@ -612,7 +628,7 @@ def test_declared_retry_with_changed_selection_does_not_supersede(tmp_path):
     _system_retry(queue, "retry-test-1-a1", "test-1", "test", reviewed_sha="a" * 40)
     _dispatched_test(queue, "retry-test-1-a1", scope="targeted", digest="policy-h2")
     _complete(queue, "retry-test-1-a1")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "test-1=timed_out")
 
 
 def test_same_policy_fingerprint_differing_run_does_not_supersede(tmp_path):
@@ -635,9 +651,7 @@ def test_same_policy_fingerprint_differing_run_does_not_supersede(tmp_path):
                   ingress="http.tasks")
     _dispatched_test(queue, "test-smoke", scope="targeted", digest="policy-h1")
     _complete(queue, "test-smoke")
-    intent = queue.get_work_intent("directive-1")
-    assert intent["state"] == "BOUND"
-    assert intent["decision_reason"] is None
+    _assert_blocked_on(queue, "test-full=failed")
 
 
 def test_declared_retry_provenance_supersedes_dead_task(tmp_path):
@@ -675,14 +689,14 @@ def test_needs_human_task_is_never_superseded(tmp_path):
     queue.enqueue(TaskRequest(**_lineage_task("test-2", "test", "review-1")),
                   ingress="http.tasks")
     _complete(queue, "test-2")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "test-held=needs_human")
     queue.enqueue(TaskRequest(**_lineage_task("retry-test-held-a1", "test", "test-held",
                                               original_task_id="test-held",
                                               retry_attempt=1)),
                   ingress="retry.failed_task",
                   _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
     _complete(queue, "retry-test-held-a1")
-    assert queue.get_work_intent("directive-1")["state"] == "BOUND"
+    _assert_blocked_on(queue, "test-held=needs_human")
 
 
 def test_intent_update_failure_rolls_back_task_completion(tmp_path):
