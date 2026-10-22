@@ -3723,6 +3723,127 @@ class TaskQueue:
             current = context.get("prev_task_id") if isinstance(context, dict) else None
         return chain
 
+    # ``needs_human`` is deliberately absent: it is not a dead round but an open
+    # question for a person, and no sibling result answers it (review of PR
+    # #822 at 4afcda7, finding 2).
+    _SUPERSEDABLE_STATUSES = frozenset({"failed", "timed_out", "cancelled"})
+    # The revision a task declares it works on (pipeline review -> test). It is
+    # a compatibility check, never scope: two different test runs of one commit
+    # share its SHA without being the same run (review of PR #822 at 1624758).
+    _WORK_REVISION_KEYS = ("reviewed_sha", "expected_head_sha")
+
+    @staticmethod
+    def _row_context(row) -> dict:
+        try:
+            context = json.loads(row["context"] or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return context if isinstance(context, dict) else {}
+
+    @staticmethod
+    def _work_revision(context: dict) -> str:
+        """The revision a task declares it works on, or ``""`` for none."""
+        for key in TaskQueue._WORK_REVISION_KEYS:
+            value = context.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    @staticmethod
+    def _test_selection_identities_on(conn, task_ids: list) -> dict:
+        """Persisted, dispatcher-verified test *treatment* per bound test (#278).
+
+        ``task_attribution.effective_test_scope`` / ``test_scope_hash`` are
+        written by the dispatcher from the admission receipt and the test
+        policy in force (``server.py``, ``record_test_economics``); the
+        request's ``context.test_scope`` is logged and ignored there (§7.2),
+        so it is ignored here too (review of PR #822 at 97edc73). A task with
+        no row, or NULL columns, has no identity.
+
+        ⛔This is a *policy* fingerprint, not an executed-test identity:
+          ``testing_policy.scope_fingerprint`` hashes the configuration and
+          deliberately excludes the commands, so two different targeted runs
+          under one policy share it (review of PR #822 at 00c959a). Nothing in
+          the system persists which tests a run actually selected. It can
+          therefore only *refute* a retry (different treatment => different
+          work), never prove one.
+        """
+        if not task_ids:
+            return {}
+        placeholders = ",".join("?" for _ in task_ids)
+        rows = conn.execute(
+            f"SELECT task_id, effective_test_scope, test_scope_hash FROM task_attribution "
+            f"WHERE task_id IN ({placeholders})",
+            tuple(task_ids),
+        ).fetchall()
+        identities = {}
+        for row in rows:
+            scope, digest = row["effective_test_scope"], row["test_scope_hash"]
+            if isinstance(scope, str) and scope and isinstance(digest, str) and digest:
+                identities[row["task_id"]] = (scope, digest)
+        return identities
+
+    @staticmethod
+    def _superseded_bound_tasks(by_id: dict, test_identities: dict) -> set:
+        """Bound task ids whose failure is covered by a completed, trusted retry.
+
+        A bound task in :data:`_SUPERSEDABLE_STATUSES` is superseded only by a
+        completed bound task of the same ``task_type`` that the **system
+        itself constructed as its retry** (#821; reviews of PR #822 at
+        4afcda7, e7f639a, 1624758, 97edc73 and 00c959a): the completed task
+        names the dead one -- directly or through a chain of bound successors
+        -- in a system lineage key (:data:`_CEA_LINEAGE_PARENT_KEYS`:
+        ``original_task_id`` from ``_auto_retry_failed_task`` and the
+        owner-conflict re-admission, ``retry_of``, ``fallback_*``). HTTP
+        ingress drops those keys (``_trusted_enqueue_context``), so only an
+        in-process constructor can make this claim. Two compatibility checks
+        can still refute the retry: the declared revision
+        (:meth:`_work_revision`) must match, and where both tasks carry a
+        persisted test treatment (:meth:`_test_selection_identities_on`) it
+        must match too.
+
+        There is deliberately no second path. Every "same step" heuristic --
+        shared PR/branch, shared ``prev_task_id``, equal ``context.test_scope``,
+        equal ``review_findings``, equal policy fingerprint -- was shown to let
+        a different run (a smoke test off the same review) stand in for a
+        failed one: those claims are either caller-supplied on ``http.tasks``
+        or describe policy rather than the work. Without a persisted
+        executed-test identity, which the system does not record, provenance
+        is the only proof. A coordinator that re-dispatches a dead round by
+        hand therefore does not close the intent; the cascade's retry
+        constructor does. The dead task stays bound and in the audit trail;
+        only its veto on SUCCESS is lifted.
+        """
+        superseded = set()
+        dead = {task_id: row for task_id, row in by_id.items()
+                if row["status"] in TaskQueue._SUPERSEDABLE_STATUSES}
+        if not dead:
+            return superseded
+        dead_revision = {task_id: TaskQueue._work_revision(TaskQueue._row_context(row))
+                         for task_id, row in dead.items()}
+        for other in by_id.values():
+            if other["status"] != "completed":
+                continue
+            context = TaskQueue._row_context(other)
+            revision = TaskQueue._work_revision(context)
+            selection = test_identities.get(other["task_id"])
+            # Walk the declared-parent chain through the bound rows (bounded,
+            # cycle-safe) and lift every dead same-type, compatible ancestor --
+            # a retry of a retry covers both rounds.
+            parent, seen = _cea_lineage_parent_from_ctx(context), set()
+            while (parent and parent in by_id and parent not in seen
+                   and len(seen) < _CEA_LINEAGE_MAX_DEPTH):
+                seen.add(parent)
+                parent_row = by_id[parent]
+                parent_selection = test_identities.get(parent)
+                if (parent in dead and parent_row["task_type"] == other["task_type"]
+                        and dead_revision[parent] == revision
+                        and (parent_selection is None or selection is None
+                             or parent_selection == selection)):
+                    superseded.add(parent)
+                parent = _cea_lineage_parent_from_ctx(TaskQueue._row_context(parent_row))
+        return superseded
+
     @staticmethod
     def _terminalize_work_intent_on(conn, task_id: str, task_type: str,
                                     result_status: str, now: float) -> None:
@@ -3750,6 +3871,20 @@ class TaskQueue:
         itself is terminal; submit_result rejects later revisions to tasks
         belonging to a successful intent.
 
+        Retries are normal (#821): a fix round that hit dispatcher_timeout is
+        re-dispatched as a new task, and the dead round stays bound. A bound
+        task in failed/timed_out/cancelled is *superseded* -- it no longer
+        blocks SUCCESS -- once a completed bound task of the same task_type
+        is its system-constructed retry (:meth:`_superseded_bound_tasks`):
+        trusted retry provenance is the only proof. A shared PR/branch, a
+        shared parent, anything the request context claims and the persisted
+        policy fingerprint are not (reviews of PR #822 at e7f639a, 1624758,
+        97edc73, 00c959a), and ``needs_human`` is never
+        superseded: a human-waiting task is resolved by a human, not by a
+        sibling that happened to pass (review of PR #822 at 4afcda7). A dead
+        task with no completed successor still blocks, so an intent whose
+        only fix failed never closes on its own.
+
         The update shares submit_result's transaction, so task completion and
         operation state cannot diverge on crash.
         """
@@ -3764,7 +3899,8 @@ class TaskQueue:
         if not isinstance(op_id, str) or not op_id:
             return
         intent = conn.execute(
-            "SELECT task_ids, state FROM work_intents WHERE external_operation_id=?",
+            "SELECT task_ids, state, coordinator_identity, execution_slo_s "
+            "FROM work_intents WHERE external_operation_id=?",
             (op_id,),
         ).fetchone()
         if intent is None or intent["state"] not in ("BOUND", "SUCCESS"):
@@ -3784,8 +3920,11 @@ class TaskQueue:
         # The row for ``task_id`` was already updated in this transaction, so
         # ``rows`` reflects the result being accepted, not the prior status.
         by_id = {row["task_id"]: row for row in rows}
+        superseded = TaskQueue._superseded_bound_tasks(
+            by_id, TaskQueue._test_selection_identities_on(conn, task_ids))
         all_completed = (len(by_id) == len(task_ids)
-                         and all(by_id[bound]["status"] == "completed" for bound in task_ids))
+                         and all(by_id[bound]["status"] == "completed" or bound in superseded
+                                 for bound in task_ids))
         terminal_test_completed = any(
             row["task_type"] == "test" and row["status"] == "completed" for row in by_id.values())
         completed_reviews = [row for row in by_id.values()
@@ -3808,13 +3947,50 @@ class TaskQueue:
             for row in completed_reviews)
         succeeded = all_completed and terminal_test_completed and not review_requires_fix
         if intent["state"] == "BOUND" and succeeded:
+            reason = "all bound tasks completed; terminal test completed"
+            if superseded:
+                reason = ("all bound tasks completed or superseded by a completed retry "
+                          f"({', '.join(sorted(superseded))}); terminal test completed")
             conn.execute(
                 "UPDATE work_intents SET state='SUCCESS', blocker=NULL, "
                 "decision_reason=?, decision_authority=?, last_progress_at=?, "
                 "next_check_at=NULL WHERE external_operation_id=? AND state='BOUND'",
-                ("all bound tasks completed; terminal test completed",
-                 "agent_crew:task_result", now, op_id),
+                (reason, "agent_crew:task_result", now, op_id),
             )
+        elif intent["state"] == "BOUND":
+            # #823: a bound operation must not disappear into a permanent
+            # BOUND state after every active task has ended unsuccessfully.
+            # Superseded dead rounds (#821) are ignored here: a trusted retry
+            # owns their outcome. Completed-but-nonterminal pipeline stages
+            # (for example request_changes awaiting its fix) also stay BOUND.
+            active = {row["task_id"] for row in by_id.values()
+                      if row["status"] in ("pending", "in_progress")}
+            unsuccessful = {
+                row["task_id"]: row["status"] for row in by_id.values()
+                if row["task_id"] not in superseded
+                and row["status"] in (
+                    "failed", "timed_out", "cancelled", "canceled",
+                    "needs_human", "blocked", "expired")
+            }
+            if unsuccessful and not active:
+                statuses = ", ".join(
+                    f"{bound}={unsuccessful[bound]}" for bound in sorted(unsuccessful))
+                next_check_at = now + float(intent["execution_slo_s"])
+                blocker = {
+                    "blocker_type": "bound_tasks_unsuccessful",
+                    "reason": f"all active bound work ended; {statuses}",
+                    "unblock_action": "retry/bind a successor task or reject the operation",
+                    "owner": intent["coordinator_identity"],
+                    "next_check_at": next_check_at,
+                }
+                conn.execute(
+                    "UPDATE work_intents SET state='BLOCKED', blocker=?, "
+                    "decision_reason=?, decision_authority=?, last_progress_at=?, "
+                    "next_check_at=? "
+                    "WHERE external_operation_id=? AND state='BOUND'",
+                    (json.dumps(blocker), blocker["reason"],
+                     "agent_crew:task_result", now, next_check_at, op_id),
+                )
 
     def admit_work_intent(self, intent: dict) -> dict:
         """Deduplicate an external operation; optional first task shares enqueue's txn."""
