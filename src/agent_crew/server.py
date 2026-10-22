@@ -7115,6 +7115,7 @@ def create_app(
             # watch-ingested issue is `main`.
             result=result,
             repo_cwd=_any_worktree_path(),
+            coordinator_notify_fn=coordinator_notify_fn,
         )
         if review_id:
             _try_push_next("reviewer")
@@ -7134,6 +7135,7 @@ def create_app(
             repo=repo,
             repo_cwd=_any_worktree_path(),
             tester_agent=_DISPATCH_ROLE_TO_AGENT.get("tester"),
+            coordinator_notify_fn=coordinator_notify_fn,
         )
         if test_id:
             _try_push_next("tester")
@@ -7267,6 +7269,7 @@ def create_app(
                 repo_cwd=_any_worktree_path(),
                 # #314 §4 P0: replay 중엔 fix-budget exhaustion PR comment skip.
                 suppress_side_effects=_REPLAYING.get(),
+                coordinator_notify_fn=coordinator_notify_fn,
             )
             if fix_id:
                 _try_push_next("implementer")

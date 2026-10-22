@@ -26,6 +26,7 @@ import re
 import sqlite3
 import json
 import subprocess
+import time
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from typing import Optional
@@ -1079,7 +1080,8 @@ def _inherit_root_risk(tasks_by_id: dict, parent_task, context: dict) -> None:
 
 def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
                                  tasks_by_id: dict, parent_task, *,
-                                 ingress: str, successor_provenance=None) -> None:
+                                 ingress: str, successor_provenance=None,
+                                 coordinator_notify_fn=None) -> None:
     """Keep inherited risk out of the broker payload, then record it (#578)."""
     inherited: dict = {}
     _inherit_root_risk(tasks_by_id, parent_task, inherited)
@@ -1090,8 +1092,39 @@ def _enqueue_with_inherited_risk(queue: TaskQueue, task: TaskRequest,
         tier = parent_context.get("risk_tier")
         if isinstance(tier, int) and not isinstance(tier, bool) and 0 <= tier <= 3:
             task.context["risk_tier"] = tier
-    queue.enqueue(task, ingress=ingress,
-                  _successor_provenance=successor_provenance)
+    for attempt in range(3):
+        try:
+            queue.enqueue(task, ingress=ingress,
+                          _successor_provenance=successor_provenance)
+            break
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower():
+                raise
+            if attempt < 2:
+                time.sleep(0.05 * (2 ** attempt))
+                continue
+            step = ingress.rsplit(".", 1)[-1]
+            parent_context = parent_task.context if isinstance(parent_task.context, dict) else {}
+            lineage = parent_context.get("lineage_root_task_id") or parent_task.task_id
+            failure = {
+                "reason": "database is locked", "missing_step": step,
+                "lineage_task_id": parent_task.task_id,
+                "lineage_root_task_id": lineage,
+                "successor_task_id": task.task_id,
+            }
+            try:
+                queue.merge_task_context(parent_task.task_id,
+                                         {"cascade_enqueue_failure": failure})
+            except Exception:
+                logger.exception("cascade lock marker failed for %s", parent_task.task_id)
+            from agent_crew.server import coordinator_notice_once
+            coordinator_notice_once(
+                queue, parent_task.task_id, f"cascade_enqueue_locked_{step}",
+                f"lineage={lineage} missing_step={step} successor={task.task_id} "
+                "reason=database is locked",
+                coordinator_notify_fn,
+            )
+            raise
     if "risk_declaration" in inherited:
         try:
             context = task.context if isinstance(task.context, dict) else {}
@@ -1444,6 +1477,7 @@ def auto_enqueue_fix(
     repo_cwd: str = "",
     require_repo_default: bool = False,
     suppress_side_effects: bool = False,
+    coordinator_notify_fn=None,
 ) -> Optional[str]:
     """Create the fix task after an actionable review or test failure (#244, #795).
 
@@ -1851,7 +1885,8 @@ def auto_enqueue_fix(
                 context=fix_context,
                 project=_successor_project(queue, review_task, server_project),
             ), tasks_by_id, review_task, ingress="cascade.fix",
-                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                coordinator_notify_fn=coordinator_notify_fn)
         except (sqlite3.IntegrityError, TaskAlreadyExistsError):
             # A concurrent submission (or replay 재실행) won the insert. That is the
             # mechanism working, not an error: exactly one fix task exists.
@@ -2072,6 +2107,7 @@ def auto_enqueue_review(
     pr_state_fn=None,
     result=None,
     repo_cwd: str = "",
+    coordinator_notify_fn=None,
 ) -> Optional[str]:
     """Create the review task that follows a completed impl task.
 
@@ -2216,6 +2252,7 @@ def auto_enqueue_review(
                             {task.task_id: task for task in queue.list_tasks()},
                             impl_task, ingress="retry.failed_task",
                             successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                            coordinator_notify_fn=coordinator_notify_fn,
                         )
                     except TaskAlreadyExistsError:
                         pass  # The same result was replayed.
@@ -2388,7 +2425,8 @@ def auto_enqueue_review(
             _enqueue_with_inherited_risk(
                 queue, review_req, {t.task_id: t for t in queue.list_tasks()},
                 impl_task, ingress="cascade.review",
-                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                coordinator_notify_fn=coordinator_notify_fn)
         except TaskAlreadyExistsError:
             # 이미 생성됨(replay 재실행/중복 cascade) → 멱등 no-op.
             logger.info(f"auto_enqueue_review: {review_id} 이미 존재 — 멱등 skip")
@@ -2418,6 +2456,7 @@ def auto_enqueue_test(
     repo: str = "",
     repo_cwd: str = "",
     tester_agent: Optional[str] = None,
+    coordinator_notify_fn=None,
 ) -> Optional[str]:
     """Create the test task that follows an approved review.
 
@@ -2579,7 +2618,8 @@ def auto_enqueue_test(
             _enqueue_with_inherited_risk(
                 queue, test_req, tasks_by_id, review_task,
                 ingress="cascade.test",
-                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+                successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                coordinator_notify_fn=coordinator_notify_fn)
         except TaskAlreadyExistsError:
             logger.info(f"auto_enqueue_test: {test_id} 이미 존재 — 멱등 skip")
         except DuplicateReviewError as exc:
