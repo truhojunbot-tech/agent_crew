@@ -3830,6 +3830,11 @@ def create_app(
         for outcome in outcomes:
             if outcome.action == "needs_decision":
                 _coordinator_notice(outcome.task_id, "cloud_needs_decision", outcome.detail)
+            elif outcome.action == "requeued":
+                # The prior cloud session can still be running even though its
+                # slot was released. The durable notice includes its URL from
+                # task context and the deterministic retry id from detail.
+                _coordinator_notice(outcome.task_id, "cloud_stale_requeued", outcome.detail)
 
     def _resume_codex_quota_holds() -> list[str]:
         """Release one probe, then its cohort after a dispatch was recorded."""
