@@ -218,10 +218,8 @@ def test_finding3_reproduction_hangs_forever_without_a_budget(q):
             os.environ[cc._ENV_STALE_SECONDS] = old
 
 
-def test_finding3_stale_dispatch_resolves_to_needs_human(q, monkeypatch):
-    """Fix: past the configured budget, a no-PR/no-commit dispatch is
-    resolved to `needs_human` — freeing the concurrency slot and leaving a
-    human-actionable record instead of hanging forever."""
+def test_finding3_stale_dispatch_requeues_once(q, monkeypatch):
+    """Past the budget, the first unobservable dispatch frees its slot and retries."""
     monkeypatch.setenv(cc._ENV_STALE_SECONDS, "1")
     task_id, branch = _enqueue_implement(q)
     q.dequeue(role="implementer")
@@ -242,9 +240,11 @@ def test_finding3_stale_dispatch_resolves_to_needs_human(q, monkeypatch):
         pr_number_for_branch_fn=lambda branch, repo=None: None,
         commit_message_fn=lambda branch, repo=None: None,
     )
-    assert outcome.action == "needs_decision"
-    resolved = [t for t in q.list_tasks(status="needs_human") if t.task_id == task_id]
-    assert len(resolved) == 1, "the slot must be freed — the task must leave in_progress"
+    assert outcome.action == "requeued"
+    assert q.get_task(task_id).status == "failed"
+    retry = q.get_task(f"retry-{task_id}-a1")
+    assert retry is not None and retry.status == "pending"
+    assert retry.context["cloud_stale_retry"] is True
     assert not [t for t in q.list_tasks(status="in_progress") if t.task_id == task_id]
 
 

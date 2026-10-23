@@ -131,7 +131,8 @@ def test_stale_review_without_comment_uses_fallback(queue, monkeypatch):
         queue, task, pr_comments_fn=lambda pr, repo=None: [],
         submit_review_result_fn=lambda *_: pytest.fail("stale review submitted"),
     )
-    assert outcome.action == "failed"
+    assert outcome.action == "requeued"
+    assert queue.get_task(f"retry-{task.task_id}-a1").status == "pending"
 
 
 @pytest.mark.parametrize("failure", ["raises", "held"])
@@ -153,7 +154,8 @@ def test_stale_review_with_unaccepted_result_uses_fallback(queue, monkeypatch, f
         pr_comments_fn=lambda pr, repo=None: [{"body": _comment()}],
         submit_review_result_fn=submit,
     )
-    assert outcome.action == "failed"
+    assert outcome.action == "requeued"
+    assert queue.get_task(f"retry-{task.task_id}-a1").status == "pending"
     assert queue.get_task(task.task_id).status == "failed"
     assert len(fallback_calls) == 1
 

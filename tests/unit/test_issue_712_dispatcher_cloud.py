@@ -105,7 +105,7 @@ def test_cloud_daily_cap_uses_durable_launch_count(tmp_path, monkeypatch):
     assert queue.get_task("review-next").status == "pending"
 
 
-def test_cloud_review_without_result_goes_stale_not_approved(tmp_path, monkeypatch):
+def test_cloud_review_without_result_requeues_once_not_approved(tmp_path, monkeypatch):
     queue = TaskQueue(str(tmp_path / "tasks.db"))
     task = _enqueue_review(queue)
     task = queue.dequeue(role="reviewer")
@@ -118,9 +118,12 @@ def test_cloud_review_without_result_goes_stale_not_approved(tmp_path, monkeypat
     outcome = cloud.reconcile_cloud_dispatch(
         queue, task, pr_comments_fn=lambda *_args, **_kwargs: [],
         submit_review_result_fn=lambda *_args: None)
-    assert outcome.action == "failed"
+    assert outcome.action == "requeued"
     assert queue.get_task(task.task_id).status == "failed"
     assert queue.get_result(task.task_id).verdict is None
+    retry = queue.get_task(f"retry-{task.task_id}-a1")
+    assert retry is not None and retry.status == "pending"
+    assert retry.context["cloud_stale_retry"] is True
 
 
 def test_cloud_review_records_result_verdict_and_end_time(tmp_path):
