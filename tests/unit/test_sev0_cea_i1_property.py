@@ -58,7 +58,7 @@ from tests.unit.sev0_cea_acceptance_helpers import (
 #: §7 modules the task names for the static sweep. ``mcp_server.py`` and
 #: ``protocol.py`` are included on purpose: they must contribute *zero* ingress
 #: call sites (adapters.py documents MCP as deliberately absent).
-SWEPT = ("server.py", "mcp_server.py", "pipeline.py", "loop.py", "watch.py",
+SWEPT = ("server.py", "mcp_server.py", "pipeline.py", "claude_cloud.py", "loop.py", "watch.py",
          "triage.py", "discussion.py", "protocol.py", "cli.py", "queue.py")
 
 #: The adapter list as documented in the ADR §2.2 / adapters.INGRESSES docstring.
