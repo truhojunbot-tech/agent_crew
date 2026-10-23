@@ -3381,6 +3381,7 @@ def create_app(
         except ValueError:
             shadow_memory_timeout_seconds = SHADOW_MEMORY_DEFAULT_TIMEOUT_SECONDS
 
+    _state_worktree_map = worktree_map is None
     if worktree_map is None:
         worktree_map = _load_worktree_map(state_path) if not _WORKTREE_SYNC_DISABLED else {}
     if watchdog_interval is None:
@@ -3807,6 +3808,37 @@ def create_app(
     def _coordinator_notice(task_id: str, kind: str, detail: str = "") -> None:
         """Wake the coordinator once after confirmed delivery."""
         coordinator_notice_once(q(), task_id, kind, detail, coordinator_notify_fn)
+
+    def _review_implementer_agent(task: TaskRequest) -> Optional[str]:
+        context = task.context if isinstance(task.context, dict) else {}
+        implementer = None
+        parent_id = context.get("prev_task_id")
+        seen = {task.task_id}
+        while not implementer and isinstance(parent_id, str) and parent_id not in seen:
+            seen.add(parent_id)
+            parent = q().get_task(parent_id)
+            if parent is None:
+                break
+            parent_context = parent.context if isinstance(parent.context, dict) else {}
+            if parent.task_type == "implement":
+                attribution = q().get_attribution(parent_id) or {}
+                implementer = attribution.get("agent") or parent_context.get("agent_override")
+            parent_id = parent_context.get("prev_task_id")
+        implementer = implementer or context.get("implementer_agent")
+        return implementer if isinstance(implementer, str) and implementer else None
+
+    def _refuse_self_review(task: TaskRequest, agent: str) -> bool:
+        if task.task_type != "review":
+            return False
+        implementer = _review_implementer_agent(task)
+        if not implementer or implementer.strip().lower() != agent.strip().lower():
+            return False
+        reason = f"reviewer_matches_implementer: {agent}"
+        logger.error("dispatcher: refusing review task=%s — %s", task.task_id, reason)
+        _fail_if_active(task.task_id, reason, status="needs_human",
+                        details={"implementer_agent": implementer,
+                                 "reviewer_agent": agent})
+        return True
 
     def _failed_no_successor_notice(task_id: str, result: TaskResult,
                                     task_type: str) -> None:
@@ -4316,6 +4348,7 @@ def create_app(
 
     def _try_push_next(role: str) -> None:
         """If the role has an available pane and is idle, dequeue and push the next task."""
+        _refresh_role_map()
         # #314 §4 P0: replay 중에는 queue push 금지 — push는 다른 pending task를 claim/start하므로
         # replay가 ACK 전 죽으면 다음 replay가 또 다른 task를 claim/start(중복). replay는 successor
         # enqueue(durable transition)만; dispatch는 resume 후 정상 push 사이클/watchdog이 담당.
@@ -4355,7 +4388,7 @@ def create_app(
             try:
                 _claude_cloud.dispatch_cloud_for_role(
                     q(), role=role, task_type=_ROLE_TO_TYPE.get(role, ""),
-                    state_path=state_path)
+                    state_path=state_path, review_guard_fn=_refuse_self_review)
             except Exception:
                 logger.exception(f"_try_push_next: claude_cloud dispatch failed for role={role}")
             return
@@ -4413,6 +4446,9 @@ def create_app(
                 skipped.add(task.task_id)
                 continue
             break
+
+        if _refuse_self_review(task, _target_agent):
+            return
 
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
@@ -5142,10 +5178,41 @@ def create_app(
             return
 
     # ── Headless dispatcher (subprocess-per-task model) ──────────────────────
-    # Built from state.json's "roles" field when present; falls back to the
-    # hardcoded default (codex/claude/gemini). This is what lets the same
-    # agent serve multiple roles (e.g. claude implementer + claude reviewer).
+    # Built from state.json's role assignment, with the hardcoded fallback.
+    # Recheck its mtime before dispatch so a live role change takes effect.
     _DISPATCH_ROLE_TO_AGENT: dict[str, str] = _load_role_to_agent(state_path)
+    def _role_map_stamp():
+        if not state_path:
+            return None
+        try:
+            stat = os.stat(state_path)
+            return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
+        except OSError:
+            return None
+
+    _role_map_cached_stamp = _role_map_stamp()
+    logger.info("dispatcher: effective role map at startup: %s", _DISPATCH_ROLE_TO_AGENT)
+
+    def _refresh_role_map() -> None:
+        nonlocal _role_map_cached_stamp
+        stamp = _role_map_stamp()
+        if stamp == _role_map_cached_stamp:
+            return
+        mapping = _load_role_to_agent(state_path)
+        _role_map_cached_stamp = stamp
+        if _state_worktree_map and not _WORKTREE_SYNC_DISABLED:
+            refreshed_worktrees = _load_worktree_map(state_path)
+            worktree_map.update(refreshed_worktrees)
+            for role in tuple(worktree_map):
+                if role not in refreshed_worktrees:
+                    worktree_map.pop(role)
+        if mapping != _DISPATCH_ROLE_TO_AGENT:
+            _DISPATCH_ROLE_TO_AGENT.update(mapping)
+            for role in tuple(_DISPATCH_ROLE_TO_AGENT):
+                if role not in mapping:
+                    _DISPATCH_ROLE_TO_AGENT.pop(role)
+        logger.info("dispatcher: state changed; effective role map: %s", mapping)
+
     _DISPATCH_DISCUSS_WORKTREES = _load_discuss_worktrees(state_path)
 
     # #772: the test stage is a deterministic script, not a provider call.
@@ -5154,6 +5221,7 @@ def create_app(
     _script_test_lock = threading.Lock()
 
     def _script_tester_active() -> bool:
+        _refresh_role_map()
         return _DISPATCH_ROLE_TO_AGENT.get("tester") == _script_tester.SCRIPT_TESTER
 
     def _run_script_test_task(task: TaskRequest) -> None:
@@ -5335,6 +5403,7 @@ def create_app(
         ``_dispatch_task`` (to actually run it). Both callers resolving via
         the same function means they can never disagree about the target.
         """
+        _refresh_role_map()
         if task.task_type == "discuss":
             ctx = task.context if isinstance(task.context, dict) else {}
             agent = (ctx.get("agent") or "").strip().lower()
@@ -5405,6 +5474,8 @@ def create_app(
         agent, wt = _resolve_dispatch_target(task, role)
         if dispatch_agent is not None:
             agent = dispatch_agent
+        if _refuse_self_review(task, agent):
+            return
         if task.task_type == "test" and agent == _script_tester.SCRIPT_TESTER:
             # #772: before any provider cooldown or spawn — no provider runs here.
             def _locked_script_test() -> None:
@@ -6857,25 +6928,20 @@ def create_app(
 
         # Keep every configured role for an agent; the execution slot still
         # serializes that agent's tasks across those roles.
-        _AGENT_TO_ROLES: dict[str, list[str]] = {}
         _ROLE_PRIORITY = {"implementer": 0, "reviewer": 1, "tester": 2}
-        for _role, _agent in _DISPATCH_ROLE_TO_AGENT.items():
-            _AGENT_TO_ROLES.setdefault(_agent, []).append(_role)
-        for _roles in _AGENT_TO_ROLES.values():
-            _roles.sort(key=lambda r: _ROLE_PRIORITY.get(r, 99))
-
-        # worker 순회 순서 — 역할 우선순위를 따르되 같은 worker 는 한 번만.
-        _workers: list[str] = []
-        for _role, _agent in sorted(
-            _DISPATCH_ROLE_TO_AGENT.items(),
-            key=lambda kv: _ROLE_PRIORITY.get(kv[0], 99),
-        ):
-            if _agent and _agent not in _workers:
-                _workers.append(_agent)
-        # discuss 는 role 매핑에 없는 agent 로도 올 수 있다.
-        _discuss_workers = list(dict.fromkeys(
-            [worker for worker in _workers if worker != _script_tester.SCRIPT_TESTER]
-            + ["claude", "codex", "gemini"]))
+        def _worker_role_map():
+            by_agent: dict[str, list[str]] = {}
+            workers: list[str] = []
+            for role, agent in sorted(_DISPATCH_ROLE_TO_AGENT.items(),
+                                      key=lambda kv: _ROLE_PRIORITY.get(kv[0], 99)):
+                by_agent.setdefault(agent, []).append(role)
+                if agent and agent not in workers:
+                    workers.append(agent)
+            # Discuss can use an agent with no assigned task role.
+            discuss_workers = list(dict.fromkeys(
+                [worker for worker in workers if worker != _script_tester.SCRIPT_TESTER]
+                + ["claude", "codex", "gemini"]))
+            return by_agent, workers, discuss_workers
 
         # ⭐dispatcher 가 **실제로 들고 있는 lease**. orphan 판정의 권위다 —
         #   `in_progress` 인데 여기 없으면 주인이 사라진 task 다(GET /tasks/orphans).
@@ -6888,6 +6954,8 @@ def create_app(
             while True:
                 await asyncio.sleep(interval)
                 try:
+                    _refresh_role_map()
+                    _AGENT_TO_ROLES, _workers, _discuss_workers = _worker_role_map()
                     try:
                         _resume_codex_quota_holds()
                     except Exception:
@@ -6947,14 +7015,14 @@ def create_app(
                             _cloud_implement_outcome = await asyncio.to_thread(
                                 _claude_cloud.dispatch_cloud_for_role, q(),
                                 role="implementer", task_type="implement",
-                                state_path=state_path)
+                                state_path=state_path, review_guard_fn=_refuse_self_review)
                             if _cloud_implement_outcome.dispatched or _worker_roles == ["implementer"]:
                                 continue
                             if "reviewer" in _worker_roles and _claude_cloud.cloud_dispatch_enabled():
                                 await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="reviewer", task_type="review",
-                                    state_path=state_path)
+                                    state_path=state_path, review_guard_fn=_refuse_self_review)
                             continue
                         if (_worker_roles == ["reviewer"] and
                                 worker == _claude_cloud.CLOUD_PROVIDER_NAME and
@@ -6966,7 +7034,7 @@ def create_app(
                                 _cloud_outcome = await asyncio.to_thread(
                                     _claude_cloud.dispatch_cloud_for_role, q(),
                                     role="reviewer", task_type="review",
-                                    state_path=state_path)
+                                    state_path=state_path, review_guard_fn=_refuse_self_review)
                                 _skip = _cloud_outcome.skipped_reason or ""
                                 if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
                                     continue
@@ -7120,6 +7188,8 @@ def create_app(
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
+    app.state.review_implementer_agent = _review_implementer_agent
+    app.state.try_push_next = _try_push_next
     app.state.active_dispatch_processes = _active_dispatch_processes
     # Exposed so a test can assert no kill is left armed after it finishes —
     # and defuse one in teardown if it is.
@@ -7987,6 +8057,7 @@ def create_app(
 
     def _validate_task_admission_request(task: TaskRequest) -> None:
         """Apply the public /tasks guard to an atomically admitted first task."""
+        _refresh_role_map()
         def _agent_can_receive(agent: object) -> bool:
             return (isinstance(agent, str) and
                     (agent in _DISPATCH_ROLE_TO_AGENT.values() or

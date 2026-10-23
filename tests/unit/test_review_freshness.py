@@ -1,5 +1,7 @@
 """Reviewer must be told to read the live PR head, not stale line numbers
 from earlier rounds (Issue #86)."""
+import json
+from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
@@ -54,6 +56,12 @@ def _completed_result(task_id, pr_number=None):
 
 
 def _make_app(tmp_db, push_calls):
+    state_path = Path(tmp_db).with_name("state.json")
+    state_path.write_text(json.dumps({
+        "project": "review-freshness-test",
+        "role_agents": {"implementer": "claude", "reviewer": "codex",
+                        "tester": "gemini"},
+    }))
     panes = {
         "implementer": "%C", "claude": "%C",
         "reviewer": "%X", "codex": "%X",
@@ -65,10 +73,12 @@ def _make_app(tmp_db, push_calls):
 
     return create_app(
         db_path=tmp_db,
+        state_path=str(state_path),
         pane_map=panes,
         port=8200,
         push_fn=push,
         watchdog_disabled=True,
+        identity_required=False,
     )
 
 

@@ -1011,6 +1011,7 @@ def dispatch_cloud_for_role(
     repo: Optional[str] = None, run_fn: Optional[RunFn] = None,
     cli_path: Optional[str] = None,
     state_path: Optional[str] = None,
+    review_guard_fn: Optional[Callable[[TaskRequest, str], bool]] = None,
 ) -> CloudDispatchOutcome:
     """Hand at most one pending task for ``role`` to a Cloud session.
 
@@ -1082,6 +1083,10 @@ def dispatch_cloud_for_role(
                          skip_task_ids=cloud_review_skip_ids(queue) if task_type == "review" else None)
     if task is None:
         return CloudDispatchOutcome(False, skipped_reason="no_task")
+    if task_type == "review" and review_guard_fn is not None:
+        if review_guard_fn(task, CLOUD_PROVIDER_NAME):
+            return CloudDispatchOutcome(False, task_id=task.task_id,
+                                        launch_error="reviewer_matches_implementer")
 
     preflight_repo = _resolve_task_repo(task, repo, state_path)
     preflight_reason = _cloud_preflight_reason(task, preflight_repo)
