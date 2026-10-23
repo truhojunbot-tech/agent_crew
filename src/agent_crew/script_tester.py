@@ -520,11 +520,14 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
     try:
         if not repo:
             raise RuntimeError("no project checkout to run tests from")
-        if pr_number and not (isinstance(ctx.get("repo"), str) and ctx["repo"].strip()):
-            raise RuntimeError("missing context.repo for PR script test")
-        base_branch = (ctx.get("base_branch")
-                       or (pr_base_branch(pr_number, ctx.get("repo") or "") if pr_number else "")
-                       or "main")
+        base_branch = ctx.get("base_branch") or ""
+        if not base_branch and pr_number:
+            from agent_crew.github import get_repo
+            gh_repo = ctx.get("repo") or get_repo(cwd=repo)
+            if not gh_repo:
+                raise RuntimeError("missing context.repo for PR base branch lookup")
+            base_branch = pr_base_branch(pr_number, gh_repo)
+        base_branch = base_branch or "main"
         base_sha, head_sha = resolve_refs(
             repo, base_branch=base_branch, pr_number=pr_number,
             head_sha=ctx.get("reviewed_sha") or ctx.get("expected_head_sha") or "",
