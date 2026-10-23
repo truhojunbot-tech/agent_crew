@@ -3,6 +3,7 @@
 import json
 import os
 import time
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -65,6 +66,36 @@ def test_unchanged_mtime_does_not_reload_role_map(tmp_path, monkeypatch):
     for _ in range(3):
         assert app.state.resolve_dispatch_target(review, "reviewer")[0] == "claude"
     assert reads == []
+
+
+def test_role_map_refresh_never_exposes_empty_worktree(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    _state(state_path, "codex")
+    app = _app(tmp_path, state_path)
+    review = TaskRequest(task_id="review-map-race", task_type="review",
+                         description="review", project="demo")
+    entered = threading.Event()
+    release = threading.Event()
+    original = server._load_worktree_map
+
+    def paused_load(path):
+        entered.set()
+        assert release.wait(3)
+        return original(path)
+
+    monkeypatch.setattr(server, "_load_worktree_map", paused_load)
+    _state(state_path, "claude")
+    worker = threading.Thread(target=app.state.resolve_dispatch_target,
+                              args=(review, "reviewer"))
+    worker.start()
+    assert entered.wait(3)
+    try:
+        assert app.state.resolve_dispatch_target(review, "reviewer") == (
+            "codex", "/wt/codex")
+    finally:
+        release.set()
+        worker.join(3)
+    assert not worker.is_alive()
 
 
 def test_dispatcher_uses_changed_role_on_next_claim(tmp_path, monkeypatch):
@@ -135,3 +166,66 @@ async def test_review_is_refused_when_resolved_reviewer_is_implementer(tmp_path)
     assert result.summary.startswith("reviewer_matches_implementer")
     assert "codex" in result.summary
     assert notices
+
+
+def test_lineage_walk_prefers_nearest_implement_attribution(tmp_path):
+    state_path = tmp_path / "state.json"
+    _state(state_path, "codex")
+    app = _app(tmp_path, state_path)
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    for task_id, task_type, context in (
+        ("impl-root", "implement", {"agent_override": "claude"}),
+        ("review-first", "review", {"prev_task_id": "impl-root"}),
+        ("fix-nearest", "implement", {"prev_task_id": "review-first",
+                                       "agent_override": "claude"}),
+        ("review-final", "review", {"prev_task_id": "fix-nearest",
+                                     "implementer_agent": "claude"}),
+    ):
+        queue.enqueue(TaskRequest(task_id=task_id, task_type=task_type,
+                                  description=task_id, project="demo", context=context))
+    queue.record_attribution("fix-nearest", project="demo", agent="codex",
+                             role="implementer", task_type="implement")
+    final = queue.get_task("review-final")
+    with TestClient(app):
+        assert app.state.review_implementer_agent(final) == "codex"
+
+
+def test_lineage_walk_stops_on_cycle(tmp_path):
+    state_path = tmp_path / "state.json"
+    _state(state_path, "codex")
+    app = _app(tmp_path, state_path)
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="review-cycle-a", task_type="review",
+                              description="a", project="demo",
+                              context={"prev_task_id": "review-cycle-b"}))
+    queue.enqueue(TaskRequest(task_id="review-cycle-b", task_type="review",
+                              description="b", project="demo",
+                              context={"prev_task_id": "review-cycle-a"}))
+    with TestClient(app):
+        assert app.state.review_implementer_agent(queue.get_task("review-cycle-a")) is None
+
+
+def test_tmux_push_refuses_lineage_self_review_before_provider(tmp_path, monkeypatch):
+    state_path = tmp_path / "state.json"
+    _state(state_path, "codex")
+    monkeypatch.setenv("AGENT_CREW_DELIVERY", "push")
+    pushes = []
+    app = _app(tmp_path, state_path,
+               pane_map={"reviewer": "%834", "codex": "%834"},
+               push_fn=lambda *args, **kwargs: pushes.append((args, kwargs)))
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    queue.enqueue(TaskRequest(task_id="fix-tmux", task_type="implement",
+                              description="fix", project="demo",
+                              context={"agent_override": "claude"}))
+    queue.record_attribution("fix-tmux", project="demo", agent="codex",
+                             role="implementer", task_type="implement")
+    queue.enqueue(TaskRequest(task_id="review-tmux", task_type="review",
+                              description="review", project="demo",
+                              context={"prev_task_id": "fix-tmux",
+                                       "implementer_agent": "claude"}))
+    with TestClient(app):
+        app.state.try_push_next("reviewer")
+    result = queue.get_result("review-tmux")
+    assert result.status == "needs_human"
+    assert result.summary.startswith("reviewer_matches_implementer: codex")
+    assert pushes == []

@@ -5196,11 +5196,16 @@ def create_app(
         mapping = _load_role_to_agent(state_path)
         _role_map_cached_stamp = stamp
         if _state_worktree_map and not _WORKTREE_SYNC_DISABLED:
-            worktree_map.clear()
-            worktree_map.update(_load_worktree_map(state_path))
+            refreshed_worktrees = _load_worktree_map(state_path)
+            worktree_map.update(refreshed_worktrees)
+            for role in tuple(worktree_map):
+                if role not in refreshed_worktrees:
+                    worktree_map.pop(role)
         if mapping != _DISPATCH_ROLE_TO_AGENT:
-            _DISPATCH_ROLE_TO_AGENT.clear()
             _DISPATCH_ROLE_TO_AGENT.update(mapping)
+            for role in tuple(_DISPATCH_ROLE_TO_AGENT):
+                if role not in mapping:
+                    _DISPATCH_ROLE_TO_AGENT.pop(role)
         logger.info("dispatcher: state changed; effective role map: %s", mapping)
 
     _DISPATCH_DISCUSS_WORKTREES = _load_discuss_worktrees(state_path)
@@ -7178,6 +7183,8 @@ def create_app(
     # provider/worktree decision the dispatcher will use.
     app.state.resolve_dispatch_target = _resolve_dispatch_target
     app.state.dispatch_task = _dispatch_task
+    app.state.review_implementer_agent = _review_implementer_agent
+    app.state.try_push_next = _try_push_next
     app.state.active_dispatch_processes = _active_dispatch_processes
     # Exposed so a test can assert no kill is left armed after it finishes —
     # and defuse one in teardown if it is.
