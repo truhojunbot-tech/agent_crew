@@ -2524,8 +2524,22 @@ def auto_enqueue_test(
                 ))
             return None
         from agent_crew.github import get_repo
-        _test_repo = repo or (review_ctx.get("repo") or "") or (
+        def lineage_field(field: str) -> str:
+            current = review_task
+            seen: set[str] = set()
+            while current is not None and current.task_id not in seen:
+                seen.add(current.task_id)
+                current_ctx = current.context if isinstance(current.context, dict) else {}
+                value = current_ctx.get(field)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                parent_id = current_ctx.get("prev_task_id")
+                current = tasks_by_id.get(parent_id) if isinstance(parent_id, str) else None
+            return ""
+
+        _test_repo = repo or lineage_field("repo") or (
             get_repo(cwd=repo_cwd) if repo_cwd else "") or ""
+        _test_base_branch = lineage_field("base_branch")
         implementer_agent = review_ctx.get("implementer_agent")
         reviewer_agent = (
             review_ctx.get("agent_override")
@@ -2586,6 +2600,8 @@ def auto_enqueue_test(
             test_context["pr_number"] = pr_number  # #171: propagate for post-test merge
         if _test_repo:
             test_context["repo"] = _test_repo
+        if _test_base_branch:
+            test_context["base_branch"] = _test_base_branch
         if implementer_agent:
             test_context["implementer_agent"] = implementer_agent
         if reviewer_agent:

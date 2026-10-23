@@ -100,7 +100,7 @@ BROKEN_BASE = {"tests/test_a.py": "def test_one():\n    assert True\n",
 def _task(head, **ctx):
     return TaskRequest(task_id="test-review-1", task_type="test", description="Test PR #7",
                        branch="feature", context={"pr_number": PR, "base_branch": "main",
-                                                  "reviewed_sha": head, **ctx})
+                                                  "reviewed_sha": head, "repo": "owner/repo", **ctx})
 
 
 def _execute(repo, head, tmp_path, state=None):
