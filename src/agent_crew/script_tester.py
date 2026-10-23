@@ -308,9 +308,10 @@ def resolve_refs(repo: str, *, base_branch: str, pr_number: Optional[int],
 
 def pr_base_branch(pr_number: int, repo: str = "") -> str:
     """The PR's base branch name via ``gh``; ``""`` when it cannot be read."""
-    cmd = ["gh", "pr", "view", str(pr_number), "--json", "baseRefName", "-q", ".baseRefName"]
-    if repo:
-        cmd += ["--repo", repo]
+    if not repo or not repo.strip():
+        raise RuntimeError("missing context.repo for PR base branch lookup")
+    cmd = ["gh", "pr", "view", str(pr_number), "--json", "baseRefName", "-q", ".baseRefName",
+           "--repo", repo]
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
@@ -519,6 +520,8 @@ def execute_test_task(task, *, repo: str, state: Optional[Mapping], cache_dir: s
     try:
         if not repo:
             raise RuntimeError("no project checkout to run tests from")
+        if pr_number and not (isinstance(ctx.get("repo"), str) and ctx["repo"].strip()):
+            raise RuntimeError("missing context.repo for PR script test")
         base_branch = (ctx.get("base_branch")
                        or (pr_base_branch(pr_number, ctx.get("repo") or "") if pr_number else "")
                        or "main")
