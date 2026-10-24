@@ -37,7 +37,7 @@ def checker(tmp_path, monkeypatch):
 
 def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
                  change_type="create", gate_failure="", status_details=None,
-                 ci_state=None):
+                 ci_state=None, pr_status="open"):
     if not gate_enabled:
         monkeypatch.delenv("AGENT_CREW_CONFORMANCE_GATE_CMD", raising=False)
     db = str(tmp_path / "tasks.db")
@@ -57,7 +57,7 @@ def _submit_test(tmp_path, monkeypatch, *, title, gate_enabled=True,
         description="test", context={"prev_task_id": "review-615",
                                      "pr_number": 615, "repo": "owner/repo"}))
     calls = []
-    monkeypatch.setattr(github, "pr_state", lambda *a, **k: "open")
+    monkeypatch.setattr(github, "pr_state", lambda *a, **k: pr_status)
     monkeypatch.setattr(github, "pr_head_sha", lambda *a, **k: "a" * 40)
     monkeypatch.setattr(github, "independent_review_for_head",
                         lambda *a, **k: ("a" * 40, "claude", "review-615", "ok"))
