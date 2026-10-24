@@ -964,8 +964,9 @@ def _restore_task_wip(queue: TaskQueue, task: TaskRequest, worktree_path: str) -
             source = queue.get_task(source_id)
             source_info = source.error_info if source and isinstance(source.error_info, dict) else {}
             sha = source_info.get("wip_stash")
-            if sha:
+            if sha and source_info.get("wip_restored") != sha:
                 break
+            sha = None
     if not sha:
         return ""
     if info.get("wip_restored") == sha:

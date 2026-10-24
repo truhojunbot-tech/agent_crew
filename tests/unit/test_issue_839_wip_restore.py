@@ -146,6 +146,35 @@ def test_retry_restores_source_task_stash(tmp_path, monkeypatch):
     assert queue.get_task("retry-impl-source-a1").error_info["wip_restored"] == sha
 
 
+def test_retry_does_not_reapply_source_stash_already_restored(tmp_path, monkeypatch):
+    wt = _worktree(tmp_path)
+    sha = _stash(wt, "impl-source")
+    pushes = []
+    app, queue = _dispatch_app(tmp_path, monkeypatch, wt, pushes)
+    queue.enqueue(_task("impl-source"))
+    source = queue.dequeue(role="implementer")
+    queue.annotate_error_info("impl-source", {"wip_stash": sha})
+    server._restore_task_wip(queue, source, str(wt))
+    _git(wt, "add", "app.py", "new_test.py")
+    _git(wt, "commit", "-qm", "saved work")
+    queue.force_fail("impl-source", "agent failed", {
+        "wip_stash": sha, "wip_restored": sha,
+    })
+    queue.enqueue(_task("retry-impl-source-a1", {
+        "prev_task_id": "impl-source", "original_task_id": "impl-source",
+        "retry_attempt": 1,
+    }))
+
+    with TestClient(app):
+        app.state.try_push_next("implementer")
+
+    assert len(pushes) == 1
+    assert queue.get_task("retry-impl-source-a1").status == "in_progress"
+    assert (wt / "app.py").read_text() == "value = 2\n"
+    assert (wt / "new_test.py").exists()
+    assert queue.get_task("retry-impl-source-a1").error_info is None
+
+
 def test_restored_stash_is_not_applied_twice(tmp_path, monkeypatch):
     wt = _worktree(tmp_path)
     sha = _stash(wt, "impl-once")
