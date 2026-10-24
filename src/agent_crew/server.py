@@ -1049,11 +1049,23 @@ def _prepare_worktree_for_task_inner(
     # D-state. This can't fix that specific case (nothing userspace can),
     # but it bounds every OTHER local git op here so one slow/stuck call
     # fails that single task instead of being able to hang indefinitely.
-    _pre_stash = subprocess.run(
-        ["git", "-C", worktree_path, "stash", "push", "-u",
-         "-m", f"agent_crew pre-{task_id[:8]}"],
-        capture_output=True, text=True, timeout=30,
-    )
+    for attempt in range(3):
+        _pre_stash = subprocess.run(
+            ["git", "-C", worktree_path, "stash", "push", "-u",
+             "-m", f"agent_crew pre-{task_id[:8]}"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if _pre_stash.returncode == 0:
+            break
+        stderr = _pre_stash.stderr or ""
+        logger.warning("pre-dispatch stash failed task=%s returncode=%s stderr=%s",
+                       task_id, _pre_stash.returncode, stderr[:500])
+        if attempt == 2 or not re.search(
+            r"Unable to create ['\"].*?\.lock['\"]|cannot lock ref",
+            stderr, re.IGNORECASE,
+        ):
+            break
+        time.sleep((0.5, 1.5)[attempt])
     if _pre_stash.returncode != 0:
         # Some callers use a directory that has not been initialized as a Git
         # worktree yet. Only a real repository can contain work that a later
