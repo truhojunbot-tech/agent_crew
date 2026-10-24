@@ -6153,7 +6153,8 @@ def create_app(
         # ADR-001 live recall is independent of Context Pack. Reuse its scoped
         # storage reader and render keys so the worker can verify each source.
         if memory_enabled():
-            _served = {"authoritative": 0, "failure_pattern": 0}
+            _served = {"authoritative": 0, "failure_pattern": 0,
+                       "authoritative_omitted": 0, "failure_pattern_omitted": 0}
             try:
                 _memory_db = os.path.expanduser(os.getenv(
                     "AGENT_CREW_SHADOW_MEMORY_DB", "").strip())
@@ -6162,7 +6163,8 @@ def create_app(
                     _memory_block, _served = await asyncio.wait_for(
                         asyncio.to_thread(
                             dispatch_memory_block, _storage, role, task.task_id,
-                            MemoryScope(project=_adr001_project(_project))),
+                            MemoryScope(project=_adr001_project(_project)),
+                            local_project=_project),
                         timeout=2.0,
                     )
                     if _served["authoritative"] or _served["failure_pattern"]:

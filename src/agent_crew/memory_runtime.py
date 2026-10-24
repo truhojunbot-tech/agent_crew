@@ -641,12 +641,13 @@ def capture_owner_statement(storage: MemoryStorage, *, project: str,
     return record
 
 
-def effective_owner_statements(storage: MemoryStorage, project: str) -> list[MemoryRecord]:
+def effective_owner_statements(storage: MemoryStorage, project: str, *,
+                               records: Optional[list[MemoryRecord]] = None) -> list[MemoryRecord]:
     """PR #57 correction resolution on records from one scoped memory store."""
-    records = _scoped_owner_records(storage, project)
-    superseded = {link for record in records
+    owners = _scoped_owner_records(storage, project, records=records)
+    superseded = {link for record in owners
                   for link in record.value.get("supersedes", [])}
-    return [r for r in records if r.key not in superseded]
+    return [r for r in owners if r.key not in superseded]
 
 
 def owner_statement_history(storage: MemoryStorage, project: str,
@@ -666,11 +667,13 @@ def owner_statement_history(storage: MemoryStorage, project: str,
     return originals + [r for r in records if r.key in seen and r.key != exact_key]
 
 
-def _scoped_owner_records(storage: MemoryStorage, project: str) -> list[MemoryRecord]:
+def _scoped_owner_records(storage: MemoryStorage, project: str, *,
+                          records: Optional[list[MemoryRecord]] = None) -> list[MemoryRecord]:
     if not project:
         raise ValueError("owner project is required")
     from .memory import same_memory_project
-    records = [r for r in storage.retrieve(MemoryScope(project=project))
+    records = [r for r in (records if records is not None
+                           else storage.retrieve(MemoryScope(project=project)))
                if r.layer == "authoritative" and r.value.get("kind") == "owner_statement"
                and same_memory_project(project, r.scope.project)]
     for record in records:
@@ -787,50 +790,131 @@ def reconstruct_context(storage: MemoryStorage, role: str, task_id: str, scope: 
 
 
 def dispatch_memory_block(storage: MemoryStorage, role: str, task_id: str,
-                          scope: MemoryScope, *, max_chars: int = 32768) -> tuple[str, dict[str, int]]:
-    """Render scoped ADR-001 truth and fleet failures for one live dispatch."""
-    counts = {"authoritative": 0, "failure_pattern": 0}
-    reconstructed = reconstruct_context(storage, role, task_id, scope)
-    if not reconstructed["enabled"]:
+                          scope: MemoryScope, *, max_chars: int = 8900,
+                          local_project: str = "") -> tuple[str, dict[str, int]]:
+    """Render scope-only truth and local/fleet failures within a UTF-8 byte cap.
+
+    ``max_chars`` remains the public argument name for old callers. It now
+    denotes bytes and cannot raise the ADR-001 injection ceiling.
+    """
+    counts = {"authoritative": 0, "failure_pattern": 0,
+              "authoritative_omitted": 0, "failure_pattern_omitted": 0}
+    if not memory_enabled():
         return "", counts
+    own_project = local_project or scope.project
+    # Empty-query retrieval is scope-only. The live dispatch block must not
+    # depend on ranked episodic/decision recall while M3a is unproven.
+    authority_rows = storage.retrieve(scope)
     effective_keys = {record.key for record in effective_owner_statements(
-        storage, scope.project)}
-    authoritative = [record for record in reconstructed["records"]
-                     if record["layer"] == "authoritative"
-                     and record["scope"]["project"] == scope.project
-                     and (record["value"].get("kind") != "owner_statement"
-                          or record["key"] in effective_keys)]
-    patterns = [record for record in storage.retrieve(scope)
-                if record.layer == "failure_pattern" and
-                (record.scope.project == scope.project or
-                 (not record.scope.project and bool(record.scope.fleet)))]
-    fleet = [record for record in patterns if not record.scope.project]
-    local = [record for record in patterns if record.scope.project]
+        storage, scope.project, records=authority_rows)}
+    authoritative_by_key: dict[str, MemoryRecord] = {}
+    for record in authority_rows:
+        if (record.layer != "authoritative" or record.scope.project != scope.project
+                or (record.value.get("kind") == "owner_statement"
+                    and record.key not in effective_keys)):
+            continue
+        prior = authoritative_by_key.get(record.key)
+        if prior is None or _scope_specificity(record.scope) > _scope_specificity(prior.scope):
+            authoritative_by_key[record.key] = record
+    # Under the byte cap, keep the earliest lexical source keys first. The
+    # order is stable across runs and does not depend on task-query ranking.
+    authoritative = sorted(authoritative_by_key.values(), key=lambda record: record.key)
+    pattern_rows = (authority_rows if own_project == scope.project else
+                    storage.retrieve(MemoryScope(fleet=scope.fleet, project=own_project)))
+    patterns_by_key: dict[str, MemoryRecord] = {}
+    for record in pattern_rows:
+        if (record.layer != "failure_pattern" or not
+                (record.scope.project == own_project or
+                 (not record.scope.project and bool(record.scope.fleet)))):
+            continue
+        prior = patterns_by_key.get(record.key)
+        if prior is None or _scope_specificity(record.scope) > _scope_specificity(prior.scope):
+            patterns_by_key[record.key] = record
+    patterns = list(patterns_by_key.values())
+    fleet = sorted((record for record in patterns if not record.scope.project),
+                   key=lambda record: record.key)
+    local = sorted((record for record in patterns if record.scope.project),
+                   key=lambda record: record.key)
     selected = (fleet[:2] + local[:2]) or patterns[:4]
-    lines = ["=== ADR-001 MEMORY (scoped, verify current sources) ==="]
-    # Reserve room for every authoritative key before assigning excerpt space.
-    key_cost = sum(len(record["key"]) + 20 for record in authoritative)
-    excerpt_cap = min(160, max(0, (max_chars - key_cost - 1800) // max(1, len(authoritative))))
-    for record in authoritative:
-        value = record["value"]
-        excerpt = str(value.get("text") or value.get("title") or "")[:excerpt_cap]
-        line = f"authoritative key={record['key']}: {excerpt}"
-        if sum(map(len, lines)) + len(line) > max_chars - 1200:
-            line = f"authoritative key={record['key']}"
-        if sum(map(len, lines)) + len(line) > max_chars - 1200:
-            break
-        lines.append(line)
-        counts["authoritative"] += 1
-    for record in selected:
-        value = record.value
-        excerpt = str(value.get("title") or value.get("pattern") or
-                      value.get("text") or value.get("rule") or "")[:240]
-        line = f"failure_pattern key={record.key}: {excerpt}"
-        if sum(map(len, lines)) + len(line) > max_chars:
-            break
-        lines.append(line)
-        counts["failure_pattern"] += 1
-    lines.append("=== END ADR-001 MEMORY ===")
+    header = "=== ADR-001 MEMORY (scoped, verify current sources) ==="
+    footer = "=== END ADR-001 MEMORY ==="
+    cap = min(8900, max(0, max_chars))
+    used = len((header + "\n" + footer).encode("utf-8"))
+    if used > cap:
+        counts["authoritative_omitted"] = len(authoritative)
+        counts["failure_pattern_omitted"] = len(patterns)
+        return "", counts
+
+    def line_cost(line: str) -> int:
+        return len(("\n" + line).encode("utf-8"))
+
+    # Fleet keys, then local keys, get reserved before authoritative keys so
+    # the alias cannot crowd out local failure patterns. If all keys fit, use
+    # the full budget. Otherwise retry with room for an in-cap omission marker.
+    def choose_keys(marker_cost: int) -> tuple[list[str], list[MemoryRecord],
+                                                list[str], list[MemoryRecord], int]:
+        available = cap - used - marker_cost
+        pattern_keys = [f"failure_pattern key={record.key}" for record in selected]
+        pattern_cost = sum(map(line_cost, pattern_keys))
+        while pattern_keys and pattern_cost > available:
+            pattern_cost -= line_cost(pattern_keys.pop())
+        owner_keys, served_owners = [], []
+        owner_budget = available - pattern_cost
+        for record in authoritative:
+            line = f"authoritative key={record.key}"
+            cost = line_cost(line)
+            if cost > owner_budget:
+                break
+            owner_keys.append(line)
+            served_owners.append(record)
+            owner_budget -= cost
+        return owner_keys, served_owners, pattern_keys, selected[:len(pattern_keys)], owner_budget
+
+    owner_keys, served_owners, pattern_keys, served_patterns, _ = choose_keys(0)
+    if len(served_owners) < len(authoritative) or len(served_patterns) < len(patterns):
+        maximum_marker = (f"omitted authoritative={len(authoritative)} "
+                          f"failure_pattern={len(patterns)}; key_order=lexicographic")
+        owner_keys, served_owners, pattern_keys, served_patterns, _ = choose_keys(
+            line_cost(maximum_marker))
+    counts["authoritative"] = len(served_owners)
+    counts["failure_pattern"] = len(served_patterns)
+    counts["authoritative_omitted"] = len(authoritative) - len(served_owners)
+    counts["failure_pattern_omitted"] = len(patterns) - len(served_patterns)
+    lines = [header, *owner_keys, *pattern_keys]
+    used += sum(map(line_cost, owner_keys)) + sum(map(line_cost, pattern_keys))
+    if counts["authoritative_omitted"] or counts["failure_pattern_omitted"]:
+        marker = (f"omitted authoritative={counts['authoritative_omitted']} "
+                  f"failure_pattern={counts['failure_pattern_omitted']}; "
+                  "key_order=lexicographic")
+        if used + line_cost(marker) > cap:
+            # Caller-supplied tiny budgets may not even fit the omission
+            # marker. Serve no misleading partial block in that case.
+            return "", {"authoritative": 0, "failure_pattern": 0,
+                        "authoritative_omitted": len(authoritative),
+                        "failure_pattern_omitted": len(patterns)}
+        lines.append(marker)
+        used += line_cost(marker)
+
+    # Short excerpts are optional after the source keys and are never allowed
+    # to displace a key. Tiny caller budgets stay key-only.
+    if cap - used >= 1024:
+        for layer, records in (("authoritative", served_owners),
+                               ("failure_pattern", served_patterns)):
+            for record in records:
+                value = record.value
+                excerpt = str(value.get("text") or value.get("title") or
+                              value.get("pattern") or value.get("rule") or "")
+                if not excerpt:
+                    continue
+                prefix = f"{layer} excerpt={record.key}: "
+                room = min(160, cap - used - line_cost(prefix))
+                if room <= 0:
+                    break
+                excerpt = excerpt.encode("utf-8")[:room].decode("utf-8", "ignore")
+                line = prefix + excerpt
+                used += line_cost(line)
+                lines.append(line)
+    lines.append(footer)
     return "\n".join(lines), counts
 
 
