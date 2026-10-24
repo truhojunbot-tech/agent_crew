@@ -942,6 +942,63 @@ def _stash_dirty_worktree(worktree_path: str, task_id: str) -> Optional[str]:
         return None
 
 
+class WipRestoreConflict(RuntimeError):
+    def __init__(self, sha: str, message: str):
+        self.sha = sha
+        super().__init__(message)
+
+
+def _restore_task_wip(queue: TaskQueue, task: TaskRequest, worktree_path: str) -> str:
+    """Restore #482's saved work after preparation, before spending a provider round."""
+    current = queue.get_task(task.task_id) or task
+    info = current.error_info if isinstance(current.error_info, dict) else {}
+    sha = info.get("wip_stash")
+    if not sha and re.fullmatch(r"retry-.+-a\d+", task.task_id):
+        context = current.context if isinstance(current.context, dict) else {}
+        source_ids = (context.get("retry_of"), context.get("prev_task_id"),
+                      context.get("original_task_id"),
+                      re.fullmatch(r"retry-(.+)-a\d+", task.task_id).group(1))
+        for source_id in source_ids:
+            if not isinstance(source_id, str) or source_id == task.task_id:
+                continue
+            source = queue.get_task(source_id)
+            source_info = source.error_info if source and isinstance(source.error_info, dict) else {}
+            sha = source_info.get("wip_stash")
+            if sha and source_info.get("wip_restored") != sha:
+                break
+            sha = None
+    if not sha:
+        return ""
+    if info.get("wip_restored") == sha:
+        return sha
+
+    try:
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+            raise ValueError("invalid stash object id")
+        for args in (("cat-file", "-e", f"{sha}^{{commit}}"),
+                     ("stash", "apply", "--index", sha)):
+            result = subprocess.run(["git", "-C", worktree_path, *args],
+                                    capture_output=True, text=True, timeout=30)
+            if result.returncode != 0:
+                raise RuntimeError(result.stderr.strip() or result.stdout.strip() or
+                                   f"git {args[0]} failed")
+        queue.annotate_error_info(task.task_id, {"wip_restored": sha})
+        task.error_info = {**info, "wip_restored": sha}
+        logger.info("restored WIP stash %s for task=%s in %s", sha, task.task_id, worktree_path)
+        return sha
+    except Exception as exc:
+        for args in (("reset", "--hard", "HEAD"), ("clean", "-fd")):
+            try:
+                cleanup = subprocess.run(["git", "-C", worktree_path, *args],
+                                         capture_output=True, text=True, timeout=30)
+                if cleanup.returncode != 0:
+                    logger.error("WIP restore cleanup failed task=%s: %s", task.task_id,
+                                 cleanup.stderr.strip())
+            except Exception:
+                logger.exception("WIP restore cleanup failed task=%s", task.task_id)
+        raise WipRestoreConflict(str(sha), str(exc)) from exc
+
+
 def _prepare_worktree_for_task_inner(
     worktree_path: str,
     task_id: str,
@@ -4468,10 +4525,18 @@ def create_app(
                         _fail_if_active(task.task_id, "prepared_base_not_recorded",
                                         status="needs_human")
                         return
+                    if _reviewed_sha:
+                        _restore_task_wip(q(), task, wt_path)
                     logger.info(
                         f"_try_push_next: worktree prepared for {role} "
                         f"task_id={task.task_id} branch={task.branch or '(none)'}"
                     )
+                except WipRestoreConflict as exc:
+                    logger.error("_try_push_next: WIP restore failed task_id=%s: %s",
+                                 task.task_id, exc)
+                    _fail_if_active(task.task_id, "wip_restore_conflict",
+                                    details={"wip_stash": exc.sha, "wip_restore_error": str(exc)})
+                    return
                 except WorktreePrepRefused as exc:
                     # ⛔The broad handler below caught this and logged
                     #   "continuing with dispatch", so under
@@ -5803,11 +5868,19 @@ def create_app(
                     _fail_if_active(task.task_id, "prepared_base_not_recorded",
                                     status="needs_human")
                     return
+                if _reviewed_sha:
+                    await asyncio.to_thread(_restore_task_wip, q(), task, wt)
                 logger.info(
                     f"dispatcher: worktree prepared for {role} "
                     f"task_id={task.task_id} branch={task.branch or '(none)'} "
                     f"at {(_reviewed_sha or '?')[:9]}"
                 )
+            except WipRestoreConflict as exc:
+                logger.error("dispatcher: WIP restore failed task_id=%s: %s", task.task_id, exc)
+                _lock_stack.close()
+                _fail_if_active(task.task_id, "wip_restore_conflict",
+                                details={"wip_stash": exc.sha, "wip_restore_error": str(exc)})
+                return
             except WorktreePrepRefused as exc:
                 # ⛔needs_human, not failed and not a retry. A retry would make
                 #   the same `gh` call again; a `failed` routes into the
