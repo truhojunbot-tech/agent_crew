@@ -66,8 +66,8 @@ def test_atomic_first_task_and_existing_bind(tmp_path):
         assert queue.get_task("review-793").context["external_operation_id"] == "directive-1"
 
 
-@pytest.mark.parametrize("status", ["completed", "failed", "cancelled", "timed_out"])
-def test_terminal_task_cannot_bind_unstarted_intent(tmp_path, status):
+@pytest.mark.parametrize("status", ["failed", "cancelled", "timed_out"])
+def test_unsuccessful_task_cannot_bind_unstarted_intent(tmp_path, status):
     db = tmp_path / "tasks.db"
     notices = []
     with TestClient(_app(db, notices)) as client:

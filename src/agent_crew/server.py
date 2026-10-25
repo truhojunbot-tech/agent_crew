@@ -84,7 +84,8 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               PausedError,
                               LateResultRejected,
                               TaskAlreadyExistsError,
-                              TaskQueue, QUEUE_SCHEMA_VERSION, _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
+                              TaskQueue, WorkIntentTargetConflict, QUEUE_SCHEMA_VERSION,
+                              _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
                               validate_http_root_risk,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
                               RequestSqliteTiming, request_sqlite_timing)
@@ -8233,6 +8234,8 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except PausedError as exc:
             raise HTTPException(status_code=423, detail=str(exc)) from exc
+        except WorkIntentTargetConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (ValueError, TypeError, KeyError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
