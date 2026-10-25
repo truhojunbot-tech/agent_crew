@@ -421,13 +421,42 @@ def _required_context_recalled_observation(pack) -> Optional[bool]:
     return True if getattr(pack, "items", ()) else None
 
 
-def _lineage_recall_observation(result, predecessor_task_ids: tuple[str, ...]) -> Optional[bool]:
-    """Shadow memory recalled every predecessor, or there was none to recall."""
+def _lineage_recall_observation(storage, db_path: str, project: str,
+                                predecessor_task_ids: tuple[str, ...]) -> Optional[bool]:
+    """Read predecessor decision keys directly from the project memory store."""
     if not predecessor_task_ids:
         return None
-    result_ids = {item.item_id for item in result.items}
-    return all(f"task:{task_id}:decision" in result_ids
-               for task_id in predecessor_task_ids)
+    if storage is None:
+        return None
+    try:
+        with sqlite3.connect(db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            for task_id in predecessor_task_ids:
+                row = conn.execute(
+                    "SELECT t.context, a.worktree_path, a.provider_session_id, "
+                    "a.context_generation FROM tasks t LEFT JOIN task_attribution a "
+                    "ON a.task_id=t.task_id WHERE t.task_id=? AND t.project=?",
+                    (task_id, project),
+                ).fetchone()
+                context = json.loads(row["context"] or "{}") if row else {}
+                if not isinstance(context, dict):
+                    context = {}
+                scope = MemoryScope(
+                    project=project, task_id=task_id,
+                    issue=str(context.get("issue") or ""),
+                    worktree=str(row["worktree_path"] or "") if row else "",
+                    provider_session=str(row["provider_session_id"] or "") if row else "",
+                    context_generation=row["context_generation"] if row else None,
+                )
+                key = f"task:{task_id}:decision"
+                records = storage.retrieve(scope, exact_key=key)
+                if not any(record.key == key and record.layer == "decision"
+                           and record.scope.project == project for record in records):
+                    return False
+        return True
+    except Exception:
+        logger.exception("dispatcher: exact lineage recall lookup failed for project=%s", project)
+        return None
 
 
 def _resolve_pr_head_branch(pr_number: int, cwd: Optional[str] = None) -> Optional[str]:
@@ -6460,10 +6489,12 @@ def create_app(
                     _shadow_result = shadow_retrieve_bounded(
                         _memory_provider, _memory_request, shadow_memory_timeout_seconds)
                 try:
-                    q().record_required_context_recalled(
-                        task.task_id,
-                        _lineage_recall_observation(_shadow_result, _predecessors),
-                    )
+                    _storage = (_ranked_memory if _ranked_memory is not None else
+                                getattr(_memory_provider, "storage", None))
+                    _recall = await asyncio.to_thread(
+                        _lineage_recall_observation, _storage, db_path, _project,
+                        _predecessors)
+                    q().record_required_context_recalled(task.task_id, _recall)
                 except Exception:
                     logger.exception("dispatcher: lineage recall telemetry failed for %s",
                                      task.task_id)

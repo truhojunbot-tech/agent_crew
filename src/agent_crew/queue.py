@@ -5353,6 +5353,9 @@ class TaskQueue:
                                 "dispatcher_failed" if dispatcher_failed else "result",
                                 posted=True, strict=dispatcher_failed,
                                 status=result.status, outcome=outcome)
+            if task_type == "review" and result.status == "completed":
+                self._record_review_quality_on(conn, task_id, task_context,
+                                               result.verdict, now)
             self._terminalize_work_intent_on(conn, task_id, task_type, result.status, now)
             self._store_task_telemetry(conn, task_id, telemetry, now)
             # #204: completed_at >= started_at is expected to always hold —
@@ -5477,6 +5480,45 @@ class TaskQueue:
             conn.close()
 
     @staticmethod
+    def _record_review_quality_on(conn: sqlite3.Connection, review_id: str,
+                                  context: object, verdict: Optional[str], now: float) -> None:
+        """Attach a committed independent verdict to the directly reviewed task."""
+        if not isinstance(context, dict) or not verdict:
+            return
+        reviewed_id = context.get("prev_task_id")
+        if not isinstance(reviewed_id, str) or not reviewed_id or reviewed_id == review_id:
+            return
+        latest = conn.execute(
+            "SELECT verdict FROM tasks WHERE task_type='review' AND status='completed' "
+            "AND task_id<>? AND CASE WHEN json_valid(context) "
+            "THEN json_extract(context, '$.prev_task_id') END=? "
+            "ORDER BY created_at DESC, task_id DESC LIMIT 1",
+            (reviewed_id, reviewed_id),
+        ).fetchone()
+        if latest is None:
+            return
+        observed = {"approve": True, "approved": True,
+                    "request_changes": False, "changes_requested": False,
+                    "reject": False, "rejected": False}.get(latest["verdict"])
+        row = conn.execute(
+            "SELECT evidence_json FROM tokenomics_shadow_receipts WHERE task_id=?",
+            (reviewed_id,),
+        ).fetchone()
+        if row is None:
+            return
+        try:
+            evidence = json.loads(row["evidence_json"] or "{}")
+        except (TypeError, ValueError):
+            evidence = {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        evidence["independent_review_correct"] = observed
+        conn.execute(
+            "UPDATE tokenomics_shadow_receipts SET evidence_json=?, updated_at=? WHERE task_id=?",
+            (json.dumps(evidence), now, reviewed_id),
+        )
+
+    @staticmethod
     def _refresh_shadow_economics(conn: sqlite3.Connection, task_id: str, now: float,
                                   outcome: Optional[str] = None) -> None:
         economics = conn.execute(
@@ -5499,8 +5541,8 @@ class TaskQueue:
         }
         # quota-core #80 evidence contract: NULL is an observation of unknown,
         # never an inferred false/zero.  `required_context_recalled` is written
-        # only by the Context Pack producer; other quality facts remain NULL
-        # until Agent Crew has a direct observation for them (#342 A).
+        # only by the memory producer; review correctness is preserved from
+        # the reviewed task's receipt after a direct review verdict (#342).
         evidence = {
             "outcome": outcome or (economics["outcome"] if economics is not None and "outcome" in economics.keys() else None),
             "independent_review_correct": None,
@@ -5535,6 +5577,9 @@ class TaskQueue:
             if (isinstance(prior_evidence, dict)
                     and isinstance(prior_evidence.get("canary_history"), list)):
                 envelope["canary_history"] = prior_evidence["canary_history"]
+            if (isinstance(prior_evidence, dict)
+                    and isinstance(prior_evidence.get("independent_review_correct"), bool)):
+                envelope["independent_review_correct"] = prior_evidence["independent_review_correct"]
         conn.execute(
             """UPDATE tokenomics_shadow_receipts
                SET outcome=COALESCE(?, outcome), economics_json=?, evidence_json=?, updated_at=? WHERE task_id=?""",
