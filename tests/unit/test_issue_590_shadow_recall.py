@@ -3,6 +3,8 @@
 import json
 import sqlite3
 
+import pytest
+
 from agent_crew.memory import (FakeMemoryProvider, MemoryItem, MemoryRequest,
                                shadow_retrieve_bounded)
 from agent_crew.memory_capture import (capture_result_best_effort, capture_task_outcome,
@@ -169,6 +171,26 @@ def test_dispatch_persists_shadow_lineage_observation(tmp_path, monkeypatch,
     with sqlite3.connect(case / "tasks.db") as db:
         assert db.execute("SELECT required_context_recalled FROM task_attribution "
                           "WHERE task_id='shadow-322'").fetchone()[0] is None
+
+
+@pytest.mark.parametrize("decision_present, expected", [(True, 1), (False, 0)])
+def test_dispatch_persists_exact_lineage_recall(tmp_path, monkeypatch,
+                                                unused_tcp_port, decision_present,
+                                                expected):
+    import agent_crew.server as server
+
+    monkeypatch.setattr(server, "task_lineage", lambda _db, _task: (("prior",), None))
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    if decision_present:
+        storage.put(MemoryRecord(
+            "decision", "task:prior:decision", {"task_id": "prior"},
+            MemoryScope(project="project-a", task_id="prior")))
+    _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, RuntimeMemoryProvider(storage),
+        unused_tcp_port=unused_tcp_port)
+    with sqlite3.connect(tmp_path / "dispatch" / "tasks.db") as db:
+        assert db.execute("SELECT required_context_recalled FROM task_attribution "
+                          "WHERE task_id='shadow-322'").fetchone()[0] == expected
 
 
 def test_indexed_read_only_shadow_retrieval_during_capture_write(tmp_path):
