@@ -5919,7 +5919,12 @@ class TaskQueue:
 
     def reresolve_tokenomics_shadow_receipts(self, *,
                                             limit: int = TOKENOMICS_SHADOW_SWEEP_LIMIT) -> int:
-        """Bounded catch-up for baseline and verdict-updated shadow receipts."""
+        """Bounded catch-up; oldest last-attempted receipt goes first.
+
+        A pending verdict may wait indefinitely for quota-core. Refreshing it
+        advances updated_at even when the prior decision is kept, so it cannot
+        monopolize the limit and starve baseline settlement.
+        """
         if limit < 1:
             raise ValueError("limit must be positive")
         now = time.time()
@@ -5935,9 +5940,7 @@ class TaskQueue:
                            AND (created_at <= ? OR COALESCE(shadow_contract_sha, '') != ?))
                           OR (evidence_updated_at IS NOT NULL
                               AND evidence_updated_at > COALESCE(shadow_resolved_at, 0)))
-                   ORDER BY CASE WHEN evidence_updated_at IS NOT NULL
-                                      AND evidence_updated_at > COALESCE(shadow_resolved_at, 0)
-                                 THEN 0 ELSE 1 END, created_at, task_id LIMIT ?""",
+                   ORDER BY updated_at, created_at, task_id LIMIT ?""",
                 (now - TOKENOMICS_SHADOW_SETTLE_SECONDS, contract_sha, limit),
             ).fetchall()
         finally:

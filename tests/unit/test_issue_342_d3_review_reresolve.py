@@ -109,7 +109,7 @@ def test_reviewed_refresh_failure_does_not_fail_result(tmp_path, monkeypatch, ca
         "independent_review_correct"] is True
 
 
-def test_bounded_sweep_prioritizes_updated_evidence(tmp_path, monkeypatch):
+def test_bounded_sweep_reaches_updated_evidence(tmp_path, monkeypatch):
     queue, policy = _setup(tmp_path, monkeypatch)
     queue.enqueue(TaskRequest("old-baseline", "test", "older row", branch="agent/d3"))
     with queue._connect() as conn:
@@ -118,5 +118,36 @@ def test_bounded_sweep_prioritizes_updated_evidence(tmp_path, monkeypatch):
     _review(queue, "review-d3", "approve")
     _contract(policy, "fix-d3", "preserving", _after(0))
 
+    # The older baseline may take the first slot; the pending verdict gets
+    # the next slot because the attempted row moves behind it.
+    assert queue.reresolve_tokenomics_shadow_receipts(limit=1) == 1
     assert queue.reresolve_tokenomics_shadow_receipts(limit=1) == 1
     assert queue.get_tokenomics_shadow_receipt("fix-d3")["quality_evidence_state"] == "preserving"
+
+
+def test_pending_evidence_cannot_starve_baseline_settlement(tmp_path, monkeypatch):
+    queue, policy = _setup(tmp_path, monkeypatch)
+    _review(queue, "review-d3", "approve")
+    for index in range(2):
+        queue.enqueue(TaskRequest(f"pending-{index}", "implement", "pending",
+                                  branch="agent/d3"))
+    queue.enqueue(TaskRequest("old-baseline", "test", "old baseline",
+                              branch="agent/d3"))
+    old = time.time() - 7 * 3600
+    with queue._connect() as conn:
+        for index in range(2):
+            conn.execute("UPDATE tokenomics_shadow_receipts SET "
+                         "shadow_decision_source='quota_core_contract', "
+                         "evidence_updated_at=?, shadow_resolved_at=?, updated_at=? "
+                         "WHERE task_id=?", (time.time() - 1, time.time() - 2,
+                                             time.time() - 1, f"pending-{index}"))
+        conn.execute("UPDATE tokenomics_shadow_receipts SET created_at=?, updated_at=? "
+                     "WHERE task_id='old-baseline'", (old, old))
+    # quota-core has not re-emitted a decision after the new verdict.
+    policy.write_text('{"contract_version":"1.0","mode":"shadow","decisions":[]}')
+
+    for _ in range(3):
+        queue.reresolve_tokenomics_shadow_receipts(limit=3)
+
+    assert queue.get_tokenomics_shadow_receipt("old-baseline")[
+        "shadow_reason"] == "UNKNOWN_NOT_IN_CONTRACT"
