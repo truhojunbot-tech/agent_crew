@@ -59,6 +59,63 @@ def test_same_issue_bind_stays_allowed(crew):
     assert queue.get_task("impl-44").context["issue"] == 44
 
 
+@pytest.mark.parametrize("task_tier", [2, 3])
+def test_bind_accepts_task_at_or_below_intent_tier(crew, task_tier):
+    client, queue = crew
+    assert client.post("/work-intents/admit", json=_intent(risk_tier=3)).status_code == 201
+    _task(queue, "impl-44", issue=44, tier=task_tier)
+
+    response = _bind(client, "impl-44")
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "BOUND"
+    assert queue.get_task("impl-44").context["risk_tier"] == task_tier
+
+
+def test_bind_refuses_task_above_intent_tier(crew):
+    client, queue = crew
+    client.post("/work-intents/admit", json=_intent(risk_tier=1))
+    _task(queue, "impl-44", issue=44, tier=2)
+
+    response = _bind(client, "impl-44")
+
+    assert response.status_code == 409
+    assert "risk_tier" in response.json()["detail"]
+    assert queue.get_work_intent(OP_ID)["task_ids"] == []
+
+
+@pytest.mark.parametrize("invalid_tier", [True, 4, "2"])
+def test_bind_refuses_invalid_declared_task_tier(crew, invalid_tier):
+    client, queue = crew
+    client.post("/work-intents/admit", json=_intent(risk_tier=3))
+    _task(queue, "impl-44", issue=44)
+    with sqlite3.connect(queue.db_path) as conn:
+        context = queue.get_task("impl-44").context
+        context["risk_tier"] = invalid_tier
+        conn.execute("UPDATE tasks SET context=? WHERE task_id='impl-44'",
+                     (json.dumps(context),))
+
+    response = _bind(client, "impl-44")
+
+    assert response.status_code == 409
+    assert "risk_tier" in response.json()["detail"]
+    assert queue.get_work_intent(OP_ID)["task_ids"] == []
+
+
+def test_bind_without_declared_tier_inherits_intent_tier(crew):
+    client, queue = crew
+    client.post("/work-intents/admit", json=_intent(risk_tier=3))
+    _task(queue, "impl-44", issue=44)
+    with sqlite3.connect(queue.db_path) as conn:
+        context = queue.get_task("impl-44").context
+        del context["risk_tier"]
+        conn.execute("UPDATE tasks SET context=? WHERE task_id='impl-44'",
+                     (json.dumps(context),))
+
+    assert _bind(client, "impl-44").status_code == 200
+    assert queue.get_task("impl-44").context["risk_tier"] == 3
+
+
 def test_admit_with_task_cannot_declare_target(crew):
     client, queue = crew
     task = {"task_id": "impl-44", "task_type": "implement",
@@ -132,6 +189,34 @@ def test_explicit_target_binds_pending_canonical_task_without_rewriting_it(crew)
     assert queue.get_task("impl-405").context["repo"] == "owner/alfred"
 
 
+def test_explicit_target_bind_accepts_lower_task_tier(crew):
+    client, queue = crew
+    client.post("/work-intents/admit", json=_intent(
+        risk_tier=3, target_repo="owner/alfred", target_issue=405))
+    _task(queue, "impl-405", tier=1)
+
+    response = _bind(client, "impl-405")
+
+    assert response.status_code == 200
+    assert response.json()["state"] == "BOUND"
+    assert queue.get_task("impl-405").context["risk_tier"] == 1
+    assert queue.get_task("impl-405").context["issue"] == 405
+
+
+def test_admit_with_embedded_task_keeps_strict_tier_check(crew):
+    client, queue = crew
+    task = {"task_id": "impl-44", "task_type": "implement",
+            "description": "Thread work", "branch": "agent/44", "project": "alfred",
+            "context": {"issue": 44, "risk_tier": 2, "repo": "owner/alfred"}}
+
+    response = client.post("/work-intents/admit", json=_intent(
+        risk_tier=3, task=task))
+
+    assert response.status_code == 422
+    assert queue.get_work_intent(OP_ID) is None
+    assert queue.get_task("impl-44") is None
+
+
 def test_explicit_target_can_name_a_different_repo(crew):
     client, queue = crew
     client.post("/work-intents/admit", json=_intent(
@@ -187,7 +272,6 @@ def test_blocked_replay_sets_target_once_then_completed_test_reconciles(crew):
     ({}, {}, "issue"),
     ({"target_repo": "owner/alfred", "target_issue": 406}, {}, "issue"),
     ({"target_repo": "owner/other", "target_issue": 405}, {}, "repo"),
-    ({"target_repo": "owner/alfred", "target_issue": 405}, {"tier": 1}, "risk_tier"),
     ({"target_repo": "owner/alfred", "target_issue": 405}, {"project": "other"}, "project"),
     ({"target_repo": "owner/alfred", "target_issue": 405}, {"status": "failed"}, "active"),
     ({"target_repo": "owner/alfred", "target_issue": 405}, {"status": "cancelled"}, "active"),
