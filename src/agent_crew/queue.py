@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 6
+QUEUE_SCHEMA_VERSION = 7
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -658,6 +658,7 @@ CREATE TABLE IF NOT EXISTS tokenomics_shadow_receipts (
     shadow_decision_source TEXT, shadow_policy_version TEXT,
     shadow_recommendation_json TEXT, shadow_contract_sha TEXT,
     shadow_resolved_at REAL, shadow_reason TEXT, evidence_json TEXT,
+    evidence_updated_at REAL,
     created_at REAL NOT NULL, updated_at REAL NOT NULL
 )
 """
@@ -678,6 +679,12 @@ _DDL_MIGRATE_SHADOW_COLUMNS = (
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN quality_veto_reason TEXT",
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN quality_recommendation_json TEXT",
     "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN quality_actual_action TEXT",
+)
+
+# Version 7 adds the timestamp used to revisit verdict-updated receipts.
+# Keep it separate from the pre-existing shadow migrations (schema version 6).
+_DDL_MIGRATE_SHADOW_EVIDENCE_UPDATED_AT = (
+    "ALTER TABLE tokenomics_shadow_receipts ADD COLUMN evidence_updated_at REAL",
 )
 
 #: SEV-0 §11 ONE-TASK tokenomics canary (issue #51).
@@ -1551,7 +1558,8 @@ class TaskQueue:
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
         conn.execute(_DDL_TOKENOMICS_SHADOW)
-        for _stmt in _DDL_MIGRATE_SHADOW_COLUMNS + _DDL_MIGRATE_CANARY_COLUMNS:
+        for _stmt in (_DDL_MIGRATE_SHADOW_COLUMNS + _DDL_MIGRATE_CANARY_COLUMNS
+                      + _DDL_MIGRATE_SHADOW_EVIDENCE_UPDATED_AT):
             try:
                 conn.execute(_stmt)
             except Exception as exc:
@@ -5496,9 +5504,10 @@ class TaskQueue:
                                 "dispatcher_failed" if dispatcher_failed else "result",
                                 posted=True, strict=dispatcher_failed,
                                 status=result.status, outcome=outcome)
+            reviewed_for_refresh = None
             if task_type == "review" and result.status == "completed":
-                self._record_review_quality_on(conn, task_id, task_context,
-                                               result.verdict, now)
+                reviewed_for_refresh = self._record_review_quality_on(
+                    conn, task_id, task_context, result.verdict, now)
             self._terminalize_work_intent_on(conn, task_id, task_type, result.status, now)
             self._store_task_telemetry(conn, task_id, telemetry, now)
             # #204: completed_at >= started_at is expected to always hold —
@@ -5559,6 +5568,12 @@ class TaskQueue:
                 self._refresh_shadow_after_commit(task_id, outcome)
             except Exception:
                 logger.exception("tokenomics completion shadow refresh failed for %s", task_id)
+            if reviewed_for_refresh:
+                try:
+                    self._refresh_shadow_after_commit(reviewed_for_refresh)
+                except Exception:
+                    logger.exception("reviewed task shadow refresh failed for %s",
+                                     reviewed_for_refresh)
             return task_type
         except Exception:
             try:
@@ -5624,7 +5639,7 @@ class TaskQueue:
 
     @staticmethod
     def _record_review_quality_on(conn: sqlite3.Connection, review_id: str,
-                                  context: object, verdict: Optional[str], now: float) -> None:
+                                  context: object, verdict: Optional[str], now: float) -> Optional[str]:
         """Attach a committed independent verdict to the directly reviewed task."""
         if not isinstance(context, dict) or not verdict:
             return
@@ -5657,9 +5672,11 @@ class TaskQueue:
             evidence = {}
         evidence["independent_review_correct"] = observed
         conn.execute(
-            "UPDATE tokenomics_shadow_receipts SET evidence_json=?, updated_at=? WHERE task_id=?",
-            (json.dumps(evidence), now, reviewed_id),
+            "UPDATE tokenomics_shadow_receipts SET evidence_json=?, evidence_updated_at=?, "
+            "updated_at=? WHERE task_id=?",
+            (json.dumps(evidence), now, now, reviewed_id),
         )
+        return reviewed_id
 
     @staticmethod
     def _refresh_shadow_economics(conn: sqlite3.Connection, task_id: str, now: float,
@@ -5829,12 +5846,31 @@ class TaskQueue:
             conn.execute("BEGIN IMMEDIATE")
             self._refresh_shadow_economics(conn, task_id, now, outcome)
             receipt = conn.execute(
-                "SELECT created_at, shadow_decision_source, shadow_reason "
+                "SELECT created_at, shadow_decision_source, shadow_reason, "
+                "evidence_updated_at, shadow_resolved_at "
                 "FROM tokenomics_shadow_receipts WHERE task_id=?", (task_id,)).fetchone()
+            evidence_pending = bool(
+                receipt is not None and receipt["evidence_updated_at"] is not None
+                and receipt["evidence_updated_at"] > (receipt["shadow_resolved_at"] or 0))
             if receipt is None or receipt["shadow_reason"] == "UNKNOWN_NOT_IN_CONTRACT" or (
-                    only_baseline and receipt["shadow_decision_source"] not in (None, "baseline")):
+                    only_baseline and receipt["shadow_decision_source"] not in (None, "baseline")
+                    and not evidence_pending):
                 conn.commit()
                 return
+            if evidence_pending:
+                try:
+                    produced = datetime.fromisoformat(str(produced_at).replace("Z", "+00:00"))
+                    produced_s = produced.timestamp() if produced.tzinfo is not None else None
+                except (TypeError, ValueError, OverflowError, OSError):
+                    produced_s = None
+                if (shadow["decision_source"] != "quota_core_contract"
+                        or produced_s is None
+                        or produced_s < receipt["evidence_updated_at"]):
+                    # Keep the prior decision until quota-core has evaluated
+                    # the new verdict evidence. A missing/old contract cannot
+                    # resolve the pending evidence update.
+                    conn.commit()
+                    return
             if (now - receipt["created_at"] >= TOKENOMICS_SHADOW_SETTLE_SECONDS
                     and receipt["shadow_decision_source"] in (None, "baseline")
                     and shadow.get("reason") in ("task_decision_unavailable",
@@ -5883,7 +5919,7 @@ class TaskQueue:
 
     def reresolve_tokenomics_shadow_receipts(self, *,
                                             limit: int = TOKENOMICS_SHADOW_SWEEP_LIMIT) -> int:
-        """Best-effort bounded catch-up for baseline receipts after contract re-emission."""
+        """Bounded catch-up for baseline and verdict-updated shadow receipts."""
         if limit < 1:
             raise ValueError("limit must be positive")
         now = time.time()
@@ -5894,10 +5930,14 @@ class TaskQueue:
         try:
             rows = conn.execute(
                 """SELECT task_id FROM tokenomics_shadow_receipts
-                   WHERE (shadow_decision_source IS NULL OR shadow_decision_source='baseline')
-                     AND COALESCE(shadow_reason, '') != 'UNKNOWN_NOT_IN_CONTRACT'
-                     AND (created_at <= ? OR COALESCE(shadow_contract_sha, '') != ?)
-                   ORDER BY created_at, task_id LIMIT ?""",
+                   WHERE COALESCE(shadow_reason, '') != 'UNKNOWN_NOT_IN_CONTRACT'
+                     AND (((shadow_decision_source IS NULL OR shadow_decision_source='baseline')
+                           AND (created_at <= ? OR COALESCE(shadow_contract_sha, '') != ?))
+                          OR (evidence_updated_at IS NOT NULL
+                              AND evidence_updated_at > COALESCE(shadow_resolved_at, 0)))
+                   ORDER BY CASE WHEN evidence_updated_at IS NOT NULL
+                                      AND evidence_updated_at > COALESCE(shadow_resolved_at, 0)
+                                 THEN 0 ELSE 1 END, created_at, task_id LIMIT ?""",
                 (now - TOKENOMICS_SHADOW_SETTLE_SECONDS, contract_sha, limit),
             ).fetchall()
         finally:
