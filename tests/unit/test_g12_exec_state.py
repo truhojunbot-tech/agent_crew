@@ -113,9 +113,9 @@ def test_migrated_legacy_rows_keep_working(legacy_db):
     assert task.task_id == "legacy-pending"
     state = q.get_exec_state("legacy-pending")
     assert state["claimed_by_role"] == "tester"
-    # A pre-2c row has no receipt, so the CEA claim gate reports it (shadow mode)
-    # before the claim itself is recorded; both are events on the same task.
-    assert [e["event"] for e in state["events"]] == ["cea_legacy_row", "claimed"]
+    # A pre-2c row has no receipt. Under the default OFF mode (#818), it is
+    # claimed without a cea_legacy_row event; operational shadow is retired.
+    assert [e["event"] for e in state["events"]] == ["claimed"]
 
 
 # ---------------------------------------------------------------------------
