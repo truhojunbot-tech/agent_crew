@@ -1472,6 +1472,11 @@ def task_issue_number(task) -> Optional[int]:
     return issue_from_description(getattr(task, "description", None))
 
 
+def _schema_lock_error(exc: BaseException) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and (
+        "locked" in str(exc).lower() or "busy" in str(exc).lower())
+
+
 class TaskQueue:
     @property
     def db_path(self) -> str:
@@ -1504,19 +1509,44 @@ class TaskQueue:
         # to grant them against the signed snapshot.
         self._runtime_authority = (runtime_authority or _DEFAULT_RUNTIME_AUTHORITY
                                    or RefuseAllLoosening())
-        conn = self._connect()
         if read_only:
-            # Status/reporting must not acquire schema/STOP authority merely
-            # to inspect an already-initialized project database.
+            conn = self._connect()
+            # Status/reporting must not acquire schema/STOP authority.
             conn.close()
             return
+        for attempt in range(5):
+            conn = self._connect()
+            try:
+                # A short busy timeout plus backoff bounds startup lock waits.
+                conn.execute("PRAGMA busy_timeout=3000")
+                self._initialize_schema(conn)
+                conn.commit()
+                break
+            except sqlite3.OperationalError as exc:
+                conn.rollback()
+                if not _schema_lock_error(exc) or attempt == 4:
+                    raise
+                delay = (0.5, 1, 2, 4)[attempt]
+                logger.warning("schema init locked (attempt %s/5): %s; retrying in %ss",
+                               attempt + 1, exc, delay)
+                time.sleep(delay)
+            finally:
+                conn.close()
+        # #314 §1: boot reconciliation. pause.json(외부/부팅 신호)과 runtime_stop(DB 권위)을
+        # 화해시킨다 — 더 높은 epoch가 승자, 같은 epoch인데 상태 불일치면 fail-closed(paused 유지).
+        # restart-while-paused(기존 armed pause.json)가 새 코드에서 첫 요청부터 DB 게이트로 이어진다.
+        self._reconcile_stop_on_boot()
+
+    def _initialize_schema(self, conn: sqlite3.Connection) -> None:
         conn.execute(_DDL)
         conn.execute(_DDL_GATES)
         conn.execute(_DDL_TOKENOMICS_SHADOW)
         for _stmt in _DDL_MIGRATE_SHADOW_COLUMNS + _DDL_MIGRATE_CANARY_COLUMNS:
             try:
                 conn.execute(_stmt)
-            except Exception:
+            except Exception as exc:
+                if _schema_lock_error(exc):
+                    raise
                 pass  # column already exists
         conn.execute(_DDL_ATTRIBUTION)
         conn.execute(_DDL_CHECKPOINTS)
@@ -1531,11 +1561,15 @@ class TaskQueue:
         for _stmt in _DDL_MIGRATE_RUNTIME_STOP_P6:
             try:
                 conn.execute(_stmt)
-            except Exception:
+            except Exception as exc:
+                if _schema_lock_error(exc):
+                    raise
                 pass  # column already exists
         try:
             conn.execute(_DDL_BACKFILL_RUNTIME_STOP_STATE)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass
         conn.execute(_DDL_RUNTIME_STATE_EVENTS)
         conn.execute(_DDL_RUNTIME_STATE_EVENTS_INDEX)
@@ -1550,54 +1584,76 @@ class TaskQueue:
         conn.execute(_DDL_WORK_INTENTS)
         try:
             conn.execute(_DDL_MIGRATE_EXTERNAL_OP_ADMITTED)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         try:
             conn.execute("ALTER TABLE pr_announcements ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''")
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         # Migrate existing DBs: add project column if absent
         try:
             conn.execute(_DDL_MIGRATE_STATUS_CHANGED_AT)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_PROJECT)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_LAST_ACTIVITY)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_PUSH_AT)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_DISPATCH_PANE)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_ERROR_INFO)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         # G12 / D6: execution-state snapshot columns + append-only history.
         for _stmt in _DDL_MIGRATE_EXEC_STATE_COLUMNS:
             try:
                 conn.execute(_stmt)
-            except Exception:
+            except Exception as exc:
+                if _schema_lock_error(exc):
+                    raise
                 pass  # column already exists
         conn.execute(_DDL_TASK_EXEC_EVENTS)
         conn.execute(_DDL_TASK_EXEC_EVENTS_INDEX)
         try:
             conn.execute(_DDL_MIGRATE_CLAIM_SOURCE)
-        except Exception:
+        except Exception as exc:
+            if _schema_lock_error(exc):
+                raise
             pass  # column already exists
         # #202: durable context identity + lineage columns on task_attribution.
         for _stmt in _DDL_MIGRATE_ATTRIBUTION_COLUMNS:
             try:
                 conn.execute(_stmt)
-            except Exception:
+            except Exception as exc:
+                if _schema_lock_error(exc):
+                    raise
                 pass  # column already exists
         # Create indexes for performance
         # #590/#558: the earlier expression index called json_extract on every
@@ -1607,12 +1663,6 @@ class TaskQueue:
         for idx_stmt in _DDL_INDEXES.strip().split('\n'):
             if idx_stmt.strip():
                 conn.execute(idx_stmt)
-        conn.commit()
-        conn.close()
-        # #314 §1: boot reconciliation. pause.json(외부/부팅 신호)과 runtime_stop(DB 권위)을
-        # 화해시킨다 — 더 높은 epoch가 승자, 같은 epoch인데 상태 불일치면 fail-closed(paused 유지).
-        # restart-while-paused(기존 armed pause.json)가 새 코드에서 첫 요청부터 DB 게이트로 이어진다.
-        self._reconcile_stop_on_boot()
 
     def _connect(self) -> sqlite3.Connection:
         # sqlite3's timeout parameter installs a 10,000 ms busy_timeout on
