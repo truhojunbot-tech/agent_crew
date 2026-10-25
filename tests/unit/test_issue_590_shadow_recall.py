@@ -3,6 +3,8 @@
 import json
 import sqlite3
 
+import pytest
+
 from agent_crew.memory import (FakeMemoryProvider, MemoryItem, MemoryRequest,
                                shadow_retrieve_bounded)
 from agent_crew.memory_capture import (capture_result_best_effort, capture_task_outcome,
@@ -50,7 +52,7 @@ def test_fix_retrieves_review_and_implement_predecessors(tmp_path, monkeypatch):
     assert records[0].value["predecessor_task_ids"] == ["impl-root"]
     result = RuntimeMemoryProvider(storage).retrieve(MemoryRequest(
         project="agent_crew", task_id="fix-root", predecessor_task_ids=predecessors))
-    assert _lineage_recall_observation(result, predecessors) is True
+    assert _lineage_recall_observation(storage, db_path, "agent_crew", predecessors) is True
 
 
 def test_same_pr_predecessor_is_required_without_prev_link(tmp_path):
@@ -106,13 +108,16 @@ def test_lineage_read_and_index_migration_tolerate_malformed_context(tmp_path):
 
 def test_keyed_lineage_read_keeps_project_boundary(tmp_path):
     storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    db_path = str(tmp_path / "tasks.db")
+    q = TaskQueue(db_path)
+    q.enqueue(_task("prior"))
     storage.put(MemoryRecord(
         "decision", "task:prior:decision", {"task_id": "prior"},
         MemoryScope(project="other-project", task_id="prior")))
     result = RuntimeMemoryProvider(storage).retrieve(MemoryRequest(
         project="agent_crew", task_id="current", predecessor_task_ids=("prior",)))
     assert result.items == ()
-    assert _lineage_recall_observation(result, ("prior",)) is False
+    assert _lineage_recall_observation(storage, db_path, "agent_crew", ("prior",)) is False
 
 
 def test_shared_store_recalls_same_pr_without_local_task_row(tmp_path):
@@ -132,21 +137,24 @@ def test_shared_store_recalls_same_pr_without_local_task_row(tmp_path):
 def test_required_context_recalled_is_one_zero_or_null(tmp_path):
     q = TaskQueue(str(tmp_path / "tasks.db"))
     q.enqueue(_task("fix-root"))
+    q.enqueue(_task("review-root"))
+    q.enqueue(_task("impl-root"))
     q.record_attribution("fix-root", project="agent_crew")
-    from agent_crew.memory import MemoryItem, MemoryResult
-
-    full = MemoryResult(provider="test", items=(
-        MemoryItem("task:review-root:decision", "agent_crew", "decision", "review"),
-        MemoryItem("task:impl-root:decision", "agent_crew", "decision", "implement"),
-    ))
-    partial = MemoryResult(provider="test", items=full.items[:1])
-    for result, expected in ((full, 1), (partial, 0)):
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    storage.put(MemoryRecord("decision", "task:review-root:decision", {},
+                             MemoryScope(project="agent_crew", task_id="review-root")))
+    for expected in (0, 1):
+        if expected:
+            storage.put(MemoryRecord("decision", "task:impl-root:decision", {},
+                                     MemoryScope(project="agent_crew", task_id="impl-root")))
         q.record_required_context_recalled(
-            "fix-root", _lineage_recall_observation(result, ("review-root", "impl-root")))
+            "fix-root", _lineage_recall_observation(
+                storage, q.db_path, "agent_crew", ("review-root", "impl-root")))
         with sqlite3.connect(q.db_path) as db:
             assert db.execute("SELECT required_context_recalled FROM task_attribution "
                               "WHERE task_id='fix-root'").fetchone()[0] == expected
-    q.record_required_context_recalled("fix-root", _lineage_recall_observation(full, ()))
+    q.record_required_context_recalled(
+        "fix-root", _lineage_recall_observation(storage, q.db_path, "agent_crew", ()))
     with sqlite3.connect(q.db_path) as db:
         assert db.execute("SELECT required_context_recalled FROM task_attribution "
                           "WHERE task_id='fix-root'").fetchone()[0] is None
@@ -162,7 +170,27 @@ def test_dispatch_persists_shadow_lineage_observation(tmp_path, monkeypatch,
     _dispatch_snapshot(case, monkeypatch, provider, unused_tcp_port=unused_tcp_port)
     with sqlite3.connect(case / "tasks.db") as db:
         assert db.execute("SELECT required_context_recalled FROM task_attribution "
-                          "WHERE task_id='shadow-322'").fetchone()[0] == 1
+                          "WHERE task_id='shadow-322'").fetchone()[0] is None
+
+
+@pytest.mark.parametrize("decision_present, expected", [(True, 1), (False, 0)])
+def test_dispatch_persists_exact_lineage_recall(tmp_path, monkeypatch,
+                                                unused_tcp_port, decision_present,
+                                                expected):
+    import agent_crew.server as server
+
+    monkeypatch.setattr(server, "task_lineage", lambda _db, _task: (("prior",), None))
+    storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    if decision_present:
+        storage.put(MemoryRecord(
+            "decision", "task:prior:decision", {"task_id": "prior"},
+            MemoryScope(project="project-a", task_id="prior")))
+    _dispatch_snapshot(
+        tmp_path / "dispatch", monkeypatch, RuntimeMemoryProvider(storage),
+        unused_tcp_port=unused_tcp_port)
+    with sqlite3.connect(tmp_path / "dispatch" / "tasks.db") as db:
+        assert db.execute("SELECT required_context_recalled FROM task_attribution "
+                          "WHERE task_id='shadow-322'").fetchone()[0] == expected
 
 
 def test_indexed_read_only_shadow_retrieval_during_capture_write(tmp_path):
