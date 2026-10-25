@@ -8,6 +8,7 @@ receives one JSON result on stdin after the PR comment is posted.
 
 import argparse
 from contextlib import contextmanager
+from datetime import datetime, timezone
 import fcntl
 import json
 import os
@@ -228,6 +229,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         with single_run_lock(args.lock_file):
+            print(f"premerge gate: run start {datetime.now(timezone.utc).isoformat()}",
+                  flush=True)
             if args.work_dir:
                 Path(args.work_dir).mkdir(parents=True, exist_ok=True)
             try:
@@ -275,7 +278,7 @@ def main(argv=None):
                     checked(["gh", "pr", "comment", str(number), "--repo", REPO,
                              "--body", body], cwd=ROOT)
                     deliver_blackboard(args.blackboard_command, number, body)
-                    print(f"PR #{number}: {summary}; EXIT {exit_code}")
+                    print(f"PR #{number}: {summary}; EXIT {exit_code}", flush=True)
                 except Exception as exc:
                     errors = True
                     print(f"PR #{number}: {exc}", file=sys.stderr)
