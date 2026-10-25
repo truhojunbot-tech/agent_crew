@@ -4123,7 +4123,7 @@ class TaskQueue:
             conn.execute("BEGIN IMMEDIATE")
             task = conn.execute("SELECT context, project, status FROM tasks WHERE task_id=?",
                                 (task_id,)).fetchone()
-            intent = conn.execute("SELECT project, repo, issue, risk_tier FROM work_intents WHERE external_operation_id=?",
+            intent = conn.execute("SELECT project, repo, issue, risk_tier, task_ids FROM work_intents WHERE external_operation_id=?",
                                   (op_id,)).fetchone()
             if task is None or intent is None:
                 raise KeyError("task or work intent not found")
@@ -4134,14 +4134,37 @@ class TaskQueue:
             context = json.loads(task["context"] or "{}")
             if context.get("external_operation_id") not in (None, op_id):
                 raise ValueError("task already bound to another work intent")
-            for key in ("repo", "issue", "risk_tier"):
-                if key in context and context[key] != intent[key]:
+            first_bind = not json.loads(intent["task_ids"])
+            issue, risk_tier = intent["issue"], intent["risk_tier"]
+            if first_bind:
+                if "issue" in context:
+                    value = context["issue"]
+                    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                        raise ValueError("task issue differs from work intent")
+                    issue = value
+                if "risk_tier" in context:
+                    value = context["risk_tier"]
+                    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 3:
+                        raise ValueError("task risk_tier differs from work intent")
+                    risk_tier = value
+            expected_fields = {"repo": intent["repo"], "issue": issue,
+                               "risk_tier": risk_tier}
+            for key, expected in expected_fields.items():
+                if key in context and context[key] != expected:
                     raise ValueError(f"task {key} differs from work intent")
-                context[key] = intent[key]
+                context[key] = expected
             context["external_operation_id"] = op_id
             conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
                          (json.dumps(context), task_id))
-            self._bind_work_intent_on(conn, op_id, task_id, time.time(),
+            now = time.time()
+            if first_bind and (issue != intent["issue"] or risk_tier != intent["risk_tier"]):
+                conn.execute("UPDATE work_intents SET issue=?, risk_tier=? "
+                             "WHERE external_operation_id=?", (issue, risk_tier, op_id))
+                self._append_exec_event_on(
+                    conn, "work-intent:" + op_id, "work_intent_retargeted", now,
+                    from_issue=intent["issue"], to_issue=issue,
+                    from_risk_tier=intent["risk_tier"], to_risk_tier=risk_tier)
+            self._bind_work_intent_on(conn, op_id, task_id, now,
                                       project=task["project"])
             conn.commit()
         except Exception:
