@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 5
+QUEUE_SCHEMA_VERSION = 6
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -1293,6 +1293,8 @@ CREATE TABLE IF NOT EXISTS work_intents (
     project TEXT NOT NULL,
     repo TEXT NOT NULL,
     issue INTEGER,
+    target_repo TEXT,
+    target_issue INTEGER,
     received_at REAL NOT NULL,
     admitted_at REAL NOT NULL,
     task_ids TEXT NOT NULL DEFAULT '[]',
@@ -1311,6 +1313,10 @@ CREATE TABLE IF NOT EXISTS work_intents (
 )
 """
 _DDL_MIGRATE_EXTERNAL_OP_ADMITTED = "ALTER TABLE external_op ADD COLUMN admitted_epoch INTEGER"
+_DDL_MIGRATE_WORK_INTENT_TARGET = (
+    "ALTER TABLE work_intents ADD COLUMN target_repo TEXT",
+    "ALTER TABLE work_intents ADD COLUMN target_issue INTEGER",
+)
 
 # Performance indexes for common queries
 _DDL_INDEXES = """
@@ -1414,6 +1420,10 @@ class DuplicateReviewError(Exception):
 
 class InvalidRiskTierError(ValueError):
     """An HTTP task declared no valid integer tier or mismatched its root."""
+
+
+class WorkIntentTargetConflict(ValueError):
+    """A replay tried to replace a work intent's already recorded target."""
 
 
 def validate_http_root_risk(context: dict | None) -> None:
@@ -1582,6 +1592,13 @@ class TaskQueue:
         conn.execute(_DDL_CASCADE_OUTBOX)
         conn.execute(_DDL_EXTERNAL_OP)
         conn.execute(_DDL_WORK_INTENTS)
+        for _stmt in _DDL_MIGRATE_WORK_INTENT_TARGET:
+            try:
+                conn.execute(_stmt)
+            except Exception as exc:
+                if _schema_lock_error(exc):
+                    raise
+                pass  # column already exists
         try:
             conn.execute(_DDL_MIGRATE_EXTERNAL_OP_ADMITTED)
         except Exception as exc:
@@ -3727,10 +3744,12 @@ class TaskQueue:
                    if blocked else None)
         conn.execute(
             "INSERT INTO work_intents (external_operation_id, project, repo, issue, "
+            "target_repo, target_issue, "
             "received_at, admitted_at, task_ids, coordinator_identity, "
             "coordinator_session, priority, risk_tier, state, blocker, last_progress_at, "
-            "execution_slo_s, next_check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (op_id, intent["project"], intent["repo"], intent.get("issue"), now, now,
+            "execution_slo_s, next_check_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (op_id, intent["project"], intent["repo"], intent.get("issue"),
+             intent.get("target_repo"), intent.get("target_issue"), now, now,
              json.dumps([task_id] if task_id else []), intent["coordinator_identity"],
              intent["coordinator_session"], int(intent["priority"]),
              int(intent["risk_tier"]), "BLOCKED" if blocked else "BOUND" if task_id else "ADMITTED",
@@ -4045,9 +4064,58 @@ class TaskQueue:
     def admit_work_intent(self, intent: dict) -> dict:
         """Deduplicate an external operation; optional first task shares enqueue's txn."""
         op_id = intent["external_operation_id"]
+        has_target_repo = "target_repo" in intent
+        has_target_issue = "target_issue" in intent
+        if (has_target_repo != has_target_issue or
+                (has_target_repo and (
+                    not isinstance(intent["target_repo"], str) or
+                    not intent["target_repo"].strip() or
+                    isinstance(intent["target_issue"], bool) or
+                    not isinstance(intent["target_issue"], int) or
+                    intent["target_issue"] <= 0))):
+            raise ValueError("target_repo and target_issue must be a nonempty repo and positive integer issue")
         existing = self.get_work_intent(op_id)
+        if has_target_repo and intent.get("task") is not None:
+            if existing is not None and existing["task_ids"]:
+                if (existing["target_repo"] is not None
+                        and (existing["target_repo"], existing["target_issue"]) != (
+                            intent["target_repo"], intent["target_issue"])):
+                    raise WorkIntentTargetConflict("work intent target conflicts with existing target")
+                return existing
+            raise ValueError("target requires a task-less work intent")
         if existing is not None:
-            return existing
+            if not has_target_repo:
+                return existing
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT project, repo, issue, coordinator_identity, state, task_ids, "
+                    "target_repo, target_issue FROM work_intents WHERE external_operation_id=?",
+                    (op_id,),
+                ).fetchone()
+                if row["target_repo"] is not None:
+                    if (row["target_repo"], row["target_issue"]) != (
+                            intent["target_repo"], intent["target_issue"]):
+                        raise WorkIntentTargetConflict("work intent target conflicts with existing target")
+                elif (not json.loads(row["task_ids"])
+                      and row["state"] not in ("SUCCESS", "REJECTED", "SUPERSEDED")
+                      and all(intent.get(key) == row[key] for key in (
+                          "project", "repo", "issue", "coordinator_identity"))):
+                    now = time.time()
+                    conn.execute("UPDATE work_intents SET target_repo=?, target_issue=? "
+                                 "WHERE external_operation_id=?",
+                                 (intent["target_repo"], intent["target_issue"], op_id))
+                    self._append_exec_event_on(
+                        conn, "work-intent:" + op_id, "work_intent_target_set", now,
+                        target_repo=intent["target_repo"], target_issue=intent["target_issue"])
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+            return self.get_work_intent(op_id)
         task_data = intent.get("task")
         if task_data is not None:
             task = TaskRequest(**task_data)
@@ -4067,7 +4135,7 @@ class TaskQueue:
                 existing = self.get_work_intent(op_id)
                 if existing is None:
                     raise
-                return existing
+                return self.admit_work_intent(intent)
         else:
             conn = self._connect()
             try:
@@ -4076,6 +4144,9 @@ class TaskQueue:
                 conn.commit()
             except sqlite3.IntegrityError:
                 conn.rollback()
+                if self.get_work_intent(op_id) is None:
+                    raise
+                return self.admit_work_intent(intent)
             finally:
                 conn.close()
         return self.get_work_intent(op_id)
@@ -4121,28 +4192,50 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            task = conn.execute("SELECT context, project, status FROM tasks WHERE task_id=?",
+            task = conn.execute("SELECT context, project, status, task_type FROM tasks WHERE task_id=?",
                                 (task_id,)).fetchone()
-            intent = conn.execute("SELECT project, repo, issue, risk_tier FROM work_intents WHERE external_operation_id=?",
+            intent = conn.execute("SELECT project, repo, issue, risk_tier, target_repo, "
+                                  "target_issue FROM work_intents WHERE external_operation_id=?",
                                   (op_id,)).fetchone()
             if task is None or intent is None:
                 raise KeyError("task or work intent not found")
-            if task["status"] not in ("pending", "in_progress"):
-                raise ValueError(f"task is not active: {task['status']}")
             if task["project"] != intent["project"]:
                 raise ValueError("task project differs from work intent")
             context = json.loads(task["context"] or "{}")
             if context.get("external_operation_id") not in (None, op_id):
                 raise ValueError("task already bound to another work intent")
-            for key in ("repo", "issue", "risk_tier"):
-                if key in context and context[key] != intent[key]:
-                    raise ValueError(f"task {key} differs from work intent")
-                context[key] = intent[key]
+            issue = context.get("issue", intent["issue"])
+            repo = context.get("repo", intent["repo"])
+            same_issue = issue == intent["issue"] and repo == intent["repo"]
+            target = (intent["target_repo"] is not None
+                      and context.get("repo") == intent["target_repo"]
+                      and context.get("issue") == intent["target_issue"]
+                      and isinstance(context.get("issue"), int)
+                      and not isinstance(context.get("issue"), bool))
+            if not same_issue and not target:
+                if (intent["target_repo"] is not None
+                        and issue == intent["target_issue"]
+                        and repo != intent["target_repo"]):
+                    raise ValueError("task repo differs from work intent")
+                if repo != intent["repo"] and repo != intent["target_repo"]:
+                    raise ValueError("task repo differs from work intent")
+                raise ValueError("task issue differs from work intent")
+            if "risk_tier" in context and context["risk_tier"] != intent["risk_tier"]:
+                raise ValueError("task risk_tier differs from work intent")
+            if task["status"] not in ("pending", "in_progress", "completed"):
+                raise ValueError(f"task is not active: {task['status']}")
+            context["repo"] = repo
+            context["issue"] = issue
+            context["risk_tier"] = intent["risk_tier"]
             context["external_operation_id"] = op_id
             conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
                          (json.dumps(context), task_id))
-            self._bind_work_intent_on(conn, op_id, task_id, time.time(),
+            now = time.time()
+            self._bind_work_intent_on(conn, op_id, task_id, now,
                                       project=task["project"])
+            if task["status"] == "completed":
+                self._terminalize_work_intent_on(
+                    conn, task_id, task["task_type"], task["status"], now)
             conn.commit()
         except Exception:
             conn.rollback()
