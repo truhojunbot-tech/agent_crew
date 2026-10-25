@@ -1,5 +1,7 @@
 """#831: the premerge cron prepares its scratch dir and tolerates GitHub outages."""
 
+from datetime import datetime, timezone
+
 import pytest
 
 from scripts import premerge_gate as gate
@@ -74,3 +76,38 @@ def test_network_skip_message_is_one_line(tmp_path, monkeypatch, capsys):
     assert capsys.readouterr().err.splitlines() == [
         "premerge gate: skipped run, GitHub unreachable: TLS handshake timeout retry later",
     ]
+
+
+def test_run_start_is_printed_only_after_lock_acquisition(tmp_path, monkeypatch, capsys):
+    lock = tmp_path / "gate.lock"
+    monkeypatch.setattr(gate, "_api_list", lambda _endpoint: [])
+
+    assert gate.main(["--lock-file", str(lock)]) == 0
+    output = capsys.readouterr()
+    assert output.err == ""
+    assert len(output.out.splitlines()) == 1
+    prefix = "premerge gate: run start "
+    assert output.out.startswith(prefix)
+    assert datetime.fromisoformat(output.out[len(prefix):].strip()).tzinfo == timezone.utc
+
+    with gate.single_run_lock(lock):
+        assert gate.main(["--lock-file", str(lock)]) == 0
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "premerge gate already running" in output.err
+
+
+def test_per_pr_result_print_is_flushed(tmp_path, monkeypatch):
+    monkeypatch.setattr(gate, "_api_list", lambda endpoint:
+                        [_pr()] if "/pulls?" in endpoint else _approval())
+    monkeypatch.setattr(gate, "checked", lambda args, **_kwargs:
+                        MAIN if args == ["git", "rev-parse", "origin/main"] else
+                        HEAD if args == ["git", "rev-parse", "FETCH_HEAD"] else "")
+    monkeypatch.setattr(gate, "test_pr", lambda *_args: ("1 passed", 0))
+    printed = []
+    monkeypatch.setattr(gate, "print", lambda message, **kwargs:
+                        printed.append((message, kwargs)), raising=False)
+
+    assert gate.main(["--lock-file", str(tmp_path / "gate.lock")]) == 0
+    assert any(message.startswith("PR #831: 1 passed") and kwargs.get("flush") is True
+               for message, kwargs in printed)
