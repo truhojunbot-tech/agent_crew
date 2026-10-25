@@ -339,7 +339,7 @@ def _swap_fixture(tmp_path, monkeypatch, *, db_outside=False):
     (directory / 'pause.json').write_text('{"paused": true}')
     (directory / 'cea.env').write_text('AGENT_CREW_CEA_MODE=shadow\n')
     monkeypatch.setattr(swap, 'prepare_checkout', lambda *args: None)
-    monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}} if path == '/health' else [])
+    monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}, 'project': 'demo'} if path == '/health' else [])
     monkeypatch.setattr(swap, 'listener_pid', lambda port: __import__('os').getpid())
     return swap, directory, db
 
@@ -397,7 +397,7 @@ def test_post_hidden_pid_refuses_wrong_or_unreachable_health(tmp_path, monkeypat
 
     monkeypatch.setattr(swap, 'api',
                         lambda port, path, project: (_ for _ in ()).throw(OSError('health down')))
-    with pytest.raises(OSError, match='health down'):
+    with pytest.raises(RuntimeError, match='post refused: health unavailable: health down'):
         swap.main(['demo', 'a' * 40, 'post'])
 
 
@@ -560,28 +560,42 @@ def test_broker_probe_refuses_missing_socket(tmp_path):
         spawn.probe_broker(env_file, cea_file, tmp_path)
 
 
-def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch):
+def test_go_mocked_relaunch_requires_new_build(tmp_path, monkeypatch, capsys):
     swap, directory, _ = _swap_fixture(tmp_path, monkeypatch)
     evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
     evidence.mkdir(parents=True)
     (evidence / 'preflight.json').write_text(json.dumps({'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': __import__('os').getpid()}))
-    (evidence / 'env.pre.nul').write_bytes(b'X=Y\0')
+    old_src = tmp_path / 'old' / 'src'
+    (old_src / 'agent_crew').mkdir(parents=True)
+    (evidence / 'env.pre.nul').write_bytes(f'PYTHONPATH={old_src}\0'.encode())
     (evidence / 'cwd.pre').write_text(str(tmp_path))
+    swap.write_json(evidence / 'health.pre.json', {'build': {'commit': 'b' * 40}})
     killed = []
     monkeypatch.setattr(swap.os, 'kill', lambda pid, sig: killed.append((pid, sig)))
     calls = iter([__import__('os').getpid(), None])
     def listener(port):
-        value = next(calls)
+        value = next(calls, None)
         if value is None:
             raise RuntimeError('no listener')
         return value
     monkeypatch.setattr(swap, 'listener_pid', listener)
     monkeypatch.setattr(swap.time, 'sleep', lambda _: None)
-    monkeypatch.setattr(swap.subprocess, 'run', lambda *args, **kwargs: None)
-    monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}} if path == '/health' else [])
+    spawns = []
+    def run(command, **_kwargs):
+        if '--probe-broker' in command:
+            return None
+        spawns.append(command)
+        return type('Result', (), {'stdout': f'{43209 + len(spawns)}\n'})()
+    monkeypatch.setattr(swap.subprocess, 'run', run)
+    monkeypatch.setattr(swap, 'process_alive', lambda candidate: not any(
+        candidate == signalled and sig == swap.signal.SIGTERM for signalled, sig in killed))
+    monkeypatch.setattr(swap, 'api', lambda port, path, project: {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'} if path == '/health' else [])
     with pytest.raises(RuntimeError, match='build SHA differs'):
         swap.main(['demo', 'a' * 40, 'go'])
-    assert len(killed) == 1
+    assert len(killed) >= 1
+    assert len(spawns) == 2
+    assert spawns[1][-1] == str(old_src)
+    assert 'ROLLBACK_OK served_sha=' in capsys.readouterr().out
     assert (evidence / 'tasks.db.pre').exists()
     assert json.loads((evidence / 'pending.pre.json').read_text()) == []
     assert not json.loads((directory / 'state.json').read_text()).get('cea_env_expected')
@@ -605,12 +619,15 @@ def test_swap_cea_launch_makes_dead_server_recovery_require_cea(tmp_path, monkey
     (evidence / 'preflight.json').write_text(json.dumps({
         'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid(),
     }))
-    (evidence / 'env.pre.nul').write_bytes(b'X=Y\0')
+    old_src = tmp_path / 'old' / 'src'
+    (old_src / 'agent_crew').mkdir(parents=True)
+    (evidence / 'env.pre.nul').write_bytes(f'PYTHONPATH={old_src}\0'.encode())
     (evidence / 'cwd.pre').write_text(str(tmp_path))
+    swap.write_json(evidence / 'health.pre.json', {'build': {'commit': 'a' * 40}})
     listener_calls = iter([os.getpid(), None])
 
     def listener(_port):
-        pid = next(listener_calls)
+        pid = next(listener_calls, None)
         if pid is None:
             raise RuntimeError('no listener')
         return pid
@@ -618,7 +635,8 @@ def test_swap_cea_launch_makes_dead_server_recovery_require_cea(tmp_path, monkey
     monkeypatch.setattr(swap, 'listener_pid', listener)
     monkeypatch.setattr(swap.os, 'kill', lambda *_args: None)
     monkeypatch.setattr(swap.time, 'sleep', lambda _seconds: None)
-    monkeypatch.setattr(swap.subprocess, 'run', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(swap.subprocess, 'run', lambda *_args, **_kwargs: type('Result', (), {'stdout': '43210\n'})())
+    monkeypatch.setattr(swap, 'process_alive', lambda _pid: True)
     assert swap.main(['demo', 'a' * 40, 'go']) == 0
     assert json.loads(state_path.read_text())['cea_env_expected'] is True
 
@@ -649,3 +667,98 @@ def test_go_broker_probe_failure_keeps_old_server(tmp_path, monkeypatch):
     with pytest.raises(subprocess.CalledProcessError):
         swap.main(['demo', 'a' * 40, 'go'])
     assert killed == []
+
+
+def _ready_go(tmp_path, monkeypatch):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    evidence = tmp_path / '.sev0-evidence' / 'crew-swap-demo-aaaaaaa'
+    evidence.mkdir(parents=True)
+    old_src = tmp_path / 'old' / 'src'
+    (old_src / 'agent_crew').mkdir(parents=True)
+    (evidence / 'preflight.json').write_text(json.dumps({
+        'sha': 'a' * 40, 'project': 'demo', 'port': 8765, 'pid': os.getpid()}))
+    raw = f'PYTHONPATH={old_src}:/other\0X=Y\0'.encode()
+    (evidence / 'env.pre.nul').write_bytes(raw)
+    (evidence / 'cwd.pre').write_text(str(tmp_path))
+    swap.write_json(evidence / 'health.pre.json',
+                    {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'})
+    calls = iter([os.getpid(), None])
+    def listener(_port):
+        value = next(calls, None)
+        if value is None:
+            raise RuntimeError('no listener')
+        return value
+    monkeypatch.setattr(swap, 'listener_pid', listener)
+    monkeypatch.setattr(swap.os, 'kill', lambda *_args: None)
+    return swap, evidence, old_src, raw
+
+
+def test_go_waits_past_sixty_seconds_for_live_startup(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    swap, evidence, _, _ = _ready_go(tmp_path, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(swap.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(swap.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setattr(swap, 'process_alive', lambda _pid: True, raising=False)
+    monkeypatch.setattr(swap.subprocess, 'run', lambda *_args, **_kwargs: SimpleNamespace(stdout='43210\n'))
+    def health(_port, path, _project):
+        if path == '/tasks':
+            return []
+        if clock[0] > 60:
+            return {'stop': {'paused': True}, 'build': {'commit': 'a' * 40}, 'project': 'demo'}
+        if clock[0] == 0:
+            return {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'}
+        raise OSError('starting')
+    monkeypatch.setattr(swap, 'api', health)
+    assert swap.main(['demo', 'a' * 40, 'go']) == 0
+    assert clock[0] > 60
+    assert 'STARTING' in capsys.readouterr().out
+    assert not (evidence / 'env.pre.nul').exists()
+    assert (evidence / 'env.pre.sha256').exists()
+
+
+@pytest.mark.parametrize('failure', ['dead', 'budget'])
+def test_go_failure_rolls_back_previous_source_and_scrubs_env(tmp_path, monkeypatch, failure, capsys):
+    from types import SimpleNamespace
+    import hashlib
+    swap, evidence, old_src, raw = _ready_go(tmp_path, monkeypatch)
+    clock = [0.0]
+    monkeypatch.setattr(swap.time, 'monotonic', lambda: clock[0])
+    monkeypatch.setattr(swap.time, 'sleep', lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+    monkeypatch.setenv('AGENT_CREW_SWAP_STARTUP_BUDGET_SECONDS', '2')
+    spawns = []
+    def run(command, **kwargs):
+        if '--probe-broker' in command:
+            return SimpleNamespace(stdout='')
+        spawns.append(command)
+        return SimpleNamespace(stdout=f'{43210 + len(spawns)}\n')
+    monkeypatch.setattr(swap.subprocess, 'run', run)
+    stopped = []
+    monkeypatch.setattr(swap.os, 'kill', lambda pid, sig: stopped.append((pid, sig)))
+    monkeypatch.setattr(swap, 'process_alive',
+                        lambda pid: pid != 43211 if failure == 'dead' else not any(
+                            item == (pid, swap.signal.SIGTERM) for item in stopped), raising=False)
+    def health(_port, path, _project):
+        if path == '/tasks':
+            return []
+        if not spawns:
+            return {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'}
+        if len(spawns) == 2:
+            return {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'}
+        raise OSError('starting')
+    monkeypatch.setattr(swap, 'api', health)
+    with pytest.raises(RuntimeError, match='died|budget'):
+        swap.main(['demo', 'a' * 40, 'go'])
+    assert len(spawns) == 2
+    assert spawns[1][-1] == str(old_src)
+    assert 'ROLLBACK_OK' in capsys.readouterr().out
+    assert not (evidence / 'env.pre.nul').exists()
+    assert (evidence / 'env.pre.sha256').read_text().strip() == hashlib.sha256(raw).hexdigest()
+
+
+def test_post_unhealthy_refuses_before_db_counts(tmp_path, monkeypatch):
+    swap, _, _ = _swap_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(swap, 'api', lambda *_args: (_ for _ in ()).throw(OSError('unreachable')))
+    monkeypatch.setattr(swap, 'counts', lambda *_args: pytest.fail('opened DB counts'))
+    with pytest.raises(RuntimeError, match='post refused.*health unavailable'):
+        swap.main(['demo', 'a' * 40, 'post'])

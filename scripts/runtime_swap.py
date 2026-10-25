@@ -150,6 +150,99 @@ def write_json(path: Path, value) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
+def process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def startup_budget_seconds() -> float:
+    budget = float(os.environ.get("AGENT_CREW_SWAP_STARTUP_BUDGET_SECONDS", "900"))
+    if not 0 < budget <= 86400:
+        raise ValueError("AGENT_CREW_SWAP_STARTUP_BUDGET_SECONDS must be positive and at most 86400")
+    return budget
+
+
+def wait_for_health(port: int, project: str, expected_sha: str, pid: int,
+                    budget: float) -> dict:
+    started = time.monotonic()
+    next_notice = started + 30
+    while True:
+        if not process_alive(pid):
+            raise RuntimeError(f"new process {pid} died before health")
+        try:
+            health = api(port, "/health", project)
+        except (OSError, ValueError):
+            health = None
+        if health is not None:
+            if health.get("project") != project:
+                raise RuntimeError(f"relaunch project differs: {health.get('project')} != {project}")
+            served_sha = health.get("build", {}).get("commit")
+            if served_sha != expected_sha:
+                raise RuntimeError(f"relaunch build SHA differs: {served_sha} != {expected_sha}")
+            return health
+        now = time.monotonic()
+        if now - started >= budget:
+            raise RuntimeError(f"startup budget expired after {budget:g}s")
+        if now >= next_notice:
+            print(f"STARTING pid={pid} elapsed={now - started:.0f}s", flush=True)
+            next_notice = now + 30
+        time.sleep(min(1, budget - (now - started)))
+
+
+def spawn_runtime(env_dump: Path, cea_file: Path, log: Path, port: int,
+                  source: Path, cwd: str) -> int:
+    command = [sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"),
+               str(env_dump), str(cea_file), str(log), str(port), str(source)]
+    result = subprocess.run(command, cwd=cwd, check=True, capture_output=True, text=True)
+    try:
+        pid = int(result.stdout.strip())
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError("spawn did not report a process PID") from exc
+    if pid <= 0:
+        raise RuntimeError("spawn reported an invalid process PID")
+    return pid
+
+
+def stop_spawned_runtime(pid: int, port: int) -> None:
+    # A broker-group launch may leave an sg wrapper between the reported PID
+    # and the actual listener. Stop the listener as well before rollback binds.
+    try:
+        listening_pid = listener_pid(port)
+    except RuntimeError:
+        listening_pid = None
+    if listening_pid is not None and listening_pid != pid:
+        os.kill(listening_pid, signal.SIGTERM)
+    if process_alive(pid):
+        os.kill(pid, signal.SIGTERM)
+    for _ in range(30):
+        try:
+            listener_pid(port)
+        except RuntimeError:
+            return
+        time.sleep(1)
+    raise RuntimeError("new listener still active after SIGTERM; no SIGKILL issued")
+
+
+def previous_source(env_dump: Path, new_source: Path) -> Path:
+    from scripts.spawn_from_env import parse_env
+    path = parse_env(complete_environ(env_dump.read_bytes())).get("PYTHONPATH", "")
+    for entry in path.split(":"):
+        source = Path(entry)
+        if entry and source != new_source and (source / "agent_crew").is_dir():
+            return source
+    raise RuntimeError("captured PYTHONPATH has no previous runtime src")
+
+
+def scrub_captured_env(evidence: Path) -> None:
+    env_dump = evidence / "env.pre.nul"
+    if env_dump.exists():
+        (evidence / "env.pre.sha256").write_text(hashlib.sha256(env_dump.read_bytes()).hexdigest() + "\n")
+        env_dump.unlink()
+
+
 def mark_cea_expected(state_path: Path) -> None:
     """Keep recover's CEA requirement after the swap listener exits."""
     state = json.loads(state_path.read_text())
@@ -189,7 +282,12 @@ def main(argv=None) -> int:
         enter_client_group(cea_env.get("AGENT_CREW_CEA_BROKER_SOCKET", ""),
                            list(sys.argv[1:] if argv is None else argv), cea_file)
     prepare_checkout(checkout, args.sha)
-    health = api(port, "/health", args.project)
+    try:
+        health = api(port, "/health", args.project)
+    except (OSError, ValueError) as exc:
+        if args.step == "post":
+            raise RuntimeError(f"post refused: health unavailable: {exc}") from exc
+        raise
     paused(db_path, health)
     require_no_running_work(api(port, "/tasks", args.project))
     try:
@@ -244,6 +342,12 @@ def main(argv=None) -> int:
             shutil.copy2(directory / "pause.json", evidence / "pause.json.pre")
         write_json(evidence / "counts.pre.json", counts(db_path))
         write_json(evidence / "pending.pre.json", pending_task_ids(db_path))
+        log = evidence / "server.log"
+        env_dump = evidence / "env.pre.nul"
+        cwd = (evidence / "cwd.pre").read_text()
+        previous_sha = json.loads((evidence / "health.pre.json").read_text())["build"]["commit"]
+        old_source = previous_source(env_dump, checkout / "src")
+        budget = startup_budget_seconds()
         os.kill(pid, signal.SIGTERM)
         for _ in range(30):
             time.sleep(1)
@@ -253,26 +357,32 @@ def main(argv=None) -> int:
                 break
         else:
             raise RuntimeError("listener still active after SIGTERM; no SIGKILL issued")
-        log = evidence / "server.log"
-        command = [sys.executable, str(SCRIPT_DIR / "spawn_from_env.py"),
-                   str(evidence / "env.pre.nul"), str(cea_file), str(log), str(port),
-                   str(checkout / "src")]
-        subprocess.run(command, cwd=(evidence / "cwd.pre").read_text(), check=True)
-        for _ in range(40):
-            time.sleep(1)
+        new_pid = None
+        try:
+            new_pid = spawn_runtime(env_dump, cea_file, log, port, checkout / "src", cwd)
+            after = wait_for_health(port, args.project, args.sha, new_pid, budget)
+            paused(db_path, after)
+            write_json(evidence / "health.post.json", after)
+            if any(key.startswith("AGENT_CREW_CEA_") for key in cea_env):
+                mark_cea_expected(state_path)
+        except Exception:
             try:
-                after = api(port, "/health", args.project)
-                break
-            except Exception:
-                continue
-        else:
-            raise RuntimeError(f"health unavailable after relaunch; see {log}")
-        paused(db_path, after)
-        if after.get("build", {}).get("commit") != args.sha:
-            raise RuntimeError(f"relaunch build SHA differs: {after.get('build', {}).get('commit')} != {args.sha}")
-        write_json(evidence / "health.post.json", after)
-        if any(key.startswith("AGENT_CREW_CEA_") for key in cea_env):
-            mark_cea_expected(state_path)
+                if new_pid is not None:
+                    stop_spawned_runtime(new_pid, port)
+                rollback_pid = spawn_runtime(env_dump, cea_file, log, port, old_source, cwd)
+                restored = wait_for_health(port, args.project, previous_sha, rollback_pid, budget)
+                paused(db_path, restored)
+                print(f"ROLLBACK_OK served_sha={restored['build']['commit']}", flush=True)
+            except Exception as rollback_error:
+                try:
+                    served_sha = api(port, "/health", args.project).get("build", {}).get("commit")
+                except Exception:
+                    served_sha = None
+                print(f"ROLLBACK_FAILED served_sha={served_sha or 'unknown'} error={rollback_error}", flush=True)
+            finally:
+                scrub_captured_env(evidence)
+            raise
+        scrub_captured_env(evidence)
         print(f"GO_DONE evidence={evidence}; run post")
         return 0
     # post: all evidence gates are mandatory and failures are explicit.
@@ -289,10 +399,7 @@ def main(argv=None) -> int:
     write_json(evidence / "health.post.json", health)
     # The captured environment can carry provider tokens. It is needed only
     # until a verified post; retain its digest, not its secret contents.
-    env_dump = evidence / "env.pre.nul"
-    if env_dump.exists():
-        (evidence / "env.pre.sha256").write_text(hashlib.sha256(env_dump.read_bytes()).hexdigest() + "\n")
-        env_dump.unlink()
+    scrub_captured_env(evidence)
     print(f"POST_OK evidence={evidence}")
     return 0
 
