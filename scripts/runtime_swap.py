@@ -372,6 +372,7 @@ def main(argv=None) -> int:
                 rollback_pid = spawn_runtime(env_dump, cea_file, log, port, old_source, cwd)
                 restored = wait_for_health(port, args.project, previous_sha, rollback_pid, budget)
                 paused(db_path, restored)
+                scrub_captured_env(evidence)
                 print(f"ROLLBACK_OK served_sha={restored['build']['commit']}", flush=True)
             except Exception as rollback_error:
                 try:
@@ -379,8 +380,6 @@ def main(argv=None) -> int:
                 except Exception:
                     served_sha = None
                 print(f"ROLLBACK_FAILED served_sha={served_sha or 'unknown'} error={rollback_error}", flush=True)
-            finally:
-                scrub_captured_env(evidence)
             raise
         scrub_captured_env(evidence)
         print(f"GO_DONE evidence={evidence}; run post")

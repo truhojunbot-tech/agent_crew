@@ -762,3 +762,30 @@ def test_post_unhealthy_refuses_before_db_counts(tmp_path, monkeypatch):
     monkeypatch.setattr(swap, 'counts', lambda *_args: pytest.fail('opened DB counts'))
     with pytest.raises(RuntimeError, match='post refused.*health unavailable'):
         swap.main(['demo', 'a' * 40, 'post'])
+
+
+def test_failed_rollback_retains_captured_env_for_manual_recovery(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    swap, evidence, old_src, raw = _ready_go(tmp_path, monkeypatch)
+    spawns = []
+    def run(command, **_kwargs):
+        if '--probe-broker' in command:
+            return SimpleNamespace(stdout='')
+        spawns.append(command)
+        if len(spawns) == 2:
+            raise subprocess.CalledProcessError(1, command)
+        return SimpleNamespace(stdout='43211\n')
+    monkeypatch.setattr(swap.subprocess, 'run', run)
+    monkeypatch.setattr(swap.time, 'sleep', lambda _seconds: None)
+    monkeypatch.setattr(swap, 'process_alive', lambda _pid: False)
+    monkeypatch.setattr(swap, 'api', lambda _port, path, _project: (
+        {'stop': {'paused': True}, 'build': {'commit': 'b' * 40}, 'project': 'demo'}
+        if path == '/health' and not spawns else
+        [] if path == '/tasks' else
+        (_ for _ in ()).throw(OSError('unavailable'))))
+    with pytest.raises(RuntimeError, match='died'):
+        swap.main(['demo', 'a' * 40, 'go'])
+    assert len(spawns) == 2 and spawns[1][-1] == str(old_src)
+    assert 'ROLLBACK_FAILED' in capsys.readouterr().out
+    assert (evidence / 'env.pre.nul').read_bytes() == raw
+    assert not (evidence / 'env.pre.sha256').exists()
