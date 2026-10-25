@@ -228,7 +228,21 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         with single_run_lock(args.lock_file):
-            prs = _api_list(f"repos/{REPO}/pulls?state=open&per_page=100")
+            if args.work_dir:
+                Path(args.work_dir).mkdir(parents=True, exist_ok=True)
+            try:
+                prs = _api_list(f"repos/{REPO}/pulls?state=open&per_page=100")
+            except RuntimeError as exc:
+                if not re.search(
+                    r"TLS handshake timeout|i/o timeout|connection (?:reset|refused)"
+                    r"|could not resolve host|HTTP\s+5\d\d\b",
+                    str(exc), re.IGNORECASE,
+                ):
+                    raise
+                message = " ".join(str(exc).split())
+                print(f"premerge gate: skipped run, GitHub unreachable: {message}",
+                      file=sys.stderr)
+                return 0
             main = None
             errors = False
             for pr in prs:
