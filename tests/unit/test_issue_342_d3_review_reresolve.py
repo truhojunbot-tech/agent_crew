@@ -1,6 +1,7 @@
 """#342 D3: a later independent verdict can update a reviewed receipt."""
 
 import json
+import sqlite3
 import time
 from datetime import datetime, timezone
 
@@ -8,6 +9,26 @@ import pytest
 
 from agent_crew.protocol import TaskRequest, TaskResult
 from agent_crew.queue import TaskQueue
+
+
+@pytest.mark.parametrize("prior_version", [5, 6])
+def test_existing_queue_schema_adds_verdict_timestamp(tmp_path, prior_version):
+    db = str(tmp_path / "tasks.db")
+    TaskQueue(db)
+    with sqlite3.connect(db) as conn:
+        conn.execute("ALTER TABLE tokenomics_shadow_receipts "
+                     "DROP COLUMN evidence_updated_at")
+        if prior_version == 5:
+            conn.execute("ALTER TABLE work_intents DROP COLUMN target_repo")
+            conn.execute("ALTER TABLE work_intents DROP COLUMN target_issue")
+
+    TaskQueue(db)
+    with sqlite3.connect(db) as conn:
+        shadow_columns = {row[1] for row in conn.execute(
+            "PRAGMA table_info(tokenomics_shadow_receipts)")}
+        intent_columns = {row[1] for row in conn.execute("PRAGMA table_info(work_intents)")}
+    assert "evidence_updated_at" in shadow_columns
+    assert {"target_repo", "target_issue"} <= intent_columns
 
 
 def _contract(path, task_id, state, produced_at):
