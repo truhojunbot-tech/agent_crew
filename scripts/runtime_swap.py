@@ -28,6 +28,10 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from agent_crew.cea_launch import parse_env_file, resolve_cea_file
+if __package__:
+    from .spawn_from_env import parse_env
+else:
+    from spawn_from_env import parse_env
 
 SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?\Z")
 PROJECT = re.compile(r"[A-Za-z][A-Za-z0-9_-]*\Z")
@@ -227,7 +231,6 @@ def stop_spawned_runtime(pid: int, port: int) -> None:
 
 
 def previous_source(env_dump: Path, new_source: Path) -> Path:
-    from scripts.spawn_from_env import parse_env
     path = parse_env(complete_environ(env_dump.read_bytes())).get("PYTHONPATH", "")
     for entry in path.split(":"):
         source = Path(entry)

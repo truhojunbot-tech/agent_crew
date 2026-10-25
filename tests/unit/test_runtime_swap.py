@@ -693,6 +693,26 @@ def _ready_go(tmp_path, monkeypatch):
     return swap, evidence, old_src, raw
 
 
+def test_previous_source_works_with_script_run_import_path(tmp_path):
+    script = Path(__file__).resolve().parents[2] / 'scripts' / 'runtime_swap.py'
+    old_src = tmp_path / 'old' / 'src'
+    (old_src / 'agent_crew').mkdir(parents=True)
+    new_src = tmp_path / 'new' / 'src'
+    env_dump = tmp_path / 'env.pre.nul'
+    env_dump.write_bytes(f'PYTHONPATH={old_src}\0'.encode())
+    code = (
+        'import runpy, sys; from pathlib import Path; '
+        'sys.path.insert(0, str(Path(sys.argv[1]).parent)); '
+        'swap = runpy.run_path(sys.argv[1]); '
+        'print(swap["previous_source"](Path(sys.argv[2]), Path(sys.argv[3])))'
+    )
+    result = subprocess.run(
+        [sys.executable, '-I', '-c', code, str(script), str(env_dump), str(new_src)],
+        cwd=script.parent.parent, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(old_src)
+
+
 def test_go_waits_past_sixty_seconds_for_live_startup(tmp_path, monkeypatch, capsys):
     from types import SimpleNamespace
     swap, evidence, _, _ = _ready_go(tmp_path, monkeypatch)
