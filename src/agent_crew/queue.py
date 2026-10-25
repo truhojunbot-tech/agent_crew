@@ -4075,6 +4075,14 @@ class TaskQueue:
                     intent["target_issue"] <= 0))):
             raise ValueError("target_repo and target_issue must be a nonempty repo and positive integer issue")
         existing = self.get_work_intent(op_id)
+        if has_target_repo and intent.get("task") is not None:
+            if existing is not None and existing["task_ids"]:
+                if (existing["target_repo"] is not None
+                        and (existing["target_repo"], existing["target_issue"]) != (
+                            intent["target_repo"], intent["target_issue"])):
+                    raise WorkIntentTargetConflict("work intent target conflicts with existing target")
+                return existing
+            raise ValueError("target requires a task-less work intent")
         if existing is not None:
             if not has_target_repo:
                 return existing
@@ -4082,7 +4090,7 @@ class TaskQueue:
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 row = conn.execute(
-                    "SELECT project, repo, issue, coordinator_identity, state, "
+                    "SELECT project, repo, issue, coordinator_identity, state, task_ids, "
                     "target_repo, target_issue FROM work_intents WHERE external_operation_id=?",
                     (op_id,),
                 ).fetchone()
@@ -4090,7 +4098,8 @@ class TaskQueue:
                     if (row["target_repo"], row["target_issue"]) != (
                             intent["target_repo"], intent["target_issue"]):
                         raise WorkIntentTargetConflict("work intent target conflicts with existing target")
-                elif (row["state"] not in ("SUCCESS", "REJECTED", "SUPERSEDED")
+                elif (not json.loads(row["task_ids"])
+                      and row["state"] not in ("SUCCESS", "REJECTED", "SUPERSEDED")
                       and all(intent.get(key) == row[key] for key in (
                           "project", "repo", "issue", "coordinator_identity"))):
                     now = time.time()

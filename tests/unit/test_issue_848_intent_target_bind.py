@@ -59,6 +59,43 @@ def test_same_issue_bind_stays_allowed(crew):
     assert queue.get_task("impl-44").context["issue"] == 44
 
 
+def test_admit_with_task_cannot_declare_target(crew):
+    client, queue = crew
+    task = {"task_id": "impl-44", "task_type": "implement",
+            "description": "Thread work", "branch": "agent/44", "project": "alfred",
+            "context": {"issue": 44, "risk_tier": 2, "repo": "owner/alfred"}}
+
+    response = client.post("/work-intents/admit", json=_intent(
+        task=task, target_repo="owner/alfred", target_issue=405))
+
+    assert response.status_code == 422
+    assert queue.get_work_intent(OP_ID) is None
+    assert queue.get_task("impl-44") is None
+
+
+def test_task_bound_intent_cannot_gain_target_on_replay(crew):
+    client, queue = crew
+    task = {"task_id": "impl-44", "task_type": "implement",
+            "description": "Thread work", "branch": "agent/44", "project": "alfred",
+            "context": {"issue": 44, "risk_tier": 2, "repo": "owner/alfred"}}
+    admitted = client.post("/work-intents/admit", json=_intent(task=task))
+    assert admitted.status_code == 201
+    assert admitted.json()["task_ids"] == ["impl-44"]
+
+    replay = client.post("/work-intents/admit", json=_intent(
+        target_repo="owner/alfred", target_issue=405))
+    replay_with_task = client.post("/work-intents/admit", json=_intent(
+        task=task, target_repo="owner/alfred", target_issue=405))
+
+    assert replay.status_code == 201
+    assert replay.json()["target_issue"] is None
+    assert replay_with_task.status_code == 201
+    assert replay_with_task.json()["target_issue"] is None
+    _task(queue, "impl-405")
+    assert _bind(client, "impl-405").status_code == 409
+    assert queue.get_work_intent(OP_ID)["task_ids"] == ["impl-44"]
+
+
 def test_missing_task_issue_inherits_thread_issue(crew):
     client, queue = crew
     client.post("/work-intents/admit", json=_intent())
