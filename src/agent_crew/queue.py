@@ -4192,10 +4192,12 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute("BEGIN IMMEDIATE")
-            task = conn.execute("SELECT context, project, status, task_type FROM tasks WHERE task_id=?",
+            task = conn.execute("SELECT context, project, status, task_type, created_at "
+                                "FROM tasks WHERE task_id=?",
                                 (task_id,)).fetchone()
             intent = conn.execute("SELECT project, repo, issue, risk_tier, target_repo, "
-                                  "target_issue FROM work_intents WHERE external_operation_id=?",
+                                  "target_issue, received_at FROM work_intents "
+                                  "WHERE external_operation_id=?",
                                   (op_id,)).fetchone()
             if task is None or intent is None:
                 raise KeyError("task or work intent not found")
@@ -4226,6 +4228,10 @@ class TaskQueue:
                 raise ValueError("task risk_tier exceeds work intent ceiling or is invalid")
             if task["status"] not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"task is not active: {task['status']}")
+            if (task["status"] == "completed"
+                    and task["created_at"] < intent["received_at"]
+                    and context.get("external_operation_id") != op_id):
+                raise ValueError("completed task predates work intent without causal provenance")
             context["repo"] = repo
             context["issue"] = issue
             context["risk_tier"] = task_tier
