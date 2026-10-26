@@ -4272,10 +4272,6 @@ class TaskQueue:
                         continue
                     if child["created_at"] < intent["received_at"]:
                         continue
-                    if child["status"] not in (
-                            "pending", "in_progress", "completed", "failed",
-                            "timed_out", "cancelled"):
-                        continue
                     child_issue = child_context.get("issue", intent["issue"])
                     child_repo = child_context.get("repo", intent["repo"])
                     child_same_issue = (child_issue == intent["issue"]

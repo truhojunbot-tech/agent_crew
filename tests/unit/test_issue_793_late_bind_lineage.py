@@ -63,6 +63,15 @@ def _pipeline(queue, *, test_status="completed"):
           created_at=RECEIVED_AT + 50)
 
 
+def _set_context(queue, task_id, **changes):
+    with sqlite3.connect(queue.db_path) as conn:
+        row = conn.execute("SELECT context FROM tasks WHERE task_id=?", (task_id,)).fetchone()
+        context = json.loads(row[0])
+        context.update(changes)
+        conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                     (json.dumps(context), task_id))
+
+
 def test_late_bind_adopts_completed_corrected_lineage_and_reconciles(queue):
     _pipeline(queue)
 
@@ -133,6 +142,41 @@ def test_foreign_bound_descendant_stops_its_branch(queue):
     assert bound["task_ids"] == ["impl-405"]
     assert queue.get_task("review-foreign").context["external_operation_id"] == (
         "another-operation")
+
+
+@pytest.mark.parametrize("status", ["needs_human", "blocked", "expired", "canceled"])
+def test_blocking_descendant_and_its_subtree_are_bound(queue, status):
+    _task(queue, "impl-405", "implement")
+    _task(queue, "review-h", "review", parent="impl-405", status=status)
+    _task(queue, "test-h", "test", parent="review-h")
+    _task(queue, "review-1", "review", parent="impl-405", verdict="approve")
+    _task(queue, "test-405", "test", parent="review-1")
+
+    result = queue.bind_work_intent(OP_ID, "impl-405")
+
+    assert result["state"] == "BLOCKED"
+    assert set(result["task_ids"]) == {
+        "impl-405", "review-h", "test-h", "review-1", "test-405"}
+    assert result["blocker"]["blocker_type"] == "bound_tasks_unsuccessful"
+    assert f"review-h={status}" in result["blocker"]["reason"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"issue": 406}, {"repo": "owner/other"},
+    {"risk_tier": 4}, {"risk_tier": True}, {"risk_tier": "2"},
+])
+def test_invalid_descendant_stops_its_subtree(queue, changes):
+    _task(queue, "impl-405", "implement")
+    _task(queue, "review-invalid", "review", parent="impl-405", verdict="approve")
+    _set_context(queue, "review-invalid", **changes)
+    _task(queue, "test-child", "test", parent="review-invalid")
+
+    result = queue.bind_work_intent(OP_ID, "impl-405")
+
+    assert result["state"] == "BOUND"
+    assert result["task_ids"] == ["impl-405"]
+    assert "external_operation_id" not in queue.get_task("review-invalid").context
+    assert "external_operation_id" not in queue.get_task("test-child").context
 
 
 def test_failed_fix_is_superseded_by_completed_system_retry(queue):
