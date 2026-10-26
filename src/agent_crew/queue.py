@@ -4249,9 +4249,59 @@ class TaskQueue:
             now = time.time()
             self._bind_work_intent_on(conn, op_id, task_id, now,
                                       project=task["project"])
-            if task["status"] == "completed":
-                self._terminalize_work_intent_on(
-                    conn, task_id, task["task_type"], task["status"], now)
+            # A directive may be bound after its pipeline has already run.
+            # Recover only the existing same-project prev_task_id descendants;
+            # an ineligible task stops propagation through its branch.
+            children = {}
+            for row in conn.execute(
+                    "SELECT task_id, context, status, created_at FROM tasks "
+                    "WHERE project=? ORDER BY created_at, task_id",
+                    (task["project"],)).fetchall():
+                child_context = self._row_context(row)
+                parent = child_context.get("prev_task_id")
+                if isinstance(parent, str) and parent:
+                    children.setdefault(parent, []).append((row, child_context))
+            ancestors, seen = [task_id], {task_id}
+            for parent in ancestors:
+                for child, child_context in children.get(parent, ()):
+                    child_id = child["task_id"]
+                    if child_id in seen:
+                        continue
+                    seen.add(child_id)
+                    if child_context.get("external_operation_id") not in (None, op_id):
+                        continue
+                    if child["created_at"] < intent["received_at"]:
+                        continue
+                    if child["status"] not in (
+                            "pending", "in_progress", "completed", "failed",
+                            "timed_out", "cancelled"):
+                        continue
+                    child_issue = child_context.get("issue", intent["issue"])
+                    child_repo = child_context.get("repo", intent["repo"])
+                    child_same_issue = (child_issue == intent["issue"]
+                                        and child_repo == intent["repo"])
+                    child_target = (intent["target_repo"] is not None
+                                    and child_context.get("repo") == intent["target_repo"]
+                                    and child_context.get("issue") == intent["target_issue"]
+                                    and isinstance(child_context.get("issue"), int)
+                                    and not isinstance(child_context.get("issue"), bool))
+                    child_tier = child_context.get("risk_tier", intent["risk_tier"])
+                    if (not child_same_issue and not child_target
+                            or isinstance(child_tier, bool)
+                            or not isinstance(child_tier, int)
+                            or not 0 <= child_tier <= 3
+                            or child_tier > intent["risk_tier"]):
+                        continue
+                    child_context.update(repo=child_repo, issue=child_issue,
+                                         risk_tier=child_tier,
+                                         external_operation_id=op_id)
+                    conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
+                                 (json.dumps(child_context), child_id))
+                    self._bind_work_intent_on(conn, op_id, child_id, now,
+                                              project=task["project"])
+                    ancestors.append(child_id)
+            self._terminalize_work_intent_on(
+                conn, task_id, task["task_type"], task["status"], now)
             conn.commit()
         except Exception:
             conn.rollback()
