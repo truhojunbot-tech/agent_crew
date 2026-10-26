@@ -4220,13 +4220,15 @@ class TaskQueue:
                 if repo != intent["repo"] and repo != intent["target_repo"]:
                     raise ValueError("task repo differs from work intent")
                 raise ValueError("task issue differs from work intent")
-            if "risk_tier" in context and context["risk_tier"] != intent["risk_tier"]:
-                raise ValueError("task risk_tier differs from work intent")
+            task_tier = context.get("risk_tier", intent["risk_tier"])
+            if (isinstance(task_tier, bool) or not isinstance(task_tier, int)
+                    or not 0 <= task_tier <= 3 or task_tier > intent["risk_tier"]):
+                raise ValueError("task risk_tier exceeds work intent ceiling or is invalid")
             if task["status"] not in ("pending", "in_progress", "completed"):
                 raise ValueError(f"task is not active: {task['status']}")
             context["repo"] = repo
             context["issue"] = issue
-            context["risk_tier"] = intent["risk_tier"]
+            context["risk_tier"] = task_tier
             context["external_operation_id"] = op_id
             conn.execute("UPDATE tasks SET context=? WHERE task_id=?",
                          (json.dumps(context), task_id))
