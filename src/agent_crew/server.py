@@ -4921,6 +4921,50 @@ def create_app(
             except Exception:
                 logger.exception("watchdog: failed to recover unstarted claim %s", row["task_id"])
         rows = [row for row in rows if row["task_id"] not in recovered]
+        try:
+            orphan_grace = float(os.getenv("AGENT_CREW_ORPHAN_GRACE_S", "1800"))
+            if not math.isfinite(orphan_grace) or orphan_grace < 0:
+                raise ValueError("grace must be non-negative and finite")
+        except ValueError:
+            logger.warning("watchdog: invalid orphan grace; using 1800s")
+            orphan_grace = 1800.0
+        expired_orphans: set[str] = set()
+        for row in rows:
+            lease_end = row.get("lease_expires_at")
+            if (lease_end is None or not math.isfinite(lease_end) or
+                    now <= lease_end + orphan_grace or
+                    (row.get("last_heartbeat_at") or 0.0) > lease_end):
+                continue
+            task_id = row["task_id"]
+            active = active_dispatches.get(task_id)
+            if active is not None and (not hasattr(active, "done") or not active.done()):
+                continue
+            with _active_dispatch_lock:
+                entry = _active_dispatch_processes.get(task_id)
+                proc = entry.proc if isinstance(entry, _DispatchSlot) else entry
+                live_child = entry is not None and (proc is None or
+                                                     getattr(proc, "returncode", None) is None)
+            if live_child:
+                continue
+            pane_id = row.get("dispatch_pane_id") or row.get("dispatch_target", "")
+            if pane_id.startswith("%"):
+                try:
+                    if pane_busy_fn(pane_id):
+                        continue
+                except Exception:
+                    logger.exception("watchdog: orphan pane activity check failed for %s", task_id)
+                    continue
+            if _fail_if_active(task_id, "orphan_lease_expired", status="timed_out",
+                               details={"lease_expires_at": lease_end,
+                                        "grace_seconds": orphan_grace}):
+                expired_orphans.add(task_id)
+                actions["timed_out"].append(task_id)
+                watchdog_expiry_counts["orphan_lease_expired"] = (
+                    watchdog_expiry_counts.get("orphan_lease_expired", 0) + 1)
+                logger.error("WATCHDOG TIMEOUT: task_id=%s reason=orphan_lease_expired "
+                             "count=%d", task_id,
+                             watchdog_expiry_counts["orphan_lease_expired"])
+        rows = [row for row in rows if row["task_id"] not in expired_orphans]
         in_progress_ids = {r["task_id"] for r in rows}
         # Drop completed/failed tasks from the reminder dedupe set so a recycled
         # task_id (or a re-enqueued retry) doesn't get its reminder suppressed.
