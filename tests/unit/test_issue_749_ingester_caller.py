@@ -44,10 +44,49 @@ def test_configured_ingester_refreshes_remote_and_is_idempotent(tmp_path):
     doc.write_text("# Revised policy\n")
     _git(source, "commit", "-qam", "revised")
     _git(source, "push", "-q", "origin", "HEAD:main")
+    revised_commit = _git(source, "rev-parse", "HEAD")
     assert memory_ingest.run_configured_ingest(str(config)) == (0, 1)
     assert memory_ingest.run_configured_ingest(str(config)) == (0, 0)
     with sqlite3.connect(db) as conn:
+        keys = [row[0] for row in conn.execute(
+            "SELECT key FROM adr001_memory WHERE key LIKE 'doc:%'")]
+    assert keys == [f"doc:truhojunbot-tech/quota-core:docs/context-economics.md@{revised_commit}"]
+
+
+def test_bad_task_db_does_not_block_document_pass(tmp_path, caplog):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    doc = repo / "docs" / "context-economics.md"
+    doc.parent.mkdir()
+    doc.write_text("# Policy\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "first")
+    db = tmp_path / "memory.db"
+    SQLiteMemoryStorage(str(db))
+    missing_task_db = tmp_path / "missing-tasks.db"
+    good_task_db = tmp_path / "good-tasks.db"
+    with sqlite3.connect(good_task_db) as conn:
+        conn.execute("CREATE TABLE tasks (task_id TEXT PRIMARY KEY, task_type TEXT, "
+                     "description TEXT, branch TEXT, context TEXT, status TEXT, "
+                     "created_at REAL, project TEXT, summary TEXT, verdict TEXT, "
+                     "findings TEXT, pr_number INTEGER)")
+        conn.execute("INSERT INTO tasks VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                     ("review-1", "review", "approved", "main", "{}", "completed",
+                      1, "agent_crew", "approved", "approve", "[]", None))
+    config = tmp_path / "ingest.json"
+    config.write_text(json.dumps({"memory_db": str(db),
+                                  "task_dbs": [str(missing_task_db), str(good_task_db)],
+                                  "repos": {"truhojunbot-tech/quota-core": str(repo)}}))
+
+    assert memory_ingest.run_configured_ingest(str(config)) == (1, 1)
+    assert str(missing_task_db) in caplog.text
+    assert not missing_task_db.exists()
+    with sqlite3.connect(db) as conn:
         assert conn.execute("SELECT count(*) FROM adr001_memory WHERE key LIKE 'doc:%'").fetchone()[0] == 1
+        assert conn.execute("SELECT count(*) FROM adr001_memory WHERE key LIKE 'task_outcome:%'").fetchone()[0] == 1
 
 
 def test_ingester_lock_skips_overlapping_run(tmp_path):

@@ -67,8 +67,15 @@ def run_configured_ingest(path: str) -> tuple[int, int] | None:
     storage = SQLiteMemoryStorage.existing(memory_db)
     try:
         with ingest_lock(memory_db + ".ingest.lock"):
-            task_changed = backfill_task_outcomes(
-                storage, [str(Path(db).expanduser()) for db in config.get("task_dbs", [])])
+            task_changed = 0
+            failed_task_dbs = []
+            for db in config.get("task_dbs", []):
+                task_db = str(Path(db).expanduser())
+                try:
+                    task_changed += backfill_task_outcomes(storage, [task_db])
+                except Exception:
+                    failed_task_dbs.append(task_db)
+                    logger.exception("memory ingest: task DB %s failed", task_db)
             repos = [(repo, str(Path(root).expanduser()))
                      for repo, root in config.get("repos", {}).items()]
             explicit = {repo: set(paths) for repo, paths in
@@ -90,8 +97,8 @@ def run_configured_ingest(path: str) -> tuple[int, int] | None:
                 except Exception:
                     failed_repos.append(repo)
                     logger.exception("memory ingest: repo %s failed", repo)
-            logger.info("memory ingest: tasks=%s documents=%s failed_repos=%s",
-                        task_changed, doc_changed, failed_repos)
+            logger.info("memory ingest: tasks=%s documents=%s failed_task_dbs=%s failed_repos=%s",
+                        task_changed, doc_changed, failed_task_dbs, failed_repos)
             return task_changed, doc_changed
     except BlockingIOError:
         logger.info("memory ingest: another server owns the lock")
