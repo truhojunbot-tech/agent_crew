@@ -5009,6 +5009,8 @@ def create_app(
                 # A failing head runs the same suite again on base. Bound both
                 # runs and checkout setup, regardless of pane/dispatcher claim.
                 stored_timeout = (row.get("context") or {}).get("script_test_timeout_s")
+                stored_rerun_budget = (row.get("context") or {}).get(
+                    "script_test_rerun_budget_s")
                 state = {"test_timeout_s": stored_timeout} if stored_timeout is not None else {}
                 if stored_timeout is None and state_path and os.path.exists(state_path):
                     try:
@@ -5016,6 +5018,8 @@ def create_app(
                             state = json.load(file)
                     except (OSError, ValueError):
                         logger.exception("watchdog: could not read script test config")
+                if stored_rerun_budget is not None:
+                    state["script_test_rerun_budget_s"] = stored_rerun_budget
                 budget = _script_tester.watchdog_timeout_seconds(state, timeout_seconds)
                 last_activity = max(row["last_activity_at"],
                                     row.get("last_heartbeat_at") or 0.0,
@@ -5410,13 +5414,15 @@ def create_app(
                 logger.exception("script test: could not read %s", state_path)
         # Same P2 DISPATCH → EXECUTE_START → RESULT receipts as a pane or a
         # subprocess; the executor is this server, not a provider.
+        test_config = _script_tester.resolve_test_config(state, "")
         try:
             nonce = q().record_dispatch(task.task_id, channel="api",
                                         agent=_script_tester.SCRIPT_TESTER,
                                         target="script_tester",
-                                        context_patch={"script_test_timeout_s":
-                                                       _script_tester.resolve_test_config(
-                                                           state, "")[1]})
+                                        context_patch={
+                                            "script_test_timeout_s": test_config.timeout_s,
+                                            "script_test_rerun_budget_s":
+                                                test_config.rerun_budget_s})
         except AdmissionRefused as exc:
             logger.warning("script test: dispatch refused for %s — %s", task.task_id, exc)
             return
