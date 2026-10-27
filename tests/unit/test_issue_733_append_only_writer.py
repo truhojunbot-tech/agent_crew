@@ -6,9 +6,11 @@ import sqlite3
 import pytest
 
 from agent_crew.memory_hybrid import HybridMemoryStorage
+from agent_crew.memory_capture import capture_task_outcome
 from agent_crew.memory_runtime import (
     MemoryRecord, MemoryScope, SQLiteMemoryStorage, reconstruct_context,
 )
+from agent_crew.server import _lineage_recall_observation
 
 
 @pytest.mark.parametrize("storage_type", [SQLiteMemoryStorage, HybridMemoryStorage])
@@ -71,6 +73,19 @@ def test_shadow_lineage_pin_returns_only_effective_revision(tmp_path, storage_ty
         MemoryScope(project="demo", task_id="successor"), {"decision"}, 10,
         predecessor_task_ids=("predecessor",))
     assert [record.value["text"] for record in rows] == ["final"]
+
+
+@pytest.mark.parametrize("storage_type", [SQLiteMemoryStorage, HybridMemoryStorage])
+def test_lineage_recall_finds_decision_after_recapture(tmp_path, storage_type):
+    store = storage_type(str(tmp_path / "memory.db"))
+    options = {"project": "agent_crew", "repo": "truhojunbot-tech/agent_crew",
+               "task_id": "prior", "status": "completed"}
+    capture_task_outcome(store, **options, summary="first")
+    assert _lineage_recall_observation(store, "", "agent_crew", ("prior",)) is True
+
+    capture_task_outcome(store, **options, summary="corrected", issue="733")
+    assert _lineage_recall_observation(store, "", "agent_crew", ("prior",)) is True
+    assert _lineage_recall_observation(store, "", "agent_crew", ("missing",)) is False
 
 
 def test_shadow_scope_refresh_keeps_older_scope_row_as_history(tmp_path):

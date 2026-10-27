@@ -282,13 +282,14 @@ class SQLiteMemoryStorage:
         its current scope is therefore not a reliable lookup scope.
         """
         key = f"task:{task_id}:decision"
+        revision_prefix = key + "@v"
         uri = Path(self.path).resolve().as_uri() + "?mode=ro"
         with closing(sqlite3.connect(
             uri, uri=True, timeout=shadow_sqlite_timeout_seconds(),
         )) as db:
             columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
             clauses = [
-                "layer='decision'", "key=?",
+                "layer='decision'", "(key=? OR (key>=? AND key<?))",
                 "json_extract(scope,'$.project')=?",
                 "json_extract(scope,'$.task_id')=?",
                 "COALESCE(json_extract(scope,'$.fleet'),'')=''",
@@ -299,7 +300,7 @@ class SQLiteMemoryStorage:
                 clauses.append("invalidated_at IS NULL")
             rows = db.execute(
                 "SELECT value FROM adr001_memory WHERE " + " AND ".join(clauses),
-                (key, project, task_id),
+                (key, revision_prefix, revision_prefix + "\uffff", project, task_id),
             )
             for (raw,) in rows:
                 value = json.loads(raw)
