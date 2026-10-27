@@ -197,6 +197,25 @@ def _resolve_gemini_model() -> str:
     return os.getenv("AGENT_CREW_GEMINI_MODEL", "").strip() or _DEFAULT_GEMINI_MODEL
 
 
+def _resolve_claude_model(worktree: str) -> str:
+    """Read the live crew pin; Claude also reads this worktree's local settings."""
+    env_pin = os.getenv("AGENT_CREW_CLAUDE_MODEL", "").strip()
+    if env_pin:
+        return env_pin
+    settings_path = os.path.join(worktree, ".claude", "settings.local.json")
+    try:
+        with open(settings_path, encoding="utf-8") as settings_file:
+            settings = json.load(settings_file)
+    except FileNotFoundError:
+        return ""
+    except (OSError, ValueError) as exc:
+        logger.warning("dispatcher: cannot read Claude model pin from %s: %s",
+                       settings_path, exc)
+        return ""
+    model = settings.get("model") if isinstance(settings, dict) else None
+    return model.strip() if isinstance(model, str) else ""
+
+
 def _provider_zero_turn_config_error(agent: str, output: str) -> bool:
     """Identify provider launch/config errors before any test work occurred."""
     if agent not in {"gemini", "claude", "codex"}:
@@ -5680,7 +5699,7 @@ def create_app(
         # argv cannot drift. An unpinned Claude/Codex model remains unknown.
         _known_model = (
             _resolve_gemini_model() if agent == "gemini" else
-            os.getenv("AGENT_CREW_CLAUDE_MODEL", "").strip() if agent == "claude" else ""
+            _resolve_claude_model(wt) if agent == "claude" else ""
         )
 
         # #202: resolve durable context identity before dispatch. A context

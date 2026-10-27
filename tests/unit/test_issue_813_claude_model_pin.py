@@ -159,3 +159,33 @@ def test_same_task_redispatch_after_model_change_resets_once(tmp_path, monkeypat
     assert same["context_policy"] == "resume"
     assert same["context_generation"] == changed["context_generation"]
     assert "--continue" in seen[2][0]
+
+
+def test_worktree_settings_pin_applies_on_resume_and_resets_after_change(
+    tmp_path, monkeypatch, unused_tcp_port,
+):
+    monkeypatch.delenv("AGENT_CREW_CLAUDE_MODEL", raising=False)
+    app, queue, seen = _harness(tmp_path, monkeypatch, unused_tcp_port)
+    settings = tmp_path / "claude" / ".claude" / "settings.local.json"
+    settings.parent.mkdir()
+    settings.write_text(json.dumps({"model": "claude-fable-5-1"}))
+
+    with TestClient(app):
+        first = _dispatch(app, queue, "impl-813-settings-a")
+        same = _dispatch(app, queue, "impl-813-settings-b")
+        settings.write_text(json.dumps({"model": "claude-opus-5-1"}))
+        changed = _dispatch(app, queue, "impl-813-settings-c")
+        resumed = _dispatch(app, queue, "impl-813-settings-d")
+
+    assert first["model"] == same["model"] == "claude-fable-5-1"
+    assert same["context_policy"] == "resume"
+    assert "--continue" in seen[1][0]
+    assert seen[1][0][seen[1][0].index("--model") + 1] == "claude-fable-5-1"
+    assert changed["model"] == resumed["model"] == "claude-opus-5-1"
+    assert changed["context_policy"] == "fresh"
+    assert changed["context_generation"] == same["context_generation"] + 1
+    assert "--continue" not in seen[2][0]
+    assert seen[2][0][seen[2][0].index("--model") + 1] == "claude-opus-5-1"
+    assert resumed["context_policy"] == "resume"
+    assert "--continue" in seen[3][0]
+    assert seen[3][0][seen[3][0].index("--model") + 1] == "claude-opus-5-1"
