@@ -78,6 +78,7 @@ def test_auto_retry_skips_agent_reported_implement_failure(
         monkeypatch.delenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", raising=False)
     else:
         monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", retry_flag)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     # This test submits the result itself. The default script tester would
     # claim test tasks on a background thread and race that manual result.
     state_path = tmp_path / "state.json"
@@ -89,7 +90,7 @@ def test_auto_retry_skips_agent_reported_implement_failure(
     app = create_app(
         db_path=tmp_db, pane_map={"implementer": "%100"}, port=8100,
         push_fn=_RecordingPush(), watchdog_disabled=True, fallback_disabled=True,
-        state_path=str(state_path),
+        state_path=str(state_path), identity_required=False,
     )
     with TestClient(app) as client:
         assert _post_task(
