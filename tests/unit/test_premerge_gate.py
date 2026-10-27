@@ -313,3 +313,26 @@ def test_pr_cleans_worktree_and_basetemp_on_all_outcomes(
 def test_pytest_summary_extracts_decorated_line():
     assert gate.pytest_summary("failures above\n=== 2 failed, 3 passed, 1 skipped in 9s ===\n") == \
            "2 failed, 3 passed, 1 skipped in 9s"
+
+
+def test_pytest_summary_names_up_to_three_failures_in_posted_summary():
+    output = "\n".join([
+        "FAILED tests/unit/test_a.py::test_one - AssertionError",
+        "ERROR tests/unit/test_b.py::test_two - RuntimeError",
+        "FAILED tests/unit/test_c.py::test_three - AssertionError",
+        "FAILED tests/unit/test_d.py::test_four - AssertionError",
+        "=== 3 failed, 1 error, 10 passed in 9s ===",
+    ])
+    summary = gate.pytest_summary(output)
+    assert "tests/unit/test_a.py::test_one" in summary
+    assert "tests/unit/test_b.py::test_two" in summary
+    assert "tests/unit/test_c.py::test_three" in summary
+    assert "test_four" not in summary
+    assert len(summary) <= 300
+    assert gate.gate_payload(7, gate.gate_comment(HEAD, MAIN, summary, 1))["summary"] == summary
+
+
+def test_pytest_summary_truncates_long_failure_nodes():
+    output = ("FAILED tests/unit/test_long.py::test_" + "x" * 400 +
+              " - AssertionError\n=== 1 failed in 1s ===\n")
+    assert len(gate.pytest_summary(output)) == 300

@@ -72,21 +72,33 @@ class _RecordingPush:
     ],
 )
 def test_auto_retry_skips_agent_reported_implement_failure(
-    tmp_db, monkeypatch, task_type, error_info, retry_flag, expected_retry,
+    tmp_db, tmp_path, monkeypatch, task_type, error_info, retry_flag, expected_retry,
 ):
     if retry_flag is None:
         monkeypatch.delenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", raising=False)
     else:
         monkeypatch.setenv("AGENT_CREW_RETRY_IMPLEMENT_SELF_FAILED", retry_flag)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    # This test submits the result itself. The default script tester would
+    # claim test tasks on a background thread and race that manual result.
+    state_path = tmp_path / "state.json"
+    state_path.write_text(json.dumps({
+        "project": "test", "role_agents": {
+            "implementer": "codex", "reviewer": "claude", "tester": "gemini",
+        },
+    }))
     app = create_app(
         db_path=tmp_db, pane_map={"implementer": "%100"}, port=8100,
         push_fn=_RecordingPush(), watchdog_disabled=True, fallback_disabled=True,
+        state_path=str(state_path), identity_required=False,
     )
     with TestClient(app) as client:
         assert _post_task(
             client, "self-report-probe", task_type=task_type,
             ctx={"pr_number": 123} if task_type == "review" else None,
         ).status_code == 201
+        if task_type == "test":
+            assert getattr(app.state, "script_test_thread", None) is None
         response = client.post("/tasks/self-report-probe/result", json={
             "task_id": "self-report-probe", "status": "failed",
             "summary": "agent failed", "error_info": error_info,
