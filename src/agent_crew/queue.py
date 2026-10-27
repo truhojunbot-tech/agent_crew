@@ -5487,8 +5487,9 @@ class TaskQueue:
             # #265: `timed_out` too — a consumer that sees "we stopped waiting"
             # needs the reason as badly as one that sees "it failed", and leaving
             # the field null there is exactly what made the cause unreadable.
+            # `needs_human` also needs its stop reason for a coordinator to act.
             error_info_json = None
-            if result.status in ("failed", "timed_out", "blocked") and result.error_info:
+            if result.status in ("failed", "timed_out", "blocked", "needs_human") and result.error_info:
                 error_info_json = json.dumps(result.error_info)
             # ⛔`status_changed_at` moves only when the status actually moves.
             #   Stamping it on every submission made a duplicate same-status
