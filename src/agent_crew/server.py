@@ -6654,7 +6654,11 @@ def create_app(
                     _recall = await asyncio.to_thread(
                         _lineage_recall_observation, _storage, db_path, _project,
                         _causal_predecessors)
-                    q().record_required_context_recalled(task.task_id, _recall)
+                    # Root tasks were marked not applicable above. A shadow
+                    # retrieval has no predecessor decision to observe and
+                    # must not erase that attribution marker.
+                    if _causal_predecessors:
+                        q().record_required_context_recalled(task.task_id, _recall)
                 except Exception:
                     logger.exception("dispatcher: lineage recall telemetry failed for %s",
                                      task.task_id)

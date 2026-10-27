@@ -638,7 +638,7 @@ _TYPE_TO_ROLE = {
 
 # Bump when tasks.db DDL or CLI write semantics change. The CLI and server
 # compare this protocol version before the CLI opens a served DB for writing.
-QUEUE_SCHEMA_VERSION = 7
+QUEUE_SCHEMA_VERSION = 8
 
 _DDL_GATES = """
 CREATE TABLE IF NOT EXISTS gates (
@@ -923,6 +923,8 @@ _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH = "ALTER TABLE task_attribution ADD COLUMN 
 _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH = "ALTER TABLE task_attribution ADD COLUMN context_pack_hash TEXT DEFAULT NULL"
 _DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED = (
     "ALTER TABLE task_attribution ADD COLUMN required_context_recalled INTEGER DEFAULT NULL")
+_DDL_MIGRATE_ATTR_RECALL_NOT_APPLICABLE = (
+    "ALTER TABLE task_attribution ADD COLUMN recall_not_applicable INTEGER DEFAULT NULL")
 _DDL_MIGRATE_ATTR_SAFETY_OR_LIVE_CHANGE = (
     "ALTER TABLE task_attribution ADD COLUMN safety_or_live_change INTEGER DEFAULT NULL")
 _DDL_MIGRATE_ATTR_BROAD_ARCHITECTURE_CHANGE = (
@@ -981,6 +983,7 @@ _DDL_MIGRATE_ATTRIBUTION_COLUMNS = (
     _DDL_MIGRATE_ATTR_STABLE_PREFIX_HASH,
     _DDL_MIGRATE_ATTR_CONTEXT_PACK_HASH,
     _DDL_MIGRATE_ATTR_REQUIRED_CONTEXT_RECALLED,
+    _DDL_MIGRATE_ATTR_RECALL_NOT_APPLICABLE,
     _DDL_MIGRATE_ATTR_SAFETY_OR_LIVE_CHANGE,
     _DDL_MIGRATE_ATTR_BROAD_ARCHITECTURE_CHANGE,
     _DDL_MIGRATE_ATTR_BOUNDED_ROUTINE_FIX,
@@ -5740,6 +5743,7 @@ class TaskQueue:
             """SELECT uncached_input_tokens, cache_write_tokens, cache_read_tokens,
                       output_tokens, reasoning_tokens, context_window_tokens,
                       outcome, retry_of, fallback_of, required_context_recalled,
+                      recall_not_applicable,
                       codex_thread_cumulative
                FROM task_attribution WHERE task_id=?""", (task_id,)).fetchone()
         economics_json = None
@@ -5755,9 +5759,10 @@ class TaskQueue:
                         "output_tokens", "reasoning_tokens")
         }
         # quota-core #80 evidence contract: NULL is an observation of unknown,
-        # never an inferred false/zero.  `required_context_recalled` is written
-        # only by the memory producer; review correctness is preserved from
-        # the reviewed task's receipt after a direct review verdict (#342).
+        # never an inferred false/zero. Recall applicability and
+        # `required_context_recalled` are written only by the memory producer;
+        # review correctness is preserved from the reviewed task's receipt
+        # after a direct review verdict (#342).
         evidence = {
             "outcome": outcome or (economics["outcome"] if economics is not None and "outcome" in economics.keys() else None),
             "independent_review_correct": None,
@@ -5816,8 +5821,10 @@ class TaskQueue:
         conn = self._connect()
         try:
             conn.execute(
-                "UPDATE task_attribution SET required_context_recalled=?, updated_at=? WHERE task_id=?",
-                (None if observed is None else int(observed), time.time(), task_id),
+                "UPDATE task_attribution SET required_context_recalled=?, "
+                "recall_not_applicable=?, updated_at=? WHERE task_id=?",
+                (None if observed is None else int(observed),
+                 1 if recall_not_applicable else None, time.time(), task_id),
             )
             if recall_not_applicable:
                 row = conn.execute(
