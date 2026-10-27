@@ -73,6 +73,7 @@ def test_conflict_enqueues_one_rebase_round_without_failure_notice(harness):
     assert task.context["pr_number"] == PR
     assert task.context["prev_task_id"] == "test-original"
     assert task.context["auto_rebase_of"] == "test-original"
+    assert task.context["artifact_kind"] == "rebase"
     assert task.context["rebase_onto"] == "main"
     assert task.context["rebase_source_sha"] == HEAD_1
     assert task.context["issue"] == 854

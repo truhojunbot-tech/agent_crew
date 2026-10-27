@@ -7574,6 +7574,7 @@ def create_app(
             return rebase_id if old.get("auto_rebase_of") == test_task_id else None
 
         context = {"prev_task_id": test_task_id, "auto_rebase_of": test_task_id,
+                   "artifact_kind": "rebase",
                    "rebase_onto": base, "rebase_source_sha": source,
                    "base_branch": base, "pr_number": pr_number,
                    "repo": repo, "issue": issue, "issue_number": issue,
