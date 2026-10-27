@@ -470,3 +470,37 @@ def test_cloud_capacity_without_reviewer_worktree_keeps_review_pending(tmp_path,
         assert attempted_twice.wait(4)
         assert queue.get_task("review-cloud").status == "pending"
         assert queue.get_result("review-cloud") is None
+
+
+@pytest.mark.parametrize("reason", ["daily_cap", "cli_unsupported:probe failed"])
+def test_nontransient_cloud_skip_without_reviewer_worktree_fails_visibly(
+        tmp_path, monkeypatch, reason):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "0")
+    monkeypatch.setattr(cloud, "dispatch_cloud_for_role",
+                        lambda *_args, **_kwargs: SimpleNamespace(skipped_reason=reason))
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_worktree=False),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: queue.get_task("review-cloud").status == "failed")
+    assert queue.get_result("review-cloud").error_info["reason"] == "no_worktree"
+
+
+def test_shadow_without_reviewer_worktree_fails_visibly(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "1")
+    monkeypatch.setattr(cloud, "launch_shadow_review", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_worktree=False),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: queue.get_task("review-cloud").status == "failed")
+    assert queue.get_result("review-cloud").error_info["reason"] == "no_worktree"
