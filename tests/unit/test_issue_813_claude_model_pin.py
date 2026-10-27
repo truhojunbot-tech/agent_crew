@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from agent_crew import server as sv
 from agent_crew.protocol import TaskRequest
 from agent_crew.queue import TaskQueue
+from agent_crew.telemetry import TaskTelemetry
 
 
 IDENTITY_KEYS = {
@@ -95,8 +96,8 @@ def test_claude_model_pin_and_model_change_reset_once(tmp_path, monkeypatch, unu
     assert same["context_generation"] == changed["context_generation"]
     assert changed["model"] == same["model"] == "claude-fable-5-1"
     assert "--model" not in seen[4][0]
-    assert "--continue" not in seen[4][0]
-    assert unpinned["context_policy"] == "fresh"
+    assert "--continue" in seen[4][0]
+    assert unpinned["context_policy"] == "resume"
 
 
 def test_provider_child_env_drops_only_claude_session_identity():
@@ -189,3 +190,39 @@ def test_worktree_settings_pin_applies_on_resume_and_resets_after_change(
     assert resumed["context_policy"] == "resume"
     assert "--continue" in seen[3][0]
     assert seen[3][0][seen[3][0].index("--model") + 1] == "claude-opus-5-1"
+
+
+def test_unpinned_transcript_model_does_not_reset_context(
+    tmp_path, monkeypatch, unused_tcp_port,
+):
+    monkeypatch.delenv("AGENT_CREW_CLAUDE_MODEL", raising=False)
+    app, queue, seen = _harness(tmp_path, monkeypatch, unused_tcp_port)
+    with TestClient(app):
+        first = _dispatch(app, queue, "impl-813-observed-a")
+        queue.record_task_telemetry("impl-813-observed-a", TaskTelemetry(model="claude-opus-5-5"))
+        assert queue.get_attribution("impl-813-observed-a")["model"] == "claude-opus-5-5"
+        second = _dispatch(app, queue, "impl-813-observed-b")
+
+    assert first["context_policy"] == "fresh"
+    assert second["context_policy"] == "resume"
+    assert second["context_generation"] == first["context_generation"]
+    assert "--continue" in seen[1][0]
+    assert "--model" not in seen[1][0]
+
+
+def test_pinned_transcript_model_keeps_same_pin_on_resume(
+    tmp_path, monkeypatch, unused_tcp_port,
+):
+    monkeypatch.setenv("AGENT_CREW_CLAUDE_MODEL", "claude-opus-5-5")
+    app, queue, seen = _harness(tmp_path, monkeypatch, unused_tcp_port)
+    with TestClient(app):
+        first = _dispatch(app, queue, "impl-813-pinned-a")
+        queue.record_task_telemetry("impl-813-pinned-a", TaskTelemetry(model="claude-opus-5-5"))
+        assert queue.get_attribution("impl-813-pinned-a")["model"] == "claude-opus-5-5"
+        second = _dispatch(app, queue, "impl-813-pinned-b")
+
+    assert first["context_policy"] == "fresh"
+    assert second["context_policy"] == "resume"
+    assert second["context_generation"] == first["context_generation"]
+    assert "--continue" in seen[1][0]
+    assert seen[1][0][seen[1][0].index("--model") + 1] == "claude-opus-5-5"

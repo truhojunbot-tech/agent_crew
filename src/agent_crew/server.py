@@ -5771,8 +5771,10 @@ def create_app(
                 # task. Capacity/transient paths re-dispatch the same task_id,
                 # and its earlier attribution row holds the model that last
                 # ran in this conversation — a pin changed in between must
-                # not be `--continue`d onto the old model's context.
-                if _previous_task_id:
+                # not be `--continue`d onto the old model's context. Without a
+                # pin, telemetry may backfill the observed model into that row;
+                # comparing it with the empty pin would reset every dispatch.
+                if _previous_task_id and _known_model:
                     _previous_model = (q().get_attribution(_previous_task_id) or {}).get("model") or ""
                     if _previous_model != _known_model:
                         _force_context_reset = True
