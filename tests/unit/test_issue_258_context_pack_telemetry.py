@@ -416,7 +416,10 @@ def test_shadow_pack_is_advisory_and_keeps_prompt_and_task_unchanged(tmp_path, m
     assert off["events"] == []
     assert shadow["message"] == off["message"]
     assert shadow["patches"] == off["patches"]
-    assert shadow["recalled"] == []
+    # Root recall evidence is recorded independently of Context Pack shadowing.
+    assert shadow["recalled"] == off["recalled"] == [
+        (("shadow-t", None), {"recall_not_applicable": True})
+    ]
     assert "context_pack_hash" not in shadow["row_context"]
     assert len(shadow["events"]) == 1
     event = shadow["events"][0]
@@ -437,7 +440,9 @@ def test_shadow_build_error_does_not_change_dispatch(tmp_path, monkeypatch, unus
     assert broken["message"] == off["message"]
     assert broken["events"] == []
     assert broken["patches"] == off["patches"]
-    assert broken["recalled"] == []
+    assert broken["recalled"] == off["recalled"] == [
+        (("shadow-t", None), {"recall_not_applicable": True})
+    ]
 
 
 def test_live_pack_overrides_shadow_without_a_second_event(tmp_path, monkeypatch, unused_tcp_port):
