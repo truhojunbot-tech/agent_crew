@@ -167,11 +167,24 @@ def deliver_blackboard(command, number, gate_body):
 
 
 def pytest_summary(output):
+    summary = "pytest summary unavailable"
     for line in reversed(output.splitlines()):
         stripped = line.strip().strip("= ")
         if SUMMARY.match(stripped):
-            return stripped
-    return "pytest summary unavailable"
+            summary = stripped
+            break
+    failures = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(("FAILED ", "ERROR ")):
+            node = stripped.split(" ", 1)[1].split(" - ", 1)[0].strip()
+            if node and node not in failures:
+                failures.append(node)
+            if len(failures) == 3:
+                break
+    if failures:
+        summary += " | failed: " + ", ".join(failures)
+    return summary[:300]
 
 
 def gate_comment(head, main, summary, exit_code):
