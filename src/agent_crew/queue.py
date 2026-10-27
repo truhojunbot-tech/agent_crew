@@ -6539,6 +6539,18 @@ class TaskQueue:
         finally:
             conn.close()
 
+    def coordinator_notices_gave_up_24h(self) -> int:
+        """Count terminal notice delivery failures in the trailing 24 hours."""
+        conn = self._connect()
+        try:
+            return conn.execute(
+                "SELECT COUNT(*) FROM task_exec_events "
+                "WHERE event='coordinator_notice_gave_up' AND at>=?",
+                (time.time() - 86400,),
+            ).fetchone()[0]
+        finally:
+            conn.close()
+
     def _record_claim_on(self, conn, task_id: str, at: float, *, role: Optional[str],
                          agent: Optional[str], via: str) -> None:
         """Stamp a claim inside the dequeue transaction that made it.
