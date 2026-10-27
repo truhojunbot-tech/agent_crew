@@ -5795,22 +5795,51 @@ class TaskQueue:
             if (isinstance(prior_evidence, dict)
                     and isinstance(prior_evidence.get("independent_review_correct"), bool)):
                 envelope["independent_review_correct"] = prior_evidence["independent_review_correct"]
+            if (isinstance(prior_evidence, dict)
+                    and prior_evidence.get("recall_not_applicable") is True):
+                envelope["recall_not_applicable"] = True
         conn.execute(
             """UPDATE tokenomics_shadow_receipts
                SET outcome=COALESCE(?, outcome), economics_json=?, evidence_json=?, updated_at=? WHERE task_id=?""",
             (outcome, economics_json, json.dumps(envelope), now, task_id),
         )
 
-    def record_required_context_recalled(self, task_id: str, observed: Optional[bool]) -> None:
+    def record_required_context_recalled(
+        self, task_id: str, observed: Optional[bool], *,
+        recall_not_applicable: bool = False,
+    ) -> None:
         """Persist Context Pack recall evidence without converting unknown to false (#342)."""
         if observed is not None and not isinstance(observed, bool):
             raise TypeError("required_context_recalled must be bool or None")
+        if recall_not_applicable and observed is not None:
+            raise ValueError("root recall is not applicable, so observation must be None")
         conn = self._connect()
         try:
             conn.execute(
                 "UPDATE task_attribution SET required_context_recalled=?, updated_at=? WHERE task_id=?",
                 (None if observed is None else int(observed), time.time(), task_id),
             )
+            if recall_not_applicable:
+                row = conn.execute(
+                    "SELECT evidence_json FROM tokenomics_shadow_receipts WHERE task_id=?",
+                    (task_id,),
+                ).fetchone()
+                if row is not None:
+                    try:
+                        evidence = json.loads(row["evidence_json"] or "{}")
+                    except (TypeError, ValueError):
+                        evidence = {}
+                    if not isinstance(evidence, dict):
+                        evidence = {}
+                    evidence["recall_not_applicable"] = True
+                    evidence["required_context_recalled"] = None
+                    now = time.time()
+                    conn.execute(
+                        "UPDATE tokenomics_shadow_receipts SET evidence_json=?, "
+                        "evidence_updated_at=?, updated_at=? "
+                        "WHERE task_id=?",
+                        (json.dumps(evidence), now, now, task_id),
+                    )
             conn.commit()
         finally:
             conn.close()

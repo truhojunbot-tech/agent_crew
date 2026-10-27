@@ -153,8 +153,9 @@ def _task_context(raw: object) -> dict:
     return context if isinstance(context, dict) else {}
 
 
-def task_lineage(db_path: str, task_id: str) -> tuple[tuple[str, ...], int | None]:
-    """Read this task's predecessor chain and earlier terminal tasks on its PR."""
+def task_lineage(db_path: str, task_id: str, *,
+                 include_same_pr: bool = True) -> tuple[tuple[str, ...], int | None]:
+    """Read the causal predecessor chain, optionally adding earlier PR tasks."""
     uri = Path(db_path).resolve().as_uri() + "?mode=ro"
     with closing(sqlite3.connect(uri, uri=True, timeout=shadow_sqlite_timeout_seconds())) as db:
         db.row_factory = sqlite3.Row
@@ -183,7 +184,7 @@ def task_lineage(db_path: str, task_id: str) -> tuple[tuple[str, ...], int | Non
                 break
             predecessors.append(parent)
             parent = _task_context(previous["context"]).get("prev_task_id")
-        if pr_number:
+        if pr_number and include_same_pr:
             # rowid is insertion order; it excludes this task and later work
             # even when several tasks have the same created_at timestamp.
             for previous in db.execute(

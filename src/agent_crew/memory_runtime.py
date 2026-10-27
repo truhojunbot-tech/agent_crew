@@ -237,6 +237,7 @@ def _scope_applies(record_scope: MemoryScope, query_scope: MemoryScope,
 class MemoryStorage(Protocol):
     def put(self, record: MemoryRecord) -> None: ...
     def retrieve(self, scope: MemoryScope, query: str = "", exact_key: str = "") -> list[MemoryRecord]: ...
+    def has_active_task_decision(self, project: str, task_id: str) -> bool: ...
 
 
 class SQLiteMemoryStorage:
@@ -261,6 +262,39 @@ class SQLiteMemoryStorage:
         instance = cls.__new__(cls)
         instance.path = path
         return instance
+
+    def has_active_task_decision(self, project: str, task_id: str) -> bool:
+        """Find an exact predecessor key across its historical dispatch scopes.
+
+        Attribution can gain a provider session after the decision is captured;
+        its current scope is therefore not a reliable lookup scope.
+        """
+        key = f"task:{task_id}:decision"
+        uri = Path(self.path).resolve().as_uri() + "?mode=ro"
+        with closing(sqlite3.connect(
+            uri, uri=True, timeout=shadow_sqlite_timeout_seconds(),
+        )) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(adr001_memory)")}
+            clauses = [
+                "layer='decision'", "key=?",
+                "json_extract(scope,'$.project')=?",
+                "json_extract(scope,'$.task_id')=?",
+                "COALESCE(json_extract(scope,'$.fleet'),'')=''",
+            ]
+            if "superseded_by" in columns:
+                clauses.append("superseded_by IS NULL")
+            if "invalidated_at" in columns:
+                clauses.append("invalidated_at IS NULL")
+            rows = db.execute(
+                "SELECT value FROM adr001_memory WHERE " + " AND ".join(clauses),
+                (key, project, task_id),
+            )
+            for (raw,) in rows:
+                value = json.loads(raw)
+                if not any(value.get(flag) for flag in (
+                    "invalidated_at", "superseded_at", "superseded")):
+                    return True
+            return False
 
     @staticmethod
     def _migrate_legacy_generation_zero(db: sqlite3.Connection) -> None:

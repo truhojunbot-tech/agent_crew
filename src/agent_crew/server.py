@@ -449,30 +449,9 @@ def _lineage_recall_observation(storage, db_path: str, project: str,
     if storage is None:
         return None
     try:
-        with sqlite3.connect(db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            for task_id in predecessor_task_ids:
-                row = conn.execute(
-                    "SELECT t.context, a.worktree_path, a.provider_session_id, "
-                    "a.context_generation FROM tasks t LEFT JOIN task_attribution a "
-                    "ON a.task_id=t.task_id WHERE t.task_id=? AND t.project=?",
-                    (task_id, project),
-                ).fetchone()
-                context = json.loads(row["context"] or "{}") if row else {}
-                if not isinstance(context, dict):
-                    context = {}
-                scope = MemoryScope(
-                    project=project, task_id=task_id,
-                    issue=str(context.get("issue") or ""),
-                    worktree=str(row["worktree_path"] or "") if row else "",
-                    provider_session=str(row["provider_session_id"] or "") if row else "",
-                    context_generation=row["context_generation"] if row else None,
-                )
-                key = f"task:{task_id}:decision"
-                records = storage.retrieve(scope, exact_key=key)
-                if not any(record.key == key and record.layer == "decision"
-                           and record.scope.project == project for record in records):
-                    return False
+        for task_id in predecessor_task_ids:
+            if not storage.has_active_task_decision(project, task_id):
+                return False
         return True
     except Exception:
         logger.exception("dispatcher: exact lineage recall lookup failed for project=%s", project)
@@ -6583,16 +6562,33 @@ def create_app(
         # and its result is deliberately never assigned to `message`, `task`,
         # routing, retry, or context-policy state.  A provider failure is
         # converted to telemetry by `shadow_retrieve`, not an execution error.
+        # Recall requires the causal prev_task_id chain. Broad shadow retrieval
+        # also includes older completed tasks on the same PR; those are useful
+        # context but are not required decisions for this task (#342 E).
+        _lineage_known = False
+        try:
+            _causal_predecessors, _lineage_pr = await asyncio.to_thread(
+                task_lineage, db_path, task.task_id, include_same_pr=False)
+            _lineage_known = True
+        except Exception:
+            logger.exception("dispatcher: lineage lookup failed for %s", task.task_id)
+            _parent = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
+            _causal_predecessors = (_parent,) if isinstance(_parent, str) and _parent else ()
+            _lineage_pr = task.pr_number or (_ctx.get("pr_number") if isinstance(_ctx, dict) else None)
+        if _lineage_known and not _causal_predecessors:
+            try:
+                q().record_required_context_recalled(
+                    task.task_id, None, recall_not_applicable=True)
+            except Exception:
+                logger.exception("dispatcher: root recall evidence failed for %s", task.task_id)
         if (shadow_memory_enabled and not memory_enabled()) or _ranked_memory is not None:
             try:
                 try:
                     _predecessors, _lineage_pr = await asyncio.to_thread(
                         task_lineage, db_path, task.task_id)
                 except Exception:
-                    logger.exception("dispatcher: lineage lookup failed for %s", task.task_id)
-                    _parent = _ctx.get("prev_task_id") if isinstance(_ctx, dict) else None
-                    _predecessors = (_parent,) if isinstance(_parent, str) and _parent else ()
-                    _lineage_pr = task.pr_number or (_ctx.get("pr_number") if isinstance(_ctx, dict) else None)
+                    logger.exception("dispatcher: broad lineage lookup failed for %s", task.task_id)
+                    _predecessors = _causal_predecessors
                 _memory_request = MemoryRequest(
                         project=_project,
                         task_id=task.task_id,
@@ -6657,7 +6653,7 @@ def create_app(
                                 getattr(_memory_provider, "storage", None))
                     _recall = await asyncio.to_thread(
                         _lineage_recall_observation, _storage, db_path, _project,
-                        _predecessors)
+                        _causal_predecessors)
                     q().record_required_context_recalled(task.task_id, _recall)
                 except Exception:
                     logger.exception("dispatcher: lineage recall telemetry failed for %s",
