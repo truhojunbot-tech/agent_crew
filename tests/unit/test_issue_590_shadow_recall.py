@@ -163,7 +163,7 @@ def test_required_context_recalled_is_one_zero_or_null(tmp_path):
 def test_dispatch_persists_shadow_lineage_observation(tmp_path, monkeypatch,
                                                        unused_tcp_port):
     import agent_crew.server as server
-    monkeypatch.setattr(server, "task_lineage", lambda _db, _task: (("prior",), None))
+    monkeypatch.setattr(server, "task_lineage", lambda _db, _task, **_kw: (("prior",), None))
     provider = FakeMemoryProvider([MemoryItem(
         "task:prior:decision", "project-a", "decision", "prior-source")])
     case = tmp_path / "dispatch"
@@ -179,7 +179,7 @@ def test_dispatch_persists_exact_lineage_recall(tmp_path, monkeypatch,
                                                 expected):
     import agent_crew.server as server
 
-    monkeypatch.setattr(server, "task_lineage", lambda _db, _task: (("prior",), None))
+    monkeypatch.setattr(server, "task_lineage", lambda _db, _task, **_kw: (("prior",), None))
     storage = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
     if decision_present:
         storage.put(MemoryRecord(

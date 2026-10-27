@@ -34,7 +34,7 @@ def test_exact_lineage_key_wins_when_ranked_result_omits_it(tmp_path):
 
     def broken(*_args, **_kwargs):
         raise OSError('store unavailable')
-    storage.retrieve = broken
+    storage.has_active_task_decision = broken
     assert _lineage_recall_observation(storage, queue.db_path, 'agent_crew', ('pred',)) is None
 
 
