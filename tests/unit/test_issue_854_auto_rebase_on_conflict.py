@@ -89,6 +89,32 @@ def test_conflict_enqueues_one_rebase_round_without_failure_notice(harness):
     assert notices == []
 
 
+@pytest.mark.parametrize("pr_state", ["merged", "closed", None])
+def test_terminal_or_unknown_pr_does_not_enqueue_rebase(harness, monkeypatch, pr_state):
+    import agent_crew.github as github
+
+    client, queue, notices, _ = harness
+    monkeypatch.setattr(github, "pr_state", lambda *args, **kwargs: pr_state)
+
+    response = _conflict(client)
+
+    assert response.status_code == 200, response.text
+    assert _rebase_rounds(queue) == []
+    assert len(notices) == 1 and "failed_no_successor" in notices[0]
+
+
+@pytest.mark.parametrize("current_head", [HEAD_2, ""])
+def test_moved_or_unreadable_pr_head_does_not_enqueue_rebase(harness, current_head):
+    client, queue, notices, head = harness
+    head["sha"] = current_head
+
+    response = _conflict(client)
+
+    assert response.status_code == 200, response.text
+    assert _rebase_rounds(queue) == []
+    assert len(notices) == 1 and "failed_no_successor" in notices[0]
+
+
 def test_second_conflict_on_rebase_lineage_notifies_without_new_round(harness):
     client, queue, notices, head = harness
     assert _conflict(client).status_code == 200
