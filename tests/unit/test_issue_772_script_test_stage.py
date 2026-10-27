@@ -244,7 +244,7 @@ def test_many_new_failures_do_not_start_unbounded_reruns(project, tmp_path):
     repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
     base_sha, _ = script_tester.resolve_refs(
         repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
-    ids = [f"tests/test_b.py::test_case_{i}" for i in range(3)]
+    ids = [f"tests/test_b.py::test_case_{i}" for i in range(6)]
     calls = []
 
     def runner(command, cwd, timeout_s, *, env=None):
@@ -325,8 +325,85 @@ def test_isolated_reruns_share_bounded_watchdog_allowance(project, tmp_path):
         cache_dir=str(tmp_path / "cache"), runner=runner)
     assert record["outcome"] == "FAILED"
     assert len(rerun_timeouts) == 2
-    assert all(0 < timeout <= 300 for timeout in rerun_timeouts)
-    assert record["rerun_budget_s"] <= 300
+    assert all(0 < timeout <= 600 for timeout in rerun_timeouts)
+    assert record["rerun_budget_s"] == 600
+
+
+@pytest.mark.parametrize("candidate_count", [3, 4, 5])
+def test_default_limit_reruns_three_through_five_candidates(project, tmp_path, candidate_count):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    ids = [f"tests/test_b.py::test_case_{i}" for i in range(candidate_count)]
+    calls = []
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        calls.append(command)
+        if command != PYTEST:
+            return script_tester.RunOutcome(exit_code=0)
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=ids)
+        return script_tester.RunOutcome(exit_code=0)
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": PYTEST}, cache_dir=str(tmp_path / "cache"), runner=runner)
+    assert record["outcome"] == "PASSED"
+    assert set(record["flaky"]) == set(ids)
+    assert len(calls) == candidate_count + 2
+    assert "reruns_skipped" not in record
+
+
+def test_rerun_limit_and_budget_config_from_env_and_state(monkeypatch, tmp_path, caplog):
+    state = {"test_command": PYTEST, "max_rerun_candidates": 4,
+             "rerun_budget_s": 240}
+    config = script_tester.resolve_test_config(state, str(tmp_path))
+    assert config.max_rerun_candidates == 4
+    assert config.rerun_budget_s == 240
+    monkeypatch.setenv("AGENT_CREW_SCRIPT_TEST_MAX_RERUN_CANDIDATES", "3")
+    monkeypatch.setenv("AGENT_CREW_SCRIPT_TEST_RERUN_BUDGET_S", "90.5")
+    config = script_tester.resolve_test_config(state, str(tmp_path))
+    assert config.max_rerun_candidates == 3
+    assert config.rerun_budget_s == 90.5
+    monkeypatch.setenv("AGENT_CREW_SCRIPT_TEST_MAX_RERUN_CANDIDATES", "0")
+    monkeypatch.setenv("AGENT_CREW_SCRIPT_TEST_RERUN_BUDGET_S", "nan")
+    with caplog.at_level("WARNING"):
+        config = script_tester.resolve_test_config(state, str(tmp_path))
+    assert config.max_rerun_candidates == 5
+    assert config.rerun_budget_s == 600
+    assert "AGENT_CREW_SCRIPT_TEST_MAX_RERUN_CANDIDATES" in caplog.text
+    assert "AGENT_CREW_SCRIPT_TEST_RERUN_BUDGET_S" in caplog.text
+    monkeypatch.delenv("AGENT_CREW_SCRIPT_TEST_MAX_RERUN_CANDIDATES")
+    monkeypatch.delenv("AGENT_CREW_SCRIPT_TEST_RERUN_BUDGET_S")
+    with caplog.at_level("WARNING"):
+        config = script_tester.resolve_test_config(
+            {"max_rerun_candidates": "many", "rerun_budget_s": -1}, str(tmp_path))
+    assert (config.max_rerun_candidates, config.rerun_budget_s) == (5, 600)
+    assert "max_rerun_candidates" in caplog.text
+    assert "rerun_budget_s" in caplog.text
+
+
+def test_configured_rerun_budget_limits_attempt_time(project, tmp_path, monkeypatch):
+    repo, head_sha = project(GREEN, {"tests/test_b.py": "def test_two():\n    assert False\n"})
+    base_sha, _ = script_tester.resolve_refs(
+        repo, base_branch="main", pr_number=PR, head_sha=head_sha, branch="feature")
+    node = "tests/test_b.py::test_two"
+    timeouts = []
+    monkeypatch.setenv("AGENT_CREW_SCRIPT_TEST_RERUN_BUDGET_S", "0.05")
+
+    def runner(command, cwd, timeout_s, *, env=None):
+        if command != PYTEST:
+            timeouts.append(timeout_s)
+            return script_tester.RunOutcome(exit_code=0)
+        if "test_b.py" in os.listdir(os.path.join(cwd, "tests")):
+            return script_tester.RunOutcome(exit_code=1, failing_ids=[node])
+        return script_tester.RunOutcome(exit_code=0)
+
+    record = script_tester.run_script_test(
+        repo, base_sha=base_sha, head_sha=head_sha,
+        state={"test_command": PYTEST}, cache_dir=str(tmp_path / "cache"), runner=runner)
+    assert record["rerun_budget_s"] == 0.05
+    assert len(timeouts) == 1 and 0 < timeouts[0] <= 0.05
 
 
 def test_unjudged_rerun_is_incomplete_and_notifies_once(project, server, monkeypatch):
@@ -393,11 +470,13 @@ def test_merge_conflict_fails_on_the_rebased_head(project, tmp_path):
 
 
 def test_config_default_and_timeout(tmp_path):
-    assert script_tester.resolve_test_config({}, str(tmp_path)) == (None, 1800.0)
+    assert script_tester.resolve_test_config({}, str(tmp_path)) == (
+        None, 1800.0, 5, 600.0)
     (tmp_path / "tests").mkdir()
     assert script_tester.resolve_test_config({}, str(tmp_path))[0] == "python3 -m pytest -q"
     assert script_tester.resolve_test_config(
-        {"test_command": "", "test_timeout_s": 60}, str(tmp_path)) == (None, 60.0)
+        {"test_command": "", "test_timeout_s": 60}, str(tmp_path)) == (
+            None, 60.0, 5, 600.0)
     assert script_tester.resolve_test_config(
         {"test_command": "make test"}, str(tmp_path))[0] == "make test"
 

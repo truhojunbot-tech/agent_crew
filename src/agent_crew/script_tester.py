@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import re
 import shlex
@@ -28,7 +29,7 @@ import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import NamedTuple, Optional
 
 from agent_crew.protocol import TaskResult
 
@@ -52,8 +53,35 @@ _COUNT_RE = re.compile(
 _TEST_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 _PRIVATE_ENV_KEY = re.compile(
     r"(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL|AUTH|PRIVATE_KEY)", re.I)
-_MAX_RERUN_CANDIDATES = 2
-_RERUN_BUDGET_S = 300.0  # watchdog allows 600s beyond the two suite runs
+_MAX_RERUN_CANDIDATES = 5
+_RERUN_BUDGET_S = 600.0  # watchdog allows 600s beyond the two suite runs
+
+
+class TestConfig(NamedTuple):
+    command: Optional[str]
+    timeout_s: float
+    max_rerun_candidates: int
+    rerun_budget_s: float
+
+
+def _rerun_limit(state: Mapping, key: str, env_key: str, default: int | float,
+                 *, integer: bool) -> int | float:
+    raw = os.environ.get(env_key) if env_key in os.environ else state.get(key)
+    if raw is None and env_key not in os.environ and key not in state:
+        return default
+    try:
+        if isinstance(raw, bool):
+            raise ValueError("boolean is not a limit")
+        value = int(raw) if integer else float(raw)
+        if integer and str(raw).strip() != str(value):
+            raise ValueError("not an integer")
+        if value <= 0 or not math.isfinite(value):
+            raise ValueError("limit must be positive and finite")
+        return value
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("invalid %s=%r; using default %s", env_key if env_key in os.environ
+                       else key, raw, default)
+        return default
 
 
 @dataclass
@@ -82,13 +110,19 @@ class RunOutcome:
                    duration_s=float(data.get("duration_s") or 0.0))
 
 
-def resolve_test_config(state: Optional[Mapping], checkout: str) -> tuple[Optional[str], float]:
-    """Return ``(command, timeout_s)`` for a project.
+def resolve_test_config(state: Optional[Mapping], checkout: str) -> TestConfig:
+    """Return the suite command, timeout, and isolated rerun limits.
 
     ``state.test_command`` wins; an explicit ``""``/``null`` opts out. With the
     key absent, ``python3 -m pytest -q`` applies when ``tests/`` exists.
     """
     state = state if isinstance(state, Mapping) else {}
+    max_candidates = _rerun_limit(
+        state, "max_rerun_candidates", "AGENT_CREW_SCRIPT_TEST_MAX_RERUN_CANDIDATES",
+        _MAX_RERUN_CANDIDATES, integer=True)
+    rerun_budget = _rerun_limit(
+        state, "rerun_budget_s", "AGENT_CREW_SCRIPT_TEST_RERUN_BUDGET_S",
+        _RERUN_BUDGET_S, integer=False)
     timeout = DEFAULT_TEST_TIMEOUT_S
     raw_timeout = state.get("test_timeout_s")
     if not isinstance(raw_timeout, bool):
@@ -101,10 +135,10 @@ def resolve_test_config(state: Optional[Mapping], checkout: str) -> tuple[Option
     if "test_command" in state:
         command = state.get("test_command")
         command = command.strip() if isinstance(command, str) else ""
-        return (command or None), timeout
+        return TestConfig(command or None, timeout, max_candidates, rerun_budget)
     if os.path.isdir(os.path.join(checkout, "tests")):
-        return DEFAULT_TEST_COMMAND, timeout
-    return None, timeout
+        return TestConfig(DEFAULT_TEST_COMMAND, timeout, max_candidates, rerun_budget)
+    return TestConfig(None, timeout, max_candidates, rerun_budget)
 
 
 def _after_balanced_group(line: str, start: int) -> Optional[int]:
@@ -172,7 +206,7 @@ def parse_test_output(text: str) -> tuple[dict, list]:
 
 def watchdog_timeout_seconds(state: Optional[Mapping], ordinary_timeout_s: float) -> float:
     """Bound both possible suite runs, plus fetch/checkout setup time."""
-    _, suite_timeout_s = resolve_test_config(state, "")
+    suite_timeout_s = resolve_test_config(state, "").timeout_s
     return max(ordinary_timeout_s, 2 * suite_timeout_s + 600.0)
 
 
@@ -384,7 +418,8 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                     "pre_existing": [], "new_failures": [], "flaky": [], "reruns": {}}
     try:
         with Checkout(repo, base_sha, head_sha) as checkout:
-            command, timeout_s = resolve_test_config(state, checkout)
+            config = resolve_test_config(state, checkout)
+            command, timeout_s = config.command, config.timeout_s
             record.update(command=command, timeout_s=timeout_s)
             if not command:
                 record["outcome"] = SKIPPED_NO_TEST_COMMAND
@@ -410,7 +445,7 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                 candidates = [i for i in head.failing_ids if i not in base_ids]
                 if head.exit_code == 1:
                     skip_reason = ("script_test_rerun_limit"
-                                   if len(candidates) > _MAX_RERUN_CANDIDATES else None)
+                                   if len(candidates) > config.max_rerun_candidates else None)
                     rerun_commands = ({
                         node_id: _isolated_rerun_command(command, node_id)
                         for node_id in candidates
@@ -423,7 +458,7 @@ def run_script_test(repo: str, *, base_sha: str, head_sha: str, state: Optional[
                         # flake checks must not suppress its new failures.
                         record["reruns_skipped"] = skip_reason
                     else:
-                        record["rerun_budget_s"] = min(_RERUN_BUDGET_S, timeout_s)
+                        record["rerun_budget_s"] = min(config.rerun_budget_s, timeout_s)
                         rerun_deadline = time.monotonic() + record["rerun_budget_s"]
                         for node_id in candidates:
                             attempts = record["reruns"][node_id] = []
