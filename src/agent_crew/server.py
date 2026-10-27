@@ -9,6 +9,7 @@ import math
 import os
 import random
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -114,6 +115,40 @@ _unclaimed_lock_notices: set[tuple[str, str, str]] = set()
 _unclaimed_lock_notices_guard = threading.Lock()
 
 
+def coordinator_notice_sink() -> str:
+    """Report the configured delivery route without exposing the command."""
+    raw = os.getenv("AGENT_CREW_COORDINATOR_NOTICE_CMD", "")
+    if raw.strip():
+        try:
+            if shlex.split(raw):
+                return "cmd"
+        except ValueError:
+            pass
+    return "telegram" if os.getenv("TELEGRAM_CHAT_ID", "").strip() else "none"
+
+
+def _deliver_coordinator_notice(message: str) -> bool:
+    """Try the configured command first, then the existing Telegram route."""
+    raw = os.getenv("AGENT_CREW_COORDINATOR_NOTICE_CMD", "")
+    if raw.strip():
+        try:
+            argv = shlex.split(raw)
+            if argv:
+                result = subprocess.run(argv, input=message, text=True,
+                                        timeout=15, capture_output=True)
+                if result.returncode == 0:
+                    return True
+                logger.warning("coordinator notice command exited with rc=%s",
+                               result.returncode)
+        except (ValueError, OSError, subprocess.TimeoutExpired):
+            logger.exception("coordinator notice command failed")
+    from agent_crew.notify import notify_console, notify_telegram
+    delivered = bool(notify_telegram(message))
+    if not delivered:
+        notify_console(message)
+    return delivered
+
+
 def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
                             detail: str = "", notify_fn=None, *,
                             fallback_on_claim_lock: bool = False) -> None:
@@ -143,10 +178,7 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
         if notify_fn is not None:
             delivered = bool(notify_fn(message))
         else:
-            from agent_crew.notify import notify_console, notify_telegram
-            delivered = bool(notify_telegram(message))
-            if not delivered:
-                notify_console(message)
+            delivered = _deliver_coordinator_notice(message)
         retryable = queue.finish_coordinator_notice(task_id, kind, delivered=delivered)
         claimed = False
         if not delivered:
@@ -172,10 +204,7 @@ def coordinator_notice_once(queue: TaskQueue, task_id: str, kind: str,
                     if notify_fn is not None:
                         delivered = bool(notify_fn(message))
                     else:
-                        from agent_crew.notify import notify_console, notify_telegram
-                        delivered = bool(notify_telegram(message))
-                        if not delivered:
-                            notify_console(message)
+                        delivered = _deliver_coordinator_notice(message)
                     if not delivered:
                         with _unclaimed_lock_notices_guard:
                             _unclaimed_lock_notices.discard(emergency_key)
@@ -3809,6 +3838,8 @@ def create_app(
             db_path=db_path, project=project, logger=logger)
         state["cea_wiring"] = _cea_wiring
         state["queue"] = TaskQueue(db_path, cea_providers=_cea_wiring.providers)
+        if coordinator_notice_sink() == "none":
+            logger.error("coordinator notice sink is none; stalled lineages cannot notify a coordinator")
         # #248: stamp the build into the durable event stream at startup, so a
         # production before/after cohort can be cut on the PROCESS boundary
         # instead of on a GitHub merge time. #247 showed those are not the same
@@ -8346,8 +8377,14 @@ def create_app(
             # /health is also used before TestClient enters the lifespan and
             # must remain a liveness probe if its queue is unavailable.
             _work_intents_out = {"error": f"{type(exc).__name__}: {exc}"}
+        try:
+            _notices_gave_up = q().coordinator_notices_gave_up_24h()
+        except Exception:
+            _notices_gave_up = None
         return {
             "status": "ok",
+            "coordinator_notice_sink": coordinator_notice_sink(),
+            "coordinator_notices_gave_up_24h": _notices_gave_up,
             "schema_version": QUEUE_SCHEMA_VERSION,
             "work_intents": _work_intents_out,
             "project": ident["project"],

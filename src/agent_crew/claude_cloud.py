@@ -819,12 +819,15 @@ def _fail_closed_dispatch(queue: TaskQueue, task: TaskRequest, task_type: str,
     queue.record_cloud_cost(task.task_id, context.get("cloud_credit_used_before"),
                             None, None, status="UNKNOWN_NO_FRESH_READING", overlaps=[])
     result = TaskResult(task_id=task.task_id, status="failed", summary=reason[:2000])
+    fallback_created = False
     try:
         from agent_crew.pipeline import auto_fallback_failed_task
-        auto_fallback_failed_task(queue, task.task_id, result, task_type)
+        fallback_created = auto_fallback_failed_task(queue, task.task_id, result, task_type)
     except Exception:
         logger.exception("claude_cloud: fallback failed for %s", task.task_id)
     if retryable:
+        if not fallback_created:
+            _enqueue_cloud_retry_once(queue, task, reason)
         from agent_crew.server import coordinator_notice_once
         coordinator_notice_once(queue, task.task_id, "cloud_submit_timeout",
                                 f"retryable cloud submit failure: {reason[:300]}")
@@ -838,7 +841,22 @@ def _requeue_stale_cloud_once(queue: TaskQueue, task: TaskRequest,
     context = task.context if isinstance(task.context, dict) else {}
     if context.get("cloud_stale_retry"):
         return None
+    from agent_crew.pipeline import MAX_TASK_RETRIES
+    try:
+        attempt = int(context.get("retry_attempt") or 0)
+    except (TypeError, ValueError):
+        return None
+    if attempt >= MAX_TASK_RETRIES:
+        return None
+    _fail_closed_dispatch(queue, task, task.task_type, reason)
+    return _enqueue_cloud_retry_once(queue, task, reason, stale=True)
+
+
+def _enqueue_cloud_retry_once(queue: TaskQueue, task: TaskRequest,
+                              reason: str, *, stale: bool = False) -> Optional[str]:
+    """Construct one same-role retry for a closed cloud task."""
     from agent_crew.pipeline import MAX_TASK_RETRIES, successor_context
+    context = task.context if isinstance(task.context, dict) else {}
     try:
         attempt = int(context.get("retry_attempt") or 0)
     except (TypeError, ValueError):
@@ -846,7 +864,6 @@ def _requeue_stale_cloud_once(queue: TaskQueue, task: TaskRequest,
     if attempt >= MAX_TASK_RETRIES:
         return None
     retry_id = f"retry-{task.task_id}-a{attempt + 1}"
-    _fail_closed_dispatch(queue, task, task.task_type, reason)
     retry_context = {key: value for key, value in successor_context(context).items()
                      if not key.startswith("cloud_")}
     retry_context.update({
@@ -855,8 +872,9 @@ def _requeue_stale_cloud_once(queue: TaskQueue, task: TaskRequest,
         "retry_of": task.task_id,
         "retry_attempt": attempt + 1,
         "lineage_root_task_id": context.get("lineage_root_task_id") or task.task_id,
-        "cloud_stale_retry": True,
     })
+    if stale:
+        retry_context["cloud_stale_retry"] = True
     retry = TaskRequest(
         task_id=retry_id, task_type=task.task_type,
         description=task.description, branch=task.branch,
@@ -869,13 +887,15 @@ def _requeue_stale_cloud_once(queue: TaskQueue, task: TaskRequest,
     except TaskAlreadyExistsError:
         pass  # A repeated reconciliation uses the same successor id.
     except Exception:
-        logger.exception("claude_cloud: stale retry enqueue failed for %s", task.task_id)
+        logger.exception("claude_cloud: retry enqueue failed for %s", task.task_id)
         from agent_crew.server import coordinator_notice_once
-        coordinator_notice_once(queue, task.task_id, "cloud_stale_no_successor",
+        notice_kind = "cloud_stale_no_successor" if stale else "cloud_submit_no_successor"
+        coordinator_notice_once(queue, task.task_id, notice_kind,
                                 f"lineage={retry_context['lineage_root_task_id']} "
                                 f"missing_retry={retry_id} reason={reason[:200]}")
         return ""  # The original was closed, but its successor could not be queued.
-    queue.patch_context(task.task_id, {"cloud_stale_retry_task_id": retry_id})
+    queue.patch_context(task.task_id, {
+        "cloud_stale_retry_task_id" if stale else "cloud_submit_retry_task_id": retry_id})
     return retry_id
 
 
