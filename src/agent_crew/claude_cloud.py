@@ -596,12 +596,13 @@ class CloudDispatchOutcome:
 
 
 def _resolve_resume_session_id(queue: TaskQueue, task: TaskRequest) -> Optional[str]:
-    """Walk the SAME lineage chain ``pipeline._lineage_root_task_id`` already
-    walks (``context.prev_task_id``) to find the original implement task for
-    this fix, then read ITS persisted cloud session id. Reuses lineage
-    tracking rather than reimplementing it; returns ``None`` (fresh session)
-    on any lookup failure — a resume is an optimization, not a requirement.
+    """Resume a fix only from its cloud implementer's own session.
+
+    Reviews always start independently, and another provider's session ID is
+    never a Claude Cloud resume target. Lookup failure starts a fresh session.
     """
+    if task.task_type != "implement":
+        return None
     ctx = task.context if isinstance(task.context, dict) else {}
     if ctx.get("cloud_stale_retry"):
         return None  # The predecessor's session was unobservable and must not be resumed.
@@ -620,6 +621,8 @@ def _resolve_resume_session_id(queue: TaskQueue, task: TaskRequest) -> Optional[
     if root_id == task.task_id:
         return None
     attribution = queue.get_attribution(root_id)
+    if (attribution or {}).get("agent") != CLOUD_PROVIDER_NAME:
+        return None
     session_id = (attribution or {}).get("provider_session_id") or ""
     return session_id or None
 
