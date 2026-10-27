@@ -26,6 +26,9 @@ def test_root_dispatch_marks_recall_not_applicable_through_approve(
     dispatch_evidence = _evidence(queue, "shadow-322")
     assert dispatch_evidence["recall_not_applicable"] is True
     assert dispatch_evidence["required_context_recalled"] is None
+    dispatch_attribution = queue.get_attribution("shadow-322")
+    assert dispatch_attribution["recall_not_applicable"] == 1
+    assert dispatch_attribution["required_context_recalled"] is None
 
     # The fake dispatched worker exits without a result, so complete a second
     # root through the ordinary queue result path to exercise evidence refresh.
