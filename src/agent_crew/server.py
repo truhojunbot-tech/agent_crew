@@ -7321,6 +7321,10 @@ def create_app(
                                 if _skip not in ("daily_cap", "at_capacity") and not _skip.startswith("cli_unsupported:"):
                                     continue
                                 _cloud_local_fallback = True
+                        if _cloud_local_fallback and not worktree_map.get("reviewer"):
+                            # Cloud admission left the review pending. Without a
+                            # local checkout, dequeuing it would fail no_worktree.
+                            continue
                         _default_role = _worker_roles[0] if _worker_roles else ""
                         task = None
                         for _candidate_role in _worker_roles:
