@@ -2,6 +2,7 @@
 
 import json
 import sqlite3
+import threading
 import time
 from types import SimpleNamespace
 
@@ -26,14 +27,15 @@ def _cloud_checkout_contract(monkeypatch):
                         lambda project, repo, state_path=None: ("/fixture/claude", repo))
 
 
-def _state(tmp_path, reviewer_agent="claude_cloud"):
+def _state(tmp_path, reviewer_agent="claude_cloud", reviewer_worktree=True):
     roles = []
     for role, agent in (("implementer", "codex"), ("reviewer", reviewer_agent),
                         ("tester", "gemini")):
         worktree = tmp_path / f"wt_{role}"
         worktree.mkdir()
         (worktree / ".git").mkdir()
-        roles.append({"role": role, "agent": agent, "worktree": str(worktree)})
+        if role != "reviewer" or reviewer_worktree:
+            roles.append({"role": role, "agent": agent, "worktree": str(worktree)})
     path = tmp_path / "state.json"
     path.write_text(json.dumps({"project": "agent_crew", "role_agents": {
         "implementer": "codex", "reviewer": reviewer_agent, "tester": "gemini"},
@@ -443,3 +445,62 @@ def test_headless_cloud_skip_dispatches_local_reviewer(tmp_path, monkeypatch, re
     with TestClient(app):
         _wait_for(lambda: bool(agents))
     assert agents[0] == "claude"
+
+
+def test_cloud_capacity_without_reviewer_worktree_keeps_review_pending(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_MAX_CONCURRENCY", "1")
+    attempted_twice = threading.Event()
+    attempts = []
+
+    def at_capacity(*_args, **_kwargs):
+        attempts.append(1)
+        if len(attempts) >= 2:
+            attempted_twice.set()
+        return SimpleNamespace(skipped_reason="at_capacity")
+
+    monkeypatch.setattr(cloud, "dispatch_cloud_for_role", at_capacity)
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_worktree=False),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        assert attempted_twice.wait(4)
+        assert queue.get_task("review-cloud").status == "pending"
+        assert queue.get_result("review-cloud") is None
+
+
+@pytest.mark.parametrize("reason", ["daily_cap", "cli_unsupported:probe failed"])
+def test_nontransient_cloud_skip_without_reviewer_worktree_fails_visibly(
+        tmp_path, monkeypatch, reason):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "0")
+    monkeypatch.setattr(cloud, "dispatch_cloud_for_role",
+                        lambda *_args, **_kwargs: SimpleNamespace(skipped_reason=reason))
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_worktree=False),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: queue.get_task("review-cloud").status == "failed")
+    assert queue.get_result("review-cloud").error_info["reason"] == "no_worktree"
+
+
+def test_shadow_without_reviewer_worktree_fails_visibly(tmp_path, monkeypatch):
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue_review(queue)
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "1")
+    monkeypatch.setenv("AGENT_CREW_DISPATCH_INTERVAL", ".02")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_ENABLED", "1")
+    monkeypatch.setenv("AGENT_CREW_CLOUD_SHADOW", "1")
+    monkeypatch.setattr(cloud, "launch_shadow_review", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cloud, "reconcile_shadow_reviews", lambda *_args: None)
+    app = create_app(queue._db_path, state_path=_state(tmp_path, reviewer_worktree=False),
+                     watchdog_disabled=True, anomaly_disabled=True)
+    with TestClient(app):
+        _wait_for(lambda: queue.get_task("review-cloud").status == "failed")
+    assert queue.get_result("review-cloud").error_info["reason"] == "no_worktree"
