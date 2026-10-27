@@ -684,9 +684,24 @@ def independent_review_for_head(queue, pr_number: int, repo: str,
     if reviewed_sha.lower() != head:
         return "", "", "", f"PR head {head[:7]} differs from reviewed SHA {reviewed_sha[:7]}"
     reviewer = queue.get_attribution(latest.task_id) or {}
-    parent_id = (latest.context or {}).get("prev_task_id")
-    parent = queue.get_task(parent_id) if parent_id else None
-    author = queue.get_attribution(parent_id) if parent and parent.task_type == "implement" else {}
+    author = {}
+    current = latest
+    seen = {latest.task_id}
+    for _ in range(10):
+        context = current.context if isinstance(current.context, dict) else {}
+        parent_id = next((context[key] for key in
+                          ("prev_task_id", "retry_of", "original_task_id")
+                          if isinstance(context.get(key), str) and context[key]), None)
+        if not parent_id or parent_id in seen:
+            break
+        seen.add(parent_id)
+        parent = queue.get_task(parent_id)
+        if parent is None:
+            break
+        if parent.task_type == "implement":
+            author = queue.get_attribution(parent_id) or {}
+            break
+        current = parent
     reviewer_agent, author_agent = reviewer.get("agent"), (author or {}).get("agent")
     if not reviewer_agent or not author_agent:
         return "", "", "", "author or reviewer attribution unavailable"
