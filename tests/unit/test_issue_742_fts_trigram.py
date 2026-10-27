@@ -1,7 +1,7 @@
 """#742: migrate the existing ADR-001 index for Korean substring search."""
 import json
 import sqlite3
-import time
+
 import pytest
 
 from agent_crew.memory_hybrid import HybridMemoryStorage, ensure_index_schema
@@ -265,19 +265,76 @@ def test_short_only_terms_rank_lexical_hit_ahead_of_recent_noise(tmp_path):
     assert ranked[0]["key"] == "owner:short"
 
 
-def test_fts_definition_rebuild_rolls_back_as_one_unit(tmp_path):
+def test_fts_definition_swap_rolls_back_as_one_unit(tmp_path):
     path = tmp_path / "memory.db"
     SQLiteMemoryStorage(str(path))
-    with sqlite3.connect(path) as db:
+    class FailSwap(sqlite3.Connection):
+        fail_swap = True
+
+        def execute(self, sql, *args):
+            if self.fail_swap and sql.startswith("ALTER TABLE adr001_fts_new RENAME"):
+                raise sqlite3.OperationalError("injected swap failure")
+            return super().execute(sql, *args)
+
+    with sqlite3.connect(path, factory=FailSwap) as db:
         db.execute("CREATE VIRTUAL TABLE adr001_fts USING fts5(layer,key,body)")
         db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
                    "VALUES ('episodic','owner:korean',?,?,1,1)",
                    (json.dumps({"text": "토큰노믹스 게이트 측정"}), json.dumps({"project": "agent_crew"})))
         db.commit()
-        ensure_index_schema(db)
+        with pytest.raises(sqlite3.OperationalError, match="injected swap failure"):
+            ensure_index_schema(db)
         db.rollback()
         assert "trigram" not in db.execute(
             "SELECT sql FROM sqlite_master WHERE name='adr001_fts'").fetchone()[0]
+        db.fail_swap = False
         ensure_index_schema(db)
         db.commit()
         assert db.execute("SELECT key FROM adr001_fts WHERE adr001_fts MATCH '노믹스'").fetchone()[0] == "owner:korean"
+
+
+@pytest.mark.parametrize("stage", ["adr001_short_fts_new", "adr001_fts_new"])
+def test_rebuild_mirrors_concurrent_write_before_swap(tmp_path, stage):
+    path = tmp_path / "memory.db"
+    SQLiteMemoryStorage(str(path))
+
+    class WriteDuringStage(sqlite3.Connection):
+        wrote = False
+
+        def commit(self):
+            super().commit()
+            if (not self.wrote and self.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name=?", (stage,)).fetchone()):
+                self.wrote = True
+                with sqlite3.connect(path) as other:
+                    other.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                                  "VALUES ('episodic','owner:concurrent',?,?,1,2)",
+                                  (json.dumps({"text": "동시 기록확인"}),
+                                   json.dumps({"project": "agent_crew"})))
+
+    with sqlite3.connect(path, factory=WriteDuringStage) as db:
+        db.execute("CREATE VIRTUAL TABLE adr001_fts USING fts5(layer,key,body)")
+        db.execute("INSERT INTO adr001_memory(layer,key,value,scope,version,created) "
+                   "VALUES ('episodic','owner:old',?,?,1,1)",
+                   (json.dumps({"text": "기존 기록확인"}), json.dumps({"project": "agent_crew"})))
+        db.commit()
+        ensure_index_schema(db)
+        assert db.wrote
+        assert db.execute("SELECT key FROM adr001_fts WHERE adr001_fts MATCH '기록확인'").fetchall()
+        assert {row[0] for row in db.execute(
+            "SELECT key FROM adr001_fts WHERE adr001_fts MATCH '기록확인'")} == {
+                "owner:old", "owner:concurrent"}
+        assert db.execute("SELECT count(*) FROM adr001_short_fts").fetchone()[0] == 2
+
+
+def test_rebuild_finishes_retiring_old_table_after_restart(tmp_path):
+    path = tmp_path / "memory.db"
+    HybridMemoryStorage(str(path))
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE VIRTUAL TABLE adr001_fts_old USING fts5(layer,key,body)")
+        db.execute("INSERT INTO adr001_fts_old(rowid,layer,key,body) "
+                   "VALUES (1,'episodic','stale','stale')")
+        db.commit()
+        ensure_index_schema(db)
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts_old'").fetchone() is None
+        assert db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_fts'").fetchone()

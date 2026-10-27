@@ -82,6 +82,106 @@ _SHORT_FTS_DDL = ("CREATE VIRTUAL TABLE adr001_short_fts USING "
                   "fts5(key,body, tokenize='unicode61')")
 
 
+def _retire_fts_table(db: sqlite3.Connection, name: str) -> None:
+    """Clear an unused FTS table without one large DROP write transaction."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone() is None:
+        return
+    while True:
+        rowids = [row[0] for row in db.execute(
+            f"SELECT rowid FROM {name} LIMIT 256")]
+        if not rowids:
+            break
+        db.execute("BEGIN IMMEDIATE")
+        db.executemany(f"DELETE FROM {name} WHERE rowid=?",
+                       ((rowid,) for rowid in rowids))
+        db.commit()
+    db.execute(f"DROP TABLE {name}")
+    db.commit()
+
+
+def _stage_fts_rebuild(db: sqlite3.Connection, *, short: bool) -> None:
+    """Populate an FTS replacement with short write locks, then swap atomically.
+
+    Mirror triggers cover writes arriving while the existing table is still in
+    service. A restart discards an incomplete stage and builds it again.
+    """
+    name = "adr001_short_fts" if short else "adr001_fts"
+    stage = name + "_new"
+    old = name + "_old"
+    columns = "rowid,key,body" if short else "rowid,layer,key,body"
+    values = f"new.rowid,new.key,{_body_sql('new')}" if short else (
+        f"new.rowid,new.layer,new.key,{_body_sql('new')}")
+    source = f"m.rowid,m.key,{_body_sql('m')}" if short else (
+        f"m.rowid,m.layer,m.key,{_body_sql('m')}")
+    mirror = stage + "_mirror"
+    for suffix in ("ai", "au", "ad"):
+        db.execute(f"DROP TRIGGER IF EXISTS {mirror}_{suffix}")
+    db.commit()
+    _retire_fts_table(db, stage)
+    _retire_fts_table(db, old)
+    ddl = _SHORT_FTS_DDL if short else _FTS_DDL
+    db.execute(ddl.replace(name, stage, 1))
+    db.execute(f"CREATE TRIGGER {mirror}_ai AFTER INSERT ON adr001_memory BEGIN "
+               f"INSERT INTO {stage}({columns}) VALUES({values}); END")
+    db.execute(f"CREATE TRIGGER {mirror}_au AFTER UPDATE OF value ON adr001_memory BEGIN "
+               f"DELETE FROM {stage} WHERE rowid=old.rowid; "
+               f"INSERT INTO {stage}({columns}) VALUES({values}); END")
+    db.execute(f"CREATE TRIGGER {mirror}_ad AFTER DELETE ON adr001_memory BEGIN "
+               f"DELETE FROM {stage} WHERE rowid=old.rowid; END")
+    db.commit()
+
+    last = 0
+    while True:
+        row = db.execute("SELECT rowid FROM adr001_memory WHERE rowid>? "
+                         "ORDER BY rowid LIMIT 1 OFFSET 255", (last,)).fetchone()
+        if row is None:
+            row = db.execute("SELECT max(rowid) FROM adr001_memory WHERE rowid>?",
+                             (last,)).fetchone()
+        end = row[0] if row else None
+        if end is None:
+            break
+        # A mirrored insert/update can already have populated this row. Read
+        # the current source under the same write lock used for replacement.
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(f"DELETE FROM {stage} WHERE rowid>? AND rowid<=?", (last, end))
+        db.execute(f"INSERT INTO {stage}({columns}) SELECT {source} "
+                   "FROM adr001_memory m WHERE m.rowid>? AND m.rowid<=?",
+                   (last, end))
+        db.commit()
+        last = end
+
+    db.execute("BEGIN IMMEDIATE")
+    if short:
+        old_triggers = ("adr001_short_fts_ai", "adr001_short_fts_au",
+                        "adr001_short_fts_ad")
+    else:
+        old_triggers = ("adr001_fts_ai", "adr001_fts_au", "adr001_fts_ad")
+    for trigger in (*old_triggers, *(f"{mirror}_{s}" for s in ("ai", "au", "ad"))):
+        db.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (name,)).fetchone():
+        db.execute(f"ALTER TABLE {name} RENAME TO {old}")
+    db.execute(f"ALTER TABLE {stage} RENAME TO {name}")
+    if short:
+        db.execute("CREATE TRIGGER adr001_short_fts_ai AFTER INSERT ON adr001_memory BEGIN "
+                   "INSERT INTO adr001_short_fts(rowid,key,body) "
+                   f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
+        db.execute("CREATE TRIGGER adr001_short_fts_au AFTER UPDATE OF value ON adr001_memory BEGIN "
+                   "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; "
+                   "INSERT INTO adr001_short_fts(rowid,key,body) "
+                   f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
+        db.execute("CREATE TRIGGER adr001_short_fts_ad AFTER DELETE ON adr001_memory BEGIN "
+                   "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; END")
+    else:
+        db.execute("CREATE TRIGGER adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN "
+                   "DELETE FROM adr001_fts WHERE rowid=old.rowid; "
+                   "DELETE FROM adr001_vec WHERE rowid=old.rowid; "
+                   "DELETE FROM adr001_vec_gloss WHERE rowid=old.rowid; END")
+        db.execute(_FTS_AI_SQL)
+        db.execute(_FTS_AU_SQL)
+    db.commit()
+    _retire_fts_table(db, old)
+
+
 def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str) -> bool:
     row = db.execute("SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?",
                      (name,)).fetchone()
@@ -145,8 +245,9 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
     fts_changed = not fresh and "tokenize='trigram'" not in fts_row[0].lower()
     triggers_changed = any(_trigger_definition_changed(db, name, ddl) for name, ddl in (
         ("adr001_fts_ai", _FTS_AI_SQL), ("adr001_fts_au", _FTS_AU_SQL)))
-    if fresh:
-        db.execute(_FTS_DDL)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='trigger' "
+                  "AND name='adr001_fts_ad'").fetchone() is None:
+        triggers_changed = True
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec_gloss "
@@ -164,11 +265,6 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
           json_type(new.value,'$.superseded') IS NOT NULL OR
           json_type(new.value,'$.invalidated_at') IS NOT NULL
         BEGIN SELECT RAISE(ABORT,'legacy memory flags forbidden'); END;
-      CREATE TRIGGER IF NOT EXISTS adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN
-        DELETE FROM adr001_fts WHERE rowid=old.rowid;
-        DELETE FROM adr001_vec WHERE rowid=old.rowid;
-        DELETE FROM adr001_vec_gloss WHERE rowid=old.rowid;
-      END;
       CREATE TRIGGER IF NOT EXISTS adr001_fts_effectiveness_au
         AFTER UPDATE OF superseded_by,invalidated_at ON adr001_memory BEGIN
         DELETE FROM adr001_vec WHERE rowid=new.rowid;
@@ -183,59 +279,26 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
         DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid;
       END;
     """)
-    # Build the short-token companion in its own transaction. The trigram
-    # replacement below has its own rollback boundary and must not hold one
-    # write lock for both full-index backfills.
+    # Build each replacement while the old index remains available. Each
+    # chunk commits separately; only the final table/trigger swap is atomic.
     short_fresh = db.execute("SELECT 1 FROM sqlite_master WHERE name='adr001_short_fts'").fetchone() is None
-    if short_fresh:
-        db.execute(_SHORT_FTS_DDL)
-    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_ai "
-               "AFTER INSERT ON adr001_memory BEGIN "
-               "INSERT INTO adr001_short_fts(rowid,key,body) "
-               f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
-    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_au "
-               "AFTER UPDATE OF value ON adr001_memory BEGIN "
-               "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; "
-               "INSERT INTO adr001_short_fts(rowid,key,body) "
-               f"VALUES(new.rowid,new.key,{_body_sql('new')}); END")
-    db.execute("CREATE TRIGGER IF NOT EXISTS adr001_short_fts_ad "
-               "AFTER DELETE ON adr001_memory BEGIN "
-               "DELETE FROM adr001_short_fts WHERE rowid=old.rowid; END")
+    short_triggers_missing = any(db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+    ).fetchone() is None for name in (
+        "adr001_short_fts_ai", "adr001_short_fts_au", "adr001_short_fts_ad"))
     short_count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
-    if (short_fresh or
-            db.execute("SELECT count(*) FROM adr001_short_fts").fetchone()[0] != short_count):
-        db.execute("DELETE FROM adr001_short_fts")
-        db.execute("INSERT INTO adr001_short_fts(rowid,key,body) "
-                   "SELECT m.rowid,m.key," + _body_sql("m") + " FROM adr001_memory m")
     db.commit()
-    if fts_changed:
-        # The script above ends the legacy-column transaction. Replacing the
-        # table and its triggers in one write transaction keeps concurrent
-        # writers from observing an unindexed row.
-        db.execute("BEGIN IMMEDIATE")
-        for name in ("adr001_fts_ai", "adr001_fts_au", "adr001_fts_ad"):
-            db.execute(f"DROP TRIGGER IF EXISTS {name}")
-        db.execute("DROP TABLE adr001_fts")
-        db.execute(_FTS_DDL)
-        db.execute("""CREATE TRIGGER adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN
-            DELETE FROM adr001_fts WHERE rowid=old.rowid;
-            DELETE FROM adr001_vec WHERE rowid=old.rowid;
-        END;""")
+    # A process can stop after the atomic swap but before retiring the old
+    # table. Resume that bounded cleanup even when no rebuild is needed.
+    _retire_fts_table(db, "adr001_short_fts_old")
+    _retire_fts_table(db, "adr001_fts_old")
+    if (short_fresh or short_triggers_missing or
+            db.execute("SELECT count(*) FROM adr001_short_fts").fetchone()[0] != short_count):
+        _stage_fts_rebuild(db, short=True)
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
-    indexed = db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
+    indexed = 0 if fresh else db.execute("SELECT count(*) FROM adr001_fts").fetchone()[0]
     if fresh or fts_changed or triggers_changed or count != indexed:
-        db.execute("DELETE FROM adr001_fts")
-        db.execute("INSERT INTO adr001_fts(rowid,layer,key,body) "
-                   "SELECT m.rowid,m.layer,m.key," + _body_sql("m") + " FROM adr001_memory m")
-    if fts_changed or triggers_changed:
-        # executescript commits before it runs. Keep the old triggers until
-        # the rebuild starts, then swap them in that same transaction. A
-        # rollback leaves both the old body and old trigger definition, so
-        # the next initializer retries the rebuild.
-        db.execute("DROP TRIGGER IF EXISTS adr001_fts_ai")
-        db.execute("DROP TRIGGER IF EXISTS adr001_fts_au")
-        db.execute(_FTS_AI_SQL)
-        db.execute(_FTS_AU_SQL)
+        _stage_fts_rebuild(db, short=False)
 
 
 def _effective_sql(alias: str = "m") -> str:
