@@ -54,7 +54,7 @@ _TEST_ENV_KEYS = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
 _PRIVATE_ENV_KEY = re.compile(
     r"(?:TOKEN|SECRET|PASSWORD|API_KEY|CREDENTIAL|AUTH|PRIVATE_KEY)", re.I)
 _MAX_RERUN_CANDIDATES = 5
-_RERUN_BUDGET_S = 600.0  # watchdog allows 600s beyond the two suite runs
+_RERUN_BUDGET_S = 600.0  # watchdog adds this capped budget plus checkout allowance
 
 
 class TestConfig(NamedTuple):
@@ -205,9 +205,20 @@ def parse_test_output(text: str) -> tuple[dict, list]:
 
 
 def watchdog_timeout_seconds(state: Optional[Mapping], ordinary_timeout_s: float) -> float:
-    """Bound both possible suite runs, plus fetch/checkout setup time."""
-    suite_timeout_s = resolve_test_config(state, "").timeout_s
-    return max(ordinary_timeout_s, 2 * suite_timeout_s + 600.0)
+    """Bound both suite runs, isolated reruns, and fetch/checkout setup."""
+    config = resolve_test_config(state, "")
+    rerun_budget_s = config.rerun_budget_s
+    if isinstance(state, Mapping) and "script_test_rerun_budget_s" in state:
+        try:
+            stored = float(state["script_test_rerun_budget_s"])
+            if not math.isfinite(stored) or stored <= 0:
+                raise ValueError("invalid persisted rerun budget")
+            rerun_budget_s = stored
+        except (TypeError, ValueError, OverflowError):
+            logger.warning("invalid persisted script_test_rerun_budget_s=%r; "
+                           "using configured budget", state["script_test_rerun_budget_s"])
+    return max(ordinary_timeout_s,
+               2 * config.timeout_s + min(rerun_budget_s, config.timeout_s) + 600.0)
 
 
 def _isolated_rerun_command(command: str, node_id: str) -> Optional[str]:
