@@ -7517,6 +7517,109 @@ def create_app(
             )
         return None
 
+    def _auto_enqueue_conflict_rebase(test_task_id: str, result: TaskResult) -> Optional[str]:
+        """Rebase the exact PR head a script test could not squash (#854)."""
+        if os.getenv("AGENT_CREW_AUTO_REBASE_ON_CONFLICT", "1") == "0":
+            return None
+        parent = q().get_task(test_task_id)
+        if parent is None or parent.task_type != "test":
+            return None
+        info = result.error_info if isinstance(result.error_info, dict) else {}
+        script = info.get("script_test") if isinstance(info.get("script_test"), dict) else {}
+        source = str(script.get("head_sha") or "").strip().lower()
+        if not re.fullmatch(r"[0-9a-f]{40}", source):
+            logger.warning("auto rebase: test %s has no verified conflicting head", test_task_id)
+            return None
+
+        lineage = []
+        current, seen = parent, set()
+        while current is not None and current.task_id not in seen and len(seen) < 64:
+            seen.add(current.task_id)
+            context = current.context if isinstance(current.context, dict) else {}
+            if context.get("auto_rebase_of"):
+                logger.info("auto rebase: lineage of %s already has a rebase round", test_task_id)
+                return None
+            lineage.append((current, context))
+            previous = context.get("prev_task_id")
+            current = q().get_task(previous) if isinstance(previous, str) and previous else None
+
+        def inherited(key: str):
+            return next((ctx[key] for _, ctx in lineage if ctx.get(key) not in (None, "")), None)
+
+        pr_number = result.pr_number or inherited("pr_number")
+        repo = inherited("repo")
+        branch = parent.branch
+        base = inherited("base_branch") or "main"
+        issue = inherited("issue")
+        tier = inherited("risk_tier")
+        if (not isinstance(pr_number, int) or isinstance(pr_number, bool)
+                or not isinstance(repo, str) or not repo.strip()
+                or not isinstance(issue, int) or isinstance(issue, bool) or issue <= 0
+                or not isinstance(tier, int) or isinstance(tier, bool) or not 0 <= tier <= 3
+                or not branch or branch == base):
+            logger.warning("auto rebase: test %s lacks a safe PR lineage", test_task_id)
+            return None
+        from agent_crew.github import pr_head_sha, pr_state
+        if pr_state(pr_number, repo=repo) != "open":
+            logger.warning("auto rebase: PR #%s is not confirmed open", pr_number)
+            return None
+        if pr_head_sha(pr_number, repo=repo) != source:
+            logger.warning("auto rebase: PR #%s no longer points at %s", pr_number, source)
+            return None
+
+        rebase_id = f"rebase-pr{pr_number}-{source}"
+        existing = q().get_task(rebase_id)
+        if existing is not None:
+            old = existing.context if isinstance(existing.context, dict) else {}
+            return rebase_id if old.get("auto_rebase_of") == test_task_id else None
+
+        context = {"prev_task_id": test_task_id, "auto_rebase_of": test_task_id,
+                   "artifact_kind": "rebase",
+                   "rebase_onto": base, "rebase_source_sha": source,
+                   "base_branch": base, "pr_number": pr_number,
+                   "repo": repo, "issue": issue, "issue_number": issue,
+                   "risk_tier": tier}
+        for key in ("implementer_agent", "reviewer_agent", "coordinator_managed",
+                    "external_operation_id", "lineage_root_task_id", "fix_round",
+                    "risk_declaration"):
+            value = inherited(key)
+            if value is not None:
+                context[key] = value
+        if isinstance(context.get("implementer_agent"), str):
+            context["agent_override"] = context["implementer_agent"]
+        description = (
+            f"Rebase PR #{pr_number} on branch {branch!r} onto origin/{base} "
+            f"after script test {test_task_id} could not squash head {source}. "
+            "Resolve conflicts preserving both sides' intent, re-run targeted tests, "
+            "and force-push the same branch. Do not open a new PR."
+        )
+        try:
+            q().enqueue(TaskRequest(
+                task_id=rebase_id, task_type="implement", description=description,
+                branch=branch, priority=3, context=context, project=parent.project),
+                ingress="cascade.fix",
+                _successor_provenance=_CEA_SYSTEM_SUCCESSOR_PROVENANCE)
+        except TaskAlreadyExistsError:
+            existing = q().get_task(rebase_id)
+            old = existing.context if existing and isinstance(existing.context, dict) else {}
+            return rebase_id if old.get("auto_rebase_of") == test_task_id else None
+        except _PausedError:
+            try:
+                q().outbox_reopen(test_task_id)
+            except Exception:
+                logger.exception("auto rebase: outbox reopen failed for %s", test_task_id)
+            raise
+        except Exception:
+            logger.exception("auto rebase: enqueue failed for %s", test_task_id)
+            return None
+        try:
+            _try_push_next("implementer")
+        except _PausedError:
+            raise
+        except Exception:
+            logger.exception("auto rebase: push failed for %s", rebase_id)
+        return rebase_id
+
     def _readmit_provider_capacity(task_id: str, cap: dict, delay_s: float, tag: str) -> str:
         """Re-admit capacity-refused work whose receipt §8 superseded (#581).
 
@@ -8915,8 +9018,13 @@ def create_app(
                     if _existing_fix is None:
                         _coordinator_notice(task_id, "test_failed_no_successor", result.summary)
             elif result.status == "failed" and _script_tester.is_script_test_result(result):
-                logger.info(f"POST /tasks/{task_id}/result: script test failed; no retry")
-                _failed_no_successor_notice(task_id, result, task_type)
+                if (_test_info.get("reason") == "script_test_merge_conflict"
+                        and _auto_enqueue_conflict_rebase(task_id, result)):
+                    logger.info("POST /tasks/%s/result: script merge conflict; rebase enqueued",
+                                task_id)
+                else:
+                    logger.info(f"POST /tasks/{task_id}/result: script test failed; no retry")
+                    _failed_no_successor_notice(task_id, result, task_type)
             elif result.status == "failed":
                 logger.info(f"POST /tasks/{task_id}/result: task failed with status=failed, evaluating fallback/retry")
                 if not _auto_fallback_failed_task(task_id, result, task_type):
