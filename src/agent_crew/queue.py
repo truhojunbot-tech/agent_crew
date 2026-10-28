@@ -5421,7 +5421,14 @@ class TaskQueue:
                     fallback and adopted_fallback_task_id == fallback["task_id"]
                     and fallback["status"] == "cancelled")
             ignored_for_fallback = bool(fallback and not adopted_fallback)
-            if ((prior_status in ("cancelled", "timed_out") or system_failed)
+            # #883: a completed result already drove its cascade. A later
+            # status change would re-run it (e.g. a retry implement on the
+            # same branch while the review continues). Reviews have their own
+            # rejection above; identical completed re-posts stay idempotent.
+            completed_revision = (prior_status == "completed"
+                                  and result.status != "completed")
+            if ((prior_status in ("cancelled", "timed_out") or system_failed
+                    or completed_revision)
                     and not adopted_fallback) or ignored_for_fallback:
                 # Same write lock as cancel/timeout: evidence is durable, but
                 # the terminal row, receipt, attribution and outbox stay put.
