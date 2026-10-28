@@ -32,6 +32,26 @@ CANONICAL_PROJECTS = frozenset({
     "agent_council", "apify-forge", "claude_autonomous_trader", "ht-8004",
 })
 _WARNED_UNKNOWN_PROJECTS: set[str] = set()
+
+
+def _capture_storage(path: str) -> SQLiteMemoryStorage:
+    """Use the provisioned hybrid writer only when embedding is configured."""
+    if os.getenv("AGENT_CREW_MEMORY_BACKEND", "").strip().lower() == "hybrid":
+        from agent_crew.memory_hybrid import (
+            EndpointEmbedder, HybridMemoryStorage, configured_write_embedder,
+        )
+
+        embedder = configured_write_embedder()
+        if embedder is not None:
+            if isinstance(embedder, EndpointEmbedder):
+                # Result capture runs on request and watchdog threads. Leave
+                # slow vectors for the resumable backfill instead of blocking.
+                embedder.timeout_seconds = 0.5
+            storage = HybridMemoryStorage.existing(path)
+            storage.write_embedder = embedder
+            storage.model_id = str(embedder.model_id)
+            return storage
+    return SQLiteMemoryStorage.existing(path)
 _ALIASES = {"agent-crew": "agent_crew", "agent crew": "agent_crew",
             "truhojunbot-tech/agent_crew": "agent_crew",
             "alpha-engine": "alpha_engine", "alpha engine": "alpha_engine",
@@ -569,7 +589,7 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
             context = {}
         predecessors, lineage_pr_number = task_lineage(db_path, task_id)
         records = capture_task_outcome(
-            SQLiteMemoryStorage.existing(str(path)), project=row[0] if row else "",
+            _capture_storage(str(path)), project=row[0] if row else "",
             repo=str(context.get("repo") or context.get("target_repo") or ""),
             task_id=task_id, status=result.status, summary=result.summary,
             verdict=result.verdict or "",
@@ -582,7 +602,7 @@ def capture_result_best_effort(db_path: str, task_id: str, result) -> None:
         )
         # A project-wide outcome can be recalled by later tasks. The older
         # task-scoped rows above remain for compatibility and attribution.
-        capture_task_outcome_record(SQLiteMemoryStorage.existing(str(path)),
+        capture_task_outcome_record(_capture_storage(str(path)),
                                     db_path, task_id)
         record_context_event(events_path, "shadow_memory_capture",
                              task_id=task_id, outcome="stored",
@@ -615,7 +635,7 @@ def capture_merge_best_effort(db_path: str, review_task_id: str) -> None:
         if (not shadow_db or os.getenv("AGENT_CREW_SHADOW_MEMORY_CAPTURE_ENABLED", "1").lower()
                 in {"0", "false", "no", "off"}):
             return
-        capture_task_outcome_record(SQLiteMemoryStorage.existing(str(Path(shadow_db).expanduser())),
+        capture_task_outcome_record(_capture_storage(str(Path(shadow_db).expanduser())),
                                     db_path, review_task_id)
     except Exception:
         logger.exception("shadow merge outcome capture failed for %s", review_task_id)
