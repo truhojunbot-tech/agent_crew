@@ -5610,7 +5610,11 @@ def create_app(
                     task_id=task_id, status=status, summary=summary,
                     error_info={"reason": reason, "final": status == "failed",
                                 **(details or {})})
+                # The list above is only a snapshot; a worker result can land
+                # before this write. CAS on in_progress so it is never
+                # overwritten (#884).
                 q().submit_result(task_id, terminal_result,
+                                  expected_status="in_progress",
                                   dispatcher_failed=status == "failed")
                 try:
                     _claude_cloud.record_terminal_cloud_cost(q(), task_id)
