@@ -465,6 +465,44 @@ def _agent_slot_worktree(base: str, slot: int) -> str:
     return base if slot == 1 else f"{base.rstrip(os.sep)}-{slot}"
 
 
+def _git_out(path: str, *args: str) -> Optional[str]:
+    try:
+        proc = subprocess.run(["git", "-C", path, *args],
+                              capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _is_linked_worktree_of(base: str, path: str) -> bool:
+    """True only if `path` is a linked worktree registered in slot 1's repository.
+
+    `.git` existing proves nothing: a stale clone or an unrelated checkout can
+    sit at `<base>-<k>`, and dispatching there runs the task in the wrong tree
+    (review of PR #878). Same common git dir + listed by `git worktree list`
+    on the base is what makes a reused slot equivalent to a freshly added one.
+    """
+    real = os.path.realpath(path)
+    if real == os.path.realpath(base):
+        logger.error("dispatcher: slot path %s is the slot-1 worktree itself", path)
+        return False
+    common = [_git_out(p, "rev-parse", "--path-format=absolute", "--git-common-dir")
+              for p in (base, path)]
+    top = _git_out(path, "rev-parse", "--show-toplevel")
+    listed = _git_out(base, "worktree", "list", "--porcelain")
+    if None in common or top is None or listed is None:
+        logger.error("dispatcher: could not inspect existing slot path %s", path)
+        return False
+    registered = {os.path.realpath(line[len("worktree "):])
+                  for line in listed.splitlines() if line.startswith("worktree ")}
+    if (os.path.realpath(common[0].strip()) != os.path.realpath(common[1].strip())
+            or os.path.realpath(top.strip()) != real or real not in registered):
+        logger.error("dispatcher: slot path %s is not a worktree of %s's repository; "
+                     "refusing to dispatch there (#875)", path, base)
+        return False
+    return True
+
+
 def _ensure_slot_worktree(base: str, path: str) -> bool:
     """Create a slot worktree from the slot-1 repository on first use (#875).
 
@@ -473,7 +511,7 @@ def _ensure_slot_worktree(base: str, path: str) -> bool:
     Protocol files are left to `_ensure_role_protocol` at dispatch.
     """
     if os.path.exists(os.path.join(path, ".git")):
-        return True
+        return _is_linked_worktree_of(base, path)
     if os.path.exists(path):
         logger.error("dispatcher: slot path %s exists but is not a git worktree", path)
         return False
