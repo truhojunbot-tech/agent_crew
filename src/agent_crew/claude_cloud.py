@@ -818,15 +818,21 @@ def _origin_branch_ref(checkout: str, branch: str) -> str:
     """
     if not os.path.isdir(checkout):
         return ""  # Test transports may provide a synthetic validated cwd.
-    if _publishable_ref(branch):
-        published = subprocess.run(
-            ["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"],
-            cwd=checkout, capture_output=True, text=True, timeout=10,
-            env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
-        if published.returncode == 0 and published.stdout.strip():
-            return branch
-    from agent_crew.worktree_default_branch import remote_default_branch
-    default = remote_default_branch(checkout, deadline=time.monotonic() + 10)
+    # The task is already claimed: a probe failure must become the caller's
+    # fail-closed "" rather than an exception that strands it in_progress
+    # (review of PR #913).
+    try:
+        if _publishable_ref(branch):
+            published = subprocess.run(
+                ["git", "ls-remote", "--exit-code", "origin", f"refs/heads/{branch}"],
+                cwd=checkout, capture_output=True, text=True, timeout=10,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            if published.returncode == 0 and published.stdout.strip():
+                return branch
+        from agent_crew.worktree_default_branch import remote_default_branch
+        default = remote_default_branch(checkout, deadline=time.monotonic() + 10)
+    except (OSError, subprocess.SubprocessError):
+        return ""
     return default if _publishable_ref(default) else ""
 
 

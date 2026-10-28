@@ -190,6 +190,40 @@ def test_lineage_implement_without_origin_ref_refuses_launch(tmp_path, env, monk
     assert launches == []
 
 
+def _raise_timeout(*args, **kwargs):
+    raise subprocess.TimeoutExpired("git ls-remote", 10)
+
+
+@pytest.mark.parametrize("probe", ["ls_remote", "default_branch"])
+def test_lineage_origin_probe_timeout_fails_closed(tmp_path, env, monkeypatch, probe):
+    """Review of PR #913 (round 2): a probe timeout after dequeue used to
+    propagate out of dispatch and strand the claimed task in_progress."""
+    checkout = _checkout(tmp_path)
+    _leave_on_unpublished_local_branch(checkout)
+    if probe == "ls_remote":
+        real_run = subprocess.run
+
+        def run(argv, *args, **kwargs):
+            if argv[:2] == ["git", "ls-remote"]:
+                _raise_timeout()
+            return real_run(argv, *args, **kwargs)
+        monkeypatch.setattr(cloud.subprocess, "run", run)
+    else:
+        monkeypatch.setattr("agent_crew.worktree_default_branch.remote_default_branch",
+                            _raise_timeout)
+    queue = TaskQueue(str(tmp_path / "tasks.db"))
+    _enqueue(queue, branch="fix/890-not-pushed",
+             context={"prev_task_id": "impl-prior", "fix_round": 0})
+    launches = []
+    outcome = cloud.dispatch_cloud_for_role(queue, role="implementer", task_type="implement",
+                                            state_path=_state(tmp_path, checkout),
+                                            run_fn=_run(launches))
+    assert not outcome.dispatched
+    assert outcome.launch_error == "cloud_origin_ref_unavailable"
+    assert queue.get_task("impl-890").status == "failed"
+    assert launches == []
+
+
 @pytest.mark.parametrize("name", [
     "foo.", "foo/.bar", ".foo", "foo/bar.", "foo.lock", "foo/bar.lock/baz",
     "bad..ref", "trailing/", "a//b", "has space", "-lead",
