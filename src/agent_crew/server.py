@@ -4619,6 +4619,20 @@ def create_app(
             if "agent_override" in task_context:
                 agent_override = task_context["agent_override"]
                 override_pane_id = pane_map.get(agent_override)
+                _override_norm = str(agent_override or "").strip().lower()
+                if (override_pane_id and worktree_map and _override_norm
+                        and _resolve_dispatch_target(task, role)[0] != _override_norm):
+                    # #861 review: the override has a pane but no role, so no
+                    # worktree is its own and the resolver falls back to
+                    # `worktree_map[role]` — another agent's tree. Preparing it
+                    # would move that agent's checkout under its feet.
+                    logger.warning(
+                        f"_try_push_next: agent_override {agent_override} has no worktree of its own "
+                        f"(role map {_DISPATCH_ROLE_TO_AGENT}) — requeueing {task.task_id} "
+                        f"instead of preparing {role}'s worktree")
+                    q().requeue(task.task_id)
+                    skipped.add(task.task_id)
+                    continue
                 if override_pane_id:
                     logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
                     pane_id = override_pane_id

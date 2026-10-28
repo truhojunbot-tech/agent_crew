@@ -27,10 +27,11 @@ def _payload(task_id, task_type, override):
     }
 
 
-def _app(tmp_db, tmp_path, monkeypatch, push_calls, prepared, protocols):
+def _app(tmp_db, tmp_path, monkeypatch, push_calls, prepared, protocols,
+         role_to_agent=ROLE_TO_AGENT):
     monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
     monkeypatch.setattr(server, "_WORKTREE_SYNC_DISABLED", False)
-    monkeypatch.setattr(server, "_load_role_to_agent", lambda _p: dict(ROLE_TO_AGENT))
+    monkeypatch.setattr(server, "_load_role_to_agent", lambda _p: dict(role_to_agent))
 
     def fake_prepare(wt, task_id, branch, role, task_context=None, task_type=""):
         prepared.append((task_id, wt))
@@ -44,7 +45,7 @@ def _app(tmp_db, tmp_path, monkeypatch, push_calls, prepared, protocols):
     monkeypatch.setattr(server, "_ensure_role_protocol", fake_protocol)
     monkeypatch.setattr(server, "_restore_task_wip", lambda *a, **k: "")
     wts = {agent: str(tmp_path / agent) for agent in ROLE_TO_AGENT.values()}
-    worktree_map = {role: wts[agent] for role, agent in ROLE_TO_AGENT.items()}
+    worktree_map = {role: wts[agent] for role, agent in role_to_agent.items() if agent in wts}
     app = server.create_app(
         db_path=tmp_db,
         pane_map={"implementer": "%100", "reviewer": "%101", "tester": "%102",
@@ -86,3 +87,23 @@ def test_task_without_override_still_uses_its_role_worktree(tmp_db, tmp_path, mo
     assert prepared == [("impl-plain", wts["claude"])]
     assert protocols == [("implementer", wts["claude"])]
     assert push_calls and push_calls[0][0] == "%100"
+
+
+def test_override_agent_without_a_role_worktree_is_not_prepared_in_another_agents_tree(
+        tmp_db, tmp_path, monkeypatch):
+    # Review of PR #880: gemini has a pane but no role (tester is the script
+    # tester), so no worktree is gemini's. The resolver then falls back to
+    # `worktree_map["implementer"]` — claude's — while the push goes to the
+    # gemini pane. Refuse before prep instead of guessing a worktree.
+    role_to_agent = {"implementer": "claude", "reviewer": "codex", "tester": "script"}
+    push_calls, prepared, protocols = [], [], []
+    app, wts = _app(tmp_db, tmp_path, monkeypatch, push_calls, prepared, protocols,
+                    role_to_agent=role_to_agent)
+    with TestClient(app) as client:
+        assert client.post("/tasks", json=_payload("impl-gemini", "implement", "gemini")).status_code == 201
+        task = client.get("/tasks/impl-gemini").json()
+
+    assert prepared == [] and protocols == [], (
+        f"a gemini override touched another agent's worktree: {prepared + protocols}")
+    assert push_calls == []
+    assert task["status"] == "pending"
