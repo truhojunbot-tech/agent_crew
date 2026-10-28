@@ -188,3 +188,109 @@ def test_prep_retry_on_a_spent_receipt_leaves_the_task_for_needs_human(tmp_path)
     assert q.get_task_status("t1") == "in_progress"
     assert receipt_for_task(q, "t1")["state"] == "CLAIMED"
     assert q.get_task_context("t1").get("prep_retry_count") is None
+
+
+# ── implementer: a fallback SHA must not skip the retry (review-impl-896p-r0) ──
+
+def _impl_repo(tmp_path):
+    worker = tmp_path / "impl-worker"
+    subprocess.run(["git", "init", "--initial-branch=main", str(worker)],
+                   check=True, capture_output=True)
+    for args in (["config", "user.name", "T"], ["config", "user.email", "t@example.invalid"],
+                 ["commit", "--allow-empty", "-m", "base"]):
+        subprocess.run(["git", "-C", str(worker), *args], check=True, capture_output=True)
+    head = subprocess.run(["git", "-C", str(worker), "rev-parse", "HEAD"], check=True,
+                          capture_output=True, text=True).stdout.strip()
+    return worker, head
+
+
+def _impl_app(tmp_path, monkeypatch, pushed, worker):
+    monkeypatch.setenv("AGENT_CREW_DISPATCHER", "0")
+    monkeypatch.setenv("AGENT_CREW_CEA_MODE__DEMO", "off")
+    monkeypatch.setattr(sv, "_pane_has_usage_limit", lambda *a, **kw: False)
+    monkeypatch.setattr(sv, "_resolve_tmux_pane_target", lambda pane: pane)
+    monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
+    monkeypatch.setattr(sv, "_pane_process_kind", lambda pane: ("agent", "codex"))
+    monkeypatch.setattr(sv, "_ensure_role_protocol", lambda *a, **kw: True)
+    monkeypatch.setattr(sv, "_restore_task_wip", lambda *a, **kw: None)
+    db = str(tmp_path / "tasks.db")
+    app = sv.create_app(
+        db, worktree_map={"implementer": str(worker)}, pane_map={"implementer": "%92"},
+        push_fn=lambda *args: pushed.append(args),
+        identity_required=False, watchdog_disabled=True, anomaly_disabled=True,
+    )
+    return app, TaskQueue(db)
+
+
+def test_implementer_head_fallback_still_retries_on_dispatcher_path(tmp_path, monkeypatch):
+    worker, head = _impl_repo(tmp_path)
+    pushed = []
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
+    launched = []
+
+    async def fake_exec(*args, **kwargs):
+        launched.append(args)
+        raise RuntimeError("provider launch stubbed out")
+    monkeypatch.setattr(sv.asyncio, "create_subprocess_exec", fake_exec)
+    app, queue = _impl_app(tmp_path, monkeypatch, pushed, worker)
+
+    with TestClient(app):
+        queue.enqueue(TaskRequest("impl-896-disp", "implement", "fix", branch="feature",
+                                  project="demo", context={}))
+        task = queue.dequeue(role="implementer")
+        assert task is not None
+        # Precondition the review found: prep returns the HEAD fallback, not "".
+        assert sv._prepare_worktree_for_task(str(worker), task.task_id, "feature",
+                                             "implementer", task_context=dict(task.context)) == head
+        asyncio.run(app.state.dispatch_task(task, "implementer"))
+
+    assert launched == []
+    assert queue.get_task_status("impl-896-disp") == "pending"
+    ctx = queue.get_task_context("impl-896-disp")
+    assert ctx["prep_retry_count"] == 1
+    assert ctx["push_refusal_reason"] == "prep_transient"
+    # The stale HEAD was not recorded as the base, so a retry cannot re-read it
+    # as a "caller" base.
+    assert ctx.get("worktree_base_sha") is None
+
+
+def test_implementer_head_fallback_still_retries_on_push_path(tmp_path, monkeypatch):
+    worker, head = _impl_repo(tmp_path)
+    pushed = []
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
+    app, queue = _impl_app(tmp_path, monkeypatch, pushed, worker)
+
+    with TestClient(app) as client:
+        admitted = client.post("/tasks", json={
+            "task_id": "impl-896-push", "task_type": "implement", "description": "fix",
+            "branch": "feature", "project": "demo", "context": {},
+        })
+
+    assert admitted.status_code == 201
+    assert pushed == []
+    assert queue.get_task_status("impl-896-push") == "pending"
+    ctx = queue.get_task_context("impl-896-push")
+    assert ctx["prep_retry_count"] == 1
+    assert ctx.get("worktree_base_sha") is None
+
+
+def test_implementer_second_timeout_falls_back_to_812_dispatch(tmp_path, monkeypatch):
+    worker, head = _impl_repo(tmp_path)
+    pushed = []
+    monkeypatch.setattr(sv, "_prepare_worktree_for_task_inner", _timeout)
+    app, queue = _impl_app(tmp_path, monkeypatch, pushed, worker)
+
+    with TestClient(app) as client:
+        client.post("/tasks", json={
+            "task_id": "impl-896-twice", "task_type": "implement", "description": "fix",
+            "branch": "feature", "project": "demo", "context": {},
+        })
+        assert pushed == []
+        queue.merge_task_context("impl-896-twice", {"push_not_before": 0})
+        app.state.try_push_next("implementer")
+
+    ctx = queue.get_task_context("impl-896-twice")
+    assert ctx["prep_retry_count"] == 1
+    assert ctx["worktree_base_sha"] == head
+    assert ctx["worktree_base_status"] == "head_after_prep_error"
+    assert pushed and queue.get_task_status("impl-896-twice") == "in_progress"

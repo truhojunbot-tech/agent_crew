@@ -4771,6 +4771,13 @@ def create_app(
                         wt_path, task.task_id, task.branch or "", role,
                         task_context=task.context if isinstance(task.context, dict) else {},
                     )
+                    # #896: a transient prep error is retried before anything
+                    # is recorded or delivered — including an implementer whose
+                    # prep fell back to a caller/HEAD SHA, which is not the base
+                    # this task asked for. Not recording it also keeps a HEAD
+                    # fallback from being re-read as a "caller" base next time.
+                    if _retry_transient_prep(task):
+                        return
                     # #253: persist it on the task BEFORE the push, so it also
                     # reaches the agent in the task block — a reviewer that can
                     # see which commit it was given can say so in its result,
@@ -4782,10 +4789,9 @@ def create_app(
                                         status="needs_human")
                         return
                     if (task.context or {}).get("prep_error") and not _reviewed_sha:
-                        if not _retry_transient_prep(task):
-                            _fail_if_active(task.task_id, "prepared_base_not_recorded",
-                                            status="needs_human",
-                                            details=_prep_failure_details(task))
+                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                        status="needs_human",
+                                        details=_prep_failure_details(task))
                         return
                     if _reviewed_sha:
                         _restore_task_wip(q(), task, wt_path)
@@ -5706,8 +5712,11 @@ def create_app(
 
         A git timeout under host load (alpha_engine 10-28: load 27-37, a fetch
         taking 36.5 s) is infrastructure, not a broken task. The first one
-        backs off and retries; a second one, or any other prep error, still
-        ends in needs_human.
+        backs off and retries; a second one, or any other prep error, falls
+        through to the pre-#896 handling: needs_human without a base, or — for
+        an implementer with a verified caller/HEAD fallback — dispatch on it
+        (#812). Callers ask this BEFORE recording a base, so the retry also
+        covers an implementer whose prep returned a fallback SHA.
         """
         ctx = task.context or {}
         prep_error = ctx.get("prep_error")
@@ -6222,6 +6231,11 @@ def create_app(
                     task_context=task.context if isinstance(task.context, dict) else {},
                     task_type=task.task_type,
                 )
+                # #896: retry a transient prep error before recording or
+                # delivering anything, whatever fallback SHA prep returned.
+                if _retry_transient_prep(task):
+                    _lock_stack.close()
+                    return
                 # #253/#358: record the exact prepared commit, or explicit
                 # unknown, before prompt construction.  A prep failure still
                 # dispatches, but can no longer masquerade as an unrecorded
@@ -6234,10 +6248,9 @@ def create_app(
                     return
                 if (task.context or {}).get("prep_error") and not _reviewed_sha:
                     _lock_stack.close()
-                    if not _retry_transient_prep(task):
-                        _fail_if_active(task.task_id, "prepared_base_not_recorded",
-                                        status="needs_human",
-                                        details=_prep_failure_details(task))
+                    _fail_if_active(task.task_id, "prepared_base_not_recorded",
+                                    status="needs_human",
+                                    details=_prep_failure_details(task))
                     return
                 if _reviewed_sha:
                     await asyncio.to_thread(_restore_task_wip, q(), task, wt)
