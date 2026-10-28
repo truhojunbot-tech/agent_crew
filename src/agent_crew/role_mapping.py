@@ -39,7 +39,39 @@ def provider_family(agent: object) -> str:
     for family in ("codex", "gemini"):
         if name.startswith(family):
             return family
+    if name == "agy" or name.startswith(("agy-", "agy_")):
+        return "gemini"  # the gemini tester binary (#236)
     return name
+
+
+#: Which provider families may hold each role (#889). The one policy every
+#: route reads: explicit override, ``implementer_agent``, role assignment, fix
+#: rounds, retries. ``None`` means no family restriction — review independence
+#: is the separate #871 rule. ``claude_cloud`` is in the ``claude`` family.
+ROLE_PROVIDER_POLICY: dict[str, tuple[str, ...] | None] = {
+    "implementer": ("claude", "codex"),
+    "reviewer": None,
+    "tester": ("gemini", "script"),
+}
+TASK_TYPE_TO_ROLE = {"implement": "implementer", "review": "reviewer", "test": "tester"}
+
+
+def role_policy() -> dict[str, list[str] | None]:
+    """JSON view of :data:`ROLE_PROVIDER_POLICY` for enqueue-side pre-checks."""
+    return {role: (list(families) if families is not None else None)
+            for role, families in ROLE_PROVIDER_POLICY.items()}
+
+
+def role_policy_refusal(role: object, agent: object) -> str | None:
+    """Reason ``agent`` may not hold ``role``, or ``None`` when allowed."""
+    allowed = ROLE_PROVIDER_POLICY.get(role) if isinstance(role, str) else None
+    if allowed is None or not str(agent or "").strip():
+        return None
+    if provider_family(agent) in allowed:
+        return None
+    return (f"role_policy: {str(agent).strip()!r} (family "
+            f"{provider_family(agent)!r}) may not hold role {role!r}; "
+            f"allowed families: {list(allowed)}")
 
 
 def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, str]:
