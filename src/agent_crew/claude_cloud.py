@@ -1155,7 +1155,10 @@ def dispatch_cloud_for_role(
         # branch already has a PR. Without a launch head, reconcile took that
         # PR for this session's output and completed the task at launch.
         try:
-            existing_pr = _github.pr_number_for_branch(task.branch, repo=preflight_repo)
+            # strict: the default form returns None on gh failure too, which
+            # would read "unknown" as "no PR" and launch without a head.
+            existing_pr = _github.pr_number_for_branch(task.branch, repo=preflight_repo,
+                                                       strict=True)
         except Exception:
             # Launching without knowing whether a PR exists recreates the
             # false completion this lookup exists to prevent; defer instead.

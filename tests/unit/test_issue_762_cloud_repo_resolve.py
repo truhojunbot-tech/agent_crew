@@ -234,3 +234,10 @@ def test_cloud_cost_recorded_on_result_cancel_and_fail(tmp_path, monkeypatch):
     monkeypatch.setattr(cloud, "read_cloud_credit_used", lambda: 9.0)
     cloud.record_terminal_cloud_cost(queue, "posted")
     assert queue.get_attribution("posted")["cloud_usd"] is None
+
+
+@pytest.fixture(autouse=True)
+def _branch_has_no_pr(monkeypatch):
+    # #910: the pre-launch PR lookup is strict, so an unstubbed (unauthenticated)
+    # `gh` defers the launch instead of reading as "no PR". Tests override this.
+    monkeypatch.setattr(cloud._github, "pr_number_for_branch", lambda *a, **kw: None)

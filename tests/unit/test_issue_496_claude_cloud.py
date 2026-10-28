@@ -250,8 +250,6 @@ def test_at6_dispatch_uses_resume_argv_for_fix_task(q, monkeypatch):
     fix_id = f"fix-{uuid.uuid4().hex[:8]}"
     q.enqueue(TaskRequest(task_id=fix_id, task_type="implement", description="address findings",
                           branch=branch, context={"prev_task_id": impl_id, "repo": "owner/repo"}, project="agent_crew"))
-    # #910: a failed pre-launch PR lookup defers the launch; this branch has no PR yet.
-    monkeypatch.setattr(cc._github, "pr_number_for_branch", lambda *a, **kw: None)
 
     seen_argv = {}
 
@@ -553,3 +551,10 @@ def test_parse_terminal_outcome_takes_the_last_line():
 
 def test_parse_terminal_outcome_none_when_absent():
     assert cc.parse_terminal_outcome("just some prose, no verdict") is None
+
+
+@pytest.fixture(autouse=True)
+def _branch_has_no_pr(monkeypatch):
+    # #910: the pre-launch PR lookup is strict, so an unstubbed (unauthenticated)
+    # `gh` defers the launch instead of reading as "no PR". Tests override this.
+    monkeypatch.setattr(cc._github, "pr_number_for_branch", lambda *a, **kw: None)

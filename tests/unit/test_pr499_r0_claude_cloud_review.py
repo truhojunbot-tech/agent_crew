@@ -352,3 +352,10 @@ class _LaunchProc:
         "View: https://claude.ai/code/session_01KCkrmLbhobrds8fApuuoun\n"
         "Resume with: claude --teleport session_01KCkrmLbhobrds8fApuuoun\n"
     )
+
+
+@pytest.fixture(autouse=True)
+def _branch_has_no_pr(monkeypatch):
+    # #910: the pre-launch PR lookup is strict, so an unstubbed (unauthenticated)
+    # `gh` defers the launch instead of reading as "no PR". Tests override this.
+    monkeypatch.setattr(cc._github, "pr_number_for_branch", lambda *a, **kw: None)
