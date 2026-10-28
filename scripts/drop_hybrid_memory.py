@@ -20,7 +20,6 @@ _TRIGGERS = (
     "adr001_no_legacy_flags_bi", "adr001_no_legacy_flags_bu",
     "adr001_fts_ai", "adr001_fts_au", "adr001_fts_ad",
     "adr001_fts_effectiveness_au",
-    "adr001_vec_gloss_ad", "adr001_vec_gloss_effectiveness_au",
 )
 
 
@@ -66,7 +65,6 @@ def drop_hybrid_schema(path: Path, *, apply: bool = False) -> dict:
                        "COALESCE(invalidated_at,created)) WHERE superseded_by IS NOT NULL")
             db.execute("DROP TABLE IF EXISTS adr001_fts")
             db.execute("DROP TABLE IF EXISTS adr001_vec")
-            db.execute("DROP TABLE IF EXISTS adr001_vec_gloss")
             db.execute("ALTER TABLE adr001_memory DROP COLUMN superseded_by")
             db.execute("ALTER TABLE adr001_memory DROP COLUMN invalidated_at")
             db.commit()

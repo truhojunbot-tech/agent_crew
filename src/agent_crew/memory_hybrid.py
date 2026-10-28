@@ -10,7 +10,6 @@ import re
 import sqlite3
 import threading
 import time
-import urllib.request
 from array import array
 from contextlib import closing
 from dataclasses import asdict
@@ -19,8 +18,7 @@ from typing import Callable, Optional
 
 from .memory_runtime import (
     MemoryRecord, MemoryScope, MemoryStorage, SQLiteMemoryStorage,
-    _canonical_scope_json, _logical_revision_key, _scope_from_json,
-    _retrieval_rank,
+    _logical_revision_key, _scope_from_json, _retrieval_rank,
     procedural_row_servable, procedural_servable_sql,
 )
 
@@ -41,27 +39,6 @@ def _body_sql(alias: str) -> str:
             f"ELSE {alias}.value END")
 
 
-def _vector_text(layer: str, raw_value: str, fts_body: str) -> tuple[str, str | None]:
-    """Keep the legacy body for ordinary rows; split out a declared gloss."""
-    value = json.loads(raw_value)
-    gloss = value.get("gloss_en") if isinstance(value, dict) else None
-    gloss = gloss.strip() if isinstance(gloss, str) else None
-    if not gloss:
-        return fts_body, None
-    primary = value.get("text") if isinstance(value.get("text"), str) else fts_body
-    return primary, gloss
-
-
-def _embed_kind(embedder: Callable, text: str, kind: str):
-    method = getattr(embedder, "embed_kind", None)
-    return method(text, kind) if method is not None else embedder(text)
-
-
-def _content_sha(text: str, embedder: Callable | None, kind: str) -> str:
-    prefix = str(getattr(embedder, f"{kind}_prefix", ""))
-    return hashlib.sha256((prefix + text).encode()).hexdigest()
-
-
 _FTS_AI_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_ai AFTER INSERT ON "
                "adr001_memory BEGIN INSERT INTO adr001_fts(rowid,layer,key,body) "
                f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); END;")
@@ -69,8 +46,7 @@ _FTS_AU_SQL = ("CREATE TRIGGER IF NOT EXISTS adr001_fts_au AFTER UPDATE OF value
                "ON adr001_memory BEGIN DELETE FROM adr001_fts WHERE rowid=old.rowid; "
                "INSERT INTO adr001_fts(rowid,layer,key,body) "
                f"VALUES(new.rowid,new.layer,new.key,{_body_sql('new')}); "
-               "DELETE FROM adr001_vec WHERE rowid=new.rowid; "
-               "DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid; END;")
+               "DELETE FROM adr001_vec WHERE rowid=new.rowid; END;")
 
 
 def _trigger_definition_changed(db: sqlite3.Connection, name: str, expected: str) -> bool:
@@ -137,8 +113,6 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
     db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS adr001_fts USING fts5(layer,key,body)")
     db.execute("CREATE TABLE IF NOT EXISTS adr001_vec "
                "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
-    db.execute("CREATE TABLE IF NOT EXISTS adr001_vec_gloss "
-               "(rowid INTEGER PRIMARY KEY, model_id TEXT, content_sha TEXT, vec BLOB)")
     db.executescript("""
       CREATE TRIGGER IF NOT EXISTS adr001_no_legacy_flags_bi
         BEFORE INSERT ON adr001_memory WHEN
@@ -155,20 +129,10 @@ def ensure_index_schema(db: sqlite3.Connection) -> None:
       CREATE TRIGGER IF NOT EXISTS adr001_fts_ad AFTER DELETE ON adr001_memory BEGIN
         DELETE FROM adr001_fts WHERE rowid=old.rowid;
         DELETE FROM adr001_vec WHERE rowid=old.rowid;
-        DELETE FROM adr001_vec_gloss WHERE rowid=old.rowid;
       END;
       CREATE TRIGGER IF NOT EXISTS adr001_fts_effectiveness_au
         AFTER UPDATE OF superseded_by,invalidated_at ON adr001_memory BEGIN
         DELETE FROM adr001_vec WHERE rowid=new.rowid;
-        DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid;
-      END;
-      CREATE TRIGGER IF NOT EXISTS adr001_vec_gloss_ad
-        AFTER DELETE ON adr001_memory BEGIN
-        DELETE FROM adr001_vec_gloss WHERE rowid=old.rowid;
-      END;
-      CREATE TRIGGER IF NOT EXISTS adr001_vec_gloss_effectiveness_au
-        AFTER UPDATE OF superseded_by,invalidated_at ON adr001_memory BEGIN
-        DELETE FROM adr001_vec_gloss WHERE rowid=new.rowid;
       END;
     """)
     count = db.execute("SELECT count(*) FROM adr001_memory").fetchone()[0]
@@ -235,36 +199,27 @@ def _bytes(record: dict) -> int:
 class OnnxMiniLMEmbedder:
     """Optional CPU embedder configured by model and tokenizer paths."""
 
-    def __init__(self, model_path: str, tokenizer_path: str, model_id: str,
-                 *, query_prefix: str = "", passage_prefix: str = ""):
+    def __init__(self, model_path: str, tokenizer_path: str, model_id: str):
         import onnxruntime as ort
         from tokenizers import Tokenizer
 
         self.model_id = model_id
-        self.query_prefix = query_prefix
-        self.passage_prefix = passage_prefix
         self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
         self.tokenizer = Tokenizer.from_file(tokenizer_path)
 
     def __call__(self, text: str):
-        return self.embed_kind(text, "passage")
-
-    def embed_kind(self, text: str, kind: str):
         import numpy as np
 
-        encoded = self.tokenizer.encode(getattr(self, f"{kind}_prefix") + text)
+        encoded = self.tokenizer.encode(text)
         ids = np.asarray([encoded.ids[:256]], dtype=np.int64)
-        mask = np.asarray([getattr(encoded, "attention_mask", [1] * len(encoded.ids))[:256]],
-                          dtype=np.int64)
+        mask = np.ones_like(ids)
         segments = np.zeros_like(ids)
         feeds = {}
         for input_meta in self.session.get_inputs():
             feeds[input_meta.name] = (mask if "mask" in input_meta.name else
                                       segments if "token_type" in input_meta.name else ids)
         tokens = self.session.run(None, feeds)[0][0]
-        pooled = (tokens * mask[0, :, None]).sum(axis=0) / max(1, int(mask.sum()))
-        norm = np.linalg.norm(pooled)
-        return (pooled / norm if norm else pooled).astype(np.float32)
+        return tokens.mean(axis=0).astype(np.float32)
 
 
 def configured_embedder():
@@ -274,50 +229,10 @@ def configured_embedder():
         return None
     try:
         return OnnxMiniLMEmbedder(
-            model, tokenizer, os.getenv("AGENT_CREW_MEMORY_MODEL_ID", "all-MiniLM-L6-v2"),
-            query_prefix=os.getenv("AGENT_CREW_MEMORY_QUERY_PREFIX", ""),
-            passage_prefix=os.getenv("AGENT_CREW_MEMORY_PASSAGE_PREFIX", ""))
+            model, tokenizer, os.getenv("AGENT_CREW_MEMORY_MODEL_ID", "all-MiniLM-L6-v2"))
     except Exception as exc:
         logger.warning("memory local embedder unavailable: %s: %s", type(exc).__name__, exc)
         return None
-
-
-class EndpointEmbedder:
-    """Embed through an explicitly configured serving endpoint."""
-
-    def __init__(self, endpoint: str, model_id: str, timeout_seconds: float = 30.0,
-                 *, query_prefix: str = "", passage_prefix: str = ""):
-        self.endpoint = endpoint
-        self.model_id = model_id
-        self.timeout_seconds = timeout_seconds
-        self.query_prefix = query_prefix
-        self.passage_prefix = passage_prefix
-
-    def __call__(self, text: str):
-        return self.embed_kind(text, "passage")
-
-    def embed_kind(self, text: str, kind: str):
-        payload = json.dumps({"model": self.model_id,
-                              "input": getattr(self, f"{kind}_prefix") + text}).encode()
-        request = urllib.request.Request(self.endpoint, data=payload,
-                                         headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
-            result = json.load(response)
-        vectors = result.get("embeddings")
-        return vectors[0] if vectors else result["embedding"]
-
-
-def configured_write_embedder():
-    endpoint = os.getenv("AGENT_CREW_MEMORY_EMBED_ENDPOINT", "").strip()
-    model_id = os.getenv("AGENT_CREW_MEMORY_MODEL_ID", "").strip()
-    if not endpoint or not model_id:
-        return None
-    if not endpoint.startswith(("http://", "https://")):
-        logger.warning("memory embed endpoint must be an HTTP URL")
-        return None
-    return EndpointEmbedder(endpoint, model_id,
-                            query_prefix=os.getenv("AGENT_CREW_MEMORY_QUERY_PREFIX", ""),
-                            passage_prefix=os.getenv("AGENT_CREW_MEMORY_PASSAGE_PREFIX", ""))
 
 
 class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
@@ -326,14 +241,8 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
     def __init__(self, path: str, *, embedder: Optional[Callable] = None):
         super().__init__(path, busy_timeout_seconds=30.0)
         self.backfill()
-        self.write_embedder = embedder if embedder is not None else configured_write_embedder()
-        # The endpoint can wait 30 seconds; only local embedders may run in
-        # the 300 ms retrieval path. Explicit test embedders serve both paths.
         self.embedder = embedder if embedder is not None else configured_embedder()
-        self.model_id = str(getattr(self.write_embedder or self.embedder,
-                                    "model_id", ""))
-        self.retrieval_model_id = str(getattr(self.embedder, "model_id", ""))
-        self.last_backfill_stats = {"failed": 0, "remaining": 0}
+        self.model_id = str(getattr(self.embedder, "model_id", "")) if self.embedder else ""
         self.fallback_count = 0
         self._fallback_lock = threading.Lock()
         self.last_retrieval_mode = "lexical_only"
@@ -351,155 +260,6 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
             ensure_index_schema(db)
             db.commit()
         self._revision_columns = True
-
-    def put(self, record: MemoryRecord) -> None:
-        super().put(record)
-        if self.write_embedder is not None:
-            self._embed_written_record(record)
-
-    def put_many_shadow(self, records: list[MemoryRecord], **kwargs) -> None:
-        super().put_many_shadow(records, **kwargs)
-        if self.write_embedder is not None:
-            for record in records:
-                if not self._embed_written_record(record):
-                    break
-
-    def _embed_written_record(self, record: MemoryRecord) -> bool:
-        try:
-            with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
-                row = db.execute("SELECT m.rowid,m.layer,m.value,f.body "
-                                 "FROM adr001_memory m "
-                                 "JOIN adr001_fts f ON f.rowid=m.rowid "
-                                 "WHERE "
-                                 "m.layer=? AND m.key=? AND m.scope=? AND " + _effective_sql(),
-                                 (record.layer, record.key,
-                                  _canonical_scope_json(record.scope))).fetchone()
-            if row:
-                rowid, layer, raw_value, body = row
-                primary, gloss = _vector_text(layer, raw_value, body)
-                return self._embed_row(rowid, primary, gloss)
-            return True
-        except Exception as exc:
-            logger.warning("memory write embed failed key=%s: %s", record.key, exc)
-            return False
-
-    def _embed_row(self, rowid: int, body: str, gloss: str | None = None) -> bool:
-        try:
-            targets = [("adr001_vec", body)]
-            if gloss:
-                targets.append(("adr001_vec_gloss", gloss))
-            with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
-                existing = {table: db.execute(
-                    f"SELECT model_id,content_sha,vec FROM {table} WHERE rowid=?", (rowid,)).fetchone()
-                    for table, _ in targets}
-            stale = [(table, text) for table, text in targets
-                     if not existing[table] or existing[table][0] != self.model_id
-                     or existing[table][1] != _content_sha(text, self.write_embedder, "passage")
-                     or existing[table][2] is None]
-            if not stale:
-                return True
-            computed = []
-            for table, text in stale:
-                vector = array("f", _embed_kind(self.write_embedder, text, "passage"))
-                if not vector or not all(math.isfinite(value) for value in vector):
-                    raise ValueError("empty or non-finite embedding")
-                computed.append((table, text, vector))
-            with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
-                # Another writer may have changed or retired this row while the
-                # endpoint was computing its vector.
-                db.execute("BEGIN IMMEDIATE")
-                current = db.execute("SELECT m.layer,m.value,f.body FROM adr001_memory m "
-                                     "JOIN adr001_fts f ON f.rowid=m.rowid "
-                                     "WHERE m.rowid=? AND " + _effective_sql(), (rowid,)).fetchone()
-                if not current or _vector_text(*current) != (body, gloss):
-                    return False
-                for table, text, vector in computed:
-                    db.execute(f"INSERT INTO {table}(rowid,model_id,content_sha,vec) "
-                               "VALUES(?,?,?,?) ON CONFLICT(rowid) DO UPDATE SET "
-                               "model_id=excluded.model_id,content_sha=excluded.content_sha,vec=excluded.vec",
-                               (rowid, self.model_id,
-                                _content_sha(text, self.write_embedder, "passage"), vector.tobytes()))
-                db.commit()
-            return True
-        except Exception as exc:
-            logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
-            return False
-
-    def backfill_vectors(self, *, limit: Optional[int] = None, batch_size: int = 128) -> int:
-        """Fill effective stale vectors; committed rows survive interrupted runs."""
-        if self.write_embedder is None:
-            return 0
-        if batch_size < 1 or (limit is not None and limit < 0):
-            raise ValueError("batch_size must be positive and limit nonnegative")
-        cursor = 0
-        written = 0
-        failed = consecutive_failures = 0
-        while limit is None or written < limit:
-            with closing(sqlite3.connect(self.path, timeout=30.0)) as db:
-                rows = db.execute("SELECT m.rowid,m.layer,m.value,f.body "
-                                  "FROM adr001_memory m JOIN adr001_fts f ON f.rowid=m.rowid "
-                                  "WHERE m.rowid>? AND " + _effective_sql() +
-                                  " ORDER BY m.rowid LIMIT ?", (cursor, batch_size)).fetchall()
-            if not rows:
-                break
-            for rowid, layer, raw_value, fts_body in rows:
-                cursor = rowid
-                body, gloss = _vector_text(layer, raw_value, fts_body)
-                if self._row_vectors_current(rowid, body, gloss):
-                    continue
-                if self._embed_row(rowid, body, gloss):
-                    written += 1
-                    consecutive_failures = 0
-                else:
-                    failed += 1
-                    consecutive_failures += 1
-                    if consecutive_failures >= 3:
-                        break
-                if limit is not None and written >= limit:
-                    break
-            if consecutive_failures >= 3:
-                break
-        self.last_backfill_stats = {
-            "failed": failed,
-            "remaining": self.remaining_vector_count(),
-        }
-        return written
-
-    def remaining_vector_count(self) -> int:
-        """Count missing or stale primary and gloss vectors for effective rows."""
-        with closing(sqlite3.connect(self.path)) as db:
-            rows = db.execute("SELECT m.layer,m.value,f.body,"
-                              "v.model_id,v.content_sha,v.vec,"
-                              "g.model_id,g.content_sha,g.vec "
-                              "FROM adr001_memory m JOIN adr001_fts f ON f.rowid=m.rowid "
-                              "LEFT JOIN adr001_vec v ON v.rowid=m.rowid "
-                              "LEFT JOIN adr001_vec_gloss g ON g.rowid=m.rowid WHERE "
-                              + _effective_sql()).fetchall()
-        count = 0
-        for layer, value, fts_body, model, digest, vector, gloss_model, gloss_digest, gloss_vector in rows:
-            body, gloss = _vector_text(layer, value, fts_body)
-            count += int(vector is None or model != self.model_id or
-                         digest != _content_sha(body, self.write_embedder, "passage"))
-            if gloss is not None:
-                count += int(gloss_vector is None or gloss_model != self.model_id or
-                             gloss_digest != _content_sha(gloss, self.write_embedder, "passage"))
-        return count
-
-    def _row_vector_missing_count(self, rowid: int, body: str, gloss: str | None) -> int:
-        with closing(sqlite3.connect(self.path)) as db:
-            missing = 0
-            for table, text in (("adr001_vec", body), ("adr001_vec_gloss", gloss)):
-                if text is None:
-                    continue
-                row = db.execute(f"SELECT model_id,content_sha,vec FROM {table} WHERE rowid=?",
-                                 (rowid,)).fetchone()
-                if not row or row[0] != self.model_id or row[1] != _content_sha(
-                        text, self.write_embedder, "passage") or row[2] is None:
-                    missing += 1
-            return missing
-
-    def _row_vectors_current(self, rowid: int, body: str, gloss: str | None) -> bool:
-        return self._row_vector_missing_count(rowid, body, gloss) == 0
 
     def missing_vector_count(self) -> int:
         with closing(sqlite3.connect(self.path)) as db:
@@ -586,33 +346,29 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
 
         by_id = {r["rowid"]: r for r in candidates}
         with closing(sqlite3.connect(self.path, timeout=.1)) as db:
-            rows = db.execute("SELECT m.rowid,m.layer,m.value,f.body,v.model_id,v.content_sha "
-                              "FROM adr001_memory m "
+            rows = db.execute("SELECT m.rowid,f.body,v.model_id,v.content_sha FROM adr001_memory m "
                               "JOIN adr001_fts f ON f.rowid=m.rowid LEFT JOIN adr001_vec v "
                               "ON v.rowid=m.rowid WHERE m.rowid IN (" +
                               ",".join("?" for _ in by_id) + ") ORDER BY m.created DESC,m.rowid DESC",
                               list(by_id)).fetchall() if by_id else []
-            missing = [(rowid, *_vector_text(layer, value, body))
-                       for rowid, layer, value, body, model, digest in rows
-                       if model != self.retrieval_model_id or
-                       digest != _content_sha(_vector_text(layer, value, body)[0],
-                                              self.embedder, "passage")]
+            missing = [(rowid, body, hashlib.sha256(body.encode()).hexdigest())
+                       for rowid, body, model, digest in rows
+                       if model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest()]
         # Compute outside a write transaction; other producers share this DB.
         attempted = 0
-        for rowid, body, gloss in missing[:min(LAZY_EMBED_LIMIT, LAZY_EMBED_BATCH)]:
+        for rowid, body, digest in missing[:min(LAZY_EMBED_LIMIT, LAZY_EMBED_BATCH)]:
             if time.perf_counter() >= deadline:
                 break
             attempted += 1
             try:
-                vector = array("f", _embed_kind(self.embedder, body, "passage"))
+                vector = array("f", self.embedder(body))
                 if not vector or not all(math.isfinite(v) for v in vector):
                     continue
                 with closing(sqlite3.connect(self.path, timeout=.1)) as db:
                     db.execute("INSERT INTO adr001_vec(rowid,model_id,content_sha,vec) "
                                "VALUES(?,?,?,?) ON CONFLICT(rowid) DO UPDATE SET "
                                "model_id=excluded.model_id,content_sha=excluded.content_sha,vec=excluded.vec",
-                               (rowid, self.retrieval_model_id,
-                                _content_sha(body, self.embedder, "passage"), vector.tobytes()))
+                               (rowid, self.model_id, digest, vector.tobytes()))
                     db.commit()
             except Exception as exc:
                 logger.warning("memory embed failed rowid=%s: %s", rowid, exc)
@@ -636,36 +392,24 @@ class HybridMemoryStorage(SQLiteMemoryStorage, MemoryStorage):
                         bm25[rowid] = len(bm25) + 1
             vectors = db.execute("SELECT rowid,model_id,content_sha,vec FROM adr001_vec WHERE "
                                  "rowid IN (" + ",".join("?" for _ in ids) + ")", list(ids)).fetchall()
-            gloss_vectors = db.execute("SELECT rowid,model_id,content_sha,vec "
-                                       "FROM adr001_vec_gloss WHERE rowid IN (" +
-                                       ",".join("?" for _ in ids) + ")", list(ids)).fetchall()
-            bodies = {rowid: _vector_text(layer, value, body) for rowid, layer, value, body
-                      in db.execute("SELECT m.rowid,m.layer,m.value,f.body FROM adr001_memory m "
-                                    "JOIN adr001_fts f ON f.rowid=m.rowid WHERE m.rowid IN (" +
-                                    ",".join("?" for _ in ids) + ")", list(ids))}
+            bodies = {rowid: body for rowid, body in db.execute(
+                "SELECT rowid,body FROM adr001_fts WHERE rowid IN (" +
+                ",".join("?" for _ in ids) + ")", list(ids))}
         semantic = []
-        if self.embedder and (vectors or gloss_vectors):
-            q = array("f", _embed_kind(self.embedder, query, "query"))
+        if self.embedder and vectors:
+            q = array("f", self.embedder(query))
             qnorm = math.sqrt(sum(v * v for v in q))
-            scores = {}
-            for kind, rows in (("primary", vectors), ("gloss", gloss_vectors)):
-                for rowid, model, digest, blob in rows:
-                    texts = bodies.get(rowid)
-                    if texts is None:
-                        continue
-                    body = texts[0] if kind == "primary" else texts[1]
-                    if body is None or model != self.retrieval_model_id or digest != _content_sha(
-                            body, self.embedder, "passage"):
-                        continue
-                    vector = array("f")
-                    vector.frombytes(blob)
-                    if len(vector) != len(q):
-                        continue
-                    denom = qnorm * math.sqrt(sum(v * v for v in vector))
-                    if denom:
-                        score = sum(a * b for a, b in zip(q, vector)) / denom
-                        scores[rowid] = max(score, scores.get(rowid, -math.inf))
-            semantic = list(scores.items())
+            for rowid, model, digest, blob in vectors:
+                body = bodies.get(rowid, "")
+                if model != self.model_id or digest != hashlib.sha256(body.encode()).hexdigest():
+                    continue
+                vector = array("f")
+                vector.frombytes(blob)
+                if len(vector) != len(q):
+                    continue
+                denom = qnorm * math.sqrt(sum(v * v for v in vector))
+                if denom:
+                    semantic.append((rowid, sum(a * b for a, b in zip(q, vector)) / denom))
         semantic.sort(key=lambda item: (-item[1], item[0]))
         vector_rank = {rowid: rank for rank, (rowid, _) in enumerate(semantic, 1)}
         lexical = {r["rowid"]: rank for rank, r in enumerate(candidates, 1)}
