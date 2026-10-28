@@ -42,6 +42,9 @@ def _app(tmp_path, monkeypatch, worker, pushed, *, role="implementer"):
     monkeypatch.setattr(sv, "_pane_alive_for_push", lambda pane: True)
     monkeypatch.setattr(sv, "_pane_process_kind", lambda pane: ("agent", "codex"))
     monkeypatch.setattr(sv, "_ensure_role_protocol", lambda *a, **kw: True)
+    # These pin the needs_human end itself; #896's one transient retry is
+    # covered in test_issue_896_prep_timeout_retry.py.
+    monkeypatch.setattr(sv, "_PREP_TRANSIENT_RETRIES", 0)
     db = str(tmp_path / "tasks.db")
     app = sv.create_app(
         db, worktree_map={role: str(worker)},
