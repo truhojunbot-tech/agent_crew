@@ -878,13 +878,14 @@ _STATUS_ALIASES = (
 # Reverse map: DB status → display label (used in DB fallback)
 _DB_STATUS_TO_DISPLAY = {api: disp for disp, api in _STATUS_ALIASES}
 
-def _fetch_tasks_by_status(port: int, status: str, project: str = "") -> list[dict]:
+def _fetch_tasks_by_status(port: int, status: str, project: str = "",
+                           timeout: float = 2) -> list[dict]:
     import urllib.request
 
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/tasks?status={status}",
         headers={"X-Agent-Crew-Project": project} if project else {})
-    with urllib.request.urlopen(req, timeout=2) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
 
 
@@ -2457,14 +2458,29 @@ def teardown(project: str, base: str):
 
 
 def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
-                         role_to_agent: dict | None = None) -> dict[str, str]:
-    """Map claimed worktree paths to active task ids using the target server."""
+                         role_to_agent: dict | None = None,
+                         deadline: float | None = None) -> dict[str, str]:
+    """Map claimed worktree paths to active task ids using the target server.
+
+    ``deadline`` (a ``time.monotonic()`` instant, #893) bounds the whole lookup.
+    Past it this raises ``subprocess.TimeoutExpired`` rather than returning
+    ``{}``: an unfinished lookup must not read as "nothing is busy".
+    """
     import urllib.request
+
+    def request_timeout() -> float:
+        if deadline is None:
+            return 2
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired("busy worktree lookup", 0)
+        return min(2, left)
 
     if not port:
         return {}
     try:
-        tasks = _fetch_tasks_by_status(port, "in_progress", project=project)
+        tasks = _fetch_tasks_by_status(port, "in_progress", project=project,
+                                       timeout=request_timeout())
         busy = {}
         for task in tasks:
             task_id = task.get("task_id")
@@ -2474,7 +2490,7 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
                 f"http://127.0.0.1:{port}/tasks/{task_id}",
                 headers={"X-Agent-Crew-Project": project} if project else {},
             )
-            with urllib.request.urlopen(req, timeout=2) as resp:
+            with urllib.request.urlopen(req, timeout=request_timeout()) as resp:
                 detail = json.loads(resp.read())
             if detail.get("status") != "in_progress":
                 continue
@@ -2490,7 +2506,12 @@ def _busy_sync_worktrees(worktrees: dict, *, port: int, project: str,
             if wt_path:
                 busy[os.path.realpath(wt_path)] = task_id
         return busy
+    except subprocess.TimeoutExpired:
+        raise
     except Exception as exc:
+        if deadline is not None and deadline - time.monotonic() <= 0:
+            # A request cut short by the deadline is a timeout, not "idle".
+            raise subprocess.TimeoutExpired("busy worktree lookup", 0) from exc
         # The server is optional for standalone sync; preserve its old behavior.
         logger.debug("worktree sync: busy-task lookup unavailable: %s", exc)
         return {}
@@ -2504,32 +2525,57 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
     Used both before a crew run/discuss (so agents start from latest main)
     and after a run completes (so the next run isn't stale). Failures are
     logged but never propagated — a sync error must not block the task.
+
+    #893: the whole sync is bounded by ``AGENT_CREW_SYNC_TIMEOUT`` seconds
+    (default 120, under the 240 s callers give ``crew run``). An unbounded
+    fetch held the client until its caller killed it before enqueue, losing
+    the dispatch with no task and no error. On expiry the remaining
+    worktrees are recorded as ``timeout`` and the caller proceeds.
     """
     main_branch = base_branch or os.environ.get("AGENT_CREW_MAIN_BRANCH", "main")
+    try:
+        budget = float(os.environ.get("AGENT_CREW_SYNC_TIMEOUT", "120"))
+    except ValueError:
+        budget = 120.0
+    deadline = time.monotonic() + budget
+
+    def _remaining() -> float:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise subprocess.TimeoutExpired("worktree sync", budget)
+        return left
+
     landed_bases: dict[str, dict] = {}
+    timed_out = False
     for agent, wt_path in worktrees.items():
         if not wt_path or not os.path.isdir(wt_path):
             continue
         requested_ref = f"origin/{main_branch}"
-        # Recheck immediately before this worktree's first mutating git call.
-        busy = _busy_sync_worktrees({agent: wt_path}, port=port, project=project,
-                                    role_to_agent=role_to_agent)
-        task_id = busy.get(os.path.realpath(wt_path))
-        if task_id:
+        if timed_out or deadline - time.monotonic() <= 0:
+            timed_out = True
             landed_bases[agent] = {"requested_ref": requested_ref, "actual_ref": None,
-                                   "sha": None, "status": "skipped_busy", "task_id": task_id}
-            click.echo(f"Skipping busy worktree {agent!r} (task {task_id}).")
+                                   "sha": None, "status": "timeout"}
             continue
         try:
+            # Recheck immediately before this worktree's first mutating git call.
+            busy = _busy_sync_worktrees({agent: wt_path}, port=port, project=project,
+                                        role_to_agent=role_to_agent, deadline=deadline)
+            task_id = busy.get(os.path.realpath(wt_path))
+            if task_id:
+                landed_bases[agent] = {"requested_ref": requested_ref, "actual_ref": None,
+                                       "sha": None, "status": "skipped_busy",
+                                       "task_id": task_id}
+                click.echo(f"Skipping busy worktree {agent!r} (task {task_id}).")
+                continue
             subprocess.run(
                 ["git", "-C", wt_path, "stash", "push", "-u", "-m", "agent_crew sync", "--", ".",
                  ":(exclude).claude/CLAUDE.md", ":(exclude)AGENTS.md", ":(exclude)GEMINI.md",
                  ":(exclude).gemini/settings.json"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=_remaining(),
             )
             subprocess.run(
                 ["git", "-C", wt_path, "fetch", "origin", "--quiet"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=_remaining(),
             )
             # #280: detach rather than `checkout -B <main_branch>`. This
             # worktree shares `refs/heads/*` with the caller's clone and every
@@ -2541,20 +2587,20 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
             status = "known"
             checkout = subprocess.run(
                 ["git", "-C", wt_path, "checkout", "--detach", requested_ref],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=_remaining(),
             )
             if checkout.returncode != 0:
                 # A new task base is often not on origin yet.  Do not leave
                 # the prior (unknown/stale) checkout in place: resolve the
                 # remote's advertised default branch and land there instead.
-                default_branch = remote_default_branch(wt_path)
+                default_branch = remote_default_branch(wt_path, deadline=deadline)
                 fallback = (f"origin/{default_branch}" if default_branch else
                             f"origin/{os.environ.get('AGENT_CREW_MAIN_BRANCH', 'main')}")
                 actual_ref = fallback
                 status = "fallback"
                 fallback_checkout = subprocess.run(
                     ["git", "-C", wt_path, "checkout", "--detach", fallback],
-                    capture_output=True, text=True,
+                    capture_output=True, text=True, timeout=_remaining(),
                 )
                 if fallback_checkout.returncode != 0:
                     click.echo(
@@ -2570,15 +2616,22 @@ def _sync_worktrees_to_main(worktrees: dict, *, base_branch: str = "",
                 )
             head = subprocess.run(
                 ["git", "-C", wt_path, "rev-parse", "HEAD"],
-                capture_output=True, text=True,
+                capture_output=True, text=True, timeout=_remaining(),
             )
             landed_bases[agent] = {"requested_ref": requested_ref, "actual_ref": actual_ref,
                                    "sha": head.stdout.strip() if head.returncode == 0 else None,
                                    "status": status if head.returncode == 0 else "unknown"}
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            landed_bases[agent] = {"requested_ref": requested_ref, "actual_ref": None,
+                                   "sha": None, "status": "timeout"}
         except Exception as exc:
             click.echo(f"Warning: could not sync worktree {agent!r} to {main_branch}: {exc}")
             landed_bases[agent] = {"requested_ref": f"origin/{main_branch}", "actual_ref": None,
                                    "sha": None, "status": "unknown"}
+    if timed_out:
+        click.echo(f"Warning: worktree sync timed out after {budget:g}s; continuing "
+                   "without it (AGENT_CREW_SYNC_TIMEOUT).")
     return landed_bases
 
 

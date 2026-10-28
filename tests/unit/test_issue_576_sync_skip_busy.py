@@ -56,7 +56,7 @@ def test_sync_skips_dispatched_busy_worktree_and_syncs_idle_one(
     dirty = busy / "unfinished.txt"
     dirty.write_text("leave this alone\n")
     monkeypatch.setattr(cli, "_fetch_tasks_by_status",
-                        lambda port, status, project: [{"task_id": "review-active"}])
+                        lambda port, status, project, **_kwargs: [{"task_id": "review-active"}])
 
     def task_detail(req, timeout):
         assert req.get_header("X-agent-crew-project") == "demo"
