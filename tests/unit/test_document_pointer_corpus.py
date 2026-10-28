@@ -10,7 +10,7 @@ import pytest
 from agent_crew.memory_capture import (
     _decision_document_path, backfill_document_pointers, capture_document_pointer,
 )
-from agent_crew.memory_runtime import SQLiteMemoryStorage
+from agent_crew.memory_runtime import MemoryScope, SQLiteMemoryStorage
 from scripts import backfill_task_outcomes as backfill_cli
 from scripts.backfill_task_outcomes import count_available_refs
 
@@ -62,8 +62,34 @@ def test_backfill_is_idempotent_and_refreshes_on_new_commit(tmp_path):
         rows = db.execute("SELECT key,value FROM adr001_memory WHERE key GLOB 'doc:*' ORDER BY key").fetchall()
     assert len(rows) == 2
     assert any(json.loads(value)["title"] == "Revised ruling" for _, value in rows)
+    assert backfill_document_pointers(memory, sources) == 0
+    assert backfill_document_pointers(memory, sources) == 0
     historic = {"truhojunbot-tech/agent_crew": [("docs/decisions/ruling.md", first_sha)]}
     assert backfill_document_pointers(memory, sources, historic_files=historic) == 0
+
+
+def test_committed_pointer_backfill_uses_effective_revision(tmp_path):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    decision = repo / "docs" / "decisions" / "ruling.md"
+    decision.parent.mkdir(parents=True)
+    decision.write_text("# Current ruling\n\nUse this rule.\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "decision")
+    memory = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    sources = [("truhojunbot-tech/agent_crew", str(repo))]
+    # A prior capture for this commit has stale metadata. The first backfill
+    # appends the correction; later runs must compare against that new head.
+    capture_document_pointer(
+        memory, repo="truhojunbot-tech/agent_crew", project="agent_crew",
+        path="docs/decisions/ruling.md", commit=_git(repo, "rev-parse", "HEAD"),
+        content="# Stale ruling\n\nOld summary.\n")
+    assert backfill_document_pointers(memory, sources) == 1
+    assert backfill_document_pointers(memory, sources) == 0
+    assert backfill_document_pointers(memory, sources) == 0
 
 
 def test_audit_counts_document_path_with_project_identity(tmp_path):
@@ -106,11 +132,14 @@ def test_explicit_working_verdict_is_honestly_versioned_and_refreshes(tmp_path):
     verdict.write_text('{"pass_if":"drawdown improves"}')
     assert backfill_document_pointers(memory, sources, explicit) == 1
     with sqlite3.connect(memory.path) as db:
-        rows = db.execute("SELECT key,value,version FROM adr001_memory WHERE key GLOB 'doc:*'").fetchall()
-    assert len(rows) == 1
+        rows = db.execute("SELECT key,value,version,superseded_by FROM adr001_memory "
+                          "WHERE key GLOB 'doc:*' ORDER BY version").fetchall()
+    assert len(rows) == 2
     assert rows[0][0].endswith("@" + _git(repo, "rev-parse", "HEAD"))
-    assert json.loads(rows[0][1])["source_state"] == "working_file"
-    assert rows[0][2] == 2
+    assert json.loads(rows[0][1])["summary"] == "profit improves"
+    assert rows[0][3] == rows[1][0]
+    assert json.loads(rows[1][1])["source_state"] == "working_file"
+    assert rows[1][2:] == (2, None)
 
 
 def test_unchanged_working_file_survives_unrelated_head_commit_without_duplicate(tmp_path):
@@ -139,10 +168,44 @@ def test_unchanged_working_file_survives_unrelated_head_commit_without_duplicate
     verdict.write_text('{"verdict":"change"}')
     assert backfill_document_pointers(memory, sources, explicit) == 1
     with sqlite3.connect(memory.path) as db:
-        rows = db.execute("SELECT key,value FROM adr001_memory WHERE key GLOB 'doc:*'").fetchall()
-    assert len(rows) == 1
-    assert rows[0][0].endswith("@" + _git(repo, "rev-parse", "HEAD"))
-    assert json.loads(rows[0][1])["summary"] == "change"
+        rows = db.execute("SELECT key,value,superseded_by FROM adr001_memory "
+                          "WHERE key GLOB 'doc:*' ORDER BY created").fetchall()
+    assert len(rows) == 2
+    assert rows[0][0].endswith("@" + first_head)
+    assert json.loads(rows[0][1])["summary"] == "keep"
+    assert rows[0][2] == rows[1][0]
+    assert rows[1][0].endswith("@" + _git(repo, "rev-parse", "HEAD"))
+    assert json.loads(rows[1][1])["summary"] == "change"
+
+
+def test_working_file_refreshes_when_head_returns_to_earlier_commit(tmp_path):
+    repo = tmp_path / "source"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "test@example.com")
+    _git(repo, "config", "user.name", "Test")
+    (repo / "README.md").write_text("first\n")
+    _git(repo, "add", "README.md")
+    _git(repo, "commit", "-qm", "A")
+    first_sha = _git(repo, "rev-parse", "HEAD")
+    verdict = repo / "research" / "verdicts" / "v.json"
+    verdict.parent.mkdir(parents=True)
+    memory = SQLiteMemoryStorage(str(tmp_path / "memory.db"))
+    sources = [("truhojunbot-tech/agent_crew", str(repo))]
+    explicit = {"truhojunbot-tech/agent_crew": {"research/verdicts/v.json"}}
+    verdict.write_text('{"verdict":"first"}')
+    assert backfill_document_pointers(memory, sources, explicit) == 1
+    (repo / "README.md").write_text("second\n")
+    _git(repo, "commit", "-qam", "B")
+    verdict.write_text('{"verdict":"second"}')
+    assert backfill_document_pointers(memory, sources, explicit) == 1
+    _git(repo, "checkout", "--detach", first_sha)
+    verdict.write_text('{"verdict":"third"}')
+    assert backfill_document_pointers(memory, sources, explicit) == 1
+    effective = memory.retrieve(MemoryScope(project="agent_crew"))
+    assert [(row.value["summary"], row.value["commit"]) for row in effective] == [
+        ("third", first_sha)]
+    assert backfill_document_pointers(memory, sources, explicit) == 0
 
 
 def test_historic_capture_reads_old_commit_and_audit_matches_pinned_ref(tmp_path):

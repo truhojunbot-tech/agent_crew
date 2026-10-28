@@ -83,7 +83,9 @@ def test_superseded_decision_does_not_count_as_recalled(tmp_path):
     storage.put(MemoryRecord("decision", "task:prior:decision", {"task_id": "prior"},
                              MemoryScope(project="agent_crew", task_id="prior")))
     with sqlite3.connect(storage.path) as conn:
-        conn.execute("ALTER TABLE adr001_memory ADD COLUMN superseded_by TEXT")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(adr001_memory)")}
+        if "superseded_by" not in columns:
+            conn.execute("ALTER TABLE adr001_memory ADD COLUMN superseded_by TEXT")
         conn.execute("UPDATE adr001_memory SET superseded_by='later' WHERE key='task:prior:decision'")
     assert _lineage_recall_observation(storage, queue.db_path, "agent_crew",
                                        ("prior",)) is False
