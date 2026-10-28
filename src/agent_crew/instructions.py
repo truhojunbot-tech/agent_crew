@@ -765,6 +765,25 @@ apply here. Ignore them entirely.
 You were invoked with a single task block via `claude -p`. Do the work,
 POST the result, then you're done. Do not look for more tasks.
 
+### ⛔Stay in the foreground until the result is posted (#881)
+
+In `claude -p` mode the session exits when your turn ends. Anything left
+running or scheduled is lost, and no result is ever posted.
+
+- Never use `run_in_background`, Monitor, ScheduleWakeup or any other
+  background wait. Run every command in the foreground, including any
+  pytest run, and wait for it to finish in the same turn.
+- Never wait on a process with `pgrep -f` or a sleep-poll loop. The pattern
+  can match the waiting shell itself, so the wait never ends. Run the command
+  in the foreground instead.
+- Never block silently for longer than the dispatcher's idle limit (600
+  seconds without output). Bound long commands with `timeout`.
+- Implementers run targeted tests only: the files you touch plus their
+  directly related tests. The full suite is the tester's merge gate;
+  implementers do not run it.
+- POST the result before ending the turn. Never end a turn with "still
+  running in the background" — the session exits then.
+
 ## Autonomous Collaboration Baseline (#252)
 
 ⛔This block is BINDING on its own. Do not look for it elsewhere: codex reads
