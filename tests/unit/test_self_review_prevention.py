@@ -68,23 +68,25 @@ class TestAutoEnqueueReviewRecordsImplementer:
             assert reviews[0]["context"].get("implementer_agent") == "claude"
 
     def test_override_implementer_is_recorded(self, tmp_db):
-        """Impl task with agent_override=gemini → review records gemini."""
+        """Impl task with agent_override=codex → review records codex.
+
+        (gemini may not implement at all — #889.)"""
         push = RecordingPush()
         app = create_app(
             db_path=tmp_db, pane_map=PANE_MAP, port=8100, push_fn=push
         )
         with TestClient(app) as client:
-            ctx = {"agent_override": "gemini"}
-            client.post(
+            ctx = {"agent_override": "codex"}
+            assert client.post(
                 "/tasks",
                 json=_task_payload("impl-002", "implement", context=ctx),
-            )
+            ).status_code == 201
             client.post(
                 "/tasks/impl-002/result", json=_result_payload("impl-002")
             )
             tasks = client.get("/tasks").json()
             reviews = [t for t in tasks if t["task_type"] == "review"]
-            assert reviews[0]["context"].get("implementer_agent") == "gemini"
+            assert reviews[0]["context"].get("implementer_agent") == "codex"
 
 
 # ---------------------------------------------------------------------------
