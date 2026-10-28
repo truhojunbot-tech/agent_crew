@@ -430,7 +430,8 @@ def verify_rebase_artifact(
       branch head it handed out — defines the change: its commits since it
       forked from the target;
     * the submitted commit must be pushed on ``origin/<branch>``, descend from
-      ``origin/<rebase_onto>``, and add commits of its own;
+      ``origin/<rebase_onto>`` at or after the dispatch-time floor
+      (``context.rebase_onto_sha``, #908), and add commits of its own;
     * and those commits must be patch-equivalent to the dispatched ones, one
       for one (``git patch-id --stable``), or — for a squash — the whole
       change must be. An added empty commit or a dropped one breaks the
@@ -476,11 +477,28 @@ def verify_rebase_artifact(
         if commit != head_sha and _git(
                 repo_cwd, "merge-base", "--is-ancestor", commit, head_sha).returncode != 0:
             return False, f"reported commit is not on the pushed branch origin/{branch}"
-        if commit == tip_sha:
-            return False, f"reported commit is the origin/{target} tip (no artifact)"
         if source and commit == source:
             return False, "reported commit is the dispatch base (nothing was rewritten)"
-        if _git(repo_cwd, "merge-base", "--is-ancestor", tip_sha, commit).returncode != 0:
+        # #908: the floor is the target as it was at dispatch, not the tip now.
+        # Other PRs merge while the worker runs. A pinned floor counts only if
+        # it is on origin/<target>'s history; otherwise the current tip is it.
+        floor = tip_sha
+        for pinned in (context.get("rebase_onto_sha"), context.get("worktree_base_sha")):
+            pinned = str(pinned or "").strip()
+            if pinned and _git(repo_cwd, "merge-base", "--is-ancestor",
+                               pinned, tip_sha).returncode == 0:
+                floor = pinned
+                break
+        # The change sits on whichever target commit the worker rebased onto:
+        # where it leaves origin/<target>, which must be at or after the floor.
+        onto = _git(repo_cwd, "merge-base", commit, tip_sha)
+        onto_sha = onto.stdout.strip() if onto.returncode == 0 else ""
+        if commit == tip_sha:
+            return False, f"reported commit is the origin/{target} tip (no artifact)"
+        if commit in (floor, onto_sha):
+            return False, f"reported commit is on origin/{target} (no artifact)"
+        if not onto_sha or _git(repo_cwd, "merge-base", "--is-ancestor",
+                                floor, onto_sha).returncode != 0:
             return False, f"reported commit does not descend from origin/{target}"
 
         # ── same content ────────────────────────────────────────────────
@@ -488,12 +506,12 @@ def verify_rebase_artifact(
             return False, "rebase contract requires the dispatched head (worktree_base_sha)"
         if _git(repo_cwd, "rev-parse", "--verify", f"{source}^{{commit}}").returncode != 0:
             return False, "dispatched head is not resolvable; cannot prove the same content"
-        fork = _git(repo_cwd, "merge-base", source, tip_sha)
+        fork = _git(repo_cwd, "merge-base", source, onto_sha)
         if fork.returncode != 0 or not fork.stdout.strip():
             return False, f"dispatched head shares no history with origin/{target}"
         fork_sha = fork.stdout.strip()
         before = _patch_ids(repo_cwd, f"{fork_sha}..{source}")
-        after = _patch_ids(repo_cwd, f"{tip_sha}..{commit}")
+        after = _patch_ids(repo_cwd, f"{onto_sha}..{commit}")
         if before is None or after is None:
             return False, "patch-ids unavailable; cannot prove the same content"
         if not before or all(p is None for p in before):
@@ -501,10 +519,10 @@ def verify_rebase_artifact(
         if not after or None in after:
             return False, "rebased range is empty or contains an empty commit"
         if after == [p for p in before if p is not None]:
-            return True, (f"rebased {len(after)} commit(s) onto origin/{target} ({tip_sha[:12]}), "
+            return True, (f"rebased {len(after)} commit(s) onto origin/{target} ({onto_sha[:12]}), "
                           f"patch-equivalent to dispatched {source[:12]}; pushed to origin/{branch}")
         whole_before = _diff_patch_id(repo_cwd, fork_sha, source)
-        whole_after = _diff_patch_id(repo_cwd, tip_sha, commit)
+        whole_after = _diff_patch_id(repo_cwd, onto_sha, commit)
         if whole_before and whole_before == whole_after and len(after) < len(before):
             return True, (f"squashed {len(before)}→{len(after)} commit(s) onto origin/{target}; "
                           f"same total change as dispatched {source[:12]}")

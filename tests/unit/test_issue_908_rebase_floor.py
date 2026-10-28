@@ -110,3 +110,110 @@ def test_floor_off_target_history_falls_back_to_current_tip(repo):
 
     ok, detail = _verify(clone, old_head, commit)
     assert ok is True, detail
+
+
+# ── declared rebase contract (artifact_kind=rebase, review of PR #909) ──────
+
+def _verify_declared(clone, source, commit, floor=None, branch="feat/work"):
+    from agent_crew.pipeline import verify_rebase_artifact
+
+    context = {"artifact_kind": "rebase", "rebase_onto": "main",
+               "rebase_source_sha": source, "worktree_base_sha": source}
+    if floor is not None:
+        context["rebase_onto_sha"] = floor
+    task = TaskRequest("rebase-908", "implement", "x", branch=branch, context=context)
+    result = TaskResult("rebase-908", "completed", "done", branch=branch, commit=commit)
+    return verify_rebase_artifact(task, result, repo_cwd=str(clone))
+
+
+@pytest.fixture
+def diverged(repo):
+    """feat/work forked at root; main moved to the dispatch-time tip since."""
+    clone, root = repo
+    _git(clone, "switch", "-c", "feat/old", root)
+    source = _commit(clone, "feature.txt", "feature\n")
+    _git(clone, "push", "-u", "origin", "feat/old")
+    _git(clone, "switch", "main")
+    dispatch_tip = _commit(clone, "second.txt", "main before dispatch\n")
+    _git(clone, "push", "origin", "main")
+    return clone, root, source, dispatch_tip
+
+
+def _rebase_onto(clone, source, onto):
+    _git(clone, "switch", "-C", "feat/work", onto)
+    _git(clone, "cherry-pick", source)
+    # A distinct message: a same-second cherry-pick onto the source's own
+    # parent would otherwise reproduce the source SHA exactly.
+    _git(clone, "commit", "--amend", "-m", f"rebased onto {onto[:12]}")
+    commit = _git(clone, "rev-parse", "HEAD")
+    _git(clone, "push", "-f", "origin", "feat/work")
+    return commit
+
+
+def test_declared_rebase_accepted_when_target_advances_after_dispatch(diverged):
+    clone, _root, source, dispatch_tip = diverged
+    commit = _rebase_onto(clone, source, dispatch_tip)
+    new_tip = _advance_main(clone, "other.txt")
+    assert subprocess.run(["git", "merge-base", "--is-ancestor", new_tip, commit],
+                          cwd=clone).returncode == 1
+
+    ok, detail = _verify_declared(clone, source, commit, floor=dispatch_tip)
+    assert ok is True, detail
+
+
+def test_declared_rebase_onto_point_between_floor_and_tip_accepted(diverged):
+    clone, _root, source, dispatch_tip = diverged
+    mid = _advance_main(clone, "mid.txt")
+    commit = _rebase_onto(clone, source, mid)
+    _advance_main(clone, "other.txt")
+
+    ok, detail = _verify_declared(clone, source, commit, floor=dispatch_tip)
+    assert ok is True, detail
+
+
+def test_declared_rebase_below_dispatch_floor_rejected(diverged):
+    clone, root, source, dispatch_tip = diverged
+    commit = _rebase_onto(clone, source, root)  # not rebased at all
+    _advance_main(clone, "other.txt")
+
+    ok, detail = _verify_declared(clone, source, commit, floor=dispatch_tip)
+    assert ok is False
+    assert "does not descend from origin/main" in detail
+
+
+def test_declared_rebase_changed_content_still_rejected(diverged):
+    clone, _root, source, dispatch_tip = diverged
+    _git(clone, "switch", "-C", "feat/work", dispatch_tip)
+    commit = _commit(clone, "feature.txt", "something else\n")
+    _git(clone, "push", "-f", "origin", "feat/work")
+    _advance_main(clone, "other.txt")
+
+    ok, detail = _verify_declared(clone, source, commit, floor=dispatch_tip)
+    assert ok is False
+    assert "not patch-equivalent" in detail
+
+
+@pytest.mark.parametrize("which", ["dispatch", "current"])
+def test_declared_rebase_commit_on_target_is_no_artifact(diverged, which):
+    clone, _root, source, dispatch_tip = diverged
+    new_tip = _advance_main(clone, "other.txt")
+    commit = dispatch_tip if which == "dispatch" else new_tip
+    _git(clone, "push", "-f", "origin", f"{commit}:refs/heads/feat/work")
+
+    ok, detail = _verify_declared(clone, source, commit, floor=dispatch_tip)
+    assert ok is False
+    assert "no artifact" in detail
+
+
+def test_declared_floor_off_target_history_falls_back_to_current_tip(diverged):
+    """An unpinned floor (source only) keeps the strict current-tip rule."""
+    clone, _root, source, dispatch_tip = diverged
+    commit = _rebase_onto(clone, source, dispatch_tip)
+    _advance_main(clone, "other.txt")
+
+    ok, detail = _verify_declared(clone, source, commit, floor=source)
+    assert ok is False
+    assert "does not descend from origin/main" in detail
+    new_commit = _rebase_onto(clone, source, _git(clone, "rev-parse", "origin/main"))
+    ok, detail = _verify_declared(clone, source, new_commit)
+    assert ok is True, detail

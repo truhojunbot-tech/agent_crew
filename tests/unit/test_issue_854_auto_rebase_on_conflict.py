@@ -49,7 +49,7 @@ def _conflict(client, task_id="test-original", head=HEAD_1, reason="merge_confli
         "summary": f"script test FAILED ({reason})", "pr_number": PR,
         "error_info": {"reason": f"script_test_{reason}", "final": True,
                        "script_test": {"outcome": "FAILED", "reason": reason,
-                                       "head_sha": head}},
+                                       "head_sha": head, "base_sha": "b" * 40}},
     })
 
 
@@ -76,6 +76,7 @@ def test_conflict_enqueues_one_rebase_round_without_failure_notice(harness):
     assert task.context["artifact_kind"] == "rebase"
     assert task.context["rebase_onto"] == "main"
     assert task.context["rebase_source_sha"] == HEAD_1
+    assert task.context["rebase_onto_sha"] == "b" * 40  # #908 dispatch floor
     assert task.context["issue"] == 854
     assert task.context["repo"] == "owner/repo"
     assert task.context["risk_tier"] == 2
