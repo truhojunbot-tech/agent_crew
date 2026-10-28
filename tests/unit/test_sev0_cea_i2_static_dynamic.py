@@ -435,7 +435,8 @@ def test_static_requeue_callers_are_inventoried():
         if n and rel != "queue.py":
             calls[rel] = n
     # #759 requeues an unverified cloud fix; #797 requeues capped claims through the CEA gate for local fallback or notice.
-    assert calls == {"claude_cloud.py": 4, "cli.py": 1, "server.py": 17}, calls
+    # #861 requeues an agent_override push whose agent has no worktree of its own.
+    assert calls == {"claude_cloud.py": 4, "cli.py": 1, "server.py": 18}, calls
 
 
 def _claimed(tmp_path, name, mode, *, config=None):

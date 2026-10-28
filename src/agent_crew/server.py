@@ -4720,6 +4720,20 @@ def create_app(
             if "agent_override" in task_context:
                 agent_override = task_context["agent_override"]
                 override_pane_id = pane_map.get(agent_override)
+                _override_norm = str(agent_override or "").strip().lower()
+                if (override_pane_id and worktree_map and _override_norm
+                        and _resolve_dispatch_target(task, role)[0] != _override_norm):
+                    # #861 review: the override has a pane but no role, so no
+                    # worktree is its own and the resolver falls back to
+                    # `worktree_map[role]` — another agent's tree. Preparing it
+                    # would move that agent's checkout under its feet.
+                    logger.warning(
+                        f"_try_push_next: agent_override {agent_override} has no worktree of its own "
+                        f"(role map {_DISPATCH_ROLE_TO_AGENT}) — requeueing {task.task_id} "
+                        f"instead of preparing {role}'s worktree")
+                    q().requeue(task.task_id)
+                    skipped.add(task.task_id)
+                    continue
                 if override_pane_id:
                     logger.info(f"_try_push_next: using agent override {agent_override} (pane {override_pane_id}) instead of role {role}")
                     pane_id = override_pane_id
@@ -4749,9 +4763,16 @@ def create_app(
         if _refuse_self_review(task, _target_agent):
             return
 
+        # #861: the worktree follows the pane, i.e. the same resolution the
+        # dispatcher uses. `worktree_map[role]` belongs to the role's default
+        # agent; with `agent_override` that is another provider's worktree,
+        # which the busy check above (keyed by THIS pane) never looked at — so
+        # an override implement task re-checked-out a running review's tree.
+        _push_worktree = (_resolve_dispatch_target(task, role)[1] or "") if worktree_map else ""
+
         # #140/#141: prepare worktree branch before task delivery.
         if worktree_map and not _WORKTREE_SYNC_DISABLED:
-            wt_path = worktree_map.get(role)
+            wt_path = _push_worktree
             if wt_path:
                 try:
                     _reviewed_sha = _prepare_worktree_for_task(
@@ -4835,7 +4856,6 @@ def create_app(
         ):
             return
 
-        _push_worktree = worktree_map.get(role) if worktree_map else ""
         _push_project = task.project or os.path.basename(db_path.rstrip("/").rsplit("/", 2)[-2])
         if _push_worktree and not _ensure_role_protocol(
             role, _push_worktree, _push_project,
