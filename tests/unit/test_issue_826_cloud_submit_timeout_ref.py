@@ -139,7 +139,9 @@ def test_dispatch_without_prepared_sha_pins_bare_main(tmp_path, monkeypatch):
     assert "--ref " + "b" * 40 not in launches[0][2]
 
 
-def test_lineage_implement_on_symbolic_checkout_launches_without_ref(tmp_path, monkeypatch):
+def test_lineage_implement_on_symbolic_checkout_fails_closed_without_ref(tmp_path, monkeypatch):
+    """#890 / review of PR #913: a launch without --ref would start from the
+    shared checkout's HEAD, so an unresolvable lineage ref refuses instead."""
     _setup(monkeypatch)
     monkeypatch.setattr(cloud, "_detached_cloud_ref", lambda cwd: "")
     monkeypatch.setattr(cloud, "_resolve_resume_session_id", lambda queue, task: None)
@@ -158,9 +160,11 @@ def test_lineage_implement_on_symbolic_checkout_launches_without_ref(tmp_path, m
             '{"session_id":"session_826abc",'
             '"url":"https://claude.ai/code/session_826abc"}'))
 
-    assert cloud.dispatch_cloud_for_role(
-        queue, role="implementer", task_type="implement", run_fn=run).dispatched
-    assert len(launches) == 1 and "--ref" not in launches[0][2]
+    outcome = cloud.dispatch_cloud_for_role(
+        queue, role="implementer", task_type="implement", run_fn=run)
+    assert not outcome.dispatched
+    assert outcome.launch_error == "cloud_origin_ref_unavailable"
+    assert launches == []
 
 
 def test_timeout_with_session_output_is_recovered_without_resubmit(tmp_path, monkeypatch):
