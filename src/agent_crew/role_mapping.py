@@ -27,6 +27,21 @@ LEGACY_SOURCE = "legacy state.json.roles"
 DEFAULT_SOURCE = "hardcoded default"
 
 
+def provider_family(agent: object) -> str:
+    """Model family of an agent name, for review-independence checks (#871).
+
+    ``claude_cloud`` is the same model as ``claude``; comparing raw strings let
+    a claude-implemented PR pass a claude_cloud review.
+    """
+    name = str(agent or "").strip().lower()
+    if name == "claude" or name.startswith(("claude-", "claude_")):
+        return "claude"
+    for family in ("codex", "gemini"):
+        if name.startswith(family):
+            return family
+    return name
+
+
 def validate_explicit_role_agents(mapping: Mapping[str, object]) -> dict[str, str]:
     """Validate a complete explicit mapping without imposing provider policy."""
     if set(mapping) != set(ROLE_ORDER):

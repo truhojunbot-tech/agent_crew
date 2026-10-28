@@ -6,6 +6,8 @@ import re
 import subprocess
 from typing import Optional
 
+from agent_crew.role_mapping import provider_family
+
 
 logger = logging.getLogger(__name__)
 
@@ -705,7 +707,7 @@ def independent_review_for_head(queue, pr_number: int, repo: str,
     reviewer_agent, author_agent = reviewer.get("agent"), (author or {}).get("agent")
     if not reviewer_agent or not author_agent:
         return "", "", "", "author or reviewer attribution unavailable"
-    if reviewer_agent == author_agent:
+    if provider_family(reviewer_agent) == provider_family(author_agent):
         return "", "", "", f"reviewer agent equals implementer agent ({reviewer_agent})"
     return head, reviewer_agent, latest.task_id, "independent approval"
 
