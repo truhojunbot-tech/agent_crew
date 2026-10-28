@@ -87,7 +87,7 @@ from agent_crew.queue import (AdmissionRefused, CompletedReviewRejected, Duplica
                               TaskAlreadyExistsError,
                               TaskQueue, WorkIntentTargetConflict, QUEUE_SCHEMA_VERSION,
                               _CEA_SYSTEM_SUCCESSOR_PROVENANCE,
-                              validate_http_root_risk,
+                              validate_http_root_risk, claim_lease_seconds,
                               _ROLE_TO_TYPE, _TYPE_TO_ROLE,
                               RequestSqliteTiming, request_sqlite_timing)
 from agent_crew.queue import CANCEL_REASON_ATTEMPT as _CANCEL_REASON_ATTEMPT
@@ -4986,7 +4986,8 @@ def create_app(
         try:
             _nonce = q().record_dispatch(
                 task.task_id, channel="tmux_pane", agent=_target_agent or None,
-                target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}")
+                target=guarded_pane_id, lease_owner=f"pane:{guarded_pane_id}",
+                lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             logger.warning("_try_push_next: dispatch refused for %s — %s", task.task_id, exc)
             return
@@ -5092,7 +5093,8 @@ def create_app(
         try:
             _nonce = q().record_dispatch(task.task_id, channel="tmux_pane", agent=agent,
                                          target=guarded_pane_id,
-                                         lease_owner=f"pane:{guarded_pane_id}")
+                                         lease_owner=f"pane:{guarded_pane_id}",
+                                         lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             logger.warning("_try_push_discuss: dispatch refused for %s — %s", task.task_id, exc)
             return
@@ -9048,7 +9050,9 @@ def create_app(
                 TASK_TYPE_TO_ROLE.get(task.task_type), agent))
         try:
             nonce = q().record_dispatch(task.task_id, channel="api", agent=agent or None,
-                                        target=f"http_poll:{agent or 'anonymous'}")
+                                        target=f"http_poll:{agent or 'anonymous'}",
+                                        lease_owner=f"http_poll:{agent or 'anonymous'}",
+                                        lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             # The claim already committed; the dispatch did not. Say so rather
             # than hand out a task the gate refused.

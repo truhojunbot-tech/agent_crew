@@ -785,6 +785,26 @@ CREATE TABLE IF NOT EXISTS task_exec_events (
 """
 
 _COORDINATOR_NOTICE_MAX_ATTEMPTS = 3
+
+#: Lease for a claim no dispatcher subprocess owns — MCP, HTTP poll, tmux pane
+#: (#887). Without one the orphan sweep never looks at the row, and a pane the
+#: watchdog cannot resolve left it in_progress forever, holding an implement
+#: slot. A heartbeat after expiry still keeps the task alive.
+DEFAULT_CLAIM_LEASE_S = 3600.0
+
+
+def claim_lease_seconds() -> float:
+    """``AGENT_CREW_CLAIM_LEASE_S``, read per call; invalid values use the default."""
+    raw = os.getenv("AGENT_CREW_CLAIM_LEASE_S", "")
+    try:
+        value = float(raw) if raw.strip() else DEFAULT_CLAIM_LEASE_S
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(raw)
+        return value
+    except ValueError:
+        logger.warning("invalid AGENT_CREW_CLAIM_LEASE_S=%r; using %.0fs",
+                       raw, DEFAULT_CLAIM_LEASE_S)
+        return DEFAULT_CLAIM_LEASE_S
 def _claim_build() -> tuple:
     """The build of the process making the claim, as `/health` reports it.
 
@@ -6632,8 +6652,9 @@ class TaskQueue:
         ``channel`` uses D6's vocabulary: ``tmux_pane``, ``claude_p``,
         ``codex_exec``, ``gemini_cli``, ``api``. ``target`` is the pane id or
         ``pid:<n>``. ``lease_seconds`` is the bound the handing path enforces
-        (the dispatcher's kill timeout); None where there is no fixed bound —
-        a tmux pane task is reaped on idleness (#231), not on a deadline.
+        (the dispatcher's kill timeout). Pane, MCP and HTTP-poll claims pass
+        :func:`claim_lease_seconds` (#887): idleness still reaps a resolvable
+        pane (#231), and the lease is the backstop when the pane cannot be.
         ``context_patch`` is committed with the dispatch channel so a
         reconciler cannot observe a cloud fix dispatch without its launch head.
 
@@ -9313,11 +9334,19 @@ class TaskQueue:
                 "UPDATE tasks SET status = 'failed', summary = ?, error_info = ? WHERE task_id = ?",
                 (summary, json.dumps(error_info) if error_info is not None else None, task_id),
             )
+            now = time.time()
+            reason = error_info.get("reason") if isinstance(error_info, dict) else None
+            # #887: close the attribution the way submit_result does, or the
+            # row stays in_progress next to a failed task.
+            conn.execute(
+                "UPDATE task_attribution SET status='failed', outcome=?, completed_at=?, "
+                "updated_at=? WHERE task_id=?",
+                (f"failed:{reason}" if reason else "failed", now, now, task_id),
+            )
             # G12: a watchdog timeout ends the lease without a result.
             self._record_end_on(
-                conn, task_id, time.time(), "force_failed", posted=False,
-                from_status=row["status"],
-                reason=error_info.get("reason") if isinstance(error_info, dict) else None)
+                conn, task_id, now, "force_failed", posted=False,
+                from_status=row["status"], reason=reason)
             conn.execute("COMMIT")
             return row["task_type"]
         except Exception:

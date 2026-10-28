@@ -34,6 +34,7 @@ try:
 except ImportError:  # pragma: no cover — surfaced loud at import time
     FastMCP = None  # type: ignore
 
+from agent_crew.cea import callsites as _cea_callsites
 from agent_crew.loop import _resolve_verdict, handle_test_result
 from agent_crew.pipeline import (
     auto_enqueue_fix,
@@ -42,7 +43,7 @@ from agent_crew.pipeline import (
     fix_task_id,
     auto_fallback_failed_task,    hold_mismatched_pr_result,
     artifact_gate_applies, declared_artifact_kind, no_artifact_result,
-    verify_implement_artifact, verify_task_artifact,
+    verify_implement_artifact, verify_task_artifact, review_publication_decision,
 )
 from agent_crew.protocol import (
     TaskRequest, TaskResult, RESULT_BRANCH_CONTEXT_KEY, RESULT_COMMIT_CONTEXT_KEY,
@@ -50,7 +51,7 @@ from agent_crew.protocol import (
 from agent_crew.memory_capture import capture_result_best_effort
 from agent_crew.queue import (
     AdmissionRefused, CompletedReviewRejected, DuplicateReviewResult, InvalidReviewResult,
-    LateResultRejected, PausedError as _PausedError, TaskQueue,
+    LateResultRejected, PausedError as _PausedError, TaskQueue, claim_lease_seconds,
 )
 from agent_crew.role_mapping import (
     LEGACY_AGENT_TO_ROLE, TASK_TYPE_TO_ROLE, anonymous_pull_refusal, role_policy_refusal,
@@ -164,7 +165,9 @@ def build_mcp_server(
             return {"task_id": task.task_id, "dispatch_refused": refusal}
         try:
             nonce = queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
-                                          target=f"mcp:{agent or 'anonymous'}")
+                                          target=f"mcp:{agent or 'anonymous'}",
+                                          lease_owner=f"mcp:{agent or 'anonymous'}",
+                                          lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
         return _task_to_dict(task, nonce=nonce)
@@ -177,7 +180,9 @@ def build_mcp_server(
             return None
         try:
             nonce = queue.record_dispatch(task.task_id, channel="api", agent=agent or None,
-                                          target=f"mcp:{agent or 'anonymous'}")
+                                          target=f"mcp:{agent or 'anonymous'}",
+                                          lease_owner=f"mcp:{agent or 'anonymous'}",
+                                          lease_seconds=claim_lease_seconds())
         except AdmissionRefused as exc:
             return {"task_id": task.task_id, "dispatch_refused": str(exc)}
         return _task_to_dict(task, nonce=nonce)
@@ -257,7 +262,19 @@ def build_mcp_server(
                 and declared_artifact_kind(_task) is None
                 and not (_artifact_context.get("worktree_base_sha") or _artifact_context.get("reviewed_sha")
                          or "rebase_onto" in _artifact_context)):
-            logger.info("MCP submit_result: artifact gate not applied — dispatch base absent (task=%s)", task_id)
+            # #887: same T5 rule as HTTP — "dispatch base absent" is held under
+            # the project's enforce mode and only logged under shadow/off.
+            _no_base = ("dispatch base absent: this implement task declares no "
+                        "artifact contract and carries no worktree_base_sha or "
+                        "reviewed_sha, so its completion cannot be verified")
+            if _cea_callsites.enforcing(project=getattr(_task, "project", None) or None):
+                logger.warning("MCP submit_result: artifact gate FAILED — %s (task=%s)",
+                               _no_base, task_id)
+                _artifact_held = _no_base
+                result = no_artifact_result(result, _no_base)
+            else:
+                logger.info("MCP submit_result: artifact gate would FAIL under enforce — "
+                            "%s (task=%s, shadow: result stands)", _no_base, task_id)
         if not _runtime_paused and artifact_gate_applies(_task, result):
             # MCP is a per-worker subprocess launched from that worker's
             # checkout. Unlike HTTP it has no in-process worktree map; its cwd
@@ -374,7 +391,27 @@ def build_mcp_server(
             auto_enqueue_review(queue, task_id, pr_number=result.pr_number,
                                 result=result)
         elif task_type == "review" and _resolve_verdict(result) == "approve":
-            auto_enqueue_test(queue, task_id)
+            # #887: the #304 head gate HTTP applies before acting on an
+            # approval. A verdict about a head that has moved neither spends a
+            # tester nor reaches a merge.
+            _ctx = _task_ctx if isinstance(_task_ctx, dict) else {}
+            _review_pr = result.pr_number or _ctx.get("pr_number")
+            _pub = review_publication_decision(
+                _ctx, _review_pr, repo=_ctx.get("repo") or "",
+                repo_cwd=os.getcwd()) if _review_pr else None
+            if _pub is not None and not _pub.publish:
+                logger.warning("MCP submit_result: approval NOT acted on for %s — %s (#304)",
+                               task_id, _pub.reason)
+                try:
+                    queue.patch_context(task_id, {
+                        "review_publication": _pub.status,
+                        "review_publication_reason": _pub.reason,
+                    })
+                except Exception:
+                    logger.exception("MCP submit_result: could not record the suppressed "
+                                     "approval for %s", task_id)
+            else:
+                auto_enqueue_test(queue, task_id)
         elif task_type == "review" and _resolve_verdict(result) == "request_changes":
             # #244: the rejection path must cascade on this transport too,
             # otherwise an MCP-only crew stalls on every request_changes.
